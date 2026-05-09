@@ -30,6 +30,7 @@
 - `mozyo-bridge` は notification transport であり、review、completion、task state の source of truth ではない。
 - pane message を受けた agent は、作業前に Asana task または明示された source of truth を確認する。
 - marker が観測される前に Enter を送る safety behavior を壊さない。
+- `.agent_handoff/tasks.json` は retired queue の棚卸し用であり、standard notification fallback として扱わない。
 
 ## 禁止事項
 

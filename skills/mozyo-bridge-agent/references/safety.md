@@ -12,6 +12,7 @@
 - It is not the source of truth for review state, task completion, or release approval.
 - The receiving agent must check Asana or the named source of truth before acting.
 - Preserve marker-based safety behavior. Enter must not be sent before the marker is observed.
+- `.agent_handoff/tasks.json` is a retired queue cleanup surface, not a standard notification fallback.
 
 ## Release Safety
 
