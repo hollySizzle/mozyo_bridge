@@ -10,7 +10,7 @@ python -m pip wheel . --no-deps -w /tmp/mozyo_bridge_dist
 python -m mozyo_bridge --help
 ```
 
-On this machine, Homebrew `python3` may point to Python 3.14 without `PyYAML`. Use a venv with dependencies installed when needed.
+Use a Python environment matching the project's supported Python versions for local tests.
 
 ## tmux Delivery Changes
 

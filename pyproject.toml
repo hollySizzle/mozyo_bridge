@@ -10,9 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = [
-    "PyYAML>=6.0",
-]
+dependencies = []
 authors = [
     { name = "takahorishizuru" },
 ]

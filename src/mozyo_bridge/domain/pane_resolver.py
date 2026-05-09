@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ AGENT_COMMANDS = {
     "claude": "claude",
     "codex": "codex",
 }
+VERSIONED_NATIVE_BINARY_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+].*)?")
 READ_MARK_TTL_SECONDS = 300
 
 
@@ -113,12 +115,17 @@ def pane_info(target: str) -> dict[str, str]:
     raise AssertionError("unreachable")
 
 
+def is_agent_process(command: str) -> bool:
+    name = Path(command or "").name
+    return name in AGENT_PROCESSES or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
+
+
 def ensure_agent_target(pane: dict[str, str], expected_label: str, force: bool = False) -> None:
     if force:
         return
     label = pane.get("label") or ""
     command = Path(pane.get("command") or "").name
-    if label == expected_label and command in AGENT_PROCESSES:
+    if label == expected_label and is_agent_process(command):
         return
     die(
         "target pane does not look like an agent pane; "

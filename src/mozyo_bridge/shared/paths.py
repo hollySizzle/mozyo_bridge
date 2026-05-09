@@ -28,7 +28,7 @@ def resolve_repo_root(repo: str | Path | None = None, start: Path | None = None)
 
 
 def default_queue_path(repo_root: Path | None = None) -> Path:
-    return Path(repo_root or resolve_repo_root()) / ".agent_handoff" / "tasks.yaml"
+    return Path(repo_root or resolve_repo_root()) / ".agent_handoff" / "tasks.json"
 
 
 def default_tmux_conf(repo_root: Path | None = None) -> Path:

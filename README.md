@@ -79,6 +79,45 @@ mozyo-bridge init codex
 mozyo-bridge status
 ```
 
+Claude Code の project skill は repo root の `.claude/skills/` から解決されます。
+`mozyo-bridge status` / `doctor` が `claude_pane cwd is outside repo root` を出した場合、その pane では `/mozyo-bridge-agent` などの project skill が解決されない可能性があります。
+repo root で Claude Code を起動し直してから `mozyo-bridge init claude` を再実行してください。
+
+## Agent skill install
+
+Codex skill は Codex home に同期します。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_codex_skill.sh | sh
+```
+
+Install destination:
+
+- `${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/`
+
+Claude Code skill は project skill として対象 project に同期します。別の Mac や別 project に配布する場合は、対象 project path を明示してください。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
+  -o /tmp/install_mozyo_bridge_claude_skill.sh
+MOZYO_BRIDGE_CLAUDE_PROJECT_DIR=/path/to/project \
+  sh /tmp/install_mozyo_bridge_claude_skill.sh
+```
+
+Install destinations:
+
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/mozyo-bridge-agent/`
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/skills/mozyo-bridge-agent/`
+
+現在の project root で実行している場合だけ、`MOZYO_BRIDGE_CLAUDE_PROJECT_DIR` を省略できます。
+
+```bash
+sh scripts/install_claude_skill.sh
+```
+
+Both scripts fetch `hollySizzle/mozyo_bridge` `main` by default. Override the source with `MOZYO_BRIDGE_SKILL_REPO` and `MOZYO_BRIDGE_SKILL_REF`.
+Claude Code must be started from the target project directory for `.claude/skills/` project skills to resolve.
+
 ClaudeCode から Codex へレビュー依頼を通知:
 
 ```bash
@@ -117,7 +156,7 @@ mozyo-bridge notify-claude \
 - `notify-*` には `--issue` と `--journal` を渡す。
 - pane message の内容だけで作業開始・完了判断をしない。
 - 受信側は通知を見たら Redmine gate を確認してから動く。
-- `.agent_handoff/tasks.yaml` は retired queue であり fallback ではない。
+- `.agent_handoff/tasks.json` は retired queue であり fallback ではない。
 - `notify-*` は短い `[mozyo:notify:...]` marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。
 - marker を確認できない場合、mozyo-bridge は入力欄を `C-u` で消し、Enter を送らず失敗する。
 

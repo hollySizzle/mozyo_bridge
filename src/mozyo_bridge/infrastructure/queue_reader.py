@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from mozyo_bridge.shared.errors import die
 
@@ -11,7 +10,10 @@ from mozyo_bridge.shared.errors import die
 def load_queue(queue_path: Path) -> dict[str, Any]:
     if not queue_path.exists():
         return {"tasks": []}
-    data = yaml.safe_load(queue_path.read_text(encoding="utf-8")) or {"tasks": []}
+    try:
+        data = json.loads(queue_path.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        die(f"queue must be JSON: {queue_path}: {exc}")
     if not isinstance(data, dict):
         die(f"queue root must be a mapping: {queue_path}")
     tasks = data.setdefault("tasks", [])

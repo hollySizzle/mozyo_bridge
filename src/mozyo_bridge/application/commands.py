@@ -9,12 +9,12 @@ from pathlib import Path
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
-    AGENT_PROCESSES,
     clear_read,
     current_pane,
     current_session_name,
     ensure_agent_target,
     find_labeled_pane,
+    is_agent_process,
     is_tmux_target,
     mark_read,
     pane_info,
@@ -172,7 +172,7 @@ def wait_for_agent_terminal_pane(pane_id: str, agent: str, timeout: float) -> No
     while time.monotonic() < deadline:
         info = pane_info(pane_id)
         command = Path(info.get("command") or "").name
-        if command in AGENT_PROCESSES:
+        if is_agent_process(command):
             return
         time.sleep(0.2)
     die(f"timed out waiting for {agent} pane startup: {pane_id}")
@@ -377,7 +377,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(_: argparse.Namespace) -> int:
+def cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:
+    if not cwd:
+        return True
+    try:
+        Path(cwd).expanduser().resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
     if subprocess.run(["sh", "-c", "command -v tmux >/dev/null 2>&1"]).returncode != 0:
         print("tmux: missing")
@@ -404,8 +414,17 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             else:
                 pane = matches[0]
                 command = Path(pane["command"]).name
-                status = "ok" if command in AGENT_PROCESSES else "not-agent-process"
+                status = "ok" if is_agent_process(command) else "not-agent-process"
                 print(f"{agent}_pane: {pane['id']} process={command} status={status}")
-    queue = queue_path_from_args(_)
+                if agent == "claude":
+                    repo_root = repo_root_from_args(args)
+                    if (repo_root / ".claude" / "skills").exists() and not cwd_is_under_repo(pane.get("cwd", ""), repo_root):
+                        print(
+                            "warning: claude_pane cwd is outside repo root; "
+                            "project skills may not resolve. "
+                            f"cwd={pane.get('cwd', '') or '-'} repo={repo_root}"
+                        )
+                        ok = False
+    queue = queue_path_from_args(args)
     print(f"queue: {queue} ({'exists' if queue.exists() else 'missing'})")
     return 0 if ok else 1

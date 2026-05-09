@@ -14,12 +14,20 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.commands import cmd_ensure_pair, cmd_open, notify_agent
+from mozyo_bridge.application.commands import cmd_doctor, cmd_ensure_pair, cmd_open, notify_agent
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
-from mozyo_bridge.domain.pane_resolver import clear_read, ensure_agent_target, find_labeled_pane, is_tmux_target, mark_read, require_read
+from mozyo_bridge.domain.pane_resolver import (
+    clear_read,
+    ensure_agent_target,
+    find_labeled_pane,
+    is_agent_process,
+    is_tmux_target,
+    mark_read,
+    require_read,
+)
 import mozyo_bridge.domain.pane_resolver as pane_resolver
-from mozyo_bridge.infrastructure.queue_reader import find_handoff_task
+from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
 
 
@@ -87,25 +95,71 @@ class NotificationTest(unittest.TestCase):
 
 
 class QueueReaderTest(unittest.TestCase):
+    def test_load_queue_returns_empty_tasks_when_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Path(tmp) / "missing" / "tasks.json"
+
+            self.assertEqual({"tasks": []}, load_queue(queue))
+
+    def test_load_queue_rejects_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Path(tmp) / "tasks.json"
+            queue.write_text("tasks:\n  - id: yaml-is-not-json\n", encoding="utf-8")
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    load_queue(queue)
+
+        self.assertIn("queue must be JSON", stderr.getvalue())
+
+    def test_load_queue_rejects_non_mapping_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Path(tmp) / "tasks.json"
+            queue.write_text(json.dumps([{"id": "not-a-root-object"}]), encoding="utf-8")
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    load_queue(queue)
+
+        self.assertIn("queue root must be a mapping", stderr.getvalue())
+
+    def test_load_queue_rejects_non_list_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Path(tmp) / "tasks.json"
+            queue.write_text(json.dumps({"tasks": {"id": "not-a-list"}}), encoding="utf-8")
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    load_queue(queue)
+
+        self.assertIn("queue tasks must be a list", stderr.getvalue())
+
     def test_find_handoff_task_filters_pending_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            queue = Path(tmp) / "tasks.yaml"
+            queue = Path(tmp) / "tasks.json"
             queue.write_text(
-                """
-tasks:
-  - id: old
-    to: codex
-    issue_id: 9020
-    type: review_request
-    status: completed
-    created_at: "2026-05-01T00:00:00Z"
-  - id: wanted
-    to: codex
-    issue_id: 9020
-    type: review_request
-    status: pending
-    created_at: "2026-05-02T00:00:00Z"
-""",
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "old",
+                                "to": "codex",
+                                "issue_id": 9020,
+                                "type": "review_request",
+                                "status": "completed",
+                                "created_at": "2026-05-01T00:00:00Z",
+                            },
+                            {
+                                "id": "wanted",
+                                "to": "codex",
+                                "issue_id": 9020,
+                                "type": "review_request",
+                                "status": "pending",
+                                "created_at": "2026-05-02T00:00:00Z",
+                            },
+                        ]
+                    }
+                ),
                 encoding="utf-8",
             )
             args = argparse.Namespace(queue=str(queue), task_id="wanted", issue="9020", type="review_request")
@@ -116,16 +170,21 @@ tasks:
 
     def test_find_handoff_task_raises_for_completed_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            queue = Path(tmp) / "tasks.yaml"
+            queue = Path(tmp) / "tasks.json"
             queue.write_text(
-                """
-tasks:
-  - id: done
-    to: codex
-    issue_id: 9020
-    type: review_request
-    status: completed
-""",
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "done",
+                                "to": "codex",
+                                "issue_id": 9020,
+                                "type": "review_request",
+                                "status": "completed",
+                            }
+                        ]
+                    }
+                ),
                 encoding="utf-8",
             )
             args = argparse.Namespace(queue=str(queue), task_id="done", issue="9020", type="review_request")
@@ -154,7 +213,7 @@ class PathResolutionTest(unittest.TestCase):
             root = Path(tmp)
             (root / ".tmux.conf").write_text("", encoding="utf-8")
 
-            self.assertEqual(root / ".agent_handoff" / "tasks.yaml", default_queue_path(root))
+            self.assertEqual(root / ".agent_handoff" / "tasks.json", default_queue_path(root))
             self.assertEqual(root / ".tmux.conf", default_tmux_conf(root))
 
 
@@ -195,6 +254,14 @@ class PaneResolverTest(unittest.TestCase):
         pane = {"label": "codex", "command": "node"}
 
         ensure_agent_target(pane, "codex")
+
+    def test_ensure_agent_target_accepts_versioned_native_binary_for_labeled_claude(self) -> None:
+        pane = {"label": "claude", "command": "2.1.138"}
+
+        ensure_agent_target(pane, "claude")
+
+    def test_is_agent_process_accepts_versioned_native_binary(self) -> None:
+        self.assertTrue(is_agent_process("2.1.138"))
 
     def test_ensure_agent_target_rejects_shell_without_force(self) -> None:
         pane = {"label": "", "command": "bash"}
@@ -617,6 +684,53 @@ class CommandTest(unittest.TestCase):
                 cmd_open(args)
 
         source_conf.assert_called_once_with("/repo/.tmux.conf")
+
+    def test_doctor_warns_when_claude_pane_cwd_is_outside_repo_with_project_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / ".claude" / "skills").mkdir(parents=True)
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {
+                    "id": "%1",
+                    "location": "agents:0.0",
+                    "command": "claude",
+                    "label": "claude",
+                    "cwd": str(Path(tmp) / "outside"),
+                },
+                {"id": "%2", "location": "agents:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+            ]
+            list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
+
+            with patch("mozyo_bridge.application.commands.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(1, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("warning: claude_pane cwd is outside repo root; project skills may not resolve", output)
+        self.assertIn(f"repo={repo.resolve()}", output)
+
+    def test_doctor_accepts_versioned_claude_native_binary_as_agent_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {"id": "%1", "location": "agents:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
+                {"id": "%2", "location": "agents:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+            ]
+            list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
+
+            with patch("mozyo_bridge.application.commands.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_doctor(args))
+
+        self.assertIn("claude_pane: %1 process=2.1.138 status=ok", stdout.getvalue())
 
 
 if __name__ == "__main__":

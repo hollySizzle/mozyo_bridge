@@ -10,7 +10,7 @@ python -m pip wheel . --no-deps -w /tmp/mozyo_bridge_dist
 python -m mozyo_bridge --help
 ```
 
-この machine では Homebrew の `python3` が Python 3.14 を指し、`PyYAML` が入っていない場合がある。local test は dependency が入った venv を使う。
+local test は project の対応 Python version と同じ環境で実行する。
 
 ## tmux / delivery 変更時
 
