@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+tmp/
 
 # Virtual environments
 .venv/
