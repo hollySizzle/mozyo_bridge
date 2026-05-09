@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mozyo-bridge"
+version = "0.1.0"
+description = "Redmine-gated tmux pane notification bridge for Claude Code and Codex terminals"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
+authors = [
+    { name = "takahorishizuru" },
+]
+keywords = ["tmux", "codex", "claude", "redmine", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Terminals",
+]
+
+[project.scripts]
+mozyo-bridge = "mozyo_bridge.application.cli:main"
+mozyo = "mozyo_bridge.application.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
