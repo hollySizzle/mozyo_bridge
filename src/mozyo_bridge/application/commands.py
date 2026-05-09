@@ -432,7 +432,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_rules_install(args: argparse.Namespace) -> int:
-    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     written = install_rules(home)
     if written:
         for path in written:
@@ -443,7 +443,7 @@ def cmd_rules_install(args: argparse.Namespace) -> int:
 
 
 def cmd_rules_status(args: argparse.Namespace) -> int:
-    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     print("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH")
     ok = True
     for row in rules_status(home):
@@ -454,7 +454,7 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
 
 
 def cmd_scaffold_rules(args: argparse.Namespace) -> int:
-    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     target = repo_root_from_args(args)
     paths = write_scaffold(
         args.preset,

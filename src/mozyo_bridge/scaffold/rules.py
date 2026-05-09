@@ -25,7 +25,7 @@ class RenderedFile:
 
 
 def mozyo_bridge_home() -> Path:
-    return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser()
+    return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
 
 
 def package_preset_root(preset: str):

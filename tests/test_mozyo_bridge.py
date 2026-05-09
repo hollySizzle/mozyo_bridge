@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -446,6 +447,29 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("Redmine issue", (project / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
             self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
+
+    def test_relative_home_is_recorded_as_absolute_rule_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path.cwd()
+            try:
+                os.chdir(tmp)
+                project = Path(tmp) / "project"
+                project.mkdir()
+                self.run_cli(["rules", "install", "--home", "home"])
+
+                self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", "home"])
+
+                state = scaffold_state(project)
+                self.assertIsNotNone(state)
+                assert state is not None
+                self.assertEqual(
+                    str((Path(tmp) / "home" / "rules" / "presets" / "asana" / "agent-workflow.md").resolve()),
+                    state["rule_path"],
+                )
+                agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+                self.assertIn(str((Path(tmp) / "home").resolve()), agents)
+            finally:
+                os.chdir(cwd)
 
 
 class NotifyContractTest(unittest.TestCase):
