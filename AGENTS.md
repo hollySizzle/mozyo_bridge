@@ -4,12 +4,11 @@
 
 ## 起動時に読むもの
 
-1. Notion のグローバル規約 `global agent rules`
-   - <private-notion-rules-url>
-   - Notion MCP で取得できない場合は、読んだふりをせずユーザーへ通知して停止する。
+1. 利用者自身の Notion / workspace にあるグローバル agent 規約
+   - 具体 URL は public repository に置かず、local-only の設定や private docs で管理する。
+   - 必須規約を取得できない場合は、読んだふりをせずユーザーへ通知して停止する。
 2. 現在の `cwd`
-3. Asana project `mozyo_bridge`
-   - <private-asana-project-url>
+3. 利用者自身の Asana project
 4. active な Asana task
 
 ## この repo の router

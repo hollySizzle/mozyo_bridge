@@ -5,14 +5,14 @@
 - Project: `mozyo-bridge`
 - Import package: `mozyo_bridge`
 - Package name: `mozyo-bridge`
-- Workspace: `<repo-root>`
+- Workspace: repository root
 - GitHub repository: https://github.com/hollySizzle/mozyo_bridge
-- Asana project: <private-asana-project-url>
+- Asana project: configure per user or private workspace
 
 ## Source of Truth
 
-- 実行キュー: Asana project `mozyo_bridge`
-- グローバル規約・知識: Notion
+- 実行キュー: 利用者自身の Asana project
+- グローバル規約・知識: 利用者自身の Notion workspace
 - code と release artifact: この repository
 - package metadata: `pyproject.toml`
 - user-facing usage / safety: `README.md`

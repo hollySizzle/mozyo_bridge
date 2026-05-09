@@ -7,7 +7,7 @@
 ## 作業開始
 
 - セッション開始時に Notion のグローバル規約を fetch する。
-- 現在の `cwd` が `<repo-root>` であることを確認する。
+- 現在の `cwd` が対象 repository root、またはその配下であることを確認する。
 - Asana project `mozyo_bridge` の project notes を確認する。
 - active な Asana task を確認する。該当 task がない場合は、実装前に作成する。
 

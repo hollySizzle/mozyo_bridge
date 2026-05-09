@@ -6,8 +6,8 @@
 - Import package: `mozyo_bridge`
 - Package name: `mozyo-bridge`
 - Repository: https://github.com/hollySizzle/mozyo_bridge
-- Workspace: `<repo-root>`
-- Asana project: <private-asana-project-url>
+- Workspace: repository root
+- Asana project: configure per user or private workspace
 
 ## Important Paths
 
