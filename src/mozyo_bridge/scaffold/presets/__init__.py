@@ -1,0 +1,2 @@
+"""Packaged scaffold rule presets."""
+

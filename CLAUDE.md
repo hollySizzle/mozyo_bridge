@@ -17,6 +17,7 @@
 - project 構造: `vibes/docs/specs/project-map.md`
 - release 判断と検証: `vibes/docs/logics/release-flow.md`
 - skill 配布方針: `vibes/docs/logics/skill-distribution.md`
+- scaffold rules 方針: `vibes/docs/logics/scaffold-rules.md`
 - Asana task 作成テンプレート: `vibes/docs/temps/asana-task.md`
 - shared skill: `skills/mozyo-bridge-agent/SKILL.md`
 

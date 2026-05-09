@@ -33,6 +33,7 @@ from mozyo_bridge.infrastructure.tmux_client import (
     set_pane_label,
     source_tmux_conf,
 )
+from mozyo_bridge.scaffold.rules import install_rules, rules_status, write_scaffold
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import LABEL_OPTION, default_queue_path, default_tmux_conf, resolve_repo_root
 
@@ -428,3 +429,42 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     queue = queue_path_from_args(args)
     print(f"queue: {queue} ({'exists' if queue.exists() else 'missing'})")
     return 0 if ok else 1
+
+
+def cmd_rules_install(args: argparse.Namespace) -> int:
+    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    written = install_rules(home)
+    if written:
+        for path in written:
+            print(f"installed: {path}")
+    else:
+        print("rules: already up to date")
+    return 0
+
+
+def cmd_rules_status(args: argparse.Namespace) -> int:
+    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    print("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH")
+    ok = True
+    for row in rules_status(home):
+        print("\t".join([row["preset"], row["status"], row["installed"], row["packaged"], row["path"]]))
+        if row["status"] != "ok":
+            ok = False
+    return 0 if ok else 1
+
+
+def cmd_scaffold_rules(args: argparse.Namespace) -> int:
+    home = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    target = repo_root_from_args(args)
+    paths = write_scaffold(
+        args.preset,
+        target,
+        dry_run=args.dry_run,
+        backup=args.backup,
+        force=args.force,
+        home=home,
+    )
+    action = "would write" if args.dry_run else "wrote"
+    for path in paths:
+        print(f"{action}: {path}")
+    return 0

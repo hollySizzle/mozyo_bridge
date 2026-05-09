@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mozyo-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Redmine-gated tmux pane notification bridge for Claude Code and Codex terminals"
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,14 @@ Issues = "https://github.com/hollySizzle/mozyo_bridge/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mozyo_bridge = [
+    "scaffold/presets/*/AGENTS.md",
+    "scaffold/presets/*/CLAUDE.md",
+    "scaffold/presets/*/VERSION",
+    "scaffold/presets/*/agent-workflow.md",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

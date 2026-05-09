@@ -115,6 +115,37 @@ Claude Code must be started from the target project directory for `.claude/skill
 
 Detailed distribution rules live in `vibes/docs/logics/skill-distribution.md`.
 
+## Agent Rules Scaffold
+
+`mozyo-bridge` can install ticket-system-specific development flow rules and scaffold thin project routers for Claude Code and Codex.
+
+Install the central rules store:
+
+```bash
+mozyo-bridge rules install
+mozyo-bridge rules status
+```
+
+Scaffold project routers:
+
+```bash
+mozyo-bridge scaffold rules asana --target /path/to/project
+mozyo-bridge scaffold rules redmine --target /path/to/project
+mozyo-bridge scaffold rules none --target /path/to/project
+```
+
+This creates:
+
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.mozyo-bridge/scaffold.json`
+
+The generated routers point to `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md`. They do not copy the full development flow into each repository.
+
+Existing `AGENTS.md` or `CLAUDE.md` files are not overwritten by default. Use `--dry-run` to preview, `--backup` to replace with backups, or `--force` to replace without backups.
+
+Detailed scaffold rules live in `vibes/docs/logics/scaffold-rules.md`.
+
 ## Notification Commands
 
 Claude Code から Codex へレビュー依頼を通知:
@@ -210,6 +241,7 @@ VS Code `tmux-integrated` を標準運用にしている場合は使いません
 - `vibes/docs/rules/agent-workflow.md`: AI agent work rules for this repository.
 - `vibes/docs/specs/project-map.md`: repository structure and source-of-truth routing.
 - `vibes/docs/logics/skill-distribution.md`: Claude/Codex skill layout and install logic.
+- `vibes/docs/logics/scaffold-rules.md`: scaffold rules presets for Asana, Redmine, and no-ticket projects.
 - `vibes/docs/logics/release-flow.md`: release and verification gates.
 - `skills/mozyo-bridge-agent/references/`: compact runtime references consumed by the shared agent skill.
 

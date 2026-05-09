@@ -28,6 +28,7 @@ from mozyo_bridge.domain.pane_resolver import (
 )
 import mozyo_bridge.domain.pane_resolver as pane_resolver
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
+from mozyo_bridge.scaffold.rules import scaffold_state
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
 
 
@@ -306,6 +307,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual("status", parser.parse_args(["status"]).command)
         self.assertEqual("init", parser.parse_args(["init", "codex"]).command)
         self.assertEqual("notify-codex-review", parser.parse_args(["notify-codex-review", "--issue", "9020"]).command)
+        self.assertEqual("rules", parser.parse_args(["rules", "install"]).command)
+        self.assertEqual("scaffold", parser.parse_args(["scaffold", "rules", "asana"]).command)
         self.assertEqual("doctor", parser.parse_args(["doctor"]).command)
 
     def test_notify_codex_accepts_type(self) -> None:
@@ -348,6 +351,101 @@ class CliTest(unittest.TestCase):
         self.assertEqual("tmux-ui-open", args.command)
         self.assertEqual("agents", args.session)
         self.assertEqual("/repo", args.cwd)
+
+    def test_scaffold_rules_rejects_unknown_preset(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["scaffold", "rules", "jira"])
+
+
+class ScaffoldRulesTest(unittest.TestCase):
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def test_rules_install_and_scaffold_asana_thin_router(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, _ = self.run_cli(["rules", "install", "--home", str(home)])
+            self.assertEqual(0, result)
+            self.assertTrue((home / "rules" / "presets" / "asana" / "agent-workflow.md").exists())
+
+            result, output = self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", str(home)])
+
+            self.assertEqual(0, result)
+            self.assertIn("AGENTS.md", output)
+            self.assertTrue((project / "AGENTS.md").exists())
+            self.assertTrue((project / "CLAUDE.md").exists())
+            self.assertFalse((project / "vibes" / "docs" / "rules" / "asana-agent-workflow.md").exists())
+            agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), agents)
+            self.assertIn("Asana task state", agents)
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("central", state["mode"])
+            self.assertEqual("asana", state["preset"])
+            self.assertIn("AGENTS.md", state["files"])
+
+    def test_scaffold_requires_installed_central_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)])
+
+            self.assertIn("rules preset is not installed", stderr.getvalue())
+            self.assertFalse((project / "AGENTS.md").exists())
+
+    def test_scaffold_refuses_overwrite_by_default_and_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(["scaffold", "rules", "none", "--target", str(project), "--home", str(home)])
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.run_cli(["scaffold", "rules", "none", "--target", str(project), "--home", str(home)])
+
+            fresh = Path(tmp) / "fresh"
+            fresh.mkdir()
+            result, output = self.run_cli(
+                ["scaffold", "rules", "none", "--target", str(fresh), "--home", str(home), "--dry-run"]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("would write", output)
+            self.assertFalse((fresh / "AGENTS.md").exists())
+
+    def test_scaffold_backup_replaces_existing_router(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            (project / "AGENTS.md").write_text("old agents\n", encoding="utf-8")
+            (project / "CLAUDE.md").write_text("old claude\n", encoding="utf-8")
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, _ = self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home), "--backup"])
+
+            self.assertEqual(0, result)
+            self.assertIn("Redmine issue", (project / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
+            self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
 
 
 class NotifyContractTest(unittest.TestCase):

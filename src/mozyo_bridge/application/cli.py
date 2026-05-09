@@ -22,6 +22,9 @@ from mozyo_bridge.application.commands import (
     cmd_open,
     cmd_read,
     cmd_resolve,
+    cmd_rules_install,
+    cmd_rules_status,
+    cmd_scaffold_rules,
     cmd_setup,
     cmd_spawn,
     cmd_status,
@@ -202,6 +205,28 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(func=cmd_init)
 
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+
+    rules = sub.add_parser("rules")
+    rules_sub = rules.add_subparsers(dest="rules_command", required=True)
+    rules_install = rules_sub.add_parser("install")
+    rules_install.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    rules_install.set_defaults(func=cmd_rules_install)
+    rules_status = rules_sub.add_parser("status")
+    rules_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    rules_status.set_defaults(func=cmd_rules_status)
+
+    scaffold = sub.add_parser("scaffold")
+    scaffold_sub = scaffold.add_subparsers(dest="scaffold_command", required=True)
+    scaffold_rules = scaffold_sub.add_parser("rules")
+    scaffold_rules.add_argument("preset", choices=["asana", "redmine", "none"])
+    add_repo_option(scaffold_rules)
+    scaffold_rules.add_argument("--target", dest="repo", help="Project root to scaffold. Alias for --repo")
+    scaffold_rules.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    scaffold_rules.add_argument("--dry-run", action="store_true")
+    replace_group = scaffold_rules.add_mutually_exclusive_group()
+    replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
+    replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")
+    scaffold_rules.set_defaults(func=cmd_scaffold_rules)
     return parser
 
 
