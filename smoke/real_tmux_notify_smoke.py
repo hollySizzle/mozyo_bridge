@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+BRIDGE_COMMAND = shlex.split(os.environ.get("MOZYO_BRIDGE_COMMAND", f"{sys.executable} -m mozyo_bridge"))
 
 
 def run(*args: str, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -71,9 +73,7 @@ def main() -> int:
         env["TMUX_PANE"] = sender
         env["PYTHONPATH"] = str(REPO_ROOT / "src")
         result = run(
-            "python3",
-            "-m",
-            "mozyo_bridge",
+            *BRIDGE_COMMAND,
             "notify-claude",
             "--issue",
             "9020",
@@ -90,8 +90,14 @@ def main() -> int:
             "5",
             "--submit-delay",
             "0.2",
+            check=False,
             env=env,
         )
+        if result.returncode != 0:
+            print(result.stdout, file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            print(f"fail: notify command exited with {result.returncode}", file=sys.stderr)
+            return 1
         if "notified claude: journal=46005" not in result.stdout:
             print(result.stdout, file=sys.stderr)
             print(result.stderr, file=sys.stderr)
