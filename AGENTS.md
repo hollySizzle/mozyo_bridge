@@ -17,7 +17,10 @@
 - agent workflow: `vibes/docs/rules/agent-workflow.md`
 - project map: `vibes/docs/specs/project-map.md`
 - release / verification logic: `vibes/docs/logics/release-flow.md`
+- skill distribution logic: `vibes/docs/logics/skill-distribution.md`
 - Asana task template: `vibes/docs/temps/asana-task.md`
+- shared Claude/Codex skill: `skills/mozyo-bridge-agent/SKILL.md`
+- Claude Code project skill adapter: `.claude/skills/mozyo-bridge-agent/SKILL.md`
 - package metadata: `pyproject.toml`
 - usage / safety: `README.md`
 - CI / publish workflows: `.github/workflows/`
