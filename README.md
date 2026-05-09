@@ -4,6 +4,29 @@
 
 正本は Redmine です。`mozyo-bridge` は通知 transport であり、レビュー依頼・監査結果・完了判断の正本にはなりません。
 
+`mozyo-bridge` is a small CLI that sends Redmine-gated notifications to Claude Code / Codex tmux panes.
+It is only a notification transport. Redmine remains the source of truth for review requests, audit results, and completion decisions.
+
+## Install
+
+Recommended:
+
+```bash
+pipx install mozyo-bridge
+```
+
+Alternative:
+
+```bash
+python3 -m pip install mozyo-bridge
+python3 -m mozyo_bridge --help
+```
+
+System dependency:
+
+- `tmux` must be installed and available on `PATH`.
+- Use `mozyo-bridge doctor` to check the local tmux environment.
+
 ## 標準コマンド
 
 正式な実行パス:
@@ -98,6 +121,14 @@ mozyo-bridge notify-claude \
 - `notify-*` は短い `[mozyo:notify:...]` marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。
 - marker を確認できない場合、mozyo-bridge は入力欄を `C-u` で消し、Enter を送らず失敗する。
 
+## Safety Notes
+
+- Create the Redmine journal first, then send a `mozyo-bridge` notification.
+- Do not treat pane messages as the source of truth.
+- The receiving operator or agent must check the Redmine gate before acting.
+- `notify-*` commands send text to a tmux pane and press Enter only after the short `[mozyo:notify:...]` marker is observed in the target pane.
+- If the marker is not observed, `mozyo-bridge` clears the input with `C-u`, does not press Enter, and exits with an error.
+
 ## 使わないこと
 
 通常運用では以下を使いません。
@@ -157,6 +188,18 @@ python3 smoke/real_tmux_notify_smoke.py
 ```
 
 smoke test はローカル tmux server に依存するため、通常の unit test には含めません。
+
+## Release
+
+Build locally:
+
+```bash
+python3 -m pip install build
+python3 -m build
+```
+
+Publishing is intended to run through GitHub Actions and PyPI Trusted Publishing.
+The local `.env` / `.pypirc` path should only be used for temporary release rehearsal, not as the normal production publishing path.
 
 ## License
 

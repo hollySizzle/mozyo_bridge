@@ -1,0 +1,21 @@
+.DS_Store
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local secrets and release credentials
+.env
+.env.*
+!.env.example
+.pypirc
