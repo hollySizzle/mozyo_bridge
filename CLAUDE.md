@@ -18,6 +18,7 @@
 - release 判断と検証: `vibes/docs/logics/release-flow.md`
 - skill 配布方針: `vibes/docs/logics/skill-distribution.md`
 - scaffold rules 方針: `vibes/docs/logics/scaffold-rules.md`
+- dogfood scaffold preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
 - Asana task 作成テンプレート: `vibes/docs/temps/asana-task.md`
 - shared skill: `skills/mozyo-bridge-agent/SKILL.md`
 
@@ -28,3 +29,4 @@
 - real token を記録・commit しない。
 - local token upload より GitHub Actions Trusted Publishing を優先する。
 - `mozyo-bridge` の通知は作業開始の合図にすぎない。必ず source of truth を確認する。
+- この repository では既存 router を維持したまま Asana scaffold preset を dogfood する。preset が取得できない場合は、読んだふりをせず停止する。

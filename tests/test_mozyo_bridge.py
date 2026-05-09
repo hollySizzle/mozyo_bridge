@@ -389,7 +389,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertFalse((project / "vibes" / "docs" / "rules" / "asana-agent-workflow.md").exists())
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), agents)
-            self.assertIn("Asana task state", agents)
+            self.assertIn("Asana task state と task comment", agents)
             state = scaffold_state(project)
             self.assertIsNotNone(state)
             assert state is not None
@@ -444,7 +444,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             result, _ = self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home), "--backup"])
 
             self.assertEqual(0, result)
-            self.assertIn("Redmine issue", (project / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertIn("Redmine issue と journal state", (project / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
             self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
 

@@ -18,6 +18,7 @@
 - release / verification logic: `vibes/docs/logics/release-flow.md`
 - skill distribution logic: `vibes/docs/logics/skill-distribution.md`
 - scaffold rules logic: `vibes/docs/logics/scaffold-rules.md`
+- dogfood scaffold preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
 - Asana task template: `vibes/docs/temps/asana-task.md`
 - shared Claude/Codex skill: `skills/mozyo-bridge-agent/SKILL.md`
 - Claude Code project skill adapter: `.claude/skills/mozyo-bridge-agent/SKILL.md`
@@ -33,6 +34,7 @@
 - credential、token、個人情報を commit しない。`.env` は local-only とする。
 - `mozyo-bridge` の pane message は通知であり、authoritative state ではない。
 - root の `AGENTS.md` / `CLAUDE.md` を詳細規約置き場にしない。
+- この repository では既存 router を維持したまま Asana scaffold preset を dogfood する。preset が取得できない場合は、読んだふりをせず停止する。
 
 ## 注意
 

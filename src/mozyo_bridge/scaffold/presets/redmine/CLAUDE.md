@@ -2,15 +2,14 @@
 
 @AGENTS.md
 
-## Required Rules
+## 必須規約
 
-Read the central mozyo-bridge Redmine preset before doing non-trivial work:
+非自明な作業を始める前に、mozyo-bridge の Redmine central preset を読む:
 
 - `${rule_path}`
 
-If the file is missing, stop and ask the operator to run:
+この file が存在しない場合は停止し、operator に以下の実行を依頼する:
 
 ```bash
 mozyo-bridge rules install
 ```
-
