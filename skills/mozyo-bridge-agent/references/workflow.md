@@ -47,17 +47,24 @@ Pane messages are notification edges in this lifecycle. They are not review pass
 - Claude owns implementation for normal development tasks.
 - Codex does not directly implement normal development tasks in `mozyo_bridge`.
 - Codex owns escalation handling, audit, user-facing clarification, and decisions that can be made from source of truth.
+- When Codex receives a normal development task ID, the standard action is to convert it into a Claude handoff, not to implement it. Task size, urgency, implementation difficulty, user impatience, or the user writing directly into the Codex pane do not override this default.
+- Imperative or request phrases from the user — for example "実行せよ", "対応して", "やって", "お願いします", "進めて", "implement it", "go ahead", "please do it" — are not by themselves authorization for Codex to perform a direct edit. They express "I want this done", not "you may bypass Claude".
+- The standard handoff is overridden only by an explicit Codex-direct-edit exception defined in the Policy / Skill Authoring Boundary section.
 - When Codex receives a workflow-change verification task, Codex selects a valid normal development task, records the selection in Asana, and hands it off to Claude.
 - The verification task only counts if Claude performs the normal development work and Codex performs the audit path.
-- If Codex mistakenly implements the normal development task directly, that run does not satisfy workflow-change verification. Reopen or leave the verification task incomplete, record the correction in Asana, and rerun the flow from Claude implementation through Codex audit.
+- If Codex mistakenly implements a normal development task directly, that run does not count as the task's normal completion. If it occurred during a verification task, it also does not satisfy workflow-change verification.
+- After such a mistake, reopen the affected task, record the mistake, the impact scope, and the follow-up decision (adopt, discard, reimplement) in Asana as a correction, then rerun the flow from Claude implementation through Codex audit. This correction flow applies to every normal development task, not only verification-target tasks.
 
 ## Policy / Skill Authoring Boundary
 
 - For autonomous workflow, rules, skills, handoff, audit, or release/distribution gate changes, Codex owns policy framing, draft wording, user-facing clarification, and audit.
 - Claude is the default implementer for repository file edits to those policies and skill references.
-- Codex should not directly edit and commit policy or skill reference files during ordinary operation.
-- Codex direct edits are allowed only when the user explicitly requests a Codex direct edit, when a small urgent correction would be damaged by handoff, or when recording a minimal correction for an existing mistaken implementation.
-- If Codex makes a direct edit under an exception, record `Codex direct edit` in Asana with the reason, changed files, verification, and whether follow-up verification is required.
+- Codex must not directly edit and commit policy or skill reference files during ordinary operation.
+- A Codex direct edit is permitted only when one of the following narrow exceptions applies. Operate the exception conservatively; when in doubt, or when the user instruction admits more than one reading, fall back to the default and produce a Claude handoff.
+  1. The user explicitly authorized a Codex direct edit using wording equivalent to `Codex direct edit`, "Codex が直接編集してよい", or "Codex に直接実装させてよい", scoped to a specific task or file. Generic imperative or request forms ("実行せよ", "対応して", "やって", "お願いします", "進めて", "implement it", "please do it") do not qualify.
+  2. The change is the minimal record-keeping correction needed to capture an existing mistaken implementation, mistaken commit, or mistaken procedure in Asana or the repo.
+  3. The change is a genuinely urgent small fix that would be damaged by handoff (for example, a one- or few-line fix needed within minutes to halt an in-progress release, publish, or CI run). Before invoking this exception Codex must stop implementation, record an "urgent direct-edit request" in Asana with the situation, target files, intended change, and impact scope, and obtain user confirmation when possible. Do not apply this exception when the situation is ambiguous or when confirmation cannot be obtained.
+- When Codex makes a direct edit under an exception, record `Codex direct edit` in Asana with (a) which exception applied, (b) the verbatim or quoted user instruction, (c) the changed files, (d) the verification performed, and (e) whether follow-up verification is required. A direct edit missing any of these fields is itself subject to a follow-up correction.
 - A Codex direct edit to autonomous workflow or role boundaries does not waive the workflow-change verification requirement.
 
 ## Workflow Change Verification

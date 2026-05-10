@@ -28,3 +28,4 @@ description: Follow the mozyo_bridge project workflow for Asana-driven work, Not
 - Treat `mozyo-bridge` pane messages as notifications, not authoritative task state.
 - Do not reintroduce `vibes/tools/mozyo_bridge` as a runtime path.
 - Prefer GitHub Actions Trusted Publishing over local PyPI token upload.
+- Imperative or request phrases from the user ("実行せよ", "対応して", "やって", "implement it", etc.) are not by themselves authorization for Codex to perform a direct edit on policy / skill / rule files. Convert normal development tasks into a Claude handoff by default. See `references/workflow.md` for the narrow Codex direct-edit exception conditions.

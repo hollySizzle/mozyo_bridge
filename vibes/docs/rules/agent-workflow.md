@@ -57,17 +57,23 @@
 
 - 通常開発 task の実装者は Claude とする。Codex は通常開発 task を直接実装しない。
 - Codex は escalation、audit、ユーザー対話窓口、source of truth からの判断整理を担当する。
+- Codex が通常開発 task ID を受けた場合の standard 動作は、自ら実装することではなく、Claude handoff に変換することである。task の規模、緊急度、実装難易度、ユーザーからの催促、ユーザーが Codex pane に直接書いたことを理由に standard を曲げない。
+- ユーザーからの「実行せよ」「対応して」「やって」「お願いします」「実装して」「進めて」など命令形・依頼形・激励形の指示は、それ単独では Codex の direct edit 権限の根拠にならない。これらは「実行してほしい」という意思表示であり、「Claude を経由しなくてよい」という意思表示ではない。
+- Codex 受領時に上記 standard handoff を上書きできるのは、Policy / Skill Authoring Boundary に定義された Codex direct edit 例外に明示的に該当する場合だけである。
 - Codex が自律フロー反映確認 task を受けた場合、検証対象となる通常開発 task を選定し、Claude へ handoff する。
 - Codex は handoff 前に、選定理由、対象 task、既存 worktree 差分の扱い、Codex の後続 audit 役割を Asana に記録する。
-- Codex が誤って通常開発 task を直接実装した場合、その実行は自律フロー反映確認の成功条件に数えない。
-- 上記の誤実装が発生した場合、確認 task を未完了に戻し、誤実装を Asana に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。
+- Codex が誤って通常開発 task を直接実装した場合、その実行は task の正規完了に数えない。確認 task 中であれば自律フロー反映確認の成功条件にも数えない。
+- 上記の誤実装が発生した場合、対象 task を未完了に戻し、誤実装の事実、影響範囲、後続対応(採用・破棄・再実装)の判断を Asana に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。この correction flow は、検証対象の確認 task に限らず、すべての通常開発 task に適用する。
 
 ## Policy / Skill Authoring Boundary
 
 - 自律フロー、規約、skill、handoff、audit、release / distribution gate の変更では、Codex は方針整理、文案作成、ユーザー対話、audit を担当する。
 - 上記の repo ファイル変更実装者は原則 Claude とする。Codex は通常時、規約や skill reference の repo ファイルを直接編集して commit しない。
-- Codex が直接実装してよい例外は、ユーザーが明示的に Codex direct edit を指示した場合、Claude に引き継ぐと作業が壊れる緊急小修正、または既存の誤実装を記録するための最小 correction に限る。
-- Codex が例外として直接実装した場合は、Asana に `Codex direct edit` として理由、変更ファイル、verification、後続確認の要否を記録する。
+- Codex direct edit が許される例外は、以下のいずれかに当てはまる場合に限る。条件は narrow に運用し、ユーザー指示が曖昧な場合や、複数の解釈ができる場合は default に戻して Claude handoff にする。
+  1. ユーザーが `Codex direct edit` または「Codex が直接編集してよい」「Codex に直接実装させてよい」と同等の文言で、対象 task または対象 file を限定して明示的に許可した場合。「実行せよ」「対応して」「やって」「お願いします」「進めて」など一般的な命令形・依頼形・激励形は該当しない。
+  2. 既存の誤実装、誤 commit、または誤手順を Asana / repo に correction として記録するための最小の変更である場合。
+  3. Claude に handoff する暇がない真に緊急の小修正である場合(例: 数分以内に進行する release / publish / CI を止めるための1〜数行の修正)。この例外を使う前に Codex は実装を停止し、Asana に「緊急 direct edit 申請」として状況、対象ファイル、想定変更、影響範囲を記録し、可能ならユーザー確認を得る。状況が曖昧な場合や、確認を得られない場合は適用しない。
+- Codex が例外として直接実装した場合は、Asana に `Codex direct edit` として、(a) 該当した例外条件、(b) ユーザー指示の原文または引用、(c) 変更ファイル、(d) 実施した verification、(e) 後続反映確認の要否、を必ず記録する。これらが欠けた direct edit は事後 correction の対象とする。
 - 自律フローや role boundary の変更を Codex が直接実装した場合でも、変更後の反映確認 requirement は免除されない。
 
 ## Audit Handoff (Claude → Codex)
