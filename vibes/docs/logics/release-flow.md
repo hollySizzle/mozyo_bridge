@@ -28,7 +28,8 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 3. `main` に push し、GitHub Actions `Test` の成功を確認する。
 4. TestPyPI は `Publish to TestPyPI` workflow を使う。
 5. TestPyPI install を `pipx` で検証する。
-6. その後で production PyPI へ公開するか判断する。
+6. 社内ベータ配布は TestPyPI install 検証で完了とする。
+7. production PyPI 公開は、別途 production release として明示判断する。
 
 ## Trusted Publishing
 
@@ -48,13 +49,21 @@ PyPI production publisher:
 - Workflow: `publish.yml`
 - Environment: `pypi`
 
-## Release Gate
+## Internal Beta Gate
+
+- 社内ベータ配布は TestPyPI を使う。production PyPI や GitHub Release は使わない。
+- TestPyPI package が pipx で install でき、`mozyo-bridge` と `mozyo` を expose すること。
+- beta tester には TestPyPI install command と version を明示する。
+- stable version (`0.1.4` など) を TestPyPI に上げても、それだけでは production release ではない。
+
+## Production Release Gate
 
 - production release 前に `pipx install .` が動くこと。
 - production PyPI 前に TestPyPI publish が成功していること。
 - TestPyPI package が pipx で install でき、`mozyo-bridge` と `mozyo` を expose すること。
 - GitHub Actions `Test` が Python 3.10, 3.11, 3.12, 3.13 で pass すること。
 - production publish は local token upload ではなく `.github/workflows/publish.yml` を使うこと。
+- GitHub Release は production publish の trigger なので、production 公開する時だけ作成する。
 
 ## Version Policy
 

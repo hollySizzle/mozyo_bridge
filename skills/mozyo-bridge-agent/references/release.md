@@ -28,7 +28,8 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 3. Push to `main` and confirm GitHub Actions `Test` succeeds.
 4. Use `Publish to TestPyPI` for TestPyPI.
 5. Validate TestPyPI install with `pipx`.
-6. Decide production PyPI release only after TestPyPI validation.
+6. Treat internal beta distribution as complete after TestPyPI install validation.
+7. Decide production PyPI release separately and only when explicitly requested.
 
 For TestPyPI validation, force the pip backend so TestPyPI is used for
 `mozyo-bridge` and PyPI remains available for dependencies:
@@ -36,6 +37,10 @@ For TestPyPI validation, force the pip backend so TestPyPI is used for
 ```bash
 pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==X.Y.Z
 ```
+
+Do not create a GitHub Release for internal beta distribution. The production
+publish workflow runs on `release: published`, so a GitHub Release is a
+production trigger.
 
 ## Trusted Publishing
 
