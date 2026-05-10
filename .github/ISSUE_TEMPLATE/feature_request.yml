@@ -1,0 +1,62 @@
+name: Feature request / 機能要望
+description: mozyo-bridge への機能追加・改善を提案する / Propose a new feature or improvement
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ご提案ありがとうございます。Thank you for the suggestion.
+
+        `mozyo-bridge` は notification transport です。Redmine / Asana / その他 source of truth に対するレビュー判断や完了承認の置き換えではありません。
+        Please keep in mind that `mozyo-bridge` is a notification transport, not a substitute for the configured source of truth (Redmine, Asana, or any other ticketing system).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 事前確認 / Preflight
+      options:
+        - label: 既存の Issue / Discussion を検索し、重複が無いことを確認した / I searched existing issues and discussions and this is not a duplicate.
+          required: true
+        - label: 認証情報・個人情報・社内情報を本文に含めていない / I have not included credentials, personal data, or internal-only information.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解きたい課題 / Problem
+      description: |
+        現状の挙動でどんな運用上の問題が起きているかを書いてください。
+        Describe the operational problem you hit with the current behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する挙動 / Proposed behavior
+      description: |
+        どんな command / option / 出力になっていて欲しいかを書いてください。
+        Describe the command, option, or output you would like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案 / Alternatives considered
+      description: 既存機能の組み合わせ、外部ツール、運用回避などを試したかを書いてください。
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 想定する利用場面 / Intended use case
+      description: |
+        どの pane (claude / codex)、どの ticket システム (Redmine / Asana / なし)、どの運用フェーズで使うかを書いてください。
+        Mention the target pane, ticketing system, and stage of the workflow.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 補足 / Additional context
+      description: 関連 Issue / PR / 設計メモがあれば記載してください。

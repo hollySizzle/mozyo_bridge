@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / Discussion / 質問・議論
+    url: https://github.com/hollySizzle/mozyo_bridge/discussions
+    about: 使い方の質問や設計議論は GitHub Discussions で扱います。Use Discussions for questions and design conversations.
+  - name: Security report / セキュリティ報告
+    url: https://github.com/hollySizzle/mozyo_bridge/security/advisories/new
+    about: 認証情報や脆弱性に関する報告は public Issue ではなく Private Security Advisory を使ってください。Report vulnerabilities through a Private Security Advisory, not a public issue.

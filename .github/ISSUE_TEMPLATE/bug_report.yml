@@ -1,0 +1,121 @@
+name: Bug report / バグ報告
+description: mozyo-bridge の不具合を報告する / Report a defect in mozyo-bridge
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ご報告ありがとうございます。Thank you for the report.
+
+        Redmine token、PyPI token、`.env` の中身など、認証情報や個人情報は貼り付けないでください。
+        Do not paste credentials, tokens, `.env` contents, or any personal information.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 事前確認 / Preflight
+      options:
+        - label: 既存の Issue を検索し、重複が無いことを確認した / I searched existing issues and this is not a duplicate.
+          required: true
+        - label: 認証情報・個人情報・社内情報を本文に含めていない / I have not included credentials, personal data, or internal-only information.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要 / Summary
+      description: 何が起きたかを 1〜2 行で / Describe what went wrong in one or two sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順 / Steps to reproduce
+      description: |
+        再現に必要なコマンドや設定を順に書いてください。
+        List the exact commands and configuration needed to reproduce.
+      placeholder: |
+        1. `mozyo-bridge init claude`
+        2. `mozyo-bridge notify-codex --issue 1 --journal 2`
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した挙動 / Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の挙動 / Actual behavior
+      description: 出力やエラーメッセージはコードブロックで貼ってください。Paste output or error messages inside a code block.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: mozyo-bridge version
+      description: |
+        `pip show mozyo-bridge | grep Version` または `pipx list | grep mozyo-bridge` の出力。
+        Output of `pip show mozyo-bridge | grep Version` or `pipx list | grep mozyo-bridge`.
+      placeholder: "0.1.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: インストール方法 / Install method
+      options:
+        - pipx
+        - pip
+        - from source (git clone)
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: "`python3 --version` の出力 / Output of `python3 --version`"
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: tmux
+    attributes:
+      label: tmux version
+      description: "`tmux -V` の出力 / Output of `tmux -V`"
+      placeholder: "tmux 3.5a"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "macOS 14.5 / Ubuntu 24.04 / ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`mozyo-bridge doctor` の出力 / Output of `mozyo-bridge doctor`"
+      description: 機微情報があれば伏せ字にしてください。Mask any sensitive paths or identifiers before posting.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 補足 / Additional context
+      description: スクリーンショット、関連 Issue / PR、想定原因などがあれば記載してください。
