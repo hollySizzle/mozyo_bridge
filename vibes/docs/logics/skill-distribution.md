@@ -50,6 +50,7 @@ Claude Code は対象 project root から起動する。`.claude/skills/` は pr
 - README は public user 向けの install / command / safety summary に留める。
 - skill 配布の配置理由、override env、禁止事項はこの文書を正本にする。
 - skill 本体の runtime reference は `skills/mozyo-bridge-agent/references/` に置き、README や root router へ詳細規約を重複させない。
+- `skills/mozyo-bridge-agent/references/` は Codex install と Claude install のどちらにも同期される配布対象である。agent 実行時に従うべき運用境界は、まずこの runtime reference に置く。
 
 ## 禁止事項
 

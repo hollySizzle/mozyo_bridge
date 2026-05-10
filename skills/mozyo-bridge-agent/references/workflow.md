@@ -22,3 +22,16 @@
 - `vibes/docs/specs/` holds project structure and specification notes.
 - `vibes/docs/logics/` holds decision and release logic.
 - `vibes/docs/temps/` holds reusable templates.
+
+## Handoff Lifecycle
+
+Use handoff only when the active project workflow or the user explicitly asks for another agent to participate.
+
+1. The sender records or identifies the durable source of truth first.
+2. The sender notifies the receiver through `mozyo-bridge` after the required read/guard step.
+3. The receiver starts from the durable source of truth, not from pane text alone.
+4. The receiver records findings, blockers, completion notes, and verification in the durable source of truth.
+5. The receiver sends a short result notification back to the sender so the sender knows to read the durable record.
+6. The sender resumes from the durable record and decides the next action.
+
+Pane messages are notification edges in this lifecycle. They are not review passes, task completion, release approval, or the work log.

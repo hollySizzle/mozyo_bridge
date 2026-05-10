@@ -12,6 +12,8 @@ Supported presets:
 - `redmine`
 - `none`
 
+Preset selection is explicit. `mozyo-bridge scaffold rules <preset>` applies only the chosen preset's workflow, so cross-preset policy matrices should not be duplicated in shared workflow docs. Keep each preset self-contained, and keep project-specific mandatory policies in the target project's local docs or private systems.
+
 ## Common Responsibilities
 
 Every preset must generate or update the same project-local router pair:
@@ -36,6 +38,7 @@ Common constraints:
 - Do not generate tool-specific rules that make Codex and Claude follow different project processes.
 - Treat pane messages as notifications, not authoritative task state.
 - Keep project-specific policy in project-local docs or private systems, not in package templates or central public presets.
+- Do not put repo-local mandatory Claude/Codex audit policies into the shared skill or into unrelated presets.
 - Do not support a repo-local vendor mode in the initial implementation. A second distribution mode would double the update, diff, and diagnostic surface before there is proven need.
 
 ## Preset: redmine
