@@ -32,6 +32,21 @@
 - marker が観測される前に Enter を送る safety behavior を壊さない。
 - `.agent_handoff/tasks.json` は retired queue の棚卸し用であり、standard notification fallback として扱わない。
 
+## User Interaction And Escalation
+
+- Claude は active Asana task の scope 内では自律的に作業する。通常はユーザーへ直接質問しない。
+- Claude は以下に該当する場合だけ Codex へ escalation する。
+  - Asana task の目的、成果物、完了条件が曖昧である。
+  - 規約、Notion、Asana、repository docs の間に矛盾がある。
+  - shared skill、scaffold preset、repo-local policy の境界判断が必要である。
+  - destructive、irreversible、release、publish、tag、version bump など外部影響のある操作判断が必要である。
+  - secret、credential、個人情報、権限、認証に触れる可能性がある。
+  - ユーザー意図の解釈が複数あり、間違えると作業が無駄になる。
+  - audit finding への対応方針が source of truth から決めきれない。
+- Codex は escalation を受けたら、既存の source of truth から判断できるかを先に確認する。判断できる場合はユーザーへ質問せず、判断と根拠を Asana に記録する。
+- Codex は source of truth だけでは推測になる場合に限り、ユーザーへ問い合わせる。ユーザーとの対話窓口は原則 Codex に統一する。
+- ユーザーが Claude に直接指示した場合、Claude は必要に応じて Asana comment または Codex への通知で source of truth を更新してから続行する。
+
 ## Audit Handoff (Claude → Codex)
 
 - Claude が code、documentation、設定を作成、修正、削除した task は完了前に必ず Codex に audit を依頼する。documentation のみの変更でも省略しない。
