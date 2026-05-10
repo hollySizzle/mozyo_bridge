@@ -61,6 +61,14 @@
 - この mandatory audit rule は `mozyo_bridge` repository の project-local policy であり、shared skill や scaffold preset へ一般化しない。
 - `mozyo-bridge scaffold rules <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
 
+## Workflow Change Verification
+
+- 自律フロー、skills、rules、handoff、escalation、release / distribution gate を変更した場合は、変更後に新規セッションで反映確認を行う。
+- 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。検証対象の規約や skill そのものを変更する task を検証対象にしない。
+- task の大小や production 影響の有無では検証対象を判定しない。判定軸は、検証対象の自律フロー規約、skill、workflow、release / distribution gate を直接変更する作業かどうかである。
+- 反映確認では、agent が起動時規約、Asana task、source of truth、handoff / escalation、audit、verification 記録を想定どおり扱ったかを確認する。
+- 反映確認の結果は Asana に記録する。問題があれば follow-up task を起票する。
+
 ## 禁止事項
 
 - root の `AGENTS.md` / `CLAUDE.md` に詳細規約を大量貼り付けしない。

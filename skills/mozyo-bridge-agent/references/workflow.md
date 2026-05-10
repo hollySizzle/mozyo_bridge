@@ -35,3 +35,16 @@ Use handoff only when the active project workflow or the user explicitly asks fo
 6. The sender resumes from the durable record and decides the next action.
 
 Pane messages are notification edges in this lifecycle. They are not review passes, task completion, release approval, or the work log.
+
+## Workflow Change Verification
+
+- After changing autonomous workflow, skills, rules, handoff, escalation, or
+  release/distribution gates, verify the change in a new session.
+- Use a normal `mozyo_bridge` development task for that verification.
+- Do not use a task that directly changes the workflow/rule/skill area being
+  verified.
+- Do not choose the verification target based on task size or production impact.
+  The criterion is whether the task directly changes the workflow, skill, or
+  gate under verification.
+- Record the verification result in Asana and create follow-up tasks for any
+  gaps.
