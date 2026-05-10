@@ -47,6 +47,15 @@
 - Codex は source of truth だけでは推測になる場合に限り、ユーザーへ問い合わせる。ユーザーとの対話窓口は原則 Codex に統一する。
 - ユーザーが Claude に直接指示した場合、Claude は必要に応じて Asana comment または Codex への通知で source of truth を更新してから続行する。
 
+## Claude / Codex Role Boundary
+
+- 通常開発 task の実装者は Claude とする。Codex は通常開発 task を直接実装しない。
+- Codex は escalation、audit、ユーザー対話窓口、source of truth からの判断整理を担当する。
+- Codex が自律フロー反映確認 task を受けた場合、検証対象となる通常開発 task を選定し、Claude へ handoff する。
+- Codex は handoff 前に、選定理由、対象 task、既存 worktree 差分の扱い、Codex の後続 audit 役割を Asana に記録する。
+- Codex が誤って通常開発 task を直接実装した場合、その実行は自律フロー反映確認の成功条件に数えない。
+- 上記の誤実装が発生した場合、確認 task を未完了に戻し、誤実装を Asana に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。
+
 ## Audit Handoff (Claude → Codex)
 
 - Claude が code、documentation、設定を作成、修正、削除した task は完了前に必ず Codex に audit を依頼する。documentation のみの変更でも省略しない。
@@ -65,6 +74,7 @@
 
 - 自律フロー、skills、rules、handoff、escalation、release / distribution gate を変更した場合は、変更後に新規セッションで反映確認を行う。
 - 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。検証対象の規約や skill そのものを変更する task を検証対象にしない。
+- 反映確認の通常開発 task は Claude が実装し、Codex は handoff と audit を担当する。Codex は検証対象 task を直接実装しない。
 - task の大小や production 影響の有無では検証対象を判定しない。判定軸は、検証対象の自律フロー規約、skill、workflow、release / distribution gate を直接変更する作業かどうかである。
 - 反映確認では、agent が起動時規約、Asana task、source of truth、handoff / escalation、audit、verification 記録を想定どおり扱ったかを確認する。
 - 反映確認の結果は Asana に記録する。問題があれば follow-up task を起票する。
