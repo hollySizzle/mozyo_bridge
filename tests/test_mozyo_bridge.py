@@ -416,6 +416,67 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("asana", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
 
+    def test_rules_install_and_scaffold_redmine_thin_router(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, _ = self.run_cli(["rules", "install", "--home", str(home)])
+            self.assertEqual(0, result)
+            redmine_workflow = home / "rules" / "presets" / "redmine" / "agent-workflow.md"
+            self.assertTrue(redmine_workflow.exists())
+            installed = redmine_workflow.read_text(encoding="utf-8")
+            for marker in (
+                "Redmine Gate Lifecycle",
+                "Start Gate",
+                "Progress Log Gate",
+                "Design Consultation Gate",
+                "Implementation Done Gate",
+                "Review Request Gate",
+                "Review Gate",
+                "Close Gate",
+                "Pane Notification",
+                "Implementer / Auditor Role Boundary",
+                "Decision Routing",
+                "Scope Integrity",
+                "Verification Discipline",
+                "mozyo-bridge notify-",
+            ):
+                self.assertIn(marker, installed)
+            self.assertIn(
+                'Do not hard-code a fixed agent role split such as "Claude Code implements, Codex only audits"',
+                installed,
+            )
+            self.assertNotIn("python3 vibes/tools/mozyo_bridge", installed)
+            self.assertNotIn(".claude-nagger/file_conventions.yaml", installed)
+            self.assertNotIn("resolve_audit_docs.py", installed)
+            self.assertNotIn("vibes/docs/catalog.yaml", installed)
+            self.assertNotIn("manual_spec", installed)
+
+            result, output = self.run_cli(
+                ["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("AGENTS.md", output)
+            self.assertTrue((project / "AGENTS.md").exists())
+            self.assertTrue((project / "CLAUDE.md").exists())
+            agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn(
+                str(home / "rules" / "presets" / "redmine" / "agent-workflow.md"),
+                agents,
+            )
+            self.assertIn("Redmine issue と journal state", agents)
+            self.assertIn("Redmine gate lifecycle", agents)
+            self.assertIn("mozyo-bridge notify-", agents)
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("central", state["mode"])
+            self.assertEqual("redmine", state["preset"])
+            self.assertIn("AGENTS.md", state["files"])
+
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"

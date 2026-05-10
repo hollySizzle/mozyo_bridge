@@ -26,4 +26,6 @@
 
 - `${rule_path}` を取得できない場合は、読んだふりをせず停止する。
 - Redmine issue と journal state を durable な作業状態として扱う。pane message と chat message は通知にすぎない。
+- Redmine gate lifecycle (start / progress / design consultation / implementation done / review request / review / close) は `${rule_path}` を正本とする。
+- 標準の agent 間通知は `mozyo-bridge notify-* --issue <issue_id> --journal <journal_id>` を使い、journal を作ってから pane へ通知する。
 - credential、token、個人情報を repository file や Redmine note に記録しない。
