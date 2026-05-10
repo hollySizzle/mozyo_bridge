@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_config,
     cmd_doctor,
@@ -94,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mozyo-bridge",
         description="Redmine-gated pane notification bridge for ClaudeCode/Codex terminals",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     setup = sub.add_parser("tmux-ui-setup")

@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import cmd_doctor, cmd_ensure_pair, cmd_open, notify_agent
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
@@ -352,6 +353,18 @@ class CliTest(unittest.TestCase):
         self.assertEqual("tmux-ui-open", args.command)
         self.assertEqual("agents", args.session)
         self.assertEqual("/repo", args.cwd)
+
+    def test_version_flag_prints_version_and_exits_cleanly(self) -> None:
+        parser = build_parser()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                parser.parse_args(["--version"])
+
+        self.assertEqual(0, ctx.exception.code)
+        self.assertIn(__version__, stdout.getvalue())
+        self.assertIn("mozyo-bridge", stdout.getvalue())
 
     def test_scaffold_rules_rejects_unknown_preset(self) -> None:
         parser = build_parser()
