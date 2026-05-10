@@ -42,6 +42,20 @@ Do not create a GitHub Release for internal beta distribution. The production
 publish workflow runs on `release: published`, so a GitHub Release is a
 production trigger.
 
+## Distribution Gates
+
+- Internal beta distribution uses TestPyPI, not production PyPI.
+- Before calling an internal beta ready, install the package from TestPyPI with
+  the same command given to beta testers.
+- Do not substitute a local checkout, editable install, or local wheel for the
+  beta tester path.
+- Confirm both command entry points start: `mozyo-bridge --help` and
+  `mozyo --help`.
+- Confirm distributed scaffold/rule content that is material to the change is
+  present inside the installed package.
+- Production PyPI distribution is separate from internal beta distribution and
+  requires an explicit production release request or approval.
+
 ## Trusted Publishing
 
 TestPyPI pending publisher:

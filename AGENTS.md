@@ -14,6 +14,7 @@
 ## この repo の router
 
 - agent workflow: `vibes/docs/rules/agent-workflow.md`
+- release distribution rules: `vibes/docs/rules/release-distribution.md`
 - project map: `vibes/docs/specs/project-map.md`
 - release / verification logic: `vibes/docs/logics/release-flow.md`
 - skill distribution logic: `vibes/docs/logics/skill-distribution.md`
