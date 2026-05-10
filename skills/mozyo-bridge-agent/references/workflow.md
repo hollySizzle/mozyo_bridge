@@ -51,6 +51,15 @@ Pane messages are notification edges in this lifecycle. They are not review pass
 - The verification task only counts if Claude performs the normal development work and Codex performs the audit path.
 - If Codex mistakenly implements the normal development task directly, that run does not satisfy workflow-change verification. Reopen or leave the verification task incomplete, record the correction in Asana, and rerun the flow from Claude implementation through Codex audit.
 
+## Policy / Skill Authoring Boundary
+
+- For autonomous workflow, rules, skills, handoff, audit, or release/distribution gate changes, Codex owns policy framing, draft wording, user-facing clarification, and audit.
+- Claude is the default implementer for repository file edits to those policies and skill references.
+- Codex should not directly edit and commit policy or skill reference files during ordinary operation.
+- Codex direct edits are allowed only when the user explicitly requests a Codex direct edit, when a small urgent correction would be damaged by handoff, or when recording a minimal correction for an existing mistaken implementation.
+- If Codex makes a direct edit under an exception, record `Codex direct edit` in Asana with the reason, changed files, verification, and whether follow-up verification is required.
+- A Codex direct edit to autonomous workflow or role boundaries does not waive the workflow-change verification requirement.
+
 ## Workflow Change Verification
 
 - After changing autonomous workflow, skills, rules, handoff, escalation, or

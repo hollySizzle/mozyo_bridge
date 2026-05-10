@@ -62,6 +62,14 @@
 - Codex が誤って通常開発 task を直接実装した場合、その実行は自律フロー反映確認の成功条件に数えない。
 - 上記の誤実装が発生した場合、確認 task を未完了に戻し、誤実装を Asana に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。
 
+## Policy / Skill Authoring Boundary
+
+- 自律フロー、規約、skill、handoff、audit、release / distribution gate の変更では、Codex は方針整理、文案作成、ユーザー対話、audit を担当する。
+- 上記の repo ファイル変更実装者は原則 Claude とする。Codex は通常時、規約や skill reference の repo ファイルを直接編集して commit しない。
+- Codex が直接実装してよい例外は、ユーザーが明示的に Codex direct edit を指示した場合、Claude に引き継ぐと作業が壊れる緊急小修正、または既存の誤実装を記録するための最小 correction に限る。
+- Codex が例外として直接実装した場合は、Asana に `Codex direct edit` として理由、変更ファイル、verification、後続確認の要否を記録する。
+- 自律フローや role boundary の変更を Codex が直接実装した場合でも、変更後の反映確認 requirement は免除されない。
+
 ## Audit Handoff (Claude → Codex)
 
 - Claude が code、documentation、設定を作成、修正、削除した task は完了前に必ず Codex に audit を依頼する。documentation のみの変更でも省略しない。
