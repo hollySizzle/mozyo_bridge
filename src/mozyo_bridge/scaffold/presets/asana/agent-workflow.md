@@ -47,6 +47,14 @@
 - If the project uses more than one agent, route user-facing clarification through the project's designated coordinator. Record the decision and rationale in Asana.
 - If the user gives a direct instruction outside Asana, update the Asana task comment or the designated coordinator before continuing when that instruction changes scope, policy, or completion criteria.
 
+## Role Boundaries
+
+- Follow the role split defined by the active project rules, Asana task, or designated coordinator.
+- If a project assigns normal development to one agent and coordination or audit to another, the coordinating/auditing agent must not directly implement the normal development task.
+- When a coordinating/auditing agent receives a workflow verification task, it should select a valid normal development task, record the selection in Asana, and hand the task to the implementation agent.
+- A workflow verification run only counts if the assigned implementation agent performs the normal development work and the coordinating/auditing agent performs the review or audit path.
+- If the coordinating/auditing agent mistakenly implements the normal development task directly, record the correction in Asana and rerun the verification from the assigned implementation agent through the review or audit path.
+
 ## Completion
 
 Before marking a task complete:
