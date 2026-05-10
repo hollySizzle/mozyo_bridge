@@ -83,13 +83,15 @@ repo root で Claude Code を起動し直してから `mozyo-bridge init claude`
 
 ## Agent Skill Install
 
-Codex skill は Codex home に同期します。
+Codex skill は Codex home (user-global) に同期します。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_codex_skill.sh | sh
 ```
 
-Claude Code skill は project skill として対象 project に同期します。別の Mac や別 project に配布する場合は、対象 project path を明示してください。
+Claude Code skill は default で project skill として対象 project に同期します。`MOZYO_BRIDGE_CLAUDE_SCOPE` で `project` または `global` を選びます。**Claude Code は同名 skill について personal/user skill (`~/.claude/skills/`) を project skill (`<project>/.claude/skills/`) より優先します** (公式 docs: <https://code.claude.com/docs/en/skills>)。多くの開発ツールと逆向きの慣習なので注意してください。
+
+Project skill (default):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
@@ -98,11 +100,23 @@ MOZYO_BRIDGE_CLAUDE_PROJECT_DIR=/path/to/project \
   sh /tmp/install_mozyo_bridge_claude_skill.sh
 ```
 
+User-global (personal) skill (Codex の `~/.codex/skills/` と対称な配置):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
+  -o /tmp/install_mozyo_bridge_claude_skill.sh
+MOZYO_BRIDGE_CLAUDE_SCOPE=global \
+  sh /tmp/install_mozyo_bridge_claude_skill.sh
+```
+
+両方に配布したい場合は、明確な意図のもとで script を二度実行します (`scope=project` と `scope=global` を順に)。同名で両方に install すると Claude Code は personal copy を読み、project copy は shadow されます。
+
 Install destinations:
 
-- `${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/`
-- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/mozyo-bridge-agent/`
-- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/skills/mozyo-bridge-agent/`
+- `${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/` (Codex user-global)
+- `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/` (Claude user/personal, scope=global)
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/mozyo-bridge-agent/` (Claude project adapter, scope=project)
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/skills/mozyo-bridge-agent/` (Claude project shared body, scope=project)
 
 現在の project root で実行している場合だけ、`MOZYO_BRIDGE_CLAUDE_PROJECT_DIR` を省略できます。
 
@@ -110,8 +124,8 @@ Install destinations:
 sh scripts/install_claude_skill.sh
 ```
 
-Both scripts fetch `hollySizzle/mozyo_bridge` `main` by default. Override the source with `MOZYO_BRIDGE_SKILL_REPO` and `MOZYO_BRIDGE_SKILL_REF`.
-Claude Code must be started from the target project directory for `.claude/skills/` project skills to resolve.
+Both scripts fetch `hollySizzle/mozyo_bridge` `main` by default. Override the source with `MOZYO_BRIDGE_SKILL_REPO`, `MOZYO_BRIDGE_SKILL_REF`, or `MOZYO_BRIDGE_SKILL_ARCHIVE_URL` (the last accepts any tarball URL, including `file:///...` for local-checkout install).
+Claude Code must be started from the target project directory for `.claude/skills/` project skills to resolve. User-global (personal) skills under `~/.claude/skills/` resolve regardless of where Claude Code is started; **personal/user skills override project skills with the same name** per Claude Code's documented precedence (Enterprise → Personal → Project).
 
 Detailed distribution rules live in `vibes/docs/logics/skill-distribution.md`.
 
