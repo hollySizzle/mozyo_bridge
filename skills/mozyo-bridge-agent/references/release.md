@@ -30,6 +30,13 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 5. Validate TestPyPI install with `pipx`.
 6. Decide production PyPI release only after TestPyPI validation.
 
+For TestPyPI validation, force the pip backend so TestPyPI is used for
+`mozyo-bridge` and PyPI remains available for dependencies:
+
+```bash
+pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==X.Y.Z
+```
+
 ## Trusted Publishing
 
 TestPyPI pending publisher:
