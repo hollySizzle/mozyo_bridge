@@ -42,6 +42,13 @@ def repo_root_from_args(args: argparse.Namespace) -> Path:
     return resolve_repo_root(getattr(args, "repo", None))
 
 
+def scaffold_target_from_args(args: argparse.Namespace) -> Path:
+    target = getattr(args, "repo", None)
+    if target:
+        return Path(target).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
 def config_path_from_args(args: argparse.Namespace) -> str:
     return str(Path(getattr(args, "config_path", None) or default_tmux_conf(repo_root_from_args(args))).expanduser())
 
@@ -455,7 +462,7 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
 
 def cmd_scaffold_rules(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
-    target = repo_root_from_args(args)
+    target = scaffold_target_from_args(args)
     paths = write_scaffold(
         args.preset,
         target,

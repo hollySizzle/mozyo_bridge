@@ -416,6 +416,48 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("rules preset is not installed", stderr.getvalue())
             self.assertFalse((project / "AGENTS.md").exists())
 
+    def test_scaffold_without_target_writes_to_current_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            parent = Path(tmp) / "parent"
+            nested = parent / "nested"
+            nested.mkdir(parents=True)
+            (parent / "pyproject.toml").write_text("[project]\nname = \"parent\"\n", encoding="utf-8")
+            self.run_cli(["rules", "install", "--home", str(home)])
+            cwd = Path.cwd()
+            try:
+                os.chdir(nested)
+
+                result, output = self.run_cli(["scaffold", "rules", "asana", "--home", str(home)])
+
+                self.assertEqual(0, result)
+                self.assertIn(str(nested / "AGENTS.md"), output)
+                self.assertTrue((nested / "AGENTS.md").exists())
+                self.assertTrue((nested / "CLAUDE.md").exists())
+                self.assertFalse((parent / "AGENTS.md").exists())
+            finally:
+                os.chdir(cwd)
+
+    def test_scaffold_without_target_ignores_mozyo_repo_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            env_repo = Path(tmp) / "env-repo"
+            cwd_project = Path(tmp) / "cwd-project"
+            env_repo.mkdir()
+            cwd_project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            cwd = Path.cwd()
+            try:
+                os.chdir(cwd_project)
+                with patch.dict(os.environ, {"MOZYO_REPO": str(env_repo)}):
+                    result, _ = self.run_cli(["scaffold", "rules", "none", "--home", str(home)])
+
+                self.assertEqual(0, result)
+                self.assertTrue((cwd_project / "AGENTS.md").exists())
+                self.assertFalse((env_repo / "AGENTS.md").exists())
+            finally:
+                os.chdir(cwd)
+
     def test_rules_status_reports_installed_presets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"

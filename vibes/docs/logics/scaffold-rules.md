@@ -186,7 +186,7 @@ mozyo-bridge scaffold rules <asana|redmine|none> \
   --force
 ```
 
-`--target` should default to the resolved project root, using the same root resolution rules as the rest of the CLI.
+`--target` should default to the current working directory. This command generates strong router files, so it must not walk upward to a parent repository unless the user explicitly passes `--target` or `--repo`.
 
 `scaffold.json` should record the selected preset, central preset version, mozyo-bridge version, generated router file hashes, and the rule path that the routers reference. It is a local installation record, not a copy of the central rules.
 

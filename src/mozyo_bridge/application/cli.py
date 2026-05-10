@@ -37,6 +37,11 @@ def add_repo_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", help="Project root. Defaults to MOZYO_REPO or the nearest cwd parent with .git/.tmux.conf/pyproject.toml")
 
 
+def add_scaffold_target_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo", help="Project root to scaffold. Defaults to the current working directory")
+    parser.add_argument("--target", dest="repo", help="Project root to scaffold. Alias for --repo")
+
+
 def repo_root_from_args(args: argparse.Namespace):
     return resolve_repo_root(getattr(args, "repo", None))
 
@@ -219,8 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold_sub = scaffold.add_subparsers(dest="scaffold_command", required=True)
     scaffold_rules = scaffold_sub.add_parser("rules")
     scaffold_rules.add_argument("preset", choices=["asana", "redmine", "none"])
-    add_repo_option(scaffold_rules)
-    scaffold_rules.add_argument("--target", dest="repo", help="Project root to scaffold. Alias for --repo")
+    add_scaffold_target_option(scaffold_rules)
     scaffold_rules.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
     scaffold_rules.add_argument("--dry-run", action="store_true")
     replace_group = scaffold_rules.add_mutually_exclusive_group()

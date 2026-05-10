@@ -129,10 +129,13 @@ mozyo-bridge rules status
 Scaffold project routers:
 
 ```bash
+mozyo-bridge scaffold rules asana
 mozyo-bridge scaffold rules asana --target /path/to/project
 mozyo-bridge scaffold rules redmine --target /path/to/project
 mozyo-bridge scaffold rules none --target /path/to/project
 ```
+
+When `--target` or `--repo` is omitted, scaffold writes to the current working directory. Use an explicit target to scaffold a different directory.
 
 This creates:
 
