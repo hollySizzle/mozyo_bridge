@@ -29,7 +29,7 @@ from mozyo_bridge.domain.pane_resolver import (
 )
 import mozyo_bridge.domain.pane_resolver as pane_resolver
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
-from mozyo_bridge.scaffold.rules import scaffold_state
+from mozyo_bridge.scaffold.rules import package_version, rules_status, scaffold_state
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
 
 
@@ -413,6 +413,41 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             self.assertIn("rules preset is not installed", stderr.getvalue())
             self.assertFalse((project / "AGENTS.md").exists())
+
+    def test_rules_status_reports_installed_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, output = self.run_cli(["rules", "status", "--home", str(home)])
+            rows = rules_status(home)
+
+            self.assertEqual(0, result)
+            self.assertIn("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH", output)
+            self.assertEqual(["ok", "ok", "ok"], [row["status"] for row in rows])
+            self.assertIn(f"asana\tok\t{package_version('asana')}\t{package_version('asana')}\t", output)
+            self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), output)
+
+    def test_rules_status_reports_missing_and_outdated_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+
+            self.run_cli(["rules", "install", "--home", str(home)])
+            (home / "rules" / "presets" / "redmine" / "agent-workflow.md").unlink()
+            (home / "rules" / "presets" / "none" / "VERSION").write_text("0.0.0\n", encoding="utf-8")
+
+            result, output = self.run_cli(["rules", "status", "--home", str(home)])
+            rows = {row["preset"]: row for row in rules_status(home)}
+
+            self.assertEqual(1, result)
+            self.assertEqual("ok", rows["asana"]["status"])
+            self.assertEqual("missing", rows["redmine"]["status"])
+            self.assertEqual("-", rows["redmine"]["installed"])
+            self.assertEqual("outdated", rows["none"]["status"])
+            self.assertEqual("0.0.0", rows["none"]["installed"])
+            self.assertIn(f"redmine\tmissing\t-\t{package_version('redmine')}\t", output)
+            self.assertIn(f"none\toutdated\t0.0.0\t{package_version('none')}\t", output)
 
     def test_scaffold_refuses_overwrite_by_default_and_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

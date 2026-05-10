@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__asana__get_task",
+      "Bash(git log *)",
+      "mcp__asana__get_project"
+    ]
+  }
+}
