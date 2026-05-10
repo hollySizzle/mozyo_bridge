@@ -378,7 +378,11 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             result, _ = self.run_cli(["rules", "install", "--home", str(home)])
             self.assertEqual(0, result)
-            self.assertTrue((home / "rules" / "presets" / "asana" / "agent-workflow.md").exists())
+            asana_workflow = home / "rules" / "presets" / "asana" / "agent-workflow.md"
+            self.assertTrue(asana_workflow.exists())
+            installed_workflow = asana_workflow.read_text(encoding="utf-8")
+            self.assertIn("User Interaction And Escalation", installed_workflow)
+            self.assertIn("designated coordinator", installed_workflow)
 
             result, output = self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", str(home)])
 

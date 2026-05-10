@@ -39,6 +39,14 @@
 - If a story/comment id is unavailable, use the task permalink plus timestamp or latest comment context.
 - Project status updates are for project-level progress, not ordinary task handoffs.
 
+## User Interaction And Escalation
+
+- Agents should work autonomously inside the active Asana task scope.
+- Do not ask the user directly when the task, project notes, Notion rules, or repository docs already answer the question.
+- Escalate when the task purpose, artifacts, done criteria, policy boundary, destructive operation, release action, credential handling, or user intent cannot be resolved from the source of truth without guessing.
+- If the project uses more than one agent, route user-facing clarification through the project's designated coordinator. Record the decision and rationale in Asana.
+- If the user gives a direct instruction outside Asana, update the Asana task comment or the designated coordinator before continuing when that instruction changes scope, policy, or completion criteria.
+
 ## Completion
 
 Before marking a task complete:
