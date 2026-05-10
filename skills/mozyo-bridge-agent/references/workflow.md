@@ -14,6 +14,12 @@
 - Update the task when work is completed, blocked, or materially changes scope.
 - Do not treat chat as the durable work log.
 - Split follow-up work into new Asana tasks when scope expands.
+- For a normal development completion comment, record a short audit trail:
+  - global Notion rules fetched;
+  - `mozyo-bridge-agent` skill loaded;
+  - active Asana task and project notes confirmed;
+  - any additional relevant rule or reference paths consulted.
+- This audit trail is for reviewability. It does not require reading every reference file on every task.
 
 ## Local Documentation
 

@@ -18,6 +18,12 @@
 - 作業が完了、block、または scope 変更された場合は、該当 task の comment または notes を更新する。
 - chat message を durable な作業ログとして扱わない。
 - task scope が膨らんだ場合は、黙って削らず follow-up task に分割する。
+- Claude の通常開発完了 comment には、次の最小証跡を短く残す。
+  - Notion global rules を fetch したこと。
+  - `mozyo-bridge-agent` skill を loaded したこと。
+  - active Asana task と project notes を確認したこと。
+  - 追加で参照した relevant rule / reference がある場合は、その path または source。
+- 上記は監査可能性のための証跡であり、全 reference を毎回読むことを要求しない。
 
 ## Secret Handling
 
