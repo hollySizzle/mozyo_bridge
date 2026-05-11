@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -367,6 +368,13 @@ class CliTest(unittest.TestCase):
         self.assertEqual(0, ctx.exception.code)
         self.assertIn(__version__, stdout.getvalue())
         self.assertIn("mozyo-bridge", stdout.getvalue())
+
+    def test_module_version_matches_pyproject_version(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'^version = "([^"]+)"', pyproject, flags=re.MULTILINE)
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), __version__)
 
     def test_scaffold_rules_rejects_unknown_preset(self) -> None:
         parser = build_parser()
