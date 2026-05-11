@@ -437,11 +437,19 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Review Gate",
                 "Close Gate",
                 "Pane Notification",
+                "Handoff Startup Decision",
+                "Factual Posture",
                 "Implementer / Auditor Role Boundary",
                 "Decision Routing",
                 "Scope Integrity",
                 "Verification Discipline",
                 "mozyo-bridge notify-",
+                "mozyo-bridge init",
+                "Receiver pane unavailable",
+                "Notification fails",
+                "Implementation Done is not",
+                "Stop hook handoff waits",
+                "Prioritize factual correctness",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
@@ -453,6 +461,14 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("resolve_audit_docs.py", installed)
             self.assertNotIn("vibes/docs/catalog.yaml", installed)
             self.assertNotIn("manual_spec", installed)
+            self.assertNotIn("FeatureListDsl", installed)
+            self.assertNotIn("/myapp/Source/rails", installed)
+            self.assertNotIn("tmux-integrated", installed)
+            self.assertNotIn("VS Code", installed)
+            # Implementation Done Gate is a distinct durable gate, not a Progress Log.
+            # The Factual Posture wording must not downgrade it.
+            self.assertNotIn("self-verification is a Progress Log", installed)
+            self.assertIn("review input, not completion", installed)
 
             result, output = self.run_cli(
                 ["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)]
@@ -470,12 +486,28 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("Redmine issue と journal state", agents)
             self.assertIn("Redmine gate lifecycle", agents)
             self.assertIn("mozyo-bridge notify-", agents)
+
+            claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn(
+                str(home / "rules" / "presets" / "redmine" / "agent-workflow.md"),
+                claude,
+            )
+            self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
+            self.assertIn("迎合せず", claude)
+            self.assertIn("implementation_done は completion ではない", claude)
+            self.assertIn("Codex受領方法", claude)
+            # Router stays thin: keep CLAUDE.md well below the central preset's depth.
+            self.assertLess(len(claude.splitlines()), 30)
+            self.assertNotIn("Redmine Gate Lifecycle", claude)
+            self.assertNotIn("Implementer / Auditor Role Boundary", claude)
+
             state = scaffold_state(project)
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
+            self.assertEqual("2026.05.11.1", state["preset_version"])
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

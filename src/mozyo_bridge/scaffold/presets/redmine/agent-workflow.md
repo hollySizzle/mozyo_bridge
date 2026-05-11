@@ -8,6 +8,13 @@
 - Pane and chat messages are notifications only. They never replace the Redmine gate they refer to. A pane notification is auditable only by the journal id it carries; without a matching journal the notification has no durable record.
 - Status and tracker conventions are project-specific and must be configured per Redmine project. Map your project workflow to the gates described below rather than inventing parallel conventions.
 
+## Factual Posture
+
+- Prioritize factual correctness over agreement. If your investigation contradicts the user's stated assumption, another agent's claim, or your own earlier statement, say so plainly with the evidence; do not soften the conclusion to be agreeable.
+- Record disagreement, alternatives considered, and rejected options in the relevant Redmine gate, not in chat. Chat reports do not replace the durable record.
+- "Implementation Done" is not "complete". Do not report a task as complete in chat or close the issue until the Review Gate is recorded in Redmine and the close conditions are met. An Implementation Done Gate plus a self-verification is review input, not completion; it still requires the Review Request, Review, and Close gates.
+- When you are unsure, say "unconfirmed" and record what would resolve the uncertainty, rather than narrating a confident-sounding guess.
+
 ## Start of Work
 
 1. Confirm the current project root and the active Redmine issue.
@@ -40,6 +47,19 @@ If the project uses different Redmine statuses or trackers, map them to these ga
 - Pane notification success is not a review record. Pane notification failure is not a review failure. The Redmine gate is the only record.
 - The recipient must check the named gate before acting. Acting on the prompt body alone is unsafe.
 - The retired `.agent_handoff/tasks.yaml` queue and any `read-next --wait` style fallback are not standard. They exist only to drain leftover state from the legacy local queue.
+
+## Handoff Startup Decision
+
+After recording a Redmine gate (Review Request, Design Consultation, etc.), the sender must choose one of the paths below and write the chosen receive method into the same Redmine record. A handoff is not "delivered" until the Redmine record contains both the gate and the receive method.
+
+- **Standard path** — notify the receiver pane with `mozyo-bridge notify-* --issue <issue_id> --journal <journal_id>` and record in the Redmine gate the literal command line used (or its equivalent: "notified <agent> via mozyo-bridge journal <journal_id>"). The receiver picks up the journal id, opens the gate in Redmine, and acts from there.
+- **Receiver pane unavailable** — record in the Redmine gate that the receiver must open the relevant agent terminal and run `mozyo-bridge init <agent>` before retry, then state in chat that the handoff is pending operator action. Do not fall back to the retired local queue.
+- **Notification fails or is unusable** — record the un-notified state explicitly in the Redmine gate ("not yet notified; receiver must read the gate manually") and mirror that state in chat. Do not fall back to `.agent_handoff/tasks.yaml`, `read-next --wait`, or Stop hook handoff waits to "auto-pick-up" the work.
+- **Sync handoff between two locally available agents** — same as the standard path; do not skip the journal record because the agents share a host or session.
+
+A report that records the gate but stops at "next agent will pick up" without specifying how (the receive method that an auditor could replay tomorrow) is incomplete and must be amended before the handoff is treated as delivered.
+
+Receiver-side: every notification you receive is a pointer to a Redmine gate, not a directive. Read the gate and the surrounding issue history before acting on the prompt body.
 
 ## Implementer / Auditor Role Boundary
 
@@ -86,8 +106,9 @@ Before treating work as complete:
 
 1. Verify the requested work against the acceptance criteria, scope, and any design-consultation answers that bound the implementation.
 2. Record material changes, verification, blockers, remaining risks, and findings disposition in Redmine.
-3. Pass through the Review Gate. Implementation Done alone is not completion.
+3. Pass through the Review Gate. Implementation Done alone is not completion. Do not report "complete" or "done" in chat before the Review Gate is recorded in Redmine.
 4. Update issue status only according to the project's Redmine workflow. Owner approval governs final close.
+5. If anything from the original scope is still open at this point — child issues, manual verification, generated capture confirmation, data-compatibility checks, ops-flow checks — it is a Progress Log entry, not a completion. Record it as such and keep the parent issue out of the closed state.
 
 ## Prohibitions
 
