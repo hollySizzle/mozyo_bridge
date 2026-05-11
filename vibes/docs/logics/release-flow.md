@@ -123,12 +123,13 @@ GA / patch 手順:
 
 4. `Publish to PyPI` workflow が成功したことを確認する。
 5. `pipx install --force mozyo-bridge==X.Y.Z` で fresh install を確認する。
+6. fresh install 後、`README.md` の `Beta Tester Install (GitHub main)` 節に書かれた acceptance smoke を、GitHub `main` install のかわりに本 PyPI install に対して実行する (`mozyo-bridge rules install` → skill install → `mozyo-bridge doctor` → isolated target に Asana / Redmine の scaffold + `scaffold status` + `doctor --target`)。tester / CI 検証 1 command として `mozyo-bridge doctor --json` を使い、`ok=true` と scaffold section ok を確認する。
 
 ### Pre-release (0.1.0a1)
 
 - pre-release は production publish を起こしてはならないので、GitHub Release を作らない。
 - bump → push → `Publish to TestPyPI` workflow を `workflow_dispatch` で起動する流れだけで完了する。
-- 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行う。
+- 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
 - `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。
 - 必要なら `git tag -a v0.1.0a1 -m "Pre-release v0.1.0a1"` で tag を打って push する。GitHub Release は作らない。
 

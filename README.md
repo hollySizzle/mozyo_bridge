@@ -25,7 +25,7 @@ python3 -m mozyo_bridge --help
 System dependency:
 
 - `tmux` must be installed and available on `PATH`.
-- Use `mozyo-bridge doctor` to check the local tmux environment.
+- Use `mozyo-bridge doctor` to check CLI, central rules, agent skills, scaffold, and tmux readiness in one command. Add `--target <project>` to also verify a scaffolded project. See `Beta Tester Install (GitHub main)` for the full acceptance smoke.
 
 Use the full command in docs and durable task records:
 
@@ -41,7 +41,20 @@ mozyo <command>
 
 ## Beta Tester Install (GitHub main)
 
-PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。
+PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help` / `mozyo-bridge doctor --json`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。
+
+PyPI / TestPyPI release の検証手順は本節と同じ acceptance smoke を、GitHub `main` install のかわりに該当 PyPI install で実行してください。release 経路の詳細は `vibes/docs/logics/release-flow.md` を見ます。
+
+### Isolation principle
+
+`mozyo-bridge scaffold rules <preset>` は対象 directory の `AGENTS.md` / `CLAUDE.md` を生成 / 上書きします。本 repository (`mozyo_bridge` 自身) の tracked router を壊さないために、検証は必ず以下のどちらかで行います。
+
+- `./tmp/mb-smoke-asana` / `./tmp/mb-smoke-redmine` のような isolated target を使う (`./tmp/` は `.gitignore` 配下の作業領域)。
+- もしくは別 directory で `git clone` した fresh checkout、または任意の `/tmp/...` directory を使う。
+
+本 repo の working tree で `mozyo-bridge scaffold rules <preset>` を `--target` 無しで実行しないでください。tracked `AGENTS.md` / `CLAUDE.md` が上書き候補になり、`scaffold rules` 自体は default で既存ファイルを保護しますが、`--force` / `--backup` を伴うと取り違える可能性があります。
+
+### Acceptance smoke
 
 1. GitHub `main` から install (既存 PyPI install を上書き):
 
@@ -66,30 +79,48 @@ PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI inst
 
    # Claude Code skill (user-global, ${MOZYO_BRIDGE_CLAUDE_HOME:-~/.claude}/skills/)
    curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
-     -o /tmp/install_mozyo_bridge_claude_skill.sh
-   MOZYO_BRIDGE_CLAUDE_SCOPE=global \
-     sh /tmp/install_mozyo_bridge_claude_skill.sh
+     | MOZYO_BRIDGE_CLAUDE_SCOPE=global sh
    ```
 
    `project` scope や両 scope 配布、precedence の落とし穴 (Claude Code は同名 skill で personal が project を override) は `Agent Skill Install` 節と `vibes/docs/logics/skill-distribution.md` を参照してください。
 
+   注: `MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` の形は env var が `curl` にしか渡らないため、`install_claude_skill.sh` は default の `scope=project` で動作してしまいます。pipe の右側で `sh` の直前に env を置く形を使ってください。
+
 4. Claude Code / Codex を再起動して、新しい skill と user-global 規約を再読み込みさせます。同 session 内では skill index がキャッシュされるため再起動を省略しないでください。
 
-5. dummy project で repo-local scaffold を smoke:
+5. install 直後の前提を `mozyo-bridge doctor` で一括確認します:
 
    ```bash
-   mkdir -p /tmp/mb-smoke-asana
-   mozyo-bridge scaffold rules asana --target /tmp/mb-smoke-asana
-   mozyo-bridge scaffold status --target /tmp/mb-smoke-asana
-
-   mkdir -p /tmp/mb-smoke-redmine
-   mozyo-bridge scaffold rules redmine --target /tmp/mb-smoke-redmine
-   mozyo-bridge scaffold status --target /tmp/mb-smoke-redmine
+   mozyo-bridge doctor
    ```
 
-   `scaffold status` が両 dummy project で `result: clean` を返せば、user-global 規約・repo-local routers・manifest が整合しています。
+   このタイミングでは `scaffold` section が `missing` (`-> mozyo-bridge scaffold rules <asana|redmine|none> --target ...`) になりますが、`cli` / `rules` / `codex_skill` / `claude_skill` の 4 section が ok であることを確認します。`next_action` (`-> ...`) を読み、不足があれば該当 install / set up を再実行してください。
 
-`mozyo-bridge rules status` (user-global 規約の install 状態) と `mozyo-bridge scaffold status` (repo-local manifest drift) は別責務です。前者は host 全体、後者は 1 つの scaffold 済 project を見ます。詳細は次の logic docs を正本にしてください。
+6. isolated target に対して Asana / Redmine の repo-local scaffold を smoke:
+
+   ```bash
+   mkdir -p ./tmp/mb-smoke-asana
+   mozyo-bridge scaffold rules asana --target ./tmp/mb-smoke-asana
+   mozyo-bridge scaffold status --target ./tmp/mb-smoke-asana
+   mozyo-bridge doctor --target ./tmp/mb-smoke-asana
+
+   mkdir -p ./tmp/mb-smoke-redmine
+   mozyo-bridge scaffold rules redmine --target ./tmp/mb-smoke-redmine
+   mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine
+   mozyo-bridge doctor --target ./tmp/mb-smoke-redmine
+   ```
+
+   各 target で `scaffold status` が `result: clean` を返し、`mozyo-bridge doctor --target ...` の `scaffold` section が `ok` であれば、user-global 規約・repo-local routers・manifest が整合しています。両 preset (Asana と Redmine) を両方確認します。片側だけで完了させると preset 間 boundary の検証が落ちます。
+
+7. CI / 機械的な acceptance smoke では `--json` を使います:
+
+   ```bash
+   mozyo-bridge doctor --target ./tmp/mb-smoke-asana --json
+   ```
+
+   出力は `{"ok": <bool>, "sections": {"cli": {...}, "rules": {...}, "codex_skill": {...}, "claude_skill": {...}, "scaffold": {...}, "tmux": {...}}}` 形式で、`jq '.sections.scaffold.status == "ok"'` 等で gate を組めます。exit code は `ok` が false の時に非ゼロです。
+
+`mozyo-bridge rules status` (user-global 規約の install 状態) と `mozyo-bridge scaffold status` (repo-local manifest drift) は別責務です。前者は host 全体、後者は 1 つの scaffold 済 project を見ます。`mozyo-bridge doctor` は両者と CLI / Codex skill / Claude skill / tmux を 1 command で見る 6-section diagnostic で、acceptance smoke の標準確認に使います。詳細は次の logic docs を正本にしてください。
 
 - `vibes/docs/logics/skill-distribution.md`
 - `vibes/docs/logics/scaffold-rules.md`

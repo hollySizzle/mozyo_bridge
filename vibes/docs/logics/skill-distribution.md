@@ -108,8 +108,9 @@ beta tester が GitHub `main` から CLI を install した後、skill 配布が
 検証観点:
 
 1. Codex user-global skill: `scripts/install_codex_skill.sh` 実行後、`${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/SKILL.md` が存在し、`SKILL.md` の `name` / `description` が GitHub `main` の内容と一致する。
-2. Claude user-global skill: `MOZYO_BRIDGE_CLAUDE_SCOPE=global` で `scripts/install_claude_skill.sh` 実行後、`${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` が存在する。`global` scope では `.claude/skills/` 配下に adapter を生成しない (Claude Code は user skill 直下の `SKILL.md` を直接読むため)。
-3. agent を再起動した後、Claude / Codex の skill 一覧に `mozyo-bridge-agent` が出る。同 session 内では skill index がキャッシュされるため再起動を省略しない。
+2. Claude user-global skill: `curl ... | MOZYO_BRIDGE_CLAUDE_SCOPE=global sh` で `scripts/install_claude_skill.sh` 実行後 (env var は pipe の右側で `sh` の直前に置く)、`${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` が存在する。`global` scope では `.claude/skills/` 配下に adapter を生成しない (Claude Code は user skill 直下の `SKILL.md` を直接読むため)。`MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` の形は env が `curl` にしか渡らず、script は default の `scope=project` で走るため不可。
+3. `mozyo-bridge doctor` の `codex_skill` / `claude_skill` section で 1 と 2 の両方を 1 command で確認できる。`codex_skill: ok` と `claude_skill: ok` の出力が出れば user-global skill は揃っている。global / project 同名 skill が両方 install されている場合は `claude_skill: warning` と "personal/global ... overrides project ..." の警告が出る。
+4. agent を再起動した後、Claude / Codex の skill 一覧に `mozyo-bridge-agent` が出る。同 session 内では skill index がキャッシュされるため再起動を省略しない。
 
 PyPI release との見分け:
 

@@ -235,16 +235,21 @@ beta tester が GitHub `main` から CLI を install した後、user-global rul
 tester smoke check 観点:
 
 1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `asana` / `redmine` / `none` を expected version で報告する。
-2. dummy project を 2 つ作り、`mozyo-bridge scaffold rules asana --target ...` と `mozyo-bridge scaffold rules redmine --target ...` をそれぞれ実行する。どちらか片方のみで終わらせない (preset 間 boundary の確認が落ちる)。
-3. 各 dummy project で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
-4. 生成された `AGENTS.md` / `CLAUDE.md` が preset 期待値を持つ。例:
+2. **isolated target を 2 つ作る**。`./tmp/mb-smoke-asana` と `./tmp/mb-smoke-redmine` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold rules` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
+3. dummy target に対して `mozyo-bridge scaffold rules asana --target ./tmp/mb-smoke-asana` と `mozyo-bridge scaffold rules redmine --target ./tmp/mb-smoke-redmine` をそれぞれ実行する。どちらか片方のみで終わらせない (preset 間 boundary の確認が落ちる)。
+4. 各 dummy target で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
+5. `mozyo-bridge doctor --target ./tmp/mb-smoke-<preset>` を 1 command の acceptance smoke として使う。`scaffold` section が `ok`、`rules` / `codex_skill` / `claude_skill` / `cli` / `tmux` の各 section status と `next_action` を確認する。CI / 機械的 smoke では `--json` で `{"ok": <bool>, "sections": {...}}` を取り、`jq '.sections.scaffold.status == "ok"'` 等で gate を組む。
+6. 生成された `AGENTS.md` / `CLAUDE.md` が preset 期待値を持つ。例:
    - Redmine: `Redmine issue と journal state` / `Redmine gate lifecycle` / `mozyo-bridge notify-` を含む。`vibes/docs/specs/project-map.md` などの mozyo_bridge 固有 path を含まない。
    - Asana: `Asana task state と task comment` を含む。Redmine 固有の gate 用語 (`Implementation Done Gate` 等) を含まない。
 
+`mozyo-bridge doctor` は host 全体の `rules status`、対象 project の `scaffold status`、Codex / Claude skill install、CLI 自体の readiness を 1 command で見る 6-section diagnostic。`rules status` / `scaffold status` の責務差は前述の通りで、doctor はそれらを束ねる acceptance gate であり、検証手順の最終 1 行として使う。`--home <path>` を渡すと診断対象 home と一致した `next_action` (例: `mozyo-bridge rules install --home <path>`) が出るため、CI / fresh smoke でそのまま実行できる。
+
 PyPI release との見分け:
 
-- `mozyo-bridge --version` の出力は `pyproject.toml` の package version 文字列であり、GitHub `main` で未 bump の状態だと PyPI release と同じ string が表示されうる。版確認に `mozyo-bridge --version` だけを使わず、(a) `mozyo-bridge scaffold status --help` などの GitHub `main` で追加された sub-command が存在するか、(b) 生成された router の文言が GitHub `main` の preset 内容と一致するか、で確認する。
+- `mozyo-bridge --version` の出力は `pyproject.toml` の package version 文字列であり、GitHub `main` で未 bump の状態だと PyPI release と同じ string が表示されうる。版確認に `mozyo-bridge --version` だけを使わず、(a) `mozyo-bridge scaffold status --help` / `mozyo-bridge doctor --json` などの GitHub `main` で追加された sub-command / flag が存在するか、(b) 生成された router の文言が GitHub `main` の preset 内容と一致するか、で確認する。
 - docs 上は、未 PyPI release の GitHub `main` 変更を、すでに PyPI で利用可能であるかのように書かない。tester onboarding は GitHub `main` 経路と PyPI 経路を別物として扱う。
+- PyPI / TestPyPI release の検証は、本節と同じ tester smoke を install 経路 (`pipx install mozyo-bridge` または TestPyPI install) に置き換えて実行する。release 経路の上位フローは `vibes/docs/logics/release-flow.md` を正本にする。
 
 詳細な drift 状態の意味は本節の `Drift Detection` を正本にする。
 
