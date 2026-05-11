@@ -212,7 +212,31 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("target", nargs="?")
     init.set_defaults(func=cmd_init)
 
-    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose CLI, central rules, agent skills, and scaffold readiness",
+    )
+    doctor.add_argument(
+        "--target",
+        dest="repo",
+        help="Project root to check for scaffold and Claude project-skill readiness. "
+        "Defaults to MOZYO_REPO or the current working directory.",
+    )
+    doctor.add_argument(
+        "--repo",
+        dest="repo",
+        help="Alias for --target.",
+    )
+    doctor.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    doctor.set_defaults(func=cmd_doctor)
 
     rules = sub.add_parser("rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)

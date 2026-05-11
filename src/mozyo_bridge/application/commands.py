@@ -6,6 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
@@ -396,46 +397,14 @@ def cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    ok = True
-    if subprocess.run(["sh", "-c", "command -v tmux >/dev/null 2>&1"]).returncode != 0:
-        print("tmux: missing")
-        return 1
-    print("tmux: ok")
-    print(f"TMUX_PANE: {os.environ.get('TMUX_PANE', '')}")
-    result = run_tmux("list-panes", "-a", "-F", "#{pane_id} #{@agent_name}", check=False)
-    if result.returncode != 0:
-        print(f"tmux list-panes: failed: {result.stderr.strip()}")
-        ok = False
+    result = run_doctor(args)
+    if getattr(args, "json", False):
+        import json as _json
+
+        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        labeled = [line for line in result.stdout.splitlines() if len(line.split(" ", 1)) == 2 and line.split(" ", 1)[1]]
-        print(f"panes: {len(result.stdout.splitlines())}")
-        print(f"labeled_panes: {len(labeled)}")
-        panes = pane_lines()
-        for agent in ["claude", "codex"]:
-            matches = [pane for pane in panes if pane["label"] == agent]
-            if not matches:
-                print(f"{agent}_pane: missing")
-                ok = False
-            elif len(matches) > 1:
-                print(f"{agent}_pane: duplicate ({len(matches)})")
-                ok = False
-            else:
-                pane = matches[0]
-                command = Path(pane["command"]).name
-                status = "ok" if is_agent_process(command) else "not-agent-process"
-                print(f"{agent}_pane: {pane['id']} process={command} status={status}")
-                if agent == "claude":
-                    repo_root = repo_root_from_args(args)
-                    if (repo_root / ".claude" / "skills").exists() and not cwd_is_under_repo(pane.get("cwd", ""), repo_root):
-                        print(
-                            "warning: claude_pane cwd is outside repo root; "
-                            "project skills may not resolve. "
-                            f"cwd={pane.get('cwd', '') or '-'} repo={repo_root}"
-                        )
-                        ok = False
-    queue = queue_path_from_args(args)
-    print(f"queue: {queue} ({'exists' if queue.exists() else 'missing'})")
-    return 0 if ok else 1
+        print(format_doctor_text(result))
+    return 0 if result["ok"] else 1
 
 
 def cmd_rules_install(args: argparse.Namespace) -> int:

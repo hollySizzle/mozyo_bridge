@@ -1318,9 +1318,17 @@ class CommandTest(unittest.TestCase):
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
 
-            with patch("mozyo_bridge.application.commands.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
-                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
-                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.doctor._in_tmux", return_value=True), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(1, cmd_doctor(args))
 
@@ -1339,13 +1347,373 @@ class CommandTest(unittest.TestCase):
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
 
-            with patch("mozyo_bridge.application.commands.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
-                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
-                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.doctor._in_tmux", return_value=True), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_doctor(args))
 
         self.assertIn("claude_pane: %1 process=2.1.138 status=ok", stdout.getvalue())
+
+
+class DoctorEnvironmentTest(unittest.TestCase):
+    """Diagnostic sections for `mozyo-bridge doctor` (cli/rules/skills/scaffold)."""
+
+    def _stub_args(self, **kwargs) -> argparse.Namespace:
+        defaults = {"repo": None, "home": None, "json": False}
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _seed_codex_skill(self, codex_home: Path, *, complete: bool = True) -> Path:
+        skill_dir = codex_home / "skills" / "mozyo-bridge-agent"
+        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text("stub\n", encoding="utf-8")
+        if complete:
+            for ref in ("workflow.md", "safety.md", "project-map.md", "release.md"):
+                (skill_dir / "references" / ref).write_text("stub\n", encoding="utf-8")
+        return skill_dir
+
+    def _seed_claude_global_skill(self, claude_home: Path, *, complete: bool = True) -> Path:
+        skill_dir = claude_home / "skills" / "mozyo-bridge-agent"
+        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text("stub\n", encoding="utf-8")
+        if complete:
+            for ref in ("workflow.md", "safety.md", "project-map.md", "release.md"):
+                (skill_dir / "references" / ref).write_text("stub\n", encoding="utf-8")
+        return skill_dir
+
+    def _seed_claude_project_skill(self, project: Path) -> Path:
+        skill_dir = project / ".claude" / "skills" / "mozyo-bridge-agent"
+        (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text("stub\n", encoding="utf-8")
+        for ref in ("workflow.md", "safety.md", "project-map.md", "release.md"):
+            (skill_dir / "references" / ref).write_text("stub\n", encoding="utf-8")
+        return skill_dir
+
+    def test_cli_section_reports_version_and_subcommands(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_cli_section
+
+        section = doctor_cli_section()
+        self.assertEqual("ok", section["status"])
+        self.assertEqual(__version__, section["version"])
+        for cmd in ("doctor", "rules", "scaffold"):
+            self.assertIn(cmd, section["subcommands"])
+        self.assertTrue(section["package_path"].endswith("mozyo_bridge"))
+
+    def test_rules_section_reports_missing_when_not_installed(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_rules_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            section = doctor_rules_section(home)
+            self.assertEqual("missing-or-outdated", section["status"])
+            statuses = {row["preset"]: row["status"] for row in section["presets"]}
+            self.assertEqual({"asana": "missing", "redmine": "missing", "none": "missing"}, statuses)
+            # Custom home was diagnosed, so next_action must target the same home.
+            self.assertEqual(
+                [f"mozyo-bridge rules install --home {home}"], section["next_action"]
+            )
+
+    def test_rules_section_reports_ok_when_installed(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_rules_section
+        from mozyo_bridge.scaffold.rules import install_rules
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            install_rules(home)
+            section = doctor_rules_section(home)
+            self.assertEqual("ok", section["status"])
+            for row in section["presets"]:
+                self.assertEqual("ok", row["status"])
+            self.assertEqual([], section["next_action"])
+
+    def test_codex_skill_section_reports_missing_with_install_hint(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_codex_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"CODEX_HOME": str(Path(tmp) / "codex-home")}, clear=False):
+                section = doctor_codex_skill_section()
+                self.assertEqual("missing", section["status"])
+                self.assertFalse(section["present"])
+                self.assertTrue(section["next_action"])
+                self.assertTrue(
+                    any("install_codex_skill.sh" in action for action in section["next_action"])
+                )
+
+    def test_codex_skill_section_reports_ok_when_skill_present(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_codex_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex-home"
+            self._seed_codex_skill(codex_home, complete=True)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                section = doctor_codex_skill_section()
+                self.assertEqual("ok", section["status"])
+                self.assertTrue(section["present"])
+                self.assertEqual([], section["references_missing"])
+
+    def test_codex_skill_section_flags_incomplete_when_references_missing(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_codex_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex-home"
+            self._seed_codex_skill(codex_home, complete=False)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                section = doctor_codex_skill_section()
+                self.assertEqual("incomplete", section["status"])
+                self.assertTrue(section["references_missing"])
+
+    def test_claude_skill_section_reports_missing_when_neither_present(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_claude_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(Path(tmp) / "claude-home"),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                args = self._stub_args(repo=str(project))
+                section = doctor_claude_skill_section(args)
+                self.assertEqual("missing", section["status"])
+                self.assertFalse(section["global"]["present"])
+                self.assertFalse(section["project"]["present"])
+                self.assertEqual([], section["warnings"])
+                self.assertTrue(section["next_action"])
+
+    def test_claude_skill_section_warns_when_global_and_project_collide(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_claude_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_home = Path(tmp) / "claude-home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self._seed_claude_global_skill(claude_home, complete=True)
+            self._seed_claude_project_skill(project)
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                args = self._stub_args(repo=str(project))
+                section = doctor_claude_skill_section(args)
+                self.assertEqual("warning", section["status"])
+                self.assertEqual(1, len(section["warnings"]))
+                self.assertIn("overrides project skill", section["warnings"][0])
+
+    def test_claude_skill_section_global_only_is_ok(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_claude_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_home = Path(tmp) / "claude-home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self._seed_claude_global_skill(claude_home, complete=True)
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                args = self._stub_args(repo=str(project))
+                section = doctor_claude_skill_section(args)
+                self.assertEqual("ok", section["status"])
+                self.assertTrue(section["global"]["present"])
+                self.assertFalse(section["project"]["present"])
+                self.assertEqual([], section["warnings"])
+
+    def test_scaffold_section_unscaffolded_suggests_scaffold_rules(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_scaffold_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "project"
+            target.mkdir()
+            args = self._stub_args(repo=str(target), home=str(Path(tmp) / "mb-home"))
+            section = doctor_scaffold_section(args)
+            self.assertEqual("missing", section["status"])
+            self.assertTrue(
+                any("mozyo-bridge scaffold rules" in action for action in section["next_action"])
+            )
+
+    def test_scaffold_section_reports_ok_after_fresh_asana_scaffold(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_scaffold_section
+        from mozyo_bridge.scaffold.rules import install_rules, write_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            target = Path(tmp) / "project"
+            target.mkdir()
+            install_rules(home)
+            write_scaffold("asana", target, home=home)
+            args = self._stub_args(repo=str(target), home=str(home))
+            section = doctor_scaffold_section(args)
+            self.assertEqual("ok", section["status"])
+            self.assertEqual("asana", section["detail"].get("preset"))
+            self.assertEqual([], section["next_action"])
+
+    def test_scaffold_section_reports_ok_after_fresh_redmine_scaffold(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_scaffold_section
+        from mozyo_bridge.scaffold.rules import install_rules, write_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            target = Path(tmp) / "project"
+            target.mkdir()
+            install_rules(home)
+            write_scaffold("redmine", target, home=home)
+            args = self._stub_args(repo=str(target), home=str(home))
+            section = doctor_scaffold_section(args)
+            self.assertEqual("ok", section["status"])
+            self.assertEqual("redmine", section["detail"].get("preset"))
+
+    def test_doctor_json_output_is_structured(self) -> None:
+        from mozyo_bridge.application.doctor import run_doctor
+        from mozyo_bridge.scaffold.rules import install_rules, write_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            claude_home = Path(tmp) / "claude-home"
+            codex_home = Path(tmp) / "codex-home"
+            target = Path(tmp) / "project"
+            target.mkdir()
+            install_rules(home)
+            write_scaffold("asana", target, home=home)
+            self._seed_codex_skill(codex_home, complete=True)
+            self._seed_claude_global_skill(claude_home, complete=True)
+            env = {
+                "MOZYO_BRIDGE_HOME": str(home),
+                "CODEX_HOME": str(codex_home),
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(target),
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                patch("mozyo_bridge.application.doctor.doctor_tmux_section", return_value={"status": "skipped", "next_action": []}):
+                args = self._stub_args(repo=str(target), home=str(home), json=True)
+                result = run_doctor(args)
+            self.assertTrue(result["ok"])
+            self.assertIn("cli", result["sections"])
+            self.assertIn("rules", result["sections"])
+            self.assertIn("codex_skill", result["sections"])
+            self.assertIn("claude_skill", result["sections"])
+            self.assertIn("scaffold", result["sections"])
+            self.assertIn("tmux", result["sections"])
+            self.assertEqual("ok", result["sections"]["scaffold"]["status"])
+            self.assertEqual("asana", result["sections"]["scaffold"]["detail"]["preset"])
+
+            # Round-trip through json so we can assert the public payload is serializable.
+            payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            self.assertTrue(payload)
+
+    def test_doctor_is_read_only_for_isolated_environment(self) -> None:
+        """Doctor must not install, repair, or contact external systems."""
+        from mozyo_bridge.application.doctor import run_doctor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            claude_home = Path(tmp) / "claude-home"
+            codex_home = Path(tmp) / "codex-home"
+            target = Path(tmp) / "project"
+            target.mkdir()
+            env = {
+                "MOZYO_BRIDGE_HOME": str(home),
+                "CODEX_HOME": str(codex_home),
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(target),
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                patch("mozyo_bridge.application.doctor.doctor_tmux_section", return_value={"status": "skipped", "next_action": []}):
+                args = self._stub_args(repo=str(target), home=str(home))
+                run_doctor(args)
+            # None of the homes should have been auto-created/populated by doctor.
+            self.assertFalse((home / "rules").exists())
+            self.assertFalse((claude_home / "skills").exists())
+            self.assertFalse((codex_home / "skills").exists())
+
+    def test_cli_parser_accepts_doctor_target_home_and_json_flags(self) -> None:
+        parser = build_parser()
+        ns = parser.parse_args(
+            ["doctor", "--target", "/tmp/a", "--home", "/tmp/b", "--json"]
+        )
+        self.assertEqual("doctor", ns.command)
+        self.assertEqual("/tmp/a", ns.repo)
+        self.assertEqual("/tmp/b", ns.home)
+        self.assertTrue(ns.json)
+
+    def test_claude_skill_install_hint_sets_scope_for_the_downstream_shell(self) -> None:
+        """next_action must place `MOZYO_BRIDGE_CLAUDE_SCOPE=global` before `sh`,
+        not before `curl`, so the env var actually reaches the install script."""
+        from mozyo_bridge.application.doctor import (
+            CLAUDE_GLOBAL_SKILL_INSTALL_HINT,
+            doctor_claude_skill_section,
+        )
+
+        # The hint itself: env var must immediately precede the executor (`sh`),
+        # not the pipeline producer (`curl`).
+        self.assertIn("| MOZYO_BRIDGE_CLAUDE_SCOPE=global sh", CLAUDE_GLOBAL_SKILL_INSTALL_HINT)
+        self.assertNotIn("MOZYO_BRIDGE_CLAUDE_SCOPE=global curl", CLAUDE_GLOBAL_SKILL_INSTALL_HINT)
+
+        # And the section actually emits that hint when both global and project are absent.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(Path(tmp) / "claude-home"),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                section = doctor_claude_skill_section(self._stub_args(repo=str(project)))
+            self.assertEqual("missing", section["status"])
+            self.assertTrue(
+                any("| MOZYO_BRIDGE_CLAUDE_SCOPE=global sh" in action for action in section["next_action"]),
+                f"expected pipe-then-env install hint, got {section['next_action']!r}",
+            )
+
+    def test_rules_next_action_propagates_custom_home(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_rules_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            section = doctor_rules_section(home)
+            self.assertEqual("missing-or-outdated", section["status"])
+            self.assertEqual(
+                [f"mozyo-bridge rules install --home {home}"], section["next_action"]
+            )
+
+    def test_rules_next_action_omits_home_flag_for_default_home(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_rules_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {"MOZYO_BRIDGE_HOME": str(Path(tmp) / "mb-home")},
+                clear=False,
+            ):
+                section = doctor_rules_section(None)
+            self.assertEqual("missing-or-outdated", section["status"])
+            self.assertEqual(["mozyo-bridge rules install"], section["next_action"])
+
+    def test_scaffold_next_action_propagates_custom_home(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_scaffold_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "project"
+            target.mkdir()
+            home = Path(tmp) / "mb-home"
+            args = self._stub_args(repo=str(target), home=str(home))
+            section = doctor_scaffold_section(args)
+            self.assertEqual("missing", section["status"])
+            self.assertTrue(section["next_action"])
+            action = section["next_action"][0]
+            self.assertIn(f"--target {target.resolve()}", action)
+            self.assertIn(f"--home {home.resolve()}", action)
 
 
 if __name__ == "__main__":
