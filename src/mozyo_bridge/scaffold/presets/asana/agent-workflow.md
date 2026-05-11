@@ -8,6 +8,13 @@
 - Task comments are the durable work log and handoff record.
 - Pane messages are notifications only.
 
+## Factual Posture
+
+- Prioritize factual correctness over agreement. If your investigation contradicts the user's stated assumption, another agent's claim, or your own earlier statement, say so plainly with the evidence; do not soften the conclusion to be agreeable.
+- Record disagreement, alternatives considered, and rejected options in an Asana task comment, not in chat. Chat reports do not replace the durable record.
+- "Implementation done" is not "task complete". Do not mark the Asana task complete in the API or report it complete in chat until the review / audit comment is captured on the task (when the project uses an audit agent) and the task's stated completion criteria are satisfied. An Implementation Done summary plus a self-verification is review input, not completion.
+- When you are unsure, say "unconfirmed" and record what would resolve the uncertainty, rather than narrating a confident-sounding guess.
+
 ## Start of Work
 
 1. Confirm the current project root.
@@ -39,6 +46,24 @@
 - If a story/comment id is unavailable, use the task permalink plus timestamp or latest comment context.
 - Project status updates are for project-level progress, not ordinary task handoffs.
 
+## Handoff Startup Decision
+
+After creating a durable Asana task comment (review request, audit result, design consultation, etc.), the sender must choose one of the paths below and record the chosen receive method in the same task comment (or a follow-up comment that links back to it). A handoff is not "delivered" until the task comment contains both the request body and the receive method.
+
+- **Standard path** — notify the receiver pane with `mozyo-bridge message <pane-or-label> <text>` (or `mozyo-bridge notify-* ...` when the project provides a compatible substitute for the notification gate). Include the Asana task permalink in the notification body, and the durable comment / story id if the Asana API exposed one. Record the literal notification command (or a clear paraphrase) in the task comment so an auditor can replay the handoff later.
+- **Receiver pane unavailable** — record in the task comment that the receiver must open the relevant agent terminal and run `mozyo-bridge init <agent>` before retry, then state in chat that the handoff is pending operator action. Do not fall back to the retired local queue.
+- **Notification fails or is unusable** — record the un-notified state explicitly in the task comment ("not yet notified; receiver must read the comment manually") and mirror that state in chat. Do not fall back to `.agent_handoff/tasks.yaml`, `read-next --wait`, or Stop hook handoff waits.
+- **Sync handoff between two locally available agents** — same as the standard path; do not skip the comment record because the agents share a host or session.
+
+Receive method id:
+
+- If the Asana API returns a durable comment / story id for the new comment, treat that id as the canonical handoff id and include it in the notification.
+- If the API does not expose a durable id, fall back to the task permalink plus the comment timestamp and the latest comment context, and make the limitation explicit in the same comment.
+
+A report that records the comment but stops at "next agent will pick up" without specifying how (the receive method that an auditor could replay tomorrow) is incomplete and must be amended before the handoff is treated as delivered.
+
+Receiver-side: every notification you receive is a pointer to an Asana task comment, not a directive. Read the comment and the surrounding task history before acting on the prompt body.
+
 ## User Interaction And Escalation
 
 - Agents should work autonomously inside the active Asana task scope.
@@ -55,13 +80,31 @@
 - A workflow verification run only counts if the assigned implementation agent performs the normal development work and the coordinating/auditing agent performs the review or audit path.
 - If the coordinating/auditing agent mistakenly implements the normal development task directly, record the correction in Asana and rerun the verification from the assigned implementation agent through the review or audit path.
 
+## Scope Preservation
+
+- Difficulty splits work; it does not shrink the Asana task. Acceptance criteria stated in the task description remain intact unless the owner explicitly approves a change in a task comment.
+- Split work into subtasks or follow-up tasks so the total scope still appears in Asana. Do not silently drop deliverables.
+- Scope is more than UI. It typically includes data model, controller / route / authorization, specifications, manual verification, generated screenshots, seed data, existing URL or data compatibility, and operational flow.
+- Implementation Done must not contain unfinished scope. Unfinished scope belongs in an explicit "residual scope" task comment or in a new subtask / follow-up task, not in a "complete" claim.
+
+## Decision Routing
+
+Separate technical decisions from owner / business decisions before asking the owner.
+
+- Technical, design, rule, existing-spec consistency, UI structure, route, data integrity, authorization, and spec / test methodology decisions are design-consultation candidates. Route them through the auditor (or a dedicated design-consultation pass) before asking the owner.
+- Owner-only decisions are typically: rights and asset usage, legal wording, ongoing service or account continuity, brand judgement, business prioritization, deadlines, budgets, and release timing.
+- Do not collapse a technical decision into an owner decision. The owner will accept whatever choice you bring; the cost of skipping the design consultation surfaces as rework later.
+- When asking the owner is unavoidable, present options with pros / cons / impact summarized in the task comment so the owner is reading a structured decision, not a free-form question.
+
 ## Completion
 
 Before marking a task complete:
 
-1. Verify the requested work.
-2. Record material changes, verification, blockers, and remaining risks in an Asana comment.
-3. Mark the task complete only when its completion criteria are satisfied.
+1. Verify the requested work against the acceptance criteria, scope, and any design-consultation answers that bound the implementation.
+2. Record material changes, verification, blockers, remaining risks, and findings disposition in an Asana task comment.
+3. Pass through the review / audit comment when the project uses an audit agent. Implementation Done alone is not completion. Do not report "complete" or "done" in chat before the review / audit comment is captured on the task.
+4. Mark the Asana task complete only when its completion criteria are satisfied and (when applicable) the audit comment confirms no remaining findings.
+5. If anything from the original scope is still open at this point — subtasks, manual verification, generated capture confirmation, data-compatibility checks, ops-flow checks — record it as a residual-scope task comment or a new subtask and keep the parent task uncompleted.
 
 ## Prohibitions
 

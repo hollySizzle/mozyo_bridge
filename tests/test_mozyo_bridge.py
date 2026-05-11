@@ -400,6 +400,31 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("designated coordinator", installed_workflow)
             self.assertIn("Role Boundaries", installed_workflow)
             self.assertIn("coordinating/auditing agent must not directly implement", installed_workflow)
+            # Asana-native guardrails added in this task.
+            for marker in (
+                "Factual Posture",
+                "Prioritize factual correctness",
+                "review input, not completion",
+                "Handoff Startup Decision",
+                "Receiver pane unavailable",
+                "Notification fails",
+                "mozyo-bridge init",
+                "Receive method id",
+                "Asana API",
+                "Scope Preservation",
+                "residual scope",
+                "Decision Routing",
+            ):
+                self.assertIn(marker, installed_workflow)
+            # Asana central preset must NOT import Redmine journal / gate semantics.
+            for forbidden in (
+                "Redmine journal",
+                "Review Gate",
+                "Implementation Done Gate",
+                "Close Gate",
+                "Design Consultation Gate",
+            ):
+                self.assertNotIn(forbidden, installed_workflow)
 
             result, output = self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", str(home)])
 
@@ -411,11 +436,42 @@ class ScaffoldRulesTest(unittest.TestCase):
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), agents)
             self.assertIn("Asana task state と task comment", agents)
+            # Generated routers must not name vibes/docs/* paths as runtime context.
+            # vibes/docs/ is this repo's design/spec source, not an external scaffold
+            # target's runtime convention.
+            self.assertNotIn("vibes/docs/specs/project-map.md", agents)
+            self.assertNotIn("vibes/docs/rules/agent-workflow.md", agents)
+            self.assertNotIn("vibes/docs/", agents)
+            # The Project-Local Context heading was folded into step 3.
+            self.assertNotIn("## Project-Local Context", agents)
+            self.assertIn("target project 側の任意の convention", agents)
+            self.assertIn("mozyo-bridge の runtime 必須参照ではない", agents)
+
+            claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), claude)
+            self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
+            self.assertIn("迎合せず", claude)
+            self.assertIn("implementation done は task complete ではない", claude)
+            self.assertIn("Asana task comment", claude)
+            self.assertIn("受領方法", claude)
+            # CLAUDE.md stays thin even with the Claude-specific reminder block.
+            self.assertLess(len(claude.splitlines()), 30)
+            # Asana CLAUDE.md must not import Redmine-specific vocabulary.
+            for forbidden in ("Redmine journal", "Review Gate", "Implementation Done Gate"):
+                self.assertNotIn(forbidden, claude)
+
             state = scaffold_state(project)
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual("central", state["mode"])
             self.assertEqual("asana", state["preset"])
+            # Schema v2 + preset_hash from the previous task must still be in effect.
+            self.assertEqual(2, state["schema_version"])
+            self.assertEqual(
+                hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
+                state["preset_hash"],
+            )
+            self.assertEqual("2026.05.11", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
     def test_rules_install_and_scaffold_redmine_thin_router(self) -> None:
@@ -696,6 +752,17 @@ class ScaffoldStatusTest(unittest.TestCase):
     def test_scaffold_status_reports_clean_after_fresh_scaffold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home, project = self._setup_scaffold(Path(tmp))
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, result)
+            self.assertIn("manifest: present", output)
+            self.assertIn("central status: ok", output)
+            self.assertIn("result: clean", output)
+
+    def test_scaffold_status_reports_clean_after_fresh_asana_scaffold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp), preset="asana")
             result, output = self.run_cli(
                 ["scaffold", "status", "--target", str(project), "--home", str(home)]
             )
