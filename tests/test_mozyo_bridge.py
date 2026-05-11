@@ -544,6 +544,15 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("Redmine issue と journal state", agents)
             self.assertIn("Redmine gate lifecycle", agents)
             self.assertIn("mozyo-bridge notify-", agents)
+            # Generated routers must not name vibes/docs/* paths as runtime context.
+            # vibes/docs/ is this repo's design/spec source, not an external scaffold
+            # target's runtime convention.
+            self.assertNotIn("vibes/docs/specs/project-map.md", agents)
+            self.assertNotIn("vibes/docs/rules/agent-workflow.md", agents)
+            self.assertNotIn("vibes/docs/", agents)
+            self.assertNotIn("## Project-Local Context", agents)
+            self.assertIn("target project 側の任意の convention", agents)
+            self.assertIn("mozyo-bridge の runtime 必須参照ではない", agents)
 
             claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn(
