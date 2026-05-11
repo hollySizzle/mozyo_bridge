@@ -26,6 +26,7 @@ from mozyo_bridge.application.commands import (
     cmd_rules_install,
     cmd_rules_status,
     cmd_scaffold_rules,
+    cmd_scaffold_status,
     cmd_setup,
     cmd_spawn,
     cmd_status,
@@ -233,6 +234,12 @@ def build_parser() -> argparse.ArgumentParser:
     replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
     replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")
     scaffold_rules.set_defaults(func=cmd_scaffold_rules)
+
+    scaffold_status = scaffold_sub.add_parser("status")
+    add_scaffold_target_option(scaffold_status)
+    scaffold_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    scaffold_status.add_argument("--json", action="store_true", help="Emit structured JSON output instead of human-readable text")
+    scaffold_status.set_defaults(func=cmd_scaffold_status)
     return parser
 
 

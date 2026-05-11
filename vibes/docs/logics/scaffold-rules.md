@@ -188,7 +188,38 @@ mozyo-bridge scaffold rules <asana|redmine|none> \
 
 `--target` should default to the current working directory. This command generates strong router files, so it must not walk upward to a parent repository unless the user explicitly passes `--target` or `--repo`.
 
-`scaffold.json` should record the selected preset, central preset version, mozyo-bridge version, generated router file hashes, and the rule path that the routers reference. It is a local installation record, not a copy of the central rules.
+`scaffold.json` records the selected preset, central preset version, central preset content hash, mozyo-bridge version, generated router file hashes, and the rule path that the routers reference. It is a local installation record, not a copy of the central rules. The current schema is `schema_version: 2`; the `preset_hash` field (sha256 of the central `agent-workflow.md` at scaffold time) makes content-level drift detection possible. Pre-v2 manifests written by older mozyo-bridge releases are still readable but trigger a fail-and-upgrade signal from `scaffold status`.
+
+## Drift Detection
+
+Global central preset updates (e.g. after `pipx upgrade mozyo-bridge && mozyo-bridge rules install`) change the runtime guardrails that every scaffolded repo reads. The convenience of one update flowing into many repos is offset by the risk that an unintended change ships to repos whose owners did not review it. `mozyo-bridge scaffold status` resolves this by comparing the local `.mozyo-bridge/scaffold.json` against the currently installed central preset and against the on-disk router files.
+
+```bash
+mozyo-bridge scaffold status                       # implicit target = cwd
+mozyo-bridge scaffold status --target /path/to/proj
+mozyo-bridge scaffold status --target /path/to/proj --json
+```
+
+States reported per project:
+
+- `manifest: present` plus `central status: ok` and all router files `ok` — clean; exit 0.
+- `manifest: present` plus `central status: drifted-content` — the central preset's `agent-workflow.md` content changed since scaffold time; the repo's recorded behavior no longer matches what agents will actually read. Exit 1.
+- `manifest: present` plus `central status: drifted-version` — the version label moved without a content change, or the hash check is unavailable. Exit 1.
+- `manifest: present` plus `central status: missing` — the central preset is not installed on this machine; agents will fail at the read-central-preset guard. Run `mozyo-bridge rules install`. Exit 1.
+- `manifest: present` plus `central status: ok-version-only` — the manifest is schema v1 and lacks `preset_hash`; the version matches but content drift cannot be detected. Regenerate the manifest by re-running `mozyo-bridge scaffold rules <preset> --backup`. Exit 1.
+- Router file row `drifted` — the on-disk `AGENTS.md` or `CLAUDE.md` differs from the hash recorded at scaffold time; someone edited the generated file locally. Exit 1.
+- `manifest: missing` — the target directory has no `.mozyo-bridge/scaffold.json`; no scaffold was ever run there. Exit 1.
+
+`scaffold status` is for repo-local drift. The complementary `rules status` reports whether the central preset store itself is installed and up to date relative to the packaged version (i.e. it answers "does this host have the latest preset?"). The two commands have separate responsibilities: `rules status` for global install, `scaffold status` for per-repo manifest drift.
+
+End-user flow after a release ships:
+
+1. `pipx upgrade mozyo-bridge` (or the equivalent pip command).
+2. `mozyo-bridge rules install` — updates `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/` to the newly-packaged version.
+3. In each scaffolded repo, run `mozyo-bridge scaffold status`. If it reports `drifted-content`, decide whether to accept the new guardrails (re-run `mozyo-bridge scaffold rules <preset> --backup`) or pin by regenerating from a specific older release.
+4. CI can run `mozyo-bridge scaffold status --json` and fail the build on non-zero exit so unreviewed central-preset updates do not silently change agent behavior in production repos.
+
+Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. If a project ever needs an immutable snapshot of the preset content, that is a separate "export"/"pin" feature, not a default of `scaffold rules`. Do not conflate the two paths.
 
 ## Test Strategy
 

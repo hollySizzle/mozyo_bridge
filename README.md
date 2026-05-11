@@ -161,6 +161,16 @@ The generated routers point to `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/pres
 
 Existing `AGENTS.md` or `CLAUDE.md` files are not overwritten by default. Use `--dry-run` to preview, `--backup` to replace with backups, or `--force` to replace without backups.
 
+After upgrading mozyo-bridge (e.g. `pipx upgrade mozyo-bridge && mozyo-bridge rules install`), check each scaffolded project for drift:
+
+```bash
+mozyo-bridge scaffold status                       # implicit target = cwd
+mozyo-bridge scaffold status --target /path/to/proj
+mozyo-bridge scaffold status --target /path/to/proj --json
+```
+
+The command compares the project's `.mozyo-bridge/scaffold.json` against the installed central preset (content hash, not only the version label) and the on-disk `AGENTS.md` / `CLAUDE.md`. Exit code is non-zero when central preset content drifted, when a router was modified locally, when the central preset is missing, or when the manifest is missing. Use `mozyo-bridge scaffold rules <preset> --backup` to regenerate routers and accept the new central preset content.
+
 Detailed scaffold rules live in `vibes/docs/logics/scaffold-rules.md`.
 
 ## Notification Commands

@@ -126,12 +126,27 @@ def render_router_pair(preset: str, target: Path, workflow_path: Path) -> list[R
     return files
 
 
+def installed_preset_hash(preset: str, home: Path | None = None) -> str | None:
+    workflow = installed_agent_workflow(preset, home)
+    if not workflow.exists():
+        return None
+    return sha256_file(workflow)
+
+
+def installed_preset_version(preset: str, home: Path | None = None) -> str | None:
+    version_path = installed_preset_dir(preset, home) / "VERSION"
+    if not version_path.exists():
+        return None
+    return version_path.read_text(encoding="utf-8").strip()
+
+
 def manifest_content(preset: str, workflow_path: Path, rendered: list[RenderedFile]) -> str:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "central",
         "preset": preset,
         "preset_version": package_version(preset),
+        "preset_hash": sha256_file(workflow_path),
         "generated_by": f"mozyo-bridge {__version__}",
         "rule_path": str(workflow_path),
         "files": {
@@ -186,3 +201,126 @@ def scaffold_state(target: Path) -> dict[str, object] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]:
+    target = target.expanduser().resolve()
+    manifest_path = target / MANIFEST_RELATIVE_PATH
+    result: dict[str, object] = {
+        "target": str(target),
+        "manifest_path": str(manifest_path),
+        "manifest": "missing",
+        "clean": False,
+    }
+    if not manifest_path.exists():
+        return result
+
+    try:
+        state = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        result["manifest"] = "invalid"
+        result["error"] = f"manifest is not valid JSON: {exc}"
+        return result
+    if not isinstance(state, dict):
+        result["manifest"] = "invalid"
+        result["error"] = "manifest root must be a JSON object"
+        return result
+    preset = state.get("preset")
+    if not isinstance(preset, str) or preset not in PRESETS:
+        result["manifest"] = "invalid"
+        result["error"] = f"manifest preset is missing or unsupported: {preset!r}"
+        return result
+
+    schema_version = state.get("schema_version")
+    manifest_preset_version = state.get("preset_version")
+    manifest_preset_hash = state.get("preset_hash")
+    manifest_files = state.get("files") if isinstance(state.get("files"), dict) else {}
+
+    # Schema v2 contract: `files` must include AGENTS.md and CLAUDE.md with sha256
+    # strings so router drift can actually be verified. Without these, the status
+    # command cannot answer its own question, so refuse to call the manifest
+    # usable. Schema v1 manifests predate this contract and stay tolerated
+    # (they fall through to the `manifest-missing-hash` per-file status below).
+    if schema_version == 2:
+        required_router_files = ("AGENTS.md", "CLAUDE.md")
+        missing_router_entries = []
+        for filename in required_router_files:
+            entry = manifest_files.get(filename)
+            if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
+                missing_router_entries.append(filename)
+        if missing_router_entries:
+            result["manifest"] = "invalid"
+            result["error"] = (
+                "schema v2 manifest is missing router hash entries for: "
+                + ", ".join(missing_router_entries)
+                + ". Regenerate with `mozyo-bridge scaffold rules <preset> --backup`."
+            )
+            return result
+
+    central_workflow = installed_agent_workflow(preset, home)
+    central_version = installed_preset_version(preset, home)
+    central_hash = installed_preset_hash(preset, home)
+    if central_hash is None:
+        central_status = "missing"
+    elif manifest_preset_hash is None:
+        # Pre-v2 manifest cannot detect content drift. Fall back to version compare.
+        if manifest_preset_version is not None and manifest_preset_version == central_version:
+            central_status = "ok-version-only"
+        else:
+            central_status = "drifted-version"
+    elif manifest_preset_hash != central_hash:
+        central_status = "drifted-content"
+    elif manifest_preset_version is not None and manifest_preset_version != central_version:
+        # Same content but the recorded version label moved (rare).
+        central_status = "drifted-version"
+    else:
+        central_status = "ok"
+
+    file_rows: list[dict[str, str]] = []
+    for filename in sorted(manifest_files.keys()):
+        recorded = manifest_files.get(filename)
+        expected_hash = (
+            recorded.get("sha256") if isinstance(recorded, dict) else None
+        )
+        on_disk = target / filename
+        if not on_disk.exists():
+            file_status = "missing"
+            on_disk_hash = None
+        elif not isinstance(expected_hash, str):
+            file_status = "manifest-missing-hash"
+            on_disk_hash = sha256_file(on_disk)
+        else:
+            on_disk_hash = sha256_file(on_disk)
+            file_status = "ok" if on_disk_hash == expected_hash else "drifted"
+        file_rows.append(
+            {
+                "path": filename,
+                "status": file_status,
+                "expected_sha256": expected_hash or "",
+                "actual_sha256": on_disk_hash or "",
+            }
+        )
+
+    # Only an exact `ok` is fully clean. `ok-version-only` means the manifest is
+    # schema v1 and we cannot detect content drift; flag so the user regenerates
+    # the manifest under schema v2.
+    central_drift = central_status != "ok"
+    router_drift = any(row["status"] != "ok" for row in file_rows)
+    clean = not central_drift and not router_drift
+
+    result.update(
+        {
+            "manifest": "present",
+            "schema_version": schema_version,
+            "preset": preset,
+            "rule_path": str(central_workflow),
+            "manifest_preset_version": manifest_preset_version,
+            "manifest_preset_hash": manifest_preset_hash,
+            "installed_preset_version": central_version,
+            "installed_preset_hash": central_hash,
+            "central_status": central_status,
+            "files": file_rows,
+            "clean": clean,
+        }
+    )
+    return result

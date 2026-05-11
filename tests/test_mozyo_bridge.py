@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -659,6 +661,222 @@ class ScaffoldRulesTest(unittest.TestCase):
                 self.assertIn(str((Path(tmp) / "home").resolve()), agents)
             finally:
                 os.chdir(cwd)
+
+
+class ScaffoldStatusTest(unittest.TestCase):
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def _setup_scaffold(self, tmp: Path, preset: str = "redmine") -> tuple[Path, Path]:
+        home = tmp / "home"
+        project = tmp / "project"
+        project.mkdir()
+        self.run_cli(["rules", "install", "--home", str(home)])
+        self.run_cli(["scaffold", "rules", preset, "--target", str(project), "--home", str(home)])
+        return home, project
+
+    def test_manifest_records_preset_hash_and_schema_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp), "redmine")
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(2, state["schema_version"])
+            workflow = home / "rules" / "presets" / "redmine" / "agent-workflow.md"
+            expected_hash = hashlib.sha256(workflow.read_bytes()).hexdigest()
+            self.assertEqual(expected_hash, state["preset_hash"])
+            self.assertIn("AGENTS.md", state["files"])
+            self.assertIn("sha256", state["files"]["AGENTS.md"])
+
+    def test_scaffold_status_reports_clean_after_fresh_scaffold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, result)
+            self.assertIn("manifest: present", output)
+            self.assertIn("central status: ok", output)
+            self.assertIn("result: clean", output)
+
+    def test_scaffold_status_detects_central_preset_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            workflow = home / "rules" / "presets" / "redmine" / "agent-workflow.md"
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8"
+            )
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("central status: drifted-content", output)
+            self.assertIn("result: drift detected", output)
+            self.assertIn("central preset content has changed", output)
+
+    def test_scaffold_status_detects_router_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            agents_path = project / "AGENTS.md"
+            agents_path.write_text(
+                agents_path.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8"
+            )
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("AGENTS.md: drifted", output)
+            self.assertIn("router AGENTS.md was modified locally", output)
+
+    def test_scaffold_status_reports_missing_central_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            preset_dir = home / "rules" / "presets" / "redmine"
+            shutil.rmtree(preset_dir)
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("central status: missing", output)
+            self.assertIn("`mozyo-bridge rules install`", output)
+
+    def test_scaffold_status_reports_missing_manifest_for_empty_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            home = Path(tmp) / "home"
+            self.run_cli(["rules", "install", "--home", str(home)])
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(empty), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("manifest: missing", output)
+            self.assertIn("no scaffold manifest", output)
+
+    def test_scaffold_status_handles_schema_v1_manifest_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            manifest_path = project / ".mozyo-bridge" / "scaffold.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            # Simulate a manifest written by a pre-hash version of the scaffolder.
+            data["schema_version"] = 1
+            data.pop("preset_hash", None)
+            manifest_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            # Same version + no hash means we can't prove content drift, but the
+            # known router hashes still verify; treat as drift so the user upgrades.
+            self.assertEqual(1, result)
+            self.assertIn("central status: ok-version-only", output)
+            self.assertIn("schema v1 (no preset_hash)", output)
+
+    def test_scaffold_status_reports_invalid_manifest_on_bad_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            manifest_path = project / ".mozyo-bridge" / "scaffold.json"
+            manifest_path.write_text("{bad json", encoding="utf-8")
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("manifest: invalid", output)
+            self.assertIn("manifest is not valid JSON", output)
+
+    def test_scaffold_status_json_output_for_invalid_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            manifest_path = project / ".mozyo-bridge" / "scaffold.json"
+            manifest_path.write_text("{bad json", encoding="utf-8")
+            result, output = self.run_cli(
+                [
+                    "scaffold",
+                    "status",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            self.assertEqual(1, result)
+            payload = json.loads(output)
+            self.assertEqual("invalid", payload["manifest"])
+            self.assertFalse(payload["clean"])
+            self.assertIn("error", payload)
+
+    def test_scaffold_status_rejects_schema_v2_manifest_with_missing_router_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            manifest_path = project / ".mozyo-bridge" / "scaffold.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data["files"] = {}
+            manifest_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("manifest: invalid", output)
+            self.assertIn("schema v2 manifest is missing router hash entries", output)
+            self.assertIn("AGENTS.md", output)
+            self.assertIn("CLAUDE.md", output)
+
+    def test_scaffold_status_rejects_schema_v2_manifest_with_partial_router_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            manifest_path = project / ".mozyo-bridge" / "scaffold.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data["files"].pop("CLAUDE.md", None)
+            manifest_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("manifest: invalid", output)
+            self.assertIn("CLAUDE.md", output)
+            self.assertNotIn("result: clean", output)
+
+    def test_scaffold_status_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp))
+            result, output = self.run_cli(
+                [
+                    "scaffold",
+                    "status",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            self.assertEqual(0, result)
+            payload = json.loads(output)
+            self.assertTrue(payload["clean"])
+            self.assertEqual("redmine", payload["preset"])
+            self.assertEqual(2, payload["schema_version"])
+            self.assertEqual("ok", payload["central_status"])
+            self.assertEqual(
+                payload["manifest_preset_hash"], payload["installed_preset_hash"]
+            )
 
 
 class NotifyContractTest(unittest.TestCase):

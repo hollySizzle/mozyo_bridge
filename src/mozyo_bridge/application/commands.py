@@ -33,7 +33,7 @@ from mozyo_bridge.infrastructure.tmux_client import (
     set_pane_label,
     source_tmux_conf,
 )
-from mozyo_bridge.scaffold.rules import install_rules, rules_status, write_scaffold
+from mozyo_bridge.scaffold.rules import install_rules, rules_status, scaffold_status, write_scaffold
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import LABEL_OPTION, default_queue_path, default_tmux_conf, resolve_repo_root
 
@@ -475,3 +475,75 @@ def cmd_scaffold_rules(args: argparse.Namespace) -> int:
     for path in paths:
         print(f"{action}: {path}")
     return 0
+
+
+def cmd_scaffold_status(args: argparse.Namespace) -> int:
+    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
+    target = scaffold_target_from_args(args)
+    status = scaffold_status(target, home=home)
+
+    if getattr(args, "json", False):
+        import json as _json
+
+        print(_json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if status.get("clean") else 1
+
+    print(f"target: {status['target']}")
+    print(f"manifest: {status['manifest']}")
+    if status["manifest"] != "present":
+        if status["manifest"] == "missing":
+            print(f"  no scaffold manifest at {status['manifest_path']}")
+            print("  run `mozyo-bridge scaffold rules <preset>` first")
+        elif status["manifest"] == "invalid":
+            print(f"  manifest at {status['manifest_path']} is invalid")
+            if "error" in status:
+                print(f"  {status['error']}")
+        return 1
+
+    print(f"preset: {status['preset']}")
+    print(f"schema_version: {status.get('schema_version')}")
+    print(f"rule_path: {status['rule_path']}")
+    print(
+        "central preset version: "
+        f"manifest={status.get('manifest_preset_version')!r} "
+        f"installed={status.get('installed_preset_version')!r}"
+    )
+    print(
+        "central preset hash: "
+        f"manifest={status.get('manifest_preset_hash')!r} "
+        f"installed={status.get('installed_preset_hash')!r}"
+    )
+    print(f"central status: {status.get('central_status')}")
+    print("router files:")
+    for row in status.get("files", []):
+        print(f"  {row['path']}: {row['status']}")
+
+    if status.get("clean"):
+        print("result: clean")
+        return 0
+
+    print("result: drift detected")
+    central_status = status.get("central_status")
+    if central_status == "missing":
+        print("  - central preset is missing on disk; run `mozyo-bridge rules install`")
+    elif central_status == "drifted-content":
+        print("  - central preset content has changed since scaffold time")
+        print(
+            "    run `mozyo-bridge scaffold rules <preset> --backup` to regenerate routers,"
+            " or `--force` to accept the new central preset"
+        )
+    elif central_status == "drifted-version":
+        print("  - central preset version label changed since scaffold time")
+    elif central_status == "ok-version-only":
+        print(
+            "  - manifest is schema v1 (no preset_hash); cannot detect content drift."
+            " Regenerate the manifest by running `mozyo-bridge scaffold rules <preset> --backup` to upgrade."
+        )
+    for row in status.get("files", []):
+        if row["status"] == "drifted":
+            print(f"  - router {row['path']} was modified locally")
+        elif row["status"] == "missing":
+            print(f"  - router {row['path']} is missing on disk")
+        elif row["status"] == "manifest-missing-hash":
+            print(f"  - manifest entry for {row['path']} has no recorded hash")
+    return 1
