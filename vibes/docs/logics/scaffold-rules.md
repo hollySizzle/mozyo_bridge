@@ -221,6 +221,33 @@ End-user flow after a release ships:
 
 Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. If a project ever needs an immutable snapshot of the preset content, that is a separate "export"/"pin" feature, not a default of `scaffold rules`. Do not conflate the two paths.
 
+## Beta Tester Verification
+
+beta tester が GitHub `main` から CLI を install した後、user-global rules と repo-local scaffold が期待通り動いていることを確認する流れ。詳細な install 手順は `README.md` の `Beta Tester Install (GitHub main)` 節を見る。本節はそこに重複させずに、責務差と検証観点だけを残す。
+
+`rules status` と `scaffold status` の責務差:
+
+- `mozyo-bridge rules install` / `mozyo-bridge rules status` は user-global 配置 (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/`) を相手にする。"このホストに preset が install されているか / 古くないか" を答える。host 全体の状態を見る command であり、特定の scaffold 済 project を必要としない。
+- `mozyo-bridge scaffold rules <preset>` / `mozyo-bridge scaffold status` は repo-local routers (`AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/scaffold.json`) を相手にする。"この repo の manifest が user-global preset と on-disk router と整合しているか" を答える。1 つの scaffold 済 project の drift を見る command。
+- `rules status` clean でも `scaffold status` は drift を出しうる (例: 古い manifest が新しい preset hash を指していない)。
+- `scaffold status` clean でも、`rules status` で missing が出ていれば agent は起動時 guard で停止する。両方の clean が揃ってはじめて tester 環境は通る。
+
+tester smoke check 観点:
+
+1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `asana` / `redmine` / `none` を expected version で報告する。
+2. dummy project を 2 つ作り、`mozyo-bridge scaffold rules asana --target ...` と `mozyo-bridge scaffold rules redmine --target ...` をそれぞれ実行する。どちらか片方のみで終わらせない (preset 間 boundary の確認が落ちる)。
+3. 各 dummy project で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
+4. 生成された `AGENTS.md` / `CLAUDE.md` が preset 期待値を持つ。例:
+   - Redmine: `Redmine issue と journal state` / `Redmine gate lifecycle` / `mozyo-bridge notify-` を含む。`vibes/docs/specs/project-map.md` などの mozyo_bridge 固有 path を含まない。
+   - Asana: `Asana task state と task comment` を含む。Redmine 固有の gate 用語 (`Implementation Done Gate` 等) を含まない。
+
+PyPI release との見分け:
+
+- `mozyo-bridge --version` の出力は `pyproject.toml` の package version 文字列であり、GitHub `main` で未 bump の状態だと PyPI release と同じ string が表示されうる。版確認に `mozyo-bridge --version` だけを使わず、(a) `mozyo-bridge scaffold status --help` などの GitHub `main` で追加された sub-command が存在するか、(b) 生成された router の文言が GitHub `main` の preset 内容と一致するか、で確認する。
+- docs 上は、未 PyPI release の GitHub `main` 変更を、すでに PyPI で利用可能であるかのように書かない。tester onboarding は GitHub `main` 経路と PyPI 経路を別物として扱う。
+
+詳細な drift 状態の意味は本節の `Drift Detection` を正本にする。
+
 ## Test Strategy
 
 Implementation tests should cover:

@@ -39,6 +39,61 @@ The short alias is available for local interactive use:
 mozyo <command>
 ```
 
+## Beta Tester Install (GitHub main)
+
+PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。
+
+1. GitHub `main` から install (既存 PyPI install を上書き):
+
+   ```bash
+   pipx install --force git+https://github.com/hollySizzle/mozyo_bridge.git
+   ```
+
+2. user-global rules を install して状態を確認:
+
+   ```bash
+   mozyo-bridge rules install
+   mozyo-bridge rules status
+   ```
+
+   `rules status` は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/` に展開された user-global 規約 (`asana` / `redmine` / `none`) の状態を表示します。
+
+3. agent skill を install:
+
+   ```bash
+   # Codex skill (user-global, ${CODEX_HOME:-~/.codex}/skills/)
+   curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_codex_skill.sh | sh
+
+   # Claude Code skill (user-global, ${MOZYO_BRIDGE_CLAUDE_HOME:-~/.claude}/skills/)
+   curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
+     -o /tmp/install_mozyo_bridge_claude_skill.sh
+   MOZYO_BRIDGE_CLAUDE_SCOPE=global \
+     sh /tmp/install_mozyo_bridge_claude_skill.sh
+   ```
+
+   `project` scope や両 scope 配布、precedence の落とし穴 (Claude Code は同名 skill で personal が project を override) は `Agent Skill Install` 節と `vibes/docs/logics/skill-distribution.md` を参照してください。
+
+4. Claude Code / Codex を再起動して、新しい skill と user-global 規約を再読み込みさせます。同 session 内では skill index がキャッシュされるため再起動を省略しないでください。
+
+5. dummy project で repo-local scaffold を smoke:
+
+   ```bash
+   mkdir -p /tmp/mb-smoke-asana
+   mozyo-bridge scaffold rules asana --target /tmp/mb-smoke-asana
+   mozyo-bridge scaffold status --target /tmp/mb-smoke-asana
+
+   mkdir -p /tmp/mb-smoke-redmine
+   mozyo-bridge scaffold rules redmine --target /tmp/mb-smoke-redmine
+   mozyo-bridge scaffold status --target /tmp/mb-smoke-redmine
+   ```
+
+   `scaffold status` が両 dummy project で `result: clean` を返せば、user-global 規約・repo-local routers・manifest が整合しています。
+
+`mozyo-bridge rules status` (user-global 規約の install 状態) と `mozyo-bridge scaffold status` (repo-local manifest drift) は別責務です。前者は host 全体、後者は 1 つの scaffold 済 project を見ます。詳細は次の logic docs を正本にしてください。
+
+- `vibes/docs/logics/skill-distribution.md`
+- `vibes/docs/logics/scaffold-rules.md`
+
 ## Project Root Resolution
 
 PyPI / pipx などで CLI としてインストールする場合は、インストール先ではなく実行場所から project root を決めます。

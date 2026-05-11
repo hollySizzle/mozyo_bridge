@@ -101,6 +101,27 @@ MOZYO_BRIDGE_SKILL_ARCHIVE_URL="file://$out" \
 - skill 本体の runtime reference は `skills/mozyo-bridge-agent/references/` に置き、README や root router へ詳細規約を重複させない。
 - `skills/mozyo-bridge-agent/references/` は Codex install と Claude install のどちらにも同期される配布対象である。agent 実行時に従うべき運用境界は、まずこの runtime reference に置く。
 
+## Beta Tester Verification
+
+beta tester が GitHub `main` から CLI を install した後、skill 配布が期待通り動いていることを確認する流れ。詳細 README handoff は `README.md` の `Beta Tester Install (GitHub main)` 節を見る。本節はそこに重複させずに、検証観点と落とし穴だけを残す。
+
+検証観点:
+
+1. Codex user-global skill: `scripts/install_codex_skill.sh` 実行後、`${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/SKILL.md` が存在し、`SKILL.md` の `name` / `description` が GitHub `main` の内容と一致する。
+2. Claude user-global skill: `MOZYO_BRIDGE_CLAUDE_SCOPE=global` で `scripts/install_claude_skill.sh` 実行後、`${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` が存在する。`global` scope では `.claude/skills/` 配下に adapter を生成しない (Claude Code は user skill 直下の `SKILL.md` を直接読むため)。
+3. agent を再起動した後、Claude / Codex の skill 一覧に `mozyo-bridge-agent` が出る。同 session 内では skill index がキャッシュされるため再起動を省略しない。
+
+PyPI release との見分け:
+
+- `mozyo-bridge --version` の出力は `pyproject.toml` の package version 文字列であり、GitHub `main` で未 bump の状態だと PyPI release と同じ string が表示されうる。skill 配布側で beta 適用を確認するには、(a) install 直後の `SKILL.md` 内容と GitHub `main` の最新差分を突き合わせる、(b) 同 commit に紐づく未 release 変更 (例: 新 reference file 追加) の存在を確認する。
+
+precedence の落とし穴:
+
+- Claude Code は同名 skill で personal (`~/.claude/skills/`) が project (`.claude/skills/`) を override する。beta tester が project skill も併用している repo では、`MOZYO_BRIDGE_CLAUDE_SCOPE=global` で install した personal copy が project copy を shadow する。tester は `cat ${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` と `cat <project>/.claude/skills/mozyo-bridge-agent/SKILL.md` の差分を目視確認するか、片方を一時退避させて挙動を切り分ける。
+- Codex には Claude のような multi-scope precedence rule は documented されていない。Codex skill は user-global 配置のみを標準経路とする。
+
+`scope=both` を提供しない理由、override env、archive URL の意味は本文書の `Claude install scope` / `運用` セクションを正本にする。
+
 ## 禁止事項
 
 - skill ディレクトリに README や install guide を増やさない。
