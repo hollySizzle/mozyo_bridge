@@ -1,33 +1,23 @@
-# agent and leader project router
-
-**重要**: あなたは AI agent である。ユーザーに迎合せず、事実確認に基づいて技術的に正直な結論を述べる。
+# Claude Code Router
 
 @AGENTS.md
 
-## Session Bootstrap
+## 必須規約
 
-1. `AGENTS.md` の「起動時に読むもの」を確認する。
-2. Notion グローバル規約を fetch する。
-3. `cwd`、Asana project、active task を確認する。
-4. 実作業の詳細は `vibes/docs/` 配下の該当文書を読む。
+非自明な作業を始める前に、mozyo-bridge の Asana central preset を読む:
 
-## Router
+- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
 
-- 作業規約: `vibes/docs/rules/agent-workflow.md`
-- project 構造: `vibes/docs/specs/project-map.md`
-- release 判断と検証: `vibes/docs/logics/release-flow.md`
-- skill 配布方針: `vibes/docs/logics/skill-distribution.md`
-- scaffold rules 方針: `vibes/docs/logics/scaffold-rules.md`
-- ticket-ID 起動 entrypoint: `vibes/docs/logics/autonomous-ticket-entrypoint.md`
-- dogfood scaffold preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
-- Asana task 作成テンプレート: `vibes/docs/temps/asana-task.md`
-- shared skill: `skills/mozyo-bridge-agent/SKILL.md`
+この file が存在しない場合は停止し、operator に以下の実行を依頼する:
 
-## Guardrails
+```bash
+mozyo-bridge rules install
+```
 
-- root router を詳細規約で肥大化させない。
-- Asana task なしに非自明な作業を始めない。
-- real token を記録・commit しない。
-- local token upload より GitHub Actions Trusted Publishing を優先する。
-- `mozyo-bridge` の通知は作業開始の合図にすぎない。必ず source of truth を確認する。
-- この repository では既存 router を維持したまま Asana scaffold preset を dogfood する。preset が取得できない場合は、読んだふりをせず停止する。
+## ClaudeCode 起動時の最小 reminder
+
+- 迎合せず事実に基づいて結論を述べる。意見の不一致は Asana task comment に残す (chat だけで終わらせない)。
+- implementation done は task complete ではない。review / audit comment が Asana task に記録されるまで完了報告しない。
+- pane 通知は通知でしかない。判断の正本は常に Asana task description と task comment を読む。
+- audit / design consultation を送ったら、受領方法 (`mozyo-bridge message` / `notify-*` 通知 / operator が pane を立ち上げる手順 / 未通知の明記) を Asana task comment に必ず含める。Asana comment / story id が利用可能ならそれを、利用できなければ task permalink + comment timestamp / context を受領 id として記録する。受領方法を書かずに handoff を完結させない。
+- 詳細・例外・section templates は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md` を読む。重複させない。
