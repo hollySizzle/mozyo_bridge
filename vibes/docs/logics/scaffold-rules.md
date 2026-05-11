@@ -268,6 +268,7 @@ Implementation tests should cover:
 - No `--vendor` path or repo-local preset copy is included in the initial CLI.
 - Redmine templates mention issue and journal gates.
 - Asana templates mention task, project, and comment based handoffs.
+- Asana and Redmine central presets include a Ticket-ID Entrypoint section that requires fetching the durable record before acting on pane or chat framing, and the section preserves each system's vocabulary.
 - `none` templates clearly state that no external execution queue exists.
 
 Use filesystem temporary directories for write behavior tests. Override `MOZYO_BRIDGE_HOME` in tests so central rule installation never touches the real user home. Keep tests independent from live Asana, Redmine, Notion, or tmux state.

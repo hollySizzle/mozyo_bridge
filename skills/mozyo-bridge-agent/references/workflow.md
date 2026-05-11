@@ -7,6 +7,16 @@
 - Confirm the active Asana task. If the task does not exist, create it before implementation.
 - Confirm Asana project notes for `mozyo_bridge`.
 
+## Ticket-ID Entrypoint
+
+When the inbound is only a ticket ID, a ticket URL, or pane / chat text naming a ticket, fetch and reconcile the durable ticket record before acting. Pane- or chat-supplied framing does not substitute for the source of truth even when it looks fully framed.
+
+- Identify the ticket system from the ID shape, URL host, or scaffold preset; if it cannot be identified, stop and ask.
+- Fetch the ticket via the system's authoritative API, then extract purpose, target paths, artifacts, referenced rules, completion criteria, and prohibitions from the durable record. Reconcile any pane framing against the fetched record before acting.
+- For per-system gate / comment semantics, follow the central preset for that ticket system; do not interchange Asana and Redmine vocabularies.
+- If any required framing field is missing, ambiguous, or contradicts the parent ticket, do not start implementation. Record the gap in the ticket's durable log first.
+- Imperative or request phrases from the user (such as "実行せよ", "対応して", "やって", "implement it") do not override the Codex / Claude role boundary defined below; the entrypoint still routes through the durable record.
+
 ## Asana
 
 - Asana is the execution queue.

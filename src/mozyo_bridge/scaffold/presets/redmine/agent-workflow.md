@@ -23,6 +23,20 @@
 4. Read only the project-local docs needed for the current task. If the project provides a docs catalog or active-doc resolver, use it to find the rules that bind to the changed paths and read the actual rule body, not just titles.
 5. If the issue, parent issue, or journal is missing, ambiguous, or inaccessible, stop and ask for the correct gate.
 
+## Ticket-ID Entrypoint
+
+When the inbound is "ticket-ID only" — a Redmine issue ID, a Redmine issue URL, or pane / chat text naming an issue (for example "issue X please handle") — this entrypoint applies even when the pane / chat body looks fully framed. The pane carries a journal pointer; the Redmine issue is the source of truth.
+
+Before acting:
+
+1. Fetch the Redmine issue from the project's Redmine instance, including the most recent journals.
+2. Confirm the parent issue (Epic / Feature / UserStory) and capture purpose, acceptance criteria, and known prerequisites.
+3. Identify the journal id that bounds the current handoff: typically the Review Request, Design Consultation, or Implementation Done gate. If the named journal does not exist, create the appropriate gate before acting on the prompt body.
+4. Map the project's Redmine statuses and trackers to the standard gate lifecycle (Start / Progress Log / Design Consultation / Implementation Done / Review Request / Review / Close); do not invent parallel conventions.
+5. If any required framing field is missing, ambiguous, or contradicts the parent, do not start implementation. Record the gap in a Progress Log gate before notifying anyone.
+
+Pane- or chat-supplied framing never substitutes for the durable issue record; it must be reconciled against the fetched issue even when the pane text looks like a complete work order. Do not collapse Redmine semantics into Asana's single-comment-thread shape — the canonical handoff id is the Redmine journal, and gate ordering matters for audit replay.
+
 ## Redmine Gate Lifecycle
 
 The standard lifecycle for a normal development task. Each gate must be a durable Redmine record. Pane notifications carry the journal id that points back to the gate.

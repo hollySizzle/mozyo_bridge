@@ -414,6 +414,11 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Scope Preservation",
                 "residual scope",
                 "Decision Routing",
+                # Ticket-ID entrypoint runtime reflection.
+                "Ticket-ID Entrypoint",
+                'ticket-ID only',
+                "pane / chat body looks fully framed",
+                "task comment / story id",
             ):
                 self.assertIn(marker, installed_workflow)
             # Asana central preset must NOT import Redmine journal / gate semantics.
@@ -471,7 +476,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.11", state["preset_version"])
+            self.assertEqual("2026.05.11.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
     def test_rules_install_and_scaffold_redmine_thin_router(self) -> None:
@@ -508,6 +513,11 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Implementation Done is not",
                 "Stop hook handoff waits",
                 "Prioritize factual correctness",
+                # Ticket-ID entrypoint runtime reflection.
+                "Ticket-ID Entrypoint",
+                'ticket-ID only',
+                "pane / chat body looks fully framed",
+                "canonical handoff id is the Redmine journal",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
@@ -574,7 +584,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.05.11.1", state["preset_version"])
+            self.assertEqual("2026.05.11.2", state["preset_version"])
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

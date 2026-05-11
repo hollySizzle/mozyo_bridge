@@ -23,6 +23,20 @@
 4. Read only the project-local docs needed for the task.
 5. If the task is missing, ambiguous, or inaccessible, stop and ask for the correct task.
 
+## Ticket-ID Entrypoint
+
+When the inbound is "ticket-ID only" — an Asana task ID, an Asana task URL, or pane / chat text naming a task (for example "task X を実装してください") — this entrypoint applies even when the pane / chat body looks fully framed. The pane is a notification edge; the Asana task is the source of truth.
+
+Before acting:
+
+1. Fetch the Asana task via the API, including its comments and any subtasks.
+2. Read the task description against the standard shape (目的 / 作業対象パス / 成果物パス / 参照規約 / 完了条件 / 禁止事項) and the latest task comment for handoff framing, audit feedback, and the chosen receive method.
+3. Walk to the parent task (UserStory / Epic) when the current task is part of a larger initiative, and reconcile its acceptance criteria with the current task.
+4. If any required framing field is missing, ambiguous, or contradicts the parent, do not start implementation. Record the gap in a task comment and resolve it through the role boundary before acting.
+5. Treat the durable Asana comment / story id of the latest handoff as the canonical handoff anchor when the API exposes one; otherwise use the task permalink plus the comment timestamp and make the limitation explicit.
+
+Pane- or chat-supplied framing never substitutes for the durable task record; it must be reconciled against the fetched task even when the pane text looks like a complete work order. Asana's durable handoff anchor is the task comment / story id; do not import gate / journal vocabulary from other ticket systems into Asana.
+
 ## Task Description Shape
 
 ```markdown
