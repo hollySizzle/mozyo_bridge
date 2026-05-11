@@ -19,6 +19,7 @@
 - release / verification logic: `vibes/docs/logics/release-flow.md`
 - skill distribution logic: `vibes/docs/logics/skill-distribution.md`
 - scaffold rules logic: `vibes/docs/logics/scaffold-rules.md`
+- autonomous ticket-ID entrypoint: `vibes/docs/logics/autonomous-ticket-entrypoint.md`
 - dogfood scaffold preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
 - Asana task template: `vibes/docs/temps/asana-task.md`
 - shared Claude/Codex skill: `skills/mozyo-bridge-agent/SKILL.md`
