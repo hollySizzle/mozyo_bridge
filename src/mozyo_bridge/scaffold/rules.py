@@ -42,6 +42,16 @@ def installed_agent_workflow(preset: str, home: Path | None = None) -> Path:
     return installed_preset_dir(preset, home) / "agent-workflow.md"
 
 
+def portable_rule_path(preset: str) -> str:
+    # Symbolic path embedded into generated routers and the scaffold manifest so
+    # they stay portable across hosts (no user-specific home leakage) while still
+    # honoring MOZYO_BRIDGE_HOME at consumption time. The consuming agent expands
+    # ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} when it reads the router.
+    if preset not in PRESETS:
+        die(f"unsupported rules preset: {preset}")
+    return f"${{MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}}/rules/presets/{preset}/agent-workflow.md"
+
+
 def package_text(preset: str, filename: str) -> str:
     return package_preset_root(preset).joinpath(filename).read_text(encoding="utf-8")
 
@@ -112,7 +122,7 @@ def router_context(preset: str, target: Path, workflow_path: Path) -> dict[str, 
         "preset": preset,
         "preset_version": package_version(preset),
         "project_root": str(target),
-        "rule_path": str(workflow_path),
+        "rule_path": portable_rule_path(preset),
         "mozyo_bridge_version": __version__,
     }
 
@@ -141,6 +151,9 @@ def installed_preset_version(preset: str, home: Path | None = None) -> str | Non
 
 
 def manifest_content(preset: str, workflow_path: Path, rendered: list[RenderedFile]) -> str:
+    # `rule_path` is stored in symbolic form so the manifest stays safe to commit
+    # in target repositories. Drift detection uses `preset_hash` and per-file
+    # sha256 entries, not this field, so sanitizing it does not weaken status.
     payload = {
         "schema_version": 2,
         "mode": "central",
@@ -148,7 +161,7 @@ def manifest_content(preset: str, workflow_path: Path, rendered: list[RenderedFi
         "preset_version": package_version(preset),
         "preset_hash": sha256_file(workflow_path),
         "generated_by": f"mozyo-bridge {__version__}",
-        "rule_path": str(workflow_path),
+        "rule_path": portable_rule_path(preset),
         "files": {
             str(item.path): {
                 "sha256": sha256_text(item.content),

@@ -447,7 +447,14 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertTrue((project / "CLAUDE.md").exists())
             self.assertFalse((project / "vibes" / "docs" / "rules" / "asana-agent-workflow.md").exists())
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), agents)
+            self.assertIn(
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
+                agents,
+            )
+            # The router must not leak the host-resolved home path or any
+            # user-specific absolute home path.
+            self.assertNotIn(str(home), agents)
+            self.assertNotIn("/Users/", agents)
             self.assertIn("Asana task state と task comment", agents)
             # Generated routers must not name vibes/docs/* paths as runtime context.
             # vibes/docs/ is this repo's design/spec source, not an external scaffold
@@ -461,7 +468,12 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("mozyo-bridge の runtime 必須参照ではない", agents)
 
             claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), claude)
+            self.assertIn(
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
+                claude,
+            )
+            self.assertNotIn(str(home), claude)
+            self.assertNotIn("/Users/", claude)
             self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
             self.assertIn("迎合せず", claude)
             self.assertIn("implementation done は task complete ではない", claude)
@@ -556,9 +568,11 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertTrue((project / "CLAUDE.md").exists())
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(
-                str(home / "rules" / "presets" / "redmine" / "agent-workflow.md"),
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md",
                 agents,
             )
+            self.assertNotIn(str(home), agents)
+            self.assertNotIn("/Users/", agents)
             self.assertIn("Redmine issue と journal state", agents)
             self.assertIn("Redmine gate lifecycle", agents)
             self.assertIn("mozyo-bridge notify-", agents)
@@ -574,9 +588,11 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn(
-                str(home / "rules" / "presets" / "redmine" / "agent-workflow.md"),
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md",
                 claude,
             )
+            self.assertNotIn(str(home), claude)
+            self.assertNotIn("/Users/", claude)
             self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
             self.assertIn("迎合せず", claude)
             self.assertIn("implementation_done は completion ではない", claude)
@@ -722,7 +738,11 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
             self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
 
-    def test_relative_home_is_recorded_as_absolute_rule_path(self) -> None:
+    def test_relative_home_does_not_leak_into_router_or_manifest(self) -> None:
+        # Even when --home resolves to a host-specific absolute path, the
+        # generated router and the scaffold manifest must record the portable
+        # ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} symbolic form. This guards
+        # against personal-home leakage in committed artifacts.
         with tempfile.TemporaryDirectory() as tmp:
             cwd = Path.cwd()
             try:
@@ -737,13 +757,60 @@ class ScaffoldRulesTest(unittest.TestCase):
                 self.assertIsNotNone(state)
                 assert state is not None
                 self.assertEqual(
-                    str((Path(tmp) / "home" / "rules" / "presets" / "asana" / "agent-workflow.md").resolve()),
+                    "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
                     state["rule_path"],
                 )
-                agents = (project / "AGENTS.md").read_text(encoding="utf-8")
-                self.assertIn(str((Path(tmp) / "home").resolve()), agents)
+
+                resolved_home = (Path(tmp) / "home").resolve()
+                for filename in ("AGENTS.md", "CLAUDE.md", ".mozyo-bridge/scaffold.json"):
+                    text = (project / filename).read_text(encoding="utf-8")
+                    self.assertNotIn(str(resolved_home), text)
+                    self.assertIn(
+                        "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
+                        text,
+                    )
             finally:
                 os.chdir(cwd)
+
+    def test_scaffold_does_not_leak_home_path_for_any_preset(self) -> None:
+        # Fresh scaffold for every supported preset must avoid leaking the
+        # resolved host home path into AGENTS.md, CLAUDE.md, or the manifest,
+        # and must instead reference the portable symbolic form. The MOZYO_BRIDGE_HOME
+        # override semantics are preserved because consumers expand the env var
+        # when they read the router, not when the router is generated.
+        for preset in ("asana", "redmine", "none"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        ["scaffold", "rules", preset, "--target", str(project), "--home", str(home)]
+                    )
+                    self.assertEqual(0, result)
+
+                    resolved_home = home.resolve()
+                    expected_rule_path = (
+                        f"${{MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}}/rules/presets/{preset}/agent-workflow.md"
+                    )
+                    for filename in ("AGENTS.md", "CLAUDE.md", ".mozyo-bridge/scaffold.json"):
+                        text = (project / filename).read_text(encoding="utf-8")
+                        self.assertNotIn("/Users/", text)
+                        self.assertNotIn(str(resolved_home), text)
+                        self.assertIn(expected_rule_path, text)
+
+                    state = scaffold_state(project)
+                    self.assertIsNotNone(state)
+                    assert state is not None
+                    self.assertEqual(expected_rule_path, state["rule_path"])
+
+                    status_result, status_output = self.run_cli(
+                        ["scaffold", "status", "--target", str(project), "--home", str(home)]
+                    )
+                    self.assertEqual(0, status_result)
+                    self.assertIn("clean", status_output)
 
 
 class ScaffoldStatusTest(unittest.TestCase):
