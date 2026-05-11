@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../.mozyo-bridge"
+		},
+		{
+			"path": "../../../.codex/"
+		},
+		{
+			"path": "../../../.claude/Z",
+		}
+	],
+	"settings": {}
+}
