@@ -1109,6 +1109,111 @@ class NotifyContractTest(unittest.TestCase):
         self.assertEqual(0.2, args.submit_delay)
 
 
+class MessageContractTest(unittest.TestCase):
+    def run_message_with_fake_tmux(
+        self,
+        argv: list[str],
+        captures: list[str] | None = None,
+        allow_exit: bool = False,
+    ):
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+        pane_text = ""
+        forced_captures = captures is not None
+        capture_outputs = list(captures or [])
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            if capture_outputs:
+                return capture_outputs.pop(0)
+            if forced_captures:
+                return ""
+            return pane_text
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            nonlocal pane_text
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text += tmux_args[-1]
+            sent.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.require_read"), \
+            patch("mozyo_bridge.application.commands.clear_read"), \
+            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
+            patch("mozyo_bridge.application.commands.pane_label", return_value="codex"), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
+            patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep") as sleep, \
+            contextlib.redirect_stdout(io.StringIO()):
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                if not allow_exit:
+                    raise
+                result = exc
+
+        return result, sent, pane_text, sleep
+
+    def test_message_submits_enter_after_marker_by_default(self) -> None:
+        result, sent, pane_text, _sleep = self.run_message_with_fake_tmux(
+            ["message", "%2", "hello body", "--submit-delay", "0"]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("[mozyo-bridge from:codex pane:%1 at:agents:0.0]", pane_text)
+        self.assertIn("hello body", pane_text)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+    def test_message_no_submit_leaves_input_pending(self) -> None:
+        result, sent, pane_text, _sleep = self.run_message_with_fake_tmux(
+            ["message", "%2", "pending body", "--no-submit"]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("pending body", pane_text)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+    def test_message_rolls_back_when_marker_is_not_observed(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, sent, _pane_text, _sleep = self.run_message_with_fake_tmux(
+                [
+                    "message",
+                    "%2",
+                    "lost body",
+                    "--landing-timeout",
+                    "0.01",
+                    "--submit-delay",
+                    "0",
+                ],
+                captures=["", "", ""],
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+
+    def test_message_waits_submit_delay_after_marker(self) -> None:
+        _result, _sent, _pane_text, sleep = self.run_message_with_fake_tmux(
+            ["message", "%2", "delayed body", "--submit-delay", "0.2"]
+        )
+
+        sleep.assert_called_once_with(0.2)
+
+    def test_message_submit_defaults_to_true(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["message", "%2", "hi"])
+
+        self.assertTrue(args.submit)
+        self.assertEqual(0.2, args.submit_delay)
+        self.assertEqual(5.0, args.landing_timeout)
+
+
 class CommandTest(unittest.TestCase):
     def test_ensure_pair_loads_config_after_creating_missing_session(self) -> None:
         claude = {"id": "%1", "label": "claude", "command": "claude"}

@@ -155,7 +155,31 @@ def build_parser() -> argparse.ArgumentParser:
     message = sub.add_parser("message")
     message.add_argument("target")
     message.add_argument("text")
-    message.set_defaults(func=cmd_message)
+    message.add_argument(
+        "--no-submit",
+        dest="submit",
+        action="store_false",
+        help="Type the message but do not press Enter; leave the input pending at the target prompt",
+    )
+    message.add_argument(
+        "--landing-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for the header marker to appear in the target pane before pressing Enter",
+    )
+    message.add_argument(
+        "--submit-delay",
+        type=float,
+        default=0.2,
+        help="Seconds to wait after the marker is observed before pressing Enter",
+    )
+    message.add_argument(
+        "--read-lines",
+        type=int,
+        default=50,
+        help="Number of pane lines to inspect when waiting for the header marker",
+    )
+    message.set_defaults(func=cmd_message, submit=True)
 
     keys = sub.add_parser("keys")
     keys.add_argument("target")

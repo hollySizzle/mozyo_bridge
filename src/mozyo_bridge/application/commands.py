@@ -118,6 +118,21 @@ def cmd_message(args: argparse.Namespace) -> int:
     sender_label = pane_label(sender) or sender
     header = f"[mozyo-bridge from:{sender_label} pane:{sender} at:{pane_location(sender)}]"
     run_tmux("send-keys", "-t", target, "-l", "--", f"{header} {args.text}")
+    if getattr(args, "submit", True):
+        landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
+        read_lines = int(getattr(args, "read_lines", 50) or 50)
+        landing_lines = max(read_lines, 200)
+        if not wait_for_text(target, header, landing_lines, landing_timeout):
+            run_tmux("send-keys", "-t", target, "C-u")
+            clear_read(target)
+            die(
+                "message marker was not observed in target pane; input was cleared and Enter was not pressed. "
+                f"target={target} marker={header}"
+            )
+        submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
+        if submit_delay:
+            time.sleep(submit_delay)
+        run_tmux("send-keys", "-t", target, "Enter")
     clear_read(target)
     return 0
 
@@ -331,7 +346,7 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     read_lines = str(args.read_lines)
     cmd_read(argparse.Namespace(target=target, lines=args.read_lines))
     prompt = build_prompt(args, agent, task)
-    cmd_message(argparse.Namespace(target=target, text=prompt))
+    cmd_message(argparse.Namespace(target=target, text=prompt, submit=False))
     cmd_read(argparse.Namespace(target=target, lines=args.read_lines))
     marker = landing_marker(args, task)
     landing_lines = max(args.read_lines, 200)

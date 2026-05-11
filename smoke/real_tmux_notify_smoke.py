@@ -113,6 +113,50 @@ def main() -> int:
             print("fail: receiver message did not include Redmine journal gate", file=sys.stderr)
             return 1
 
+        message_receiver = tmux(
+            "split-window",
+            "-t",
+            session,
+            "-h",
+            "-c",
+            str(REPO_ROOT),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sh",
+            "-lc",
+            "IFS= read -r line; printf 'RECEIVED:%s\\n' \"$line\"; sleep 30",
+        ).stdout.strip()
+        tmux("set-option", "-p", "-t", message_receiver, "@agent_name", "claude")
+        run(*BRIDGE_COMMAND, "read", message_receiver, env=env)
+        message_result = run(
+            *BRIDGE_COMMAND,
+            "message",
+            message_receiver,
+            "handoff body without notify-* flow",
+            "--landing-timeout",
+            "5",
+            "--submit-delay",
+            "0.2",
+            "--read-lines",
+            "80",
+            check=False,
+            env=env,
+        )
+        if message_result.returncode != 0:
+            print(message_result.stdout, file=sys.stderr)
+            print(message_result.stderr, file=sys.stderr)
+            print(f"fail: message command exited with {message_result.returncode}", file=sys.stderr)
+            return 1
+        if not wait_for(message_receiver, "RECEIVED:[mozyo-bridge from:"):
+            print(capture(message_receiver), file=sys.stderr)
+            print("fail: bare message command did not submit Enter on the receiver", file=sys.stderr)
+            return 1
+        if not wait_for(message_receiver, "handoff body without notify-* flow"):
+            print(capture(message_receiver), file=sys.stderr)
+            print("fail: bare message body did not reach the receiver", file=sys.stderr)
+            return 1
+
         print("ok: real tmux notify smoke passed")
         return 0
     finally:
