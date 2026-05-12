@@ -39,6 +39,34 @@ The short alias is available for local interactive use:
 mozyo <command>
 ```
 
+### Daily entrypoint: bare `mozyo`
+
+The fastest way to start a Claude / Codex pair in a repo is to run `mozyo` with no subcommand:
+
+```bash
+cd /path/to/your-repo
+mozyo
+```
+
+これは以下を一括で行います。
+
+- repo root を解決 (`--repo` → `MOZYO_REPO` → `.git` / `.tmux.conf` / `pyproject.toml` を遡る)
+- session 名を repo basename にして、無ければ作る
+- 1 つの repo-scoped session の中に `claude` window と `codex` window を ensure (window 別に分離)
+- `claude` window を default にしてから attach
+
+Window 分離なので、ある時点で画面に出るのは 1 agent の window だけです。tmux は同じ client 内で複数 window を同時表示する仕組みではないため、agent 同士の切り替えは `prefix + n` / `prefix + p` などの通常の window 操作で行います。
+
+attach せずに session / window だけ用意したい場合:
+
+```bash
+mozyo --no-attach
+```
+
+session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に分離する場合は `mozyo-bridge open-here --session NAME` か `mozyo-bridge tmux-ui-*` を使ってください。
+
+`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` などの旧 command は互換のため残しています。pane-split 派のレイアウトや、明示的な session 名・cwd を指定したい上級導線が必要なときに使ってください。bare `mozyo` が前提の window 構造とは別レイヤーの helper です。
+
 ## Beta Tester Install (GitHub main)
 
 PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help` / `mozyo-bridge doctor --json`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。
@@ -166,9 +194,9 @@ MOZYO_REPO=/path/to/repo mozyo-bridge tmux-ui-open
 
 config が default 解決経路のどちらにも存在しない場合、`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` / `notify-*` は config の source を skip して session / pane 起動だけを実行します。一方 `--config-path /path/to/conf` を **明示** 指定した場合は path 不存在を typo 防止のため `tmux config not found` で fail-fast します。`mozyo-bridge tmux-ui-config` (load 専用 command) も従来通り存在しない config は error にします。
 
-### `open-here` (repo-aware sugar)
+### `open-here` (repo-aware sugar, pane-split layout)
 
-`mozyo-bridge open-here` は repo root をそのまま session/cwd に当てる sugar command です。`tmux-ui-open --session <repo名> --cwd <repo root>` を毎回手で打つ運用を 1 行に縮めます。
+bare `mozyo` (window 分離) ではなく pane-split layout を使いたい場合の従来 sugar です。`mozyo-bridge open-here` は repo root をそのまま session/cwd に当てます。`tmux-ui-open --session <repo名> --cwd <repo root>` を毎回手で打つ運用を 1 行に縮めます。
 
 ```bash
 cd /path/to/your-repo

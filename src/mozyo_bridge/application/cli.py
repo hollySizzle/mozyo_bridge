@@ -13,6 +13,7 @@ from mozyo_bridge.application.commands import (
     cmd_keys,
     cmd_list,
     cmd_message,
+    cmd_mozyo,
     cmd_name,
     cmd_notify_claude,
     cmd_notify_claude_legacy_task,
@@ -97,10 +98,31 @@ def add_legacy_notify_options(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mozyo-bridge",
-        description="Redmine-gated pane notification bridge for ClaudeCode/Codex terminals",
+        description=(
+            "Repo-aware tmux session bootstrap plus Asana/Redmine-gated pane "
+            "notification bridge for ClaudeCode/Codex terminals. "
+            "Run with no subcommand to ensure a repo-scoped session with "
+            "claude/codex windows and attach."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--no-attach",
+        action="store_true",
+        default=False,
+        dest="no_attach",
+        help="Bare `mozyo`: ensure the repo session and agent windows but do not attach. Ignored when a subcommand is given.",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "Bare `mozyo`: override the repo root resolution (otherwise MOZYO_REPO env "
+            "or a `.git` / `.tmux.conf` / `pyproject.toml` parent of the cwd). "
+            "Subcommands accept their own `--repo` after the subcommand name."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     setup = sub.add_parser("tmux-ui-setup")
     add_repo_option(setup)
@@ -318,5 +340,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = normalize_paths(build_parser().parse_args())
+    args = build_parser().parse_args()
+    if not getattr(args, "command", None):
+        return cmd_mozyo(args)
+    args = normalize_paths(args)
     return args.func(args)

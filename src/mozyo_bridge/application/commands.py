@@ -176,6 +176,101 @@ def new_agent_session(agent: str, session: str, cwd: str | None = None) -> str:
     return pane_id
 
 
+def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
+    require_tmux()
+    if agent not in AGENT_COMMANDS:
+        die(f"unsupported agent: {agent}")
+    args = ["new-session", "-d", "-s", session, "-n", agent, "-P", "-F", "#{pane_id}"]
+    if cwd:
+        args.extend(["-c", cwd])
+    args.append(AGENT_COMMANDS[agent])
+    result = run_tmux(*args, check=False)
+    if result.returncode != 0:
+        die(f"tmux new-session failed: {result.stderr.strip() or result.stdout.strip()}")
+    pane_id = result.stdout.strip()
+    if not pane_id:
+        die("tmux new-session did not return a pane id")
+    set_pane_label(pane_id, agent)
+    return pane_id
+
+
+def new_agent_window(agent: str, session: str, cwd: str | None = None) -> str:
+    require_tmux()
+    if agent not in AGENT_COMMANDS:
+        die(f"unsupported agent: {agent}")
+    args = ["new-window", "-d", "-t", f"{session}:", "-n", agent, "-P", "-F", "#{pane_id}"]
+    if cwd:
+        args.extend(["-c", cwd])
+    args.append(AGENT_COMMANDS[agent])
+    result = run_tmux(*args, check=False)
+    if result.returncode != 0:
+        die(f"tmux new-window failed: {result.stderr.strip() or result.stdout.strip()}")
+    pane_id = result.stdout.strip()
+    if not pane_id:
+        die("tmux new-window did not return a pane id")
+    set_pane_label(pane_id, agent)
+    return pane_id
+
+
+def list_session_windows(session: str) -> list[str]:
+    result = run_tmux("list-windows", "-t", session, "-F", "#{window_name}", check=False)
+    if result.returncode != 0:
+        return []
+    return [name.strip() for name in result.stdout.splitlines() if name.strip()]
+
+
+def session_panes_with_window(session: str) -> list[dict[str, str]]:
+    """Return per-pane info including the containing window's name for `session`.
+
+    Distinct from ``pane_lines()`` (which is repo-wide and does not expose the
+    window name) — bare ``mozyo`` needs window-name granularity to enforce its
+    one-window-per-agent guarantee.
+    """
+    result = run_tmux(
+        "list-panes",
+        "-s",
+        "-t",
+        session,
+        "-F",
+        "#{window_index}\t#{window_name}\t#{pane_id}\t#{@agent_name}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    panes: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = (line.split("\t", 3) + [""] * 4)[:4]
+        window_index, window_name, pane_id, label = parts
+        panes.append(
+            {
+                "window_index": window_index,
+                "window_name": window_name,
+                "id": pane_id,
+                "label": label,
+            }
+        )
+    return panes
+
+
+def detect_legacy_pane_split(session: str) -> list[str]:
+    """Describe agent-labeled panes that do not live in their per-agent window.
+
+    A non-empty return means the session was created with the old pane-split
+    layout (e.g., `open-here`) and the bare-``mozyo`` window model would
+    otherwise be silently violated by reusing it.
+    """
+    descriptions: list[str] = []
+    for pane in session_panes_with_window(session):
+        label = pane.get("label") or ""
+        window_name = pane.get("window_name") or ""
+        if label in ("claude", "codex") and window_name != label:
+            location = window_name or pane.get("window_index") or "?"
+            descriptions.append(
+                f"window={location} pane={pane.get('id')} label={label}"
+            )
+    return descriptions
+
+
 def spawn_agent_terminal_pane(
     agent: str,
     cwd: str | None = None,
@@ -298,6 +393,113 @@ def cmd_setup(args: argparse.Namespace) -> int:
     args.config = True
     args.config_path = config_path_from_args(args)
     return cmd_ensure_pair(args)
+
+
+def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
+    """Ensure `args.session` exists with one window per agent (claude, codex).
+
+    Each agent runs in its own tmux window in a single repo-scoped session.
+    The window-model guarantee is gated on tmux window names, not pane labels:
+    a session reused from the legacy pane-split layout (both agents labeled
+    inside one window) is rejected explicitly so the operator can migrate
+    instead of attaching to a non-compliant session. Returns the list of newly
+    created "agent:pane_id" entries.
+    """
+    require_tmux()
+    config_loaded = False
+    if args.config and session_exists(args.session):
+        load_tmux_conf_for(args)
+        config_loaded = True
+    created: list[str] = []
+    if not session_exists(args.session):
+        claude_pane = new_agent_session_window("claude", args.session, cwd=args.cwd)
+        created.append(f"claude:{claude_pane}")
+    if args.config and not config_loaded:
+        load_tmux_conf_for(args)
+    legacy_conflicts = detect_legacy_pane_split(args.session)
+    if legacy_conflicts:
+        die(
+            f"session '{args.session}' has agent-labeled panes outside the expected "
+            f"`claude` / `codex` windows: {'; '.join(legacy_conflicts)}. "
+            "This looks like a legacy pane-split layout. To switch to the bare "
+            f"`mozyo` window model, kill the session (`tmux kill-session -t {args.session}`) "
+            "and re-run `mozyo`. To keep the pane-split layout, use `mozyo-bridge open-here` instead."
+        )
+    windows = list_session_windows(args.session)
+    for agent in ("claude", "codex"):
+        if agent in windows:
+            continue
+        pane_id = new_agent_window(agent, args.session, cwd=args.cwd)
+        created.append(f"{agent}:{pane_id}")
+    for agent in ("claude", "codex"):
+        pane = find_labeled_pane(agent, session=args.session, fallback=False)
+        if pane:
+            ensure_agent_target(pane, agent, force=args.force)
+            if args.ready_timeout:
+                wait_for_agent_terminal_pane(pane["id"], agent, args.ready_timeout)
+    return created
+
+
+def cmd_mozyo(args: argparse.Namespace) -> int:
+    """Bare ``mozyo`` entrypoint: repo-aware session with one window per agent.
+
+    Resolves the repo root, derives the session name from the repo basename,
+    ensures a single repo-scoped session containing a ``claude`` window and a
+    ``codex`` window, and attaches unless ``--no-attach`` was given.
+    """
+    require_tmux()
+    repo_root = repo_root_from_args(args)
+    derived = repo_root.name
+    if not derived:
+        die("could not derive a session name from repo root; cd into a project directory or pass a subcommand explicitly")
+    user_session = getattr(args, "session", None)
+    session = user_session or derived
+    cwd = getattr(args, "cwd", None) or str(repo_root)
+    if not user_session and session_exists(session):
+        offending = session_cwd_mismatch(session, repo_root)
+        if offending:
+            die(
+                f"session '{session}' already exists but its panes are outside repo root "
+                f"{repo_root} (cwds: {', '.join(offending)}). "
+                "Re-run from the matching repo root, or use `mozyo-bridge open-here --session NAME` to disambiguate."
+            )
+    config_path = getattr(args, "config_path", None)
+    config_path_was_default = config_path is None
+    resolved_config_path = config_path or str(default_tmux_conf(repo_root))
+    setup_args = argparse.Namespace(
+        session=session,
+        cwd=cwd,
+        config=True,
+        config_path=resolved_config_path,
+        config_path_was_default=config_path_was_default,
+        ready_timeout=float(getattr(args, "ready_timeout", 10.0) or 0.0),
+        force=bool(getattr(args, "force", False)),
+    )
+    created = ensure_repo_session_windows(setup_args)
+    select = run_tmux("select-window", "-t", f"{session}:claude", check=False)
+    if select.returncode != 0:
+        die(
+            f"failed to select `claude` window in session '{session}'. "
+            "The window-model guarantee did not hold. "
+            f"stderr={select.stderr.strip() or select.stdout.strip()}"
+        )
+    result = run_tmux(
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_index}\t#{window_name}\t#{pane_current_command}",
+        check=False,
+    )
+    print(f"session={session} created={','.join(created) if created else '-'}")
+    print("INDEX\tNAME\tPROCESS")
+    if result.returncode == 0:
+        print(result.stdout, end="")
+    if getattr(args, "no_attach", False):
+        print(f"attach: tmux attach -t {session}")
+        return 0
+    os.execvp("tmux", ["tmux", "attach", "-t", session])
+    raise AssertionError("unreachable")
 
 
 def cmd_open(args: argparse.Namespace) -> int:

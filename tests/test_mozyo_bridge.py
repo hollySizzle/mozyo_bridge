@@ -23,8 +23,10 @@ from mozyo_bridge.application.commands import (
     cmd_doctor,
     cmd_ensure_pair,
     cmd_init,
+    cmd_mozyo,
     cmd_open,
     cmd_open_here,
+    ensure_repo_session_windows,
     load_tmux_conf_for,
     notify_agent,
     session_cwd_mismatch,
@@ -400,6 +402,38 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual("open-here", args.command)
         self.assertEqual("custom", args.session)
+        self.assertEqual("/repo", args.repo)
+
+    def test_bare_mozyo_parses_with_no_subcommand(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args([])
+
+        self.assertIsNone(args.command)
+        self.assertFalse(args.no_attach)
+
+    def test_bare_mozyo_accepts_no_attach_flag(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["--no-attach"])
+
+        self.assertIsNone(args.command)
+        self.assertTrue(args.no_attach)
+
+    def test_bare_mozyo_accepts_top_level_repo_override(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["--repo", "/explicit/repo"])
+
+        self.assertIsNone(args.command)
+        self.assertEqual("/explicit/repo", args.repo)
+
+    def test_subcommand_repo_still_works_after_top_level_repo_added(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["open-here", "--repo", "/repo"])
+
+        self.assertEqual("open-here", args.command)
         self.assertEqual("/repo", args.repo)
 
     def test_version_flag_prints_version_and_exits_cleanly(self) -> None:
@@ -1702,6 +1736,239 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_open_here(args))
 
         self.assertEqual("my-project", captured["args"].session)
+
+    def test_ensure_repo_session_windows_creates_session_and_codex_window(self) -> None:
+        args = argparse.Namespace(
+            session="my-project",
+            cwd="/repo",
+            config=True,
+            config_path="/repo/.tmux.conf",
+            config_path_was_default=False,
+            ready_timeout=0,
+            force=False,
+        )
+        claude_pane = {"id": "%1", "label": "claude", "command": "claude"}
+        codex_pane = {"id": "%2", "label": "codex", "command": "node"}
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", side_effect=[False, False]), \
+            patch("mozyo_bridge.application.commands.new_agent_session_window", return_value="%1") as new_session_window, \
+            patch("mozyo_bridge.application.commands.source_tmux_conf") as source_conf, \
+            patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
+            patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude"]), \
+            patch("mozyo_bridge.application.commands.find_labeled_pane", side_effect=[claude_pane, codex_pane]), \
+            patch("mozyo_bridge.application.commands.new_agent_window", return_value="%2") as new_window, \
+            patch("mozyo_bridge.application.commands.ensure_agent_target"):
+            created = ensure_repo_session_windows(args)
+
+        new_session_window.assert_called_once_with("claude", "my-project", cwd="/repo")
+        new_window.assert_called_once_with("codex", "my-project", cwd="/repo")
+        source_conf.assert_called_once_with("/repo/.tmux.conf", optional=False)
+        self.assertEqual(["claude:%1", "codex:%2"], created)
+
+    def test_ensure_repo_session_windows_skips_creation_when_windows_exist(self) -> None:
+        args = argparse.Namespace(
+            session="my-project",
+            cwd="/repo",
+            config=False,
+            ready_timeout=0,
+            force=False,
+        )
+        claude_pane = {"id": "%1", "label": "claude", "command": "claude"}
+        codex_pane = {"id": "%2", "label": "codex", "command": "node"}
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+            patch("mozyo_bridge.application.commands.new_agent_session_window") as new_session_window, \
+            patch("mozyo_bridge.application.commands.new_agent_window") as new_window, \
+            patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
+            patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "codex"]), \
+            patch("mozyo_bridge.application.commands.find_labeled_pane",
+                  side_effect=[claude_pane, codex_pane]), \
+            patch("mozyo_bridge.application.commands.ensure_agent_target"):
+            created = ensure_repo_session_windows(args)
+
+        new_session_window.assert_not_called()
+        new_window.assert_not_called()
+        self.assertEqual([], created)
+
+    def test_ensure_repo_session_windows_rejects_legacy_pane_split_layout(self) -> None:
+        args = argparse.Namespace(
+            session="my-project",
+            cwd="/repo",
+            config=False,
+            ready_timeout=0,
+            force=False,
+        )
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+            patch("mozyo_bridge.application.commands.new_agent_session_window") as new_session_window, \
+            patch("mozyo_bridge.application.commands.new_agent_window") as new_window, \
+            patch(
+                "mozyo_bridge.application.commands.detect_legacy_pane_split",
+                return_value=["window=agents pane=%9 label=claude", "window=agents pane=%10 label=codex"],
+            ), \
+            patch("mozyo_bridge.application.commands.list_session_windows", return_value=["agents"]), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                ensure_repo_session_windows(args)
+
+        new_session_window.assert_not_called()
+        new_window.assert_not_called()
+        message = stderr.getvalue()
+        self.assertIn("legacy pane-split layout", message)
+        self.assertIn("tmux kill-session -t my-project", message)
+        self.assertIn("mozyo-bridge open-here", message)
+
+    def test_detect_legacy_pane_split_flags_labels_in_unnamed_windows(self) -> None:
+        from mozyo_bridge.application.commands import detect_legacy_pane_split
+
+        list_panes_output = "\n".join(
+            [
+                "0\tagents\t%9\tclaude",
+                "0\tagents\t%10\tcodex",
+                "1\tlogs\t%11\t",
+            ]
+        )
+        result = argparse.Namespace(returncode=0, stdout=list_panes_output, stderr="")
+
+        with patch("mozyo_bridge.application.commands.run_tmux", return_value=result):
+            conflicts = detect_legacy_pane_split("my-project")
+
+        self.assertEqual(2, len(conflicts))
+        self.assertTrue(any("label=claude" in c for c in conflicts))
+        self.assertTrue(any("label=codex" in c for c in conflicts))
+
+    def test_detect_legacy_pane_split_is_silent_when_labels_match_window_names(self) -> None:
+        from mozyo_bridge.application.commands import detect_legacy_pane_split
+
+        list_panes_output = "0\tclaude\t%1\tclaude\n1\tcodex\t%2\tcodex\n"
+        result = argparse.Namespace(returncode=0, stdout=list_panes_output, stderr="")
+
+        with patch("mozyo_bridge.application.commands.run_tmux", return_value=result):
+            self.assertEqual([], detect_legacy_pane_split("my-project"))
+
+    def test_cmd_mozyo_attaches_after_ensuring_repo_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=False,
+            )
+            captured: dict[str, argparse.Namespace] = {}
+
+            def fake_ensure(inner: argparse.Namespace) -> list[str]:
+                captured["args"] = inner
+                return ["claude:%1", "codex:%2"]
+
+            list_result = argparse.Namespace(returncode=0, stdout="0\tclaude\tclaude\n1\tcodex\tnode\n", stderr="")
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", side_effect=fake_ensure), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=RuntimeError("attached")), \
+                contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "attached"):
+                    cmd_mozyo(args)
+
+        self.assertEqual("my-project", captured["args"].session)
+        self.assertEqual(str(repo), captured["args"].cwd)
+        self.assertTrue(captured["args"].config)
+        self.assertTrue(captured["args"].config_path_was_default)
+
+    def test_cmd_mozyo_no_attach_skips_execvp_and_prints_attach_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+            )
+            list_result = argparse.Namespace(returncode=0, stdout="", stderr="")
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=[]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        self.assertIn("attach: tmux attach -t my-project", stdout.getvalue())
+
+    def test_cmd_mozyo_dies_when_claude_window_select_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=False,
+            )
+            select_failure = argparse.Namespace(returncode=1, stdout="", stderr="can't find window: claude")
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=[]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=select_failure), \
+                patch("mozyo_bridge.application.commands.os.execvp") as execvp, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_mozyo(args)
+
+        execvp.assert_not_called()
+        self.assertIn("window-model guarantee", stderr.getvalue())
+        self.assertIn("claude", stderr.getvalue())
+
+    def test_cmd_mozyo_refuses_when_existing_session_panes_are_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            other = (Path(tmp) / "other-project").resolve()
+            other.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=False,
+            )
+            panes = [
+                {"id": "%1", "location": "my-project:0.0", "command": "zsh", "label": "", "cwd": str(other)},
+            ]
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows") as ensure, \
+                patch("mozyo_bridge.application.commands.os.execvp") as execvp, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_mozyo(args)
+
+        ensure.assert_not_called()
+        execvp.assert_not_called()
+        self.assertIn("my-project", stderr.getvalue())
+        self.assertIn("outside repo root", stderr.getvalue())
 
     def test_open_here_ignores_unrelated_session_panes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
