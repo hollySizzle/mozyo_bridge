@@ -164,6 +164,33 @@ MOZYO_REPO=/path/to/repo mozyo-bridge tmux-ui-open
 `--cwd` を省略した tmux-ui 系コマンドは、解決した project root を作業ディレクトリとして使います。
 `.tmux.conf` は project root にあればそれを使い、なければ `~/.config/mozyo-bridge/tmux.conf` を見ます。
 
+### `open-here` (repo-aware sugar)
+
+`mozyo-bridge open-here` は repo root をそのまま session/cwd に当てる sugar command です。`tmux-ui-open --session <repo名> --cwd <repo root>` を毎回手で打つ運用を 1 行に縮めます。
+
+```bash
+cd /path/to/your-repo
+mozyo-bridge open-here
+```
+
+挙動:
+
+- repo root は `--repo` → `MOZYO_REPO` → `cwd` から `.git` / `.tmux.conf` / `pyproject.toml` を遡って解決します (`Project Root Resolution` と同じ規約)。
+- session 名は repo root basename を default にします。
+- `--cwd` 省略時は repo root をそのまま使います。
+- 同名 session が既に存在し、しかも **その session 内のどの pane も repo root の下にいない** 場合は別 project の session の可能性が高いため、自動 attach せずにエラーで止まります。明示的に `--session <name>` を指定し直してください。
+- 既に同名 session があっても少なくとも 1 つの pane が repo root 配下にあれば、その session を `tmux-ui-open` と同じ手順で起動し attach します。
+
+```bash
+# Conflict 例: 同じ basename の session が別の repo を指していた場合
+$ cd /path/to/my-project
+$ mozyo-bridge open-here
+session 'my-project' already exists but its panes are outside repo root ... Re-run with an explicit --session to disambiguate; this command will not auto-attach.
+
+# 解消: 明示 session で別名を切る
+$ mozyo-bridge open-here --session my-project-2
+```
+
 ## Pane Setup
 
 まず ClaudeCode / Codex の terminal を VS Code の `tmux: New tmux Terminal` または `tmux: Attach to tmux Window` で開きます。

@@ -21,6 +21,7 @@ from mozyo_bridge.application.commands import (
     cmd_notify_codex_legacy_task,
     cmd_notify_codex_review,
     cmd_open,
+    cmd_open_here,
     cmd_read,
     cmd_resolve,
     cmd_rules_install,
@@ -119,6 +120,24 @@ def build_parser() -> argparse.ArgumentParser:
     open_cmd.add_argument("--ready-timeout", type=float, default=10.0)
     open_cmd.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
     open_cmd.set_defaults(func=cmd_open)
+
+    open_here = sub.add_parser(
+        "open-here",
+        help="Open a Claude/Codex pair tmux session with session=repo-basename and cwd=repo-root.",
+    )
+    add_repo_option(open_here)
+    open_here.add_argument(
+        "--session",
+        default=None,
+        help="Explicit session name. Defaults to the repo root basename; required when an existing session of that basename points at a different work root.",
+    )
+    open_here.add_argument("--cwd", default=None, help="Working directory. Defaults to the resolved repo root.")
+    open_here.add_argument("--vertical", action="store_true")
+    open_here.add_argument("--config", action="store_true", default=True, help="Load mozyo-bridge tmux config before opening")
+    open_here.add_argument("--config-path")
+    open_here.add_argument("--ready-timeout", type=float, default=10.0)
+    open_here.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
+    open_here.set_defaults(func=cmd_open_here)
 
     status = sub.add_parser("status")
     add_repo_option(status)

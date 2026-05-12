@@ -307,6 +307,47 @@ def cmd_open(args: argparse.Namespace) -> int:
     raise AssertionError("unreachable")
 
 
+def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:
+    """Return the cwds of panes in `session` when none of them are under `repo_root`.
+
+    The session is considered "pointing at another work root" only when it has at
+    least one pane and every pane's cwd is outside `repo_root`. Returns the list
+    of offending cwds in that case; otherwise an empty list.
+    """
+    same_session_panes = [
+        pane
+        for pane in pane_lines()
+        if (pane.get("location") or "").split(":", 1)[0] == session
+    ]
+    if not same_session_panes:
+        return []
+    if any(cwd_is_under_repo(pane.get("cwd") or "", repo_root) for pane in same_session_panes):
+        return []
+    return [pane.get("cwd") or "?" for pane in same_session_panes]
+
+
+def cmd_open_here(args: argparse.Namespace) -> int:
+    require_tmux()
+    repo_root = repo_root_from_args(args)
+    user_session = getattr(args, "session", None)
+    if not user_session:
+        derived = repo_root.name
+        if not derived:
+            die("could not derive a session name from repo root; pass --session explicitly")
+        args.session = derived
+    if not getattr(args, "cwd", None):
+        args.cwd = str(repo_root)
+    if not user_session and session_exists(args.session):
+        offending = session_cwd_mismatch(args.session, repo_root)
+        if offending:
+            die(
+                f"session '{args.session}' already exists but its panes are outside repo root "
+                f"{repo_root} (cwds: {', '.join(offending)}). "
+                "Re-run with an explicit --session to disambiguate; this command will not auto-attach."
+            )
+    return cmd_open(args)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
     session = args.session
