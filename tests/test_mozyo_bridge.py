@@ -1661,6 +1661,22 @@ class DoctorEnvironmentTest(unittest.TestCase):
             (skill_dir / "references" / ref).write_text("stub\n", encoding="utf-8")
         return skill_dir
 
+    def _seed_claude_plugin_skill(
+        self, claude_home: Path, *, version: str = "abc12345"
+    ) -> Path:
+        plugin_dir = (
+            claude_home
+            / "plugins"
+            / "cache"
+            / "mozyo-bridge"
+            / "mozyo-bridge-agent"
+            / version
+        )
+        skill_dir = plugin_dir / "skills" / "mozyo-bridge-agent"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text("plugin stub\n", encoding="utf-8")
+        return plugin_dir
+
     def test_cli_section_reports_version_and_subcommands(self) -> None:
         from mozyo_bridge.application.doctor import doctor_cli_section
 
@@ -1792,6 +1808,94 @@ class DoctorEnvironmentTest(unittest.TestCase):
                 self.assertTrue(section["global"]["present"])
                 self.assertFalse(section["project"]["present"])
                 self.assertEqual([], section["warnings"])
+
+    def test_claude_skill_section_plugin_only_reports_plugin_managed(self) -> None:
+        from mozyo_bridge.application.doctor import (
+            CLAUDE_GLOBAL_SKILL_INSTALL_HINT,
+            doctor_claude_skill_section,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_home = Path(tmp) / "claude-home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self._seed_claude_plugin_skill(claude_home, version="abc12345")
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                args = self._stub_args(repo=str(project))
+                section = doctor_claude_skill_section(args)
+            self.assertEqual("plugin-managed", section["status"])
+            self.assertFalse(section["global"]["present"])
+            self.assertFalse(section["project"]["present"])
+            self.assertTrue(section["plugin"]["present"])
+            self.assertEqual(
+                "abc12345", section["plugin"]["versions"][0]["version"]
+            )
+            self.assertEqual([], section["next_action"])
+            self.assertNotIn(
+                CLAUDE_GLOBAL_SKILL_INSTALL_HINT, section["next_action"]
+            )
+
+    def test_claude_skill_section_plugin_with_legacy_global_keeps_ok(self) -> None:
+        """When both plugin and legacy global skill are installed, plugin
+        namespace is separate so status stays ok (existing precedence rules
+        for warning only fire on legacy+legacy collision)."""
+        from mozyo_bridge.application.doctor import doctor_claude_skill_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_home = Path(tmp) / "claude-home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self._seed_claude_global_skill(claude_home, complete=True)
+            self._seed_claude_plugin_skill(claude_home, version="abc12345")
+            env = {
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(project),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                args = self._stub_args(repo=str(project))
+                section = doctor_claude_skill_section(args)
+            self.assertEqual("ok", section["status"])
+            self.assertTrue(section["global"]["present"])
+            self.assertTrue(section["plugin"]["present"])
+
+    def test_run_doctor_reports_ok_for_plugin_only_state(self) -> None:
+        """Top-level run_doctor must treat plugin-managed as healthy (overall
+        result["ok"] == True) so the misleading legacy install hint does not
+        flip the aggregate status."""
+        from mozyo_bridge.application.doctor import run_doctor
+        from mozyo_bridge.scaffold.rules import install_rules, write_scaffold
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "mb-home"
+            claude_home = Path(tmp) / "claude-home"
+            codex_home = Path(tmp) / "codex-home"
+            target = Path(tmp) / "project"
+            target.mkdir()
+            install_rules(home)
+            write_scaffold("asana", target, home=home)
+            self._seed_codex_skill(codex_home, complete=True)
+            self._seed_claude_plugin_skill(claude_home, version="abc12345")
+            env = {
+                "MOZYO_BRIDGE_HOME": str(home),
+                "CODEX_HOME": str(codex_home),
+                "MOZYO_BRIDGE_CLAUDE_HOME": str(claude_home),
+                "MOZYO_BRIDGE_CLAUDE_PROJECT_DIR": str(target),
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                patch(
+                    "mozyo_bridge.application.doctor.doctor_tmux_section",
+                    return_value={"status": "skipped", "next_action": []},
+                ):
+                args = self._stub_args(repo=str(target), home=str(home))
+                result = run_doctor(args)
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                "plugin-managed", result["sections"]["claude_skill"]["status"]
+            )
 
     def test_scaffold_section_unscaffolded_suggests_scaffold_rules(self) -> None:
         from mozyo_bridge.application.doctor import doctor_scaffold_section

@@ -58,6 +58,27 @@ def claude_skill_global_home() -> Path:
     return Path(os.environ.get("MOZYO_BRIDGE_CLAUDE_HOME") or "~/.claude").expanduser()
 
 
+def claude_plugin_skill_root(global_home: Path) -> Path:
+    return global_home / "plugins" / "cache" / "mozyo-bridge" / "mozyo-bridge-agent"
+
+
+def _check_plugin_install(plugin_root: Path) -> dict[str, Any]:
+    if not plugin_root.is_dir():
+        return {"present": False, "root": str(plugin_root), "versions": []}
+    versions: list[dict[str, Any]] = []
+    for sha_dir in sorted(plugin_root.iterdir()):
+        if not sha_dir.is_dir():
+            continue
+        skill_md = sha_dir / "skills" / "mozyo-bridge-agent" / "SKILL.md"
+        if skill_md.is_file():
+            versions.append({"version": sha_dir.name, "skill_md": str(skill_md)})
+    return {
+        "present": bool(versions),
+        "root": str(plugin_root),
+        "versions": versions,
+    }
+
+
 def claude_skill_project_dir(args: argparse.Namespace) -> Path:
     override = os.environ.get("MOZYO_BRIDGE_CLAUDE_PROJECT_DIR")
     if override:
@@ -174,6 +195,8 @@ def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:
     project_skill_dir = project_dir / ".claude" / "skills" / "mozyo-bridge-agent"
     project_info = _check_skill_dir(project_skill_dir)
 
+    plugin_info = _check_plugin_install(claude_plugin_skill_root(global_home))
+
     warnings: list[str] = []
     if global_info["present"] and project_info["present"]:
         warnings.append(
@@ -187,8 +210,14 @@ def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:
     next_action: list[str] = []
     status = "ok"
     if not global_info["present"] and not project_info["present"]:
-        status = "missing"
-        next_action.append(CLAUDE_GLOBAL_SKILL_INSTALL_HINT)
+        if plugin_info["present"]:
+            # plugin marketplace install is the source of the skill; no legacy
+            # install hint should be emitted. Treated as healthy and excluded
+            # from BAD_SECTION_STATUSES so the overall doctor result stays ok.
+            status = "plugin-managed"
+        else:
+            status = "missing"
+            next_action.append(CLAUDE_GLOBAL_SKILL_INSTALL_HINT)
     elif global_info["present"] and global_info["references_missing"]:
         status = "incomplete"
         next_action.append(
@@ -212,6 +241,7 @@ def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:
         "global": global_info,
         "project_dir": str(project_dir),
         "project": project_info,
+        "plugin": plugin_info,
         "warnings": warnings,
         "next_action": next_action,
     }
@@ -449,6 +479,11 @@ def format_doctor_text(result: dict[str, Any]) -> str:
         lines.extend(_format_skill_block("global", claude["global"], "  "))
     if claude.get("project"):
         lines.extend(_format_skill_block("project", claude["project"], "  "))
+    plugin = claude.get("plugin") or {}
+    if plugin:
+        lines.append(f"  plugin: present={plugin.get('present', False)} root={plugin.get('root', '-')}")
+        for ver in plugin.get("versions", []) or []:
+            lines.append(f"    version: {ver['version']}")
     for warning in claude.get("warnings", []) or []:
         lines.append(f"  warning: {warning}")
     for action in claude.get("next_action", []):
