@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mozyo-bridge-agent",
+  "description": "Shared mozyo-bridge agent workflow skill for Asana-driven work, Notion rules, release checks, and safe tmux notification handling.",
+  "homepage": "https://github.com/hollySizzle/mozyo_bridge",
+  "repository": "https://github.com/hollySizzle/mozyo_bridge",
+  "license": "MIT",
+  "keywords": ["asana", "codex", "claude-code", "tmux", "workflow"],
+  "author": {
+    "name": "hollySizzle"
+  }
+}

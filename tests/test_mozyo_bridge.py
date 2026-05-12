@@ -1979,5 +1979,148 @@ class DoctorEnvironmentTest(unittest.TestCase):
             self.assertIn(f"--home {home.resolve()}", action)
 
 
+class PluginMarketplaceTest(unittest.TestCase):
+    """Guardrails for the Claude plugin marketplace packaging.
+
+    The repo ships a `.claude-plugin/marketplace.json` at the root and a plugin
+    at `plugins/mozyo-bridge-agent/`. The plugin bundles its own copy of the
+    shared skill body so it works after Claude Code copies the plugin
+    directory into its cache (plugin install cannot reach outside the plugin
+    root). This test class enforces:
+
+    1. Marketplace and plugin manifests load and carry the required fields.
+    2. The plugin skill mirror at `plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/`
+       stays in lockstep with the canonical `skills/mozyo-bridge-agent/`. Drift
+       must be resolved by running `scripts/sync_plugin_skill.sh`, not by
+       hand-editing the mirror.
+    """
+
+    def setUp(self) -> None:
+        self.marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
+        self.plugin_manifest_path = (
+            ROOT / "plugins" / "mozyo-bridge-agent" / ".claude-plugin" / "plugin.json"
+        )
+        self.canonical_skill_dir = ROOT / "skills" / "mozyo-bridge-agent"
+        self.plugin_skill_dir = (
+            ROOT / "plugins" / "mozyo-bridge-agent" / "skills" / "mozyo-bridge-agent"
+        )
+
+    def test_marketplace_manifest_present_and_valid(self) -> None:
+        self.assertTrue(
+            self.marketplace_path.is_file(),
+            f"expected marketplace manifest at {self.marketplace_path}",
+        )
+        data = json.loads(self.marketplace_path.read_text(encoding="utf-8"))
+        # Required top-level fields per
+        # https://code.claude.com/docs/en/plugin-marketplaces#marketplace-schema
+        self.assertIn("name", data)
+        self.assertIn("owner", data)
+        self.assertIn("plugins", data)
+        self.assertIsInstance(data["owner"], dict)
+        self.assertIn("name", data["owner"], "owner.name is required")
+        self.assertIsInstance(data["plugins"], list)
+        self.assertEqual(
+            "mozyo-bridge",
+            data["name"],
+            "marketplace name pins the install command `@mozyo-bridge` suffix",
+        )
+        # Marketplace name must not impersonate Anthropic-reserved names.
+        reserved = {
+            "claude-code-marketplace",
+            "claude-code-plugins",
+            "claude-plugins-official",
+            "anthropic-marketplace",
+            "anthropic-plugins",
+            "agent-skills",
+            "knowledge-work-plugins",
+            "life-sciences",
+        }
+        self.assertNotIn(data["name"], reserved)
+
+    def test_marketplace_lists_mozyo_bridge_agent_plugin(self) -> None:
+        data = json.loads(self.marketplace_path.read_text(encoding="utf-8"))
+        names = [entry.get("name") for entry in data["plugins"]]
+        self.assertIn("mozyo-bridge-agent", names)
+        entry = next(p for p in data["plugins"] if p.get("name") == "mozyo-bridge-agent")
+        self.assertIn("source", entry)
+        # Relative paths must start with "./" per plugin source rules.
+        source = entry["source"]
+        if isinstance(source, str):
+            self.assertTrue(
+                source.startswith("./"),
+                "relative plugin source must start with './'",
+            )
+            # When metadata.pluginRoot is set, the source is resolved under it.
+            plugin_root = data.get("metadata", {}).get("pluginRoot")
+            if plugin_root:
+                base = (
+                    ROOT / plugin_root.lstrip("./").rstrip("/")
+                    if plugin_root.startswith("./")
+                    else ROOT / plugin_root
+                )
+                resolved = (base / source.lstrip("./").rstrip("/")).resolve()
+            else:
+                resolved = (ROOT / source.lstrip("./").rstrip("/")).resolve()
+            self.assertTrue(
+                resolved.is_dir(),
+                f"plugin source path does not resolve to a directory: {resolved}",
+            )
+
+    def test_plugin_manifest_present_and_valid(self) -> None:
+        self.assertTrue(
+            self.plugin_manifest_path.is_file(),
+            f"expected plugin manifest at {self.plugin_manifest_path}",
+        )
+        data = json.loads(self.plugin_manifest_path.read_text(encoding="utf-8"))
+        # `name` is the only required plugin manifest field.
+        self.assertIn("name", data)
+        self.assertEqual("mozyo-bridge-agent", data["name"])
+
+    def test_plugin_skill_mirror_matches_canonical(self) -> None:
+        """The plugin's skill copy must be byte-identical to the canonical
+        skill body. Run `scripts/sync_plugin_skill.sh` to regenerate the mirror
+        whenever you edit `skills/mozyo-bridge-agent/`."""
+
+        def relative_files(base: Path) -> dict[str, str]:
+            mapping: dict[str, str] = {}
+            for path in base.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(base).as_posix()
+                mapping[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+            return mapping
+
+        self.assertTrue(
+            self.canonical_skill_dir.is_dir(),
+            f"canonical skill missing: {self.canonical_skill_dir}",
+        )
+        self.assertTrue(
+            self.plugin_skill_dir.is_dir(),
+            f"plugin skill mirror missing: {self.plugin_skill_dir}",
+        )
+
+        canonical = relative_files(self.canonical_skill_dir)
+        mirror = relative_files(self.plugin_skill_dir)
+
+        missing = sorted(set(canonical) - set(mirror))
+        extra = sorted(set(mirror) - set(canonical))
+        differing = sorted(
+            rel for rel in canonical.keys() & mirror.keys() if canonical[rel] != mirror[rel]
+        )
+
+        hint = "run scripts/sync_plugin_skill.sh to regenerate the mirror"
+        self.assertFalse(missing, f"plugin mirror missing files: {missing}; {hint}")
+        self.assertFalse(extra, f"plugin mirror has unexpected files: {extra}; {hint}")
+        self.assertFalse(
+            differing, f"plugin mirror content differs from canonical: {differing}; {hint}"
+        )
+
+    def test_plugin_skill_mirror_has_skill_md(self) -> None:
+        self.assertTrue(
+            (self.plugin_skill_dir / "SKILL.md").is_file(),
+            "plugin must ship SKILL.md so Claude Code can discover the skill after install",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

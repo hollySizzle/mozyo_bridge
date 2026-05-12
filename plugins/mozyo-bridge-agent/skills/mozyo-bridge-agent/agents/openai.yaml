@@ -1,0 +1,7 @@
+interface:
+  display_name: "mozyo Bridge Agent"
+  short_description: "Asana-driven workflow for mozyo_bridge"
+  default_prompt: "Use $mozyo-bridge-agent to handle the next mozyo_bridge task from Asana with the repo rules."
+
+policy:
+  allow_implicit_invocation: true
