@@ -354,27 +354,88 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
     info["agent_panes"] = {}
     info["warnings"] = []
 
+    # Scope agent-pane checks to the current tmux session. Cross-session panes
+    # are legitimate when the operator keeps parallel project sessions open;
+    # only same-session duplicates indicate a real labeling collision.
+    pane_env = os.environ.get("TMUX_PANE") or ""
+    current_session: str | None = None
+    if pane_env:
+        for pane in panes:
+            if pane["id"] == pane_env:
+                location = pane.get("location") or ""
+                current_session = location.split(":", 1)[0] or None
+                break
+    info["current_session"] = current_session or ""
+
     bad = False
     repo_root_raw = getattr(args, "repo", None) or "."
     repo_root = Path(repo_root_raw).expanduser().resolve()
     for agent in ("claude", "codex"):
-        matches = [pane for pane in panes if pane["label"] == agent]
-        if not matches:
-            info["agent_panes"][agent] = {"status": "missing"}
-            bad = True
-        elif len(matches) > 1:
-            info["agent_panes"][agent] = {"status": "duplicate", "count": len(matches)}
+        all_matches = [pane for pane in panes if pane["label"] == agent]
+        if current_session is not None:
+            in_scope = [
+                pane
+                for pane in all_matches
+                if (pane.get("location") or "").split(":", 1)[0] == current_session
+            ]
+        else:
+            in_scope = []
+        other_count = len(all_matches) - len(in_scope)
+
+        if not in_scope:
+            if current_session is None:
+                entry: dict[str, Any] = {
+                    "status": "unscoped",
+                    "count": len(all_matches),
+                    "panes": [
+                        {"id": p["id"], "location": p.get("location", "")}
+                        for p in all_matches
+                    ],
+                }
+            else:
+                entry = {"status": "missing", "session": current_session}
+                if other_count:
+                    entry["other_sessions"] = other_count
+                    entry["other_panes"] = [
+                        {"id": p["id"], "location": p.get("location", "")}
+                        for p in all_matches
+                    ]
+                bad = True
+            info["agent_panes"][agent] = entry
+        elif len(in_scope) > 1:
+            entry = {
+                "status": "duplicate",
+                "count": len(in_scope),
+                "session": current_session,
+                "panes": [
+                    {
+                        "id": p["id"],
+                        "location": p.get("location", ""),
+                        "process": Path(p.get("command") or "").name,
+                        "cwd": p.get("cwd", ""),
+                    }
+                    for p in in_scope
+                ],
+            }
+            if other_count:
+                entry["other_sessions"] = other_count
+            info["agent_panes"][agent] = entry
             bad = True
         else:
-            pane = matches[0]
+            pane = in_scope[0]
             command = Path(pane["command"]).name
             pane_status = "ok" if is_agent_process(command) else "not-agent-process"
-            info["agent_panes"][agent] = {
+            entry = {
                 "status": pane_status,
                 "id": pane["id"],
                 "process": command,
                 "cwd": pane.get("cwd", ""),
             }
+            if current_session is not None:
+                entry["session"] = current_session
+            if other_count:
+                entry["other_sessions"] = other_count
+            info["agent_panes"][agent] = entry
             if pane_status != "ok":
                 bad = True
             if agent == "claude":
@@ -520,17 +581,34 @@ def format_doctor_text(result: dict[str, Any]) -> str:
     if "panes_total" in tmux:
         lines.append(f"  panes: {tmux['panes_total']}")
         lines.append(f"  labeled_panes: {tmux['labeled_panes']}")
+        if tmux.get("current_session"):
+            lines.append(f"  current_session: {tmux['current_session']}")
         for agent, agent_info in tmux.get("agent_panes", {}).items():
-            if agent_info["status"] == "missing":
-                lines.append(f"  {agent}_pane: missing")
-            elif agent_info["status"] == "duplicate":
+            status = agent_info["status"]
+            other = agent_info.get("other_sessions") or 0
+            suffix = f" other_sessions={other}" if other else ""
+            if status == "missing":
+                session = agent_info.get("session") or "-"
                 lines.append(
-                    f"  {agent}_pane: duplicate ({agent_info['count']})"
+                    f"  {agent}_pane: missing session={session}{suffix}"
+                )
+            elif status == "duplicate":
+                session = agent_info.get("session") or "-"
+                pane_ids = ",".join(p["id"] for p in agent_info.get("panes", []))
+                lines.append(
+                    f"  {agent}_pane: duplicate ({agent_info['count']}) "
+                    f"session={session} panes={pane_ids}{suffix}"
+                )
+            elif status == "unscoped":
+                pane_ids = ",".join(p["id"] for p in agent_info.get("panes", []))
+                lines.append(
+                    f"  {agent}_pane: unscoped ({agent_info['count']}) "
+                    f"panes={pane_ids or '-'} (run from inside a tmux pane to scope)"
                 )
             else:
                 lines.append(
                     f"  {agent}_pane: {agent_info['id']} "
-                    f"process={agent_info['process']} status={agent_info['status']}"
+                    f"process={agent_info['process']} status={status}{suffix}"
                 )
         for warning in tmux.get("warnings", []):
             if warning["kind"] == "claude_pane_cwd_outside_repo":

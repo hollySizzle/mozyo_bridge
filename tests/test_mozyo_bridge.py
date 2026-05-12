@@ -1587,6 +1587,7 @@ class CommandTest(unittest.TestCase):
                 patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
                 patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
                 patch("mozyo_bridge.application.doctor._in_tmux", return_value=True), \
+                patch.dict(os.environ, {"TMUX_PANE": "%1"}), \
                 patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
                 patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
                 patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
@@ -1616,6 +1617,7 @@ class CommandTest(unittest.TestCase):
                 patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
                 patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
                 patch("mozyo_bridge.application.doctor._in_tmux", return_value=True), \
+                patch.dict(os.environ, {"TMUX_PANE": "%1"}), \
                 patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
                 patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
                 patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
@@ -1625,6 +1627,101 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_doctor(args))
 
         self.assertIn("claude_pane: %1 process=2.1.138 status=ok", stdout.getvalue())
+
+    def test_doctor_does_not_flag_cross_session_labeled_panes_as_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {"id": "%1", "location": "mozyo_bridge:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
+                {"id": "%2", "location": "mozyo_bridge:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+                {"id": "%3", "location": "other_project:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
+                {"id": "%4", "location": "other_project:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+            ]
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="%1 claude\n%2 codex\n%3 claude\n%4 codex\n",
+                stderr="",
+            )
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch.dict(os.environ, {"TMUX_PANE": "%1"}), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("claude_pane: %1 process=2.1.138 status=ok", output)
+        self.assertIn("codex_pane: %2 process=node status=ok", output)
+        self.assertIn("other_sessions=1", output)
+        self.assertNotIn("duplicate", output)
+
+    def test_doctor_flags_within_session_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {"id": "%1", "location": "agents:0.0", "command": "zsh", "label": "claude", "cwd": str(repo)},
+                {"id": "%2", "location": "agents:0.1", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
+                {"id": "%3", "location": "agents:0.2", "command": "node", "label": "codex", "cwd": str(repo)},
+            ]
+            list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 claude\n%3 codex\n", stderr="")
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch.dict(os.environ, {"TMUX_PANE": "%2"}), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(1, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("claude_pane: duplicate (2) session=agents panes=%1,%2", output)
+        self.assertIn("codex_pane: %3 process=node status=ok", output)
+
+    def test_doctor_reports_unscoped_when_invoked_outside_tmux_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {"id": "%1", "location": "mozyo_bridge:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
+                {"id": "%2", "location": "mozyo_bridge:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+            ]
+            list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
+            ok_stub = {"status": "ok", "next_action": []}
+
+            env_without_tmux_pane = {k: v for k, v in os.environ.items() if k != "TMUX_PANE"}
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch.dict(os.environ, env_without_tmux_pane, clear=True), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("claude_pane: unscoped (1) panes=%1", output)
+        self.assertIn("codex_pane: unscoped (1) panes=%2", output)
+        self.assertNotIn("duplicate", output)
 
 
 class DoctorEnvironmentTest(unittest.TestCase):
