@@ -25,11 +25,113 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 
 1. Asana release task から開始する。
 2. local unit test と build check を実行する。
-3. `main` に push し、GitHub Actions `Test` の成功を確認する。
-4. TestPyPI は `Publish to TestPyPI` workflow を使う。
-5. TestPyPI install を `pipx` で検証する。
-6. 社内ベータ配布は TestPyPI install 検証で完了とする。
-7. production PyPI 公開は、別途 production release として明示判断する。
+3. Release Artifact Guardrails を実行する。
+4. `main` に push し、GitHub Actions `Test` の成功を確認する。
+5. TestPyPI は `Publish to TestPyPI` workflow を使う。
+6. TestPyPI install を `pipx` で検証する。
+7. 社内ベータ配布は TestPyPI install 検証で完了とする。
+8. production PyPI 公開は、別途 production release として明示判断する。
+
+## Release Artifact Guardrails
+
+Release 前に、git tree、scaffold output、build artifact の三つを検査する。`mozyo-bridge --version`
+だけでは release commit の一致や scaffold preset の中身を判定できないため、version 文字列を唯一の根拠にしない。
+
+### Source Tree Hygiene
+
+以下は release commit 直前に必ず確認する。secret ではない個人ホーム絶対パスでも、public repo では release blocker として扱う。
+
+```bash
+git status --short --branch
+git log --all -S'/Users/' -- AGENTS.md CLAUDE.md src skills vibes README.md pyproject.toml
+git grep -nE '/Users/|/home/[^/]+/|C:\\Users\\|\\.env|pypirc|token|secret|password' -- \
+  ':!*.pyc' ':!build' ':!dist' ':!.git' ':!.venv' ':!tmp'
+```
+
+`git grep` は false positive を含み得る。false positive は Asana release task に理由を記録する。
+`/Users/<name>` のような個人ホーム絶対パスが router、skill、docs、scaffold preset、manifest に入っている場合は release しない。
+
+### Fresh Scaffold Smoke
+
+local checkout から、isolated home / isolated target に対して全 preset を fresh scaffold する。
+生成物に host 固有パスが入らず、portable rule path と `scaffold status` が揃うことを確認する。
+
+```bash
+tmp="$(mktemp -d)"
+home="$tmp/home"
+python -m mozyo_bridge rules install --home "$home"
+for preset in asana redmine none; do
+  project="$tmp/project-$preset"
+  mkdir -p "$project"
+  python -m mozyo_bridge scaffold rules "$preset" --target "$project" --home "$home"
+  rg -n '/Users/|/home/[^/]+/|C:\\Users\\' \
+    "$project/AGENTS.md" "$project/CLAUDE.md" "$project/.mozyo-bridge/scaffold.json" && exit 1
+  rg -n --fixed-strings \
+    "\${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/$preset/agent-workflow.md" \
+    "$project/AGENTS.md" "$project/CLAUDE.md" "$project/.mozyo-bridge/scaffold.json"
+  python -m mozyo_bridge scaffold status --target "$project" --home "$home" | rg 'clean'
+done
+```
+
+### Build Artifact Inspection
+
+Release artifact そのものを展開して検査する。sdist は root docs を含む場合があるため、wheel だけで判定しない。
+
+```bash
+rm -rf dist
+python -m build
+tmp="$(mktemp -d)"
+for artifact in dist/*; do
+  case "$artifact" in
+    *.whl) python -m zipfile -e "$artifact" "$tmp/wheel" ;;
+    *.tar.gz) mkdir -p "$tmp/sdist"; tar -xzf "$artifact" -C "$tmp/sdist" ;;
+  esac
+done
+rg -n '/Users/|/home/[^/]+/|C:\\Users\\|pypirc|token|secret|password' "$tmp" && exit 1
+```
+
+この検査で false positive が出た場合も、release task に artifact path と判断理由を残す。
+
+### Release Ref Consistency
+
+docs / command / scaffold preset / skill archive が同じ release commit を指すことを確認する。
+
+- `pyproject.toml` の version bump は単独 commit にする。
+- `mozyo-bridge --version` は package version だけを示す。GitHub `main` と PyPI artifact が同じ version string を持つ場合があるため、差分確認には使わない。
+- TestPyPI / PyPI の fresh install smoke は、package version と同じ git ref から install scripts / skill tree を取得する。tag release なら `MOZYO_BRIDGE_SKILL_REF=vX.Y.Z` を使う。
+- tag は release commit を指す annotated tag として作成し、tag 作成後に `git ls-remote origin refs/tags/vX.Y.Z` で remote ref を確認する。
+
+## Fresh Install Smoke
+
+TestPyPI / PyPI の release acceptance では、local checkout / local wheel / editable install を代用しない。
+
+TestPyPI:
+
+```bash
+pipx install --force --backend pip \
+  --index-url https://test.pypi.org/simple/ \
+  --pip-args "--extra-index-url https://pypi.org/simple/" \
+  mozyo-bridge==X.Y.Z
+```
+
+PyPI:
+
+```bash
+pipx install --force mozyo-bridge==X.Y.Z
+```
+
+Fresh install 後の minimum smoke:
+
+```bash
+mozyo-bridge --help
+mozyo --help
+mozyo-bridge rules install
+mozyo-bridge doctor --json
+```
+
+その後、`README.md` の `Beta Tester Install (GitHub main)` 節にある isolated target smoke を、GitHub `main`
+install の代わりに該当 PyPI / TestPyPI install で実行する。特に ticket-ID entrypoint と scaffold guardrail の検証として、
+Asana / Redmine / none の scaffold、`scaffold status`、`doctor --target` を release task に記録する。
 
 ## Trusted Publishing
 
