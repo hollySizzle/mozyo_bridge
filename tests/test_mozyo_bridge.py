@@ -25,9 +25,11 @@ from mozyo_bridge.application.commands import (
     cmd_init,
     cmd_open,
     cmd_open_here,
+    load_tmux_conf_for,
     notify_agent,
     session_cwd_mismatch,
 )
+from mozyo_bridge.infrastructure import tmux_client
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
@@ -364,6 +366,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual("tmux-ui-open", args.command)
         self.assertEqual("agents", args.session)
         self.assertEqual("/repo", args.cwd)
+
+    def test_normalize_paths_marks_default_config_path(self) -> None:
+        from mozyo_bridge.application.cli import normalize_paths
+
+        parsed = build_parser().parse_args(["tmux-ui-open"])
+        normalized = normalize_paths(parsed)
+        self.assertTrue(normalized.config_path_was_default)
+        self.assertIsNotNone(normalized.config_path)
+
+    def test_normalize_paths_marks_explicit_config_path(self) -> None:
+        from mozyo_bridge.application.cli import normalize_paths
+
+        parsed = build_parser().parse_args(["tmux-ui-open", "--config-path", "/explicit/.tmux.conf"])
+        normalized = normalize_paths(parsed)
+        self.assertFalse(normalized.config_path_was_default)
+        self.assertEqual("/explicit/.tmux.conf", normalized.config_path)
 
     def test_open_here_defaults_session_and_cwd_to_none_before_normalization(self) -> None:
         parser = build_parser()
@@ -1418,7 +1436,7 @@ class CommandTest(unittest.TestCase):
             self.assertEqual(0, cmd_ensure_pair(args))
 
         new_session.assert_called_once_with("claude", "agents", cwd="/repo")
-        source_conf.assert_called_once_with("/repo/.tmux.conf")
+        source_conf.assert_called_once_with("/repo/.tmux.conf", optional=False)
         spawn.assert_called_once_with("codex", cwd="/repo", vertical=False, target="agents:0")
 
     def test_notify_agent_rejects_custom_label_with_ensure(self) -> None:
@@ -1588,7 +1606,7 @@ class CommandTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "attached"):
                 cmd_open(args)
 
-        source_conf.assert_called_once_with("/repo/.tmux.conf")
+        source_conf.assert_called_once_with("/repo/.tmux.conf", optional=False)
 
     def _open_here_args(self, repo: Path, session=None, cwd=None) -> argparse.Namespace:
         return argparse.Namespace(
@@ -1705,6 +1723,77 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_open_here(args))
 
         self.assertEqual("my-project", captured["args"].session)
+
+    def test_load_tmux_conf_skips_silently_when_default_path_missing(self) -> None:
+        args = argparse.Namespace(
+            config_path="/nonexistent/.tmux.conf",
+            config_path_was_default=True,
+            repo=None,
+        )
+
+        with patch("mozyo_bridge.application.commands.source_tmux_conf", wraps=tmux_client.source_tmux_conf) as wrapped, \
+            patch("mozyo_bridge.infrastructure.tmux_client.run_tmux") as run:
+            self.assertFalse(load_tmux_conf_for(args))
+
+        wrapped.assert_called_once_with("/nonexistent/.tmux.conf", optional=True)
+        run.assert_not_called()
+
+    def test_load_tmux_conf_errors_when_explicit_config_path_missing(self) -> None:
+        args = argparse.Namespace(
+            config_path="/nonexistent/.tmux.conf",
+            config_path_was_default=False,
+            repo=None,
+        )
+
+        with patch("mozyo_bridge.application.commands.source_tmux_conf", wraps=tmux_client.source_tmux_conf), \
+            patch("mozyo_bridge.infrastructure.tmux_client.run_tmux") as run, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                load_tmux_conf_for(args)
+
+        run.assert_not_called()
+        self.assertIn("tmux config not found", stderr.getvalue())
+
+    def test_load_tmux_conf_sources_when_default_path_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / ".tmux.conf"
+            conf.write_text("# placeholder", encoding="utf-8")
+            args = argparse.Namespace(
+                config_path=str(conf),
+                config_path_was_default=True,
+                repo=None,
+            )
+            ok = argparse.Namespace(returncode=0, stdout="", stderr="")
+            with patch("mozyo_bridge.infrastructure.tmux_client.run_tmux", return_value=ok) as run:
+                self.assertTrue(load_tmux_conf_for(args))
+
+        run.assert_called_once_with("source-file", str(conf), check=False)
+
+    def test_cmd_open_propagates_config_path_was_default_to_ensure_pair(self) -> None:
+        args = argparse.Namespace(
+            session="agents",
+            cwd="/repo",
+            vertical=False,
+            config=True,
+            config_path="/repo/.tmux.conf",
+            config_path_was_default=True,
+            ready_timeout=0,
+            force=False,
+        )
+        captured: dict[str, argparse.Namespace] = {}
+
+        def fake_ensure_pair(inner: argparse.Namespace) -> int:
+            captured["args"] = inner
+            return 0
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+            patch("mozyo_bridge.application.commands.cmd_ensure_pair", side_effect=fake_ensure_pair), \
+            patch("mozyo_bridge.application.commands.os.execvp", side_effect=RuntimeError("attached")):
+            with self.assertRaisesRegex(RuntimeError, "attached"):
+                cmd_open(args)
+
+        self.assertTrue(captured["args"].config_path_was_default)
 
     def test_session_cwd_mismatch_returns_empty_when_no_panes_in_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -53,8 +53,10 @@ def normalize_paths(args: argparse.Namespace) -> argparse.Namespace:
     repo_root = repo_root_from_args(args)
     if hasattr(args, "cwd") and args.cwd is None:
         args.cwd = str(repo_root)
-    if hasattr(args, "config_path") and args.config_path is None:
-        args.config_path = str(default_tmux_conf(repo_root))
+    if hasattr(args, "config_path"):
+        args.config_path_was_default = args.config_path is None
+        if args.config_path is None:
+            args.config_path = str(default_tmux_conf(repo_root))
     if hasattr(args, "queue") and args.queue is None:
         args.queue = str(default_queue_path(repo_root))
     return args

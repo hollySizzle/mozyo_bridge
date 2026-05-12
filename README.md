@@ -164,6 +164,8 @@ MOZYO_REPO=/path/to/repo mozyo-bridge tmux-ui-open
 `--cwd` を省略した tmux-ui 系コマンドは、解決した project root を作業ディレクトリとして使います。
 `.tmux.conf` は project root にあればそれを使い、なければ `~/.config/mozyo-bridge/tmux.conf` を見ます。
 
+config が default 解決経路のどちらにも存在しない場合、`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` / `notify-*` は config の source を skip して session / pane 起動だけを実行します。一方 `--config-path /path/to/conf` を **明示** 指定した場合は path 不存在を typo 防止のため `tmux config not found` で fail-fast します。`mozyo-bridge tmux-ui-config` (load 専用 command) も従来通り存在しない config は error にします。
+
 ### `open-here` (repo-aware sugar)
 
 `mozyo-bridge open-here` は repo root をそのまま session/cwd に当てる sugar command です。`tmux-ui-open --session <repo名> --cwd <repo root>` を毎回手で打つ運用を 1 行に縮めます。

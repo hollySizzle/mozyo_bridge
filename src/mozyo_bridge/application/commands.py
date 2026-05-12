@@ -58,6 +58,18 @@ def queue_path_from_args(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "queue", None) or default_queue_path(repo_root_from_args(args))).expanduser()
 
 
+def load_tmux_conf_for(args: argparse.Namespace) -> bool:
+    """Auto-startup config loader.
+
+    Skips silently when the resolved path is the default and the file is
+    missing, so `open-here` / `tmux-ui-open` / spawn / ensure / notify paths
+    do not block on a missing tmux config. An explicit user-supplied
+    `--config-path` still errors when the file is missing.
+    """
+    optional = bool(getattr(args, "config_path_was_default", False))
+    return source_tmux_conf(config_path_from_args(args), optional=optional)
+
+
 def cmd_list(_: argparse.Namespace) -> int:
     require_tmux()
     print("TARGET\tLOCATION\tPROCESS\tLABEL\tCWD")
@@ -217,7 +229,7 @@ def rollback_unsubmitted_input(target: str) -> None:
 
 def cmd_spawn(args: argparse.Namespace) -> int:
     if args.config:
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
     pane_id = spawn_agent_terminal_pane(args.agent, cwd=args.cwd, vertical=args.vertical)
     if args.ready_timeout:
         wait_for_agent_terminal_pane(pane_id, args.agent, args.ready_timeout)
@@ -228,7 +240,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 def cmd_ensure(args: argparse.Namespace) -> int:
     require_tmux()
     if args.config:
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
     existing = find_labeled_pane(args.agent, session=current_session_name(), fallback=False)
     if existing:
         ensure_agent_target(existing, args.agent, force=args.force)
@@ -245,14 +257,14 @@ def cmd_ensure_pair(args: argparse.Namespace) -> int:
     require_tmux()
     config_loaded = False
     if args.config and session_exists(args.session):
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
         config_loaded = True
     created: list[str] = []
     if not session_exists(args.session):
         claude_pane = new_agent_session("claude", args.session, cwd=args.cwd)
         created.append(f"claude:{claude_pane}")
     if args.config and not config_loaded:
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
     claude = find_labeled_pane("claude", session=args.session, fallback=False)
     if not claude:
         claude_pane = spawn_agent_terminal_pane("claude", cwd=args.cwd, vertical=args.vertical, target=f"{args.session}:0")
@@ -297,12 +309,13 @@ def cmd_open(args: argparse.Namespace) -> int:
             vertical=args.vertical,
             config=True,
             config_path=config_path_from_args(args),
+            config_path_was_default=getattr(args, "config_path_was_default", False),
             ready_timeout=args.ready_timeout,
             force=args.force,
         )
         cmd_ensure_pair(setup_args)
     elif args.config:
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
     os.execvp("tmux", ["tmux", "attach", "-t", args.session])
     raise AssertionError("unreachable")
 
@@ -375,7 +388,7 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     target_name = args.target or agent
     should_ensure = getattr(args, "ensure", False) and not is_tmux_target(target_name)
     if getattr(args, "config", False):
-        source_tmux_conf(config_path_from_args(args))
+        load_tmux_conf_for(args)
     if getattr(args, "ensure", False) and not is_tmux_target(target_name) and target_name != agent:
         die("--ensure only supports the default agent label; omit --target or pass an explicit tmux pane id")
     if should_ensure and not find_labeled_pane(target_name, session=current_session_name(), fallback=False):

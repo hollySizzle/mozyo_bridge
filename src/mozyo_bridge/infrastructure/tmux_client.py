@@ -22,13 +22,23 @@ def require_tmux() -> None:
         die("tmux is not installed or not in PATH")
 
 
-def source_tmux_conf(path: str | None = None) -> None:
+def source_tmux_conf(path: str | None = None, *, optional: bool = False) -> bool:
+    """Source `path` (or the default tmux conf) into tmux.
+
+    When `optional` is True and the resolved file does not exist, this is a
+    no-op that returns False so the auto-startup paths can proceed without
+    a config file. When `optional` is False, a missing file is fatal as before.
+    Returns True when tmux source-file was invoked successfully.
+    """
     conf = Path(path or DEFAULT_TMUX_CONF).expanduser()
     if not conf.exists():
+        if optional:
+            return False
         die(f"tmux config not found: {conf}")
     result = run_tmux("source-file", str(conf), check=False)
     if result.returncode != 0:
         die(f"tmux source-file failed: {result.stderr.strip() or result.stdout.strip()}")
+    return True
 
 
 def pane_lines() -> list[dict[str, str]]:
