@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge import __version__
-from mozyo_bridge.application.commands import cmd_doctor, cmd_ensure_pair, cmd_open, notify_agent
+from mozyo_bridge.application.commands import cmd_doctor, cmd_ensure_pair, cmd_init, cmd_open, notify_agent
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
@@ -1722,6 +1722,93 @@ class CommandTest(unittest.TestCase):
         self.assertIn("claude_pane: unscoped (1) panes=%1", output)
         self.assertIn("codex_pane: unscoped (1) panes=%2", output)
         self.assertNotIn("duplicate", output)
+
+    def _init_run_tmux_side_effect(self, target_pane_id: str):
+        # display-message resolves any pane reference to the canonical pane id;
+        # set-option (used to clear siblings) is a no-op for the test.
+        def side_effect(*tmux_args, **_):
+            if tmux_args[:1] == ("display-message",):
+                return argparse.Namespace(returncode=0, stdout=f"{target_pane_id}\n", stderr="")
+            if tmux_args[:1] == ("set-option",):
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux args: {tmux_args}")
+        return side_effect
+
+    def test_cmd_init_refuses_within_session_collision_without_force(self) -> None:
+        args = argparse.Namespace(agent="claude", target="%5", force=False)
+        panes = [
+            {"id": "%2", "location": "agents:0.0", "command": "2.1.138", "label": "claude", "cwd": "/repo"},
+            {"id": "%5", "location": "agents:0.2", "command": "zsh", "label": "", "cwd": "/repo"},
+        ]
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=self._init_run_tmux_side_effect("%5")), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.2"), \
+            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.set_pane_label") as set_label, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                cmd_init(args)
+
+        self.assertIn("already labeled 'claude'", stderr.getvalue())
+        self.assertIn("%2", stderr.getvalue())
+        set_label.assert_not_called()
+
+    def test_cmd_init_with_force_clears_sibling_label_and_relabels_target(self) -> None:
+        args = argparse.Namespace(agent="claude", target="%5", force=True)
+        panes = [
+            {"id": "%2", "location": "agents:0.0", "command": "2.1.138", "label": "claude", "cwd": "/repo"},
+            {"id": "%5", "location": "agents:0.2", "command": "zsh", "label": "", "cwd": "/repo"},
+        ]
+        clear_calls: list[tuple] = []
+
+        def run_tmux_side_effect(*tmux_args, **_):
+            if tmux_args[:1] == ("display-message",):
+                return argparse.Namespace(returncode=0, stdout="%5\n", stderr="")
+            if tmux_args[:1] == ("set-option",):
+                clear_calls.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux args: {tmux_args}")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=run_tmux_side_effect), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.2"), \
+            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.set_pane_label") as set_label, \
+            contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(0, cmd_init(args))
+
+        self.assertEqual(1, len(clear_calls), clear_calls)
+        clear_args = clear_calls[0]
+        self.assertEqual("set-option", clear_args[0])
+        self.assertIn("%2", clear_args)
+        self.assertIn("@agent_name", clear_args)
+        self.assertIn("", clear_args)
+        set_label.assert_called_once_with("%5", "claude")
+        self.assertIn("cleared=%2", stdout.getvalue())
+
+    def test_cmd_init_allows_cross_session_label(self) -> None:
+        args = argparse.Namespace(agent="claude", target="%5", force=False)
+        panes = [
+            {"id": "%2", "location": "other:0.0", "command": "2.1.138", "label": "claude", "cwd": "/repo"},
+            {"id": "%5", "location": "agents:0.2", "command": "zsh", "label": "", "cwd": "/repo"},
+        ]
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=self._init_run_tmux_side_effect("%5")), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.2"), \
+            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.set_pane_label") as set_label, \
+            contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, cmd_init(args))
+
+        set_label.assert_called_once_with("%5", "claude")
+
+    def test_cmd_init_rejects_label_as_target(self) -> None:
+        args = argparse.Namespace(agent="claude", target="claude", force=False)
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                cmd_init(args)
+        self.assertIn("not a label", stderr.getvalue())
 
 
 class DoctorEnvironmentTest(unittest.TestCase):

@@ -395,9 +395,35 @@ def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     require_tmux()
-    target = args.target or current_pane()
-    run_tmux("set-option", "-p", "-t", target, LABEL_OPTION, args.agent)
-    print(f"initialized {target} as {args.agent}")
+    raw_target = args.target or current_pane()
+    if not is_tmux_target(raw_target):
+        die(f"init target must be a tmux pane id or location, not a label: {raw_target}")
+    resolved = run_tmux("display-message", "-t", raw_target, "-p", "#{pane_id}", check=False)
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        die(f"invalid tmux target: {raw_target}")
+    target = resolved.stdout.strip()
+    target_session = pane_location(target).split(":", 1)[0]
+
+    collisions = [
+        pane
+        for pane in pane_lines()
+        if pane["label"] == args.agent
+        and (pane.get("location") or "").split(":", 1)[0] == target_session
+        and pane["id"] != target
+    ]
+    force = bool(getattr(args, "force", False))
+    if collisions and not force:
+        ids = ", ".join(pane["id"] for pane in collisions)
+        die(
+            f"pane in session {target_session} already labeled '{args.agent}': {ids}. "
+            "Clear that label first or re-run with --force to relabel and unset siblings."
+        )
+    if force:
+        for pane in collisions:
+            run_tmux("set-option", "-p", "-t", pane["id"], LABEL_OPTION, "")
+    set_pane_label(target, args.agent)
+    cleared_note = f" cleared={','.join(p['id'] for p in collisions)}" if collisions else ""
+    print(f"initialized {target} as {args.agent}{cleared_note}")
     return 0
 
 

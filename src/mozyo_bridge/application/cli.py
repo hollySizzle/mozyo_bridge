@@ -234,6 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init")
     init.add_argument("agent", choices=["claude", "codex"])
     init.add_argument("target", nargs="?")
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="Clear the @agent_name label from any same-session siblings and relabel the target",
+    )
     init.set_defaults(func=cmd_init)
 
     doctor = sub.add_parser(
