@@ -29,7 +29,8 @@ canonical な skill 本体は `skills/mozyo-bridge-agent/` に置き、Claude pl
 
 ## Marketplace / plugin metadata
 
-- `.claude-plugin/marketplace.json` は `name`, `owner`, `plugins`, `metadata.pluginRoot` を持ち、`mozyo-bridge-agent` plugin を `./mozyo-bridge-agent` で参照する (`pluginRoot: "./plugins"` 経由)。
+- `.claude-plugin/marketplace.json` は `name`, `owner`, `plugins` を持ち、`mozyo-bridge-agent` plugin を `./plugins/mozyo-bridge-agent` の explicit path で参照する (marketplace root から resolve)。
+- **Caveat (verified 2026-05-12, commit 542edad)**: `metadata.pluginRoot` は使わない。Claude plugin docs L181 (<https://code.claude.com/docs/en/plugin-marketplaces>) は `pluginRoot` が relative source path に prepend されると記載するが、現行 Claude CLI の (a) validator schema は source に `./` prefix を強制 (L233 "Must start with `./`") し、(b) installer は `./`-prefixed source を marketplace root から resolve する (`pluginRoot` を prepend しない)。結果として `pluginRoot: "./plugins"` + `source: "./mozyo-bridge-agent"` は `claude plugin validate .` を通っても GitHub marketplace 経由の install 時に `Source path does not exist` で失敗する。verification log: Asana 1214730609356621 comment 1214731507813769。
 - `plugins/mozyo-bridge-agent/.claude-plugin/plugin.json` は `name`, `description`, `repository`, `license`, `keywords`, `author` を持つ。`version` は意図的に省略し、git commit SHA を version として使う (docs: <https://code.claude.com/docs/en/plugin-marketplaces#version-resolution-and-release-channels>)。これにより `pyproject.toml` の package version と plugin version を別管理できる。
 - marketplace name (`mozyo-bridge`) は Anthropic 公式 reserved name (`anthropic-marketplace`, `claude-code-marketplace` など) と衝突しない kebab-case。
 
