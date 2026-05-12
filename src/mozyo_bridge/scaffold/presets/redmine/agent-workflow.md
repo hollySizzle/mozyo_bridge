@@ -121,8 +121,40 @@ Before treating work as complete:
 1. Verify the requested work against the acceptance criteria, scope, and any design-consultation answers that bound the implementation.
 2. Record material changes, verification, blockers, remaining risks, and findings disposition in Redmine.
 3. Pass through the Review Gate. Implementation Done alone is not completion. Do not report "complete" or "done" in chat before the Review Gate is recorded in Redmine.
-4. Update issue status only according to the project's Redmine workflow. Owner approval governs final close.
+4. Update issue status only according to the project's Redmine workflow. Owner approval governs final close. When an audit-owned commit is required, the commit hash must be journaled in Redmine before the issue moves to closed. See `Audit-Owned Commit Authority`.
 5. If anything from the original scope is still open at this point — child issues, manual verification, generated capture confirmation, data-compatibility checks, ops-flow checks — it is a Progress Log entry, not a completion. Record it as such and keep the parent issue out of the closed state.
+
+## Audit-Owned Commit Authority
+
+When the project splits implementation and audit between separate actors, the audit actor — not the implementation actor — is authorized to stage and commit the audit-approved diff. This is a commit authority, not an implementation authority. The audit actor is still prohibited from directly editing files for a normal development issue; that path is the narrow exception in `Implementer / Auditor Role Boundary`, not this section. This section governs *who lands the commit* after the Review Gate is recorded in Redmine.
+
+Preconditions:
+
+- A Review Gate journal recording approval exists on the issue, and the journal id is captured.
+- A separate implementation actor produced the diff under review. If the audit actor itself produced the diff, this section does not apply; that path is a direct edit and must be journaled as such under the role-boundary exceptions.
+
+Pre-commit checks (audit actor):
+
+- Run `git status` and reconcile the dirty set against the Implementation Done Gate's changed-paths list.
+- Stage only the files whose diff matches what the Review Gate approved. Do not use `git add -A` or `git add .` when the worktree contains scope-outside changes.
+- Run `git diff --cached --stat` (and `git diff --cached` when content review is required) and reconcile the staged set against the Implementation Done Gate line by line.
+- Unrelated dirty files must be excluded — stashed, committed under a separately scoped issue, or left untouched. Never bundle scope-outside changes into the audit-owned commit.
+
+Commit message reference (Redmine):
+
+- `Refs: Redmine #<issue_id>` (required)
+- `Journal: <journal_id>` (required; the journal id of the Review Gate approval)
+- The subject line is the normal short description. The references go in trailers or body lines so `git log` alone is replayable back to the Redmine issue and the approving Review Gate.
+
+Post-commit recording:
+
+- Record the commit hash in a Close Gate journal on the same issue (or in a Progress Log journal if the Close Gate is not yet ready). The hash must live in the durable Redmine record, not only in pane chat.
+- The issue may move to its project's closed status only after the Review Gate journal and the commit-hash journal are both recorded. Implementation Done alone, or a commit landing without a journaled hash, is not closure.
+
+Scope of this authority:
+
+- Applies to normal development issues and to guardrail / rule / workflow issues alike whenever the project assigns separate implementation and audit actors.
+- When the project does not split implementer and auditor roles, the boundary collapses; the commit reference format and the hash-journal requirement still apply.
 
 ## Prohibitions
 

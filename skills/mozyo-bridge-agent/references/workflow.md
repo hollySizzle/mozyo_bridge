@@ -77,6 +77,29 @@ Pane messages are notification edges in this lifecycle. They are not review pass
 - When Codex makes a direct edit under an exception, record `Codex direct edit` in Asana with (a) which exception applied, (b) the verbatim or quoted user instruction, (c) the changed files, (d) the verification performed, and (e) whether follow-up verification is required. A direct edit missing any of these fields is itself subject to a follow-up correction.
 - A Codex direct edit to autonomous workflow or role boundaries does not waive the workflow-change verification requirement.
 
+## Audit-Owned Commit Authority
+
+The default `mozyo_bridge` role split has Claude implement and Codex audit. After the durable audit record is captured (an audit / review comment on the Asana task, or a Review Gate journal on the Redmine issue), Codex is authorized to stage and commit *only the audit-approved diff*. This is a commit authority, not an implementation authority. The two are distinct boundaries:
+
+- **Codex direct implementation edit** — restricted to the narrow exceptions in `Policy / Skill Authoring Boundary`. Producing new diffs.
+- **Codex audit-owned commit** — allowed after the audit record exists. Committing diffs that Claude already produced and that the audit record approved.
+
+Audit-owned commit does not waive the implementer / auditor boundary. Codex must not edit implementation files in order to "fix up" an audit-approved diff during staging. If the diff needs changes, that is a new implementation iteration that goes back to Claude.
+
+Before an audit-owned commit, Codex must:
+
+1. Confirm the durable audit record exists — an audit / review comment on the Asana task, or a Review Gate journal on the Redmine issue. The commit cannot land before this record exists.
+2. Run `git status` and reconcile the dirty set against the implementation actor's recorded changed-paths list. If scope-outside dirty files exist, stash them, route them through a separately scoped task, or leave them untouched — never bundle them into the audit-owned commit.
+3. Stage only the audit-approved paths. Avoid `git add -A` and `git add .` whenever the worktree carries anything beyond the approved diff.
+4. Run `git diff --cached --stat`, and `git diff --cached` when content review is required. Reconcile the staged set with the implementation comment line by line.
+5. Commit with a message that carries the per-system ticket reference defined in the project's central preset:
+   - Asana projects: `Refs: Asana task <task_id>` plus `Audit: Asana comment <comment_id>` (the durable comment / story id of the approval).
+   - Redmine projects: `Refs: Redmine #<issue_id>` plus `Journal: <journal_id>` (the Review Gate journal id).
+6. Record the commit hash in the durable source of truth: a follow-up Asana comment on the same task, or a Close Gate / Progress Log journal on the Redmine issue. The hash must live in the durable record, not only in pane chat.
+7. Mark the task complete or move the issue to closed only after both the audit record and the commit-hash record are present. Implementation done alone, or a commit landed without a recorded hash, is not completion.
+
+This authority applies to normal development tasks and to guardrail / rule / workflow tasks alike whenever the project splits implementation and audit actors. It does not waive the `Workflow Change Verification` requirement for changes to autonomous workflow, skills, rules, or release / distribution gates — verification of a rule change is still a separate normal development task with the standard handoff.
+
 ## Workflow Change Verification
 
 - After changing autonomous workflow, skills, rules, handoff, escalation, or

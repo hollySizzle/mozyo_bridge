@@ -117,8 +117,40 @@ Before marking a task complete:
 1. Verify the requested work against the acceptance criteria, scope, and any design-consultation answers that bound the implementation.
 2. Record material changes, verification, blockers, remaining risks, and findings disposition in an Asana task comment.
 3. Pass through the review / audit comment when the project uses an audit agent. Implementation Done alone is not completion. Do not report "complete" or "done" in chat before the review / audit comment is captured on the task.
-4. Mark the Asana task complete only when its completion criteria are satisfied and (when applicable) the audit comment confirms no remaining findings.
+4. Mark the Asana task complete only when its completion criteria are satisfied, (when applicable) the audit comment confirms no remaining findings, and (when an audit-owned commit is required) the commit hash is recorded on the task. See `Audit-Owned Commit Authority` for the commit and hash-recording requirements.
 5. If anything from the original scope is still open at this point — subtasks, manual verification, generated capture confirmation, data-compatibility checks, ops-flow checks — record it as a residual-scope task comment or a new subtask and keep the parent task uncompleted.
+
+## Audit-Owned Commit Authority
+
+When the project splits implementation and audit between separate actors, the audit actor — not the implementation actor — is authorized to stage and commit the audit-approved diff. This is a commit authority, not an implementation authority. The audit actor is still prohibited from directly editing files for a normal development task; that path is the narrow exception described in the project's role-boundary rule, not this section. This section governs *who lands the commit* after approval is recorded in Asana.
+
+Preconditions:
+
+- A durable audit / review comment recording approval exists on the Asana task, and the audit comment / story id is captured.
+- A separate implementation actor produced the diff under review. If the audit actor itself produced the diff, this section does not apply; that path is the direct-edit exception and must be recorded as such.
+
+Pre-commit checks (audit actor):
+
+- Run `git status` and reconcile the dirty set against the implementation actor's changed-paths list (recorded in the implementation comment).
+- Stage only the files whose diff matches what the audit comment approved. Do not use `git add -A` or `git add .` when the worktree contains scope-outside changes.
+- Run `git diff --cached --stat` (and `git diff --cached` when content review is required) and reconcile the staged set against the implementation comment line by line.
+- Unrelated dirty files must be excluded — stashed, committed under a separately scoped task, or left untouched. Never bundle scope-outside changes into the audit-owned commit.
+
+Commit message reference (Asana):
+
+- `Refs: Asana task <task_id>` (required)
+- `Audit: Asana comment <comment_id>` (required; the durable comment / story id of the audit approval)
+- The subject line is the normal short description. The references go in trailers or body lines so `git log` alone is replayable to the durable record.
+
+Post-commit recording:
+
+- Record the commit hash in a follow-up Asana task comment on the same task. The hash must live in the durable Asana record, not only in pane chat or chat report.
+- The task may be marked complete only after both the audit approval comment and the commit-hash comment exist on the task. Implementation Done alone, or a commit landed without a recorded hash, is not completion.
+
+Scope of this authority:
+
+- Applies to normal development tasks and to guardrail / rule / workflow tasks alike whenever the project assigns separate implementation and audit actors.
+- When the project does not split implementer and auditor roles, the boundary collapses; the commit reference format and the hash-recording requirement still apply.
 
 ## Prohibitions
 

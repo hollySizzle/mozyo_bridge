@@ -427,6 +427,14 @@ class ScaffoldRulesTest(unittest.TestCase):
                 'ticket-ID only',
                 "pane / chat body looks fully framed",
                 "task comment / story id",
+                # Audit-owned commit authority codified in this task.
+                "Audit-Owned Commit Authority",
+                "commit authority, not an implementation authority",
+                "Refs: Asana task <task_id>",
+                "Audit: Asana comment <comment_id>",
+                "git diff --cached --stat",
+                "git add -A",
+                "commit-hash comment",
             ):
                 self.assertIn(marker, installed_workflow)
             # Asana central preset must NOT import Redmine journal / gate semantics.
@@ -496,8 +504,15 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.11.1", state["preset_version"])
+            self.assertEqual("2026.05.12.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
+
+            # The audit-owned commit policy belongs in the central preset only.
+            # Root routers stay thin and must not duplicate the policy body.
+            self.assertNotIn("Audit-Owned Commit Authority", agents)
+            self.assertNotIn("Audit-Owned Commit Authority", claude)
+            self.assertNotIn("Refs: Asana task", agents)
+            self.assertNotIn("Refs: Asana task", claude)
 
     def test_rules_install_and_scaffold_redmine_thin_router(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,6 +553,15 @@ class ScaffoldRulesTest(unittest.TestCase):
                 'ticket-ID only',
                 "pane / chat body looks fully framed",
                 "canonical handoff id is the Redmine journal",
+                # Audit-owned commit authority codified in this task.
+                "Audit-Owned Commit Authority",
+                "commit authority, not an implementation authority",
+                "Refs: Redmine #<issue_id>",
+                "Journal: <journal_id>",
+                "Review Gate journal recording approval",
+                "git diff --cached --stat",
+                "git add -A",
+                "Close Gate journal on the same issue",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
@@ -608,7 +632,14 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.05.11.2", state["preset_version"])
+            self.assertEqual("2026.05.12.1", state["preset_version"])
+
+            # The audit-owned commit policy belongs in the central preset only.
+            # Root routers stay thin and must not duplicate the policy body.
+            self.assertNotIn("Audit-Owned Commit Authority", agents)
+            self.assertNotIn("Audit-Owned Commit Authority", claude)
+            self.assertNotIn("Refs: Redmine #", agents)
+            self.assertNotIn("Refs: Redmine #", claude)
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -811,6 +842,58 @@ class ScaffoldRulesTest(unittest.TestCase):
                     )
                     self.assertEqual(0, status_result)
                     self.assertIn("clean", status_output)
+
+
+class SharedSkillWorkflowTest(unittest.TestCase):
+    """The shared mozyo-bridge-agent skill reference must carry the cross-system
+    audit-owned commit policy so Codex behavior stays consistent across Asana
+    and Redmine projects."""
+
+    def setUp(self) -> None:
+        self.workflow_path = (
+            ROOT / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
+        )
+        self.workflow = self.workflow_path.read_text(encoding="utf-8")
+
+    def test_audit_owned_commit_section_present(self) -> None:
+        # Section header and policy headline.
+        self.assertIn("## Audit-Owned Commit Authority", self.workflow)
+        # Cross-system boundary statement.
+        self.assertIn("commit authority, not an implementation authority", self.workflow)
+        self.assertIn("Codex direct implementation edit", self.workflow)
+        self.assertIn("Codex audit-owned commit", self.workflow)
+
+    def test_audit_owned_commit_has_preflight_steps(self) -> None:
+        self.assertIn("git status", self.workflow)
+        self.assertIn("git diff --cached --stat", self.workflow)
+        self.assertIn("git add -A", self.workflow)
+        # Per-system commit message reference contract.
+        self.assertIn("Refs: Asana task <task_id>", self.workflow)
+        self.assertIn("Audit: Asana comment <comment_id>", self.workflow)
+        self.assertIn("Refs: Redmine #<issue_id>", self.workflow)
+        self.assertIn("Journal: <journal_id>", self.workflow)
+        # Commit hash must be recorded in the durable record, not pane chat.
+        self.assertIn("Record the commit hash", self.workflow)
+
+    def test_audit_owned_commit_does_not_grant_direct_implementation(self) -> None:
+        # The audit-owned commit section must NOT contain wording that could be
+        # read as permission for Codex to write implementation diffs as part of
+        # the commit step. We isolate the new section to keep this test from
+        # tripping on the legitimate Codex direct-edit *exception* phrasing in
+        # the Policy / Skill Authoring Boundary section.
+        section_start = self.workflow.index("## Audit-Owned Commit Authority")
+        section_end = self.workflow.index("## Workflow Change Verification", section_start)
+        section = self.workflow[section_start:section_end]
+        self.assertNotIn("Codex may edit", section)
+        self.assertNotIn("Codex may implement", section)
+        self.assertNotIn("Codex implements normal", section)
+        # The section must explicitly preserve the prohibition on Codex
+        # producing new diffs while granting the commit-only authority.
+        self.assertIn("Codex must not edit implementation files", section)
+        self.assertIn("commit authority, not an implementation authority", section)
+        # The section must NOT silently waive the implementer / auditor
+        # boundary defined elsewhere.
+        self.assertIn("does not waive the implementer / auditor boundary", section)
 
 
 class ScaffoldStatusTest(unittest.TestCase):
