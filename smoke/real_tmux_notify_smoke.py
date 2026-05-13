@@ -109,13 +109,22 @@ def main() -> int:
             print("fail: notify command did not report success", file=sys.stderr)
             return 1
 
-        if not wait_for(receiver, "RECEIVED:[mozyo-bridge from:codex pane:"):
+        # The standard notify-* wrappers now route through the new handoff
+        # primitive (audit-approved in commit 5012aac), so the receiver sees
+        # the `[mozyo:handoff:...]` marker shape and the new durable-anchor
+        # body. The legacy `[mozyo-bridge from:...]` marker is still used by
+        # the bare `mozyo-bridge message` subcommand exercised below.
+        if not wait_for(receiver, "RECEIVED:[mozyo:handoff:source=redmine:issue=9020:journal=46005:"):
             print(capture(receiver), file=sys.stderr)
-            print("fail: receiver did not get submitted message", file=sys.stderr)
+            print("fail: receiver did not get submitted handoff marker", file=sys.stderr)
             return 1
-        if not wait_for(receiver, "Redmine #9020 journal #46005 is ready for claude"):
+        if not wait_for(receiver, "review result ready for claude"):
             print(capture(receiver), file=sys.stderr)
-            print("fail: receiver message did not include Redmine journal gate", file=sys.stderr)
+            print("fail: receiver did not see new handoff body intent", file=sys.stderr)
+            return 1
+        if not wait_for(receiver, "Redmine #9020 journal #46005 is the durable anchor"):
+            print(capture(receiver), file=sys.stderr)
+            print("fail: receiver message did not include Redmine durable-anchor body", file=sys.stderr)
             return 1
 
         message_receiver = tmux(

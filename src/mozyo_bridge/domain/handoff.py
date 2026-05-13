@@ -248,6 +248,136 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
     return "sender", "inspect handoff failure and decide the next step"
 
 
+RECORD_FORMAT_TEXT = "text"
+RECORD_FORMAT_JSON = "json"
+RECORD_FORMAT_BOTH = "both"
+RECORD_FORMATS: frozenset[str] = frozenset(
+    {RECORD_FORMAT_TEXT, RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH}
+)
+
+
+def _header_label(status: Status, reason: Reason) -> str:
+    if status == "sent":
+        return "sent"
+    if status == "pending_input":
+        return "pending input"
+    return f"not delivered ({reason})"
+
+
+def _outcome_narrative(status: Status, reason: Reason) -> str:
+    if status == "sent":
+        return (
+            "Landing marker observed in the target pane; Enter was pressed. "
+            "No rollback was triggered."
+        )
+    if status == "pending_input":
+        return (
+            "Notification body was typed but Enter was intentionally not pressed; "
+            "input is left pending at the target prompt."
+        )
+    if reason == "marker_timeout":
+        return (
+            "Landing marker was not observed in the target pane before timeout; "
+            "input was cleared via C-u and Enter was not pressed."
+        )
+    if reason == "target_unavailable":
+        return (
+            "Receiver pane could not be resolved; no notification was typed."
+        )
+    if reason == "target_not_agent":
+        return (
+            "Target pane is not running an agent process and --force was not given; "
+            "no notification was typed."
+        )
+    if reason == "invalid_anchor":
+        return (
+            "Anchor arguments did not satisfy the source's contract; "
+            "handoff aborted before resolving the receiver pane. No notification was typed."
+        )
+    if reason == "invalid_args":
+        return (
+            "Required arguments for handoff send/reply were missing or invalid; "
+            "handoff aborted before resolving the receiver pane. No notification was typed."
+        )
+    return "Handoff did not deliver; see structured outcome for details."
+
+
+def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Optional[str]:
+    if status == "sent":
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            "before acting; the pane notification is only the pointer."
+        )
+    if reason == "marker_timeout":
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            "manually if action is still required; nothing was submitted at the pane."
+        )
+    return None
+
+
+def _anchor_pointer_or_dash(anchor_payload: Optional[dict[str, Any]]) -> str:
+    if not anchor_payload:
+        return "—"
+    source = anchor_payload.get("source")
+    if source == SOURCE_ASANA:
+        task = anchor_payload.get("task_id")
+        comment = anchor_payload.get("comment_id")
+        anchor_url = anchor_payload.get("anchor_url")
+        url = f"https://app.asana.com/0/0/{task}"
+        if comment:
+            return f"Asana task {task} ({url}) comment {comment}"
+        if anchor_url:
+            return f"Asana task {task} ({url}) anchor {anchor_url}"
+        return f"Asana task {task} ({url})"
+    if source == SOURCE_REDMINE:
+        return (
+            f"Redmine #{anchor_payload.get('issue')} "
+            f"journal #{anchor_payload.get('journal')}"
+        )
+    return "—"
+
+
+def build_delivery_record(
+    outcome: "DeliveryOutcome", *, command: Optional[str] = None
+) -> str:
+    """Render a durable delivery-record text from a structured outcome.
+
+    The returned markdown block is meant to be pasted verbatim into the
+    source-of-truth ticket-system (Asana task comment, Redmine journal) so the
+    sender does not have to invent phrasing or re-read the pane to describe
+    what happened. The CLI is responsible for emitting this alongside the
+    structured outcome; this module does not perform any ticket-system API
+    write.
+
+    The structured outcome carries everything the record needs after the
+    source-preservation fix from the previous task, so this function is pure
+    and deterministic over the outcome dataclass.
+    """
+    header = f"Delivery result — {_header_label(outcome.status, outcome.reason)}"
+    lines = [
+        header,
+        "",
+        f"- Receiver: `{outcome.receiver}`",
+        f"- Source: `{outcome.source or '—'}`",
+        f"- Kind: `{outcome.kind or '—'}`",
+        f"- Mode: `{outcome.mode or '—'}`",
+        f"- Target pane: `{outcome.target or '—'}`",
+        f"- Notification marker: `{outcome.notification_marker or '—'}`",
+        f"- Durable anchor: {_anchor_pointer_or_dash(outcome.anchor)}",
+        f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
+        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason)}",
+        f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
+    ]
+    if command:
+        lines.append(f"- Command: `{command}`")
+    contract = _receiver_contract_line(outcome.status, outcome.reason, outcome.receiver)
+    if contract:
+        lines.append("")
+        lines.append(contract)
+    return "\n".join(lines)
+
+
 def make_outcome(
     *,
     status: Status,
@@ -293,10 +423,15 @@ __all__: Iterable[str] = (
     "MODE_STANDARD",
     "NormalizedAnchor",
     "RECEIVERS",
+    "RECORD_FORMATS",
+    "RECORD_FORMAT_BOTH",
+    "RECORD_FORMAT_JSON",
+    "RECORD_FORMAT_TEXT",
     "RedmineAnchor",
     "SOURCES",
     "SOURCE_ASANA",
     "SOURCE_REDMINE",
+    "build_delivery_record",
     "build_marker",
     "build_notification_body",
     "make_outcome",

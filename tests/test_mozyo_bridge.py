@@ -52,7 +52,11 @@ from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     MODE_PENDING,
     MODE_STANDARD,
+    RECORD_FORMAT_BOTH,
+    RECORD_FORMAT_JSON,
+    RECORD_FORMAT_TEXT,
     RedmineAnchor,
+    build_delivery_record,
     build_marker,
     build_notification_body,
     make_outcome,
@@ -1548,6 +1552,136 @@ class NotifyContractTest(unittest.TestCase):
         args = parser.parse_args(["notify-codex", "--issue", "9020", "--journal", "1"])
 
         self.assertEqual(0.2, args.submit_delay)
+
+    def test_standard_notify_wrapper_preserves_legacy_success_line(self) -> None:
+        # Codex audit finding 1 on task 1214760547941073: the wrapper must
+        # keep printing `notified <agent>: journal=... target=... read_lines=...`
+        # so the in-repo smoke and external scripts that grep that line
+        # continue to work after the handoff-primitive retrofit.
+        result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+            [
+                "notify-codex",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+                "--type",
+                "review_request",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("notified codex: journal=46005 target=%2 read_lines=20", stdout)
+
+    def test_standard_notify_wrapper_omits_success_line_on_failure(self) -> None:
+        # The legacy success line is a courtesy that must only fire on real
+        # success. marker_timeout dies; the wrapper must not have printed
+        # `notified codex: ...` before death.
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+                [
+                    "notify-codex",
+                    "--issue",
+                    "9020",
+                    "--journal",
+                    "46005",
+                    "--target",
+                    "%2",
+                    "--force",
+                    "--landing-timeout",
+                    "0.01",
+                    "--submit-delay",
+                    "0",
+                ],
+                captures=["", "", ""],
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertNotIn("notified codex:", stdout)
+
+    def test_standard_notify_accepts_record_format_json(self) -> None:
+        # Codex audit finding 2 on task 1214760547941073: the wrapper parser
+        # must accept the same --record-format / --record-command knobs as
+        # `handoff send/reply`, so callers using the compatibility wrapper
+        # can still ask for json-only output.
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "notify-codex",
+                "--issue",
+                "9020",
+                "--journal",
+                "1",
+                "--record-format",
+                "json",
+            ]
+        )
+
+        self.assertEqual("json", args.record_format)
+
+    def test_standard_notify_record_format_json_suppresses_record(self) -> None:
+        # End-to-end through the wrapper: --record-format json suppresses
+        # the markdown block but keeps the JSON outcome and the legacy
+        # success line.
+        result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+            [
+                "notify-codex",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+                "--type",
+                "review_request",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+                "--record-format",
+                "json",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertNotIn("Delivery result —", stdout)
+        self.assertIn("notified codex: journal=46005", stdout)
+        json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertEqual(1, len(json_lines))
+
+    def test_notify_review_wrapper_accepts_record_command(self) -> None:
+        # --record-command flows through the review wrappers too (issue
+        # required path). End-to-end: the record block shows the literal
+        # command and the legacy success line still fires.
+        result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+            [
+                "notify-codex-review",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+                "--record-command",
+                "mozyo-bridge notify-codex-review --issue 9020 --journal 46005",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "- Command: `mozyo-bridge notify-codex-review --issue 9020 --journal 46005`",
+            stdout,
+        )
+        self.assertIn("notified codex: journal=46005", stdout)
 
 
 class MessageContractTest(unittest.TestCase):
@@ -3950,6 +4084,447 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("target_unavailable", outcome["reason"])
         self.assertIsNone(outcome["target"])
         self.assertIn("no claude window found", stderr.getvalue())
+
+
+class DeliveryRecordTest(unittest.TestCase):
+    """Coverage for the durable delivery-record generator.
+
+    The structured outcome contract guarantees every field the record needs
+    (after the source-preservation fix on task ``1214760548032349``), so
+    ``build_delivery_record`` must be a pure function over a ``DeliveryOutcome``
+    and produce a deterministic, source-of-truth-pastable text block for every
+    status/reason permutation the primitive can emit.
+    """
+
+    def _sent_outcome(self):
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        return make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[mozyo:handoff:source=asana:task=T1:comment=C1:kind=implementation_request:to=claude]",
+        )
+
+    def test_sent_record_includes_receiver_target_marker_anchor_and_contract(self) -> None:
+        record = build_delivery_record(self._sent_outcome())
+
+        self.assertIn("Delivery result — sent", record)
+        self.assertIn("Receiver: `claude`", record)
+        self.assertIn("Source: `asana`", record)
+        self.assertIn("Kind: `implementation_request`", record)
+        self.assertIn("Mode: `standard`", record)
+        self.assertIn("Target pane: `%2`", record)
+        self.assertIn(
+            "Notification marker: "
+            "`[mozyo:handoff:source=asana:task=T1:comment=C1:kind=implementation_request:to=claude]`",
+            record,
+        )
+        self.assertIn("Asana task T1", record)
+        self.assertIn("comment C1", record)
+        self.assertIn("Landing marker observed", record)
+        self.assertIn("Enter was pressed", record)
+        self.assertIn("Next action owner: `receiver`", record)
+        self.assertIn("Receiver-side contract", record)
+        self.assertIn("durable anchor", record)
+
+    def test_sent_record_includes_command_line_when_supplied(self) -> None:
+        record = build_delivery_record(
+            self._sent_outcome(),
+            command="mozyo-bridge handoff send --to claude --source asana --task-id T1 --comment-id C1 --kind implementation_request",
+        )
+
+        self.assertIn(
+            "- Command: `mozyo-bridge handoff send --to claude --source asana "
+            "--task-id T1 --comment-id C1 --kind implementation_request`",
+            record,
+        )
+
+    def test_pending_input_record_labels_operator_action(self) -> None:
+        anchor = normalize_anchor("redmine", issue="9020", journal="46005")
+        outcome = make_outcome(
+            status="pending_input",
+            reason="ok",
+            receiver="codex",
+            target="%111",
+            anchor=anchor,
+            mode=MODE_PENDING,
+            kind="reply",
+            notification_marker="[mozyo:handoff:source=redmine:issue=9020:journal=46005:kind=reply:to=codex]",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — pending input", record)
+        self.assertIn("Mode: `pending`", record)
+        self.assertIn("intentionally not pressed", record)
+        self.assertIn("Redmine #9020", record)
+        self.assertIn("journal #46005", record)
+        self.assertIn("Next action owner: `operator`", record)
+        self.assertNotIn("Receiver-side contract", record)
+
+    def test_marker_timeout_record_states_rollback_and_sender_action(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="blocked",
+            reason="marker_timeout",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="review_result",
+            notification_marker="[marker]",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — not delivered (marker_timeout)", record)
+        self.assertIn("input was cleared via C-u", record)
+        self.assertIn("Enter was not pressed", record)
+        self.assertIn("Receiver-side contract", record)
+        self.assertIn("manually if action is still required", record)
+        self.assertIn("Next action owner: `sender`", record)
+        self.assertIn("un-notified", record)
+
+    def test_target_unavailable_record_lacks_target_and_marker(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="target_unavailable",
+            receiver="claude",
+            target=None,
+            anchor=normalize_anchor("asana", task_id="T1", comment_id="C1"),
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker=None,
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — not delivered (target_unavailable)", record)
+        self.assertIn("Target pane: `—`", record)
+        self.assertIn("Notification marker: `—`", record)
+        self.assertIn("no notification was typed", record)
+        self.assertIn("Next action owner: `sender`", record)
+        self.assertIn("mozyo-bridge init claude", record)
+
+    def test_target_not_agent_record_keeps_target_but_no_marker(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="target_not_agent",
+            receiver="claude",
+            target="%2",
+            anchor=normalize_anchor("asana", task_id="T1", comment_id="C1"),
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker=None,
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — not delivered (target_not_agent)", record)
+        self.assertIn("Target pane: `%2`", record)
+        self.assertIn("Notification marker: `—`", record)
+        self.assertIn("not running an agent process", record)
+        self.assertIn("--force", record)
+        self.assertIn("Next action owner: `sender`", record)
+
+    def test_invalid_anchor_record_preserves_source_without_anchor_payload(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="invalid_anchor",
+            receiver="claude",
+            target=None,
+            anchor=None,
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker=None,
+            source="asana",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — not delivered (invalid_anchor)", record)
+        self.assertIn("Source: `asana`", record)
+        self.assertIn("Durable anchor: —", record)
+        self.assertIn("aborted before resolving the receiver pane", record)
+        self.assertIn("supply a valid durable anchor", record)
+
+    def test_invalid_args_record_states_arg_validation_failure(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="invalid_args",
+            receiver="codex",
+            target=None,
+            anchor=None,
+            mode=MODE_STANDARD,
+            kind=None,
+            notification_marker=None,
+            source="redmine",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("Delivery result — not delivered (invalid_args)", record)
+        self.assertIn("Source: `redmine`", record)
+        self.assertIn("Kind: `—`", record)
+        self.assertIn("missing or invalid", record)
+        self.assertIn("Next action owner: `sender`", record)
+
+    def test_record_is_deterministic_for_same_outcome(self) -> None:
+        outcome = self._sent_outcome()
+
+        self.assertEqual(build_delivery_record(outcome), build_delivery_record(outcome))
+
+
+class HandoffRecordEmissionTest(unittest.TestCase):
+    """The orchestrator must emit the delivery record alongside the structured
+    outcome so callers do not have to invent phrasing or re-read the pane to
+    describe what happened.
+    """
+
+    def run_handoff_with_fake_tmux(
+        self,
+        argv: list[str],
+        captures: list[str] | None = None,
+        allow_exit: bool = False,
+        pane: dict[str, str] | None = None,
+    ):
+        # Mirrors HandoffOrchestratorTest's helper so we can drive the CLI end
+        # to end without launching tmux.
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+        pane_text = ""
+        forced_captures = captures is not None
+        capture_outputs = list(captures or [])
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            if capture_outputs:
+                return capture_outputs.pop(0)
+            if forced_captures:
+                return ""
+            return pane_text
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            nonlocal pane_text
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text += tmux_args[-1]
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux call: {tmux_args}")
+
+        default_pane = {
+            "id": "%2",
+            "location": "agents:0.1",
+            "command": "node",
+            "cwd": "/repo",
+            "window_name": "claude",
+        }
+        pane_value = pane if pane is not None else default_pane
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout, \
+            contextlib.redirect_stderr(io.StringIO()):
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                if not allow_exit:
+                    raise
+                result = exc
+
+        return result, sent, stdout.getvalue()
+
+    def test_standard_mode_emits_record_then_json_outcome_by_default(self) -> None:
+        result, _sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("Delivery result — sent", stdout)
+        self.assertIn("Asana task T1", stdout)
+        self.assertIn("Next action owner: `receiver`", stdout)
+        json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertEqual(1, len(json_lines), f"expected exactly one JSON outcome line, got: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("sent", outcome["status"])
+
+    def test_record_format_json_suppresses_markdown_record(self) -> None:
+        result, _sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+                "--record-format",
+                "json",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertNotIn("Delivery result —", stdout)
+        json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertEqual(1, len(json_lines))
+
+    def test_record_format_text_suppresses_json_outcome(self) -> None:
+        result, _sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+                "--record-format",
+                "text",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("Delivery result — sent", stdout)
+        json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertEqual([], json_lines)
+
+    def test_record_command_is_included_when_provided(self) -> None:
+        result, _sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+                "--record-command",
+                "mozyo-bridge handoff send --to claude --source asana --kind reply",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "- Command: `mozyo-bridge handoff send --to claude --source asana --kind reply`",
+            stdout,
+        )
+
+    def test_marker_timeout_emits_record_describing_rollback(self) -> None:
+        result, sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "review_result",
+                "--task-id",
+                "T1",
+                "--anchor-url",
+                "https://example/x",
+                "--target",
+                "%2",
+                "--force",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            captures=["", "", ""],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        self.assertIn("Delivery result — not delivered (marker_timeout)", stdout)
+        self.assertIn("input was cleared via C-u", stdout)
+        self.assertIn("Next action owner: `sender`", stdout)
+
+    def test_invalid_anchor_emits_record_preserving_source(self) -> None:
+        result, _sent, stdout = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--target",
+                "%2",
+                "--force",
+            ],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("Delivery result — not delivered (invalid_anchor)", stdout)
+        self.assertIn("Source: `asana`", stdout)
+        self.assertIn("Durable anchor: —", stdout)
 
 
 class PluginMarketplaceTest(unittest.TestCase):

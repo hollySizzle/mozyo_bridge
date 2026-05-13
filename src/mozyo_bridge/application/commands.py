@@ -14,7 +14,12 @@ from mozyo_bridge.domain.handoff import (
     MODE_STANDARD,
     MODES,
     RECEIVERS,
+    RECORD_FORMAT_BOTH,
+    RECORD_FORMAT_JSON,
+    RECORD_FORMAT_TEXT,
+    RECORD_FORMATS,
     SOURCES,
+    build_delivery_record,
     build_marker,
     build_notification_body,
     make_outcome,
@@ -501,8 +506,25 @@ def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_k
         landing_timeout=float(getattr(args, "landing_timeout", 5.0) or 5.0),
         submit_delay=float(getattr(args, "submit_delay", 0.2) or 0.0),
         read_lines=int(getattr(args, "read_lines", 50) or 50),
+        record_format=getattr(args, "record_format", RECORD_FORMAT_BOTH),
+        record_command=getattr(args, "record_command", None),
     )
-    return orchestrate_handoff(forwarded)
+    rc = orchestrate_handoff(forwarded)
+    # Preserve the legacy success line so external scripts and the in-repo
+    # smoke (`smoke/real_tmux_notify_smoke.py`) that grep `notified <agent>:
+    # journal=...` keep working. The new primitive owns the durable record
+    # and structured outcome; this wrapper line is purely a back-compat
+    # courtesy and only fires on successful return from orchestrate_handoff
+    # (which dies on marker_timeout, so failure paths never reach this).
+    if rc == 0:
+        try:
+            target = pane_info(getattr(args, "target", None) or agent)["id"]
+        except SystemExit:
+            target = "-"
+        read_lines = int(getattr(args, "read_lines", 50) or 50)
+        journal = getattr(args, "journal", None)
+        print(f"notified {agent}: journal={journal} target={target} read_lines={read_lines}")
+    return rc
 
 
 def cmd_notify_codex(args: argparse.Namespace) -> int:
@@ -533,8 +555,38 @@ def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
     return notify_agent(args, "claude")
 
 
-def _emit_outcome(outcome) -> None:
-    print(outcome.to_json())
+def _emit_outcome(outcome, *, record_format: str = RECORD_FORMAT_BOTH, command: str | None = None) -> None:
+    """Emit the structured outcome and/or the durable delivery-record text.
+
+    ``record_format=both`` (default) prints the multi-line record first, a
+    blank separator line, and the single-line JSON outcome last so existing
+    callers that scrape the last JSON-looking line keep working while humans
+    can paste the record block verbatim into the source-of-truth ticket
+    system. ``json`` preserves the prior CLI shape for scripts; ``text`` is
+    for callers that only want the markdown.
+    """
+    if record_format not in RECORD_FORMATS:
+        die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {record_format!r}")
+    if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
+        print(build_delivery_record(outcome, command=command))
+        if record_format == RECORD_FORMAT_BOTH:
+            print("")
+    if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
+        print(outcome.to_json())
+
+
+def _record_format_from_args(args: argparse.Namespace) -> str:
+    raw = getattr(args, "record_format", None) or RECORD_FORMAT_BOTH
+    if raw not in RECORD_FORMATS:
+        die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {raw!r}")
+    return raw
+
+
+def _record_command_from_args(args: argparse.Namespace) -> str | None:
+    command = getattr(args, "record_command", None)
+    if command:
+        return str(command)
+    return None
 
 
 def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = None) -> int:
@@ -549,6 +601,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
     run ``mozyo-bridge read`` first.
     """
     require_tmux()
+
+    record_format = _record_format_from_args(args)
+    record_command = _record_command_from_args(args)
 
     receiver = getattr(args, "to", None)
     if receiver not in RECEIVERS:
@@ -575,7 +630,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 kind=kind,
                 notification_marker=None,
                 source=source,
-            )
+            ),
+            record_format=record_format,
+            command=record_command,
         )
         die(f"--kind must be one of {sorted(KIND_LABELS)}; got {kind!r}")
 
@@ -602,7 +659,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 kind=kind,
                 notification_marker=None,
                 source=source,
-            )
+            ),
+            record_format=record_format,
+            command=record_command,
         )
         die(str(exc))
         raise AssertionError("unreachable")
@@ -622,7 +681,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 kind=kind,
                 notification_marker=None,
                 source=source,
-            )
+            ),
+            record_format=record_format,
+            command=record_command,
         )
         raise
 
@@ -641,7 +702,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 kind=kind,
                 notification_marker=None,
                 source=source,
-            )
+            ),
+            record_format=record_format,
+            command=record_command,
         )
         raise
 
@@ -659,7 +722,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 kind=kind,
                 notification_marker=None,
                 source=source,
-            )
+            ),
+            record_format=record_format,
+            command=record_command,
         )
         die(str(exc))
         raise AssertionError("unreachable")
@@ -684,7 +749,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             kind=kind,
             notification_marker=marker,
         )
-        _emit_outcome(outcome)
+        _emit_outcome(outcome, record_format=record_format, command=record_command)
         return 0
 
     landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
@@ -701,7 +766,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             kind=kind,
             notification_marker=marker,
         )
-        _emit_outcome(outcome)
+        _emit_outcome(outcome, record_format=record_format, command=record_command)
         die(
             "handoff marker was not observed in target pane; input was cleared and Enter was not pressed. "
             f"target={target} marker={marker}"
@@ -723,7 +788,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         kind=kind,
         notification_marker=marker,
     )
-    _emit_outcome(outcome)
+    _emit_outcome(outcome, record_format=record_format, command=record_command)
     return 0
 
 

@@ -29,7 +29,14 @@ from mozyo_bridge.application.commands import (
     cmd_status,
     cmd_type,
 )
-from mozyo_bridge.domain.handoff import KIND_LABELS, MODE_STANDARD, MODES, SOURCES
+from mozyo_bridge.domain.handoff import (
+    KIND_LABELS,
+    MODE_STANDARD,
+    MODES,
+    RECORD_FORMAT_BOTH,
+    RECORD_FORMATS,
+    SOURCES,
+)
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
 
 
@@ -73,6 +80,29 @@ def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required:
 def add_notify_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
     parser.add_argument("--journal", help="Redmine journal id used as the canonical gate")
     add_notify_delivery_options(parser, issue_required=issue_required)
+    # The standard notify-* wrappers route through `orchestrate_handoff` so
+    # they accept the same record knobs as `mozyo-bridge handoff send/reply`.
+    # Legacy queue notify-* commands stay on `notify_agent` and intentionally
+    # do not expose these flags.
+    parser.add_argument(
+        "--record-format",
+        dest="record_format",
+        choices=sorted(RECORD_FORMATS),
+        default=RECORD_FORMAT_BOTH,
+        help=(
+            "Format of the durable delivery-record emitted alongside the "
+            "structured outcome. Defaults to `both`; pass `json` for the "
+            "prior single-line JSON shape that scripts expect."
+        ),
+    )
+    parser.add_argument(
+        "--record-command",
+        dest="record_command",
+        help=(
+            "Optional literal command string included in the generated "
+            "delivery record under `- Command:` for audit replay."
+        ),
+    )
 
 
 def add_legacy_notify_options(parser: argparse.ArgumentParser) -> None:
@@ -255,6 +285,26 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.add_argument("--landing-timeout", dest="landing_timeout", type=float, default=5.0)
         parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
         parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
+        parser_.add_argument(
+            "--record-format",
+            dest="record_format",
+            choices=sorted(RECORD_FORMATS),
+            default=RECORD_FORMAT_BOTH,
+            help=(
+                "Format of the durable delivery-record emitted alongside the "
+                "structured outcome. `both` (default) prints the markdown "
+                "record then the JSON outcome; `text` prints only the markdown "
+                "record; `json` preserves the prior single-line JSON shape."
+            ),
+        )
+        parser_.add_argument(
+            "--record-command",
+            dest="record_command",
+            help=(
+                "Optional literal command string included in the generated "
+                "delivery record under `- Command:` for audit replay."
+            ),
+        )
 
     handoff = sub.add_parser(
         "handoff",
