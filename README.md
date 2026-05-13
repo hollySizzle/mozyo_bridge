@@ -63,9 +63,9 @@ attach せずに session / window だけ用意したい場合:
 mozyo --no-attach
 ```
 
-session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に分離する場合は `mozyo-bridge open-here --session NAME` か `mozyo-bridge tmux-ui-*` を使ってください。
+session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に session 名を分離する場合は `mozyo-bridge open-here --session NAME` を使うか、bare `mozyo --repo /path/to/another` で別 repo root を指定してください。
 
-`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` などの旧 command は互換のため残しています。pane-split 派のレイアウトや、明示的な session 名・cwd を指定したい上級導線が必要なときに使ってください。bare `mozyo` が前提の window 構造とは別レイヤーの helper です。
+`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` は pane-split レイアウトを残したい運用のための legacy compatibility helper です。これらが作る pane は `claude` / `codex` という名前の window 内に居ない限り、resolver から `message claude` / `notify-claude` などの agent label として解決されません。pane-split layout を使い続ける場合は、spawn した pane の中で `mozyo-bridge init <agent>` を実行して window 名を `<agent>` に rename し、resolver で解決できる状態にしてください。標準導線は bare `mozyo` (1 agent = 1 window) です。
 
 ## Beta Tester Install (GitHub main)
 
@@ -186,17 +186,17 @@ PyPI / pipx などで CLI としてインストールする場合は、インス
 
 ```bash
 mozyo-bridge status --repo /path/to/repo
-MOZYO_REPO=/path/to/repo mozyo-bridge tmux-ui-open
+MOZYO_REPO=/path/to/repo mozyo
 ```
 
-`--cwd` を省略した tmux-ui 系コマンドは、解決した project root を作業ディレクトリとして使います。
+bare `mozyo` (標準導線) は 1 つの repo-scoped session 内に `claude` / `codex` window を ensure し attach します。`--cwd` を省略した legacy `tmux-ui` 系 command は、解決した project root を作業ディレクトリとして使います。
 `.tmux.conf` は project root にあればそれを使い、なければ `~/.config/mozyo-bridge/tmux.conf` を見ます。
 
-config が default 解決経路のどちらにも存在しない場合、`open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` / `notify-*` は config の source を skip して session / pane 起動だけを実行します。一方 `--config-path /path/to/conf` を **明示** 指定した場合は path 不存在を typo 防止のため `tmux config not found` で fail-fast します。`mozyo-bridge tmux-ui-config` (load 専用 command) も従来通り存在しない config は error にします。
+config が default 解決経路のどちらにも存在しない場合、bare `mozyo` / `notify-*` / legacy `open-here` / `tmux-ui-*` のすべては config の source を skip して session / pane 起動だけを実行します。一方 `--config-path /path/to/conf` を **明示** 指定した場合は path 不存在を typo 防止のため `tmux config not found` で fail-fast します。`mozyo-bridge tmux-ui-config` (load 専用 command) も従来通り存在しない config は error にします。
 
-### `open-here` (repo-aware sugar, pane-split layout)
+### `open-here` (legacy pane-split helper)
 
-bare `mozyo` (window 分離) ではなく pane-split layout を使いたい場合の従来 sugar です。`mozyo-bridge open-here` は repo root をそのまま session/cwd に当てます。`tmux-ui-open --session <repo名> --cwd <repo root>` を毎回手で打つ運用を 1 行に縮めます。
+bare `mozyo` (1 agent = 1 window) ではなく pane-split layout を残したい場合の legacy sugar です。`mozyo-bridge open-here` は repo root をそのまま session/cwd に当て、両 agent を 1 つの window の中に並べて起動します。
 
 ```bash
 cd /path/to/your-repo
@@ -209,7 +209,9 @@ mozyo-bridge open-here
 - session 名は repo root basename を default にします。
 - `--cwd` 省略時は repo root をそのまま使います。
 - 同名 session が既に存在し、しかも **その session 内のどの pane も repo root の下にいない** 場合は別 project の session の可能性が高いため、自動 attach せずにエラーで止まります。明示的に `--session <name>` を指定し直してください。
-- 既に同名 session があっても少なくとも 1 つの pane が repo root 配下にあれば、その session を `tmux-ui-open` と同じ手順で起動し attach します。
+- 既に同名 session があっても少なくとも 1 つの pane が repo root 配下にあれば、その session を再利用して attach します。
+
+pane-split layout で起動した両 pane は同じ window 内に並ぶため、resolver の標準 path (window 名 == agent 名) では到達できません。`mozyo-bridge message claude` / `notify-claude` で resolve できる状態にしたい場合は、対象 pane の中で `mozyo-bridge init <agent>` を実行して、その window 名を `<agent>` に rename してください。1 つの window 内に `claude` と `codex` の両方を共存させたい運用 (= 旧 pane-split flow) は新 model では成立しないため、片方ずつ別 window に分けるか、bare `mozyo` に移行してください。
 
 ```bash
 # Conflict 例: 同じ basename の session が別の repo を指していた場合
@@ -429,11 +431,13 @@ mozyo-bridge doctor
 
 `message` / `keys` は送信前に `read` が必要です。これは誤送信を減らすためのガードです。
 
-## tmux-ui Helpers
+## tmux-ui Helpers (legacy)
 
-`tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure` / `tmux-ui-spawn` は、tmux UI を直接作る環境向けの補助です。
+`tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure` / `tmux-ui-spawn` は、tmux UI を直接作る環境向けの legacy compatibility helper です。
 
-VS Code `tmux-integrated` を標準運用にしている場合は使いません。pane が見つからない場合は、人間が terminal を開き、対象 agent を起動してから `init` してください。
+これらが作る pane は 1 つの window 内に並ぶため、resolver の標準 path (window 名 == agent 名) では `claude` / `codex` として到達できません。spawn 後に `mozyo-bridge init <agent>` を実行して pane の window 名を `<agent>` に rename してください。標準導線は bare `mozyo` (1 agent = 1 window 自動) なので、新規 setup では bare `mozyo` を優先します。
+
+VS Code `tmux-integrated` で開いた pane は標準 tmux pane と同じ扱いです。pane の中で `mozyo-bridge init <agent>` を打って window 名を agent 名に揃えれば、`message claude` / `notify-claude` で解決されます。
 
 ## Documentation Map
 
