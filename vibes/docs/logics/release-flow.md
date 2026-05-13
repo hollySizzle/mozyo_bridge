@@ -21,6 +21,8 @@ python smoke/real_tmux_notify_smoke.py
 MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.py
 ```
 
+`smoke/real_tmux_notify_smoke.py` は strict `--mode standard` rail のみを自動検証する。relaxed `--mode queue-enter` rail (Asana `1214782240916053` 配下の v0.2 contract) は real Claude / Codex TUI 上の prompt queue 挙動に依存するため、同 smoke では模擬しない。queue-enter rail を触る変更は同 smoke header の docstring に記載した手順 (`mozyo-bridge handoff send --mode queue-enter` を marker 観測あり / 観測なし / strict regression の 3 ケースで実機確認) を Asana task に記録する。
+
 ## Release Flow
 
 1. Asana release task から開始する。

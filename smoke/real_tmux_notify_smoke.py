@@ -1,4 +1,51 @@
 #!/usr/bin/env python3
+"""Real-tmux smoke for the strict `--mode standard` delivery rail.
+
+The relaxed `--mode queue-enter` rail (defined in
+``vibes/docs/logics/tmux-send-safety-contract.md`` ``## Relaxed Queue-Enter
+Rail``) is intentionally NOT exercised by this smoke. Its distinguishing
+semantic — pressing Enter despite a landing marker that was never observed in
+the captured pane text — only manifests against a real Claude/Codex TUI that
+queues prompts during a running turn. A plain ``sh`` receiver has no prompt
+queue, and queue-enter rejects ``--force``, so spoofing one with a non-agent
+process is not a valid stand-in. In-process coverage of the new rail
+(observed / unobserved marker, ``--force`` rejection, ``--target``
+window-mismatch guard, agent-gate stricter than strict, durable-record
+wording, ``last_input`` projection, ``next_action_owner``) lives in
+``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest``.
+
+When an operator change touches the queue-enter rail, the manual verification
+recipe is:
+
+1. From the repo root, open the standard pair: ``mozyo`` (creates / attaches a
+   tmux session with a ``claude`` window and a ``codex`` window running the
+   real Claude / Codex CLI).
+2. In a sender pane, run:
+
+       mozyo-bridge handoff send --to codex --source asana \\
+           --task-id <task> --comment-id <comment> --kind reply \\
+           --mode queue-enter
+
+   Expected (marker observed in the receiver's scrollback before timeout):
+   ``Outcome`` line reads ``sent (queue-enter, marker observed)`` and the JSON
+   outcome shows ``status=sent reason=ok mode=queue-enter``.
+3. To exercise the unobserved-marker path, force the receiver to be mid-turn
+   (e.g., send a long-running prompt so the next handoff marker scrolls past
+   or wraps below the capture window) and rerun the same command. Expected:
+   ``Outcome`` line reads ``sent (queue-enter, marker unobserved)``, JSON
+   shows ``status=sent reason=queue_enter``, the durable record carries the
+   ``Operator note`` line pointing at ``--mode standard`` as the fallback,
+   and the receiver's TUI still picks the prompt up off its queue once its
+   current turn ends.
+4. Strict rail regression check (must keep working): rerun step 3 without
+   ``--mode queue-enter``. Expected: the command dies with
+   ``handoff marker was not observed...``, no Enter is pressed, the JSON
+   outcome shows ``status=blocked reason=marker_timeout mode=standard``.
+
+If any of the above diverges from the contract section ``## Relaxed
+Queue-Enter Rail``, stop and record the gap in the owning Asana task before
+landing the change.
+"""
 from __future__ import annotations
 
 import os
