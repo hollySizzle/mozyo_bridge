@@ -35,7 +35,11 @@
 
 - `mozyo-bridge` は notification transport であり、review、completion、task state の source of truth ではない。
 - pane message を受けた agent は、作業前に Asana task または明示された source of truth を確認する。
-- marker が観測される前に Enter を送る safety behavior を壊さない。
+- 送信側は 2 本の rail から正しいものを選ぶ。default を黙って弱化しない。
+  - 既定の strict rail (`--mode standard`、`notify-*`、`mozyo-bridge message --submit`): `wait_for_text(marker)` を Enter の必要条件とし、未観測時は `C-u` で入力を消して Enter を送らず `blocked` / `marker_timeout` で fail-closed する。
+  - opt-in な relaxed rail (`mozyo-bridge handoff send --mode queue-enter`、Claude / Codex agent pane 限定、`--force` 不可、`--target` を渡す場合は receiver 自身の tmux window 配下のみ許容): marker 未観測でも Enter を発行し、`sent` / `queue_enter` という別の durable outcome を emit する。silent な strict 成功には倒さない。codex TUI の wrap-shape 観測差 (Asana `1214749106025548` / `1214765093829972`) など receiver TUI が marker を wrap してしまう既知ケースのときだけ選ぶ。
+- どちらの rail を使った場合でも、durable record (Asana task comment) が正本である。pane notification は pointer。
+- 詳細・state machine 全体・例外条件の正本は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Relaxed Queue-Enter Rail` 節を参照する (重複させない)。
 - `.agent_handoff/tasks.json` は retired queue の棚卸し用であり、standard notification fallback として扱わない。
 
 ## User Interaction And Escalation

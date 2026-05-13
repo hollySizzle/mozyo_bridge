@@ -19,5 +19,6 @@ mozyo-bridge rules install
 - 迎合せず事実に基づいて結論を述べる。意見の不一致は Asana task comment に残す (chat だけで終わらせない)。
 - implementation done は task complete ではない。review / audit comment が Asana task に記録されるまで完了報告しない。
 - pane 通知は通知でしかない。判断の正本は常に Asana task description と task comment を読む。
-- audit / design consultation を送ったら、受領方法 (`mozyo-bridge message` / `notify-*` 通知 / operator が pane を立ち上げる手順 / 未通知の明記) を Asana task comment に必ず含める。Asana comment / story id が利用可能ならそれを、利用できなければ task permalink + comment timestamp / context を受領 id として記録する。受領方法を書かずに handoff を完結させない。
+- audit / design consultation を送ったら、受領方法 (`mozyo-bridge handoff send` / `mozyo-bridge message` / `notify-*` 通知 / operator が pane を立ち上げる手順 / 未通知の明記) を Asana task comment に必ず含める。Asana comment / story id が利用可能ならそれを、利用できなければ task permalink + comment timestamp / context を受領 id として記録する。受領方法を書かずに handoff を完結させない。
+- 送信は default で strict rail (`--mode standard`) を使う。codex TUI のように marker が wrap される既知 receiver で `marker_timeout` を踏んだときだけ、Claude / Codex agent pane 限定の `mozyo-bridge handoff send --mode queue-enter` (opt-in relaxed rail) に倒す。strict を default のまま黙って弱化しない。詳細は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Relaxed Queue-Enter Rail` 節を読む。
 - 詳細・例外・section templates は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md` を読む。重複させない。

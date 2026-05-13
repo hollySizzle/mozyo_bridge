@@ -359,8 +359,10 @@ mozyo-bridge notify-claude \
 - `notify-*` には `--issue` と `--journal` を渡す。
 - pane message の内容だけで作業開始・完了判断をしない。
 - 受信側は通知を見たら Redmine gate を確認してから動く。
-- `notify-*` は短い `[mozyo:notify:...]` marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。
-- marker を確認できない場合、mozyo-bridge は入力欄を `C-u` で消し、Enter を送らず失敗する。
+- `notify-*` と `mozyo-bridge handoff send` の **default は strict rail** (`--mode standard`)。短い marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。
+- 確認できない場合、strict rail は入力欄を `C-u` で消し、Enter を送らず `blocked` / `marker_timeout` で失敗する (fail-closed)。
+- 例外として、`mozyo-bridge handoff send --mode queue-enter` という opt-in な **relaxed rail** がある。Claude / Codex agent pane 限定で、`--force` 不可、`--target` を渡す場合は receiver 自身の tmux window 配下のみ許容する。marker 未観測でも Enter を発行するが、結果は `sent` / `queue_enter` という別 outcome として durable record に残す (silent な strict 成功と区別する)。codex TUI のように marker が rendered text で wrap されて観測しにくい既知ケース用。default 経路ではない。
+- どちらの rail を使った場合でも durable record (Asana task comment / Redmine journal) が正本。pane notification は pointer。詳細は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Relaxed Queue-Enter Rail` 節を参照。
 
 ## Legacy Queue
 
