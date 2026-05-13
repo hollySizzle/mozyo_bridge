@@ -157,6 +157,40 @@ def main() -> int:
             print("fail: bare message body did not reach the receiver", file=sys.stderr)
             return 1
 
+        marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
+        first_half, second_half = marker.split(" ", 1)
+        wrap_receiver = tmux(
+            "split-window",
+            "-t",
+            session,
+            "-h",
+            "-c",
+            str(REPO_ROOT),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sh",
+            "-c",
+            f"printf '%b' '> {first_half}\\n  {second_half} wrap probe body\\n'; sleep 60",
+        ).stdout.strip()
+        if not wait_for(wrap_receiver, second_half.split(" ", 1)[0], timeout=5.0):
+            print(capture(wrap_receiver), file=sys.stderr)
+            print("fail: wrap probe receiver did not render the split marker", file=sys.stderr)
+            return 1
+
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from mozyo_bridge.application.commands import wait_for_text  # type: ignore
+
+        if not wait_for_text(wrap_receiver, marker, 200, 5.0):
+            print(capture(wrap_receiver), file=sys.stderr)
+            print("fail: wait_for_text did not detect the wrap-split marker", file=sys.stderr)
+            return 1
+
+        if wait_for_text(wrap_receiver, "[mozyo-bridge from:absent pane:%9 at:none]", 200, 0.5):
+            print(capture(wrap_receiver), file=sys.stderr)
+            print("fail: wait_for_text falsely matched a marker that was not in the pane", file=sys.stderr)
+            return 1
+
         print("ok: real tmux notify smoke passed")
         return 0
     finally:

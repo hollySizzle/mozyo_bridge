@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -309,10 +310,25 @@ def wait_for_agent_terminal_pane(pane_id: str, agent: str, timeout: float) -> No
     die(f"timed out waiting for {agent} pane startup: {pane_id}")
 
 
+_WRAP_INDENT = re.compile(r"\n\s+")
+
+
 def wait_for_text(target: str, text: str, lines: int, timeout: float) -> bool:
+    # Receiver TUIs (codex CLI, Claude Code) word-wrap long input at the
+    # visible pane width, emitting a literal newline + continuation indent
+    # inside the captured text. tmux capture-pane -J only rejoins lines
+    # tmux itself wrapped, so a raw substring search would miss a marker
+    # split by the TUI wrap even though it landed cleanly on the wire.
+    # Try the raw match first (cheap, scrollback-safe); fall back to a
+    # wrap-normalized match before declaring the marker absent. Both paths
+    # still return False when the marker is genuinely missing, preserving
+    # the fail-closed rollback contract.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if text in capture_pane(target, lines):
+        captured = capture_pane(target, lines)
+        if text in captured:
+            return True
+        if text in _WRAP_INDENT.sub(" ", captured):
             return True
         time.sleep(0.2)
     return False

@@ -1476,6 +1476,82 @@ class MessageContractTest(unittest.TestCase):
         self.assertEqual(0.2, args.submit_delay)
         self.assertEqual(5.0, args.landing_timeout)
 
+    def test_message_submits_enter_when_marker_wraps_in_capture(self) -> None:
+        # Receiver TUI (codex / claude code) word-wraps long input at the
+        # visible pane width, inserting a literal newline + continuation
+        # indent inside the marker. capture-pane -J cannot rejoin these
+        # (the wrap is TUI-emitted, not tmux-display-wrap), so a raw
+        # `marker in capture` search misses it. The landing gate must
+        # still observe the marker and proceed to Enter.
+        wrapped_capture = (
+            "› [mozyo-bridge from:codex pane:%1\n"
+            "  at:agents:0.0] hello body\n"
+        )
+        result, sent, _pane_text, _sleep = self.run_message_with_fake_tmux(
+            ["message", "%2", "hello body", "--submit-delay", "0"],
+            captures=[wrapped_capture],
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+    def test_message_still_rolls_back_when_capture_lacks_marker(self) -> None:
+        # Safety lock: even after wrap-tolerant normalization, a capture
+        # that does not actually contain the marker must trigger C-u
+        # rollback and skip Enter. Fail-closed is non-negotiable.
+        unrelated_capture = "› unrelated placeholder\n  with continuation indent\n"
+        with contextlib.redirect_stderr(io.StringIO()):
+            result, sent, _pane_text, _sleep = self.run_message_with_fake_tmux(
+                [
+                    "message",
+                    "%2",
+                    "lost body",
+                    "--landing-timeout",
+                    "0.01",
+                    "--submit-delay",
+                    "0",
+                ],
+                captures=[unrelated_capture, unrelated_capture, unrelated_capture],
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+
+
+class WaitForTextContractTest(unittest.TestCase):
+    def test_detects_marker_split_by_tui_wrap(self) -> None:
+        from mozyo_bridge.application import commands as commands_mod
+
+        marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
+        wrapped = (
+            "› [mozyo-bridge from:codex pane:%1\n"
+            "  at:agents:0.0] hello body\n"
+        )
+        with patch.object(commands_mod, "capture_pane", return_value=wrapped), \
+                patch.object(commands_mod.time, "sleep"):
+            self.assertTrue(commands_mod.wait_for_text("%2", marker, 200, 0.01))
+
+    def test_returns_false_when_marker_genuinely_absent(self) -> None:
+        from mozyo_bridge.application import commands as commands_mod
+
+        marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
+        unrelated = "› unrelated pane\n  with indent\n"
+        with patch.object(commands_mod, "capture_pane", return_value=unrelated), \
+                patch.object(commands_mod.time, "sleep"):
+            self.assertFalse(commands_mod.wait_for_text("%2", marker, 200, 0.01))
+
+    def test_matches_raw_unwrapped_marker_unchanged(self) -> None:
+        from mozyo_bridge.application import commands as commands_mod
+
+        marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
+        captured = f"some scrollback\n› {marker} body text\n"
+        with patch.object(commands_mod, "capture_pane", return_value=captured), \
+                patch.object(commands_mod.time, "sleep"):
+            self.assertTrue(commands_mod.wait_for_text("%2", marker, 200, 0.01))
+
 
 class CommandTest(unittest.TestCase):
     def test_ensure_pair_loads_config_after_creating_missing_session(self) -> None:
