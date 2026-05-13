@@ -6,6 +6,8 @@ from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_config,
     cmd_doctor,
+    cmd_handoff_reply,
+    cmd_handoff_send,
     cmd_id,
     cmd_init,
     cmd_keys,
@@ -27,6 +29,7 @@ from mozyo_bridge.application.commands import (
     cmd_status,
     cmd_type,
 )
+from mozyo_bridge.domain.handoff import KIND_LABELS, MODE_STANDARD, MODES, SOURCES
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
 
 
@@ -207,6 +210,74 @@ def build_parser() -> argparse.ArgumentParser:
         add_legacy_notify_options(notify)
         notify.add_argument("--type")
         notify.set_defaults(func=func)
+
+    def configure_handoff_parser(
+        parser_: argparse.ArgumentParser,
+        *,
+        kind_required: bool,
+    ) -> None:
+        parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
+        parser_.add_argument("--source", required=True, choices=sorted(SOURCES), help="Durable record source system")
+        parser_.add_argument(
+            "--kind",
+            required=kind_required,
+            choices=sorted(KIND_LABELS),
+            help="Durable intent label. Required for `handoff send`; defaults to `reply` for `handoff reply` / `reply`",
+        )
+        parser_.add_argument("--task-id", dest="task_id", help="Asana task gid (source=asana)")
+        parser_.add_argument("--comment-id", dest="comment_id", help="Asana story/comment gid (source=asana)")
+        parser_.add_argument(
+            "--anchor-url",
+            dest="anchor_url",
+            help="Asana task permalink + comment timestamp/context when a stable comment id is unavailable",
+        )
+        parser_.add_argument("--issue", help="Redmine issue id (source=redmine)")
+        parser_.add_argument("--journal", help="Redmine journal id (source=redmine)")
+        parser_.add_argument(
+            "--target",
+            help="Optional tmux target override; defaults to same-session agent-window resolution from --to",
+        )
+        parser_.add_argument(
+            "--mode",
+            choices=sorted(MODES),
+            default=MODE_STANDARD,
+            help="`standard` types and presses Enter after the landing marker; `pending` types but leaves the input pending",
+        )
+        parser_.add_argument(
+            "--summary",
+            help="Optional short hint appended to the generated notification; required for --kind custom",
+        )
+        parser_.add_argument(
+            "--force",
+            action="store_true",
+            help="Allow sending to a non-agent-looking pane",
+        )
+        parser_.add_argument("--landing-timeout", dest="landing_timeout", type=float, default=5.0)
+        parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
+        parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
+
+    handoff = sub.add_parser(
+        "handoff",
+        help="High-level cross-agent notification primitive anchored at a durable record",
+    )
+    handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
+    handoff_send = handoff_sub.add_parser("send", help="Send a handoff notification from sender to receiver")
+    configure_handoff_parser(handoff_send, kind_required=True)
+    handoff_send.set_defaults(func=cmd_handoff_send)
+
+    handoff_reply = handoff_sub.add_parser(
+        "reply",
+        help="Send a reply notification from sender to receiver (kind defaults to `reply`)",
+    )
+    configure_handoff_parser(handoff_reply, kind_required=False)
+    handoff_reply.set_defaults(func=cmd_handoff_reply)
+
+    reply_alias = sub.add_parser(
+        "reply",
+        help="Alias for `mozyo-bridge handoff reply` (kind defaults to `reply`)",
+    )
+    configure_handoff_parser(reply_alias, kind_required=False)
+    reply_alias.set_defaults(func=cmd_handoff_reply)
 
     init = sub.add_parser(
         "init",

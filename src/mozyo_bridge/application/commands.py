@@ -7,6 +7,19 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
+from mozyo_bridge.domain.handoff import (
+    AnchorError,
+    KIND_LABELS,
+    MODE_PENDING,
+    MODE_STANDARD,
+    MODES,
+    RECEIVERS,
+    SOURCES,
+    build_marker,
+    build_notification_body,
+    make_outcome,
+    normalize_anchor,
+)
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
@@ -454,22 +467,60 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     return 0
 
 
+def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_kind: str) -> int:
+    """Adapter for the standard `notify-*` subcommands.
+
+    Maps the legacy Redmine-shaped CLI flags onto ``orchestrate_handoff``'s
+    normalized contract so the standard notify path shares a single
+    orchestration rail with `mozyo-bridge handoff` / `mozyo-bridge reply`.
+    Legacy queue notifications (`notify-*-legacy-task`) intentionally stay on
+    ``notify_agent``; they remain wrapper-only cleanup paths, not the
+    standard path.
+    """
+    validate_notify_gate(args)
+    type_str = getattr(args, "type", None)
+    if type_str in KIND_LABELS:
+        kind = type_str
+        summary = None
+    else:
+        kind = default_kind
+        summary = f"legacy --type={type_str}" if type_str else None
+    forwarded = argparse.Namespace(
+        to=agent,
+        source="redmine",
+        kind=kind,
+        issue=getattr(args, "issue", None),
+        journal=getattr(args, "journal", None),
+        task_id=None,
+        comment_id=None,
+        anchor_url=None,
+        target=getattr(args, "target", None),
+        mode=MODE_STANDARD,
+        summary=summary,
+        force=bool(getattr(args, "force", False)),
+        landing_timeout=float(getattr(args, "landing_timeout", 5.0) or 5.0),
+        submit_delay=float(getattr(args, "submit_delay", 0.2) or 0.0),
+        read_lines=int(getattr(args, "read_lines", 50) or 50),
+    )
+    return orchestrate_handoff(forwarded)
+
+
 def cmd_notify_codex(args: argparse.Namespace) -> int:
-    return notify_agent(args, "codex")
+    return _notify_standard_via_handoff(args, "codex", default_kind="reply")
 
 
 def cmd_notify_claude(args: argparse.Namespace) -> int:
-    return notify_agent(args, "claude")
+    return _notify_standard_via_handoff(args, "claude", default_kind="reply")
 
 
 def cmd_notify_codex_review(args: argparse.Namespace) -> int:
     args.type = "review_request"
-    return notify_agent(args, "codex")
+    return _notify_standard_via_handoff(args, "codex", default_kind="review_request")
 
 
 def cmd_notify_claude_review_result(args: argparse.Namespace) -> int:
     args.type = "review_result"
-    return notify_agent(args, "claude")
+    return _notify_standard_via_handoff(args, "claude", default_kind="review_result")
 
 
 def cmd_notify_codex_legacy_task(args: argparse.Namespace) -> int:
@@ -480,6 +531,208 @@ def cmd_notify_codex_legacy_task(args: argparse.Namespace) -> int:
 def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
     args.journal = None
     return notify_agent(args, "claude")
+
+
+def _emit_outcome(outcome) -> None:
+    print(outcome.to_json())
+
+
+def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = None) -> int:
+    """High-level handoff/reply primitive.
+
+    Owns: receiver-pane resolution, agent-target validation, internal pane
+    snapshot, marker-prefixed type, landing wait, fail-closed C-u rollback,
+    and structured outcome emission. Does NOT touch Asana/Redmine APIs; that
+    durable delivery record integration lives in a follow-up task.
+
+    The standard path does its own pre-type capture so callers do not need to
+    run ``mozyo-bridge read`` first.
+    """
+    require_tmux()
+
+    receiver = getattr(args, "to", None)
+    if receiver not in RECEIVERS:
+        die(f"--to must be one of {sorted(RECEIVERS)}; got {receiver!r}")
+
+    source = getattr(args, "source", None)
+    if source not in SOURCES:
+        die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
+
+    kind = getattr(args, "kind", None) or default_kind
+    mode = getattr(args, "mode", MODE_STANDARD) or MODE_STANDARD
+    if mode not in MODES:
+        die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
+
+    if kind not in KIND_LABELS:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="invalid_args",
+                receiver=receiver,
+                target=None,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            )
+        )
+        die(f"--kind must be one of {sorted(KIND_LABELS)}; got {kind!r}")
+
+    summary = getattr(args, "summary", None)
+
+    try:
+        anchor = normalize_anchor(
+            source,
+            task_id=getattr(args, "task_id", None),
+            comment_id=getattr(args, "comment_id", None),
+            anchor_url=getattr(args, "anchor_url", None),
+            issue=getattr(args, "issue", None),
+            journal=getattr(args, "journal", None),
+        )
+    except AnchorError as exc:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="invalid_anchor",
+                receiver=receiver,
+                target=None,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            )
+        )
+        die(str(exc))
+        raise AssertionError("unreachable")
+
+    target_arg = getattr(args, "target", None) or receiver
+    try:
+        target_info = pane_info(target_arg)
+    except SystemExit:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="target_unavailable",
+                receiver=receiver,
+                target=None,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            )
+        )
+        raise
+
+    target = target_info["id"]
+    try:
+        ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
+    except SystemExit:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="target_not_agent",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            )
+        )
+        raise
+
+    try:
+        body = build_notification_body(anchor, kind, summary, receiver)
+    except AnchorError as exc:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="invalid_args",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            )
+        )
+        die(str(exc))
+        raise AssertionError("unreachable")
+
+    marker = build_marker(anchor, kind, receiver)
+
+    read_lines = int(getattr(args, "read_lines", 50) or 50)
+    # Internal pane snapshot preflight. The standard path must not require
+    # callers to run `mozyo-bridge read` first.
+    capture_pane(target, read_lines)
+
+    run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
+
+    if mode == MODE_PENDING:
+        outcome = make_outcome(
+            status="pending_input",
+            reason="ok",
+            receiver=receiver,
+            target=target,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            notification_marker=marker,
+        )
+        _emit_outcome(outcome)
+        return 0
+
+    landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
+    landing_lines = max(read_lines, 200)
+    if not wait_for_text(target, marker, landing_lines, landing_timeout):
+        run_tmux("send-keys", "-t", target, "C-u")
+        outcome = make_outcome(
+            status="blocked",
+            reason="marker_timeout",
+            receiver=receiver,
+            target=target,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            notification_marker=marker,
+        )
+        _emit_outcome(outcome)
+        die(
+            "handoff marker was not observed in target pane; input was cleared and Enter was not pressed. "
+            f"target={target} marker={marker}"
+        )
+        raise AssertionError("unreachable")
+
+    submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
+    if submit_delay:
+        time.sleep(submit_delay)
+    run_tmux("send-keys", "-t", target, "Enter")
+
+    outcome = make_outcome(
+        status="sent",
+        reason="ok",
+        receiver=receiver,
+        target=target,
+        anchor=anchor,
+        mode=mode,
+        kind=kind,
+        notification_marker=marker,
+    )
+    _emit_outcome(outcome)
+    return 0
+
+
+def cmd_handoff_send(args: argparse.Namespace) -> int:
+    return orchestrate_handoff(args)
+
+
+def cmd_handoff_reply(args: argparse.Namespace) -> int:
+    return orchestrate_handoff(args, default_kind="reply")
 
 
 def cmd_init(args: argparse.Namespace) -> int:

@@ -46,6 +46,19 @@ from mozyo_bridge.domain.pane_resolver import (
     resolve_target,
 )
 import mozyo_bridge.domain.pane_resolver as pane_resolver
+from mozyo_bridge.domain.handoff import (
+    AnchorError,
+    AsanaAnchor,
+    KIND_LABELS,
+    MODE_PENDING,
+    MODE_STANDARD,
+    RedmineAnchor,
+    build_marker,
+    build_notification_body,
+    make_outcome,
+    next_action_for,
+    normalize_anchor,
+)
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
 from mozyo_bridge.scaffold.rules import package_version, rules_status, scaffold_state
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
@@ -1437,6 +1450,10 @@ class NotifyContractTest(unittest.TestCase):
         return result, sent, stdout.getvalue(), pane_text
 
     def test_notify_by_journal_types_observed_text_then_submits(self) -> None:
+        # `notify-codex` is now a thin wrapper over the new handoff primitive
+        # (Codex audit: `1214760803593547`). The marker and body shape come
+        # from `mozyo_bridge.domain.handoff`; the legacy `[mozyo:notify:...]`
+        # marker is reserved for the legacy queue subcommands.
         result, sent, stdout, pane_text = self.run_notify_with_fake_tmux(
             [
                 "notify-codex",
@@ -1455,9 +1472,18 @@ class NotifyContractTest(unittest.TestCase):
         )
 
         self.assertEqual(0, result)
-        self.assertIn("[mozyo:notify:issue=9020:journal=46005:type=review_request]", pane_text)
-        self.assertIn("Redmine #9020 journal #46005 is ready for codex", pane_text)
-        self.assertIn("notified codex: journal=46005 target=%2 read_lines=20", stdout)
+        self.assertIn(
+            "[mozyo:handoff:source=redmine:issue=9020:journal=46005:kind=review_request:to=codex]",
+            pane_text,
+        )
+        self.assertIn("review request ready for codex", pane_text)
+        self.assertIn("Redmine #9020 journal #46005", pane_text)
+        outcome_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertTrue(outcome_lines)
+        outcome = json.loads(outcome_lines[-1])
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("redmine", outcome["source"])
+        self.assertEqual("review_request", outcome["kind"])
         self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
 
     def test_legacy_task_notification_uses_separate_contract(self) -> None:
@@ -1488,7 +1514,7 @@ class NotifyContractTest(unittest.TestCase):
 
     def test_notify_does_not_submit_when_marker_is_not_observed_contract(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
-            result, sent, _stdout, _pane_text = self.run_notify_with_fake_tmux(
+            result, sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
                 [
                     "notify-codex",
                     "--issue",
@@ -1510,6 +1536,12 @@ class NotifyContractTest(unittest.TestCase):
         self.assertIsInstance(result, SystemExit)
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
         self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        outcome_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertTrue(outcome_lines)
+        outcome = json.loads(outcome_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertEqual("redmine", outcome["source"])
 
     def test_notify_submit_delay_default_is_classic_short_tui_delay(self) -> None:
         parser = build_parser()
@@ -3301,6 +3333,623 @@ class DoctorEnvironmentTest(unittest.TestCase):
             action = section["next_action"][0]
             self.assertIn(f"--target {target.resolve()}", action)
             self.assertIn(f"--home {home.resolve()}", action)
+
+
+class HandoffDomainTest(unittest.TestCase):
+    def test_normalize_anchor_builds_asana_with_comment_id(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+
+        self.assertIsInstance(anchor, AsanaAnchor)
+        self.assertEqual("T1", anchor.task_id)
+        self.assertEqual("C1", anchor.comment_id)
+        self.assertIsNone(anchor.anchor_url)
+
+    def test_normalize_anchor_builds_asana_with_anchor_url(self) -> None:
+        anchor = normalize_anchor(
+            "asana", task_id="T1", anchor_url="https://app.asana.com/0/0/T1#2026-05"
+        )
+
+        self.assertIsInstance(anchor, AsanaAnchor)
+        self.assertEqual("https://app.asana.com/0/0/T1#2026-05", anchor.anchor_url)
+        self.assertIsNone(anchor.comment_id)
+
+    def test_normalize_anchor_rejects_asana_with_both_comment_and_url(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor(
+                "asana", task_id="T1", comment_id="C1", anchor_url="https://example/x"
+            )
+
+    def test_normalize_anchor_rejects_asana_with_neither_comment_nor_url(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor("asana", task_id="T1")
+
+    def test_normalize_anchor_rejects_asana_without_task_id(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor("asana", comment_id="C1")
+
+    def test_normalize_anchor_builds_redmine(self) -> None:
+        anchor = normalize_anchor("redmine", issue="9020", journal="46005")
+
+        self.assertIsInstance(anchor, RedmineAnchor)
+        self.assertEqual("9020", anchor.issue)
+        self.assertEqual("46005", anchor.journal)
+
+    def test_normalize_anchor_rejects_redmine_with_asana_fields(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor(
+                "redmine", issue="9020", journal="46005", task_id="T1"
+            )
+
+    def test_normalize_anchor_rejects_asana_with_redmine_fields(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor(
+                "asana", task_id="T1", comment_id="C1", journal="46005"
+            )
+
+    def test_normalize_anchor_rejects_unknown_source(self) -> None:
+        with self.assertRaises(AnchorError):
+            normalize_anchor("jira", task_id="T1")
+
+    def test_build_marker_for_asana_with_comment(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+
+        self.assertEqual(
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=reply:to=claude]",
+            build_marker(anchor, "reply", "claude"),
+        )
+
+    def test_build_marker_for_asana_with_anchor_url(self) -> None:
+        anchor = normalize_anchor(
+            "asana", task_id="T1", anchor_url="https://example/x"
+        )
+
+        self.assertEqual(
+            "[mozyo:handoff:source=asana:task=T1:anchor=https://example/x:kind=review_result:to=codex]",
+            build_marker(anchor, "review_result", "codex"),
+        )
+
+    def test_build_marker_for_redmine(self) -> None:
+        anchor = normalize_anchor("redmine", issue="9020", journal="46005")
+
+        self.assertEqual(
+            "[mozyo:handoff:source=redmine:issue=9020:journal=46005:kind=review_request:to=codex]",
+            build_marker(anchor, "review_request", "codex"),
+        )
+
+    def test_build_notification_body_requires_summary_for_custom_kind(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+
+        with self.assertRaises(AnchorError):
+            build_notification_body(anchor, "custom", None, "claude")
+
+    def test_build_notification_body_appends_durable_pointer(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+
+        body = build_notification_body(anchor, "implementation_request", None, "claude")
+
+        self.assertIn("implementation request ready for claude", body)
+        self.assertIn("Asana task T1", body)
+        self.assertIn("comment C1", body)
+        self.assertIn("durable anchor", body)
+
+    def test_build_notification_body_uses_summary_when_provided(self) -> None:
+        anchor = normalize_anchor("redmine", issue="9020", journal="46005")
+
+        body = build_notification_body(
+            anchor, "custom", "ship hotfix to staging", "codex"
+        )
+
+        self.assertIn("ship hotfix to staging", body)
+        self.assertIn("Redmine #9020", body)
+        self.assertIn("journal #46005", body)
+
+    def test_build_notification_body_rejects_unknown_kind(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+
+        with self.assertRaises(AnchorError):
+            build_notification_body(anchor, "shipping_notice", None, "claude")
+
+    def test_make_outcome_sent_attributes_action_to_receiver(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker="[marker]",
+        )
+
+        self.assertEqual("receiver", outcome.next_action_owner)
+        self.assertIn("durable anchor", outcome.next_action)
+        payload = json.loads(outcome.to_json())
+        self.assertEqual("sent", payload["status"])
+        self.assertEqual("[marker]", payload["notification_marker"])
+        self.assertEqual({"source": "asana", "task_id": "T1", "comment_id": "C1"}, payload["anchor"])
+
+    def test_make_outcome_preserves_source_even_when_anchor_is_none(self) -> None:
+        # Failure paths like invalid_anchor / invalid_args call make_outcome
+        # without a normalized anchor. The structured contract still requires
+        # `source`, so downstream durable-record integration (task
+        # 1214760547941073) does not need to recover it out of band.
+        outcome = make_outcome(
+            status="blocked",
+            reason="invalid_anchor",
+            receiver="claude",
+            target=None,
+            anchor=None,
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker=None,
+            source="asana",
+        )
+
+        self.assertEqual("asana", outcome.source)
+        payload = json.loads(outcome.to_json())
+        self.assertEqual("asana", payload["source"])
+        self.assertIsNone(payload["anchor"])
+
+    def test_make_outcome_pending_attributes_action_to_operator(self) -> None:
+        anchor = normalize_anchor("redmine", issue="9020", journal="46005")
+        outcome = make_outcome(
+            status="pending_input",
+            reason="ok",
+            receiver="codex",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_PENDING,
+            kind="reply",
+            notification_marker="[marker]",
+        )
+
+        self.assertEqual("operator", outcome.next_action_owner)
+        self.assertIn("pending prompt", outcome.next_action)
+
+    def test_next_action_for_marker_timeout_attributes_to_sender(self) -> None:
+        owner, action = next_action_for("blocked", "marker_timeout", "claude")
+
+        self.assertEqual("sender", owner)
+        self.assertIn("un-notified", action)
+
+    def test_kind_labels_contract_is_stable(self) -> None:
+        self.assertEqual(
+            {
+                "implementation_request",
+                "design_consultation",
+                "review_request",
+                "review_result",
+                "implementation_done",
+                "reply",
+                "custom",
+            },
+            set(KIND_LABELS),
+        )
+
+
+class HandoffCliParserTest(unittest.TestCase):
+    def test_handoff_send_requires_kind(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "handoff",
+                        "send",
+                        "--to",
+                        "claude",
+                        "--source",
+                        "asana",
+                        "--task-id",
+                        "T1",
+                        "--comment-id",
+                        "C1",
+                    ]
+                )
+
+    def test_handoff_send_parses_full_args(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--mode",
+                "standard",
+            ]
+        )
+
+        self.assertEqual("handoff", args.command)
+        self.assertEqual("send", args.handoff_command)
+        self.assertEqual("claude", args.to)
+        self.assertEqual("asana", args.source)
+        self.assertEqual("implementation_request", args.kind)
+        self.assertEqual("T1", args.task_id)
+        self.assertEqual("C1", args.comment_id)
+        self.assertEqual(MODE_STANDARD, args.mode)
+
+    def test_handoff_reply_allows_omitted_kind(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "handoff",
+                "reply",
+                "--to",
+                "codex",
+                "--source",
+                "redmine",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+            ]
+        )
+
+        self.assertEqual("handoff", args.command)
+        self.assertEqual("reply", args.handoff_command)
+        self.assertIsNone(args.kind)
+
+    def test_reply_alias_shares_handoff_reply_func(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "reply",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--task-id",
+                "T1",
+                "--anchor-url",
+                "https://example/x",
+                "--mode",
+                "pending",
+            ]
+        )
+
+        self.assertEqual("reply", args.command)
+        self.assertEqual("https://example/x", args.anchor_url)
+        self.assertEqual(MODE_PENDING, args.mode)
+        from mozyo_bridge.application.commands import cmd_handoff_reply
+
+        self.assertIs(cmd_handoff_reply, args.func)
+
+    def test_handoff_send_rejects_unknown_source(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "handoff",
+                        "send",
+                        "--to",
+                        "claude",
+                        "--source",
+                        "jira",
+                        "--kind",
+                        "reply",
+                    ]
+                )
+
+    def test_handoff_send_rejects_unknown_kind(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "handoff",
+                        "send",
+                        "--to",
+                        "claude",
+                        "--source",
+                        "asana",
+                        "--kind",
+                        "ship_it",
+                    ]
+                )
+
+
+class HandoffOrchestratorTest(unittest.TestCase):
+    def run_handoff_with_fake_tmux(
+        self,
+        argv: list[str],
+        captures: list[str] | None = None,
+        allow_exit: bool = False,
+        pane: dict[str, str] | None = None,
+    ):
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+        pane_text = ""
+        forced_captures = captures is not None
+        capture_outputs = list(captures or [])
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            if capture_outputs:
+                return capture_outputs.pop(0)
+            if forced_captures:
+                return ""
+            return pane_text
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            nonlocal pane_text
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text += tmux_args[-1]
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux call: {tmux_args}")
+
+        default_pane = {
+            "id": "%2",
+            "location": "agents:0.1",
+            "command": "node",
+            "cwd": "/repo",
+            "window_name": "claude",
+        }
+        pane_value = pane if pane is not None else default_pane
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                if not allow_exit:
+                    raise
+                result = exc
+
+        return result, sent, stdout.getvalue(), stderr.getvalue(), pane_text
+
+    def _outcome_from_stdout(self, stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertTrue(lines, f"no JSON outcome found in stdout: {stdout!r}")
+        return json.loads(lines[-1])
+
+    def test_standard_mode_sends_marker_body_and_enter(self) -> None:
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--force",
+                "--submit-delay",
+                "0",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        expected_marker = "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=implementation_request:to=claude]"
+        self.assertIn(expected_marker, pane_text)
+        self.assertIn("Asana task T1", pane_text)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        self.assertEqual("claude", outcome["receiver"])
+        self.assertEqual("%2", outcome["target"])
+        self.assertEqual("asana", outcome["source"])
+        self.assertEqual("implementation_request", outcome["kind"])
+        self.assertEqual(MODE_STANDARD, outcome["mode"])
+        self.assertEqual(expected_marker, outcome["notification_marker"])
+        self.assertEqual("receiver", outcome["next_action_owner"])
+
+    def test_pending_mode_leaves_input_unsubmitted_and_emits_pending_outcome(self) -> None:
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "reply",
+                "--to",
+                "codex",
+                "--source",
+                "redmine",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+                "--target",
+                "%2",
+                "--force",
+                "--mode",
+                "pending",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "codex",
+            },
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "[mozyo:handoff:source=redmine:issue=9020:journal=46005:kind=reply:to=codex]",
+            pane_text,
+        )
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("pending_input", outcome["status"])
+        self.assertEqual("reply", outcome["kind"])
+        self.assertEqual("operator", outcome["next_action_owner"])
+
+    def test_marker_timeout_rolls_back_and_emits_blocked_outcome(self) -> None:
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "review_result",
+                "--task-id",
+                "T1",
+                "--anchor-url",
+                "https://example/x",
+                "--target",
+                "%2",
+                "--force",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            captures=["", "", ""],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertEqual("sender", outcome["next_action_owner"])
+
+    def test_invalid_anchor_emits_blocked_invalid_anchor_outcome(self) -> None:
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--target",
+                "%2",
+                "--force",
+            ],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_anchor", outcome["reason"])
+        self.assertIsNone(outcome["target"])
+        # Source must survive anchor-normalization failure so task
+        # 1214760547941073 can persist the outcome without re-deriving it.
+        self.assertEqual("asana", outcome["source"])
+        self.assertIn("asana anchor", stderr)
+
+    def test_non_agent_pane_without_force_emits_target_not_agent(self) -> None:
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "zsh",
+                "cwd": "/repo",
+                "window_name": "claude",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_not_agent", outcome["reason"])
+        self.assertEqual("%2", outcome["target"])
+        self.assertIn("target pane does not look like an agent pane", stderr)
+
+    def test_target_unavailable_emits_blocked_target_unavailable(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+            ]
+        )
+
+        # No agent window in the session, no explicit --target. resolve_target
+        # should die; the orchestrator must emit a structured outcome first.
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="my-project"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[]), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                args.func(args)
+
+        out = stdout.getvalue()
+        outcome_lines = [line for line in out.splitlines() if line.strip().startswith("{")]
+        self.assertTrue(outcome_lines, f"no JSON outcome found in stdout: {out!r}")
+        outcome = json.loads(outcome_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_unavailable", outcome["reason"])
+        self.assertIsNone(outcome["target"])
+        self.assertIn("no claude window found", stderr.getvalue())
 
 
 class PluginMarketplaceTest(unittest.TestCase):
