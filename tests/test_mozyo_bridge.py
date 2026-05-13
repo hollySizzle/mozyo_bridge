@@ -39,6 +39,7 @@ from mozyo_bridge.domain.pane_resolver import (
     ensure_agent_target,
     find_agent_window,
     is_agent_process,
+    is_receiver_agent_process,
     is_tmux_target,
     mark_read,
     require_read,
@@ -276,6 +277,65 @@ class PaneResolverTest(unittest.TestCase):
 
     def test_is_agent_process_accepts_versioned_native_binary(self) -> None:
         self.assertTrue(is_agent_process("2.1.138"))
+
+    def test_is_receiver_agent_process_strong_identity_for_claude(self) -> None:
+        # Step 12 strong identity: only literal `claude` counts as strong
+        # identity for receiver=claude. Literal `codex` is rejected outright.
+        self.assertTrue(is_receiver_agent_process("claude", "claude"))
+        self.assertTrue(is_receiver_agent_process("/usr/local/bin/claude", "claude"))
+        self.assertFalse(is_receiver_agent_process("codex", "claude"))
+
+    def test_is_receiver_agent_process_strong_identity_for_codex(self) -> None:
+        # Step 12 strong identity, symmetric case: only literal `codex` counts
+        # as strong identity for receiver=codex. Literal `claude` is rejected.
+        self.assertTrue(is_receiver_agent_process("codex", "codex"))
+        self.assertTrue(is_receiver_agent_process("/opt/codex/bin/codex", "codex"))
+        self.assertFalse(is_receiver_agent_process("claude", "codex"))
+
+    def test_is_receiver_agent_process_node_is_weak_identity_for_both(self) -> None:
+        # Step 12 weak identity (contract Open Question 8): both Claude Code
+        # and the Codex CLI are Node-based applications, so a `node`
+        # foreground process can belong to either receiver. The function
+        # admits `node` for both receivers but treats it as weak identity;
+        # callers must not advertise it as strong receiver confirmation.
+        self.assertTrue(is_receiver_agent_process("node", "claude"))
+        self.assertTrue(is_receiver_agent_process("node", "codex"))
+        self.assertTrue(is_receiver_agent_process("/usr/local/bin/node", "claude"))
+        self.assertTrue(is_receiver_agent_process("/usr/local/bin/node", "codex"))
+
+    def test_is_receiver_agent_process_versioned_native_is_weak_identity(self) -> None:
+        # Step 12 weak identity: versioned native binary basenames are
+        # receiver-agnostic by design — `1.0.32-arm64` passes for both
+        # `claude` and `codex`. This is honest weakness, not a bug;
+        # cross-binding protection retreats to Step 9 + Layer A here.
+        self.assertTrue(is_receiver_agent_process("1.0.32-arm64", "claude"))
+        self.assertTrue(is_receiver_agent_process("1.0.32-arm64", "codex"))
+        self.assertTrue(is_receiver_agent_process("2.1.138", "claude"))
+        self.assertTrue(is_receiver_agent_process("2.1.138", "codex"))
+
+    def test_is_receiver_agent_process_rejects_shells_and_empty(self) -> None:
+        # queue-enter is never admitted to shells or to a pane whose
+        # foreground process tmux reports as empty.
+        for receiver in ("claude", "codex"):
+            for command in ("zsh", "bash", "fish", "sh", "vim", "less", ""):
+                self.assertFalse(
+                    is_receiver_agent_process(command, receiver),
+                    msg=f"{command!r} must not satisfy receiver={receiver!r}",
+                )
+
+    def test_is_receiver_agent_process_rejects_unknown_receiver_strong_only(self) -> None:
+        # CLI args already restrict `--to` to RECEIVERS, but the function
+        # must not silently grant the *strong* identity branch to an unknown
+        # receiver. Literal receiver basenames fail the strong check and
+        # fall through to the weak branch, which is receiver-agnostic by
+        # design — only weak-branch matches admit for an unknown receiver.
+        self.assertFalse(is_receiver_agent_process("claude", "operator"))
+        self.assertFalse(is_receiver_agent_process("codex", "operator"))
+        # Weak-branch matches admit even for unknown receivers; this is
+        # documented as receiver-agnostic and is not a receiver-identity
+        # claim. Test for both `node` and versioned-native cases.
+        self.assertTrue(is_receiver_agent_process("node", "operator"))
+        self.assertTrue(is_receiver_agent_process("1.0.32-arm64", "operator"))
 
     def test_ensure_agent_target_rejects_shell_without_force(self) -> None:
         pane = {"command": "bash"}
@@ -4282,6 +4342,7 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         captures=None,
         allow_exit: bool = False,
         pane=None,
+        current_session: str | None = "agents",
     ):
         # Mirror of HandoffOrchestratorTest.run_handoff_with_fake_tmux so this
         # class can drive the CLI end-to-end without launching tmux.
@@ -4316,13 +4377,19 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
             "command": "node",
             "cwd": "/repo",
             "window_name": "claude",
+            "pane_active": "1",
         }
         pane_value = pane if pane is not None else default_pane
 
+        # Step 10 (v0.3 deterministic preflight) reads the sender's tmux
+        # session via `current_session_name`. Default to "agents" so the
+        # default pane's location prefix (`agents:0.1`) matches; individual
+        # tests can override by patching the same symbol inside the body.
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch("mozyo_bridge.application.commands.current_session_name", return_value=current_session), \
             patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
             patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
@@ -4609,6 +4676,7 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
                 # Strict (`ensure_agent_target`) would currently accept this;
                 # queue-enter must not.
                 "window_name": "codex",
+                "pane_active": "1",
             },
             allow_exit=True,
         )
@@ -4658,6 +4726,7 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
                 "command": "node",
                 "cwd": "/repo",
                 "window_name": "claude",
+                "pane_active": "1",
             },
         )
 
@@ -4696,6 +4765,7 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
                 "command": "zsh",
                 "cwd": "/repo",
                 "window_name": "claude",
+                "pane_active": "1",
             },
             allow_exit=True,
         )
@@ -4706,6 +4776,278 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("target_not_agent", outcome["reason"])
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    # --- v0.3 deterministic preflight (Step 10 / 11 / 12) -------------------------
+
+    def _queue_enter_argv(self, *, kind: str = "implementation_request") -> list[str]:
+        return [
+            "handoff",
+            "send",
+            "--to",
+            "claude",
+            "--source",
+            "asana",
+            "--kind",
+            kind,
+            "--task-id",
+            "T1",
+            "--comment-id",
+            "C1",
+            "--target",
+            "%2",
+            "--mode",
+            "queue-enter",
+        ]
+
+    def test_queue_enter_step10_rejects_foreign_session_target(self) -> None:
+        # Step 10 (v0.3): same-session binding. An explicit `--target %X` whose
+        # pane lives in a different tmux session than the sender must be
+        # rejected before typing — under queue-enter marker miss does not roll
+        # back, so cross-session delivery could otherwise land in the wrong
+        # repo's agent.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv(),
+            pane={
+                "id": "%2",
+                "location": "other:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+            current_session="agents",
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("'agents'", stderr)
+        self.assertIn("'other'", stderr)
+
+    def test_queue_enter_step10_rejects_when_sender_outside_tmux(self) -> None:
+        # Step 10 (v0.3): when invoked outside tmux, `current_session_name`
+        # returns None. queue-enter must refuse rather than admit a comparison
+        # against a missing sender session.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv(),
+            current_session=None,
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("'<unset>'", stderr)
+
+    def test_queue_enter_step11_rejects_inactive_pane(self) -> None:
+        # Step 11 (v0.3): the target pane must be the active split of its
+        # window. An inactive split would still accept keystrokes typed via
+        # `send-keys -t %X`, but the receiver agent is by construction not the
+        # foreground process the operator is looking at; queue-enter rejects
+        # before typing.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv(),
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "0",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("pane_active", stderr)
+
+    def test_queue_enter_step12_rejects_cross_receiver_literal_to_claude(self) -> None:
+        # Step 12 (v0.3) strong identity: a literal `codex` process foregrounded
+        # in a `claude` window cannot satisfy the per-receiver allowlist for
+        # `claude`. Step 9 already enforces `window_name == receiver` for
+        # explicit `--target`; this guards the case where the window itself was
+        # renamed but the foreground process betrays a different receiver.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv(),
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "codex",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_not_agent", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("'codex'", stderr)
+        self.assertIn("claude agent", stderr)
+
+    def test_queue_enter_step12_rejects_cross_receiver_literal_to_codex(self) -> None:
+        # Step 12 strong identity, symmetric case: a literal `claude` process
+        # in a `codex` window is rejected for receiver=`codex`. (Literal
+        # `node` is weak identity for both receivers because both Claude
+        # Code and the Codex CLI are Node-based, so `node` does NOT exhibit
+        # cross-binding rejection here; this test exercises the *strong*
+        # branch only.)
+        argv = self._queue_enter_argv(kind="reply")
+        argv[argv.index("claude")] = "codex"
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            argv,
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "claude",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_not_agent", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("'claude'", stderr)
+        self.assertIn("codex agent", stderr)
+
+    def test_queue_enter_step12_admits_node_for_codex_weak_identity(self) -> None:
+        # Both Claude Code and the Codex CLI surface as `node` in tmux
+        # (Node-based runtimes). Step 12 admits `node` for receiver=`codex`
+        # under the weak-identity branch — Step 9 (`window_name == receiver`)
+        # plus Layer A operator discipline carry cross-binding protection
+        # here. This test pins admission to keep real codex panes deliverable
+        # under queue-enter.
+        argv = self._queue_enter_argv(kind="reply") + ["--submit-delay", "0"]
+        argv[argv.index("claude")] = "codex"
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            argv,
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=reply:to=codex]",
+            pane_text,
+        )
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_step12_admits_versioned_native_binary_weak_identity(self) -> None:
+        # Step 12 weak identity (Open Question 8 in the contract): a versioned
+        # native binary basename (e.g. `1.0.32-arm64`) is receiver-agnostic by
+        # design. queue-enter admits it because the pane is at least running
+        # *some* versioned native agent binary, and Step 9 + Layer A operator
+        # discipline carry cross-binding protection in this branch. The
+        # contract explicitly concedes the weakness; do not pretend Step 12
+        # confirms receiver identity here.
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv() + ["--submit-delay", "0"],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "1.0.32-arm64",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=implementation_request:to=claude]",
+            pane_text,
+        )
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_strict_standard_admits_cross_receiver_process_unchanged(self) -> None:
+        # Regression: the v0.3 per-receiver process gate must not bleed into
+        # strict `--mode standard`. Strict's behavior (admit any agent-looking
+        # process, rely on marker_timeout + C-u rollback) stays as-is. This
+        # test pins that boundary by sending strict to a pane whose foreground
+        # process is `claude` while --to=codex; strict admits typing and
+        # rolls back on marker miss, as it already did pre-v0.3.
+        argv = [
+            "handoff",
+            "send",
+            "--to",
+            "codex",
+            "--source",
+            "asana",
+            "--kind",
+            "review_result",
+            "--task-id",
+            "T1",
+            "--comment-id",
+            "C1",
+            "--target",
+            "%2",
+            "--landing-timeout",
+            "0.01",
+            "--submit-delay",
+            "0",
+        ]
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            argv,
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "claude",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+            captures=["", "", ""],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        # Strict still types and then rolls back; the new v0.3 gates must not
+        # have fired here.
+        self.assertTrue(any(call[:4] == ("send-keys", "-t", "%2", "-l") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertEqual(MODE_STANDARD, outcome["mode"])
 
     # --- projection / wording ------------------------------------------------------
 

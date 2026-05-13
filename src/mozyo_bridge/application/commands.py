@@ -36,6 +36,7 @@ from mozyo_bridge.domain.pane_resolver import (
     ensure_agent_target,
     find_agent_window,
     is_agent_process,
+    is_receiver_agent_process,
     is_tmux_target,
     mark_read,
     pane_info,
@@ -717,17 +718,16 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
     target = target_info["id"]
 
     if mode == MODE_QUEUE_ENTER and target_info.get("window_name") != receiver:
-        # Under the relaxed queue-enter rail, marker miss does NOT roll back,
-        # so an explicit `--target %X` that lands in a different agent's
-        # window would silently press Enter into the wrong receiver's pane.
-        # The agent gate (`ensure_agent_target`) only verifies the pane is
-        # running *some* agent process (claude / codex / node) and does not
+        # Step 9 (v0.2). Under the relaxed queue-enter rail, marker miss does
+        # NOT roll back, so an explicit `--target %X` that lands in a different
+        # agent's window would silently press Enter into the wrong receiver's
+        # pane. The agent gate (`ensure_agent_target`) only verifies the pane
+        # is running *some* agent process (claude / codex / node) and does not
         # bind the pane to the intended receiver. The window-name resolver
         # already enforces `window_name == receiver` when no `--target` is
-        # supplied; this guard restores the same invariant for explicit
-        # pane targets under queue-enter, matching the contract's "Allowed
-        # Targets" enumeration of "Claude/Codex agent panes for the intended
-        # receiver".
+        # supplied; this guard restores the same invariant for explicit pane
+        # targets under queue-enter, matching the contract's "Allowed Targets"
+        # enumeration of "Claude/Codex agent panes for the intended receiver".
         observed_window = target_info.get("window_name") or "<unknown>"
         _emit_outcome(
             make_outcome(
@@ -752,13 +752,54 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         )
         raise AssertionError("unreachable")
 
-    try:
-        ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
-    except SystemExit:
+    if mode == MODE_QUEUE_ENTER:
+        # Step 10 (v0.3): same-session binding. queue-enter must not deliver
+        # across tmux sessions: an explicit `--target %X` could otherwise land
+        # in a different repo's session under marker miss, and tmux-outside
+        # invocations have no sender session to compare against. Reject before
+        # typing.
+        sender_session = current_session_name()
+        target_location = target_info.get("location") or ""
+        target_session = (
+            target_location.split(":", 1)[0] if ":" in target_location else ""
+        )
+        if not sender_session or not target_session or sender_session != target_session:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "--mode queue-enter requires the target pane to live in the "
+                "sender's tmux session; "
+                f"sender_session={(sender_session or '<unset>')!r} "
+                f"target_session={(target_session or '<unknown>')!r}. "
+                "Run `mozyo-bridge` from inside the receiver's tmux session, "
+                "or pass a pane id in the sender's session."
+            )
+            raise AssertionError("unreachable")
+
+    if mode == MODE_QUEUE_ENTER and target_info.get("pane_active") != "1":
+        # Step 11 (v0.3): active-pane binding. tmux only delivers keystrokes
+        # to the pane addressed by `-t`; an inactive split in the right window
+        # would still accept the typing but the receiver agent is, by
+        # construction, not the foreground process the operator is looking at.
+        # queue-enter requires the receiver pane to be the active split.
+        observed_active = target_info.get("pane_active") or "<unknown>"
         _emit_outcome(
             make_outcome(
                 status="blocked",
-                reason="target_not_agent",
+                reason="invalid_args",
                 receiver=receiver,
                 target=target,
                 anchor=anchor,
@@ -770,7 +811,68 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             record_format=record_format,
             command=record_command,
         )
-        raise
+        die(
+            "--mode queue-enter requires the target pane to be the active "
+            f"split of its window; pane {target} has pane_active="
+            f"{observed_active!r}. Activate the receiver pane in tmux, or "
+            "drop --target to use window-name resolution."
+        )
+        raise AssertionError("unreachable")
+
+    if mode == MODE_QUEUE_ENTER:
+        # Step 12 (v0.3): per-receiver foreground process binding. Stricter
+        # than the generic `ensure_agent_target` agent gate. Literal basenames
+        # (`claude` / `node` for `claude`, `codex` for `codex`) give strong
+        # receiver identity. Versioned native binary basenames give only weak
+        # identity (receiver-agnostic regex) — see
+        # `is_receiver_agent_process` and Open Question 8 in the contract.
+        # The CLI does not advertise the weak case as strong; it just admits
+        # under Step 9 + Layer A discipline.
+        pane_command = target_info.get("command") or ""
+        if not is_receiver_agent_process(pane_command, receiver):
+            observed_command = Path(pane_command).name or "<none>"
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_not_agent",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "--mode queue-enter requires the foreground process to match "
+                f"the {receiver} agent; pane {target} has process "
+                f"{observed_command!r}. Restart the receiver agent in the "
+                "pane, or pass a pane that is running the agent."
+            )
+            raise AssertionError("unreachable")
+    else:
+        try:
+            ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
+        except SystemExit:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_not_agent",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            raise
 
     try:
         body = build_notification_body(anchor, kind, summary, receiver)

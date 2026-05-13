@@ -167,6 +167,51 @@ def is_agent_process(command: str) -> bool:
     return name in AGENT_PROCESSES or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
 
 
+def is_receiver_agent_process(command: str, receiver: str) -> bool:
+    """Per-receiver foreground process check for the relaxed `queue-enter` rail.
+
+    Stricter than :func:`is_agent_process`. The contract
+    (`vibes/docs/logics/tmux-send-safety-contract.md` v0.3,
+    `### Per-Receiver Foreground Process Allowlist`) splits identity into:
+
+    - **strong identity** — literal basename matches the named receiver
+      (`claude` for receiver=`claude`; `codex` for receiver=`codex`). Cross-
+      binding is fully detectable here: a literal `codex` process for
+      receiver=`claude` (or vice versa) returns False.
+    - **weak identity** — `node` literal or `VERSIONED_NATIVE_BINARY_RE`
+      match. Both the Claude Code TUI and the Codex CLI are Node-based
+      applications, so a `node` foreground process can belong to either
+      receiver. Native distributions of either CLI surface as a versioned
+      native binary basename. Both signals are therefore receiver-agnostic
+      and only confirm the pane is running *some* agent runtime. Cross-
+      binding protection in the weak case retreats to Step 9
+      (`window_name == receiver`) plus Layer A operator discipline; closing
+      the gap is tracked as Open Question 8 in the contract. Callers must
+      not advertise stronger receiver-identity confidence than this
+      function can give.
+
+    Unknown receivers return False for the strong branch but still admit
+    weak-branch matches (the weak branch is receiver-agnostic by design).
+    Shells (e.g. `zsh`, `bash`) and empty commands return False.
+    """
+    name = Path(command or "").name
+    if not name:
+        return False
+    if receiver == "claude" and name == "claude":
+        return True
+    if receiver == "codex" and name == "codex":
+        return True
+    # Weak identity branch: `node` literal and versioned native binary
+    # basenames are receiver-agnostic. See docstring; do not pretend either
+    # confirms receiver identity. Cross-binding protection here retreats to
+    # Step 9 (window-name binding) plus Layer A operator discipline.
+    if name == "node":
+        return True
+    if VERSIONED_NATIVE_BINARY_RE.fullmatch(name):
+        return True
+    return False
+
+
 def ensure_agent_target(pane: dict[str, str], expected_agent: str, force: bool = False) -> None:
     """Confirm `pane` belongs to `expected_agent` under the window-only model.
 
