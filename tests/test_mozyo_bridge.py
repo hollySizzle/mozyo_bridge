@@ -26,9 +26,11 @@ from mozyo_bridge.application.commands import (
     cmd_mozyo,
     cmd_open,
     cmd_open_here,
+    cmd_status,
     ensure_repo_session_windows,
     load_tmux_conf_for,
     notify_agent,
+    resolve_status_session,
     session_cwd_mismatch,
 )
 from mozyo_bridge.infrastructure import tmux_client
@@ -37,11 +39,14 @@ from mozyo_bridge.domain.notification import build_prompt, landing_marker, valid
 from mozyo_bridge.domain.pane_resolver import (
     clear_read,
     ensure_agent_target,
+    find_agent_window,
     find_labeled_pane,
     is_agent_process,
     is_tmux_target,
     mark_read,
     require_read,
+    resolve_agent_label,
+    resolve_target,
 )
 import mozyo_bridge.domain.pane_resolver as pane_resolver
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
@@ -316,6 +321,199 @@ class PaneResolverTest(unittest.TestCase):
             finally:
                 pane_resolver.READ_MARK_PREFIX = original_prefix
 
+    def test_find_agent_window_returns_pane_for_window_named_agent(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "claude",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+            {
+                "id": "%2",
+                "location": "repo:1.0",
+                "label": "codex",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            window = find_agent_window("codex", "repo")
+
+        self.assertIsNotNone(window)
+        self.assertEqual("%2", window["id"])
+
+    def test_find_agent_window_returns_none_when_no_window_named_agent(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "claude",
+                "window_name": "agents",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            self.assertIsNone(find_agent_window("claude", "repo"))
+
+    def test_find_agent_window_dies_on_duplicate_window_name(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+            {
+                "id": "%2",
+                "location": "repo:1.0",
+                "label": "",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    find_agent_window("claude", "repo")
+
+    def test_find_agent_window_prefers_active_pane_in_split_window(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "",
+                "window_name": "claude",
+                "pane_active": "0",
+            },
+            {
+                "id": "%2",
+                "location": "repo:0.1",
+                "label": "claude",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            window = find_agent_window("claude", "repo")
+
+        self.assertEqual("%2", window["id"])
+
+    def test_find_agent_window_ignores_other_sessions(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "elsewhere:0.0",
+                "label": "claude",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            self.assertIsNone(find_agent_window("claude", "repo"))
+
+    def test_resolve_agent_label_prefers_window_over_label(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "claude",
+                "window_name": "agents",
+                "pane_active": "1",
+            },
+            {
+                "id": "%2",
+                "location": "repo:1.0",
+                "label": "",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            resolved = resolve_agent_label("claude", "repo")
+
+        self.assertEqual("%2", resolved["id"])
+
+    def test_resolve_agent_label_falls_back_to_label_in_same_session(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "repo:0.0",
+                "label": "claude",
+                "window_name": "agents",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            resolved = resolve_agent_label("claude", "repo")
+
+        self.assertEqual("%1", resolved["id"])
+
+    def test_resolve_agent_label_never_falls_back_cross_session(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "elsewhere:0.0",
+                "label": "claude",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            self.assertIsNone(resolve_agent_label("claude", "repo"))
+
+    def test_resolve_agent_label_returns_none_when_session_unknown(self) -> None:
+        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[]):
+            self.assertIsNone(resolve_agent_label("claude", None))
+
+    def test_resolve_target_for_agent_label_dies_outside_tmux(self) -> None:
+        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value=None), \
+            contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                resolve_target("codex")
+
+    def test_resolve_target_for_agent_label_dies_when_not_in_current_session(self) -> None:
+        panes = [
+            {
+                "id": "%1",
+                "location": "elsewhere:0.0",
+                "label": "codex",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="repo"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+            contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                resolve_target("codex")
+
+    def test_resolve_target_for_agent_label_returns_window_pane(self) -> None:
+        panes = [
+            {
+                "id": "%9",
+                "location": "repo:1.0",
+                "label": "",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+
+        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="repo"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+            self.assertEqual("%9", resolve_target("codex"))
+
 
 class CliTest(unittest.TestCase):
     def test_primary_commands_parse(self) -> None:
@@ -368,6 +566,25 @@ class CliTest(unittest.TestCase):
         self.assertEqual("tmux-ui-open", args.command)
         self.assertEqual("agents", args.session)
         self.assertEqual("/repo", args.cwd)
+
+    def test_status_session_defaults_to_none_for_runtime_resolution(self) -> None:
+        # Hard-coding the default to "agents" was the root cause of the
+        # misleading `session: agents (missing)` symptom under bare `mozyo`
+        # (Asana task 1214758916882465). Bare `status` must auto-resolve the
+        # session at runtime instead.
+        parser = build_parser()
+
+        args = parser.parse_args(["status"])
+
+        self.assertEqual("status", args.command)
+        self.assertIsNone(args.session)
+
+    def test_status_accepts_explicit_session_override(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["status", "--session", "agents"])
+
+        self.assertEqual("agents", args.session)
 
     def test_normalize_paths_marks_default_config_path(self) -> None:
         from mozyo_bridge.application.cli import normalize_paths
@@ -1866,7 +2083,10 @@ class CommandTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.source_tmux_conf") as source_conf, \
             patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
             patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude"]), \
-            patch("mozyo_bridge.application.commands.find_labeled_pane", side_effect=[claude_pane, codex_pane]), \
+            patch(
+                "mozyo_bridge.application.commands.find_agent_window",
+                side_effect=[claude_pane, codex_pane],
+            ) as find_agent, \
             patch("mozyo_bridge.application.commands.new_agent_window", return_value="%2") as new_window, \
             patch("mozyo_bridge.application.commands.ensure_agent_target"):
             created = ensure_repo_session_windows(args)
@@ -1875,6 +2095,10 @@ class CommandTest(unittest.TestCase):
         new_window.assert_called_once_with("codex", "my-project", cwd="/repo")
         source_conf.assert_called_once_with("/repo/.tmux.conf", optional=False)
         self.assertEqual(["claude:%1", "codex:%2"], created)
+        self.assertEqual(
+            [("claude", "my-project"), ("codex", "my-project")],
+            [(call.args[0], call.args[1]) for call in find_agent.call_args_list],
+        )
 
     def test_ensure_repo_session_windows_skips_creation_when_windows_exist(self) -> None:
         args = argparse.Namespace(
@@ -1893,14 +2117,21 @@ class CommandTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.new_agent_window") as new_window, \
             patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
             patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "codex"]), \
-            patch("mozyo_bridge.application.commands.find_labeled_pane",
-                  side_effect=[claude_pane, codex_pane]), \
+            patch(
+                "mozyo_bridge.application.commands.find_agent_window",
+                side_effect=[claude_pane, codex_pane],
+            ) as find_agent, \
             patch("mozyo_bridge.application.commands.ensure_agent_target"):
             created = ensure_repo_session_windows(args)
 
         new_session_window.assert_not_called()
         new_window.assert_not_called()
         self.assertEqual([], created)
+        # Window-model resolution: post-existence attach must consult the
+        # named window, not the @agent_name label.
+        self.assertEqual(2, find_agent.call_count)
+        self.assertEqual(("claude", "my-project"), find_agent.call_args_list[0].args)
+        self.assertEqual(("codex", "my-project"), find_agent.call_args_list[1].args)
 
     def test_ensure_repo_session_windows_rejects_legacy_pane_split_layout(self) -> None:
         args = argparse.Namespace(
@@ -1946,7 +2177,10 @@ class CommandTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.new_agent_window") as new_window, \
             patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
             patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "codex"]), \
-            patch("mozyo_bridge.application.commands.find_labeled_pane", return_value=None), \
+            patch(
+                "mozyo_bridge.application.commands.find_agent_window",
+                return_value=None,
+            ) as find_agent, \
             patch("mozyo_bridge.application.commands.ensure_agent_target") as ensure_target, \
             patch("mozyo_bridge.application.commands.wait_for_agent_terminal_pane") as wait_ready:
             created = ensure_repo_session_windows(args)
@@ -1955,6 +2189,7 @@ class CommandTest(unittest.TestCase):
         new_window.assert_not_called()
         ensure_target.assert_not_called()
         wait_ready.assert_not_called()
+        self.assertEqual(2, find_agent.call_count)
         self.assertEqual([], created)
 
     def test_detect_legacy_pane_split_flags_labels_in_unnamed_windows(self) -> None:
@@ -2293,8 +2528,18 @@ class CommandTest(unittest.TestCase):
                     "command": "claude",
                     "label": "claude",
                     "cwd": str(Path(tmp) / "outside"),
+                    "window_name": "claude",
+                    "pane_active": "1",
                 },
-                {"id": "%2", "location": "agents:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+                {
+                    "id": "%2",
+                    "location": "agents:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
 
@@ -2323,8 +2568,24 @@ class CommandTest(unittest.TestCase):
             repo.mkdir()
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
-                {"id": "%1", "location": "agents:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
-                {"id": "%2", "location": "agents:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+                {
+                    "id": "%1",
+                    "location": "agents:0.0",
+                    "command": "2.1.138",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "agents:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
 
@@ -2343,7 +2604,10 @@ class CommandTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_doctor(args))
 
-        self.assertIn("claude_pane: %1 process=2.1.138 status=ok", stdout.getvalue())
+        output = stdout.getvalue()
+        self.assertIn("claude_window: %1", output)
+        self.assertIn("process=2.1.138", output)
+        self.assertIn("status=ok", output)
 
     def test_doctor_does_not_flag_cross_session_labeled_panes_as_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2351,10 +2615,42 @@ class CommandTest(unittest.TestCase):
             repo.mkdir()
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
-                {"id": "%1", "location": "mozyo_bridge:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
-                {"id": "%2", "location": "mozyo_bridge:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
-                {"id": "%3", "location": "other_project:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
-                {"id": "%4", "location": "other_project:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+                {
+                    "id": "%1",
+                    "location": "mozyo_bridge:0.0",
+                    "command": "2.1.138",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "mozyo_bridge:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%3",
+                    "location": "other_project:0.0",
+                    "command": "2.1.138",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%4",
+                    "location": "other_project:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
             ]
             list_result = argparse.Namespace(
                 returncode=0,
@@ -2376,8 +2672,9 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_doctor(args))
 
         output = stdout.getvalue()
-        self.assertIn("claude_pane: %1 process=2.1.138 status=ok", output)
-        self.assertIn("codex_pane: %2 process=node status=ok", output)
+        self.assertIn("claude_window: %1", output)
+        self.assertIn("session=mozyo_bridge", output)
+        self.assertIn("codex_window: %2", output)
         self.assertIn("other_sessions=1", output)
         self.assertNotIn("duplicate", output)
 
@@ -2387,9 +2684,33 @@ class CommandTest(unittest.TestCase):
             repo.mkdir()
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
-                {"id": "%1", "location": "agents:0.0", "command": "zsh", "label": "claude", "cwd": str(repo)},
-                {"id": "%2", "location": "agents:0.1", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
-                {"id": "%3", "location": "agents:0.2", "command": "node", "label": "codex", "cwd": str(repo)},
+                {
+                    "id": "%1",
+                    "location": "agents:0.0",
+                    "command": "zsh",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "agents",
+                    "pane_active": "0",
+                },
+                {
+                    "id": "%2",
+                    "location": "agents:0.1",
+                    "command": "2.1.138",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "agents",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%3",
+                    "location": "agents:0.2",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "agents",
+                    "pane_active": "0",
+                },
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 claude\n%3 codex\n", stderr="")
             ok_stub = {"status": "ok", "next_action": []}
@@ -2407,8 +2728,128 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(1, cmd_doctor(args))
 
         output = stdout.getvalue()
-        self.assertIn("claude_pane: duplicate (2) session=agents panes=%1,%2", output)
-        self.assertIn("codex_pane: %3 process=node status=ok", output)
+        # Legacy pane-split layout: labels exist but no agent-named windows.
+        self.assertIn("claude_pane (compat): duplicate (2) session=agents panes=%1,%2", output)
+        self.assertIn("codex_pane (compat): %3 process=node status=ok", output)
+        # No agent windows exist in the session, so single-label mismatches are
+        # `compat` severity (info). The duplicate `claude` label is still bad
+        # because the resolver cannot disambiguate.
+        self.assertIn("legacy_pane_split (compat):", output)
+        # Window-model view reports missing for both agents in this session.
+        self.assertIn("claude_window: missing session=agents", output)
+        self.assertIn("codex_window: missing session=agents", output)
+
+    def test_doctor_keeps_status_ok_for_compat_pane_split_session(self) -> None:
+        # Regression for Codex audit comment 1214759362580962 finding 1:
+        # a pure pane-split session — no agent-named windows, but agent
+        # labels resolve in the same session — must stay healthy from
+        # doctor's perspective. Otherwise the bare `mozyo` migration
+        # silently breaks the supported compatibility path.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {
+                    "id": "%1",
+                    "location": "agents:0.0",
+                    "command": "claude",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "tmux:0",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "agents:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "tmux:1",
+                    "pane_active": "1",
+                },
+            ]
+            list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch.dict(os.environ, {"TMUX_PANE": "%1"}), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("tmux: ok", output)
+        self.assertIn("claude_window: missing session=agents", output)
+        self.assertIn("claude_pane (compat): %1", output)
+        self.assertIn("legacy_pane_split (compat):", output)
+        self.assertNotIn("legacy_pane_split (mixed):", output)
+
+    def test_doctor_flips_to_warning_on_mixed_state_pane_split(self) -> None:
+        # Mixed state: `claude` has a real agent-named window AND a
+        # second pane in the same session is labeled `claude` but lives
+        # outside that window. The resolver would have to disambiguate,
+        # so doctor flips to warning. Pure pane-split sessions (no agent
+        # window for that agent) stay healthy via the compat path.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
+            panes = [
+                {
+                    "id": "%1",
+                    "location": "mozyo_bridge:0.0",
+                    "command": "claude",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%3",
+                    "location": "mozyo_bridge:1.0",
+                    "command": "node",
+                    "label": "",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "mozyo_bridge:2.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "agents",
+                    "pane_active": "1",
+                },
+            ]
+            list_result = argparse.Namespace(
+                returncode=0, stdout="%1 claude\n%2 codex\n", stderr=""
+            )
+            ok_stub = {"status": "ok", "next_action": []}
+
+            with patch("mozyo_bridge.application.doctor.subprocess.run", return_value=argparse.Namespace(returncode=0)), \
+                patch("mozyo_bridge.application.doctor.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.doctor.pane_lines", return_value=panes), \
+                patch.dict(os.environ, {"TMUX_PANE": "%1"}), \
+                patch("mozyo_bridge.application.doctor.doctor_cli_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_rules_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_codex_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_claude_skill_section", return_value=ok_stub), \
+                patch("mozyo_bridge.application.doctor.doctor_scaffold_section", return_value=ok_stub), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(1, cmd_doctor(args))
+
+        output = stdout.getvalue()
+        self.assertIn("tmux: warning", output)
+        self.assertIn("legacy_pane_split (mixed):", output)
 
     def test_doctor_reports_unscoped_when_invoked_outside_tmux_pane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2416,8 +2857,24 @@ class CommandTest(unittest.TestCase):
             repo.mkdir()
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
-                {"id": "%1", "location": "mozyo_bridge:0.0", "command": "2.1.138", "label": "claude", "cwd": str(repo)},
-                {"id": "%2", "location": "mozyo_bridge:0.1", "command": "node", "label": "codex", "cwd": str(repo)},
+                {
+                    "id": "%1",
+                    "location": "mozyo_bridge:0.0",
+                    "command": "2.1.138",
+                    "label": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "mozyo_bridge:1.0",
+                    "command": "node",
+                    "label": "codex",
+                    "cwd": str(repo),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
             ]
             list_result = argparse.Namespace(returncode=0, stdout="%1 claude\n%2 codex\n", stderr="")
             ok_stub = {"status": "ok", "next_action": []}
@@ -2436,8 +2893,10 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_doctor(args))
 
         output = stdout.getvalue()
-        self.assertIn("claude_pane: unscoped (1) panes=%1", output)
-        self.assertIn("codex_pane: unscoped (1) panes=%2", output)
+        self.assertIn("claude_window: unscoped", output)
+        self.assertIn("codex_window: unscoped", output)
+        self.assertIn("claude_pane (compat): unscoped (1) panes=%1", output)
+        self.assertIn("codex_pane (compat): unscoped (1) panes=%2", output)
         self.assertNotIn("duplicate", output)
 
     def _init_run_tmux_side_effect(self, target_pane_id: str):
@@ -2526,6 +2985,241 @@ class CommandTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cmd_init(args)
         self.assertIn("not a label", stderr.getvalue())
+
+    def test_resolve_status_session_prefers_current_tmux_session(self) -> None:
+        args = argparse.Namespace(session=None, repo=None)
+
+        with patch("mozyo_bridge.application.commands.current_session_name", return_value="mozyo_bridge"):
+            self.assertEqual("mozyo_bridge", resolve_status_session(args))
+
+    def test_resolve_status_session_falls_back_to_repo_basename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "my_project"
+            repo.mkdir()
+            args = argparse.Namespace(session=None, repo=str(repo))
+
+            with patch("mozyo_bridge.application.commands.current_session_name", return_value=None):
+                self.assertEqual("my_project", resolve_status_session(args))
+
+    def test_resolve_status_session_respects_explicit_session(self) -> None:
+        args = argparse.Namespace(session="custom", repo=None)
+
+        with patch("mozyo_bridge.application.commands.current_session_name", return_value="other"):
+            self.assertEqual("custom", resolve_status_session(args))
+
+    def test_cmd_status_omits_misleading_missing_message_under_window_model(self) -> None:
+        # Regression: bare `mozyo` session named after the repo basename must
+        # not be reported as `agents (missing)` (Asana task 1214758916882465).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "my_project"
+            repo.mkdir()
+            args = argparse.Namespace(
+                session=None,
+                repo=str(repo),
+                home=None,
+                json=False,
+                queue=None,
+            )
+            list_panes_result = argparse.Namespace(
+                returncode=0,
+                stdout=(
+                    "0\tclaude\t%1\t1\tclaude\tclaude\t" + str(repo) + "\n"
+                    "1\tcodex\t%2\t1\tnode\tcodex\t" + str(repo) + "\n"
+                ),
+                stderr="",
+            )
+            doctor_ok = {"sections": {"tmux": {"status": "ok", "next_action": []}}, "ok": True}
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.current_session_name", return_value="my_project"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "codex"]), \
+                patch("mozyo_bridge.application.commands.detect_legacy_pane_split", return_value=[]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_panes_result), \
+                patch("mozyo_bridge.application.commands.run_doctor", return_value=doctor_ok), \
+                patch("mozyo_bridge.application.commands.format_doctor_text", return_value="tmux: ok\n"), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_status(args))
+
+        output = stdout.getvalue()
+        self.assertIn("session: my_project", output)
+        self.assertNotIn("(missing)", output)
+        self.assertIn("WINDOW\tNAME\tTARGET", output)
+
+    def test_cmd_status_compat_pane_split_uses_info_message(self) -> None:
+        # Pure pane-split sessions (no agent windows, labels resolve via
+        # compat) print an informational migration hint rather than the
+        # mixed-state "legacy pane-split layout detected" warning. This is
+        # what keeps `status` from exiting non-zero on supported compat
+        # operation (Codex audit comment 1214759362580962).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "agents"
+            repo.mkdir()
+            args = argparse.Namespace(
+                session="agents",
+                repo=str(repo),
+                home=None,
+                json=False,
+                queue=None,
+            )
+            list_panes_result = argparse.Namespace(
+                returncode=0,
+                stdout="%1\t0.0\tclaude\tclaude\t" + str(repo) + "\n",
+                stderr="",
+            )
+            doctor_ok = {"sections": {"tmux": {"status": "ok", "next_action": []}}, "ok": True}
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.list_session_windows", return_value=["agents"]), \
+                patch(
+                    "mozyo_bridge.application.commands.detect_legacy_pane_split",
+                    return_value=["window=agents pane=%1 label=claude"],
+                ), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_panes_result), \
+                patch("mozyo_bridge.application.commands.run_doctor", return_value=doctor_ok), \
+                patch("mozyo_bridge.application.commands.format_doctor_text", return_value="tmux: ok\n"), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_status(args))
+
+        output = stdout.getvalue()
+        self.assertIn("no agent windows", output)
+        self.assertIn("pane-split compat layout", output)
+        self.assertNotIn("mixed:", output)
+
+    def test_cmd_status_mixed_state_uses_warning_message(self) -> None:
+        # When an agent window exists but a label also lives in another
+        # window, the mismatch is real mixed-state collision and `status`
+        # uses the explicit warning wording.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "mozyo_bridge"
+            repo.mkdir()
+            args = argparse.Namespace(
+                session="mozyo_bridge",
+                repo=str(repo),
+                home=None,
+                json=False,
+                queue=None,
+            )
+            list_panes_result = argparse.Namespace(
+                returncode=0,
+                stdout=(
+                    "0\tclaude\t%1\t1\tclaude\tclaude\t" + str(repo) + "\n"
+                    "1\tagents\t%2\t1\tnode\tcodex\t" + str(repo) + "\n"
+                ),
+                stderr="",
+            )
+            doctor_ok = {"sections": {"tmux": {"status": "warning", "next_action": []}}, "ok": False}
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "agents"]), \
+                patch(
+                    "mozyo_bridge.application.commands.detect_legacy_pane_split",
+                    return_value=["window=agents pane=%2 label=codex"],
+                ), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_panes_result), \
+                patch("mozyo_bridge.application.commands.run_doctor", return_value=doctor_ok), \
+                patch("mozyo_bridge.application.commands.format_doctor_text", return_value="tmux: warning\n"), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                cmd_status(args)
+
+        output = stdout.getvalue()
+        self.assertIn("mixed:", output)
+        self.assertIn("agent window + label in non-matching window", output)
+
+    def test_notify_agent_resolves_via_window_when_label_absent(self) -> None:
+        # Regression: with the window model, an agent's tmux window is the
+        # authoritative target. A notification request for `codex` must reach
+        # the codex window even if the pane has not been `init`-labeled yet.
+        panes = [
+            {
+                "id": "%9",
+                "location": "mozyo_bridge:1.0",
+                "command": "node",
+                "label": "",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+        args = argparse.Namespace(
+            issue="9020",
+            journal="1",
+            task_id=None,
+            queue="unused",
+            target=None,
+            ensure=False,
+            config=False,
+            force=True,
+            read_lines=20,
+            prompt="custom prompt marker",
+            cwd="/repo",
+            vertical=False,
+            ready_timeout=0,
+            landing_timeout=5,
+            submit_delay=0,
+            type="review_request",
+            commit="abc123",
+        )
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.find_handoff_task", return_value=None), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
+            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.ensure_agent_target"), \
+            patch("mozyo_bridge.application.commands.cmd_read"), \
+            patch("mozyo_bridge.application.commands.cmd_message"), \
+            patch("mozyo_bridge.application.commands.wait_for_text", return_value=True), \
+            patch("mozyo_bridge.application.commands.cmd_keys") as cmd_keys, \
+            contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, notify_agent(args, "codex"))
+
+        cmd_keys.assert_called_once()
+
+    def test_notify_agent_refuses_cross_session_label_fallback(self) -> None:
+        # Regression: a `codex` label only present in another session must not
+        # be used as a notification target from a different current session
+        # (Asana task 1214743574772820 comment 1214746077864452).
+        panes = [
+            {
+                "id": "%99",
+                "location": "other:0.0",
+                "command": "node",
+                "label": "codex",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+        args = argparse.Namespace(
+            issue="9020",
+            journal="1",
+            task_id=None,
+            queue="unused",
+            target=None,
+            ensure=False,
+            config=False,
+            force=True,
+            read_lines=20,
+            prompt="custom prompt marker",
+            cwd="/repo",
+            vertical=False,
+            ready_timeout=0,
+            landing_timeout=5,
+            submit_delay=0,
+            type="review_request",
+            commit="abc123",
+        )
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.find_handoff_task", return_value=None), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
+            contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                notify_agent(args, "codex")
 
 
 class DoctorEnvironmentTest(unittest.TestCase):

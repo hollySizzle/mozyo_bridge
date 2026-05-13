@@ -165,7 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status")
     add_repo_option(status)
-    status.add_argument("--session", default="agents")
+    status.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Tmux session to describe. Defaults to the current session when "
+            "run inside tmux, or the repo basename (bare-`mozyo` window model)."
+        ),
+    )
     status.set_defaults(func=cmd_status)
 
     sub.add_parser("list").set_defaults(func=cmd_list)

@@ -42,13 +42,18 @@ def source_tmux_conf(path: str | None = None, *, optional: bool = False) -> bool
 
 
 def pane_lines() -> list[dict[str, str]]:
-    fmt = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{@agent_name}\t#{pane_current_path}"
+    fmt = (
+        "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
+        "#{pane_current_command}\t#{@agent_name}\t#{pane_current_path}\t"
+        "#{window_name}\t#{pane_active}"
+    )
     result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
     if result.returncode != 0:
         die(f"tmux list-panes failed: {result.stderr.strip() or 'no tmux server'}")
     panes: list[dict[str, str]] = []
     for line in result.stdout.splitlines():
-        pane_id, location, command, label, cwd = (line.split("\t", 4) + [""] * 5)[:5]
+        parts = (line.split("\t", 6) + [""] * 7)[:7]
+        pane_id, location, command, label, cwd, window_name, pane_active = parts
         panes.append(
             {
                 "id": pane_id,
@@ -56,6 +61,8 @@ def pane_lines() -> list[dict[str, str]]:
                 "command": command,
                 "label": label,
                 "cwd": cwd,
+                "window_name": window_name,
+                "pane_active": pane_active,
             }
         )
     return panes

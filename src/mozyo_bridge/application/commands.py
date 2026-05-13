@@ -11,16 +11,19 @@ from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
+    AGENT_LABELS,
     clear_read,
     current_pane,
     current_session_name,
     ensure_agent_target,
+    find_agent_window,
     find_labeled_pane,
     is_agent_process,
     is_tmux_target,
     mark_read,
     pane_info,
     require_read,
+    resolve_agent_label,
     resolve_target,
 )
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task
@@ -352,7 +355,7 @@ def cmd_ensure(args: argparse.Namespace) -> int:
     require_tmux()
     if args.config:
         load_tmux_conf_for(args)
-    existing = find_labeled_pane(args.agent, session=current_session_name(), fallback=False)
+    existing = resolve_agent_label(args.agent, current_session_name())
     if existing:
         ensure_agent_target(existing, args.agent, force=args.force)
         print(f"found {args.agent}: {existing['id']}")
@@ -448,7 +451,7 @@ def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
         pane_id = new_agent_window(agent, args.session, cwd=args.cwd)
         created.append(f"{agent}:{pane_id}")
     for agent in ("claude", "codex"):
-        pane = find_labeled_pane(agent, session=args.session, fallback=False)
+        pane = find_agent_window(agent, args.session)
         if pane:
             ensure_agent_target(pane, agent, force=args.force)
             if args.ready_timeout:
@@ -579,20 +582,84 @@ def cmd_open_here(args: argparse.Namespace) -> int:
     return cmd_open(args)
 
 
+def resolve_status_session(args: argparse.Namespace) -> str:
+    """Pick the session ``cmd_status`` should describe.
+
+    Order: explicit ``--session`` > current tmux session (when run inside
+    tmux) > repo basename (window-model derived). The hard-coded ``agents``
+    default is intentionally not used; it produced misleading
+    ``session: agents (missing)`` output under the bare-``mozyo`` window
+    model (see Asana task 1214758916882465).
+    """
+    explicit = getattr(args, "session", None)
+    if explicit:
+        return explicit
+    current = current_session_name()
+    if current:
+        return current
+    repo_root = repo_root_from_args(args)
+    derived = repo_root.name
+    if derived:
+        return derived
+    die("could not derive a session name; pass --session explicitly or run from inside a tmux pane")
+    raise AssertionError("unreachable")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
-    session = args.session
+    session = resolve_status_session(args)
     if session_exists(session):
         print(f"session: {session}")
-        result = run_tmux(
-            "list-panes",
-            "-t",
-            f"{session}:0",
-            "-F",
-            "#{pane_id}\t#{pane_index}\t#{pane_current_command}\t#{@agent_name}\t#{pane_current_path}",
-        )
-        print("TARGET\tINDEX\tPROCESS\tLABEL\tCWD")
-        print(result.stdout, end="")
+        windows = list_session_windows(session)
+        agent_windows = [name for name in windows if name in AGENT_LABELS]
+        if agent_windows:
+            result = run_tmux(
+                "list-panes",
+                "-s",
+                "-t",
+                session,
+                "-F",
+                "#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t"
+                "#{pane_current_command}\t#{@agent_name}\t#{pane_current_path}",
+                check=False,
+            )
+            print("WINDOW\tNAME\tTARGET\tACTIVE\tPROCESS\tLABEL\tCWD")
+            if result.returncode == 0:
+                print(result.stdout, end="")
+        else:
+            print("  no agent windows in this session (compatibility / pane-split path)")
+            result = run_tmux(
+                "list-panes",
+                "-s",
+                "-t",
+                session,
+                "-F",
+                "#{pane_id}\t#{window_index}.#{pane_index}\t#{pane_current_command}\t"
+                "#{@agent_name}\t#{pane_current_path}",
+                check=False,
+            )
+            print("TARGET\tINDEX\tPROCESS\tLABEL\tCWD")
+            if result.returncode == 0:
+                print(result.stdout, end="")
+        legacy = detect_legacy_pane_split(session)
+        if legacy:
+            if agent_windows:
+                # Some agent windows exist alongside label-vs-window mismatches:
+                # genuine mixed state the operator must resolve.
+                print(
+                    "  legacy pane-split layout detected (mixed: agent window + "
+                    "label in non-matching window):"
+                )
+            else:
+                # Pure compat / pane-split session: the layout is operable but
+                # the operator may want to migrate to the bare-`mozyo` window
+                # model. Informational, not an error.
+                print(
+                    "  pane-split compat layout (labels resolve, no agent "
+                    "windows — `mozyo` migrates to the window model):"
+                )
+            for entry in legacy:
+                print(f"    {entry}")
     else:
         print(f"session: {session} (missing)")
     print("")
@@ -609,7 +676,7 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
         load_tmux_conf_for(args)
     if getattr(args, "ensure", False) and not is_tmux_target(target_name) and target_name != agent:
         die("--ensure only supports the default agent label; omit --target or pass an explicit tmux pane id")
-    if should_ensure and not find_labeled_pane(target_name, session=current_session_name(), fallback=False):
+    if should_ensure and not resolve_agent_label(agent, current_session_name()):
         pane_id = spawn_agent_terminal_pane(agent, cwd=args.cwd, vertical=args.vertical)
         wait_for_agent_terminal_pane(pane_id, agent, args.ready_timeout)
     target_info = pane_info(target_name)

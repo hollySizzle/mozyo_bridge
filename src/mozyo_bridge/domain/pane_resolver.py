@@ -17,6 +17,7 @@ AGENT_COMMANDS = {
     "claude": "claude",
     "codex": "codex",
 }
+AGENT_LABELS = frozenset(AGENT_COMMANDS)
 VERSIONED_NATIVE_BINARY_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+].*)?")
 READ_MARK_TTL_SECONDS = 300
 
@@ -95,11 +96,81 @@ def find_labeled_pane(label: str, session: str | None = None, fallback: bool = T
     return matches[0] if matches else None
 
 
+def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
+    """Return the (active) pane of the agent-named window in ``session``.
+
+    Standard path for window-model target resolution: a tmux window whose
+    ``window_name`` equals ``agent`` is the authoritative target, regardless
+    of whether its pane has an ``@agent_name`` label set. Returns ``None``
+    when no window in ``session`` matches. Hard-errors when more than one
+    window in ``session`` is named ``agent`` (defensive: tmux usually keeps
+    window names unique within a session, but a manual ``rename-window``
+    could violate that).
+    """
+    windows: dict[str, list[dict[str, str]]] = {}
+    for pane in pane_lines():
+        location = pane.get("location") or ""
+        if location.split(":", 1)[0] != session:
+            continue
+        if pane.get("window_name") != agent:
+            continue
+        window_index = location.split(":", 1)[1].split(".", 1)[0] if ":" in location else ""
+        windows.setdefault(window_index, []).append(pane)
+    if not windows:
+        return None
+    if len(windows) > 1:
+        labels = ", ".join(f"{session}:{idx}" for idx in sorted(windows.keys()))
+        die(f"multiple windows named '{agent}' found in session '{session}': {labels}")
+    only = next(iter(windows.values()))
+    if len(only) == 1:
+        return only[0]
+    for pane in only:
+        if pane.get("pane_active") == "1":
+            return pane
+    return only[0]
+
+
+def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | None:
+    """Resolve an agent label to its target pane under the window model.
+
+    Standard path: an agent-named tmux window in ``session``.
+    Compatibility path: an agent-labeled pane in ``session`` (used only when
+    no agent-named window exists, e.g. legacy pane-split layouts from
+    ``tmux-ui-open``).
+
+    Returns ``None`` when neither resolves. Cross-session label fallback is
+    intentionally not performed: it has been the root cause of notification
+    mis-routes (Asana task 1214743574772820 comment 1214746077864452).
+    """
+    if not session:
+        return None
+    window = find_agent_window(agent, session)
+    if window:
+        return window
+    return find_labeled_pane(agent, session=session, fallback=False)
+
+
 def resolve_target(target: str) -> str:
     if is_tmux_target(target):
         validate_target(target)
         return target
-    pane = find_labeled_pane(target, session=current_session_name())
+    session = current_session_name()
+    if target in AGENT_LABELS:
+        if not session:
+            die(
+                f"cannot resolve agent label '{target}' outside a tmux session; "
+                "run from inside the repo session or pass an explicit tmux pane id"
+            )
+        pane = resolve_agent_label(target, session)
+        if pane:
+            return pane["id"]
+        die(
+            f"no {target} target found in session '{session}'. "
+            f"Run `mozyo` to ensure the repo-scoped session, or `mozyo-bridge init {target}` "
+            "on the right pane."
+        )
+        raise AssertionError("unreachable")
+    pane = find_labeled_pane(target, session=session)
     if pane:
         return pane["id"]
     die(f"no pane label found: {target}")

@@ -232,11 +232,23 @@ mozyo-bridge init claude
 mozyo-bridge init codex
 ```
 
+bare `mozyo` 経由で起動した repo-scoped session では `claude` / `codex` window 名がそのまま target id として機能するので、`init` を打たずに新しい pane を立ち上げても `mozyo-bridge message claude ...` / `notify-claude` などはその window に到達します。`init` は label collision 検出と、`tmux-ui-open` 系の pane-split 互換 layout の延命用です。
+
 状態確認:
 
 ```bash
 mozyo-bridge status
 ```
+
+`status` は引数なしで実行すると、`TMUX_PANE` から現在の tmux session を解決し、無ければ repo basename にフォールバックします。Window model 配下では `claude` / `codex` window の一覧が `WINDOW NAME TARGET ACTIVE PROCESS LABEL CWD` 表で出力されます。pane-split 互換 layout (`tmux-ui-open` 系) の session で実行した場合は `(compat)` 行に切り替わり、もし `claude` / `codex` label が agent と異なる名前の window 内にあれば `legacy_pane_split:` 警告も併記されます。`--session NAME` で明示指定もできます。
+
+### Target resolution (window model)
+
+`mozyo-bridge message claude ...` / `read claude` / `notify-claude` のように agent label を target に指定したとき、解決順は以下になります。
+
+1. 標準 path: 現在の tmux session 内で `claude` / `codex` という名前の window を探し、その active pane を target にします (`mozyo` で作る repo-scoped session はここに当たります)。
+2. 互換 path: 標準 path で window が見つからなかった場合のみ、同じ session 内の `@agent_name = claude/codex` label が付いた pane にフォールバックします (`tmux-ui-open` 等の pane-split layout のための救済です)。
+3. cross-session fallback はしません。別 session の同名 label に解決して mis-route した過去事例があるため、現 session で見つからない agent label は明示エラーで止まります。`%pane_id` を直接渡すか、対象 session の中から再実行してください。
 
 Claude Code の project skill は repo root の `.claude/skills/` から解決されます。
 `mozyo-bridge status` / `doctor` が `claude_pane cwd is outside repo root` を出した場合、その pane では `/mozyo-bridge-agent` などの project skill が解決されない可能性があります。
