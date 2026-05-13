@@ -1,17 +1,26 @@
 {
-	"folders": [
-		{
-			"path": "."
-		},
-		{
-			"path": "../../../.mozyo-bridge"
-		},
-		{
-			"path": "../../../.codex/"
-		},
-		{
-			"path": "../../../.claude/Z",
-		}
-	],
-	"settings": {}
+  "folders": [
+    {
+      "path": "."
+    },
+    {
+      "path": "../../../.mozyo-bridge"
+    },
+    {
+      "path": "../../../.codex/"
+    },
+    {
+      "path": "../../../.claude/"
+    }
+  ],
+  // "settings": {
+  //   "terminal.integrated.shellIntegration.enabled": false,
+  //   "terminal.integrated.shellIntegration.decorationsEnabled": "never",
+  //   "terminal.integrated.enablePersistentSessions": false,
+  //   "terminal.integrated.persistentSessionReviveProcess": "never",
+  //   "terminal.integrated.gpuAcceleration": "off",
+  //   "terminal.integrated.copyOnSelection": false,
+  //   "terminal.integrated.macOptionClickForcesSelection": true,
+  //   "terminal.integrated.rightClickBehavior": "copyPaste"
+  // }
 }
