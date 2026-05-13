@@ -495,6 +495,47 @@ queue-enter rail について (Asana `1214782240686275` 実装 task が追加す
 
 これらは別 task として親 `1214768200741140` 配下で扱う。本 contract の land をもって閉じない。
 
+## Queue-Enter Observability — Defer Rationale (Asana `1214782185308162`)
+
+Optional follow-up task `1214782185308162` は「queue-enter fallback の observability / durable annotation を formalize するか」を問うものだった。本節は **追加の形式化を行わず defer する** 判断を durable に記録する。本判断は contract 意味論を変更しないため、Status の version bump はしない。
+
+### 既存 surface が既に first-class に表現している項目
+
+queue-enter rail を使用した事実は、本 contract が要求する以下の surface で既に programmatic / human-readable の両形で観測可能である。新規 field の追加は不要。
+
+| 観測 surface | 表現 | 受け手 |
+| --- | --- | --- |
+| `DeliveryOutcome.mode` (wire JSON) | literal `"queue-enter"` (`MODE_STANDARD` / `MODE_PENDING` と排他) | sender script / CI / post-hoc audit ツール |
+| `DeliveryOutcome.reason` (wire JSON) | `"queue_enter"` (marker 未観測時) または `"ok"` (marker 観測時、`mode="queue-enter"` と組で識別) | 同上 |
+| `build_delivery_record` の `Outcome:` 行 | `sent (queue-enter, marker observed)` または `sent (queue-enter, marker unobserved)` | operator が Asana / Redmine に paste した textual record |
+| `build_delivery_record` の `Mode:` / `Reason:` 行 | `Mode: queue-enter`、`Reason: queue_enter` または `ok` | 同上 |
+| `build_delivery_record` の `Operator note:` 行 | marker 未観測時のみ、queue-enter rail への fallback retry hint を含む | 同上 |
+| `_outcome_narrative` 出力 | `queue-enter` rail への明示参照と `No rollback was triggered.` を narrative に持つ | 同上 |
+| Asana / Redmine durable record | operator paste 経由で上記 5 surface の文字列が全て durable comment に保存される。本 task chain の dogfood (例: Asana comment `1214785766321371` / `1214785682971732` / `1214787930025646` / `1214788211932108`) で既に reproducible | post-hoc audit、後続 task のレビュー |
+
+これらにより、後から「あの handoff は queue-enter rail を使ったか」「marker は事前観測されたか」を grep ベースで再構成できる。本節 land 時点で実運用上の事例 4 件が既に Asana 上に存在し、grep 可能性は dogfood 済み。
+
+### 意図的に first-class にしない項目
+
+- **`LastInputProjection.ack_status` を queue-enter で別値にしない**: 上流 `mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md` Field-Level Source of Truth Map / Transport-Specific Capability Matrix は `ack_status` を `submitted_at` / `acknowledged_at` から **derive** すると規定する。tmux compat は `submitted_at` を populate する経路であるため、`ack_status="unobserved"` を返すことは構造上不可能 (`submitted_at != None` ⇒ `ack_status` は `submitted` から派生)。queue-enter の wording-layer 差を inspector projection に流出させると上流 contract 違反になる。
+- **新規 `queue_enter_used: bool` などの top-level wire field**: `mode` と `reason` の組ですでに一意に判定可能なため、redundant な field を追加しない。projection 経由で leak しないことも上記理由から維持。
+- **telemetry / metrics 系の追加**: 本 repo には structured counter / metric emit の infrastructure がなく、本 task の禁止事項にも「broad runtime plumbing は射程外」と明記されている。
+- **operator-side escalation を `next_action_owner` に組み込まない**: contract `## Relaxed Queue-Enter Rail` の `State / Outcome Mapping` および `Durable Wording Requirements` 節が明示しているとおり、`next_action_owner` は strict `sent` と同じ `receiver` を保つ。operator-side escalation hint は `Operator note:` 行に専用化済み (durable record の wording layer に閉じる)。
+
+### Real frontier (Open Question 6 — pickup observability)
+
+「queue-enter rail で Enter 後に receiver が実際に pickup したか」を sender 側から確認する手段は本 task の射程外。これは receiver runtime の内部状態を読む必要があり、tmux 経路の pane signal だけでは決定論的に取得できない。本問題は本 contract `## Open Questions` 6 として既に列挙されており、closure は別 task (receiver-side runtime inspector / PTY-first 経路) を経由する。本 defer はこちらの開発機会を塞がない: `mode` + `reason` 観測が wire 上で first-class であるため、pickup probe 機構を追加する側はこの 2 field を即座に手がかりにできる。
+
+### 何が「再オープン」のシグナルか
+
+将来以下の事実が観測されたら、本 defer を再評価する:
+
+- queue-enter rail の使用頻度が増え、Asana durable record の grep だけでは後追いが困難になった (= 専用 dashboard / aggregator が欲しくなった)
+- receiver-state inspector (PTY-first 経路) が `last_input.ack_status` の derivation を queue-enter の wording-layer 差に拡張する必要が生じた (= 上流 spec が `unobserved-submitted` 等の中間 ack_status を導入)
+- queue-enter pickup の post-hoc 検証手段が確立し、`queue_enter_observed=true/false` 等の追加 field を inspector / durable record に持たせる意義が出た (= Open Question 6 の closure)
+
+これらの兆候のいずれかが顕在化したときに、本 task を `Reopen` するか、新規 task を切る。それまでは現状の wording-layer 観測で十分とする。
+
 ## Follow-up Tasks (推奨)
 
 本 contract 投入後に切るべき task。
@@ -506,7 +547,7 @@ queue-enter rail について (Asana `1214782240686275` 実装 task が追加す
 - queue-enter rail を実装する task: Asana `1214782240686275` (CLI / code 実装、本 contract の `## Relaxed Queue-Enter Rail` を仕様の正本として参照する)。
 - queue-enter rail を docs / rules / preset surface に反映する task: Asana `1214782227597692` (README、`vibes/docs/rules/agent-workflow.md`、`skills/.../safety.md`、`plugins/.../safety.md`、`CLAUDE.md` router、`src/mozyo_bridge/scaffold/presets/asana/` の AGENTS / CLAUDE / agent-workflow)。
 - queue-enter rail の test / smoke / workflow verification を追加する task: Asana `1214782185227306`。
-- queue-enter rail の observability / durable annotation を形式化する task (任意): Asana `1214782185308162` (本 contract の Open Question 6 を解消する候補)。
+- queue-enter rail の observability / durable annotation を形式化する task (任意): Asana `1214782185308162` — **defer 決定済み** (本 contract `## Queue-Enter Observability — Defer Rationale` 節参照)。pickup observability (Open Question 6) は別 task / 別経路 (receiver-side runtime inspector) に委ねる。
 
 これらはすべて別 Asana task として親 `1214768200741140` または `1214782240916053` 配下に切る。本 contract 内で「実装に進めた」と扱わない。
 
