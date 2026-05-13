@@ -216,6 +216,106 @@ class DeliveryOutcome:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
+    def to_last_input_projection(
+        self,
+        *,
+        submitted_at: Optional[str] = None,
+        input_kind: Optional[str] = None,
+        prompt_turn_id: Optional[str] = None,
+        input_id: Optional[str] = None,
+    ) -> Optional["LastInputProjection"]:
+        """Project this outcome into the inspector ``last_input`` shape.
+
+        See :func:`project_last_input` for the full contract.
+        """
+        return project_last_input(
+            self,
+            submitted_at=submitted_at,
+            input_kind=input_kind,
+            prompt_turn_id=prompt_turn_id,
+            input_id=input_id,
+        )
+
+
+AckStatus = Literal["submitted", "acknowledged", "unobserved"]
+
+
+@dataclass(frozen=True)
+class LastInputProjection:
+    """Inspector-compatible projection of a :class:`DeliveryOutcome`.
+
+    Mirrors the ``last_input`` block defined by
+    ``mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md``.
+    The tmux compatibility path can only populate the delivery-ACK-derived
+    timestamps and ack status; PTY-first paths may fill ``acknowledged_at``
+    and elevate ``ack_status`` later. This dataclass does not carry any
+    runtime/process state — ACK terminal states (``blocked + *``) deliberately
+    yield no projection.
+    """
+
+    submitted_at: Optional[str]
+    acknowledged_at: Optional[str]
+    ack_status: AckStatus
+    input_kind: Optional[str]
+    prompt_turn_id: Optional[str]
+    input_id: Optional[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def project_last_input(
+    outcome: "DeliveryOutcome",
+    *,
+    submitted_at: Optional[str] = None,
+    input_kind: Optional[str] = None,
+    prompt_turn_id: Optional[str] = None,
+    input_id: Optional[str] = None,
+) -> Optional[LastInputProjection]:
+    """Project a :class:`DeliveryOutcome` into the inspector ``last_input`` block.
+
+    The mapping is the one approved by
+    ``mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md``
+    and the upstream ACK contract:
+
+    - ``sent`` / ``ok`` -> projection with ``ack_status="submitted"`` and the
+      caller-supplied ``submitted_at``. The tmux path never claims
+      ``acknowledged`` here; ``acknowledged_at`` stays ``None`` and is only
+      populated by PTY-side callers when ``runtime.input.ack`` arrives.
+    - ``pending_input`` / ``ok`` -> projection with ``submitted_at=None`` and
+      ``ack_status="unobserved"``. The input is staged at the prompt but the
+      receiver runtime has not received it as a turn, so the ACK timestamp
+      does not exist yet.
+    - any ``blocked`` reason (``marker_timeout``, ``target_unavailable``,
+      ``target_not_agent``, ``invalid_anchor``, ``invalid_args``) -> ``None``.
+      ACK terminal states are not receiver-runtime facts; the helper refuses
+      to project them so callers cannot accidentally translate
+      ``marker_timeout`` into ``process.exited`` or push ``invalid_args`` into
+      ``runtime_phase`` (both explicitly prohibited by the inspector contract).
+    - ``delivery_failed`` is reserved by the ACK contract but is not currently
+      emitted by ``make_outcome``; it falls through to ``None`` for the same
+      reason.
+    """
+    if outcome.status == "sent" and outcome.reason == "ok":
+        return LastInputProjection(
+            submitted_at=submitted_at,
+            acknowledged_at=None,
+            ack_status="submitted",
+            input_kind=input_kind,
+            prompt_turn_id=prompt_turn_id,
+            input_id=input_id,
+        )
+    if outcome.status == "pending_input" and outcome.reason == "ok":
+        return LastInputProjection(
+            submitted_at=None,
+            acknowledged_at=None,
+            ack_status="unobserved",
+            input_kind=input_kind,
+            prompt_turn_id=prompt_turn_id,
+            input_id=input_id,
+        )
+    return None
+
 
 def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[NextActionOwner, str]:
     """Return the canonical owner/action phrase for an outcome."""
@@ -414,10 +514,12 @@ def make_outcome(
 
 
 __all__: Iterable[str] = (
+    "AckStatus",
     "AnchorError",
     "AsanaAnchor",
     "DeliveryOutcome",
     "KIND_LABELS",
+    "LastInputProjection",
     "MODES",
     "MODE_PENDING",
     "MODE_STANDARD",
@@ -437,4 +539,5 @@ __all__: Iterable[str] = (
     "make_outcome",
     "next_action_for",
     "normalize_anchor",
+    "project_last_input",
 )

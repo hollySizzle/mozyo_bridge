@@ -50,6 +50,7 @@ from mozyo_bridge.domain.handoff import (
     AnchorError,
     AsanaAnchor,
     KIND_LABELS,
+    LastInputProjection,
     MODE_PENDING,
     MODE_STANDARD,
     RECORD_FORMAT_BOTH,
@@ -62,6 +63,7 @@ from mozyo_bridge.domain.handoff import (
     make_outcome,
     next_action_for,
     normalize_anchor,
+    project_last_input,
 )
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
 from mozyo_bridge.scaffold.rules import package_version, rules_status, scaffold_state
@@ -3659,6 +3661,183 @@ class HandoffDomainTest(unittest.TestCase):
                 "custom",
             },
             set(KIND_LABELS),
+        )
+
+
+class ProjectLastInputTest(unittest.TestCase):
+    """Cover the inspector ``last_input`` projection helper.
+
+    The mapping table is fixed by the receiver-state inspector contract at
+    ``mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md``
+    section "Receiver Inspector and Existing DeliveryOutcome" and the upstream
+    transport-agnostic ACK contract section "Existing DeliveryOutcome との対応".
+    Both prohibit translating ACK terminal states (``blocked + *``) into
+    runtime/process state, and tmux-path outcomes never claim ``acknowledged``.
+    """
+
+    def _build_outcome(
+        self,
+        *,
+        status,
+        reason,
+        receiver: str = "claude",
+        mode: str = MODE_STANDARD,
+    ):
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        return make_outcome(
+            status=status,
+            reason=reason,
+            receiver=receiver,
+            target="%2",
+            anchor=anchor,
+            mode=mode,
+            kind="implementation_request",
+            notification_marker="[marker]",
+        )
+
+    def test_sent_ok_projects_submitted_ack_status(self) -> None:
+        outcome = self._build_outcome(status="sent", reason="ok")
+
+        projection = project_last_input(
+            outcome,
+            submitted_at="2026-05-13T13:20:28Z",
+            input_kind="prompt",
+            prompt_turn_id="turn-1",
+            input_id="input-1",
+        )
+
+        self.assertEqual(
+            LastInputProjection(
+                submitted_at="2026-05-13T13:20:28Z",
+                acknowledged_at=None,
+                ack_status="submitted",
+                input_kind="prompt",
+                prompt_turn_id="turn-1",
+                input_id="input-1",
+            ),
+            projection,
+        )
+
+    def test_sent_ok_does_not_claim_acknowledged_on_tmux_path(self) -> None:
+        # The tmux compatibility layer cannot observe runtime.input.ack; the
+        # helper must not synthesize an `acknowledged` claim from a `sent`
+        # outcome even when the caller forgets to pass `submitted_at`.
+        outcome = self._build_outcome(status="sent", reason="ok")
+
+        projection = project_last_input(outcome)
+
+        assert projection is not None
+        self.assertEqual("submitted", projection.ack_status)
+        self.assertIsNone(projection.acknowledged_at)
+        self.assertIsNone(projection.submitted_at)
+
+    def test_pending_input_ok_projects_unobserved_ack_status(self) -> None:
+        # Per the inspector contract, `pending_input/ok` carries input staged
+        # at the prompt but the receiver runtime has not received the turn.
+        # `submitted_at` stays null and `ack_status` is `unobserved`.
+        outcome = self._build_outcome(
+            status="pending_input", reason="ok", mode=MODE_PENDING
+        )
+
+        projection = project_last_input(
+            outcome,
+            submitted_at="2026-05-13T13:20:28Z",
+            input_kind="prompt",
+            prompt_turn_id="turn-7",
+        )
+
+        assert projection is not None
+        self.assertIsNone(projection.submitted_at)
+        self.assertIsNone(projection.acknowledged_at)
+        self.assertEqual("unobserved", projection.ack_status)
+        self.assertEqual("prompt", projection.input_kind)
+        self.assertEqual("turn-7", projection.prompt_turn_id)
+
+    def test_blocked_marker_timeout_yields_no_projection(self) -> None:
+        # `marker_timeout` is an ACK terminal state, not a receiver-runtime
+        # fact. Refusing to project it prevents callers from inferring
+        # `process.exited` or any runtime_phase value from a rollback.
+        outcome = self._build_outcome(status="blocked", reason="marker_timeout")
+
+        self.assertIsNone(project_last_input(outcome))
+
+    def test_blocked_target_unavailable_yields_no_projection(self) -> None:
+        outcome = self._build_outcome(status="blocked", reason="target_unavailable")
+
+        self.assertIsNone(project_last_input(outcome))
+
+    def test_blocked_target_not_agent_yields_no_projection(self) -> None:
+        outcome = self._build_outcome(status="blocked", reason="target_not_agent")
+
+        self.assertIsNone(project_last_input(outcome))
+
+    def test_blocked_invalid_anchor_yields_no_projection(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="invalid_anchor",
+            receiver="claude",
+            target=None,
+            anchor=None,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker=None,
+            source="asana",
+        )
+
+        self.assertIsNone(project_last_input(outcome))
+
+    def test_blocked_invalid_args_yields_no_projection(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="invalid_args",
+            receiver="claude",
+            target=None,
+            anchor=None,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker=None,
+            source="asana",
+        )
+
+        self.assertIsNone(project_last_input(outcome))
+
+    def test_outcome_method_matches_projection_helper(self) -> None:
+        outcome = self._build_outcome(status="sent", reason="ok")
+
+        via_method = outcome.to_last_input_projection(
+            submitted_at="2026-05-13T13:20:28Z",
+            input_kind="prompt",
+            prompt_turn_id="turn-1",
+        )
+        via_helper = project_last_input(
+            outcome,
+            submitted_at="2026-05-13T13:20:28Z",
+            input_kind="prompt",
+            prompt_turn_id="turn-1",
+        )
+
+        self.assertEqual(via_helper, via_method)
+
+    def test_projection_dataclass_is_serialisable_to_dict(self) -> None:
+        # Inspector consumers serialise projections into the ReceiverState
+        # snapshot; ensure the dataclass exposes all the expected fields.
+        outcome = self._build_outcome(status="sent", reason="ok")
+
+        projection = project_last_input(
+            outcome, submitted_at="2026-05-13T13:20:28Z"
+        )
+        assert projection is not None
+
+        self.assertEqual(
+            {
+                "submitted_at": "2026-05-13T13:20:28Z",
+                "acknowledged_at": None,
+                "ack_status": "submitted",
+                "input_kind": None,
+                "prompt_turn_id": None,
+                "input_id": None,
+            },
+            projection.to_dict(),
         )
 
 
