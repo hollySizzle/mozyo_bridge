@@ -271,7 +271,15 @@ def build_parser() -> argparse.ArgumentParser:
             "--mode",
             choices=sorted(MODES),
             default=MODE_STANDARD,
-            help="`standard` types and presses Enter after the landing marker; `pending` types but leaves the input pending",
+            help=(
+                "`standard` (default) types and presses Enter after the "
+                "landing marker, with C-u rollback on marker timeout; "
+                "`pending` types but leaves the input pending; "
+                "`queue-enter` (Claude/Codex agent panes only, --force not "
+                "allowed) types and presses Enter regardless of marker "
+                "observation, emitting reason=queue_enter on marker miss "
+                "without rollback"
+            ),
         )
         parser_.add_argument(
             "--summary",

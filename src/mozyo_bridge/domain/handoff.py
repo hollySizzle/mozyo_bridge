@@ -26,7 +26,8 @@ SOURCES: frozenset[str] = frozenset({SOURCE_ASANA, SOURCE_REDMINE})
 
 MODE_STANDARD = "standard"
 MODE_PENDING = "pending"
-MODES: frozenset[str] = frozenset({MODE_STANDARD, MODE_PENDING})
+MODE_QUEUE_ENTER = "queue-enter"
+MODES: frozenset[str] = frozenset({MODE_STANDARD, MODE_PENDING, MODE_QUEUE_ENTER})
 
 RECEIVERS: frozenset[str] = frozenset({"claude", "codex"})
 
@@ -185,6 +186,7 @@ Reason = Literal[
     "marker_timeout",
     "invalid_anchor",
     "invalid_args",
+    "queue_enter",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -296,7 +298,19 @@ def project_last_input(
       emitted by ``make_outcome``; it falls through to ``None`` for the same
       reason.
     """
-    if outcome.status == "sent" and outcome.reason == "ok":
+    if outcome.status == "sent" and outcome.reason in ("ok", "queue_enter"):
+        # `queue_enter` is a wording-layer differentiator on the sender side
+        # (the marker was not pre-observed before Enter under the relaxed
+        # `queue-enter` rail). The inspector projection still resolves to
+        # `submitted` with `submitted_at` populated because the upstream
+        # receiver-state-inspector contract derives `ack_status` from
+        # `submitted_at`/`acknowledged_at` and the same spec's Capability
+        # Matrix says tmux compat populates `submitted_at` for `submitted`
+        # arrivals. Returning `unobserved` here would be structurally
+        # impossible (cannot have `submitted_at != None` with
+        # `ack_status="unobserved"`) and would collapse queue-enter into
+        # `pending_input/ok`. The wording differentiation lives in
+        # `DeliveryOutcome.reason` and the durable record narrative only.
         return LastInputProjection(
             submitted_at=submitted_at,
             acknowledged_at=None,
@@ -356,16 +370,33 @@ RECORD_FORMATS: frozenset[str] = frozenset(
 )
 
 
-def _header_label(status: Status, reason: Reason) -> str:
+def _header_label(status: Status, reason: Reason, mode: Optional[str] = None) -> str:
     if status == "sent":
+        if reason == "queue_enter":
+            return "sent (queue-enter, marker unobserved)"
+        if mode == MODE_QUEUE_ENTER:
+            return "sent (queue-enter, marker observed)"
         return "sent"
     if status == "pending_input":
         return "pending input"
     return f"not delivered ({reason})"
 
 
-def _outcome_narrative(status: Status, reason: Reason) -> str:
+def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = None) -> str:
     if status == "sent":
+        if reason == "queue_enter":
+            return (
+                "Landing marker was not observed in the target pane before "
+                "timeout, but Enter was issued under the queue-enter rail "
+                "because the target is a registered agent pane. No rollback "
+                "was triggered."
+            )
+        if mode == MODE_QUEUE_ENTER:
+            return (
+                "Landing marker observed in the target pane; Enter was "
+                "pressed under the queue-enter rail. No rollback was "
+                "triggered."
+            )
         return (
             "Landing marker observed in the target pane; Enter was pressed. "
             "No rollback was triggered."
@@ -454,7 +485,7 @@ def build_delivery_record(
     source-preservation fix from the previous task, so this function is pure
     and deterministic over the outcome dataclass.
     """
-    header = f"Delivery result — {_header_label(outcome.status, outcome.reason)}"
+    header = f"Delivery result — {_header_label(outcome.status, outcome.reason, outcome.mode)}"
     lines = [
         header,
         "",
@@ -466,11 +497,21 @@ def build_delivery_record(
         f"- Notification marker: `{outcome.notification_marker or '—'}`",
         f"- Durable anchor: {_anchor_pointer_or_dash(outcome.anchor)}",
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
-        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason)}",
+        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
     ]
     if command:
         lines.append(f"- Command: `{command}`")
+    if outcome.status == "sent" and outcome.reason == "queue_enter":
+        # Operator-facing escalation hint required by the contract's Durable
+        # Wording Requirements. This note does NOT override `next_action`;
+        # the receiver-owned primary contract still stands.
+        lines.append(
+            "- Operator note: Marker was not observed before Enter; if the "
+            f"receiver does not pick up the prompt, fall back to "
+            "`mozyo-bridge handoff send --mode standard` and re-attempt with "
+            "the recovered read marker."
+        )
     contract = _receiver_contract_line(outcome.status, outcome.reason, outcome.receiver)
     if contract:
         lines.append("")
@@ -522,6 +563,7 @@ __all__: Iterable[str] = (
     "LastInputProjection",
     "MODES",
     "MODE_PENDING",
+    "MODE_QUEUE_ENTER",
     "MODE_STANDARD",
     "NormalizedAnchor",
     "RECEIVERS",

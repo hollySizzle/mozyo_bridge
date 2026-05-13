@@ -11,6 +11,7 @@ from mozyo_bridge.domain.handoff import (
     AnchorError,
     KIND_LABELS,
     MODE_PENDING,
+    MODE_QUEUE_ENTER,
     MODE_STANDARD,
     MODES,
     RECEIVERS,
@@ -618,6 +619,32 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
+    if mode == MODE_QUEUE_ENTER and bool(getattr(args, "force", False)):
+        # Per the relaxed queue-enter rail contract, the agent gate must be
+        # stricter than strict `standard`: `--force` cannot be used to bypass
+        # non-agent target checks under this rail. The rail only makes sense
+        # for Claude/Codex agent panes whose prompt queue accepts Enter.
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="invalid_args",
+                receiver=receiver,
+                target=None,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "--force is not allowed under --mode queue-enter; queue-enter is "
+            "restricted to Claude/Codex agent panes and rejects non-agent "
+            "targets even with operator override."
+        )
+
     if kind not in KIND_LABELS:
         _emit_outcome(
             make_outcome(
@@ -688,6 +715,43 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         raise
 
     target = target_info["id"]
+
+    if mode == MODE_QUEUE_ENTER and target_info.get("window_name") != receiver:
+        # Under the relaxed queue-enter rail, marker miss does NOT roll back,
+        # so an explicit `--target %X` that lands in a different agent's
+        # window would silently press Enter into the wrong receiver's pane.
+        # The agent gate (`ensure_agent_target`) only verifies the pane is
+        # running *some* agent process (claude / codex / node) and does not
+        # bind the pane to the intended receiver. The window-name resolver
+        # already enforces `window_name == receiver` when no `--target` is
+        # supplied; this guard restores the same invariant for explicit
+        # pane targets under queue-enter, matching the contract's "Allowed
+        # Targets" enumeration of "Claude/Codex agent panes for the intended
+        # receiver".
+        observed_window = target_info.get("window_name") or "<unknown>"
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="invalid_args",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "--mode queue-enter requires the explicit --target pane to live in "
+            f"the receiver's window; --to={receiver!r} but pane {target} is in "
+            f"window {observed_window!r}. Drop --target to use window-name "
+            "resolution, or pass a pane in the receiver's window."
+        )
+        raise AssertionError("unreachable")
+
     try:
         ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
     except SystemExit:
@@ -754,7 +818,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
 
     landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
     landing_lines = max(read_lines, 200)
-    if not wait_for_text(target, marker, landing_lines, landing_timeout):
+    marker_observed = wait_for_text(target, marker, landing_lines, landing_timeout)
+
+    if not marker_observed and mode != MODE_QUEUE_ENTER:
         run_tmux("send-keys", "-t", target, "C-u")
         outcome = make_outcome(
             status="blocked",
@@ -778,9 +844,15 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         time.sleep(submit_delay)
     run_tmux("send-keys", "-t", target, "Enter")
 
+    # Wording-layer differentiation under the relaxed `queue-enter` rail:
+    # marker observed → strict `sent`/`ok`; marker unobserved → `sent`/
+    # `queue_enter` (sender did not pre-confirm landing). The receiver-side
+    # contract and `next_action_owner` stay identical to strict `sent` per
+    # the contract.
+    relaxed_unobserved = mode == MODE_QUEUE_ENTER and not marker_observed
     outcome = make_outcome(
         status="sent",
-        reason="ok",
+        reason="queue_enter" if relaxed_unobserved else "ok",
         receiver=receiver,
         target=target,
         anchor=anchor,

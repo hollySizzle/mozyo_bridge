@@ -52,6 +52,7 @@ from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     LastInputProjection,
     MODE_PENDING,
+    MODE_QUEUE_ENTER,
     MODE_STANDARD,
     RECORD_FORMAT_BOTH,
     RECORD_FORMAT_JSON,
@@ -4263,6 +4264,580 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("target_unavailable", outcome["reason"])
         self.assertIsNone(outcome["target"])
         self.assertIn("no claude window found", stderr.getvalue())
+
+
+class RelaxedQueueEnterRailTest(unittest.TestCase):
+    """Coverage for the relaxed `queue-enter` rail.
+
+    Implements the v0.2 contract section `## Relaxed Queue-Enter Rail` in
+    ``vibes/docs/logics/tmux-send-safety-contract.md``. Strict `--mode standard`
+    behavior must remain unchanged (covered by ``HandoffOrchestratorTest``);
+    these tests focus on what the new rail adds and what it deliberately
+    refuses to do.
+    """
+
+    def run_handoff_with_fake_tmux(
+        self,
+        argv,
+        captures=None,
+        allow_exit: bool = False,
+        pane=None,
+    ):
+        # Mirror of HandoffOrchestratorTest.run_handoff_with_fake_tmux so this
+        # class can drive the CLI end-to-end without launching tmux.
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+        pane_text = ""
+        forced_captures = captures is not None
+        capture_outputs = list(captures or [])
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            if capture_outputs:
+                return capture_outputs.pop(0)
+            if forced_captures:
+                return ""
+            return pane_text
+
+        def fake_run_tmux(*tmux_args, check: bool = True):
+            nonlocal pane_text
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text += tmux_args[-1]
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux call: {tmux_args}")
+
+        default_pane = {
+            "id": "%2",
+            "location": "agents:0.1",
+            "command": "node",
+            "cwd": "/repo",
+            "window_name": "claude",
+        }
+        pane_value = pane if pane is not None else default_pane
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                if not allow_exit:
+                    raise
+                result = exc
+
+        return result, sent, stdout.getvalue(), stderr.getvalue(), pane_text
+
+    def _outcome_from_stdout(self, stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertTrue(lines, f"no JSON outcome found in stdout: {stdout!r}")
+        return json.loads(lines[-1])
+
+    # --- mode parsing / validation -------------------------------------------------
+
+    def test_cli_accepts_mode_queue_enter(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--mode",
+                "queue-enter",
+            ]
+        )
+
+        self.assertEqual(MODE_QUEUE_ENTER, args.mode)
+
+    def test_cli_default_mode_remains_standard(self) -> None:
+        # Default must not silently flip to queue-enter; existing strict
+        # callers must keep their fail-closed behavior.
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+            ]
+        )
+
+        self.assertEqual(MODE_STANDARD, args.mode)
+
+    def test_cli_rejects_unknown_mode(self) -> None:
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(
+                    [
+                        "handoff",
+                        "send",
+                        "--to",
+                        "claude",
+                        "--source",
+                        "asana",
+                        "--kind",
+                        "reply",
+                        "--task-id",
+                        "T1",
+                        "--comment-id",
+                        "C1",
+                        "--mode",
+                        "relaxed",
+                    ]
+                )
+
+    # --- queue-enter behavior split ------------------------------------------------
+
+    def test_queue_enter_observed_marker_emits_sent_ok_with_queue_enter_mode(self) -> None:
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+                "--submit-delay",
+                "0",
+            ]
+        )
+
+        self.assertEqual(0, result)
+        expected_marker = "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=implementation_request:to=claude]"
+        self.assertIn(expected_marker, pane_text)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        # Marker was observed (default capture returns pane_text), so no
+        # rollback occurred.
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertEqual("receiver", outcome["next_action_owner"])
+
+    def test_queue_enter_unobserved_marker_emits_sent_queue_enter_without_rollback(self) -> None:
+        # Force capture to return empty so wait_for_text returns False.
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "review_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            captures=["", "", ""],
+        )
+
+        self.assertEqual(0, result)
+        # Body was typed.
+        self.assertIn(
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=review_request:to=claude]",
+            pane_text,
+        )
+        # Enter WAS pressed (the rail's whole point).
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        # No rollback.
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("queue_enter", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        # Per the contract, next_action_owner stays receiver-owned even when
+        # the marker was unobserved.
+        self.assertEqual("receiver", outcome["next_action_owner"])
+        self.assertIn("durable anchor", outcome["next_action"])
+
+    def test_strict_standard_still_rolls_back_on_marker_timeout(self) -> None:
+        # Regression: the relaxed rail must not weaken strict `standard`.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "review_result",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            captures=["", "", ""],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertEqual(MODE_STANDARD, outcome["mode"])
+
+    # --- agent-target restriction --------------------------------------------------
+
+    def test_queue_enter_rejects_force_flag(self) -> None:
+        # Per contract, `--force` cannot bypass agent-gate under queue-enter.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+                "--force",
+            ],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        # No typing should have occurred.
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("--force", stderr)
+        self.assertIn("queue-enter", stderr)
+
+    def test_queue_enter_rejects_explicit_target_in_other_receiver_window(self) -> None:
+        # Per Codex audit finding on task 1214782240686275 comment 1214783754107198:
+        # `ensure_agent_target` only checks that the pane is running *some*
+        # agent-looking process (claude/codex/node), not that the pane belongs
+        # to the intended receiver. Under strict, marker_timeout rollback caps
+        # the blast radius. Under queue-enter, marker miss does NOT roll back,
+        # so an explicit `--target %X` in the wrong receiver's window would
+        # silently press Enter into the wrong agent. The queue-enter preflight
+        # must reject this mismatch before typing.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:1.0",
+                "command": "node",
+                "cwd": "/repo",
+                # Pane is a real agent process, but lives in the codex window.
+                # Strict (`ensure_agent_target`) would currently accept this;
+                # queue-enter must not.
+                "window_name": "codex",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        # No typing or Enter against the mismatched pane.
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        # Target id should still survive the outcome (typing was not done but
+        # the pane resolved); helps audit which mismatched pane was rejected.
+        self.assertEqual("%2", outcome["target"])
+        self.assertIn("queue-enter", stderr)
+        self.assertIn("--target", stderr)
+        self.assertIn("'codex'", stderr)
+        self.assertIn("'claude'", stderr)
+
+    def test_queue_enter_allows_explicit_target_in_matching_receiver_window(self) -> None:
+        # Sanity check that the new preflight does not over-fire: an explicit
+        # --target in the receiver's own window must still be accepted.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+                "--submit-delay",
+                "0",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "claude",
+            },
+        )
+
+        self.assertEqual(0, result)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+
+    def test_queue_enter_blocks_non_agent_pane(self) -> None:
+        # Non-agent process in a claude window: the standard agent-gate fires
+        # and emits target_not_agent. Under queue-enter this stays blocked
+        # (and `--force` is not even available to override).
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "reply",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "queue-enter",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "zsh",
+                "cwd": "/repo",
+                "window_name": "claude",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_not_agent", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    # --- projection / wording ------------------------------------------------------
+
+    def test_project_last_input_for_queue_enter_matches_strict_sent_ok(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome_strict = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="reply",
+            notification_marker="[m]",
+        )
+        outcome_queue_enter = make_outcome(
+            status="sent",
+            reason="queue_enter",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="reply",
+            notification_marker="[m]",
+        )
+
+        proj_strict = project_last_input(
+            outcome_strict, submitted_at="2026-05-13T17:30:00Z"
+        )
+        proj_queue = project_last_input(
+            outcome_queue_enter, submitted_at="2026-05-13T17:30:00Z"
+        )
+
+        # Per contract, queue-enter projection MUST equal strict sent/ok
+        # projection. Returning ack_status="unobserved" or submitted_at=None
+        # would violate the upstream inspector contract derive rule.
+        self.assertEqual(proj_strict, proj_queue)
+        assert proj_queue is not None
+        self.assertEqual("submitted", proj_queue.ack_status)
+        self.assertEqual("2026-05-13T17:30:00Z", proj_queue.submitted_at)
+        self.assertIsNone(proj_queue.acknowledged_at)
+
+    def test_project_last_input_for_queue_enter_mode_with_ok_reason_also_matches(self) -> None:
+        # Marker-observed queue-enter (status=sent, reason=ok, mode=queue-enter)
+        # must also project identically to strict sent/ok.
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="reply",
+            notification_marker="[m]",
+        )
+        projection = project_last_input(outcome, submitted_at="2026-05-13T17:30:00Z")
+        assert projection is not None
+        self.assertEqual("submitted", projection.ack_status)
+        self.assertEqual("2026-05-13T17:30:00Z", projection.submitted_at)
+
+    def test_make_outcome_for_queue_enter_keeps_receiver_owned_next_action(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="sent",
+            reason="queue_enter",
+            receiver="codex",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="implementation_request",
+            notification_marker="[m]",
+        )
+
+        owner, action = next_action_for(outcome.status, outcome.reason, outcome.receiver)
+
+        self.assertEqual("receiver", owner)
+        self.assertEqual("receiver", outcome.next_action_owner)
+        self.assertIn("durable anchor", action)
+        self.assertIn("durable anchor", outcome.next_action)
+
+    def test_delivery_record_for_queue_enter_unobserved_includes_operator_note(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="sent",
+            reason="queue_enter",
+            receiver="codex",
+            target="%111",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="review_request",
+            notification_marker="[mozyo:handoff:source=asana:task=T1:comment=C1:kind=review_request:to=codex]",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn(
+            "Delivery result — sent (queue-enter, marker unobserved)", record
+        )
+        self.assertIn("Mode: `queue-enter`", record)
+        self.assertIn("Status: `sent` (reason: `queue_enter`)", record)
+        # Receiver-side primary contract is identical to strict sent.
+        self.assertIn("Next action owner: `receiver`", record)
+        self.assertIn("Receiver-side contract", record)
+        self.assertIn("durable anchor", record)
+        # Operator note is the only place the queue-enter fallback is surfaced.
+        self.assertIn("Operator note", record)
+        self.assertIn("--mode standard", record)
+        self.assertIn("not observed before Enter", record)
+
+    def test_delivery_record_for_queue_enter_observed_marks_rail_but_no_operator_note(self) -> None:
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="implementation_request",
+            notification_marker="[m]",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn(
+            "Delivery result — sent (queue-enter, marker observed)", record
+        )
+        self.assertIn("Mode: `queue-enter`", record)
+        self.assertIn("Next action owner: `receiver`", record)
+        # No operator escalation note when the marker was actually observed.
+        self.assertNotIn("Operator note", record)
 
 
 class DeliveryRecordTest(unittest.TestCase):
