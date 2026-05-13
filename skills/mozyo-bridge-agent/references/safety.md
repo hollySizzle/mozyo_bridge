@@ -13,7 +13,12 @@
 - The receiving agent must check Asana or the named source of truth before acting.
 - Two send rails exist; pick the right one rather than weakening either:
   - `--mode standard` (default for `handoff send` / `notify-*` / `mozyo-bridge message --submit`): strict marker-observed Enter. Marker miss is fail-closed — input is cleared via `C-u`, Enter is not sent, and the outcome is `blocked` / `marker_timeout`. Do not send blind Enter to recover; record the failure in the durable record and let the receiver read the anchor manually.
-  - `--mode queue-enter` (opt-in, `mozyo-bridge handoff send` only): Claude / Codex agent panes only; rejects `--force`; rejects an explicit `--target` whose tmux window is not the receiver's window. Marker miss does NOT roll back — Enter is sent and the outcome is `sent` / `queue_enter` (a distinct durable wording, not a silent strict success). Use this rail only when the receiver TUI is known to wrap-shape the marker (currently codex TUI; tracked under Asana `1214749106025548` / `1214765093829972`).
+  - `--mode queue-enter` (opt-in, `mozyo-bridge handoff send` only): Claude / Codex agent panes only; rejects `--force`. A deterministic preflight runs before any typing; if any of the following checks fails, the CLI dies with `blocked` and the corresponding `Reason` before `send-keys -l` is issued:
+    - explicit `--target` must live in the receiver's tmux window (`Reason: invalid_args`),
+    - target pane must live in the **sender's** tmux session, i.e. invoke from inside the same tmux session as the receiver (`Reason: invalid_args`),
+    - target pane must be the **active split** of its window (`Reason: invalid_args`),
+    - foreground process must match the receiver's allowlist (`Reason: target_not_agent`): strong identity for literal `claude` (receiver=`claude`) and literal `codex` (receiver=`codex`); weak identity for literal `node` and versioned native binary basenames, which both Claude Code and Codex CLI legitimately use — Step 9 (window-name binding) plus operator discipline carry cross-binding protection in the weak case.
+    When all checks pass, marker miss does NOT roll back — Enter is sent and the outcome is `sent` / `queue_enter` (a distinct durable wording, not a silent strict success). Use this rail only when the receiver TUI is known to wrap-shape the marker (currently codex TUI; tracked under Asana `1214749106025548` / `1214765093829972`).
 - Whichever rail is used, the durable record (Asana task comment / Redmine journal) is still the source of truth. The pane notification is a pointer.
 - `.agent_handoff/tasks.json` is a retired queue cleanup surface, not a standard notification fallback.
 

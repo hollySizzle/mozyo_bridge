@@ -10,17 +10,23 @@ queues prompts during a running turn. A plain ``sh`` receiver has no prompt
 queue, and queue-enter rejects ``--force``, so spoofing one with a non-agent
 process is not a valid stand-in. In-process coverage of the new rail
 (observed / unobserved marker, ``--force`` rejection, ``--target``
-window-mismatch guard, agent-gate stricter than strict, durable-record
-wording, ``last_input`` projection, ``next_action_owner``) lives in
-``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest``.
+window-mismatch guard, the v0.3 deterministic preflight Steps 10 / 11 / 12
+(same-session, active-pane, per-receiver foreground process), strong vs
+weak receiver identity, durable-record wording, ``last_input`` projection,
+``next_action_owner``) lives in
+``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest`` and
+``tests/test_mozyo_bridge.py::PaneResolverTest`` (the
+``is_receiver_agent_process`` unit tests).
 
 When an operator change touches the queue-enter rail, the manual verification
 recipe is:
 
 1. From the repo root, open the standard pair: ``mozyo`` (creates / attaches a
    tmux session with a ``claude`` window and a ``codex`` window running the
-   real Claude / Codex CLI).
-2. In a sender pane, run:
+   real Claude / Codex CLI). Run all subsequent steps from a sender pane
+   inside that same tmux session; the v0.3 same-session preflight rejects
+   any cross-session ``--target``.
+2. In the sender pane, run:
 
        mozyo-bridge handoff send --to codex --source asana \\
            --task-id <task> --comment-id <comment> --kind reply \\
@@ -41,10 +47,27 @@ recipe is:
    ``--mode queue-enter``. Expected: the command dies with
    ``handoff marker was not observed...``, no Enter is pressed, the JSON
    outcome shows ``status=blocked reason=marker_timeout mode=standard``.
+5. v0.3 preflight spot-checks (each must reject before any ``send-keys -l``):
+
+   a. Foreign-session reject: from a tmux pane in a *different* tmux session
+      than the receiver's, run the step-2 command with ``--target %X`` set
+      to the receiver pane id. Expected: ``status=blocked
+      reason=invalid_args mode=queue-enter`` and a ``die`` message naming
+      the sender/target session pair.
+   b. Inactive-split reject: split the receiver's window so the receiver is
+      no longer the active pane, then pass that inactive pane id via
+      ``--target``. Expected: ``status=blocked reason=invalid_args
+      mode=queue-enter`` and a ``die`` message naming ``pane_active``.
+   c. Non-agent reject: rename a ``zsh`` pane's window to ``codex`` (or run
+      the command against a known-shell pane via ``--target``). Expected:
+      ``status=blocked reason=target_not_agent mode=queue-enter`` and a
+      ``die`` message naming the observed shell process. (Weak-identity
+      processes like ``node`` or a versioned native binary are admitted by
+      design; do not test them as reject cases.)
 
 If any of the above diverges from the contract section ``## Relaxed
-Queue-Enter Rail``, stop and record the gap in the owning Asana task before
-landing the change.
+Queue-Enter Rail`` (Status v0.3.1 or later), stop and record the gap in the
+owning Asana task before landing the change.
 """
 from __future__ import annotations
 
