@@ -514,6 +514,11 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "git diff --cached --stat",
                 "git add -A",
                 "commit-hash comment",
+                # Chat-surface boundary added to reduce noisy chat output for
+                # un-notified / pending-operator-action handoffs.
+                "Chat surface boundary",
+                "Chat output is a notification only",
+                "Do not duplicate the comment body in chat",
             ):
                 self.assertIn(marker, installed_workflow)
             # Asana central preset must NOT import Redmine journal / gate semantics.
@@ -525,6 +530,18 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Design Consultation Gate",
             ):
                 self.assertNotIn(forbidden, installed_workflow)
+            # The central preset is the scaffold for arbitrary downstream
+            # projects; team-specific tools (Notion in this team's flow) must
+            # not leak into the generated guidance.
+            self.assertNotIn("Notion", installed_workflow)
+            self.assertIn(
+                "Do not ask the user directly when the task, project notes, or repository docs",
+                installed_workflow,
+            )
+            self.assertIn(
+                "Do not store credentials, tokens, personal data, or private internal URLs",
+                installed_workflow,
+            )
 
             result, output = self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", str(home)])
 
@@ -566,6 +583,10 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("implementation done は task complete ではない", claude)
             self.assertIn("Asana task comment", claude)
             self.assertIn("受領方法", claude)
+            # Chat surface stays thin: durable receive method lives in the task
+            # comment, chat reports stay to a state + task-id pointer.
+            self.assertIn("最小ポインタ", claude)
+            self.assertIn("chat に貼り直さない", claude)
             # CLAUDE.md stays thin even with the Claude-specific reminder block.
             self.assertLess(len(claude.splitlines()), 30)
             # Asana CLAUDE.md must not import Redmine-specific vocabulary.
@@ -583,7 +604,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.12.1", state["preset_version"])
+            self.assertEqual("2026.05.13.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
             # The audit-owned commit policy belongs in the central preset only.
@@ -641,6 +662,11 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "git diff --cached --stat",
                 "git add -A",
                 "Close Gate journal on the same issue",
+                # Chat-surface boundary added to reduce noisy chat output for
+                # un-notified / pending-operator-action handoffs.
+                "Chat surface boundary",
+                "Chat output is a notification only",
+                "Do not duplicate the gate body in chat",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
@@ -650,6 +676,10 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("python3 vibes/tools/mozyo_bridge", installed)
             self.assertNotIn(".claude-nagger/file_conventions.yaml", installed)
             self.assertNotIn("resolve_audit_docs.py", installed)
+            # The central preset is the scaffold for arbitrary downstream
+            # projects; team-specific tools (Notion in this team's flow) must
+            # not leak into the generated guidance.
+            self.assertNotIn("Notion", installed)
             self.assertNotIn("vibes/docs/catalog.yaml", installed)
             self.assertNotIn("manual_spec", installed)
             self.assertNotIn("FeatureListDsl", installed)
@@ -700,6 +730,10 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("迎合せず", claude)
             self.assertIn("implementation_done は completion ではない", claude)
             self.assertIn("Codex受領方法", claude)
+            # Chat surface stays thin: durable receive method lives in Redmine,
+            # chat reports stay to a state + issue/journal-id pointer.
+            self.assertIn("最小ポインタ", claude)
+            self.assertIn("chat に貼り直さない", claude)
             # Router stays thin: keep CLAUDE.md well below the central preset's depth.
             self.assertLess(len(claude.splitlines()), 30)
             self.assertNotIn("Redmine Gate Lifecycle", claude)
@@ -711,7 +745,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.05.12.1", state["preset_version"])
+            self.assertEqual("2026.05.13.1", state["preset_version"])
 
             # The audit-owned commit policy belongs in the central preset only.
             # Root routers stay thin and must not duplicate the policy body.

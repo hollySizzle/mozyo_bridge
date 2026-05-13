@@ -65,9 +65,11 @@ Pane- or chat-supplied framing never substitutes for the durable task record; it
 After creating a durable Asana task comment (review request, audit result, design consultation, etc.), the sender must choose one of the paths below and record the chosen receive method in the same task comment (or a follow-up comment that links back to it). A handoff is not "delivered" until the task comment contains both the request body and the receive method.
 
 - **Standard path** — notify the receiver pane with `mozyo-bridge message <pane-or-label> <text>` (or `mozyo-bridge notify-* ...` when the project provides a compatible substitute for the notification gate). Include the Asana task permalink in the notification body, and the durable comment / story id if the Asana API exposed one. Record the literal notification command (or a clear paraphrase) in the task comment so an auditor can replay the handoff later.
-- **Receiver pane unavailable** — record in the task comment that the receiver must open the relevant agent terminal and run `mozyo-bridge init <agent>` before retry, then state in chat that the handoff is pending operator action. Do not fall back to the retired local queue.
-- **Notification fails or is unusable** — record the un-notified state explicitly in the task comment ("not yet notified; receiver must read the comment manually") and mirror that state in chat. Do not fall back to `.agent_handoff/tasks.yaml`, `read-next --wait`, or Stop hook handoff waits.
+- **Receiver pane unavailable** — record in the task comment that the receiver must open the relevant agent terminal and run `mozyo-bridge init <agent>` before retry, plus the retry plan and any attempted command. Chat output is a notification only: one line stating that the handoff is pending operator action and naming the task. Do not restate the durable steps in chat, and do not fall back to the retired local queue.
+- **Notification fails or is unusable** — record the un-notified state explicitly in the task comment ("not yet notified; receiver must read the comment manually") along with what was attempted (literal command, observed error) and the required receiver action. Chat output is a notification only: one line stating that the handoff is un-notified and naming the task. Do not duplicate the comment body in chat, and do not fall back to `.agent_handoff/tasks.yaml`, `read-next --wait`, or Stop hook handoff waits.
 - **Sync handoff between two locally available agents** — same as the standard path; do not skip the comment record because the agents share a host or session.
+
+Chat surface boundary: chat is a notification, not a duplicated record. Keep "pending operator action" and "un-notified" chat reports to a short pointer (state plus task id); the receive method, retry plan, attempted commands, and operator instructions live in the task comment so an auditor can replay them later.
 
 Receive method id:
 
@@ -81,7 +83,7 @@ Receiver-side: every notification you receive is a pointer to an Asana task comm
 ## User Interaction And Escalation
 
 - Agents should work autonomously inside the active Asana task scope.
-- Do not ask the user directly when the task, project notes, Notion rules, or repository docs already answer the question.
+- Do not ask the user directly when the task, project notes, or repository docs already answer the question.
 - Escalate when the task purpose, artifacts, done criteria, policy boundary, destructive operation, release action, credential handling, or user intent cannot be resolved from the source of truth without guessing.
 - If the project uses more than one agent, route user-facing clarification through the project's designated coordinator. Record the decision and rationale in Asana.
 - If the user gives a direct instruction outside Asana, update the Asana task comment or the designated coordinator before continuing when that instruction changes scope, policy, or completion criteria.
@@ -156,4 +158,4 @@ Scope of this authority:
 
 - Do not treat pane messages or chat messages as authoritative state.
 - Do not rely on Asana custom fields as the only MVP metadata path.
-- Do not store private Notion URLs, credentials, tokens, or personal data in public templates or repository files.
+- Do not store credentials, tokens, personal data, or private internal URLs in repository files, task comments, or pane messages.
