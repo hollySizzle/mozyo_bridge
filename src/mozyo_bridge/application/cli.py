@@ -6,8 +6,6 @@ from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_config,
     cmd_doctor,
-    cmd_ensure,
-    cmd_ensure_pair,
     cmd_id,
     cmd_init,
     cmd_keys,
@@ -20,16 +18,12 @@ from mozyo_bridge.application.commands import (
     cmd_notify_codex,
     cmd_notify_codex_legacy_task,
     cmd_notify_codex_review,
-    cmd_open,
-    cmd_open_here,
     cmd_read,
     cmd_resolve,
     cmd_rules_install,
     cmd_rules_status,
     cmd_scaffold_rules,
     cmd_scaffold_status,
-    cmd_setup,
-    cmd_spawn,
     cmd_status,
     cmd_type,
 )
@@ -60,15 +54,6 @@ def normalize_paths(args: argparse.Namespace) -> argparse.Namespace:
     if hasattr(args, "queue") and args.queue is None:
         args.queue = str(default_queue_path(repo_root))
     return args
-
-
-def add_agent_spawn_options(parser: argparse.ArgumentParser) -> None:
-    add_repo_option(parser)
-    parser.add_argument("--cwd")
-    parser.add_argument("--vertical", action="store_true")
-    parser.add_argument("--config", action="store_true", help="Load mozyo-bridge tmux config before running")
-    parser.add_argument("--config-path")
-    parser.add_argument("--ready-timeout", type=float, default=10.0)
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
@@ -121,46 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Subcommands accept their own `--repo` after the subcommand name."
         ),
     )
-    sub = parser.add_subparsers(dest="command", required=False)
-
-    setup = sub.add_parser("tmux-ui-setup")
-    add_repo_option(setup)
-    setup.add_argument("--session", default="agents")
-    setup.add_argument("--cwd")
-    setup.add_argument("--vertical", action="store_true")
-    setup.add_argument("--config-path")
-    setup.add_argument("--ready-timeout", type=float, default=10.0)
-    setup.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
-    setup.set_defaults(func=cmd_setup)
-
-    open_cmd = sub.add_parser("tmux-ui-open")
-    add_repo_option(open_cmd)
-    open_cmd.add_argument("--session", default="agents")
-    open_cmd.add_argument("--cwd")
-    open_cmd.add_argument("--vertical", action="store_true")
-    open_cmd.add_argument("--config", action="store_true", default=True, help="Load mozyo-bridge tmux config before opening")
-    open_cmd.add_argument("--config-path")
-    open_cmd.add_argument("--ready-timeout", type=float, default=10.0)
-    open_cmd.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
-    open_cmd.set_defaults(func=cmd_open)
-
-    open_here = sub.add_parser(
-        "open-here",
-        help="Open a Claude/Codex pair tmux session with session=repo-basename and cwd=repo-root.",
-    )
-    add_repo_option(open_here)
-    open_here.add_argument(
+    parser.add_argument(
         "--session",
         default=None,
-        help="Explicit session name. Defaults to the repo root basename; required when an existing session of that basename points at a different work root.",
+        help=(
+            "Bare `mozyo`: override the tmux session name. Defaults to the repo "
+            "root basename; pass an explicit name to disambiguate when two repos "
+            "share a basename."
+        ),
     )
-    open_here.add_argument("--cwd", default=None, help="Working directory. Defaults to the resolved repo root.")
-    open_here.add_argument("--vertical", action="store_true")
-    open_here.add_argument("--config", action="store_true", default=True, help="Load mozyo-bridge tmux config before opening")
-    open_here.add_argument("--config-path")
-    open_here.add_argument("--ready-timeout", type=float, default=10.0)
-    open_here.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
-    open_here.set_defaults(func=cmd_open_here)
+    sub = parser.add_subparsers(dest="command", required=False)
 
     status = sub.add_parser("status")
     add_repo_option(status)
@@ -229,28 +184,6 @@ def build_parser() -> argparse.ArgumentParser:
     keys.add_argument("target")
     keys.add_argument("keys", nargs="+")
     keys.set_defaults(func=cmd_keys)
-
-    spawn = sub.add_parser("tmux-ui-spawn")
-    spawn.add_argument("agent", choices=["claude", "codex"])
-    add_agent_spawn_options(spawn)
-    spawn.set_defaults(func=cmd_spawn)
-
-    ensure = sub.add_parser("tmux-ui-ensure")
-    ensure.add_argument("agent", choices=["claude", "codex"])
-    add_agent_spawn_options(ensure)
-    ensure.add_argument("--force", action="store_true", help="Accept an existing non-agent-looking labeled pane")
-    ensure.set_defaults(func=cmd_ensure)
-
-    ensure_pair = sub.add_parser("tmux-ui-ensure-pair")
-    add_repo_option(ensure_pair)
-    ensure_pair.add_argument("--session", default="agents")
-    ensure_pair.add_argument("--cwd")
-    ensure_pair.add_argument("--vertical", action="store_true")
-    ensure_pair.add_argument("--config", action="store_true", help="Load mozyo-bridge tmux config before ensuring")
-    ensure_pair.add_argument("--config-path")
-    ensure_pair.add_argument("--ready-timeout", type=float, default=10.0)
-    ensure_pair.add_argument("--force", action="store_true", help="Accept existing non-agent-looking labeled panes")
-    ensure_pair.set_defaults(func=cmd_ensure_pair)
 
     for name_, func in [("notify-codex", cmd_notify_codex), ("notify-claude", cmd_notify_claude)]:
         notify = sub.add_parser(name_)

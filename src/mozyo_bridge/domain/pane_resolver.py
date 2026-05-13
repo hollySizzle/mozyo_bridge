@@ -116,11 +116,10 @@ def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
 def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | None:
     """Resolve an agent label to its target pane under the window-only model.
 
-    Thin wrapper over :func:`find_agent_window`. Kept as a named entry point
-    so callers (`notify_agent`, `cmd_ensure`, `ensure_repo_session_windows`)
-    do not have to re-derive the rule. There is no compatibility fallback;
-    cross-session resolution stays explicitly absent — it was the documented
-    mis-route root cause (task 1214743574772820 comment 1214746077864452).
+    Thin wrapper over :func:`find_agent_window`. There is no compatibility
+    fallback; cross-session resolution stays explicitly absent — it was the
+    documented mis-route root cause (task 1214743574772820 comment
+    1214746077864452).
     """
     if not session:
         return None

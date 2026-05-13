@@ -24,8 +24,6 @@ from mozyo_bridge.application.commands import (
     cmd_init,
     cmd_list,
     cmd_mozyo,
-    cmd_open,
-    cmd_open_here,
     cmd_status,
     ensure_repo_session_windows,
     load_tmux_conf_for,
@@ -501,6 +499,20 @@ class CliTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["notify-codex", "--issue", "9020", "--journal", "1", "--ensure"])
 
+    def test_legacy_pane_split_subcommands_are_rejected(self) -> None:
+        parser = build_parser()
+        for command in (
+            "open-here",
+            "tmux-ui-open",
+            "tmux-ui-setup",
+            "tmux-ui-ensure",
+            "tmux-ui-ensure-pair",
+            "tmux-ui-spawn",
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([command])
+
     def test_legacy_task_notification_is_separate_command(self) -> None:
         parser = build_parser()
 
@@ -510,15 +522,6 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual("notify-codex-legacy-task", args.command)
         self.assertEqual("legacy-task", args.task_id)
-
-    def test_tmux_ui_open_accepts_setup_options(self) -> None:
-        parser = build_parser()
-
-        args = parser.parse_args(["tmux-ui-open", "--session", "agents", "--cwd", "/repo", "--ready-timeout", "0"])
-
-        self.assertEqual("tmux-ui-open", args.command)
-        self.assertEqual("agents", args.session)
-        self.assertEqual("/repo", args.cwd)
 
     def test_status_session_defaults_to_none_for_runtime_resolution(self) -> None:
         # Hard-coding the default to "agents" was the root cause of the
@@ -538,41 +541,6 @@ class CliTest(unittest.TestCase):
         args = parser.parse_args(["status", "--session", "agents"])
 
         self.assertEqual("agents", args.session)
-
-    def test_normalize_paths_marks_default_config_path(self) -> None:
-        from mozyo_bridge.application.cli import normalize_paths
-
-        parsed = build_parser().parse_args(["tmux-ui-open"])
-        normalized = normalize_paths(parsed)
-        self.assertTrue(normalized.config_path_was_default)
-        self.assertIsNotNone(normalized.config_path)
-
-    def test_normalize_paths_marks_explicit_config_path(self) -> None:
-        from mozyo_bridge.application.cli import normalize_paths
-
-        parsed = build_parser().parse_args(["tmux-ui-open", "--config-path", "/explicit/.tmux.conf"])
-        normalized = normalize_paths(parsed)
-        self.assertFalse(normalized.config_path_was_default)
-        self.assertEqual("/explicit/.tmux.conf", normalized.config_path)
-
-    def test_open_here_defaults_session_and_cwd_to_none_before_normalization(self) -> None:
-        parser = build_parser()
-
-        args = parser.parse_args(["open-here"])
-
-        self.assertEqual("open-here", args.command)
-        self.assertIsNone(args.session)
-        self.assertIsNone(args.cwd)
-        self.assertTrue(args.config)
-
-    def test_open_here_accepts_explicit_session_override(self) -> None:
-        parser = build_parser()
-
-        args = parser.parse_args(["open-here", "--session", "custom", "--repo", "/repo"])
-
-        self.assertEqual("open-here", args.command)
-        self.assertEqual("custom", args.session)
-        self.assertEqual("/repo", args.repo)
 
     def test_bare_mozyo_parses_with_no_subcommand(self) -> None:
         parser = build_parser()
@@ -601,10 +569,18 @@ class CliTest(unittest.TestCase):
     def test_subcommand_repo_still_works_after_top_level_repo_added(self) -> None:
         parser = build_parser()
 
-        args = parser.parse_args(["open-here", "--repo", "/repo"])
+        args = parser.parse_args(["status", "--repo", "/repo"])
 
-        self.assertEqual("open-here", args.command)
+        self.assertEqual("status", args.command)
         self.assertEqual("/repo", args.repo)
+
+    def test_bare_mozyo_accepts_session_override(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["--session", "alt"])
+
+        self.assertIsNone(args.command)
+        self.assertEqual("alt", args.session)
 
     def test_version_flag_prints_version_and_exits_cleanly(self) -> None:
         parser = build_parser()
@@ -1724,21 +1700,6 @@ class WaitForTextContractTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def test_notify_agent_rejects_custom_label_with_ensure(self) -> None:
-        args = argparse.Namespace(
-            issue="9020",
-            journal="1",
-            task_id=None,
-            queue="unused",
-            target="codex2",
-            ensure=True,
-            config=False,
-        )
-
-        with patch("mozyo_bridge.application.commands.require_tmux"), contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                notify_agent(args, "codex")
-
     def test_notify_agent_waits_for_marker_before_enter_on_existing_pane(self) -> None:
         args = argparse.Namespace(
             issue="9020",
@@ -1848,145 +1809,6 @@ class CommandTest(unittest.TestCase):
             self.assertEqual(0, notify_agent(args, "codex"))
 
         sleep.assert_called_once_with(0.2)
-
-    def test_open_creates_missing_session_before_attach(self) -> None:
-        args = argparse.Namespace(
-            session="agents",
-            cwd="/repo",
-            vertical=False,
-            config=True,
-            config_path="/repo/.tmux.conf",
-            ready_timeout=0,
-            force=False,
-        )
-
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
-            patch("mozyo_bridge.application.commands.cmd_ensure_pair", return_value=0) as ensure_pair, \
-            patch("mozyo_bridge.application.commands.os.execvp", side_effect=RuntimeError("attached")) as execvp:
-            with self.assertRaisesRegex(RuntimeError, "attached"):
-                cmd_open(args)
-
-        ensure_pair.assert_called_once()
-        setup_args = ensure_pair.call_args.args[0]
-        self.assertEqual("agents", setup_args.session)
-        self.assertTrue(setup_args.config)
-        execvp.assert_called_once_with("tmux", ["tmux", "attach", "-t", "agents"])
-
-    def test_open_existing_session_reloads_config_before_attach(self) -> None:
-        args = argparse.Namespace(
-            session="agents",
-            cwd="/repo",
-            vertical=False,
-            config=True,
-            config_path="/repo/.tmux.conf",
-            ready_timeout=0,
-            force=False,
-        )
-
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
-            patch("mozyo_bridge.application.commands.source_tmux_conf") as source_conf, \
-            patch("mozyo_bridge.application.commands.os.execvp", side_effect=RuntimeError("attached")):
-            with self.assertRaisesRegex(RuntimeError, "attached"):
-                cmd_open(args)
-
-        source_conf.assert_called_once_with("/repo/.tmux.conf", optional=False)
-
-    def _open_here_args(self, repo: Path, session=None, cwd=None) -> argparse.Namespace:
-        return argparse.Namespace(
-            repo=str(repo),
-            session=session,
-            cwd=cwd,
-            vertical=False,
-            config=True,
-            config_path=str(repo / ".tmux.conf"),
-            ready_timeout=0,
-            force=False,
-        )
-
-    def test_open_here_defaults_session_to_repo_basename_and_attaches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = (Path(tmp) / "my-project").resolve()
-            repo.mkdir()
-            args = self._open_here_args(repo)
-
-            captured: dict[str, argparse.Namespace] = {}
-
-            def fake_cmd_open(inner: argparse.Namespace) -> int:
-                captured["args"] = inner
-                raise RuntimeError("attached")
-
-            with patch("mozyo_bridge.application.commands.require_tmux"), \
-                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
-                patch("mozyo_bridge.application.commands.cmd_open", side_effect=fake_cmd_open):
-                with self.assertRaisesRegex(RuntimeError, "attached"):
-                    cmd_open_here(args)
-
-        self.assertEqual("my-project", captured["args"].session)
-        self.assertEqual(str(repo), captured["args"].cwd)
-
-    def test_open_here_preserves_user_supplied_session(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = (Path(tmp) / "my-project").resolve()
-            repo.mkdir()
-            args = self._open_here_args(repo, session="custom")
-            captured: dict[str, argparse.Namespace] = {}
-
-            with patch("mozyo_bridge.application.commands.require_tmux"), \
-                patch("mozyo_bridge.application.commands.session_exists", return_value=True) as sess, \
-                patch("mozyo_bridge.application.commands.cmd_open",
-                      side_effect=lambda inner: (captured.__setitem__("args", inner), 0)[1]):
-                self.assertEqual(0, cmd_open_here(args))
-
-        self.assertEqual("custom", captured["args"].session)
-        sess.assert_not_called()  # explicit --session skips the collision probe
-
-    def test_open_here_refuses_when_existing_session_panes_are_outside_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = (Path(tmp) / "my-project").resolve()
-            repo.mkdir()
-            other = (Path(tmp) / "other-project").resolve()
-            other.mkdir()
-            args = self._open_here_args(repo)
-            panes = [
-                {"id": "%1", "location": "my-project:0.0", "command": "zsh", "label": "", "cwd": str(other)},
-                {"id": "%2", "location": "my-project:0.1", "command": "zsh", "label": "", "cwd": str(other)},
-            ]
-
-            with patch("mozyo_bridge.application.commands.require_tmux"), \
-                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
-                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
-                patch("mozyo_bridge.application.commands.cmd_open") as opened, \
-                contextlib.redirect_stderr(io.StringIO()) as stderr:
-                with self.assertRaises(SystemExit):
-                    cmd_open_here(args)
-
-        opened.assert_not_called()
-        self.assertIn("--session", stderr.getvalue())
-        self.assertIn("my-project", stderr.getvalue())
-
-    def test_open_here_attaches_when_existing_session_has_pane_under_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = (Path(tmp) / "my-project").resolve()
-            repo.mkdir()
-            other = (Path(tmp) / "other-project").resolve()
-            other.mkdir()
-            args = self._open_here_args(repo)
-            panes = [
-                {"id": "%1", "location": "my-project:0.0", "command": "zsh", "label": "", "cwd": str(repo)},
-                {"id": "%2", "location": "my-project:0.1", "command": "zsh", "label": "", "cwd": str(other)},
-            ]
-            captured: dict[str, argparse.Namespace] = {}
-
-            with patch("mozyo_bridge.application.commands.require_tmux"), \
-                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
-                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
-                patch("mozyo_bridge.application.commands.cmd_open",
-                      side_effect=lambda inner: (captured.__setitem__("args", inner), 0)[1]):
-                self.assertEqual(0, cmd_open_here(args))
-
-        self.assertEqual("my-project", captured["args"].session)
 
     def test_ensure_repo_session_windows_creates_session_and_codex_window(self) -> None:
         args = argparse.Namespace(
@@ -2241,6 +2063,10 @@ class CommandTest(unittest.TestCase):
         execvp.assert_not_called()
         self.assertIn("my-project", stderr.getvalue())
         self.assertIn("outside repo root", stderr.getvalue())
+        # The disambiguation hint must point operators at the bare-`mozyo`
+        # `--session` flag, not at the retired `open-here` subcommand.
+        self.assertIn("--session", stderr.getvalue())
+        self.assertNotIn("open-here", stderr.getvalue())
 
     def test_cmd_mozyo_explicit_session_skips_cwd_mismatch_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2309,27 +2135,6 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(str(custom_conf), captured["args"].config_path)
         self.assertFalse(captured["args"].config_path_was_default)
 
-    def test_open_here_ignores_unrelated_session_panes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = (Path(tmp) / "my-project").resolve()
-            repo.mkdir()
-            other = (Path(tmp) / "other-project").resolve()
-            other.mkdir()
-            args = self._open_here_args(repo)
-            panes = [
-                {"id": "%9", "location": "other:0.0", "command": "zsh", "label": "", "cwd": str(other)},
-            ]
-            captured: dict[str, argparse.Namespace] = {}
-
-            with patch("mozyo_bridge.application.commands.require_tmux"), \
-                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
-                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
-                patch("mozyo_bridge.application.commands.cmd_open",
-                      side_effect=lambda inner: (captured.__setitem__("args", inner), 0)[1]):
-                self.assertEqual(0, cmd_open_here(args))
-
-        self.assertEqual("my-project", captured["args"].session)
-
     def test_load_tmux_conf_skips_silently_when_default_path_missing(self) -> None:
         args = argparse.Namespace(
             config_path="/nonexistent/.tmux.conf",
@@ -2374,32 +2179,6 @@ class CommandTest(unittest.TestCase):
                 self.assertTrue(load_tmux_conf_for(args))
 
         run.assert_called_once_with("source-file", str(conf), check=False)
-
-    def test_cmd_open_propagates_config_path_was_default_to_ensure_pair(self) -> None:
-        args = argparse.Namespace(
-            session="agents",
-            cwd="/repo",
-            vertical=False,
-            config=True,
-            config_path="/repo/.tmux.conf",
-            config_path_was_default=True,
-            ready_timeout=0,
-            force=False,
-        )
-        captured: dict[str, argparse.Namespace] = {}
-
-        def fake_ensure_pair(inner: argparse.Namespace) -> int:
-            captured["args"] = inner
-            return 0
-
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
-            patch("mozyo_bridge.application.commands.cmd_ensure_pair", side_effect=fake_ensure_pair), \
-            patch("mozyo_bridge.application.commands.os.execvp", side_effect=RuntimeError("attached")):
-            with self.assertRaisesRegex(RuntimeError, "attached"):
-                cmd_open(args)
-
-        self.assertTrue(captured["args"].config_path_was_default)
 
     def test_session_cwd_mismatch_returns_empty_when_no_panes_in_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

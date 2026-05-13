@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 
@@ -22,7 +21,6 @@ from mozyo_bridge.domain.pane_resolver import (
     mark_read,
     pane_info,
     require_read,
-    resolve_agent_label,
     resolve_target,
 )
 from mozyo_bridge.infrastructure.queue_reader import find_handoff_task
@@ -65,9 +63,9 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
     """Auto-startup config loader.
 
     Skips silently when the resolved path is the default and the file is
-    missing, so `open-here` / `tmux-ui-open` / spawn / ensure / notify paths
-    do not block on a missing tmux config. An explicit user-supplied
-    `--config-path` still errors when the file is missing.
+    missing, so bare ``mozyo`` and ``notify-*`` paths do not block on a
+    missing tmux config. An explicit user-supplied ``--config-path`` still
+    errors when the file is missing.
     """
     optional = bool(getattr(args, "config_path_was_default", False))
     return source_tmux_conf(config_path_from_args(args), optional=optional)
@@ -163,23 +161,6 @@ def cmd_keys(args: argparse.Namespace) -> int:
     return 0
 
 
-def new_agent_session(agent: str, session: str, cwd: str | None = None) -> str:
-    require_tmux()
-    if agent not in AGENT_COMMANDS:
-        die(f"unsupported agent: {agent}")
-    args = ["new-session", "-d", "-s", session, "-P", "-F", "#{pane_id}"]
-    if cwd:
-        args.extend(["-c", cwd])
-    args.append(AGENT_COMMANDS[agent])
-    result = run_tmux(*args, check=False)
-    if result.returncode != 0:
-        die(f"tmux new-session failed: {result.stderr.strip() or result.stdout.strip()}")
-    pane_id = result.stdout.strip()
-    if not pane_id:
-        die("tmux new-session did not return a pane id")
-    return pane_id
-
-
 def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
     require_tmux()
     if agent not in AGENT_COMMANDS:
@@ -221,32 +202,6 @@ def list_session_windows(session: str) -> list[str]:
     return [name.strip() for name in result.stdout.splitlines() if name.strip()]
 
 
-def spawn_agent_terminal_pane(
-    agent: str,
-    cwd: str | None = None,
-    vertical: bool = False,
-    target: str | None = None,
-) -> str:
-    require_tmux()
-    if agent not in AGENT_COMMANDS:
-        die(f"unsupported agent: {agent}")
-    split_args = ["split-window", "-P", "-F", "#{pane_id}"]
-    if target:
-        split_args.extend(["-t", target])
-    if not vertical:
-        split_args.append("-h")
-    if cwd:
-        split_args.extend(["-c", cwd])
-    split_args.append(AGENT_COMMANDS[agent])
-    result = run_tmux(*split_args, check=False)
-    if result.returncode != 0:
-        die(f"tmux split-window failed: {result.stderr.strip() or result.stdout.strip()}")
-    pane_id = result.stdout.strip()
-    if not pane_id:
-        die("tmux split-window did not return a pane id")
-    return pane_id
-
-
 def wait_for_agent_terminal_pane(pane_id: str, agent: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -284,100 +239,6 @@ def wait_for_text(target: str, text: str, lines: int, timeout: float) -> bool:
 
 def rollback_unsubmitted_input(target: str) -> None:
     cmd_keys(argparse.Namespace(target=target, keys=["C-u"]))
-
-
-def cmd_spawn(args: argparse.Namespace) -> int:
-    if args.config:
-        load_tmux_conf_for(args)
-    pane_id = spawn_agent_terminal_pane(args.agent, cwd=args.cwd, vertical=args.vertical)
-    if args.ready_timeout:
-        wait_for_agent_terminal_pane(pane_id, args.agent, args.ready_timeout)
-    print(f"spawned {args.agent}: {pane_id}")
-    return 0
-
-
-def cmd_ensure(args: argparse.Namespace) -> int:
-    require_tmux()
-    if args.config:
-        load_tmux_conf_for(args)
-    existing = resolve_agent_label(args.agent, current_session_name())
-    if existing:
-        ensure_agent_target(existing, args.agent, force=args.force)
-        print(f"found {args.agent}: {existing['id']}")
-        return 0
-    pane_id = spawn_agent_terminal_pane(args.agent, cwd=args.cwd, vertical=args.vertical)
-    if args.ready_timeout:
-        wait_for_agent_terminal_pane(pane_id, args.agent, args.ready_timeout)
-    print(f"spawned {args.agent}: {pane_id}")
-    print(
-        f"hint: the new pane lives inside the current window; run "
-        f"`mozyo-bridge init {args.agent}` from that pane to make it an "
-        "agent target, or use bare `mozyo` for one-window-per-agent layout."
-    )
-    return 0
-
-
-def cmd_ensure_pair(args: argparse.Namespace) -> int:
-    """Legacy pane-split pair UI.
-
-    Creates a session whose first window contains both `claude` and `codex`
-    panes side-by-side. Retained for operators still on the pane-split
-    workflow; the resulting panes are not reachable through agent labels
-    until the operator renames their window via `mozyo-bridge init <agent>`.
-    Bare `mozyo` is the standard window-model entrypoint.
-    """
-    require_tmux()
-    config_loaded = False
-    if args.config and session_exists(args.session):
-        load_tmux_conf_for(args)
-        config_loaded = True
-    created: list[str] = []
-    session_pane_ids: set[str] = set()
-    if not session_exists(args.session):
-        claude_pane = new_agent_session("claude", args.session, cwd=args.cwd)
-        created.append(f"claude:{claude_pane}")
-        session_pane_ids.add(claude_pane)
-    if args.config and not config_loaded:
-        load_tmux_conf_for(args)
-    panes_in_session = [
-        pane
-        for pane in pane_lines()
-        if (pane.get("location") or "").split(":", 1)[0] == args.session
-    ]
-    if not any(is_agent_process(p.get("command") or "") for p in panes_in_session if p["id"] not in session_pane_ids):
-        # We do not have a confidence signal that an agent process is already
-        # running here, so spawn a `codex` pane next to the `claude` pane. The
-        # spawn label is informational only; the operator is expected to use
-        # bare `mozyo` for resolvable layouts.
-        codex_pane = spawn_agent_terminal_pane(
-            "codex", cwd=args.cwd, vertical=args.vertical, target=f"{args.session}:0"
-        )
-        created.append(f"codex:{codex_pane}")
-    if args.ready_timeout:
-        for agent in ("claude", "codex"):
-            pane = find_agent_window(agent, args.session)
-            if pane:
-                ensure_agent_target(pane, agent, force=args.force)
-                wait_for_agent_terminal_pane(pane["id"], agent, args.ready_timeout)
-    run_tmux("select-window", "-t", f"{args.session}:0", check=False)
-    result = run_tmux(
-        "list-panes",
-        "-t",
-        f"{args.session}:0",
-        "-F",
-        "#{pane_id}\t#{pane_index}\t#{pane_current_command}\t#{window_name}",
-    )
-    print(f"session={args.session} created={','.join(created) if created else '-'}")
-    print("TARGET\tINDEX\tPROCESS\tWINDOW")
-    print(result.stdout, end="")
-    print(f"attach: tmux attach -t {args.session}")
-    return 0
-
-
-def cmd_setup(args: argparse.Namespace) -> int:
-    args.config = True
-    args.config_path = config_path_from_args(args)
-    return cmd_ensure_pair(args)
 
 
 def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
@@ -437,7 +298,8 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
             die(
                 f"session '{session}' already exists but its panes are outside repo root "
                 f"{repo_root} (cwds: {', '.join(offending)}). "
-                "Re-run from the matching repo root, or use `mozyo-bridge open-here --session NAME` to disambiguate."
+                "Re-run from the matching repo root, or pass an explicit `--session NAME` "
+                "to bare `mozyo` to disambiguate."
             )
     config_path = getattr(args, "config_path", None)
     config_path_was_default = config_path is None
@@ -478,26 +340,6 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     raise AssertionError("unreachable")
 
 
-def cmd_open(args: argparse.Namespace) -> int:
-    require_tmux()
-    if not session_exists(args.session):
-        setup_args = argparse.Namespace(
-            session=args.session,
-            cwd=args.cwd,
-            vertical=args.vertical,
-            config=True,
-            config_path=config_path_from_args(args),
-            config_path_was_default=getattr(args, "config_path_was_default", False),
-            ready_timeout=args.ready_timeout,
-            force=args.force,
-        )
-        cmd_ensure_pair(setup_args)
-    elif args.config:
-        load_tmux_conf_for(args)
-    os.execvp("tmux", ["tmux", "attach", "-t", args.session])
-    raise AssertionError("unreachable")
-
-
 def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:
     """Return the cwds of panes in `session` when none of them are under `repo_root`.
 
@@ -515,28 +357,6 @@ def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:
     if any(cwd_is_under_repo(pane.get("cwd") or "", repo_root) for pane in same_session_panes):
         return []
     return [pane.get("cwd") or "?" for pane in same_session_panes]
-
-
-def cmd_open_here(args: argparse.Namespace) -> int:
-    require_tmux()
-    repo_root = repo_root_from_args(args)
-    user_session = getattr(args, "session", None)
-    if not user_session:
-        derived = repo_root.name
-        if not derived:
-            die("could not derive a session name from repo root; pass --session explicitly")
-        args.session = derived
-    if not getattr(args, "cwd", None):
-        args.cwd = str(repo_root)
-    if not user_session and session_exists(args.session):
-        offending = session_cwd_mismatch(args.session, repo_root)
-        if offending:
-            die(
-                f"session '{args.session}' already exists but its panes are outside repo root "
-                f"{repo_root} (cwds: {', '.join(offending)}). "
-                "Re-run with an explicit --session to disambiguate; this command will not auto-attach."
-            )
-    return cmd_open(args)
 
 
 def resolve_status_session(args: argparse.Namespace) -> str:
@@ -607,14 +427,8 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     validate_notify_gate(args)
     task = None if getattr(args, "journal", None) else find_handoff_task(args, agent)
     target_name = args.target or agent
-    should_ensure = getattr(args, "ensure", False) and not is_tmux_target(target_name)
     if getattr(args, "config", False):
         load_tmux_conf_for(args)
-    if getattr(args, "ensure", False) and not is_tmux_target(target_name) and target_name != agent:
-        die("--ensure only supports the default agent label; omit --target or pass an explicit tmux pane id")
-    if should_ensure and not resolve_agent_label(agent, current_session_name()):
-        pane_id = spawn_agent_terminal_pane(agent, cwd=args.cwd, vertical=args.vertical)
-        wait_for_agent_terminal_pane(pane_id, agent, args.ready_timeout)
     target_info = pane_info(target_name)
     ensure_agent_target(target_info, agent, force=args.force)
     target = target_info["id"]
