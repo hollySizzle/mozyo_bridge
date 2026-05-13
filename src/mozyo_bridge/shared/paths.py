@@ -42,4 +42,3 @@ REPO_ROOT = resolve_repo_root()
 DEFAULT_QUEUE_PATH = default_queue_path(REPO_ROOT)
 DEFAULT_TMUX_CONF = default_tmux_conf(REPO_ROOT)
 READ_MARK_PREFIX = "/tmp/mozyo-bridge-read-"
-LABEL_OPTION = "@agent_name"

@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from mozyo_bridge.shared.errors import die
-from mozyo_bridge.shared.paths import DEFAULT_TMUX_CONF, LABEL_OPTION
+from mozyo_bridge.shared.paths import DEFAULT_TMUX_CONF
 
 
 def run_tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -44,7 +44,7 @@ def source_tmux_conf(path: str | None = None, *, optional: bool = False) -> bool
 def pane_lines() -> list[dict[str, str]]:
     fmt = (
         "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
-        "#{pane_current_command}\t#{@agent_name}\t#{pane_current_path}\t"
+        "#{pane_current_command}\t#{pane_current_path}\t"
         "#{window_name}\t#{pane_active}"
     )
     result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -52,14 +52,13 @@ def pane_lines() -> list[dict[str, str]]:
         die(f"tmux list-panes failed: {result.stderr.strip() or 'no tmux server'}")
     panes: list[dict[str, str]] = []
     for line in result.stdout.splitlines():
-        parts = (line.split("\t", 6) + [""] * 7)[:7]
-        pane_id, location, command, label, cwd, window_name, pane_active = parts
+        parts = (line.split("\t", 5) + [""] * 6)[:6]
+        pane_id, location, command, cwd, window_name, pane_active = parts
         panes.append(
             {
                 "id": pane_id,
                 "location": location,
                 "command": command,
-                "label": label,
                 "cwd": cwd,
                 "window_name": window_name,
                 "pane_active": pane_active,
@@ -79,20 +78,36 @@ def validate_target(target: str) -> None:
         die(f"invalid tmux target: {target}")
 
 
-def pane_label(pane_id: str) -> str:
-    result = run_tmux("display-message", "-t", pane_id, "-p", f"#{{{LABEL_OPTION}}}", check=False)
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
 def pane_location(pane_id: str) -> str:
     result = run_tmux("display-message", "-t", pane_id, "-p", "#{session_name}:#{window_index}.#{pane_index}")
     return result.stdout.strip()
 
 
+def pane_window_name(pane_id: str) -> str:
+    """Return the name of the tmux window containing `pane_id`.
+
+    Window names are the agent-identity rail under the window model. Used by
+    `cmd_message` to label the sender side of the marker header.
+    """
+    result = run_tmux("display-message", "-t", pane_id, "-p", "#{window_name}", check=False)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def rename_window(window_target: str, name: str) -> None:
+    """Rename the tmux window addressed by `window_target` (e.g. `session:idx`).
+
+    Fatal when tmux rejects the request — the caller's contract is that the
+    window is reachable. Used by `cmd_init` to normalize an existing pane's
+    window to an agent name under the window-only model.
+    """
+    result = run_tmux("rename-window", "-t", window_target, name, check=False)
+    if result.returncode != 0:
+        die(
+            f"tmux rename-window failed for {window_target} -> {name}: "
+            f"{result.stderr.strip() or result.stdout.strip() or 'no output'}"
+        )
+
+
 def session_exists(session: str) -> bool:
     result = run_tmux("has-session", "-t", session, check=False)
     return result.returncode == 0
-
-
-def set_pane_label(pane_id: str, label: str) -> None:
-    run_tmux("set-option", "-p", "-t", pane_id, LABEL_OPTION, label)

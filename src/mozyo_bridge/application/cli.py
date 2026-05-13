@@ -14,7 +14,6 @@ from mozyo_bridge.application.commands import (
     cmd_list,
     cmd_message,
     cmd_mozyo,
-    cmd_name,
     cmd_notify_claude,
     cmd_notify_claude_legacy_task,
     cmd_notify_claude_review_result,
@@ -183,11 +182,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("id").set_defaults(func=cmd_id)
 
-    name = sub.add_parser("name")
-    name.add_argument("label")
-    name.add_argument("target", nargs="?")
-    name.set_defaults(func=cmd_name)
-
     resolve = sub.add_parser("resolve")
     resolve.add_argument("target")
     resolve.set_defaults(func=cmd_resolve)
@@ -281,14 +275,16 @@ def build_parser() -> argparse.ArgumentParser:
         notify.add_argument("--type")
         notify.set_defaults(func=func)
 
-    init = sub.add_parser("init")
+    init = sub.add_parser(
+        "init",
+        help=(
+            "Rename the target pane's tmux window to the agent name so it "
+            "becomes resolvable as `claude` / `codex`. Defaults to the "
+            "current pane when no target is given."
+        ),
+    )
     init.add_argument("agent", choices=["claude", "codex"])
     init.add_argument("target", nargs="?")
-    init.add_argument(
-        "--force",
-        action="store_true",
-        help="Clear the @agent_name label from any same-session siblings and relabel the target",
-    )
     init.set_defaults(func=cmd_init)
 
     doctor = sub.add_parser(

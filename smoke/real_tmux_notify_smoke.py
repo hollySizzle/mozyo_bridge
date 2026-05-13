@@ -49,7 +49,14 @@ def main() -> int:
         return 77
 
     session = f"mozyo-bridge-smoke-{os.getpid()}"
-    tmux("new-session", "-d", "-s", session, "-c", str(REPO_ROOT), "bash")
+    # The smoke session has one window; the sender pane lives in that window.
+    # `cmd_message` stamps the sender-side header with the pane's window name
+    # (window-only model, Asana task 1214759644692283), so name the window
+    # `codex` to match the `from:codex` assertion below. All splits inherit
+    # the window name, so receivers spawned later are also in the `codex`
+    # window — that is fine because the smoke targets them via explicit pane
+    # ids and `--force`, not by agent-label resolution.
+    tmux("new-session", "-d", "-s", session, "-n", "codex", "-c", str(REPO_ROOT), "bash")
     try:
         sender = tmux("list-panes", "-t", session, "-F", "#{pane_id}").stdout.splitlines()[0]
         receiver = tmux(
@@ -66,8 +73,6 @@ def main() -> int:
             "-lc",
             "IFS= read -r line; printf 'RECEIVED:%s\\n' \"$line\"; sleep 30",
         ).stdout.strip()
-        tmux("set-option", "-p", "-t", sender, "@agent_name", "codex")
-        tmux("set-option", "-p", "-t", receiver, "@agent_name", "claude")
 
         env = os.environ.copy()
         env["TMUX_PANE"] = sender
@@ -127,7 +132,6 @@ def main() -> int:
             "-lc",
             "IFS= read -r line; printf 'RECEIVED:%s\\n' \"$line\"; sleep 30",
         ).stdout.strip()
-        tmux("set-option", "-p", "-t", message_receiver, "@agent_name", "claude")
         run(*BRIDGE_COMMAND, "read", message_receiver, env=env)
         message_result = run(
             *BRIDGE_COMMAND,

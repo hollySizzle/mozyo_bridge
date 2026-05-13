@@ -333,32 +333,22 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
         info["detail"] = "tmux not installed"
         info["next_action"] = ["install tmux to use mozyo-bridge pane notifications"]
         return info
-    list_result = run_tmux(
-        "list-panes", "-a", "-F", "#{pane_id} #{@agent_name}", check=False
-    )
+    list_result = run_tmux("list-panes", "-a", "-F", "#{pane_id}", check=False)
     if list_result.returncode != 0:
         # Not running under a tmux server. Doctor stays usable outside tmux.
         info["status"] = "skipped"
         info["detail"] = (
-            "not connected to a tmux server (run mozyo-bridge tmux-ui-setup first)"
+            "not connected to a tmux server (run `mozyo` to start the repo session)"
         )
         return info
-    labeled = [
-        line
-        for line in list_result.stdout.splitlines()
-        if len(line.split(" ", 1)) == 2 and line.split(" ", 1)[1]
-    ]
     panes = pane_lines()
     info["panes_total"] = len(list_result.stdout.splitlines())
-    info["labeled_panes"] = len(labeled)
     info["agent_windows"] = {}
-    info["agent_panes"] = {}
-    info["legacy_pane_split"] = []
     info["warnings"] = []
+    next_actions: list[str] = []
 
     # Scope agent checks to the current tmux session. Cross-session panes
-    # are legitimate when the operator keeps parallel project sessions open;
-    # only same-session duplicates indicate a real labeling collision.
+    # are legitimate when the operator keeps parallel project sessions open.
     pane_env = os.environ.get("TMUX_PANE") or ""
     current_session: str | None = None
     if pane_env:
@@ -373,7 +363,6 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
     repo_root_raw = getattr(args, "repo", None) or "."
     repo_root = Path(repo_root_raw).expanduser().resolve()
 
-    # Window-model (standard) per-agent diagnostics, scoped to current session.
     session_panes = (
         [
             pane
@@ -384,9 +373,7 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
         else []
     )
 
-    # First pass: window-model entries (purely structural — no severity yet).
-    window_ok_in_session: dict[str, bool] = {agent: False for agent in AGENT_LABELS}
-    for agent in AGENT_LABELS:
+    for agent in sorted(AGENT_LABELS):
         window_panes = [pane for pane in session_panes if pane.get("window_name") == agent]
         window_indexes = {
             (pane.get("location") or "").split(":", 1)[1].split(".", 1)[0]
@@ -397,6 +384,11 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
             window_entry: dict[str, Any] = {"status": "unscoped"}
         elif not window_panes:
             window_entry = {"status": "missing", "session": current_session}
+            bad = True
+            next_actions.append(
+                f"run `mozyo` from the repo, or `mozyo-bridge init {agent}` from the pane "
+                f"you want to be `{agent}`"
+            )
         elif len(window_indexes) > 1:
             window_entry = {
                 "status": "duplicate",
@@ -404,6 +396,10 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
                 "windows": sorted(window_indexes),
             }
             bad = True
+            next_actions.append(
+                f"resolve duplicate `{agent}` windows in session '{current_session}'; "
+                "tmux tolerates duplicates but the resolver does not"
+            )
         else:
             active = next(
                 (p for p in window_panes if p.get("pane_active") == "1"),
@@ -421,9 +417,12 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
             }
             if window_status != "ok":
                 bad = True
-            else:
-                window_ok_in_session[agent] = True
-            if agent == "claude":
+                next_actions.append(
+                    f"`{agent}` window in session '{current_session}' is running "
+                    f"`{command or '-'}`; start the agent CLI or `mozyo-bridge init "
+                    f"{agent}` on the pane that is"
+                )
+            if agent == "claude" and window_status == "ok":
                 project_skills_dir = repo_root / ".claude" / "skills"
                 if project_skills_dir.exists() and not _cwd_is_under_repo(
                     active.get("cwd", ""), repo_root
@@ -438,113 +437,12 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
                     bad = True
         info["agent_windows"][agent] = window_entry
 
-    # Second pass: compatibility-path (label-based) diagnostics. Pane-split
-    # sessions remain operable through this path; we only flip the section to
-    # ``warning`` when neither the window model nor the compat path provides a
-    # reachable agent target, or when a label co-exists with an agent window in
-    # a different window (genuine mixed-state collision). A pure pane-split
-    # session with healthy labeled panes stays ``ok`` with informational
-    # ``legacy_pane_split`` rows recorded for migration guidance.
-    compat_ok_in_session: dict[str, bool] = {agent: False for agent in AGENT_LABELS}
-    for agent in AGENT_LABELS:
-        all_matches = [pane for pane in panes if pane["label"] == agent]
-        if current_session is not None:
-            in_scope = [
-                pane
-                for pane in all_matches
-                if (pane.get("location") or "").split(":", 1)[0] == current_session
-            ]
-        else:
-            in_scope = []
-        other_count = len(all_matches) - len(in_scope)
-
-        if not in_scope:
-            if current_session is None:
-                entry: dict[str, Any] = {
-                    "status": "unscoped",
-                    "count": len(all_matches),
-                    "panes": [
-                        {"id": p["id"], "location": p.get("location", "")}
-                        for p in all_matches
-                    ],
-                }
-            else:
-                entry = {"status": "missing", "session": current_session}
-                if other_count:
-                    entry["other_sessions"] = other_count
-                    entry["other_panes"] = [
-                        {"id": p["id"], "location": p.get("location", "")}
-                        for p in all_matches
-                    ]
-            info["agent_panes"][agent] = entry
-        elif len(in_scope) > 1:
-            entry = {
-                "status": "duplicate",
-                "count": len(in_scope),
-                "session": current_session,
-                "panes": [
-                    {
-                        "id": p["id"],
-                        "location": p.get("location", ""),
-                        "process": Path(p.get("command") or "").name,
-                        "cwd": p.get("cwd", ""),
-                    }
-                    for p in in_scope
-                ],
-            }
-            if other_count:
-                entry["other_sessions"] = other_count
-            info["agent_panes"][agent] = entry
-            bad = True
-        else:
-            pane = in_scope[0]
-            command = Path(pane["command"]).name
-            pane_status = "ok" if is_agent_process(command) else "not-agent-process"
-            entry = {
-                "status": pane_status,
-                "id": pane["id"],
-                "process": command,
-                "cwd": pane.get("cwd", ""),
-            }
-            if current_session is not None:
-                entry["session"] = current_session
-            if other_count:
-                entry["other_sessions"] = other_count
-            info["agent_panes"][agent] = entry
-            window_name = pane.get("window_name") or ""
-            if window_name and window_name != agent:
-                # Pure compat pane-split sessions stay healthy and only
-                # surface the mismatch as info. A label that lives in a
-                # non-agent-named window WHILE the same agent has a real
-                # window in this session is a genuine mixed-state collision
-                # the resolver would have to disambiguate at runtime.
-                severity = (
-                    "mixed" if window_ok_in_session.get(agent) else "compat"
-                )
-                info["legacy_pane_split"].append(
-                    {
-                        "session": current_session or "",
-                        "window": window_name,
-                        "pane": pane["id"],
-                        "label": agent,
-                        "severity": severity,
-                    }
-                )
-                if severity == "mixed":
-                    bad = True
-            if pane_status == "ok":
-                compat_ok_in_session[agent] = True
-            else:
-                bad = True
-
-    if current_session is not None:
-        # An agent is "reachable" if either the window model or the compat
-        # path resolves cleanly in the current session. If neither does, the
-        # operator has a broken routing target and the section is bad.
-        for agent in AGENT_LABELS:
-            if not (window_ok_in_session[agent] or compat_ok_in_session[agent]):
-                bad = True
-
+    # De-dupe while preserving order so repeated suggestions (e.g. both
+    # agents missing → both producing the bare-`mozyo` hint) collapse.
+    seen: set[str] = set()
+    info["next_action"] = [
+        action for action in next_actions if not (action in seen or seen.add(action))
+    ]
     info["status"] = "ok" if not bad else "warning"
     return info
 
@@ -674,7 +572,6 @@ def format_doctor_text(result: dict[str, Any]) -> str:
         lines.append(f"  TMUX_PANE: {tmux['tmux_pane']}")
     if "panes_total" in tmux:
         lines.append(f"  panes: {tmux['panes_total']}")
-        lines.append(f"  labeled_panes: {tmux['labeled_panes']}")
         if tmux.get("current_session"):
             lines.append(f"  current_session: {tmux['current_session']}")
         for agent, agent_info in tmux.get("agent_windows", {}).items():
@@ -699,42 +596,6 @@ def format_doctor_text(result: dict[str, Any]) -> str:
                     f"  {agent}_window: {agent_info.get('id', '-')} session={session} "
                     f"window={window} process={agent_info.get('process', '-')} status={status}"
                 )
-        for agent, agent_info in tmux.get("agent_panes", {}).items():
-            status = agent_info["status"]
-            other = agent_info.get("other_sessions") or 0
-            suffix = f" other_sessions={other}" if other else ""
-            if status == "missing":
-                session = agent_info.get("session") or "-"
-                lines.append(
-                    f"  {agent}_pane (compat): missing session={session}{suffix}"
-                )
-            elif status == "duplicate":
-                session = agent_info.get("session") or "-"
-                pane_ids = ",".join(p["id"] for p in agent_info.get("panes", []))
-                lines.append(
-                    f"  {agent}_pane (compat): duplicate ({agent_info['count']}) "
-                    f"session={session} panes={pane_ids}{suffix}"
-                )
-            elif status == "unscoped":
-                pane_ids = ",".join(p["id"] for p in agent_info.get("panes", []))
-                lines.append(
-                    f"  {agent}_pane (compat): unscoped ({agent_info['count']}) "
-                    f"panes={pane_ids or '-'} (run from inside a tmux pane to scope)"
-                )
-            else:
-                lines.append(
-                    f"  {agent}_pane (compat): {agent_info['id']} "
-                    f"process={agent_info['process']} status={status}{suffix}"
-                )
-        for entry in tmux.get("legacy_pane_split", []) or []:
-            severity = entry.get("severity") or "compat"
-            lines.append(
-                f"  legacy_pane_split ({severity}): "
-                f"session={entry.get('session') or '-'} "
-                f"window={entry.get('window') or '-'} "
-                f"pane={entry.get('pane') or '-'} "
-                f"label={entry.get('label') or '-'}"
-            )
         for warning in tmux.get("warnings", []):
             if warning["kind"] == "claude_pane_cwd_outside_repo":
                 lines.append(

@@ -79,33 +79,16 @@ def current_session_name() -> str | None:
     return result.stdout.strip() or None
 
 
-def find_labeled_panes(label: str, session: str | None = None, fallback: bool = True) -> list[dict[str, str]]:
-    matches = [pane for pane in pane_lines() if pane["label"] == label]
-    if session:
-        session_matches = [pane for pane in matches if pane["location"].split(":", 1)[0] == session]
-        if session_matches or not fallback:
-            return session_matches
-    return matches
-
-
-def find_labeled_pane(label: str, session: str | None = None, fallback: bool = True) -> dict[str, str] | None:
-    matches = find_labeled_panes(label, session=session, fallback=fallback)
-    if len(matches) > 1:
-        ids = ", ".join(pane["id"] for pane in matches)
-        die(f"multiple panes found with label '{label}': {ids}")
-    return matches[0] if matches else None
-
-
 def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
     """Return the (active) pane of the agent-named window in ``session``.
 
-    Standard path for window-model target resolution: a tmux window whose
-    ``window_name`` equals ``agent`` is the authoritative target, regardless
-    of whether its pane has an ``@agent_name`` label set. Returns ``None``
-    when no window in ``session`` matches. Hard-errors when more than one
-    window in ``session`` is named ``agent`` (defensive: tmux usually keeps
-    window names unique within a session, but a manual ``rename-window``
-    could violate that).
+    Sole runtime resolver for agent identity under the window-only model. A
+    tmux window whose ``window_name`` equals ``agent`` is the authoritative
+    target; the previous ``@agent_name`` user-option fallback has been retired
+    (Asana task 1214759644692283). Returns ``None`` when no window in
+    ``session`` matches. Hard-errors when more than one window in ``session``
+    is named ``agent`` — tmux tolerates duplicates silently, so resolver
+    safety has to fail closed.
     """
     windows: dict[str, list[dict[str, str]]] = {}
     for pane in pane_lines():
@@ -131,49 +114,43 @@ def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
 
 
 def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | None:
-    """Resolve an agent label to its target pane under the window model.
+    """Resolve an agent label to its target pane under the window-only model.
 
-    Standard path: an agent-named tmux window in ``session``.
-    Compatibility path: an agent-labeled pane in ``session`` (used only when
-    no agent-named window exists, e.g. legacy pane-split layouts from
-    ``tmux-ui-open``).
-
-    Returns ``None`` when neither resolves. Cross-session label fallback is
-    intentionally not performed: it has been the root cause of notification
-    mis-routes (Asana task 1214743574772820 comment 1214746077864452).
+    Thin wrapper over :func:`find_agent_window`. Kept as a named entry point
+    so callers (`notify_agent`, `cmd_ensure`, `ensure_repo_session_windows`)
+    do not have to re-derive the rule. There is no compatibility fallback;
+    cross-session resolution stays explicitly absent — it was the documented
+    mis-route root cause (task 1214743574772820 comment 1214746077864452).
     """
     if not session:
         return None
-    window = find_agent_window(agent, session)
-    if window:
-        return window
-    return find_labeled_pane(agent, session=session, fallback=False)
+    return find_agent_window(agent, session)
 
 
 def resolve_target(target: str) -> str:
     if is_tmux_target(target):
         validate_target(target)
         return target
-    session = current_session_name()
-    if target in AGENT_LABELS:
-        if not session:
-            die(
-                f"cannot resolve agent label '{target}' outside a tmux session; "
-                "run from inside the repo session or pass an explicit tmux pane id"
-            )
-        pane = resolve_agent_label(target, session)
-        if pane:
-            return pane["id"]
+    if target not in AGENT_LABELS:
         die(
-            f"no {target} target found in session '{session}'. "
-            f"Run `mozyo` to ensure the repo-scoped session, or `mozyo-bridge init {target}` "
-            "on the right pane."
+            f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
+            "location (`session:window.pane`), or an agent label "
+            f"({', '.join(sorted(AGENT_LABELS))})."
         )
-        raise AssertionError("unreachable")
-    pane = find_labeled_pane(target, session=session)
+    session = current_session_name()
+    if not session:
+        die(
+            f"cannot resolve agent label '{target}' outside a tmux session; "
+            "run from inside the repo session or pass an explicit tmux pane id"
+        )
+    pane = resolve_agent_label(target, session)
     if pane:
         return pane["id"]
-    die(f"no pane label found: {target}")
+    die(
+        f"no {target} window found in session '{session}'. "
+        f"Run `mozyo` to ensure the repo-scoped session, or `mozyo-bridge init {target}` "
+        "on the right pane to rename its window."
+    )
     raise AssertionError("unreachable")
 
 
@@ -191,15 +168,23 @@ def is_agent_process(command: str) -> bool:
     return name in AGENT_PROCESSES or VERSIONED_NATIVE_BINARY_RE.fullmatch(name) is not None
 
 
-def ensure_agent_target(pane: dict[str, str], expected_label: str, force: bool = False) -> None:
+def ensure_agent_target(pane: dict[str, str], expected_agent: str, force: bool = False) -> None:
+    """Confirm `pane` belongs to `expected_agent` under the window-only model.
+
+    Identity is established by the resolver (the pane came out of the
+    `<agent>`-named window). This guard only verifies that the pane is
+    actually running an agent process, so a stray `zsh` or `bash` pane that
+    accidentally lives inside a `claude` / `codex` window does not get
+    notification input. `--force` lets the operator override for explicit
+    out-of-band sends.
+    """
     if force:
         return
-    label = pane.get("label") or ""
     command = Path(pane.get("command") or "").name
-    if label == expected_label and is_agent_process(command):
+    if is_agent_process(command):
         return
     die(
         "target pane does not look like an agent pane; "
-        f"label={label or '-'} process={command or '-'} expected_label={expected_label}. "
+        f"process={command or '-'} expected_agent={expected_agent}. "
         "Use --force only for an explicit operator-approved send."
     )
