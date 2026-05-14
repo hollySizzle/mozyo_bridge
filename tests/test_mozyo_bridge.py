@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -5815,6 +5816,406 @@ class PluginMarketplaceTest(unittest.TestCase):
             (self.plugin_skill_dir / "SKILL.md").is_file(),
             "plugin must ship SKILL.md so Claude Code can discover the skill after install",
         )
+
+
+class ReleaseHelperParserTest(unittest.TestCase):
+    """The contract-admitted release helper subcommands must round-trip
+    through ``build_parser``. Argparse will raise SystemExit if a required
+    flag is missing or a subparser was wired wrong, so this is a cheap
+    structural check that ``release check`` / ``release workflow`` exist as
+    documented in `release-helper-contract.md`.
+    """
+
+    def parse(self, *argv: str) -> argparse.Namespace:
+        return build_parser().parse_args(list(argv))
+
+    def test_release_check_tree(self) -> None:
+        args = self.parse("release", "check", "tree")
+        from mozyo_bridge.application.release import cmd_release_check_tree
+
+        self.assertIs(args.func, cmd_release_check_tree)
+
+    def test_release_check_scaffold(self) -> None:
+        args = self.parse("release", "check", "scaffold")
+        from mozyo_bridge.application.release import cmd_release_check_scaffold
+
+        self.assertIs(args.func, cmd_release_check_scaffold)
+
+    def test_release_check_artifact(self) -> None:
+        args = self.parse("release", "check", "artifact")
+        from mozyo_bridge.application.release import cmd_release_check_artifact
+
+        self.assertIs(args.func, cmd_release_check_artifact)
+
+    def test_release_check_workflow_requires_run_id(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "check", "workflow")
+        args = self.parse("release", "check", "workflow", "--run-id", "42")
+        from mozyo_bridge.application.release import cmd_release_check_workflow
+
+        self.assertIs(args.func, cmd_release_check_workflow)
+        self.assertEqual("42", args.run_id)
+
+    def test_release_workflow_runs_requires_workflow(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "workflow", "runs")
+        args = self.parse("release", "workflow", "runs", "--workflow", "testpypi.yml")
+        from mozyo_bridge.application.release import cmd_release_workflow_runs
+
+        self.assertIs(args.func, cmd_release_workflow_runs)
+        self.assertEqual("testpypi.yml", args.workflow)
+        self.assertEqual(10, args.limit)
+
+    def test_release_workflow_wait_requires_run_id_and_timeout(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "workflow", "wait", "--run-id", "42")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "workflow", "wait", "--timeout", "10")
+        args = self.parse(
+            "release",
+            "workflow",
+            "wait",
+            "--run-id",
+            "42",
+            "--timeout",
+            "30",
+        )
+        from mozyo_bridge.application.release import cmd_release_workflow_wait
+
+        self.assertIs(args.func, cmd_release_workflow_wait)
+        self.assertEqual("42", args.run_id)
+        self.assertEqual(30.0, args.timeout)
+
+    def test_release_check_subparser_requires_subcommand(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "check")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "workflow")
+
+
+class ReleaseCheckTreeTest(unittest.TestCase):
+    """`release check tree` runs three git probes inside a real git repo and
+    is strict-fail on the git grep blocker pattern. The tests build a tiny
+    git checkout with `subprocess`, then verify both clean and blocker exit
+    codes against real git behavior — no subprocess mocking, so the regex
+    and pathspec wiring stay honest.
+    """
+
+    def _init_repo(self, root: Path) -> None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init", "-q"],
+            check=True,
+            env=env,
+        )
+
+    def _commit_file(self, root: Path, rel: str, body: str) -> None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", rel], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", f"add {rel}", "-q"],
+            check=True,
+            env=env,
+        )
+
+    def test_clean_tree_returns_zero(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "README.md", "Hello world\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("result: clean", out.getvalue())
+
+    def test_personal_path_in_tracked_file_is_blocker(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            personal_path = "/Users" + "/example/project"
+            self._commit_file(root, "AGENTS.md", f"see {personal_path} for context\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn(personal_path, out.getvalue())
+            self.assertIn("result: blocker", out.getvalue())
+
+    def test_pathspec_excludes_skip_generated_trees(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            # Files inside excluded pathspecs (build/, dist/, tmp/) must not
+            # trigger the blocker even if they contain personal paths, so
+            # the helper does not flag artifacts that will be rebuilt or
+            # excluded from publication anyway.
+            personal_path = "/Users" + "/example/leak"
+            self._commit_file(root, "build/log.txt", f"{personal_path}\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("result: clean", out.getvalue())
+
+
+class ReleaseCheckScaffoldTest(unittest.TestCase):
+    def test_scaffold_check_uses_isolated_home_and_targets(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = release_mod.cmd_release_check_scaffold(argparse.Namespace())
+        # Fresh scaffold smoke runs against an isolated home / target every
+        # invocation. On a healthy package it must report clean for all
+        # presets and exit zero.
+        self.assertEqual(release_mod.EXIT_CLEAN, rc, msg=out.getvalue())
+        text = out.getvalue()
+        for preset in ("asana", "redmine", "none"):
+            self.assertIn(f"scaffold status: clean ({preset})", text)
+
+
+class ReleaseCheckArtifactTest(unittest.TestCase):
+    """The `release check` family is contractually read-only: invocations
+    must not mutate the repo worktree (including the repo's ``dist/``
+    directory). This test locks in that invariant by setting up a sentinel
+    file in a fake repo's dist/, mocking ``python -m build``, and asserting
+    (a) the sentinel survives, (b) ``--outdir`` is passed to build, and
+    (c) the outdir lives outside the repo root.
+    """
+
+    def test_does_not_mutate_repo_dist_directory(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as repo_str:
+            repo = Path(repo_str).resolve()
+            (repo / "dist").mkdir()
+            sentinel = repo / "dist" / "preexisting.whl"
+            sentinel.write_bytes(b"preexisting")
+
+            recorded: list[dict] = []
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                recorded.append(
+                    {"argv": list(argv), "cwd": str(cwd) if cwd else None}
+                )
+                # Pretend build succeeded but wrote nothing to the outdir.
+                # The helper's no-mutation invariant is what we're testing;
+                # producing no artifacts just routes us through the
+                # `no artifacts` blocker path, which is fine for this test.
+                outdir = argv[argv.index("--outdir") + 1]
+                Path(outdir).mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = release_mod.cmd_release_check_artifact(
+                        argparse.Namespace(repo=str(repo))
+                    )
+
+            self.assertTrue(
+                sentinel.exists(),
+                "release check artifact mutated the repo's dist/ directory",
+            )
+            build_calls = [c for c in recorded if "build" in c["argv"]]
+            self.assertEqual(1, len(build_calls), msg=recorded)
+            argv = build_calls[0]["argv"]
+            self.assertIn("--outdir", argv)
+            outdir = Path(argv[argv.index("--outdir") + 1]).resolve()
+            try:
+                outdir.relative_to(repo)
+                inside_repo = True
+            except ValueError:
+                inside_repo = False
+            self.assertFalse(
+                inside_repo,
+                f"--outdir {outdir} must not live inside repo {repo}",
+            )
+            # rc is blocker because the mocked build produced no artifacts;
+            # the load-bearing assertions are the sentinel + outdir checks
+            # above.
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+
+
+class ReleaseCheckWorkflowTest(unittest.TestCase):
+    def test_success_exits_zero(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        payload = {
+            "status": "completed",
+            "conclusion": "success",
+            "workflowName": "Test",
+            "headSha": "abc123",
+            "htmlUrl": "https://example/run/42",
+        }
+        with patch.object(release_mod, "_gh_run_view", return_value=payload):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_workflow(
+                    argparse.Namespace(run_id="42")
+                )
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertIn("status: completed", out.getvalue())
+        self.assertIn("conclusion: success", out.getvalue())
+
+    def test_failure_exits_non_zero(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        payload = {
+            "status": "completed",
+            "conclusion": "failure",
+            "workflowName": "Test",
+            "headSha": "abc123",
+            "htmlUrl": "https://example/run/42",
+        }
+        with patch.object(release_mod, "_gh_run_view", return_value=payload):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = release_mod.cmd_release_check_workflow(
+                    argparse.Namespace(run_id="42")
+                )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+
+    def test_in_progress_exits_non_zero(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        payload = {
+            "status": "in_progress",
+            "conclusion": None,
+            "workflowName": "Test",
+            "headSha": "abc123",
+            "htmlUrl": "https://example/run/42",
+        }
+        with patch.object(release_mod, "_gh_run_view", return_value=payload):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = release_mod.cmd_release_check_workflow(
+                    argparse.Namespace(run_id="42")
+                )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+
+
+class ReleaseWorkflowRunsTest(unittest.TestCase):
+    def test_runs_listing_renders_columns(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        runs = [
+            {
+                "databaseId": 1,
+                "createdAt": "2026-05-14T00:00:00Z",
+                "status": "completed",
+                "conclusion": "success",
+                "headSha": "abc",
+                "url": "https://example/1",
+            },
+            {
+                "databaseId": 2,
+                "createdAt": "2026-05-14T01:00:00Z",
+                "status": "in_progress",
+                "conclusion": None,
+                "headSha": "def",
+                "url": "https://example/2",
+            },
+        ]
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(runs), stderr=""
+        )
+        with patch.object(release_mod, "_run", return_value=completed):
+            with patch.object(release_mod, "_require_command"):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = release_mod.cmd_release_workflow_runs(
+                        argparse.Namespace(workflow="testpypi.yml", limit=10)
+                    )
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        text = out.getvalue()
+        self.assertIn("RUN_ID\tCREATED_AT\tSTATUS\tCONCLUSION\tHEAD_SHA\tHTML_URL", text)
+        self.assertIn("1\t2026-05-14T00:00:00Z\tcompleted\tsuccess\tabc\thttps://example/1", text)
+        self.assertIn("2\t2026-05-14T01:00:00Z\tin_progress\t\tdef\thttps://example/2", text)
+
+
+class ReleaseWorkflowWaitTest(unittest.TestCase):
+    def test_wait_returns_zero_when_run_completes_successfully(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        sequence = [
+            {"status": "in_progress", "conclusion": None},
+            {"status": "completed", "conclusion": "success"},
+        ]
+        with patch.object(release_mod, "_gh_run_view", side_effect=sequence):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod.time, "sleep"):
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_workflow_wait(
+                            argparse.Namespace(run_id="42", timeout=30.0, poll=0.0)
+                        )
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertIn("conclusion: success", out.getvalue())
+
+    def test_wait_returns_timeout_code_when_deadline_elapses(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with patch.object(
+            release_mod,
+            "_gh_run_view",
+            return_value={"status": "in_progress", "conclusion": None},
+        ):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod.time, "sleep"):
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_workflow_wait(
+                            argparse.Namespace(
+                                run_id="42", timeout=0.0, poll=0.0
+                            )
+                        )
+        self.assertEqual(release_mod.EXIT_TIMEOUT, rc)
+        self.assertIn("timeout: exceeded", out.getvalue())
+
+    def test_wait_returns_blocker_when_run_fails(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with patch.object(
+            release_mod,
+            "_gh_run_view",
+            return_value={"status": "completed", "conclusion": "failure"},
+        ):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod.time, "sleep"):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = release_mod.cmd_release_workflow_wait(
+                            argparse.Namespace(
+                                run_id="42", timeout=30.0, poll=0.0
+                            )
+                        )
+        self.assertEqual(release_mod.EXIT_BLOCKER, rc)
 
 
 if __name__ == "__main__":

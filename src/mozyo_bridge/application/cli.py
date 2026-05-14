@@ -29,6 +29,14 @@ from mozyo_bridge.application.commands import (
     cmd_status,
     cmd_type,
 )
+from mozyo_bridge.application.release import (
+    cmd_release_check_artifact,
+    cmd_release_check_scaffold,
+    cmd_release_check_tree,
+    cmd_release_check_workflow,
+    cmd_release_workflow_runs,
+    cmd_release_workflow_wait,
+)
 from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     MODE_STANDARD,
@@ -401,6 +409,128 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
     scaffold_status.add_argument("--json", action="store_true", help="Emit structured JSON output instead of human-readable text")
     scaffold_status.set_defaults(func=cmd_scaffold_status)
+
+    release = sub.add_parser(
+        "release",
+        help=(
+            "Read-only release helper surfaces (`check tree|scaffold|"
+            "artifact|workflow`, `workflow runs|wait`). Helpers do not "
+            "dispatch workflows, bump versions, commit, push, tag, or "
+            "create GitHub releases."
+        ),
+    )
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+
+    release_check = release_sub.add_parser(
+        "check",
+        help="Read-only release guardrail checks (tree / scaffold / artifact / workflow)",
+    )
+    release_check_sub = release_check.add_subparsers(
+        dest="release_check_command", required=True
+    )
+
+    release_check_tree = release_check_sub.add_parser(
+        "tree",
+        help=(
+            "Run Source Tree Hygiene from release-flow.md. Strict-fail on "
+            "personal home paths or secret-shape tokens in tracked files."
+        ),
+    )
+    add_repo_option(release_check_tree)
+    release_check_tree.set_defaults(func=cmd_release_check_tree)
+
+    release_check_scaffold = release_check_sub.add_parser(
+        "scaffold",
+        help=(
+            "Run Fresh Scaffold Smoke for every preset in an isolated home "
+            "and target. Strict-fail on host-path leakage, missing portable "
+            "rule path, or scaffold-status drift."
+        ),
+    )
+    release_check_scaffold.set_defaults(func=cmd_release_check_scaffold)
+
+    release_check_artifact = release_check_sub.add_parser(
+        "artifact",
+        help=(
+            "Run python -m build, extract every produced artifact, and scan "
+            "for personal home paths and secret-shape tokens. Strict-fail on "
+            "any match; the operator records false-positive disposition in "
+            "Asana before re-running."
+        ),
+    )
+    add_repo_option(release_check_artifact)
+    release_check_artifact.set_defaults(func=cmd_release_check_artifact)
+
+    release_check_workflow = release_check_sub.add_parser(
+        "workflow",
+        help=(
+            "Fetch a single GitHub Actions run's status and conclusion via "
+            "`gh run view`. No dispatch, no judgment; success exits 0 and "
+            "every other state exits non-zero."
+        ),
+    )
+    release_check_workflow.add_argument(
+        "--run-id",
+        dest="run_id",
+        required=True,
+        help="GitHub Actions run id to inspect (databaseId, not the URL fragment)",
+    )
+    release_check_workflow.set_defaults(func=cmd_release_check_workflow)
+
+    release_workflow = release_sub.add_parser(
+        "workflow",
+        help="GitHub Actions polling / summary helpers (read-only)",
+    )
+    release_workflow_sub = release_workflow.add_subparsers(
+        dest="release_workflow_command", required=True
+    )
+
+    release_workflow_runs = release_workflow_sub.add_parser(
+        "runs",
+        help=(
+            "List the most recent runs of a workflow with created_at / "
+            "status / conclusion / head_sha / html_url."
+        ),
+    )
+    release_workflow_runs.add_argument(
+        "--workflow",
+        required=True,
+        help="Workflow file name or id (e.g. `testpypi.yml`, `publish.yml`, `Test`)",
+    )
+    release_workflow_runs.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of runs to list (default 10)",
+    )
+    release_workflow_runs.set_defaults(func=cmd_release_workflow_runs)
+
+    release_workflow_wait = release_workflow_sub.add_parser(
+        "wait",
+        help=(
+            "Poll a single run-id until it reaches `completed` or until "
+            "--timeout elapses. Resumable; no judgment. Exit 124 on timeout."
+        ),
+    )
+    release_workflow_wait.add_argument(
+        "--run-id",
+        dest="run_id",
+        required=True,
+        help="GitHub Actions run id to wait on",
+    )
+    release_workflow_wait.add_argument(
+        "--timeout",
+        type=float,
+        required=True,
+        help="Maximum seconds to wait before exiting with code 124",
+    )
+    release_workflow_wait.add_argument(
+        "--poll",
+        type=float,
+        default=5.0,
+        help="Polling interval in seconds (default 5.0)",
+    )
+    release_workflow_wait.set_defaults(func=cmd_release_workflow_wait)
     return parser
 
 
