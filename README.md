@@ -44,6 +44,40 @@ The short alias is available for local interactive use:
 mozyo <command>
 ```
 
+### Bootstrap ownership and local secrets
+
+For bootstrap and day-1 setup, treat this repository and any shared-drive copy of
+it as the **distribution source**, not as the place where machine-local secrets
+live.
+
+Keep in the repo / shared-drive copy:
+
+- portable config and bootstrap docs
+- scaffold/rules sources
+- install / doctor / bootstrap helper scripts
+
+Keep only on each local machine:
+
+- `auth.json`
+- `~/.mcp-auth/`
+- Asana OAuth tokens / refresh state
+- client secrets or any other user-specific credentials
+
+Do not commit or sync the local-secret files above back into the repository or a
+shared-drive bootstrap bundle.
+
+### Asana OAuth note
+
+Asana OAuth is only required on machines that will actually use the Asana
+connector / MCP-backed Asana workflow. A plain CLI install, rules install,
+scaffold, or `doctor` run does not by itself provision Asana credentials.
+
+When a bootstrap or day-2 workflow reaches an Asana-backed step, the
+user/operator must complete the OAuth/login flow in that local environment and
+leave the resulting credentials on that machine only. `mozyo-bridge` docs may
+point at the Asana workflow, but the OAuth state is not part of the portable
+bootstrap payload.
+
 ### Daily entrypoint: bare `mozyo`
 
 The fastest way to start a Claude / Codex pair in a repo is to run `mozyo` with no subcommand:
