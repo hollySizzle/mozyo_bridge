@@ -52,6 +52,8 @@ Use handoff only when the active project workflow or the user explicitly asks fo
 
 Pane messages are notification edges in this lifecycle. They are not review passes, task completion, release approval, or the work log.
 
+A project-local rule that requires the sender to notify the receiver for every handoff of a given direction applies to every task in that scope, including audit-only, revalidation, and doc-only tasks; the "every" is not relaxed by how the task is framed, by the receiver's prior pickup-intent statement (for example "I will pull from the task record"), or by the sender's judgement that the receiver will read the durable record anyway. Skipping the notification on that basis is a sender-side rationalization, not a satisfied condition.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

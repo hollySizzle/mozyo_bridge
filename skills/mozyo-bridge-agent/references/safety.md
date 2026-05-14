@@ -33,6 +33,8 @@ When asking another agent to work through `mozyo-bridge`, the sending agent shou
 
 Do not keep polling or watching the target pane as standard practice. After the handoff is delivered, rely on the durable source of truth named in the request, normally Asana task comments, repository changes, or an explicit completion notification from the target agent.
 
+When a project's central preset or rule mandates a sender notification for every handoff of a given direction, that requirement is not relaxed by audit-only, revalidation, or doc-only framing of the task, nor by the receiver's prior pickup-intent statement; the sender must attempt the notification on every such handoff. Recording an "un-notified" state without first attempting the standard-path notification is a sender-side rationalization, not a satisfied fallback condition.
+
 ## Result Notification Boundary
 
 Writing the durable result is necessary but not always sufficient for a handoff. When work or audit began from another agent's request, notify that sender after recording the result so they know to read the durable source of truth.
