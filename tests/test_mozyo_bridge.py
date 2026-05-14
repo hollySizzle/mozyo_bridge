@@ -1898,6 +1898,9 @@ class MessageContractTest(unittest.TestCase):
 
 class WaitForTextContractTest(unittest.TestCase):
     def test_detects_marker_split_by_tui_wrap(self) -> None:
+        """word-boundary wrap compat: short marker that contains whitespace,
+        wrapped at a space and re-joined via the `\\n\\s+` -> ' ' normalize.
+        Covers the original `mozyo-bridge message` marker shape."""
         from mozyo_bridge.application import commands as commands_mod
 
         marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
@@ -1909,7 +1912,33 @@ class WaitForTextContractTest(unittest.TestCase):
                 patch.object(commands_mod.time, "sleep"):
             self.assertTrue(commands_mod.wait_for_text("%2", marker, 200, 0.01))
 
+    def test_detects_long_no_space_marker_split_by_character_wrap(self) -> None:
+        """character-wrap compat: long no-space marker (`mozyo-bridge handoff`
+        primitive shape) wrapped at arbitrary character boundaries by codex
+        TUI, re-joined via the `\\n\\s+` -> '' normalize. Reproducer hex shape
+        was confirmed against the real codex pane at 2026-05-13 (pane width
+        50, wrap separator `\\n` + 3 spaces). The space-substitution path
+        cannot match this shape because the original marker contains no
+        whitespace; only empty-substitution reconstructs the original."""
+        from mozyo_bridge.application import commands as commands_mod
+
+        marker = (
+            "[mozyo:handoff:source=asana:task=1214760547941073:"
+            "comment=1214764579019987:kind=review_request:to=codex]"
+        )
+        wrapped = (
+            "› [mozyo:handoff:source=asana:task=12147605479410\n"
+            "   73:comment=1214764579019987:kind=review_request\n"
+            "   :to=codex]\n"
+        )
+        with patch.object(commands_mod, "capture_pane", return_value=wrapped), \
+                patch.object(commands_mod.time, "sleep"):
+            self.assertTrue(commands_mod.wait_for_text("%2", marker, 200, 0.01))
+
     def test_returns_false_when_marker_genuinely_absent(self) -> None:
+        """fail-closed maintained: when the marker is not present in any of
+        raw / space-normalized / empty-normalized captures, the function
+        returns False so the rollback contract still triggers."""
         from mozyo_bridge.application import commands as commands_mod
 
         marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"
@@ -1918,7 +1947,29 @@ class WaitForTextContractTest(unittest.TestCase):
                 patch.object(commands_mod.time, "sleep"):
             self.assertFalse(commands_mod.wait_for_text("%2", marker, 200, 0.01))
 
+    def test_returns_false_when_long_handoff_marker_genuinely_absent(self) -> None:
+        """fail-closed maintained on the new character-wrap path: empty-string
+        substitution must not create accidental matches against unrelated
+        wrapped content that just happens to share substrings around indent
+        boundaries."""
+        from mozyo_bridge.application import commands as commands_mod
+
+        marker = (
+            "[mozyo:handoff:source=asana:task=1214760547941073:"
+            "comment=1214764579019987:kind=review_request:to=codex]"
+        )
+        unrelated_wrapped = (
+            "› [mozyo:handoff:source=asana:task=99999999999999\n"
+            "   99:comment=88888888888888:kind=reply:to=claude]\n"
+        )
+        with patch.object(commands_mod, "capture_pane", return_value=unrelated_wrapped), \
+                patch.object(commands_mod.time, "sleep"):
+            self.assertFalse(commands_mod.wait_for_text("%2", marker, 200, 0.01))
+
     def test_matches_raw_unwrapped_marker_unchanged(self) -> None:
+        """raw substring fast-path: when the marker is present without wrap,
+        the function returns True via the raw `in` check before normalization
+        runs, preserving the cheapest match path."""
         from mozyo_bridge.application import commands as commands_mod
 
         marker = "[mozyo-bridge from:codex pane:%1 at:agents:0.0]"

@@ -237,21 +237,35 @@ _WRAP_INDENT = re.compile(r"\n\s+")
 
 
 def wait_for_text(target: str, text: str, lines: int, timeout: float) -> bool:
-    # Receiver TUIs (codex CLI, Claude Code) word-wrap long input at the
-    # visible pane width, emitting a literal newline + continuation indent
-    # inside the captured text. tmux capture-pane -J only rejoins lines
-    # tmux itself wrapped, so a raw substring search would miss a marker
-    # split by the TUI wrap even though it landed cleanly on the wire.
-    # Try the raw match first (cheap, scrollback-safe); fall back to a
-    # wrap-normalized match before declaring the marker absent. Both paths
-    # still return False when the marker is genuinely missing, preserving
-    # the fail-closed rollback contract.
+    # Receiver TUIs (codex CLI, Claude Code) wrap long input at the visible
+    # pane width, emitting a literal newline + continuation indent inside
+    # the captured text. tmux capture-pane -J only rejoins lines tmux itself
+    # wrapped, so a raw substring search would miss a marker split by the
+    # TUI wrap even though it landed cleanly on the wire.
+    #
+    # Two wrap shapes are observed in practice and require different
+    # normalize functions:
+    #   1. word-boundary wrap (`mozyo-bridge message` markers like
+    #      `[mozyo-bridge from:claude pane:%110 at:mozyo_bridge:2.0]`,
+    #      ~60 chars, contain whitespace) — TUI wraps at a space, so
+    #      collapsing `\n\s+` into a single ` ` reconstructs the original.
+    #   2. character-wrap (`mozyo-bridge handoff` markers like
+    #      `[mozyo:handoff:source=asana:task=...:comment=...:kind=...:to=...]`,
+    #      100+ chars, contain no whitespace) — TUI wraps at an arbitrary
+    #      character boundary, so the only normalize that reconstructs the
+    #      original is collapsing `\n\s+` to the empty string.
+    # Try the raw match first (cheap, scrollback-safe), then both wrap
+    # normalizes before declaring the marker absent. All three paths still
+    # return False when the marker is genuinely missing, preserving the
+    # fail-closed rollback contract.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         captured = capture_pane(target, lines)
         if text in captured:
             return True
         if text in _WRAP_INDENT.sub(" ", captured):
+            return True
+        if text in _WRAP_INDENT.sub("", captured):
             return True
         time.sleep(0.2)
     return False
