@@ -9,6 +9,11 @@ It is only a notification transport. Redmine remains the source of truth for rev
 
 ## Quick Start
 
+> First-time install + project bootstrap, executed end-to-end by Claude / Codex agents,
+> is documented in `vibes/docs/logics/bootstrap.md`. Read that doc to follow the
+> install → rules → skill → scaffold → doctor stages in strict order. The sections
+> below are operator-facing reference material for the individual commands.
+
 Install the CLI:
 
 ```bash
@@ -411,6 +416,7 @@ mozyo-bridge doctor
 ## Documentation Map
 
 - `README.md`: user-facing install, core commands, and safety summary.
+- `vibes/docs/logics/bootstrap.md`: canonical LLM-first bootstrap guide. Strict stage order from a clean machine through a verified scaffold (install → rules → skill → scaffold → doctor → isolated smoke). Read this first for end-to-end setup.
 - `vibes/docs/rules/agent-workflow.md`: AI agent work rules for this repository.
 - `vibes/docs/specs/project-map.md`: repository structure and source-of-truth routing.
 - `vibes/docs/logics/skill-distribution.md`: Claude/Codex skill layout and install logic.
