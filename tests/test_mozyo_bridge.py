@@ -6218,5 +6218,530 @@ class ReleaseWorkflowWaitTest(unittest.TestCase):
         self.assertEqual(release_mod.EXIT_BLOCKER, rc)
 
 
+class ReleaseBumpPublishParserTest(unittest.TestCase):
+    """The bump/publish CLI must enforce mutually-exclusive mode flags and
+    pass through per-mode args. Argparse will raise on the missing/
+    conflicting-mode cases below if the wiring is wrong, so this is a cheap
+    structural check.
+    """
+
+    def parse(self, *argv: str) -> argparse.Namespace:
+        return build_parser().parse_args(list(argv))
+
+    def test_release_bump_requires_mode(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "bump")
+
+    def test_release_bump_mode_is_mutually_exclusive(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "bump", "--check", "--to", "0.3.0")
+
+    def test_release_bump_check(self) -> None:
+        args = self.parse("release", "bump", "--check")
+        from mozyo_bridge.application.release import cmd_release_bump
+
+        self.assertIs(args.func, cmd_release_bump)
+        self.assertTrue(args.check)
+        self.assertIsNone(args.to)
+
+    def test_release_bump_to(self) -> None:
+        args = self.parse("release", "bump", "--to", "0.3.0a1")
+        from mozyo_bridge.application.release import cmd_release_bump
+
+        self.assertIs(args.func, cmd_release_bump)
+        self.assertFalse(args.check)
+        self.assertEqual("0.3.0a1", args.to)
+
+    def test_release_publish_requires_mode(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "publish")
+
+    def test_release_publish_mode_is_mutually_exclusive(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("release", "publish", "--testpypi", "--pypi")
+
+    def test_release_publish_testpypi(self) -> None:
+        args = self.parse(
+            "release", "publish", "--testpypi", "--version", "0.3.0a1"
+        )
+        self.assertTrue(args.testpypi)
+        self.assertEqual("0.3.0a1", args.version)
+        self.assertFalse(args.execute)
+
+    def test_release_publish_pypi_dryrun(self) -> None:
+        args = self.parse(
+            "release",
+            "publish",
+            "--pypi",
+            "--tag",
+            "v0.3.0",
+            "--notes-file",
+            "/tmp/notes.md",
+        )
+        self.assertTrue(args.pypi)
+        self.assertEqual("v0.3.0", args.tag)
+        self.assertEqual("/tmp/notes.md", args.notes_file)
+        self.assertFalse(args.execute)
+
+    def test_release_publish_pypi_execute(self) -> None:
+        args = self.parse(
+            "release",
+            "publish",
+            "--pypi",
+            "--tag",
+            "v0.3.0",
+            "--notes-file",
+            "/tmp/notes.md",
+            "--execute",
+        )
+        self.assertTrue(args.execute)
+
+    def test_release_publish_plan(self) -> None:
+        args = self.parse("release", "publish", "--plan")
+        self.assertTrue(args.plan)
+
+
+class ReleaseBumpCheckTest(unittest.TestCase):
+    """`release bump --check` must (a) read the mirror set from the contract
+    doc, (b) report version literals from each mirror file, (c) strict-fail
+    when the mirror values disagree. Tests build a fake repo with both a
+    contract doc and the mirror-set files.
+    """
+
+    def _build_fake_repo(
+        self,
+        root: Path,
+        *,
+        pyproject_version: str = "0.3.0",
+        module_version: str = "0.3.0",
+    ) -> None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "fake"\nversion = "{pyproject_version}"\n',
+            encoding="utf-8",
+        )
+        module_dir = root / "src" / "mozyo_bridge"
+        module_dir.mkdir(parents=True)
+        (module_dir / "__init__.py").write_text(
+            f'__version__ = "{module_version}"\n', encoding="utf-8"
+        )
+        contract_dir = root / "vibes" / "docs" / "logics"
+        contract_dir.mkdir(parents=True)
+        (contract_dir / "release-helper-contract.md").write_text(
+            "# Contract\n\n"
+            "release-version mirror set は以下の 2 file に固定する。\n\n"
+            "- `pyproject.toml` の `[project].version`\n"
+            "- `src/mozyo_bridge/__init__.py` の `__version__`\n\n"
+            "Other section.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "add", "."],
+            check=True,
+            env=env,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "Release v" + pyproject_version, "-q"],
+            check=True,
+            env=env,
+        )
+
+    def test_clean_check_reports_each_mirror_file(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(root, pyproject_version="0.3.0", module_version="0.3.0")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_bump(
+                    argparse.Namespace(repo=str(root), check=True, to=None)
+                )
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            text = out.getvalue()
+            self.assertIn("pyproject.toml", text)
+            self.assertIn("[project].version", text)
+            self.assertIn("src/mozyo_bridge/__init__.py", text)
+            self.assertIn("__version__", text)
+            self.assertIn("0.3.0", text)
+            self.assertIn("result: clean", text)
+
+    def test_mirror_set_drift_is_blocker(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(
+                root, pyproject_version="0.3.0", module_version="0.2.9"
+            )
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_bump(
+                    argparse.Namespace(repo=str(root), check=True, to=None)
+                )
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("mirror set values disagree", out.getvalue())
+
+    def test_contract_missing_anchor_is_fatal(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(root)
+            # Strip the anchor sentence from the contract doc. The helper
+            # must refuse to operate rather than guess at the mirror set.
+            contract_path = root / "vibes" / "docs" / "logics" / "release-helper-contract.md"
+            contract_path.write_text(
+                "# Contract\n\n"
+                "(mirror-set section removed for this test)\n",
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    release_mod.cmd_release_bump(
+                        argparse.Namespace(repo=str(root), check=True, to=None)
+                    )
+
+
+class ReleaseBumpToTest(unittest.TestCase):
+    """`release bump --to` must rewrite every mirror-set file in the
+    worktree and never commit/push/tag. Tests assert (a) post-bump file
+    contents, (b) absence of any new commits in the fake repo, (c)
+    idempotency when called with the existing version.
+    """
+
+    def _build_fake_repo(
+        self,
+        root: Path,
+        *,
+        pyproject_version: str = "0.3.0",
+        module_version: str = "0.3.0",
+    ) -> str:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "fake"\nversion = "{pyproject_version}"\n',
+            encoding="utf-8",
+        )
+        module_dir = root / "src" / "mozyo_bridge"
+        module_dir.mkdir(parents=True)
+        (module_dir / "__init__.py").write_text(
+            f'__version__ = "{module_version}"\n', encoding="utf-8"
+        )
+        contract_dir = root / "vibes" / "docs" / "logics"
+        contract_dir.mkdir(parents=True)
+        (contract_dir / "release-helper-contract.md").write_text(
+            "release-version mirror set は以下の 2 file に固定する。\n\n"
+            "- `pyproject.toml` の `[project].version`\n"
+            "- `src/mozyo_bridge/__init__.py` の `__version__`\n\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True, env=env)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "init", "-q"],
+            check=True,
+            env=env,
+        )
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    def test_rewrites_every_mirror_file_without_committing(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial_head = self._build_fake_repo(root)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = release_mod.cmd_release_bump(
+                    argparse.Namespace(repo=str(root), check=False, to="0.4.0")
+                )
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn(
+                '"0.4.0"',
+                (root / "pyproject.toml").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                '"0.4.0"',
+                (root / "src" / "mozyo_bridge" / "__init__.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            head_after = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(
+                initial_head,
+                head_after,
+                "release bump --to created a commit; helper must leave commit "
+                "authority with the operator",
+            )
+
+    def test_same_version_is_idempotent_noop(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(
+                root, pyproject_version="0.4.0", module_version="0.4.0"
+            )
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_bump(
+                    argparse.Namespace(repo=str(root), check=False, to="0.4.0")
+                )
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("already at 0.4.0", out.getvalue())
+            self.assertIn(
+                "no-op (mirror set was already at 0.4.0)", out.getvalue()
+            )
+
+    def test_invalid_version_shape_is_rejected(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(root)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    release_mod.cmd_release_bump(
+                        argparse.Namespace(
+                            repo=str(root), check=False, to="not-a-version"
+                        )
+                    )
+
+    def test_missing_version_literal_strict_fails(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._build_fake_repo(root)
+            # Drop the __version__ literal from the python mirror file so
+            # the helper cannot find it. The helper must strict-fail rather
+            # than partially rewrite the mirror set — pyproject.toml must
+            # still carry the pre-bump version.
+            pyproject_before = (root / "pyproject.toml").read_text(encoding="utf-8")
+            (root / "src" / "mozyo_bridge" / "__init__.py").write_text(
+                "# version moved elsewhere\n", encoding="utf-8"
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        release_mod.cmd_release_bump(
+                            argparse.Namespace(
+                                repo=str(root), check=False, to="0.4.0"
+                            )
+                        )
+            self.assertEqual(
+                pyproject_before,
+                (root / "pyproject.toml").read_text(encoding="utf-8"),
+                "release bump --to partially rewrote the mirror set on strict-fail",
+            )
+
+
+class ReleasePublishTest(unittest.TestCase):
+    """`release publish --pypi` must default to dry-run; `--execute` must
+    be required to invoke `gh release create`. `--testpypi` and `--plan`
+    are smoke-tested for argv shape via mock.
+    """
+
+    def test_pypi_dry_run_does_not_invoke_gh(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "notes.md"
+            notes.write_text("# v0.3.0\nNotes\n", encoding="utf-8")
+            recorded = []
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                recorded.append(list(argv))
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc = release_mod.cmd_release_publish(
+                        argparse.Namespace(
+                            testpypi=False,
+                            pypi=True,
+                            plan=False,
+                            tag="v0.3.0",
+                            notes_file=str(notes),
+                            execute=False,
+                            version=None,
+                            repo=None,
+                        )
+                    )
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("(dry-run)", out.getvalue())
+            self.assertEqual(
+                recorded,
+                [],
+                "dry-run must NOT invoke `gh release create`",
+            )
+            self.assertIn("Re-run with `--execute`", out.getvalue())
+
+    def test_pypi_execute_invokes_gh_release_create(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "notes.md"
+            notes.write_text("# v0.3.0\nNotes\n", encoding="utf-8")
+            recorded = []
+
+            def fake_run(argv, cwd=None, check=False, env=None):
+                recorded.append(list(argv))
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="created\n", stderr=""
+                )
+
+            with patch.object(release_mod, "_run", side_effect=fake_run):
+                with patch.object(release_mod, "_require_command"):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = release_mod.cmd_release_publish(
+                            argparse.Namespace(
+                                testpypi=False,
+                                pypi=True,
+                                plan=False,
+                                tag="v0.3.0",
+                                notes_file=str(notes),
+                                execute=True,
+                                version=None,
+                                repo=None,
+                            )
+                        )
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertEqual(1, len(recorded))
+            argv = recorded[0]
+            self.assertEqual(argv[0], "gh")
+            self.assertEqual(argv[1:4], ["release", "create", "v0.3.0"])
+            self.assertIn("--verify-tag", argv)
+            self.assertIn("--notes-file", argv)
+
+    def test_pypi_rejects_missing_notes_file(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.md"
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    release_mod.cmd_release_publish(
+                        argparse.Namespace(
+                            testpypi=False,
+                            pypi=True,
+                            plan=False,
+                            tag="v0.3.0",
+                            notes_file=str(missing),
+                            execute=False,
+                            version=None,
+                            repo=None,
+                        )
+                    )
+
+    def test_pypi_rejects_invalid_tag(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "notes.md"
+            notes.write_text("notes", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    release_mod.cmd_release_publish(
+                        argparse.Namespace(
+                            testpypi=False,
+                            pypi=True,
+                            plan=False,
+                            tag="0.3.0",  # missing `v` prefix
+                            notes_file=str(notes),
+                            execute=False,
+                            version=None,
+                            repo=None,
+                        )
+                    )
+
+    def test_testpypi_dispatch_includes_version(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        dispatch_call = []
+
+        def fake_run(argv, cwd=None, check=False, env=None):
+            dispatch_call.append(list(argv))
+            if "workflow" in argv and "run" in argv:
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+            # gh run list response
+            payload = json.dumps(
+                [
+                    {
+                        "databaseId": 9999,
+                        "url": "https://example/run/9999",
+                        "createdAt": "2026-05-14T11:00:00Z",
+                        "headSha": "abc",
+                        "status": "queued",
+                    }
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=payload, stderr=""
+            )
+
+        with patch.object(release_mod, "_run", side_effect=fake_run):
+            with patch.object(release_mod, "_require_command"):
+                with patch.object(release_mod.time, "sleep"):
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_publish(
+                            argparse.Namespace(
+                                testpypi=True,
+                                pypi=False,
+                                plan=False,
+                                tag=None,
+                                notes_file=None,
+                                execute=False,
+                                version="0.3.0a1",
+                                repo=None,
+                            )
+                        )
+        self.assertEqual(release_mod.EXIT_CLEAN, rc)
+        self.assertEqual(2, len(dispatch_call))
+        dispatch_argv = dispatch_call[0]
+        self.assertEqual(
+            dispatch_argv,
+            [
+                "gh",
+                "workflow",
+                "run",
+                "testpypi.yml",
+                "--ref",
+                "main",
+                "-f",
+                "version=0.3.0a1",
+            ],
+        )
+        self.assertIn("9999", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

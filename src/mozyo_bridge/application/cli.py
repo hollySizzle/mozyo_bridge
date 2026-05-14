@@ -30,10 +30,12 @@ from mozyo_bridge.application.commands import (
     cmd_type,
 )
 from mozyo_bridge.application.release import (
+    cmd_release_bump,
     cmd_release_check_artifact,
     cmd_release_check_scaffold,
     cmd_release_check_tree,
     cmd_release_check_workflow,
+    cmd_release_publish,
     cmd_release_workflow_runs,
     cmd_release_workflow_wait,
 )
@@ -531,6 +533,103 @@ def build_parser() -> argparse.ArgumentParser:
         help="Polling interval in seconds (default 5.0)",
     )
     release_workflow_wait.set_defaults(func=cmd_release_workflow_wait)
+
+    release_bump = release_sub.add_parser(
+        "bump",
+        help=(
+            "Atomically rewrite the contract-declared release-version "
+            "mirror set in the worktree (`--to VERSION`) or print its "
+            "current state (`--check`). Never commits, pushes, or tags."
+        ),
+    )
+    add_repo_option(release_bump)
+    bump_mode = release_bump.add_mutually_exclusive_group(required=True)
+    bump_mode.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Read-only: print each mirror file's current version literal, "
+            "the latest `Release vX.Y.Z` commit, and the `v*` tag list. "
+            "Exits non-zero when mirror-set values disagree."
+        ),
+    )
+    bump_mode.add_argument(
+        "--to",
+        metavar="VERSION",
+        help=(
+            "Rewrite every mirror-set file to VERSION in the worktree. "
+            "Strict-fail if any mirror-set file's version literal cannot "
+            "be located. Idempotent on same value. Operator still owns "
+            "`git commit` / `git push` / `git tag -a`."
+        ),
+    )
+    release_bump.set_defaults(func=cmd_release_bump)
+
+    release_publish = release_sub.add_parser(
+        "publish",
+        help=(
+            "Release publish helpers: TestPyPI workflow dispatch, "
+            "production GitHub Release trigger (default dry-run), and "
+            "plan summarization. No GA/beta judgment is automated."
+        ),
+    )
+    add_repo_option(release_publish)
+    publish_mode = release_publish.add_mutually_exclusive_group(required=True)
+    publish_mode.add_argument(
+        "--testpypi",
+        action="store_true",
+        help=(
+            "Dispatch the TestPyPI workflow via `gh workflow run "
+            "testpypi.yml --ref main -f version=<X.Y.Z>`. Requires "
+            "--version. Run-id polling is delegated to "
+            "`release check workflow` / `release workflow wait`."
+        ),
+    )
+    publish_mode.add_argument(
+        "--pypi",
+        action="store_true",
+        help=(
+            "Assemble the `gh release create vX.Y.Z --verify-tag "
+            "--title vX.Y.Z --notes-file PATH` invocation. Default "
+            "dry-run; --execute required to actually create the "
+            "GitHub Release. Requires --tag and --notes-file."
+        ),
+    )
+    publish_mode.add_argument(
+        "--plan",
+        action="store_true",
+        help=(
+            "Enumerate operator-takeable options based on current git "
+            "ref / pyproject version / latest `Test` workflow run / "
+            "TestPyPI existing version. No judgment."
+        ),
+    )
+    release_publish.add_argument(
+        "--version",
+        help="Version literal X.Y.Z for `--testpypi` workflow dispatch input",
+    )
+    release_publish.add_argument(
+        "--tag",
+        help="Annotated tag `vX.Y.Z` for `--pypi` GitHub Release",
+    )
+    release_publish.add_argument(
+        "--notes-file",
+        dest="notes_file",
+        help=(
+            "Path to the release notes markdown file passed to "
+            "`gh release create --notes-file`. Required for `--pypi`."
+        ),
+    )
+    release_publish.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Required to actually invoke `gh release create` under "
+            "`--pypi`. Without this flag the helper only prints the "
+            "command it would run."
+        ),
+    )
+    release_publish.set_defaults(func=cmd_release_publish)
     return parser
 
 
