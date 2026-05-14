@@ -22,7 +22,8 @@ In scope:
 - agent skill install:
   - Claude Code primary path: plugin marketplace.
   - Codex primary path: `$skill-installer` against the canonical GitHub skill path.
-  - curl/script install as fallback only.
+  - Codex skill install is a user/operator action in the Codex environment.
+  - curl/script install is prohibited in bootstrap.
 - project router scaffold (`mozyo-bridge scaffold rules <preset>`).
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
 - per-preset isolated target smoke under `./tmp/mb-smoke-*` (non-destructive).
@@ -92,7 +93,7 @@ python3 -m mozyo_bridge --version
 
 This is a fallback because it installs into the user-site Python environment without isolation. Prefer `pipx`.
 
-There is no `curl ... | sh` install path for the CLI. The only curl-based install paths in this project are the agent skill scripts in Stage 3, and those are fallback only.
+There is no `curl ... | sh` install path for the CLI. Bootstrap also forbids curl/script install for agent skills; use the primary paths in Stage 3.
 
 ## Stage 2 — Install user-global rules
 
@@ -135,12 +136,14 @@ If either listing is missing:
 
 Plugin skills are namespaced `mozyo-bridge-agent:mozyo-bridge-agent`, so they do not collide with same-name personal (`~/.claude/skills/`) or project (`<project>/.claude/skills/`) skills. This is the canonical reason to prefer the marketplace path over the curl fallback.
 
-### 3b. Codex — primary: `$skill-installer`
+### 3b. Codex — primary: `$skill-installer` (user-run)
 
-In Codex, run `$skill-installer` and point it at the canonical GitHub skill path:
+The bootstrap agent must instruct the user/operator to run `$skill-installer` inside the Codex environment. Do not treat this as an agent-executed step. Continue only after the installed files can be verified.
+
+Command the user must run:
 
 ```
-https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent
+$skill-installer https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent
 ```
 
 Expected install destination:
@@ -153,21 +156,9 @@ If the install is incomplete:
 - check `${CODEX_HOME:-$HOME/.codex}` for a partial directory; remove it and retry.
 - override the source ref via the `MOZYO_BRIDGE_SKILL_REF` env var (default = `main`).
 
-### 3c. Fallback only — curl-based install scripts
+### 3c. Prohibited in bootstrap — curl/script install paths
 
-Use the curl scripts only when the primary paths above are not available (offline mirrors, internal forks, fresh-tester acceptance smoke):
-
-```bash
-# Codex skill (fallback)
-curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_codex_skill.sh | sh
-
-# Claude Code skill (fallback, user-global)
-curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_claude_skill.sh \
-  -o /tmp/install_mozyo_bridge_claude_skill.sh
-MOZYO_BRIDGE_CLAUDE_SCOPE=global sh /tmp/install_mozyo_bridge_claude_skill.sh
-```
-
-Do NOT pipe Claude install as `MOZYO_BRIDGE_CLAUDE_SCOPE=global curl … | sh`. The env var goes to `curl`, not to the `sh` that runs the script, and the install silently falls back to `scope=project`.
+Do NOT use the curl/script install paths during bootstrap. They are legacy/manual paths and are not part of the canonical bootstrap flow.
 
 Same-name skill precedence trap (Claude Code only): personal skill (`~/.claude/skills/`) overrides project skill (`<project>/.claude/skills/`). The plugin marketplace path avoids this trap entirely.
 
