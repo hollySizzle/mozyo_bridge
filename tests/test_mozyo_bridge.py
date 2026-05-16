@@ -831,7 +831,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.13.2", state["preset_version"])
+            self.assertEqual("2026.05.16.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
             # The audit-owned commit policy belongs in the central preset only.
@@ -1496,10 +1496,15 @@ class NotifyContractTest(unittest.TestCase):
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")
 
-        pane = {"id": "%2", "location": "agents:0.1", "command": "node", "cwd": "/repo", "window_name": "codex"}
+        pane = {"id": "%2", "location": "agents:0.1", "command": "node", "cwd": "/repo", "window_name": "codex", "pane_active": "1"}
 
+        # v0.4: the standard notify wrappers default to `--mode queue-enter`,
+        # so the Layer B preflight runs. Patch `current_session_name` so the
+        # Step 10 same-session binding can compare sender vs target without
+        # invoking real tmux.
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
+            patch("mozyo_bridge.application.commands.current_session_name", return_value="agents"), \
             patch("mozyo_bridge.application.commands.pane_window_name", return_value="claude"), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
@@ -1518,10 +1523,12 @@ class NotifyContractTest(unittest.TestCase):
         return result, sent, stdout.getvalue(), pane_text
 
     def test_notify_by_journal_types_observed_text_then_submits(self) -> None:
-        # `notify-codex` is now a thin wrapper over the new handoff primitive
+        # `notify-codex` is a thin wrapper over the new handoff primitive
         # (Codex audit: `1214760803593547`). The marker and body shape come
         # from `mozyo_bridge.domain.handoff`; the legacy `[mozyo:notify:...]`
-        # marker is reserved for the legacy queue subcommands.
+        # marker is reserved for the legacy queue subcommands. v0.4: the
+        # standard notify wrappers default to `--mode queue-enter`, so the
+        # Layer B preflight admits the send under the fake's codex pane.
         result, sent, stdout, pane_text = self.run_notify_with_fake_tmux(
             [
                 "notify-codex",
@@ -1533,7 +1540,6 @@ class NotifyContractTest(unittest.TestCase):
                 "review_request",
                 "--target",
                 "%2",
-                "--force",
                 "--submit-delay",
                 "0",
             ]
@@ -1580,35 +1586,42 @@ class NotifyContractTest(unittest.TestCase):
         self.assertIn("handoff task legacy-task is ready for claude", pane_text)
         self.assertIn("legacy queue fallback", pane_text)
 
-    def test_notify_does_not_submit_when_marker_is_not_observed_contract(self) -> None:
-        with contextlib.redirect_stderr(io.StringIO()):
-            result, sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
-                [
-                    "notify-codex",
-                    "--issue",
-                    "9020",
-                    "--journal",
-                    "46005",
-                    "--target",
-                    "%2",
-                    "--force",
-                    "--landing-timeout",
-                    "0.01",
-                    "--submit-delay",
-                    "0",
-                ],
-                captures=["", "", ""],
-                allow_exit=True,
-            )
+    def test_notify_submits_under_queue_enter_default_even_when_marker_missed(
+        self,
+    ) -> None:
+        # v0.4 contract pivot (Asana 1214824751741628): the standard notify
+        # wrappers default to `--mode queue-enter`, so marker miss must NOT
+        # roll back — Enter is issued and the durable outcome is `sent` /
+        # `queue_enter`. Strict-rail rollback on marker miss is still covered
+        # by `RelaxedQueueEnterRailTest.test_strict_standard_still_rolls_back_on_marker_timeout`;
+        # notify-* wrappers cannot opt into strict by design (no `--mode` flag
+        # is exposed on them).
+        result, sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+            [
+                "notify-codex",
+                "--issue",
+                "9020",
+                "--journal",
+                "46005",
+                "--target",
+                "%2",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            captures=["", "", ""],
+        )
 
-        self.assertIsInstance(result, SystemExit)
-        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
-        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        self.assertEqual(0, result)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
         outcome_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
         self.assertTrue(outcome_lines)
         outcome = json.loads(outcome_lines[-1])
-        self.assertEqual("blocked", outcome["status"])
-        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("queue_enter", outcome["reason"])
+        self.assertEqual("queue-enter", outcome["mode"])
         self.assertEqual("redmine", outcome["source"])
 
     def test_notify_submit_delay_default_is_classic_short_tui_delay(self) -> None:
@@ -1621,7 +1634,9 @@ class NotifyContractTest(unittest.TestCase):
         # Codex audit finding 1 on task 1214760547941073: the wrapper must
         # keep printing `notified <agent>: journal=... target=... read_lines=...`
         # so the in-repo smoke and external scripts that grep that line
-        # continue to work after the handoff-primitive retrofit.
+        # continue to work after the handoff-primitive retrofit. v0.4: the
+        # notify wrappers default to queue-enter; the legacy success line is
+        # still printed when the Layer B preflight admits and Enter is sent.
         result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
             [
                 "notify-codex",
@@ -1633,7 +1648,6 @@ class NotifyContractTest(unittest.TestCase):
                 "review_request",
                 "--target",
                 "%2",
-                "--force",
                 "--submit-delay",
                 "0",
             ]
@@ -1644,8 +1658,12 @@ class NotifyContractTest(unittest.TestCase):
 
     def test_standard_notify_wrapper_omits_success_line_on_failure(self) -> None:
         # The legacy success line is a courtesy that must only fire on real
-        # success. marker_timeout dies; the wrapper must not have printed
-        # `notified codex: ...` before death.
+        # success. v0.4 routes the standard notify wrappers through
+        # `--mode queue-enter`, which rejects `--force` before any typing;
+        # the wrapper must not have printed `notified codex: ...` before the
+        # forced exit. Pre-v0.4 this test exercised the strict-rail
+        # marker_timeout path; the success-line invariant is the same under
+        # any wrapper failure, so we keep the regression on the new path.
         with contextlib.redirect_stderr(io.StringIO()):
             result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
                 [
@@ -1693,7 +1711,9 @@ class NotifyContractTest(unittest.TestCase):
     def test_standard_notify_record_format_json_suppresses_record(self) -> None:
         # End-to-end through the wrapper: --record-format json suppresses
         # the markdown block but keeps the JSON outcome and the legacy
-        # success line.
+        # success line. v0.4: notify wrappers default to queue-enter; the
+        # fake fixture passes Layer B preflight so Enter is issued and the
+        # legacy success line still fires.
         result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
             [
                 "notify-codex",
@@ -1705,7 +1725,6 @@ class NotifyContractTest(unittest.TestCase):
                 "review_request",
                 "--target",
                 "%2",
-                "--force",
                 "--submit-delay",
                 "0",
                 "--record-format",
@@ -1722,7 +1741,9 @@ class NotifyContractTest(unittest.TestCase):
     def test_notify_review_wrapper_accepts_record_command(self) -> None:
         # --record-command flows through the review wrappers too (issue
         # required path). End-to-end: the record block shows the literal
-        # command and the legacy success line still fires.
+        # command and the legacy success line still fires. v0.4: review
+        # wrappers default to queue-enter; the fake fixture passes Layer B
+        # preflight.
         result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
             [
                 "notify-codex-review",
@@ -1732,7 +1753,6 @@ class NotifyContractTest(unittest.TestCase):
                 "46005",
                 "--target",
                 "%2",
-                "--force",
                 "--submit-delay",
                 "0",
                 "--record-command",
@@ -4156,6 +4176,9 @@ class HandoffOrchestratorTest(unittest.TestCase):
         return json.loads(lines[-1])
 
     def test_standard_mode_sends_marker_body_and_enter(self) -> None:
+        # Strict `--mode standard` happy path: marker observed → Enter pressed,
+        # outcome `sent` / `ok` / mode=`standard`. v0.4 default is queue-enter,
+        # so this test exercises the explicit strict fallback rail.
         result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -4172,7 +4195,8 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--submit-delay",
                 "0",
             ]
@@ -4237,6 +4261,10 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("operator", outcome["next_action_owner"])
 
     def test_marker_timeout_rolls_back_and_emits_blocked_outcome(self) -> None:
+        # Strict `--mode standard` fail-closed regression: marker miss must
+        # roll back via `C-u` and emit `blocked` / `marker_timeout`. v0.4
+        # default (queue-enter) deliberately does NOT roll back; that contract
+        # is covered separately.
         result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -4253,7 +4281,8 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 "https://example/x",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--landing-timeout",
                 "0.01",
                 "--submit-delay",
@@ -4273,6 +4302,9 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("sender", outcome["next_action_owner"])
 
     def test_invalid_anchor_emits_blocked_invalid_anchor_outcome(self) -> None:
+        # Anchor normalization fires before rail-specific preflight, so this
+        # test holds for both rails. Pinned to `--mode standard` so the v0.4
+        # queue-enter force-rejection cannot eclipse the invalid_anchor exit.
         result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -4287,7 +4319,8 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 "T1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
             ],
             allow_exit=True,
         )
@@ -4304,6 +4337,11 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertIn("asana anchor", stderr)
 
     def test_non_agent_pane_without_force_emits_target_not_agent(self) -> None:
+        # Strict-rail agent gate (`ensure_agent_target`) must still reject a
+        # non-agent foreground process when `--force` is absent. Pinned to
+        # `--mode standard` because queue-enter's Layer B preflight rejects on
+        # `target_not_agent` via a different code path (Step 12) and would
+        # surface a different `Reason` ordering.
         result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -4320,6 +4358,8 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
+                "--mode",
+                "standard",
             ],
             pane={
                 "id": "%2",
@@ -4485,9 +4525,12 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
 
         self.assertEqual(MODE_QUEUE_ENTER, args.mode)
 
-    def test_cli_default_mode_remains_standard(self) -> None:
-        # Default must not silently flip to queue-enter; existing strict
-        # callers must keep their fail-closed behavior.
+    def test_cli_default_mode_is_queue_enter_since_v0_4(self) -> None:
+        # v0.4 contract pivot (Asana 1214824751741628) flipped the CLI default
+        # for agent-pane handoff to queue-enter. Strict `--mode standard`
+        # remains explicitly selectable; its regression coverage lives in
+        # `test_strict_standard_still_rolls_back_on_marker_timeout` and
+        # `test_strict_standard_admits_cross_receiver_process_unchanged`.
         parser = build_parser()
         args = parser.parse_args(
             [
@@ -4506,7 +4549,7 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(MODE_STANDARD, args.mode)
+        self.assertEqual(MODE_QUEUE_ENTER, args.mode)
 
     def test_cli_rejects_unknown_mode(self) -> None:
         parser = build_parser()
@@ -4620,7 +4663,10 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertIn("durable anchor", outcome["next_action"])
 
     def test_strict_standard_still_rolls_back_on_marker_timeout(self) -> None:
-        # Regression: the relaxed rail must not weaken strict `standard`.
+        # Regression: the v0.4 default flip to queue-enter must not weaken
+        # strict `standard`. Strict is now an explicit fallback (`--mode
+        # standard`); its fail-closed `C-u` rollback on marker_timeout stays
+        # exactly as it was in v0.1.
         result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -4637,6 +4683,8 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
+                "--mode",
+                "standard",
                 "--landing-timeout",
                 "0.01",
                 "--submit-delay",
@@ -5051,12 +5099,13 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
 
     def test_strict_standard_admits_cross_receiver_process_unchanged(self) -> None:
-        # Regression: the v0.3 per-receiver process gate must not bleed into
-        # strict `--mode standard`. Strict's behavior (admit any agent-looking
-        # process, rely on marker_timeout + C-u rollback) stays as-is. This
-        # test pins that boundary by sending strict to a pane whose foreground
-        # process is `claude` while --to=codex; strict admits typing and
-        # rolls back on marker miss, as it already did pre-v0.3.
+        # Regression: neither the v0.3 per-receiver process gate nor the v0.4
+        # default flip to queue-enter must bleed into strict `--mode standard`.
+        # Strict's behavior (admit any agent-looking process, rely on
+        # marker_timeout + C-u rollback) stays as-is. This test pins that
+        # boundary by sending strict to a pane whose foreground process is
+        # `claude` while --to=codex; strict admits typing and rolls back on
+        # marker miss, as it already did pre-v0.3.
         argv = [
             "handoff",
             "send",
@@ -5072,6 +5121,8 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
             "C1",
             "--target",
             "%2",
+            "--mode",
+            "standard",
             "--landing-timeout",
             "0.01",
             "--submit-delay",
@@ -5494,6 +5545,9 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         return result, sent, stdout.getvalue()
 
     def test_standard_mode_emits_record_then_json_outcome_by_default(self) -> None:
+        # Pinned to `--mode standard` so the record/JSON ordering is verified
+        # against the strict-rail happy path (queue-enter has its own coverage
+        # in `RelaxedQueueEnterRailTest`). v0.4 default is queue-enter.
         result, _sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5510,7 +5564,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--submit-delay",
                 "0",
             ]
@@ -5526,6 +5581,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertEqual("sent", outcome["status"])
 
     def test_record_format_json_suppresses_markdown_record(self) -> None:
+        # Pinned to `--mode standard` so the format-suppression test is not
+        # eclipsed by the v0.4 queue-enter force-rejection.
         result, _sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5542,7 +5599,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--submit-delay",
                 "0",
                 "--record-format",
@@ -5556,6 +5614,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertEqual(1, len(json_lines))
 
     def test_record_format_text_suppresses_json_outcome(self) -> None:
+        # Pinned to `--mode standard` so the format-suppression test is not
+        # eclipsed by the v0.4 queue-enter force-rejection.
         result, _sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5572,7 +5632,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--submit-delay",
                 "0",
                 "--record-format",
@@ -5586,6 +5647,9 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertEqual([], json_lines)
 
     def test_record_command_is_included_when_provided(self) -> None:
+        # Pinned to `--mode standard` so the record-command trailer is verified
+        # against the strict-rail happy path without the v0.4 queue-enter
+        # force-rejection.
         result, _sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5602,7 +5666,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "C1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--submit-delay",
                 "0",
                 "--record-command",
@@ -5617,6 +5682,9 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         )
 
     def test_marker_timeout_emits_record_describing_rollback(self) -> None:
+        # Pinned to `--mode standard` so the rollback narrative is verified on
+        # the strict rail. v0.4 queue-enter does not roll back on marker miss;
+        # that contract is covered in `RelaxedQueueEnterRailTest`.
         result, sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5633,7 +5701,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "https://example/x",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
                 "--landing-timeout",
                 "0.01",
                 "--submit-delay",
@@ -5650,6 +5719,9 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIn("Next action owner: `sender`", stdout)
 
     def test_invalid_anchor_emits_record_preserving_source(self) -> None:
+        # Pinned to `--mode standard` so the invalid_anchor narrative is not
+        # eclipsed by the v0.4 queue-enter force-rejection (which would emit
+        # `invalid_args` first).
         result, _sent, stdout = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -5664,7 +5736,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "T1",
                 "--target",
                 "%2",
-                "--force",
+                "--mode",
+                "standard",
             ],
             allow_exit=True,
         )

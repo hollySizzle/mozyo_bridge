@@ -1,36 +1,55 @@
 #!/usr/bin/env python3
-"""Real-tmux smoke for the strict `--mode standard` delivery rail.
+"""Real-tmux smoke for the explicit strict `--mode standard` delivery rail.
 
-The relaxed `--mode queue-enter` rail (defined in
-``vibes/docs/logics/tmux-send-safety-contract.md`` ``## Relaxed Queue-Enter
-Rail``) is intentionally NOT exercised by this smoke. Its distinguishing
-semantic — pressing Enter despite a landing marker that was never observed in
-the captured pane text — only manifests against a real Claude/Codex TUI that
-queues prompts during a running turn. A plain ``sh`` receiver has no prompt
-queue, and queue-enter rejects ``--force``, so spoofing one with a non-agent
-process is not a valid stand-in. In-process coverage of the new rail
-(observed / unobserved marker, ``--force`` rejection, ``--target``
-window-mismatch guard, the v0.3 deterministic preflight Steps 10 / 11 / 12
-(same-session, active-pane, per-receiver foreground process), strong vs
-weak receiver identity, durable-record wording, ``last_input`` projection,
-``next_action_owner``) lives in
-``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest`` and
+The v0.4 contract pivot (Asana ``1214824751741628``) flipped the agent-pane
+handoff default from strict `standard` to relaxed `queue-enter`. Strict
+`standard` is preserved as the explicit fallback (`## Default Delivery
+Promise (v0.4)` / `## Strong Boundaries` in
+``vibes/docs/logics/tmux-send-safety-contract.md``) and this smoke keeps its
+end-to-end regression coverage on a real tmux server.
+
+The smoke calls ``mozyo-bridge handoff send --mode standard --force`` rather
+than the legacy ``notify-*`` wrappers because in v0.4 those wrappers
+hardcode ``--mode queue-enter`` and do not accept a mode override (see
+``_notify_standard_via_handoff`` in
+``src/mozyo_bridge/application/commands.py``). Layer B preflight (window-name,
+same-session, active-split, per-receiver foreground process allowlist) would
+reject this smoke's plain ``sh`` receiver before any typing happened, so we
+exercise the strict rail directly — that is the only end-to-end probe a
+non-agent receiver can sustain.
+
+The relaxed ``--mode queue-enter`` rail (the new default) is intentionally
+NOT auto-smoked here. Its distinguishing semantic — pressing Enter despite a
+landing marker that was never observed in the captured pane text — only
+manifests against a real Claude/Codex TUI that queues prompts during a
+running turn. A plain ``sh`` receiver has no prompt queue, and queue-enter
+rejects ``--force``, so spoofing one with a non-agent process is not a valid
+stand-in. In-process coverage of the new rail (observed / unobserved marker,
+``--force`` rejection, ``--target`` window-mismatch guard, the v0.3
+deterministic preflight Steps 10 / 11 / 12 (same-session, active-pane,
+per-receiver foreground process), strong vs weak receiver identity,
+durable-record wording, ``last_input`` projection, ``next_action_owner``)
+lives in ``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest`` and
 ``tests/test_mozyo_bridge.py::PaneResolverTest`` (the
-``is_receiver_agent_process`` unit tests).
+``is_receiver_agent_process`` unit tests). The default-mode flip itself is
+pinned by
+``tests/test_mozyo_bridge.py::RelaxedQueueEnterRailTest::test_cli_default_mode_is_queue_enter_since_v0_4``
+and the new ``notify-*`` queue-enter behavior is pinned by
+``NotifyContractTest::test_notify_submits_under_queue_enter_default_even_when_marker_missed``.
 
-When an operator change touches the queue-enter rail, the manual verification
-recipe is:
+When an operator change touches the queue-enter rail (the v0.4 default), the
+manual verification recipe is:
 
 1. From the repo root, open the standard pair: ``mozyo`` (creates / attaches a
    tmux session with a ``claude`` window and a ``codex`` window running the
    real Claude / Codex CLI). Run all subsequent steps from a sender pane
    inside that same tmux session; the v0.3 same-session preflight rejects
    any cross-session ``--target``.
-2. In the sender pane, run:
+2. In the sender pane, run (no ``--mode`` flag — queue-enter is the v0.4
+   default):
 
        mozyo-bridge handoff send --to codex --source asana \\
-           --task-id <task> --comment-id <comment> --kind reply \\
-           --mode queue-enter
+           --task-id <task> --comment-id <comment> --kind reply
 
    Expected (marker observed in the receiver's scrollback before timeout):
    ``Outcome`` line reads ``sent (queue-enter, marker observed)`` and the JSON
@@ -40,13 +59,15 @@ recipe is:
    or wraps below the capture window) and rerun the same command. Expected:
    ``Outcome`` line reads ``sent (queue-enter, marker unobserved)``, JSON
    shows ``status=sent reason=queue_enter``, the durable record carries the
-   ``Operator note`` line pointing at ``--mode standard`` as the fallback,
-   and the receiver's TUI still picks the prompt up off its queue once its
-   current turn ends.
-4. Strict rail regression check (must keep working): rerun step 3 without
-   ``--mode queue-enter``. Expected: the command dies with
+   ``Operator note`` line, and the receiver's TUI still picks the prompt up
+   off its queue once its current turn ends. The contract promise is
+   practical queued submission, not confirmed landing — the durable Asana
+   task comment / Redmine journal remains the source of truth.
+4. Strict rail regression check (must keep working): rerun step 3 with
+   ``--mode standard`` explicit. Expected: the command dies with
    ``handoff marker was not observed...``, no Enter is pressed, the JSON
    outcome shows ``status=blocked reason=marker_timeout mode=standard``.
+   This is the explicit fallback the smoke above auto-covers.
 5. v0.3 preflight spot-checks (each must reject before any ``send-keys -l``):
 
    a. Foreign-session reject: from a tmux pane in a *different* tmux session
@@ -64,10 +85,14 @@ recipe is:
       ``die`` message naming the observed shell process. (Weak-identity
       processes like ``node`` or a versioned native binary are admitted by
       design; do not test them as reject cases.)
+6. Force-rejection regression (queue-enter must reject ``--force``): rerun
+   step 2 with ``--force`` added. Expected: ``status=blocked
+   reason=invalid_args mode=queue-enter`` and a ``die`` message stating that
+   ``--force`` is not allowed under ``--mode queue-enter``.
 
-If any of the above diverges from the contract section ``## Relaxed
-Queue-Enter Rail`` (Status v0.3.1 or later), stop and record the gap in the
-owning Asana task before landing the change.
+If any of the above diverges from the contract sections ``## Default Delivery
+Promise (v0.4)`` and ``## Queue-Enter Default Rail`` (Status v0.4 or later),
+stop and record the gap in the owning Asana task before landing the change.
 """
 from __future__ import annotations
 
@@ -147,17 +172,28 @@ def main() -> int:
         env = os.environ.copy()
         env["TMUX_PANE"] = sender
         env["PYTHONPATH"] = str(REPO_ROOT / "src")
+        # v0.4: drive strict `--mode standard` directly via `handoff send`.
+        # The `notify-*` standard wrappers hardcode queue-enter and would
+        # reject this plain ``sh`` receiver under Layer B preflight; the
+        # strict-rail end-to-end regression therefore lives on `handoff send`.
         result = run(
             *BRIDGE_COMMAND,
-            "notify-claude",
+            "handoff",
+            "send",
+            "--to",
+            "claude",
+            "--source",
+            "redmine",
+            "--kind",
+            "review_result",
             "--issue",
             "9020",
             "--journal",
             "46005",
-            "--type",
-            "review_result",
             "--target",
             receiver,
+            "--mode",
+            "standard",
             "--force",
             "--read-lines",
             "80",
@@ -171,19 +207,22 @@ def main() -> int:
         if result.returncode != 0:
             print(result.stdout, file=sys.stderr)
             print(result.stderr, file=sys.stderr)
-            print(f"fail: notify command exited with {result.returncode}", file=sys.stderr)
+            print(f"fail: handoff send (strict) exited with {result.returncode}", file=sys.stderr)
             return 1
-        if "notified claude: journal=46005" not in result.stdout:
+        # Strict standard happy path: marker observed in the receiver's
+        # captured text → Enter is issued, JSON outcome carries
+        # `status=sent reason=ok mode=standard`. The receiver text
+        # assertions below cover end-to-end body delivery.
+        if '"mode": "standard"' not in result.stdout or '"status": "sent"' not in result.stdout:
             print(result.stdout, file=sys.stderr)
             print(result.stderr, file=sys.stderr)
-            print("fail: notify command did not report success", file=sys.stderr)
+            print("fail: handoff send did not report sent/standard outcome", file=sys.stderr)
             return 1
 
-        # The standard notify-* wrappers now route through the new handoff
-        # primitive (audit-approved in commit 5012aac), so the receiver sees
-        # the `[mozyo:handoff:...]` marker shape and the new durable-anchor
-        # body. The legacy `[mozyo-bridge from:...]` marker is still used by
-        # the bare `mozyo-bridge message` subcommand exercised below.
+        # The strict-rail `handoff send` types the new handoff marker shape
+        # (`[mozyo:handoff:...]`) and the durable-anchor body. The legacy
+        # `[mozyo-bridge from:...]` marker is still used by the bare
+        # `mozyo-bridge message` subcommand exercised below.
         if not wait_for(receiver, "RECEIVED:[mozyo:handoff:source=redmine:issue=9020:journal=46005:"):
             print(capture(receiver), file=sys.stderr)
             print("fail: receiver did not get submitted handoff marker", file=sys.stderr)
