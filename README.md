@@ -398,15 +398,14 @@ mozyo-bridge notify-claude \
 - `notify-*` には `--issue` と `--journal` を渡す。
 - pane message の内容だけで作業開始・完了判断をしない。
 - 受信側は通知を見たら Redmine gate を確認してから動く。
-- `notify-*` と `mozyo-bridge handoff send` の **default は strict rail** (`--mode standard`)。短い marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。
-- 確認できない場合、strict rail は入力欄を `C-u` で消し、Enter を送らず `blocked` / `marker_timeout` で失敗する (fail-closed)。
-- 例外として、`mozyo-bridge handoff send --mode queue-enter` という opt-in な **relaxed rail** がある。Claude / Codex agent pane 限定で、`--force` 不可。typing 前に deterministic preflight が走り、いずれかが false なら `send-keys -l` を発行する前に `blocked` で die する:
+- agent pane handoff (`mozyo-bridge handoff send` / `handoff reply` / `notify-*` 標準 variants で Claude / Codex pane を target にする送信) の **v0.4 normative default は `--mode queue-enter`**。Claude / Codex agent pane 限定で、`--force` 不可。typing 前に deterministic preflight が走り、いずれかが false なら `send-keys -l` を発行する前に `blocked` で die する:
   - explicit `--target` を渡す場合は receiver 自身の tmux window 配下のみ許容 (`Reason: invalid_args`)
   - target pane は **sender と同じ tmux session** にあること (= mozyo session 内から実行) (`Reason: invalid_args`)
   - target pane は所属 window の **active split** であること (`Reason: invalid_args`)
   - foreground process が receiver の allowlist にマッチすること (`Reason: target_not_agent`): literal `claude` (receiver=`claude`) / literal `codex` (receiver=`codex`) は **strong identity**、literal `node` および versioned native binary basename は Claude Code / Codex CLI どちらも採るため **weak identity** (両 receiver で admit、cross-binding 防御は window-name binding + operator 規律に retreat)。
-  すべて pass した場合、marker 未観測でも Enter を発行するが、結果は `sent` / `queue_enter` という別 outcome として durable record に残す (silent な strict 成功と区別する)。codex TUI のように marker が rendered text で wrap されて観測しにくい既知ケース用。default 経路ではない。
-- どちらの rail を使った場合でも durable record (Asana task comment / Redmine journal) が正本。pane notification は pointer。詳細は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Relaxed Queue-Enter Rail` 節を参照。
+  すべて pass した場合、marker 観測ありで `sent` / `ok`、marker 未観測でも Enter を発行して `sent` / `queue_enter` を durable record に残す。default rail の promise は **strong preflight 付き practical queued submission** であり、confirmed landing ではない。受信側は引き続き Asana task comment / Redmine journal を正本として読む。
+- **strict explicit fallback** は `mozyo-bridge handoff send --mode standard` (および `mozyo-bridge message --submit` 標準動作)。短い marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。確認できない場合は入力欄を `C-u` で消し、Enter を送らず `blocked` / `marker_timeout` で失敗する (fail-closed)。strict landing observation が必要な送信 (regression check / brand-new pane で queue-pickup 確率が未確認 / observability test / 厳格な landing evidence が監査要件) または default scope 外 (`mozyo-bridge message` / non-agent pane) のときに明示的に選ぶ。v0.4 で default ではなくなったが contract からは削除しない。挙動は v0.1 以降一切変更しない。
+- どちらの rail を使った場合でも durable record (Asana task comment / Redmine journal) が正本。pane notification は pointer。詳細・transient gap (CLI binary default flip と contract default の整合) は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` / `## Queue-Enter Default Rail` 節を参照。
 
 ## Legacy Queue
 
