@@ -12,7 +12,6 @@ from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     MODE_PENDING,
     MODE_QUEUE_ENTER,
-    MODE_STANDARD,
     MODES,
     RECEIVERS,
     RECORD_FORMAT_BOTH,
@@ -516,7 +515,7 @@ def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_k
         comment_id=None,
         anchor_url=None,
         target=getattr(args, "target", None),
-        mode=MODE_STANDARD,
+        mode=MODE_QUEUE_ENTER,
         summary=summary,
         force=bool(getattr(args, "force", False)),
         landing_timeout=float(getattr(args, "landing_timeout", 5.0) or 5.0),
@@ -630,7 +629,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
 
     kind = getattr(args, "kind", None) or default_kind
-    mode = getattr(args, "mode", MODE_STANDARD) or MODE_STANDARD
+    mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 

@@ -41,7 +41,7 @@ from mozyo_bridge.application.release import (
 )
 from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
-    MODE_STANDARD,
+    MODE_QUEUE_ENTER,
     MODES,
     RECORD_FORMAT_BOTH,
     RECORD_FORMATS,
@@ -280,15 +280,16 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.add_argument(
             "--mode",
             choices=sorted(MODES),
-            default=MODE_STANDARD,
+            default=MODE_QUEUE_ENTER,
             help=(
-                "`standard` (default) types and presses Enter after the "
-                "landing marker, with C-u rollback on marker timeout; "
-                "`pending` types but leaves the input pending; "
-                "`queue-enter` (Claude/Codex agent panes only, --force not "
-                "allowed) types and presses Enter regardless of marker "
-                "observation, emitting reason=queue_enter on marker miss "
-                "without rollback"
+                "`queue-enter` (default since v0.4; Claude/Codex agent "
+                "panes only, --force not allowed) types and presses "
+                "Enter regardless of marker observation, emitting "
+                "reason=queue_enter on marker miss without rollback; "
+                "`standard` (strict explicit fallback) types and presses "
+                "Enter after the landing marker, with C-u rollback on "
+                "marker timeout; "
+                "`pending` types but leaves the input pending"
             ),
         )
         parser_.add_argument(
