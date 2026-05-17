@@ -291,6 +291,8 @@ The user/operator must run Codex `$skill-installer` against the canonical `skill
 
 In particular, the Claude personal-skill destination (`~/.claude/skills/mozyo-bridge-agent/`) that this script writes to is the **legacy global Claude skill** and is deprecated for new installs (Asana `1214733632421625`). It is not removed from existing user homes automatically; existing users may keep it or delete it manually. New installs should use only the plugin marketplace path so the `mozyo-bridge-agent:mozyo-bridge-agent` namespace prevents the personal-overrides-project precedence gotcha. See `vibes/docs/logics/skill-distribution.md` `## Legacy Global Claude Skill Deprecation` for the policy detail.
 
+Similarly, the tracked project Claude skill at `<repo>/.claude/skills/mozyo-bridge-agent/` (loaded when Claude Code is started from this project root, or when `MOZYO_BRIDGE_CLAUDE_SCOPE=project` is used with the fallback script) is on a **grace-period deprecation** (Asana `1214733817990357`). It is not removed from the repo by this task; the canonical body remains under `skills/mozyo-bridge-agent/`. New installs should use only the plugin marketplace path; the project-scope adapter is preserved until the documented removal criteria are met. See `vibes/docs/logics/skill-distribution.md` `## Legacy Project Claude Skill (.claude/skills/mozyo-bridge-agent/) Grace-Period Deprecation` for the policy detail.
+
 ```bash
 # Codex skill (fallback)
 curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scripts/install_codex_skill.sh | sh
