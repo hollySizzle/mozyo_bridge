@@ -1215,6 +1215,39 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # Commit hash must be recorded in the durable record, not pane chat.
         self.assertIn("Record the commit hash", self.workflow)
 
+    def test_workflow_lifecycle_anchors_at_handoff_primitive(self) -> None:
+        # Regression rail for Asana 1214760806178471: the Handoff Lifecycle
+        # section must name the high-level primitive (`mozyo-bridge handoff
+        # send` / `handoff reply` / top-level `reply` alias) as the standard
+        # send. If a future refactor of the skill reference drops these names
+        # in favor of caller-assembled `read` + `message` shell choreography,
+        # this assertion catches it before agents start drifting back to the
+        # old path. The presence of these names alongside the explicit
+        # operator/debug paragraph also locks the boundary between standard
+        # handoff and low-level primitives in a single section.
+        section_start = self.workflow.index("## Handoff Lifecycle")
+        section_end = self.workflow.index(
+            "## Claude / Codex Role Boundary", section_start
+        )
+        section = self.workflow[section_start:section_end]
+        self.assertIn("`mozyo-bridge handoff send`", section)
+        self.assertIn("`mozyo-bridge handoff reply`", section)
+        self.assertIn("`mozyo-bridge reply`", section)
+        self.assertIn("compatibility", section)
+        # The operator/debug paragraph must explicitly call out the low-level
+        # commands so the boundary survives doc refactors.
+        self.assertIn("`mozyo-bridge read`", section)
+        self.assertIn("`mozyo-bridge message`", section)
+        self.assertIn("operator/debug", section)
+        self.assertIn("`notify-*-legacy-task`", section)
+        # Receiver step must explicitly forbid scrollback / status / doctor
+        # inference when a durable anchor exists; this is the rule that
+        # collapsed in the failure modes recorded on Asana 1214760517082054.
+        self.assertIn("`mozyo-bridge status`", section)
+        self.assertIn("doctor", section)
+        self.assertIn("pane scrollback", section)
+        self.assertIn("durable", section)
+
     def test_audit_owned_commit_does_not_grant_direct_implementation(self) -> None:
         # The audit-owned commit section must NOT contain wording that could be
         # read as permission for Codex to write implementation diffs as part of
@@ -1234,6 +1267,135 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # The section must NOT silently waive the implementer / auditor
         # boundary defined elsewhere.
         self.assertIn("does not waive the implementer / auditor boundary", section)
+
+
+class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
+    """Regression rails for Asana 1214760806178471: the scaffold presets must
+    document the high-level handoff primitive as the standard handoff/reply
+    path. If a future refactor accidentally restores the older "Standard
+    notification command: `mozyo-bridge notify-* --issue --journal`" wording
+    in either Asana or Redmine, or drops the explicit operator/debug boundary
+    around `read` / `message` / `type` / `keys`, these tests catch it before
+    operators install the drifted preset."""
+
+    def setUp(self) -> None:
+        presets_root = ROOT / "src" / "mozyo_bridge" / "scaffold" / "presets"
+        self.asana_workflow = (presets_root / "asana" / "agent-workflow.md").read_text(
+            encoding="utf-8"
+        )
+        self.redmine_workflow = (
+            presets_root / "redmine" / "agent-workflow.md"
+        ).read_text(encoding="utf-8")
+        self.asana_claude = (presets_root / "asana" / "CLAUDE.md").read_text(
+            encoding="utf-8"
+        )
+        self.redmine_claude = (presets_root / "redmine" / "CLAUDE.md").read_text(
+            encoding="utf-8"
+        )
+        self.redmine_agents = (presets_root / "redmine" / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_asana_preset_standard_path_anchors_at_primitive(self) -> None:
+        # Standard path bullet must name the high-level primitive.
+        self.assertIn("**Standard path (required default)**", self.asana_workflow)
+        self.assertIn("`mozyo-bridge handoff send", self.asana_workflow)
+        self.assertIn("`mozyo-bridge handoff reply", self.asana_workflow)
+        self.assertIn("`mozyo-bridge reply", self.asana_workflow)
+        # `notify-*` are compatibility wrappers, not standard-path peers.
+        self.assertIn("compatibility", self.asana_workflow)
+        # `read` / `message` / `type` / `keys` are explicitly operator/debug.
+        self.assertIn("operator/debug primitives", self.asana_workflow)
+        # The retired-queue legacy notify wrapper must be cleanup-only.
+        self.assertIn("`notify-*-legacy-task`", self.asana_workflow)
+
+    def test_asana_preset_receiver_forbids_status_doctor_scrollback_inference(
+        self,
+    ) -> None:
+        self.assertIn("`mozyo-bridge status`", self.asana_workflow)
+        self.assertIn("`mozyo-bridge doctor`", self.asana_workflow)
+        self.assertIn("pane scrollback", self.asana_workflow)
+        self.assertIn("operator/debug aids", self.asana_workflow)
+
+    def test_redmine_preset_pane_notification_anchors_at_primitive(self) -> None:
+        # The Pane Notification section must name the primitive as the
+        # standard command and the `notify-*` wrappers as compatibility.
+        section_start = self.redmine_workflow.index("## Pane Notification")
+        section_end = self.redmine_workflow.index(
+            "## Handoff Startup Decision", section_start
+        )
+        section = self.redmine_workflow[section_start:section_end]
+        self.assertIn("`mozyo-bridge handoff send", section)
+        self.assertIn("`mozyo-bridge handoff reply", section)
+        self.assertIn("`mozyo-bridge reply", section)
+        self.assertIn("compatibility", section)
+        self.assertIn("operator/debug primitives", section)
+        self.assertNotIn(
+            "Standard notification command: `mozyo-bridge notify-* --issue",
+            section,
+            msg="redmine preset still recommends the old notify-* shell as the standard",
+        )
+        # The retired-queue wrapper must be tagged cleanup-only here too.
+        self.assertIn("retired-queue cleanup wrappers", section)
+
+    def test_redmine_preset_handoff_startup_anchors_at_primitive(self) -> None:
+        # The "Standard path" entry of the Handoff Startup Decision must
+        # name the primitive, not the legacy notify-* shell.
+        section_start = self.redmine_workflow.index("## Handoff Startup Decision")
+        section_end = self.redmine_workflow.index(
+            "## Implementer / Auditor Role Boundary", section_start
+        )
+        section = self.redmine_workflow[section_start:section_end]
+        # The Standard path bullet must lead with the primitive.
+        self.assertIn("**Standard path**", section)
+        self.assertIn("`mozyo-bridge handoff send", section)
+        # `notify-*` must be described as compatibility, not the standard.
+        self.assertIn("compatibility", section)
+
+    def test_redmine_preset_receiver_forbids_status_doctor_scrollback_inference(
+        self,
+    ) -> None:
+        # The Pane Notification section's recipient bullet must explicitly
+        # forbid inferring receiver / issue state from status / doctor /
+        # scrollback when a durable Redmine anchor exists.
+        section_start = self.redmine_workflow.index("## Pane Notification")
+        section_end = self.redmine_workflow.index(
+            "## Handoff Startup Decision", section_start
+        )
+        section = self.redmine_workflow[section_start:section_end]
+        self.assertIn("`mozyo-bridge status`", section)
+        self.assertIn("`mozyo-bridge doctor`", section)
+        self.assertIn("pane scrollback", section)
+        self.assertIn("operator/debug aids", section)
+
+    def test_asana_claude_reminder_anchors_at_primitive(self) -> None:
+        self.assertIn("`mozyo-bridge handoff send`", self.asana_claude)
+        self.assertIn("`mozyo-bridge handoff reply`", self.asana_claude)
+        self.assertIn("`mozyo-bridge reply`", self.asana_claude)
+        # The reminder must explicitly tag the low-level commands as
+        # operator/debug so the boundary is visible at the router level.
+        self.assertIn("operator/debug", self.asana_claude)
+        # No-inference rule must be present so the reminder carries it from
+        # the router into every session boot.
+        self.assertIn("`mozyo-bridge status`", self.asana_claude)
+        self.assertIn("`mozyo-bridge doctor`", self.asana_claude)
+
+    def test_redmine_claude_reminder_anchors_at_primitive(self) -> None:
+        self.assertIn("`mozyo-bridge handoff send`", self.redmine_claude)
+        self.assertIn("`mozyo-bridge handoff reply`", self.redmine_claude)
+        self.assertIn("`mozyo-bridge reply`", self.redmine_claude)
+        self.assertIn("operator/debug", self.redmine_claude)
+        self.assertIn("`mozyo-bridge status`", self.redmine_claude)
+        self.assertIn("`mozyo-bridge doctor`", self.redmine_claude)
+
+    def test_redmine_agents_guardrail_anchors_at_primitive(self) -> None:
+        # The AGENTS.md guardrail bullet for inter-agent notification must
+        # name the primitive as the standard so the router itself does not
+        # drift back to the old notify-* shell.
+        self.assertIn("`mozyo-bridge handoff send", self.redmine_agents)
+        self.assertIn("`mozyo-bridge handoff reply", self.redmine_agents)
+        self.assertIn("`mozyo-bridge reply", self.redmine_agents)
+        self.assertIn("operator/debug", self.redmine_agents)
 
 
 class ScaffoldStatusTest(unittest.TestCase):
@@ -1585,6 +1747,42 @@ class NotifyContractTest(unittest.TestCase):
         self.assertIn("[mozyo:notify:task=legacy-task:issue=9596]", pane_text)
         self.assertIn("handoff task legacy-task is ready for claude", pane_text)
         self.assertIn("legacy queue fallback", pane_text)
+
+    def test_legacy_task_notification_does_not_emit_structured_outcome(self) -> None:
+        # Regression rail for the handoff-primitive split (Asana 1214760806178471):
+        # `notify-*-legacy-task` is the retired-queue cleanup wrapper and must
+        # NOT route through `orchestrate_handoff`. It therefore must not emit
+        # the structured JSON outcome line nor the markdown delivery record,
+        # because callers of the legacy wrapper have no durable Asana / Redmine
+        # anchor to anchor that record at. If a future refactor accidentally
+        # unifies the legacy queue path with the standard primitive, callers
+        # would start seeing structured-outcome bytes that name a stale queue
+        # task as the anchor.
+        task = {"id": "legacy-task", "issue_id": 9596, "commit": "abc123", "type": "design_consultation_result"}
+        with patch("mozyo_bridge.application.commands.find_handoff_task", return_value=task):
+            result, _sent, stdout, _pane_text = self.run_notify_with_fake_tmux(
+                [
+                    "notify-claude-legacy-task",
+                    "--issue",
+                    "9596",
+                    "--task-id",
+                    "legacy-task",
+                    "--type",
+                    "design_consultation_result",
+                    "--target",
+                    "%2",
+                    "--force",
+                    "--submit-delay",
+                    "0",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        outcome_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        self.assertEqual([], outcome_lines, msg=f"legacy wrapper emitted structured outcome: {stdout!r}")
+        self.assertNotIn("Delivery result —", stdout)
+        self.assertNotIn("Durable anchor:", stdout)
+        self.assertNotIn("`receiver`", stdout)
 
     def test_notify_submits_under_queue_enter_default_even_when_marker_missed(
         self,

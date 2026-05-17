@@ -42,6 +42,24 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 
 `smoke/real_tmux_notify_smoke.py` は **explicit な strict `--mode standard` rail** のみを自動検証する (v0.4 contract pivot 後は `mozyo-bridge handoff send --mode standard --force` を非 agent な `sh` receiver に対して打つ形)。v0.4 で normative default になった `--mode queue-enter` rail (Asana `1214825156046950` 配下、`vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` / `## Queue-Enter Default Rail` を正本とする) は (a) real Claude / Codex TUI 上の prompt queue 挙動と pane metadata に依存し、(b) Layer B deterministic preflight (`--force` 不可、window-name / same-session / active-split / per-receiver foreground process allowlist) が non-agent `sh` receiver を typing 前に reject するため、同 smoke では auto-cover できない。v0.4 default を触る変更は同 smoke header の docstring に記載した手順 (`mozyo-bridge handoff send` を `--mode` 指定なしで queue-enter default として marker 観測あり / 観測なしの 2 ケース、`--mode standard` 明示で strict regression 1 ケース、v0.3 preflight spot-check 3 ケース (foreign-session / inactive-split / non-agent reject)、v0.4 force-rejection regression 1 ケースの計 7 ケース) を Asana task に記録する。default promise は `confirmed landing` ではなく `strong preflight 付き practical queued submission` のため、queue-enter rail の auto smoke が無い状態でも product 約束自体は破綻しない (durable record が引き続き source of truth)。
 
+### Handoff primitive regression coverage (Asana `1214760806178471`)
+
+`mozyo-bridge handoff send` / `handoff reply` / 上位 alias `mozyo-bridge reply` の primitive regression は in-process unit test で固定済みであり、release 前に published package 専用 smoke を追加する必要はない。具体的カバー:
+
+- `HandoffOrchestratorTest` — standard mode の marker observed + Enter、`pending` mode (Enter 発行せず operator owned)、strict mode marker_timeout `C-u` rollback、anchor / target / non-agent pane の各 invalid 分岐。
+- `RelaxedQueueEnterRailTest` — CLI `--mode` の受理 / 未指定時の v0.4 default 確認 (`queue-enter`)、queue-enter rail observed/unobserved marker の outcome、strict rail rollback、`--force` rejection、target window guard、v0.3 preflight (foreign-session / inactive-split / cross-receiver / weak identity admit)、delivery record の operator-note 文言。
+- `NotifyContractTest` — `notify-codex` / `notify-claude` / `notify-codex-review` / `notify-claude-review-result` が primitive を経由していること (marker shape / body / Enter 発行 / structured outcome)、queue-enter default で marker 未観測でも Enter が出ること、success line 互換、`--record-format` / `--record-command` の伝搬、および `notify-claude-legacy-task` が primitive 経路に乗らず structured outcome を emit しないこと (retired-queue cleanup wrapper の境界)。
+- `DeliveryRecordTest` + `HandoffRecordEmissionTest` — sent / pending_input / blocked / target_unavailable / target_not_agent / invalid_anchor / invalid_args の各 outcome に対する markdown record + JSON outcome の決定論的生成、`--record-format both|text|json` の組み合わせ、`--record-command` の inline 化。
+- `SharedSkillWorkflowTest::test_workflow_lifecycle_anchors_at_handoff_primitive` + `ScaffoldPresetHandoffPrimitiveDocsTest` — skill workflow.md と asana / redmine scaffold preset の `agent-workflow.md` / `CLAUDE.md` / `AGENTS.md` が primitive を standard path として記述し、`read` / `message` / `type` / `keys` を operator/debug primitive として明記し、`status` / `doctor` / pane scrollback からの推論を禁止する文言を保持していることを doc-regression として固定する。`Standard notification command: mozyo-bridge notify-* --issue --journal` 等の旧 standard wording が再導入されればここで落ちる。
+
+Published-package 専用 smoke は追加しない。理由:
+
+- TestPyPI / PyPI fresh install acceptance (`Beta Tester Install` 節) が installed binary に対して `mozyo-bridge doctor` を実行する。primitive subcommand (`handoff send` / `handoff reply` / `reply` alias / `notify-*` standard variants) が installed binary に欠落していれば parser 構築段階で fail し、`scaffold rules` / `scaffold status` フローまで到達できない。
+- 同じ acceptance flow が installed binary に対して `scaffold rules <preset>` を実行するため、scaffold preset の中身 (上記 `ScaffoldPresetHandoffPrimitiveDocsTest` で固定された primitive guidance を含む) が installed package に乗っていることが確認される。
+- queue-enter rail の **末端 tmux 挙動** は real Claude / Codex TUI に依存し、`sh` receiver に対しては典型的な smoke にできない (上記 7 ケース手順を Asana task に残す運用で代替する)。`--mode standard` 鉄道は本 smoke で end-to-end 検証済み。
+
+新規 smoke を増やす条件: real TUI receiver を伴う queue-enter 自動化が確立した時、または `notify-*` wrapper が primitive 経路を離れた時 (上記 doc-regression テストが落ちて初めて気づくのでは遅いケース)。両条件は現状 false であるため smoke の追加は deferred とする。
+
 ## Release Flow
 
 1. Asana release task から開始する。
