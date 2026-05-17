@@ -6723,7 +6723,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
             "conclusion": "success",
             "workflowName": "Test",
             "headSha": "abc123",
-            "htmlUrl": "https://example/run/42",
+            "url": "https://example/run/42",
         }
         with patch.object(release_mod, "_gh_run_view", return_value=payload):
             with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -6742,7 +6742,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
             "conclusion": "failure",
             "workflowName": "Test",
             "headSha": "abc123",
-            "htmlUrl": "https://example/run/42",
+            "url": "https://example/run/42",
         }
         with patch.object(release_mod, "_gh_run_view", return_value=payload):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -6759,7 +6759,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
             "conclusion": None,
             "workflowName": "Test",
             "headSha": "abc123",
-            "htmlUrl": "https://example/run/42",
+            "url": "https://example/run/42",
         }
         with patch.object(release_mod, "_gh_run_view", return_value=payload):
             with contextlib.redirect_stdout(io.StringIO()):

@@ -487,7 +487,7 @@ def _gh_run_view(run_id: str) -> dict[str, object]:
             "view",
             run_id,
             "--json",
-            "status,conclusion,databaseId,headSha,workflowName,htmlUrl,createdAt,updatedAt",
+            "status,conclusion,databaseId,headSha,workflowName,url,createdAt,updatedAt",
         ]
     )
     if result.returncode != 0:
@@ -526,13 +526,13 @@ def cmd_release_check_workflow(args: argparse.Namespace) -> int:
     conclusion = payload.get("conclusion")
     workflow_name = payload.get("workflowName")
     head_sha = payload.get("headSha")
-    url = payload.get("htmlUrl")
+    url = payload.get("url")
     print(f"run_id: {args.run_id}")
     print(f"workflow: {workflow_name}")
     print(f"status: {status}")
     print(f"conclusion: {conclusion}")
     print(f"head_sha: {head_sha}")
-    print(f"html_url: {url}")
+    print(f"url: {url}")
     return _workflow_exit_code(
         status if isinstance(status, str) else None,
         conclusion if isinstance(conclusion, str) else None,
