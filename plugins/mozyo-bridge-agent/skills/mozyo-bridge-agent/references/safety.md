@@ -22,6 +22,15 @@
 - Whichever rail is used, the durable record (Asana task comment / Redmine journal) is still the source of truth. The pane notification is a pointer.
 - `.agent_handoff/tasks.json` is a retired queue cleanup surface, not a standard notification fallback.
 
+## Tool Error Parsing
+
+When a `mozyo-bridge` command (or any other tool) dies with an `error: ...` message, parse the literal text of that error first, before pattern-matching the failure shape against past similar-looking errors. The literal text is the authoritative next-step source; a remembered "this kind of error is usually fatal / escape via X" pattern from prior sessions does not override it.
+
+- If the error contains a literal next-action verb such as `read target again`, `retry`, `refresh`, `re-run`, or an explicit `Retry path:` / `Fallback path:` hint, follow that verb verbatim before considering any higher fallback. The verb is the authoritative next step.
+- Only after the literal next-action verb has been followed and produced a fresh failure, or after the latest error demonstrably contains no next-action verb at all, may the agent escalate to a higher fallback. Skipping the literal verb in favor of a remembered escape path is a known regression mode (Asana task 1214779823377861).
+- `mozyo-bridge message --no-submit` and `mozyo-bridge handoff send` marker-gate failures emit `hint:` trailers on stderr that name both the retry path and the per-preset `--no-submit` retry budget. Those trailers are part of the contract — read them and act on them, do not treat them as decoration.
+- The `--no-submit` retry budget (cap 3) and the standard `handoff send` retry pool are **separate budgets**. Do not borrow attempts across them when judging whether the preset's `Notification fails` branch may fire.
+
 ## Sender Handoff Boundary
 
 When asking another agent to work through `mozyo-bridge`, the sending agent should only verify the handoff itself:

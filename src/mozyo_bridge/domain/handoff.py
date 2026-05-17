@@ -331,6 +331,16 @@ def project_last_input(
     return None
 
 
+NO_SUBMIT_RETRY_BUDGET = 3
+"""Per preset contract, the `mozyo-bridge message --no-submit` retry budget cap.
+
+This is the *only* place the budget cap is hard-coded. CLI guidance lines and
+``next_action_for`` derive their N/3 framing from this constant so the budget
+stays in lockstep across the structured outcome, the durable record, the CLI
+stderr trailer, and any preset wording that references the same N.
+"""
+
+
 def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[NextActionOwner, str]:
     """Return the canonical owner/action phrase for an outcome."""
     if status == "sent":
@@ -341,9 +351,29 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
             "inspect the pending prompt at the target pane and decide whether to submit",
         )
     if reason == "marker_timeout":
+        # The previous wording attributed the next action to "record
+        # un-notified ... immediately", which let agents skip the retry budget
+        # entirely after a single transient gate failure (Asana task
+        # 1214779823377861, Asana task 1214774670696760 comment 1214778979254677
+        # for the worked example). The contract is: refresh the read marker,
+        # retry under `--no-submit` up to NO_SUBMIT_RETRY_BUDGET attempts, and
+        # only escalate to `un-notified` after that budget is exhausted AND the
+        # last gate error lacks a literal next-action verb. "un-notified" is
+        # preserved as the terminal escalation label so existing audit tooling
+        # and the preset's "Notification fails" branch continue to grep the
+        # same vocabulary.
         return (
             "sender",
-            "record un-notified or pending-operator-action in the durable record with the attempted command",
+            (
+                f"refresh the read marker via `mozyo-bridge read {receiver}` then "
+                f"retry with `mozyo-bridge message {receiver} \"<resubmit text>\" "
+                f"--no-submit --attempt <N>` (up to {NO_SUBMIT_RETRY_BUDGET} "
+                "attempts per preset contract). Only after that budget is "
+                "exhausted AND the last gate error lacks a next-action verb "
+                "(`read target again`, `retry`, `refresh`), record `un-notified` "
+                "in the durable record with every attempted command and observed "
+                "error verbatim."
+            ),
         )
     if reason == "target_unavailable":
         return (
@@ -512,6 +542,25 @@ def build_delivery_record(
             "`mozyo-bridge handoff send --mode standard` and re-attempt with "
             "the recovered read marker."
         )
+    if outcome.status == "blocked" and outcome.reason == "marker_timeout":
+        # Sender-facing fallback hint required to prevent the "transient
+        # marker_timeout → immediately record un-notified" shortcut described
+        # in Asana task 1214779823377861. Mirrors and is constrained by the
+        # `next_action` line; the `un-notified` terminal label is still in
+        # `next_action`, but this hint surfaces the ordered retry path
+        # explicitly in the durable record so an auditor and any future agent
+        # can replay why escalation happened (or did not).
+        receiver_label = outcome.receiver or "<receiver>"
+        lines.append(
+            f"- Fallback path: refresh the read marker via `mozyo-bridge read "
+            f"{receiver_label}` then retry with `mozyo-bridge message "
+            f"{receiver_label} \"<resubmit text>\" --no-submit --attempt <N>` "
+            f"(up to {NO_SUBMIT_RETRY_BUDGET} attempts per preset contract; "
+            "track attempts with `--attempt N`). Only after the budget is "
+            "exhausted AND the last gate error lacks a literal next-action "
+            "verb (`read target again`, `retry`, `refresh`) should the "
+            "preset's `Notification fails` branch fire."
+        )
     contract = _receiver_contract_line(outcome.status, outcome.reason, outcome.receiver)
     if contract:
         lines.append("")
@@ -565,6 +614,7 @@ __all__: Iterable[str] = (
     "MODE_PENDING",
     "MODE_QUEUE_ENTER",
     "MODE_STANDARD",
+    "NO_SUBMIT_RETRY_BUDGET",
     "NormalizedAnchor",
     "RECEIVERS",
     "RECORD_FORMATS",

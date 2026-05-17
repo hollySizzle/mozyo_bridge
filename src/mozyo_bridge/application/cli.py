@@ -221,6 +221,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Number of pane lines to inspect when waiting for the header marker",
     )
+    message.add_argument(
+        "--attempt",
+        dest="attempt",
+        type=int,
+        default=None,
+        help=(
+            "Optional retry counter for the per-preset `--no-submit` retry "
+            "budget. Pass `--attempt N` on each retry so gate-failure stderr "
+            "trailers can report `N/cap` remaining accurately; omit on the "
+            "first call. Counter is operator-tracked because the CLI is "
+            "stateless across invocations."
+        ),
+    )
     message.set_defaults(func=cmd_message, submit=True)
 
     keys = sub.add_parser("keys")

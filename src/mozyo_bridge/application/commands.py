@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from mozyo_bridge.domain.handoff import (
     MODE_PENDING,
     MODE_QUEUE_ENTER,
     MODES,
+    NO_SUBMIT_RETRY_BUDGET,
     RECEIVERS,
     RECORD_FORMAT_BOTH,
     RECORD_FORMAT_JSON,
@@ -144,10 +146,97 @@ def cmd_type(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_message_gate_guidance(
+    target: str,
+    *,
+    attempt: int | None = None,
+    no_submit: bool = False,
+) -> None:
+    """Print the stderr guidance trailer after a `mozyo-bridge message` gate failure.
+
+    The base ``error: ...`` line already names the literal next-action verb
+    ("read target again", "must read target before interacting", etc.). This
+    trailer is the structural anti-shortcut required by Asana task
+    1214779823377861: it spells out the retry path (``mozyo-bridge read``,
+    then re-run) and the per-preset ``--no-submit`` retry budget so an agent
+    cannot conflate the budget with the ``handoff send`` retry pool or jump
+    straight to the preset's ``Notification fails`` branch after one transient
+    failure.
+    """
+    cap = NO_SUBMIT_RETRY_BUDGET
+    print(
+        f"hint: retry path: `mozyo-bridge read {target}` to refresh the read "
+        f"marker, then re-run the failed `mozyo-bridge message` command.",
+        file=sys.stderr,
+    )
+    if not no_submit:
+        return
+    if attempt is not None:
+        used = max(0, int(attempt))
+        remaining = max(0, cap - used)
+        print(
+            f"hint: --no-submit retry budget: attempt {used}/{cap} just "
+            f"failed; {remaining}/{cap} attempts remaining per preset "
+            "contract. Do not borrow from the `mozyo-bridge handoff send` "
+            "retry pool — they are separate budgets.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"hint: --no-submit retry budget: up to {cap} attempts per "
+            "preset contract; pass `--attempt N` on each retry to track "
+            "the remaining budget. Do not borrow from the `mozyo-bridge "
+            "handoff send` retry pool — they are separate budgets.",
+            file=sys.stderr,
+        )
+
+
+def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
+    """Print the stderr trailer after a strict-rail `handoff send` marker_timeout.
+
+    Required by Asana task 1214779823377861 to keep agents from collapsing a
+    single transient ``marker_timeout`` into the preset's ``Notification
+    fails`` branch. The structured outcome and durable record already enumerate
+    the fallback path; this trailer surfaces it on the failure stream so the
+    agent sees it even when the durable record is consumed by a downstream
+    process and not re-read.
+    """
+    cap = NO_SUBMIT_RETRY_BUDGET
+    print(
+        f"hint: fallback path: `mozyo-bridge read {receiver}` then "
+        f"`mozyo-bridge message {receiver} \"<resubmit text>\" --no-submit "
+        f"--attempt <N>` (up to {cap} attempts per preset contract; track "
+        "remaining with `--attempt N`).",
+        file=sys.stderr,
+    )
+    print(
+        "hint: --no-submit retry budget and the `mozyo-bridge handoff send` "
+        "retry pool are separate budgets; do not borrow attempts across them.",
+        file=sys.stderr,
+    )
+    print(
+        f"hint: only after the {cap}-attempt --no-submit budget is exhausted "
+        "AND the last gate error lacks a literal next-action verb (`read "
+        "target again`, `retry`, `refresh`) may the preset's `Notification "
+        "fails` branch fire. Record every attempted command and observed "
+        "error verbatim in the durable record before escalating.",
+        file=sys.stderr,
+    )
+
+
 def cmd_message(args: argparse.Namespace) -> int:
     require_tmux()
     target = resolve_target(args.target)
-    require_read(target)
+    attempt = getattr(args, "attempt", None)
+    no_submit = not getattr(args, "submit", True)
+    try:
+        require_read(target)
+    except SystemExit:
+        # `require_read` dies before returning; intercept so the structural
+        # guidance trailer lands on stderr right after the base `error:` line.
+        # Re-raise to preserve the SystemExit exit code.
+        _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
+        raise
     sender = current_pane()
     sender_id = pane_window_name(sender) or sender
     header = f"[mozyo-bridge from:{sender_id} pane:{sender} at:{pane_location(sender)}]"
@@ -159,6 +248,7 @@ def cmd_message(args: argparse.Namespace) -> int:
         if not wait_for_text(target, header, landing_lines, landing_timeout):
             run_tmux("send-keys", "-t", target, "C-u")
             clear_read(target)
+            _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
             die(
                 "message marker was not observed in target pane; input was cleared and Enter was not pressed. "
                 f"target={target} marker={header}"
@@ -948,6 +1038,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             notification_marker=marker,
         )
         _emit_outcome(outcome, record_format=record_format, command=record_command)
+        _emit_handoff_marker_timeout_guidance(receiver)
         die(
             "handoff marker was not observed in target pane; input was cleared and Enter was not pressed. "
             f"target={target} marker={marker}"

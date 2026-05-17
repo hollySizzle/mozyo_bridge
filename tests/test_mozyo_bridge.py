@@ -831,7 +831,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.16.1", state["preset_version"])
+            self.assertEqual("2026.05.17.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
             # The audit-owned commit policy belongs in the central preset only.
@@ -1915,6 +1915,188 @@ class MessageContractTest(unittest.TestCase):
         self.assertIsInstance(result, SystemExit)
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
         self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+
+
+class MessageGateGuidanceTest(unittest.TestCase):
+    """Regression coverage for Asana task 1214779823377861.
+
+    The CLI must emit a structured stderr trailer after `mozyo-bridge message`
+    read-marker / marker-observation gate failures so agents see the literal
+    retry path and the per-preset `--no-submit` retry budget. Without this
+    trailer, agents have been observed conflating the `--no-submit` budget
+    with the `handoff send` retry pool and jumping straight to the preset's
+    `Notification fails` branch after a single transient failure (see Asana
+    task 1214774670696760 comment 1214778979254677 for the failure example).
+    """
+
+    def _run_message_with_gate_failure(
+        self,
+        argv: list[str],
+        *,
+        require_read_side_effect=None,
+        suppress_marker_in_capture: bool = False,
+    ):
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+        pane_text = ""
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            # When the test exercises the wait_for_text rollback path, the
+            # capture must not echo the typed marker even though
+            # `fake_run_tmux` accumulates it into `pane_text`. Otherwise the
+            # gate would observe the marker (because the marker is in
+            # `pane_text`) and the rollback branch never fires.
+            if suppress_marker_in_capture:
+                return ""
+            return pane_text
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            nonlocal pane_text
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text += tmux_args[-1]
+            sent.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        require_read_patch = (
+            patch(
+                "mozyo_bridge.application.commands.require_read",
+                side_effect=require_read_side_effect,
+            )
+            if require_read_side_effect is not None
+            else patch("mozyo_bridge.application.commands.require_read")
+        )
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            require_read_patch, \
+            patch("mozyo_bridge.application.commands.clear_read"), \
+            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
+            patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
+            patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                result = exc
+
+        return result, sent, stderr.getvalue()
+
+    def test_no_submit_read_marker_failure_emits_retry_path_and_budget(self) -> None:
+        # require_read dies with the literal next-action verb ("read target
+        # again before interacting"). The CLI must augment stderr with an
+        # explicit retry path and the per-preset --no-submit budget so the
+        # agent does not need to pattern-match from memory (failure mode #1 in
+        # the task body).
+        result, _sent, stderr = self._run_message_with_gate_failure(
+            ["message", "%2", "pending body", "--no-submit"],
+            require_read_side_effect=SystemExit(2),
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("hint: retry path:", stderr)
+        self.assertIn("mozyo-bridge read %2", stderr)
+        self.assertIn("--no-submit retry budget", stderr)
+        # The base preset cap is 3; if this assertion ever fails, double-check
+        # NO_SUBMIT_RETRY_BUDGET in domain/handoff.py and update the preset
+        # `Notification fails` branch in lockstep.
+        self.assertIn("3", stderr)
+        self.assertIn(
+            "handoff send",
+            stderr,
+            "stderr must name the `handoff send` pool to prevent budget conflation (failure mode #2 in task 1214779823377861)",
+        )
+
+    def test_no_submit_read_marker_failure_with_attempt_reports_remaining(
+        self,
+    ) -> None:
+        # --attempt N parameterizes the budget reporting so the agent knows
+        # exactly how many --no-submit retries remain. Operator-tracked
+        # because the CLI is stateless across invocations.
+        result, _sent, stderr = self._run_message_with_gate_failure(
+            [
+                "message",
+                "%2",
+                "pending body",
+                "--no-submit",
+                "--attempt",
+                "2",
+            ],
+            require_read_side_effect=SystemExit(2),
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn("attempt 2/3 just failed", stderr)
+        self.assertIn("1/3 attempts remaining", stderr)
+
+    def test_submit_marker_timeout_still_rolls_back_and_emits_guidance(
+        self,
+    ) -> None:
+        # Safety-gate regression: the existing fail-closed contract (no Enter
+        # when marker is not observed; C-u rollback) must remain intact, and
+        # the new guidance trailer must fire alongside it. This is the test
+        # for failure mode #3 in the task body ("Notification fails" used as
+        # escape hatch after transient failure).
+        result, sent, stderr = self._run_message_with_gate_failure(
+            [
+                "message",
+                "%2",
+                "lost body",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            suppress_marker_in_capture=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        # Fail-closed contract: Enter not pressed, C-u issued.
+        self.assertFalse(
+            any(call == ("send-keys", "-t", "%2", "Enter") for call in sent)
+        )
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        # New trailer present.
+        self.assertIn("hint: retry path:", stderr)
+        self.assertIn("mozyo-bridge read %2", stderr)
+        # In default (submit) mode no --no-submit budget trailer is emitted —
+        # `--no-submit` was not requested. The retry-path line is enough; the
+        # budget line is gated on --no-submit so we do not over-promise a
+        # budget that does not apply here.
+        self.assertNotIn("--no-submit retry budget:", stderr)
+
+    def test_no_submit_message_happy_path_emits_no_gate_guidance(self) -> None:
+        # Anti-regression: the trailer must NOT fire when require_read
+        # succeeds. The happy path must remain silent on stderr.
+        parser = build_parser()
+        args = parser.parse_args(["message", "%2", "ok body", "--no-submit"])
+        sent: list[tuple[str, ...]] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            sent.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.require_read"), \
+            patch("mozyo_bridge.application.commands.clear_read"), \
+            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
+            patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
+            patch("mozyo_bridge.application.commands.capture_pane", return_value=""), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = args.func(args)
+
+        self.assertEqual(0, result)
+        self.assertNotIn("hint: retry path:", stderr.getvalue())
+        self.assertNotIn("--no-submit retry budget", stderr.getvalue())
 
 
 class WaitForTextContractTest(unittest.TestCase):
@@ -3780,7 +3962,15 @@ class HandoffDomainTest(unittest.TestCase):
         owner, action = next_action_for("blocked", "marker_timeout", "claude")
 
         self.assertEqual("sender", owner)
+        # The terminal escalation label is preserved so audit tooling and the
+        # preset's `Notification fails` branch keep grepping the same word,
+        # but the action now spells out the retry budget that must precede it
+        # (Asana task 1214779823377861).
         self.assertIn("un-notified", action)
+        self.assertIn("mozyo-bridge read claude", action)
+        self.assertIn("--no-submit", action)
+        self.assertIn("3", action)
+        self.assertIn("next-action verb", action)
 
     def test_kind_labels_contract_is_stable(self) -> None:
         self.assertEqual(
@@ -4265,7 +4455,7 @@ class HandoffOrchestratorTest(unittest.TestCase):
         # roll back via `C-u` and emit `blocked` / `marker_timeout`. v0.4
         # default (queue-enter) deliberately does NOT roll back; that contract
         # is covered separately.
-        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
                 "send",
@@ -4300,6 +4490,20 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("marker_timeout", outcome["reason"])
         self.assertEqual("sender", outcome["next_action_owner"])
+
+        # Asana task 1214779823377861: the rollback path must emit the
+        # `--no-submit` fallback hint on stderr so agents do not jump to the
+        # preset's `Notification fails` branch after a single transient
+        # marker_timeout. Names the receiver and the per-preset cap so the
+        # budget is unambiguous and not borrowed from the `handoff send`
+        # retry pool.
+        self.assertIn("hint: fallback path:", stderr)
+        self.assertIn("mozyo-bridge read claude", stderr)
+        self.assertIn("mozyo-bridge message claude", stderr)
+        self.assertIn("--no-submit", stderr)
+        self.assertIn("3", stderr)
+        self.assertIn("separate budgets", stderr)
+        self.assertIn("next-action verb", stderr)
 
     def test_invalid_anchor_emits_blocked_invalid_anchor_outcome(self) -> None:
         # Anchor normalization fires before rail-specific preflight, so this
@@ -5387,6 +5591,15 @@ class DeliveryRecordTest(unittest.TestCase):
         self.assertIn("manually if action is still required", record)
         self.assertIn("Next action owner: `sender`", record)
         self.assertIn("un-notified", record)
+        # Asana task 1214779823377861: the durable record must also surface
+        # the ordered fallback path so an auditor (or any agent re-reading
+        # the comment later) sees the retry budget before the un-notified
+        # terminal label.
+        self.assertIn("- Fallback path:", record)
+        self.assertIn("mozyo-bridge read claude", record)
+        self.assertIn("mozyo-bridge message claude", record)
+        self.assertIn("--no-submit", record)
+        self.assertIn("Notification fails", record)
 
     def test_target_unavailable_record_lacks_target_and_marker(self) -> None:
         outcome = make_outcome(
