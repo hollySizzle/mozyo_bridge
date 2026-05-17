@@ -83,7 +83,7 @@
 ## Audit Handoff (Claude → Codex)
 
 - Claude が code、documentation、設定を作成、修正、削除した task は完了前に必ず Codex に audit を依頼する。documentation のみの変更でも省略しない。
-- 依頼経路は `mozyo-bridge message codex <text>` を標準とする。`message` 送信前には同 pane を `mozyo-bridge read codex` で確認する (mozyo-bridge の message safety guard)。
+- 依頼経路は高レベル handoff primitive を標準とする: `mozyo-bridge handoff send --to codex --source asana --task-id <gid> --comment-id <story_gid> --kind <review_request|design_consultation|implementation_done|reply|custom>` (および `mozyo-bridge handoff reply ...` / 上位 alias `mozyo-bridge reply ...`)。primitive が receiver pane resolve / deterministic Layer B preflight / marker-prefixed notification の typing / Enter 発行をまとめて行うため、caller は `mozyo-bridge read codex` + `mozyo-bridge message codex` の shell-level 組み立てを行わない。`mozyo-bridge read` / `message` / `type` / `keys` は operator/debug 用の低レベル primitive (read inspection、ad-hoc operator message、raw typing、raw keys) であり、standard handoff/reply の代替にしない。`status` / `doctor` / pane scrollback は durable Asana anchor が利用可能なときに receiver state / task state の推測 source として使わず、anchor を直接読む。
 - audit 依頼 message には次を含める。
   - Asana task の URL
   - 変更ファイルの一覧

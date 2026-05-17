@@ -1,17 +1,17 @@
 {
   "files": {
     "AGENTS.md": {
-      "sha256": "51e068b548ec84ad5e422fc95403602322e1766b799fb4676ed82fe22ed3889f"
+      "sha256": "aeb7c9b2e6a8488f38e4c8d14760624eeb0cc2559aeeae9d6ab2fa3bf93e0868"
     },
     "CLAUDE.md": {
-      "sha256": "61d63728e7a052ca3c01c148ad159343c4ba2e07d86bc5f9663557223fc1ee99"
+      "sha256": "ebe47274575a62e652d97e8eb5447c824284ba0ecd2c9a7380f04fa6e757b2cd"
     }
   },
-  "generated_by": "mozyo-bridge 0.1.9",
+  "generated_by": "mozyo-bridge 0.2.0",
   "mode": "central",
   "preset": "asana",
-  "preset_hash": "4a72c709b52316aa297e65a9ec70f0f86e9bbdfd9dd141415a7acdcab50f0db3",
-  "preset_version": "2026.05.12.1",
+  "preset_hash": "33cd84b4978bf042b7a0e8f87a06da643ccb0c79ae5c0fabf64086600249ead6",
+  "preset_version": "2026.05.17.2",
   "rule_path": "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
   "schema_version": 2
 }

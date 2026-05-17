@@ -44,13 +44,15 @@ When the inbound is only a ticket ID, a ticket URL, or pane / chat text naming a
 Use handoff only when the active project workflow or the user explicitly asks for another agent to participate.
 
 1. The sender records or identifies the durable source of truth first.
-2. The sender notifies the receiver through `mozyo-bridge` after the required read/guard step.
-3. The receiver starts from the durable source of truth, not from pane text alone.
+2. The sender notifies the receiver through the high-level `mozyo-bridge` handoff primitive (`mozyo-bridge handoff send` / `mozyo-bridge handoff reply` / top-level alias `mozyo-bridge reply`). The primitive runs its own deterministic preflight; the caller does not assemble `mozyo-bridge read` + `mozyo-bridge message` shell choreography for normal handoff/reply. The `notify-*` wrappers (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) are compatibility entrypoints that route through the same primitive for standard Redmine-shaped notifications; `notify-*-legacy-task` remains a retired-queue cleanup wrapper only.
+3. The receiver starts from the durable source of truth, not from pane text alone, and not from `mozyo-bridge status` / `doctor` / pane scrollback inference. Those surfaces are operator/debug aids; when a durable Asana / Redmine anchor is available, read the named task / comment / issue / journal.
 4. The receiver records findings, blockers, completion notes, and verification in the durable source of truth.
-5. The receiver sends a short result notification back to the sender so the sender knows to read the durable record.
+5. The receiver sends a short result notification back to the sender through the same handoff primitive so the sender knows to read the durable record.
 6. The sender resumes from the durable record and decides the next action.
 
 Pane messages are notification edges in this lifecycle. They are not review passes, task completion, release approval, or the work log.
+
+The low-level `mozyo-bridge read`, `mozyo-bridge message`, `mozyo-bridge type`, and `mozyo-bridge keys` commands are operator/debug primitives (pane inspection, ad-hoc operator messages, raw typing, raw keys). They are not the standard handoff/reply path and must not be assembled by hand as a routine substitute for the primitive; the only sanctioned uses are the operator-driven `--no-submit` retry path in step 3 of the Retry Path Checklist (per-preset central rules) and explicit operator debugging.
 
 A project-local rule that requires the sender to notify the receiver for every handoff of a given direction applies to every task in that scope, including audit-only, revalidation, and doc-only tasks; the "every" is not relaxed by how the task is framed, by the receiver's prior pickup-intent statement (for example "I will pull from the task record"), or by the sender's judgement that the receiver will read the durable record anyway. Skipping the notification on that basis is a sender-side rationalization, not a satisfied condition.
 

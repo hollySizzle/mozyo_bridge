@@ -360,27 +360,64 @@ Detailed scaffold rules live in `vibes/docs/logics/scaffold-rules.md`.
 
 ## Notification Commands
 
-Claude Code から Codex へレビュー依頼を通知:
+agent 間 handoff / reply の **standard path は高レベル primitive** `mozyo-bridge handoff send` / `mozyo-bridge handoff reply` (上位 alias `mozyo-bridge reply`) です。primitive が receiver pane resolve / deterministic Layer B preflight / marker-prefixed notification の typing / Enter 発行 (`--mode queue-enter` default、`--mode standard` strict fallback、`--mode pending` で typing のみ) をまとめて行います。caller は `mozyo-bridge read` + `mozyo-bridge message` の shell-level 組み立てを行いません。
+
+Asana driven のレビュー依頼:
 
 ```bash
+mozyo-bridge handoff send \
+  --to codex \
+  --source asana \
+  --task-id 1214760548032221 \
+  --comment-id 1214890105221452 \
+  --kind review_request \
+  --summary "branch X の review 依頼"
+```
+
+Asana driven の reply (kind は省略すると `reply`):
+
+```bash
+mozyo-bridge handoff reply \
+  --to claude \
+  --source asana \
+  --task-id 1214760548032221 \
+  --comment-id 1214890105221452 \
+  --summary "audit OK"
+
+# 上位 alias
+mozyo-bridge reply \
+  --to claude \
+  --source asana \
+  --task-id 1214760548032221 \
+  --comment-id 1214890105221452
+```
+
+Redmine driven の review handoff:
+
+```bash
+mozyo-bridge handoff send \
+  --to codex \
+  --source redmine \
+  --issue 9020 \
+  --journal 46005 \
+  --kind review_request \
+  --summary "commit f7b0398dc"
+```
+
+`notify-*` wrappers は **`handoff send` を内部 routing する Redmine 互換 entrypoint** として残ります。新規 caller は handoff primitive を直接使うほうが durable record に明示的な `--kind` ラベルが残るため推奨ですが、既存運用は引き続き動作します。
+
+```bash
+# Redmine 互換 wrapper (内部で handoff primitive を呼ぶ)
 mozyo-bridge notify-codex-review \
   --issue 9020 \
   --journal 46005 \
   --commit f7b0398dc
-```
 
-Codex から ClaudeCode へ監査結果を通知:
-
-```bash
 mozyo-bridge notify-claude-review-result \
   --issue 9020 \
   --journal 46007 \
   --commit f7b0398dc
-```
 
-設計相談など、レビュー以外の journal 通知:
-
-```bash
 mozyo-bridge notify-codex \
   --issue 9020 \
   --journal 46005 \
@@ -391,6 +428,8 @@ mozyo-bridge notify-claude \
   --journal 46007 \
   --type design_consultation_result
 ```
+
+`notify-*-legacy-task` (`.agent_handoff/tasks.yaml` queue 経由) は retired-queue cleanup wrapper であり、handoff primitive を経由しません。新規 notification には使いません。
 
 ## Safety
 
@@ -426,13 +465,15 @@ mozyo-bridge notify-codex-legacy-task \
 
 ## Utility Commands
 
-pane の内容を読む:
+`mozyo-bridge read` / `message` / `type` / `keys` は **operator / debug 用の低レベル primitive** です。standard な agent 間 handoff / reply の代替には使いません (それは上の "Notification Commands" の `mozyo-bridge handoff send/reply` を使います)。`status` / `doctor` の出力は durable Asana / Redmine anchor が利用可能なときに receiver state / task state の推測 source として使いません — anchor を直接読みます。
+
+pane の内容を読む (operator inspection):
 
 ```bash
 mozyo-bridge read codex 30
 ```
 
-明示的な operator 会話を送る:
+ad-hoc operator 会話を送る (handoff/reply ではない):
 
 ```bash
 mozyo-bridge message codex '確認してください'
@@ -444,7 +485,7 @@ mozyo-bridge message codex '確認してください'
 mozyo-bridge doctor
 ```
 
-`message` / `keys` は送信前に `read` が必要です。これは誤送信を減らすためのガードです。
+`message` / `keys` は送信前に `read` が必要です。これは誤送信を減らすためのガードです。これらは正規 handoff/reply 経路ではないため、`mozyo-bridge handoff send` / `handoff reply` のような durable anchor を引数化する structured outcome は emit しません。例外: per-preset Retry Path Checklist で operator/debug fallback として明記された `--no-submit` retry path のみ、`mozyo-bridge read <agent>` + `mozyo-bridge message <agent> "<resubmit text>" --no-submit --attempt N` を operator 経路として使えます (per-preset cap 3 回)。
 
 ## Documentation Map
 
