@@ -7326,7 +7326,7 @@ class ReleasePublishTest(unittest.TestCase):
                         )
                     )
 
-    def test_testpypi_dispatch_includes_version(self) -> None:
+    def test_testpypi_dispatch_validates_version_without_workflow_input(self) -> None:
         from mozyo_bridge.application import release as release_mod
 
         dispatch_call = []
@@ -7381,8 +7381,6 @@ class ReleasePublishTest(unittest.TestCase):
                 "testpypi.yml",
                 "--ref",
                 "main",
-                "-f",
-                "version=0.3.0a1",
             ],
         )
         self.assertIn("9999", out.getvalue())

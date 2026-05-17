@@ -338,7 +338,7 @@ GA / patch 手順:
 
 - pre-release は production publish を起こしてはならないので、GitHub Release を作らない。
 - bump → push → `Publish to TestPyPI` workflow を `workflow_dispatch` で起動する流れだけで完了する。
-  - Helper: `mozyo-bridge release publish --testpypi --version 0.1.0a1` が `gh workflow run testpypi.yml --ref main -f version=0.1.0a1` 相当の dispatch を行い、続けて run-id を Asana task に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
+  - Helper: `mozyo-bridge release publish --testpypi --version 0.1.0a1` は version literal を validate した上で `gh workflow run testpypi.yml --ref main` 相当の dispatch を行う。workflow は `main` の `pyproject.toml` から version を読むため、workflow input は渡さない。helper は続けて run-id を Asana task に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
 - 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
 - `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。
 - 必要なら `git tag -a v0.1.0a1 -m "Pre-release v0.1.0a1"` で tag を打って push する。GitHub Release は作らない。

@@ -916,8 +916,6 @@ def _gh_dispatch_testpypi(version: str) -> dict[str, str]:
             "testpypi.yml",
             "--ref",
             "main",
-            "-f",
-            f"version={version}",
         ]
     )
     if dispatch.returncode != 0:
