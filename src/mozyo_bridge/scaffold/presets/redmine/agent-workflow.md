@@ -1,170 +1,200 @@
 # Redmine Agent Workflow
 
-## Source of Truth
+## 正本
 
-- Redmine issue is the execution unit and source of truth.
-- Redmine journal id is the canonical handoff and review gate. Every formal handoff between agents must be visible as a journal in the same issue.
-- Implementation reports, design consultations, review requests, audit results, and close decisions live in Redmine, not in pane messages or chat reports.
-- Pane and chat messages are notifications only. They never replace the Redmine gate they refer to. A pane notification is auditable only by the journal id it carries; without a matching journal the notification has no durable record.
-- Status and tracker conventions are project-specific and must be configured per Redmine project. Map your project workflow to the gates described below rather than inventing parallel conventions.
+- Redmine issue を実行単位とし、Redmine journal を作業状態の正本とする。
+- agent 間 handoff、設計相談、実装完了、レビュー依頼、レビュー結果、close 判断は、同一 issue の journal として追跡できなければならない。
+- pane message と chat message は通知であり、Redmine gate の代替ではない。pane 通知は journal id を運ぶ pointer にすぎず、対応する journal がなければ監査可能な作業記録ではない。
+- status / tracker 名は Redmine project ごとに異なる。project 固有 status は下記 gate lifecycle に対応付ける。並行する独自 lifecycle を作らない。
 
-## Factual Posture
+## 事実姿勢
 
-- Prioritize factual correctness over agreement. If your investigation contradicts the user's stated assumption, another agent's claim, or your own earlier statement, say so plainly with the evidence; do not soften the conclusion to be agreeable.
-- Record disagreement, alternatives considered, and rejected options in the relevant Redmine gate, not in chat. Chat reports do not replace the durable record.
-- "Implementation Done" is not "complete". Do not report a task as complete in chat or close the issue until the Review Gate is recorded in Redmine and the close conditions are met. An Implementation Done Gate plus a self-verification is review input, not completion; it still requires the Review Request, Review, and Close gates.
-- When you are unsure, say "unconfirmed" and record what would resolve the uncertainty, rather than narrating a confident-sounding guess.
+- 迎合より事実を優先する。ユーザーの前提、他 agent の報告、自分の過去発言と調査結果が矛盾した場合は、根拠とともに明示する。
+- 意見の不一致、採用しなかった選択肢、判断理由は chat ではなく該当 Redmine gate に残す。
+- `Implementation Done` は `完了` ではない。Review Request、Review、owner approval、Close Gate が Redmine に残るまで、chat でも issue status でも完了扱いしない。
+- 未確認事項は断定しない。`未確認` と書き、何を確認すれば解消するかを gate に残す。
 
-## Start of Work
+## 作業開始
 
-1. Confirm the current project root and the active Redmine issue.
-2. Confirm the parent issue (Epic / Feature / UserStory) and capture purpose, acceptance criteria, and known prerequisites.
-3. Confirm the relevant journal id for the current handoff or review gate, or create the gate before notifying anyone.
-4. Read only the project-local docs needed for the current task. If the project provides a docs catalog or active-doc resolver, use it to find the rules that bind to the changed paths and read the actual rule body, not just titles.
-5. If the issue, parent issue, or journal is missing, ambiguous, or inaccessible, stop and ask for the correct gate.
+1. current project root と active Redmine issue を確認する。
+2. parent issue (Epic / Feature / UserStory) を確認し、目的、受入条件、前提、既知の制約を把握する。
+3. 現在の handoff / review / design consultation を境界付ける journal id を確認する。存在しない場合は、pane 通知より先に適切な gate journal を作る。
+4. project-local docs を必要最小限読む。project が docs catalog、active-doc resolver、file convention generator を提供している場合は、それで対象 path に紐づく active docs を解決し、resolver のタイトルだけで済ませず本文を読む。
+5. issue、parent issue、journal が存在しない、曖昧、またはアクセス不能な場合は作業を始めない。正しい gate を確認する。
 
 ## Ticket-ID Entrypoint
 
-When the inbound is "ticket-ID only" — a Redmine issue ID, a Redmine issue URL, or pane / chat text naming an issue (for example "issue X please handle") — this entrypoint applies even when the pane / chat body looks fully framed. The pane carries a journal pointer; the Redmine issue is the source of truth.
+入力が Redmine issue id、Redmine URL、または pane / chat 上の issue 名だけの場合でも、この entrypoint を適用する。pane text が十分に具体的に見えても、作業指示の正本は Redmine issue と journal である。
 
-Before acting:
+作業前に必ず行うこと:
 
-1. Fetch the Redmine issue from the project's Redmine instance, including the most recent journals.
-2. Confirm the parent issue (Epic / Feature / UserStory) and capture purpose, acceptance criteria, and known prerequisites.
-3. Identify the journal id that bounds the current handoff: typically the Review Request, Design Consultation, or Implementation Done gate. If the named journal does not exist, create the appropriate gate before acting on the prompt body.
-4. Map the project's Redmine statuses and trackers to the standard gate lifecycle (Start / Progress Log / Design Consultation / Implementation Done / Review Request / Review / Close); do not invent parallel conventions.
-5. If any required framing field is missing, ambiguous, or contradicts the parent, do not start implementation. Record the gap in a Progress Log gate before notifying anyone.
+1. Redmine API または project 標準 tool で issue と最新 journals を取得する。
+2. parent issue (Epic / Feature / UserStory) を確認し、目的、受入条件、前提、既知の制約を把握する。
+3. 現在の handoff を境界付ける journal id を特定する。典型例は Review Request、Design Consultation、Implementation Done の journal。指定 journal が存在しない場合は、prompt 本文に従う前に適切な gate を作るか、作成を依頼する。
+4. project の status / tracker を標準 gate lifecycle (Start / Progress Log / Design Consultation / Design Consultation Answer / Implementation Done / Review Request / Review / QA Verification / Production Verification / Close) に対応付ける。
+5. 必須 framing が欠落、曖昧、または parent issue と矛盾する場合は、実装を始めない。まず Progress Log Gate に gap を記録する。
 
-Pane- or chat-supplied framing never substitutes for the durable issue record; it must be reconciled against the fetched issue even when the pane text looks like a complete work order. Do not collapse Redmine semantics into Asana's single-comment-thread shape — the canonical handoff id is the Redmine journal, and gate ordering matters for audit replay.
+pane / chat 由来の説明は、Redmine issue record に照合してから扱う。Redmine の journal gate semantics を Asana の単一 comment thread 的な形に潰さない。Redmine では journal id と gate 順序が監査 replay の鍵である。
 
 ## Redmine Gate Lifecycle
 
-The standard lifecycle for a normal development task. Each gate must be a durable Redmine record. Pane notifications carry the journal id that points back to the gate.
+通常開発 task の標準 lifecycle。各 gate は durable な Redmine journal として残す。pane notification は gate の journal id を運ぶだけである。
 
-1. **Start Gate** — record purpose, parent issue, acceptance criteria, referenced docs, and known unknowns. If the project's Redmine workflow defines a status that maps to "work has started", update the issue to that status; otherwise leave the status alone and rely on the Start Gate journal as the durable record.
-2. **Progress Log Gate** — record material progress, decisions taken, items deferred to owner decision, and the next concrete action. Use whenever scope, blockers, or assumptions shift, not only at the end.
-3. **Design Consultation Gate** — record before implementation when the choice is hard to reverse: spec interpretation, scope of responsibility, persistence shape, automatic correction, UI flow, authorization, DB integrity, and similar. The gate must separate background, canonical references, options, pros/cons, the implementer's recommended option, the questions that need a decision, and remaining unknowns.
-4. **Design Consultation Answer Gate** — recorded by the consulting agent (audit/design role). Must separate selected options, rationale, why rejected options were rejected, remaining unknowns, and items that still require owner decision.
-5. **Implementation Done Gate** — record changed paths, intent, assumptions, unknowns, verification result, doc updates, and commit hash. Implementation Done is not completion; it is a stable input for review.
-6. **Review Request Gate** — record the implementation task, parent user story or feature, audit/test issues if any, target commit, the explicit review focus, and known unknowns. Send a pane notification only after this gate exists.
-7. **Review Gate** — recorded by the reviewer. Must separate target commit, matched rules, compliance judgement, findings ordered by severity with file/line references, unknowns, and whether re-review is required.
-8. **Close Gate** — record acceptance result, findings disposition, remaining risks, audit result, Epic/Feature close basis if applicable, retired-queue stale check if applicable, and the close decision. Close only after owner approval and a passing review.
+1. **Start Gate** — 目的、parent issue、受入条件、参照 docs、既知の不明点、現在の担当 agent、次 action を記録する。project workflow に `着手中` 相当の status がある場合は更新する。ない場合は status を無理に合わせず、Start Gate journal を正本にする。
+2. **Progress Log Gate** — 重要な進捗、判断、scope 変更、blocker、owner 判断待ち、次の具体 action を記録する。最後だけでなく、前提や scope が動いた時点で使う。
+3. **Design Consultation Gate** — 後戻りしにくい判断の前に作る。例: 仕様解釈、責務境界、永続化形状、自動補正、UI flow、authorization、DB integrity、既存 URL / data compatibility。背景、正本参照、選択肢、pro/con、実装者の推奨、判断が必要な質問、残る不明点を分けて記録する。
+4. **Design Consultation Answer Gate** — 相談を受けた audit / design role が記録する。選択した案、理由、却下した案と却下理由、残る不明点、owner 判断が必要な事項を分ける。
+5. **Implementation Done Gate** — changed paths、実装意図、前提、未確認事項、verification、doc 更新、commit hash または diff ref を記録する。これは review input であり completion ではない。未完 scope はここに混ぜず Progress Log Gate または child issue に出す。
+6. **Review Request Gate** — reviewer に渡す前に作る。必須 payload は、issue id、journal id、target commit / diff、changed files、verification、未確認事項、受信 agent、期待する read / ack path、review focus、対象外 scope。pane 通知はこの gate が存在してから送る。
+7. **Review Gate** — reviewer が記録する。必須 payload は、target commit、照合した rules / docs、総合判定、severity 順の findings、file / line 根拠、`[事実]` と `[仮説]` の区別、是正条件、再 review 要否、未確認事項。`[事実]` はコード・設定・docs で確認済みの不整合に限る。`[仮説]` は確認すべき事項と確認方法を併記する。
+8. **QA Verification Gate** — project が manual check、tester check、受入確認、または本番前確認を要求する場合に記録する。確認対象、環境、手順、期待値、実際値、evidence、tester / verifier、未確認事項を分ける。bug を見つけた場合は bug / spec misunderstanding / unnecessary work を triage し、source change が必要なら通常開発 issue または child issue に切り出し、元 issue と link し、理由を journal に残す。
+9. **Production Verification Gate** — deploy 後の本番確認が必要な project で記録する。deploy request、deploy 実施者、version / revision、確認対象、本番での期待値と実際値、rollback / follow-up 要否を分ける。deploy request と production verification を implementation done や review に混ぜない。
+10. **Close Gate** — acceptance result、Review Gate findings の disposition、QA / Production Verification Gate の disposition、remaining risks、owner approval、audit result、commit hash record、Epic / Feature close basis、retired queue stale check が必要な場合の結果、最終 close 判断を記録する。passing Review Gate と owner approval と commit hash record が揃うまで issue を close しない。
 
-If the project uses different Redmine statuses or trackers, map them to these gates. Do not invent parallel conventions.
+project 固有 status / tracker はこの gate に map する。別の名前を使ってもよいが、gate の意味と順序を曖昧にしない。
+
+## Review Quality Hierarchy
+
+review は style 指摘の収集ではない。重大度は下記の順に見る。
+
+1. **仕様・設計整合** — parent issue、受入条件、Design Consultation Answer、既存仕様、data compatibility、authorization、operation flow と矛盾しないか。
+2. **docs / rule 整合** — project-local docs、Redmine gate、migration / release / verification rules、生成物管理規約に反していないか。
+3. **behavior / data risk** — runtime error、data loss、権限漏れ、既存 URL / API / data 互換性、rollback 困難性、migration safety。
+4. **test / verification gap** — 変更に対応する automated test、manual verification、screenshot / capture、本番確認が不足していないか。
+5. **保守性・style** — 上記を満たした後に扱う。好みだけの指摘は finding にしない。
+
+設計 docs が不足していて review 判定できない、scope が曖昧、または parent / child issue と実装が矛盾する場合は、推測で approve しない。Review Gate に `[仮説]` と確認方法を残し、必要なら Design Consultation Gate または Progress Log Gate に戻す。
+
+## Test / QA Role Boundary
+
+project が tester、QA、manual verifier を分ける場合、tester は production code を直接修正しない。tester の責務は仕様から確認することであり、実装都合から期待値を作らない。
+
+- tester は issue、parent、受入条件、Design Consultation Answer、Review Gate の既知 risk を読んで確認観点を作る。
+- failure report は reproduction、expected、actual、environment、evidence、影響範囲、bug / spec misunderstanding / unnecessary work の仮判定を分ける。
+- source change が必要な failure は、既存 issue に黙って混ぜず、project workflow に従って bug issue、child issue、または Progress Log Gate に切り出す。
+- tester が修正案を書くことはできるが、それは implementation authority ではない。修正は実装 owner または project が定める actor が行う。
+
+## Close Gate Checklist
+
+Close Gate では少なくとも以下を照合する。項目を満たせない場合は close ではなく Progress Log である。
+
+- problem / background / acceptance criteria が issue または parent issue から追える。
+- owner または design role の判断が必要だった事項について、選択肢、採用案、却下案、理由が journal に残っている。
+- Implementation Done、Review Request、Review、必要な QA Verification、必要な Production Verification が同一 issue または linked issue から replay できる。
+- Review Gate findings は fixed / accepted risk / out of scope / child issue のいずれかに disposition されている。
+- commit hash、target revision、deploy version など、後から差分を特定する anchor が durable record に残っている。
+- child issue、manual verification、production verification、version consistency、retired queue residue の未完が残っていない。残る場合は close せず、理由と次 action を Progress Log Gate に残す。
 
 ## Pane Notification
 
-- Standard notification command: the high-level handoff primitive — `mozyo-bridge handoff send --to <claude|codex> --source redmine --issue <issue_id> --journal <journal_id> --kind <implementation_request|design_consultation|review_request|review_result|implementation_done|reply|custom>` (and `mozyo-bridge handoff reply ...` / the top-level alias `mozyo-bridge reply ...` when the kind is a reply). The primitive resolves the receiver pane, runs the deterministic Layer B preflight, types the marker-prefixed notification, and presses Enter (queue-enter / standard rails) without the caller assembling `read` + `message` shell choreography.
-- The `notify-*` wrappers (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) remain available and route internally through the same primitive for standard Redmine-shaped notifications: `mozyo-bridge notify-codex-review --issue <issue_id> --journal <journal_id>`, `mozyo-bridge notify-claude-review-result --issue <issue_id> --journal <journal_id>`, `mozyo-bridge notify-codex --issue <issue_id> --journal <journal_id> --type design_consultation`, and `mozyo-bridge notify-claude --issue <issue_id> --journal <journal_id> --type design_consultation_result`. Use them for compatibility; new callers should prefer `mozyo-bridge handoff send/reply` directly so the durable record carries an explicit `--kind` label.
-- The `notify-*-legacy-task` commands (`.agent_handoff/tasks.yaml` queue) are retired-queue cleanup wrappers only. They do not route through the handoff primitive and must not be used for new notifications.
-- The low-level `mozyo-bridge read`, `mozyo-bridge message`, `mozyo-bridge type`, and `mozyo-bridge keys` commands are operator/debug primitives (pane inspection, ad-hoc operator messages, raw typing, raw keys). They are not the standard handoff/reply path; do not assemble them by hand as a routine substitute for the primitive.
-- Always create or confirm the Redmine journal before sending a pane notification. Notification before journal is order-dependent and breaks audit replay.
-- Pane notification success is not a review record. Pane notification failure is not a review failure. The Redmine gate is the only record.
-- The recipient must check the named gate before acting. Acting on the prompt body alone is unsafe. Do not infer receiver state, issue state, or gate state from `mozyo-bridge status` output, `mozyo-bridge doctor` output, or pane scrollback when a durable Redmine anchor is available; those surfaces are operator/debug aids, not the durable record. Read the Redmine issue and the named journal instead.
-- The retired `.agent_handoff/tasks.yaml` queue and any `read-next --wait` style fallback are not standard. They exist only to drain leftover state from the legacy local queue.
+- 標準通知は高レベル handoff primitive を使う: `mozyo-bridge handoff send --to <claude|codex> --source redmine --issue <issue_id> --journal <journal_id> --kind <implementation_request|design_consultation|review_request|review_result|implementation_done|reply|custom>`。reply では `mozyo-bridge handoff reply ...` または上位 alias `mozyo-bridge reply ...` を使う。primitive は receiver pane 解決、Layer B deterministic preflight、marker 付き typing、Enter 発行 (queue-enter / standard rail) を所有する。caller は通常 handoff / reply で `read` + `message` shell choreography を手で組み立てない。
+- `notify-*` wrappers (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) は Redmine 互換 entrypoint として残す。内部では同じ primitive に乗る。新規 caller は、durable record に明示的な `--kind` を残せる `mozyo-bridge handoff send/reply` を優先する。
+- `notify-*-legacy-task` は retired-queue cleanup wrapper であり、新規通知に使わない。
+- 低レベルの `mozyo-bridge read`、`mozyo-bridge message`、`mozyo-bridge type`、`mozyo-bridge keys` は operator/debug primitives である。pane inspect、ad-hoc operator message、raw typing、raw keys 用であり、standard handoff/reply の代替ではない。
+- Redmine journal を作る前に pane 通知しない。journal より先の通知は順序依存になり、監査 replay を壊す。
+- pane 通知成功は review record ではない。pane 通知失敗も review failure ではない。唯一の判断 record は Redmine gate である。
+- 受信者は、通知本文だけで動かず、指定された Redmine issue / journal を読む。durable Redmine anchor が利用可能な場合、`mozyo-bridge status`、`mozyo-bridge doctor`、pane scrollback から receiver state / issue state / gate state を推測しない。それらは operator/debug aids である。
+- 退役済みの `.agent_handoff/tasks.yaml` queue、`read-next --wait`、Stop hook handoff wait は標準 transport ではない。legacy queue の残骸を drain する必要がある時だけ扱う。
 
 ## Handoff Startup Decision
 
-After recording a Redmine gate (Review Request, Design Consultation, etc.), the sender must choose one of the paths below and write the chosen receive method into the same Redmine record. A handoff is not "delivered" until the Redmine record contains both the gate and the receive method.
+Redmine gate (Review Request、Design Consultation など) を記録した後、sender は下記のどれで受信させるかを同じ gate に書く。gate と receive method の両方が Redmine に残るまで、handoff は delivered 扱いしない。
 
-- **Standard path** — notify the receiver pane with the high-level handoff primitive: `mozyo-bridge handoff send --to <claude|codex> --source redmine --issue <issue_id> --journal <journal_id> --kind <kind>` (or `mozyo-bridge handoff reply ...` / `mozyo-bridge reply ...` when the kind is a reply). The `notify-*` wrappers (`notify-codex` / `notify-claude` / `notify-codex-review` / `notify-claude-review-result`) are compatibility entrypoints that route through the same primitive. Record in the Redmine gate the literal command line used (or its equivalent: "notified <agent> via mozyo-bridge handoff send / notify-* journal <journal_id>"). The receiver picks up the journal id, opens the gate in Redmine, and acts from there. Do not assemble `mozyo-bridge read` + `mozyo-bridge message` by hand for normal handoff/reply; those are operator/debug primitives.
-- **Receiver pane unavailable** — record in the Redmine gate that the receiver must open the relevant agent terminal and run `mozyo-bridge init <agent>` before retry, plus the retry plan and any attempted command. `mozyo-bridge init <agent>` is the window-rename entrypoint: it renames the pane's tmux window to `<agent>` so the resolver can reach it via the agent-name path. Chat output is a notification only: one line stating that the handoff is pending operator action and naming the issue / gate. Do not restate the durable steps in chat, and do not fall back to the retired local queue.
-- **Notification fails or is unusable** — record the un-notified state explicitly in the Redmine gate ("not yet notified; receiver must read the gate manually") along with what was attempted (literal command, observed error) and the required receiver action. Chat output is a notification only: one line stating that the handoff is un-notified and naming the issue / gate. Do not duplicate the gate body in chat, and do not fall back to `.agent_handoff/tasks.yaml`, `read-next --wait`, or Stop hook handoff waits to "auto-pick-up" the work.
-- **Sync handoff between two locally available agents** — same as the standard path; do not skip the journal record because the agents share a host or session.
+- **Standard path** — 高レベル primitive で receiver pane に通知する: `mozyo-bridge handoff send --to <claude|codex> --source redmine --issue <issue_id> --journal <journal_id> --kind <kind>`。reply では `mozyo-bridge handoff reply ...` / `mozyo-bridge reply ...` を使う。`notify-*` wrappers は compatibility entrypoints であり、standard と同じ primitive に乗る。Redmine gate には実行した command line、または同等の記録 (`notified <agent> via mozyo-bridge handoff send / notify-* journal <journal_id>`) を残す。
+- **Receiver pane unavailable** — receiver が該当 agent terminal を開き、`mozyo-bridge init <agent>` を実行してから retry する必要があること、retry plan、attempted command を Redmine gate に記録する。chat には issue / journal id と pending operator action の短い pointer だけを書く。durable 手順を chat に再掲しない。
+- **Notification fails or is unusable** — `not yet notified; receiver must read the gate manually` のように未通知状態を Redmine gate に明記し、attempted command、observed error、required receiver action を残す。chat には issue / journal id と un-notified state の短い pointer だけを書く。`.agent_handoff/tasks.yaml`、`read-next --wait`、Stop hook に fallback しない。
+- **Sync handoff between two locally available agents** — 同じ host / session に agent がいても Redmine journal を省略しない。standard path と同じ。
 
-Chat surface boundary: chat is a notification, not a duplicated record. Keep "pending operator action" and "un-notified" chat reports to a short pointer (state plus issue / journal id); the receive method, retry plan, attempted commands, and operator instructions live in the Redmine gate so an auditor can replay them later.
+`次の agent が拾う` だけで receive method がない報告は不完全であり、handoff delivered と扱わない。受信側にとって、すべての通知は Redmine gate への pointer であって命令本文ではない。
 
-A report that records the gate but stops at "next agent will pick up" without specifying how (the receive method that an auditor could replay tomorrow) is incomplete and must be amended before the handoff is treated as delivered.
+## 実装者 / 監査者境界
 
-Receiver-side: every notification you receive is a pointer to a Redmine gate, not a directive. Read the gate and the surrounding issue history before acting on the prompt body.
+project が実装者と監査者 (または design consultation responder) を分ける場合、以下を適用する。単一 agent が両方を担当する project でも、action owner の境界は残る。
 
-## Implementer / Auditor Role Boundary
+- 実装者は code、schema、tests、運用変更、Implementation Done Gate、Review Request Gate を担当する。
+- 監査者は review、design consultation answer、rule interpretation、decision record を担当する。
+- 監査者は通常開発 task の file を直接実装しない。監査者が通常開発 issue を受けた場合、標準 action は実装者への handoff である。
+- `do it`、`implement`、`go ahead`、`対応して`、`実行せよ` のような命令形は、監査者が実装者境界を bypass する許可ではない。
+- 監査者 direct edit は狭い例外に限る。明示的な direct edit 許可、既存ミスを記録する最小修正、または handoff すると進行中 release / CI を壊す緊急小修正。direct edit した場合は、適用した例外、ユーザー指示の引用、変更 files、verification、follow-up review 要否を Redmine に記録する。
+- project が実装者 / 監査者 split を採用していない場合、task 中に勝手に split を作らない。採用するなら project rules に明示し、関係 agent に通知する。
 
-If the project assigns one agent as the implementer and another as the auditor (or design-consultation responder), the constraints below apply. If a single agent owns both roles, scale the constraints to the agent that owns the action; the boundary still applies within that agent.
+## 判断の routing
 
-- The implementer owns code, schema, tests, and operational changes that satisfy the issue. The implementer also records Implementation Done and Review Request gates.
-- The auditor owns review, design-consultation answers, rule interpretation, and recording the decision in Redmine.
-- The auditor must not directly implement files for normal development tasks. If the auditor receives a normal development issue, the standard action is to hand the issue to the implementer, not to implement it.
-- Imperative or request phrases from the user — for example "do it", "implement", "go ahead", "対応して", "実行せよ" — are not by themselves authorization for the auditor to bypass the implementer.
-- Direct edits by the auditor are reserved for narrowly scoped exceptions: explicit scoped authorization quoting "direct edit" wording, the minimum record-keeping correction needed to log a mistake, or a genuinely urgent fix where handoff would damage an in-progress release. Any direct edit must record (a) which exception applied, (b) the user instruction quoted verbatim, (c) the changed files, (d) the verification, and (e) any required follow-up review.
-- If the project does not split implementer and auditor roles, do not invent the split mid-task. Add the split deliberately, with both agents informed and the boundary recorded in the project rules.
+owner に質問する前に、技術判断と owner 判断を分ける。
 
-## Decision Routing
-
-Separate technical decisions from owner decisions before asking the owner.
-
-- Technical, design, rule, existing-spec consistency, UI structure, route, DB, authorization, and spec/test methodology decisions are design-consultation candidates. Route them through the auditor (or a dedicated design-consultation pass) before asking the owner.
-- Owner-only decisions are typically: rights and asset usage, legal wording, ongoing service or account continuity, brand judgement, business prioritization, deadlines, budgets, and release timing.
-- Do not collapse a technical decision into an owner decision. The owner will accept whatever choice you bring; the cost of skipping the design consultation is hidden in later rework.
+- 技術、設計、rule、既存仕様整合、UI structure、route、DB、authorization、spec / test methodology は design consultation 候補である。owner に投げる前に auditor または設計相談 role を通す。
+- owner-only 判断は、権利・素材利用、法務文言、継続サービス / account、brand judgement、business priority、deadline、budget、release timing など。
+- 技術判断を owner 判断として丸投げしない。owner は提示された選択肢を受け入れがちで、設計相談を飛ばしたコストは後の手戻りに隠れる。
 
 ## Scope Integrity
 
-- Difficulty splits work; it does not shrink the issue. Acceptance criteria remain intact unless the owner explicitly approves a change.
-- Split work into child issues, tasks, or tests so the total scope still appears in Redmine. Do not silently drop work.
-- Scope is more than UI. It typically includes DB, model, controller, route, authorization, specifications, manual verification, generated screenshots, seed data, existing URL or data compatibility, and operational flow.
-- Implementation Done must not contain unfinished scope. Unfinished scope belongs in a Progress Log gate or a child issue.
+- 難しさは作業分割の理由であって、scope 縮小の理由ではない。owner が明示承認しない限り、acceptance criteria は維持する。
+- scope は Redmine 上に残す。child issue、task、test issue に分けてもよいが、黙って落とさない。
+- scope は UI だけではない。DB、model、controller、route、authorization、specification、manual verification、generated screenshot、seed data、既存 URL / data compatibility、operation flow を含み得る。
+- Implementation Done に未完 scope を混ぜない。未完 scope は Progress Log Gate または child issue に出す。
 
 ## Verification Discipline
 
-- Run the project's authoritative verification commands. If the project provides a docs catalog or generated file convention, follow it; do not skip in favor of ad-hoc grepping.
-- For UI, screen, or operational flow changes, do not treat selector-level success as completion. Confirm the visible artifact (screenshot, generated capture, or visual review) shows the intended element, transition, and state change.
-- For non-UI changes, record concrete verification: tests run, commands executed, observed output, and remaining risks. "Looks fine" is not a verification record.
-- If verification fails or is impossible, record the reason in Redmine before notifying anyone.
+- project の authoritative verification command を実行する。docs catalog や generated file convention がある project では、それを使う。ただし、catalog / resolver tooling 自体は mozyo-bridge shared preset の必須依存にしない。
+- UI / screen / operation flow 変更では、selector-level success を completion としない。screenshot、generated capture、visual review で意図した element、transition、state change を確認する。
+- 非 UI 変更では、tests run、commands executed、observed output、remaining risks を具体的に記録する。`looks fine` は verification record ではない。
+- verification が失敗または実行不能なら、誰かに通知する前に理由を Redmine に記録する。
 
-## Stale and Retired Queue Handling
+## Stale And Retired Queue Handling
 
-- The retired local queue (`.agent_handoff/tasks.yaml` and any `read-next --wait` fallback) is not a standard transport. Do not reintroduce it as a regular path.
-- If retired queue residue is suspected after a session restart or before close, only then run the project's stale-list command and reconcile each remaining task against the Redmine gate. Treat Redmine as authoritative; close, fail, or discard the queue entry to match.
-- Do not close an issue based on queue state alone. Match the close to a passing Review Gate and an explicit owner approval.
+- retired local queue (`.agent_handoff/tasks.yaml` と `read-next --wait` fallback) は標準 transport ではない。通常運用に再導入しない。
+- session restart 後や close 前に retired queue residue が疑われる場合だけ、project の stale-list command を実行し、残存 task を Redmine gate と照合する。Redmine を正本として close / fail / discard を決める。
+- queue state だけで issue を close しない。passing Review Gate と明示的 owner approval に対応付ける。
 
 ## Completion
 
-Before treating work as complete:
+作業を complete 扱いする前に、以下を満たす。
 
-1. Verify the requested work against the acceptance criteria, scope, and any design-consultation answers that bound the implementation.
-2. Record material changes, verification, blockers, remaining risks, and findings disposition in Redmine.
-3. Pass through the Review Gate. Implementation Done alone is not completion. Do not report "complete" or "done" in chat before the Review Gate is recorded in Redmine.
-4. Update issue status only according to the project's Redmine workflow. Owner approval governs final close. When an audit-owned commit is required, the commit hash must be journaled in Redmine before the issue moves to closed. See `Audit-Owned Commit Authority`.
-5. If anything from the original scope is still open at this point — child issues, manual verification, generated capture confirmation, data-compatibility checks, ops-flow checks — it is a Progress Log entry, not a completion. Record it as such and keep the parent issue out of the closed state.
+1. requested work を acceptance criteria、scope、design consultation answer に照合して検証する。
+2. material changes、verification、blockers、remaining risks、findings disposition を Redmine に記録する。
+3. Review Gate を通す。Implementation Done だけでは completion ではない。Review Gate が Redmine に記録される前に chat で `complete` / `done` と報告しない。
+4. issue status は project の Redmine workflow に従ってのみ更新する。final close は owner approval が支配する。audit-owned commit が必要な場合は、close 前に commit hash を Redmine journal に残す。
+5. child issue、manual verification、generated capture confirmation、data-compatibility check、ops-flow check など、元 scope から未完のものが残っている場合、それは completion ではなく Progress Log である。parent issue を closed にしない。
 
 ## Audit-Owned Commit Authority
 
-When the project splits implementation and audit between separate actors, the audit actor — not the implementation actor — is authorized to stage and commit the audit-approved diff. This is a commit authority, not an implementation authority. The audit actor is still prohibited from directly editing files for a normal development issue; that path is the narrow exception in `Implementer / Auditor Role Boundary`, not this section. This section governs *who lands the commit* after the Review Gate is recorded in Redmine.
+project が実装と監査を別 actor に分ける場合、監査 actor は Review Gate 承認済み diff を stage / commit できる。これは commit authority であって implementation authority ではない。監査 actor は通常開発 issue の file を修正してよいわけではない。
 
 Preconditions:
 
-- A Review Gate journal recording approval exists on the issue, and the journal id is captured.
-- A separate implementation actor produced the diff under review. If the audit actor itself produced the diff, this section does not apply; that path is a direct edit and must be journaled as such under the role-boundary exceptions.
+- approval を記録した Review Gate journal が issue に存在し、journal id が捕捉されている。
+- 別の実装 actor が review 対象 diff を作成している。監査 actor 自身が diff を作った場合、この authority ではなく direct edit として扱い、role-boundary exception に従って journal 化する。
 
-Pre-commit checks (audit actor):
+Pre-commit checks:
 
-- Run `git status` and reconcile the dirty set against the Implementation Done Gate's changed-paths list.
-- Stage only the files whose diff matches what the Review Gate approved. Do not use `git add -A` or `git add .` when the worktree contains scope-outside changes.
-- Run `git diff --cached --stat` (and `git diff --cached` when content review is required) and reconcile the staged set against the Implementation Done Gate line by line.
-- Unrelated dirty files must be excluded — stashed, committed under a separately scoped issue, or left untouched. Never bundle scope-outside changes into the audit-owned commit.
+- `git status` を実行し、dirty set を Implementation Done Gate の changed-paths list と照合する。
+- Review Gate が承認した files だけを stage する。scope-outside 変更がある worktree で `git add -A` や `git add .` を使わない。
+- `git diff --cached --stat` を実行し、必要なら `git diff --cached` で内容を確認する。staged set を Implementation Done Gate と行単位で照合する。
+- 無関係な dirty files は除外する。別 issue に切る、stash する、または untouched のまま残す。scope-outside 変更を audit-owned commit に混ぜない。
 
 Commit message reference (Redmine):
 
-- `Refs: Redmine #<issue_id>` (required)
-- `Journal: <journal_id>` (required; the journal id of the Review Gate approval)
-- The subject line is the normal short description. The references go in trailers or body lines so `git log` alone is replayable back to the Redmine issue and the approving Review Gate.
+- `Refs: Redmine #<issue_id>` は必須。
+- `Journal: <journal_id>` は必須。Review Gate approval の journal id を指す。
+- subject line は通常の短い説明でよい。references は trailers または body に置き、`git log` だけで Redmine issue と承認 journal に replay できるようにする。
 
 Post-commit recording:
 
-- Record the commit hash in a Close Gate journal on the same issue (or in a Progress Log journal if the Close Gate is not yet ready). The hash must live in the durable Redmine record, not only in pane chat.
-- The issue may move to its project's closed status only after the Review Gate journal and the commit-hash journal are both recorded. Implementation Done alone, or a commit landing without a journaled hash, is not closure.
+- commit hash を同一 issue の Close Gate journal に記録する。Close Gate がまだ早い場合は Progress Log journal に記録する。hash は pane chat だけに置かない。
+- Review Gate journal と commit-hash journal の両方が存在するまで、issue を closed status に移動しない。
 
-Scope of this authority:
+Scope:
 
-- Applies to normal development issues and to guardrail / rule / workflow issues alike whenever the project assigns separate implementation and audit actors.
-- When the project does not split implementer and auditor roles, the boundary collapses; the commit reference format and the hash-journal requirement still apply.
+- 通常開発 issue にも、guardrail / rule / workflow issue にも、実装 / 監査 actor を分ける project では同じように適用する。
+- split しない project では境界は collapsed するが、commit reference format と hash-journal requirement は残る。
 
 ## Prohibitions
 
-- Do not hard-code a fixed agent role split such as "Claude Code implements, Codex only audits" into the project rules. The implementer/auditor split is project-configurable; the boundary applies only when the project has actually assigned the split.
-- Do not treat pane messages, chat messages, or queue files as authoritative state.
-- Do not rely on the retired `.agent_handoff/tasks.yaml` queue, `read-next --wait`, or Stop hook handoff waits for normal operation.
-- Do not reintroduce `vibes/tools/mozyo_bridge` as a runtime path. Use the installed `mozyo-bridge` CLI.
-- Do not embed source-project paths (Rails-specific app paths, custom resolver scripts, private docs catalogs, source-project file_conventions) as mandatory dependencies in the shared preset. Reference such things only with "if the project provides X, use it" wording.
-- Do not store credentials, tokens, personal data, or private internal URLs in repository files, Redmine notes, or pane messages.
-- Do not perform release tags, version bumps, or publish actions from inside a normal development task without an explicit, separately scoped release task.
+- `Claude Code が常に実装、Codex が常に監査` のような固定 role split を shared preset に hard-code しない。split は project-configurable であり、project が採用した場合だけ境界が適用される。
+- pane message、chat message、queue file を authoritative state として扱わない。
+- retired `.agent_handoff/tasks.yaml` queue、`read-next --wait`、Stop hook handoff wait を通常運用に戻さない。
+- `vibes/tools/mozyo_bridge` を runtime path として再導入しない。installed `mozyo-bridge` CLI を使う。
+- source project 固有 path、Rails 固有 app path、private docs catalog、custom resolver script、source-project file conventions を shared preset の必須依存にしない。`project が提供している場合は使う` という条件付きに留める。
+- `catalog.yaml` / docs resolver / nagger file conventions tooling の標準化は別タスクで扱う。この preset 変更に混ぜない。
+- credential、token、personal data、private internal URL を repository file、Redmine note、pane message に記録しない。
+- explicit な release task なしに、通常開発 task の中で release tag、version bump、publish を実行しない。

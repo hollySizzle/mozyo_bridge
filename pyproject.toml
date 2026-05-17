@@ -10,7 +10,10 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "build>=1.2",
+    "PyYAML>=6.0",
+]
 authors = [
     { name = "takahorishizuru" },
 ]
@@ -42,6 +45,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 mozyo_bridge = [
+    "scaffold/presets/presets.yaml",
     "scaffold/presets/*/AGENTS.md",
     "scaffold/presets/*/CLAUDE.md",
     "scaffold/presets/*/VERSION",

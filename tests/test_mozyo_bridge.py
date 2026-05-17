@@ -786,7 +786,8 @@ class ScaffoldRulesTest(unittest.TestCase):
             # user-specific absolute home path.
             self.assertNotIn(str(home), agents)
             self.assertNotIn("/Users/", agents)
-            self.assertIn("Asana task state と task comment", agents)
+            self.assertIn("active な `Asana task / comment`", agents)
+            self.assertIn("router に本文を複製しない", agents)
             # Generated routers must not name vibes/docs/* paths as runtime context.
             # vibes/docs/ is this repo's design/spec source, not an external scaffold
             # target's runtime convention.
@@ -807,8 +808,8 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("/Users/", claude)
             self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
             self.assertIn("迎合せず", claude)
-            self.assertIn("implementation done は task complete ではない", claude)
-            self.assertIn("Asana task comment", claude)
+            self.assertIn("implementation done / implementation_done は completion ではない", claude)
+            self.assertIn("Asana task / comment", claude)
             self.assertIn("受領方法", claude)
             # Chat surface stays thin: durable receive method lives in the task
             # comment, chat reports stay to a state + task-id pointer.
@@ -857,47 +858,68 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Start Gate",
                 "Progress Log Gate",
                 "Design Consultation Gate",
+                "Design Consultation Answer Gate",
                 "Implementation Done Gate",
                 "Review Request Gate",
                 "Review Gate",
+                "QA Verification Gate",
+                "Production Verification Gate",
                 "Close Gate",
                 "Pane Notification",
                 "Handoff Startup Decision",
-                "Factual Posture",
-                "Implementer / Auditor Role Boundary",
-                "Decision Routing",
+                "Review Quality Hierarchy",
+                "Test / QA Role Boundary",
+                "Close Gate Checklist",
+                "事実姿勢",
+                "実装者 / 監査者境界",
+                "判断の routing",
                 "Scope Integrity",
                 "Verification Discipline",
-                "mozyo-bridge notify-",
+                "notify-codex-review",
                 "mozyo-bridge init",
                 "Receiver pane unavailable",
                 "Notification fails",
-                "Implementation Done is not",
-                "Stop hook handoff waits",
-                "Prioritize factual correctness",
+                "`Implementation Done` は `完了` ではない",
+                "Stop hook handoff wait",
+                "迎合より事実を優先する",
                 # Ticket-ID entrypoint runtime reflection.
                 "Ticket-ID Entrypoint",
-                'ticket-ID only',
-                "pane / chat body looks fully framed",
-                "canonical handoff id is the Redmine journal",
+                "入力が Redmine issue id",
+                "Redmine issue record",
+                "journal id と gate 順序が監査 replay の鍵",
                 # Audit-owned commit authority codified in this task.
                 "Audit-Owned Commit Authority",
-                "commit authority, not an implementation authority",
+                "commit authority であって implementation authority ではない",
                 "Refs: Redmine #<issue_id>",
                 "Journal: <journal_id>",
-                "Review Gate journal recording approval",
+                "Review Gate journal",
                 "git diff --cached --stat",
                 "git add -A",
-                "Close Gate journal on the same issue",
+                "Close Gate journal",
                 # Chat-surface boundary added to reduce noisy chat output for
                 # un-notified / pending-operator-action handoffs.
-                "Chat surface boundary",
-                "Chat output is a notification only",
-                "Do not duplicate the gate body in chat",
+                "chat には issue / journal id",
+                "durable 手順を chat に再掲しない",
+                "durable 手順",
+                # Field-tested Redmine review payload details.
+                "Review Request Gate",
+                "target commit / diff",
+                "changed files",
+                "期待する read / ack path",
+                "[事実]",
+                "[仮説]",
+                "是正条件",
+                "仕様・設計整合",
+                "bug / spec misunderstanding / unnecessary work",
+                "reproduction",
+                "expected",
+                "actual",
+                "version consistency",
+                "`catalog.yaml` / docs resolver / nagger file conventions tooling の標準化は別タスク",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
-                'Do not hard-code a fixed agent role split such as "Claude Code implements, Codex only audits"',
+                "`Claude Code が常に実装、Codex が常に監査` のような固定 role split",
                 installed,
             )
             self.assertNotIn("python3 vibes/tools/mozyo_bridge", installed)
@@ -916,7 +938,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             # Implementation Done Gate is a distinct durable gate, not a Progress Log.
             # The Factual Posture wording must not downgrade it.
             self.assertNotIn("self-verification is a Progress Log", installed)
-            self.assertIn("review input, not completion", installed)
+            self.assertIn("review input であり completion ではない", installed)
 
             result, output = self.run_cli(
                 ["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)]
@@ -933,9 +955,9 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             self.assertNotIn(str(home), agents)
             self.assertNotIn("/Users/", agents)
-            self.assertIn("Redmine issue と journal state", agents)
-            self.assertIn("Redmine gate lifecycle", agents)
-            self.assertIn("mozyo-bridge notify-", agents)
+            self.assertIn("active な `Redmine issue / journal`", agents)
+            self.assertIn("durable state、handoff、review、verification、close 条件", agents)
+            self.assertIn("router に本文を複製しない", agents)
             # Generated routers must not name vibes/docs/* paths as runtime context.
             # vibes/docs/ is this repo's design/spec source, not an external scaffold
             # target's runtime convention.
@@ -955,8 +977,9 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("/Users/", claude)
             self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
             self.assertIn("迎合せず", claude)
-            self.assertIn("implementation_done は completion ではない", claude)
-            self.assertIn("Codex受領方法", claude)
+            self.assertIn("implementation done / implementation_done は completion ではない", claude)
+            self.assertIn("Redmine issue / journal", claude)
+            self.assertIn("handoff startup decision", claude)
             # Chat surface stays thin: durable receive method lives in Redmine,
             # chat reports stay to a state + issue/journal-id pointer.
             self.assertIn("最小ポインタ", claude)
@@ -972,7 +995,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.05.17.1", state["preset_version"])
+            self.assertEqual("2026.05.18.2", state["preset_version"])
 
             # The audit-owned commit policy belongs in the central preset only.
             # Root routers stay thin and must not duplicate the policy body.
@@ -980,6 +1003,56 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("Audit-Owned Commit Authority", claude)
             self.assertNotIn("Refs: Redmine #", agents)
             self.assertNotIn("Refs: Redmine #", claude)
+
+    def test_rules_install_and_scaffold_redmine_rails_layered_router(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, _ = self.run_cli(["rules", "install", "--home", str(home)])
+            self.assertEqual(0, result)
+            rails_workflow = home / "rules" / "presets" / "redmine-rails" / "agent-workflow.md"
+            self.assertTrue(rails_workflow.exists())
+            installed = rails_workflow.read_text(encoding="utf-8")
+            for marker in (
+                "Redmine Rails Agent Workflow",
+                "rules/presets/redmine/agent-workflow.md",
+                "Rails Scope Posture",
+                "Rails Design Consultation Triggers",
+                "Rails Implementation Done Additions",
+                "Rails Review Focus",
+                "Data / migration safety",
+                "Authorization / tenant boundary",
+                "Hotwire / UI behavior",
+                "Rails Verification Discipline",
+                "Rails QA / Production Verification",
+            ):
+                self.assertIn(marker, installed)
+            self.assertNotIn("/myapp/Source/rails", installed)
+            self.assertNotIn("vibes/docs/catalog.yaml", installed)
+
+            result, _ = self.run_cli(
+                ["scaffold", "rules", "redmine-rails", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(0, result)
+            agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+            claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn(
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-rails/agent-workflow.md",
+                agents,
+            )
+            self.assertIn("active な `Redmine issue / journal と Rails project docs`", agents)
+            self.assertIn("router に本文を複製しない", agents)
+            self.assertNotIn("Data / migration safety", agents)
+            self.assertNotIn("Rails Review Focus", claude)
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("redmine-rails", state["preset"])
+            self.assertEqual("2026.05.18.1", state["preset_version"])
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1047,8 +1120,12 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             self.assertEqual(0, result)
             self.assertIn("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH", output)
-            self.assertEqual(["ok", "ok", "ok"], [row["status"] for row in rows])
+            self.assertEqual(["ok", "ok", "ok", "ok"], [row["status"] for row in rows])
             self.assertIn(f"asana\tok\t{package_version('asana')}\t{package_version('asana')}\t", output)
+            self.assertIn(
+                f"redmine-rails\tok\t{package_version('redmine-rails')}\t{package_version('redmine-rails')}\t",
+                output,
+            )
             self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), output)
 
     def test_rules_status_reports_missing_and_outdated_presets(self) -> None:
@@ -1105,7 +1182,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             result, _ = self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home), "--backup"])
 
             self.assertEqual(0, result)
-            self.assertIn("Redmine issue と journal state", (project / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertIn("active な `Redmine issue / journal`", (project / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
             self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
 
@@ -1149,7 +1226,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         # and must instead reference the portable symbolic form. The MOZYO_BRIDGE_HOME
         # override semantics are preserved because consumers expand the env var
         # when they read the router, not when the router is generated.
-        for preset in ("asana", "redmine", "none"):
+        for preset in ("asana", "redmine", "redmine-rails", "none"):
             with self.subTest(preset=preset):
                 with tempfile.TemporaryDirectory() as tmp:
                     home = Path(tmp) / "home"
@@ -1286,15 +1363,15 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
         self.redmine_workflow = (
             presets_root / "redmine" / "agent-workflow.md"
         ).read_text(encoding="utf-8")
-        self.asana_claude = (presets_root / "asana" / "CLAUDE.md").read_text(
+        self.router_claude = (presets_root / "_router" / "CLAUDE.md").read_text(
             encoding="utf-8"
         )
-        self.redmine_claude = (presets_root / "redmine" / "CLAUDE.md").read_text(
+        self.router_agents = (presets_root / "_router" / "AGENTS.md").read_text(
             encoding="utf-8"
         )
-        self.redmine_agents = (presets_root / "redmine" / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
+        self.redmine_rails_workflow = (
+            presets_root / "redmine-rails" / "agent-workflow.md"
+        ).read_text(encoding="utf-8")
 
     def test_asana_preset_standard_path_anchors_at_primitive(self) -> None:
         # Standard path bullet must name the high-level primitive.
@@ -1328,7 +1405,7 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
         self.assertIn("`mozyo-bridge handoff send", section)
         self.assertIn("`mozyo-bridge handoff reply", section)
         self.assertIn("`mozyo-bridge reply", section)
-        self.assertIn("compatibility", section)
+        self.assertIn("互換 entrypoint", section)
         self.assertIn("operator/debug primitives", section)
         self.assertNotIn(
             "Standard notification command: `mozyo-bridge notify-* --issue",
@@ -1336,14 +1413,14 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
             msg="redmine preset still recommends the old notify-* shell as the standard",
         )
         # The retired-queue wrapper must be tagged cleanup-only here too.
-        self.assertIn("retired-queue cleanup wrappers", section)
+        self.assertIn("retired-queue cleanup wrapper", section)
 
     def test_redmine_preset_handoff_startup_anchors_at_primitive(self) -> None:
         # The "Standard path" entry of the Handoff Startup Decision must
         # name the primitive, not the legacy notify-* shell.
         section_start = self.redmine_workflow.index("## Handoff Startup Decision")
         section_end = self.redmine_workflow.index(
-            "## Implementer / Auditor Role Boundary", section_start
+            "## 実装者 / 監査者境界", section_start
         )
         section = self.redmine_workflow[section_start:section_end]
         # The Standard path bullet must lead with the primitive.
@@ -1368,34 +1445,29 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
         self.assertIn("pane scrollback", section)
         self.assertIn("operator/debug aids", section)
 
-    def test_asana_claude_reminder_anchors_at_primitive(self) -> None:
-        self.assertIn("`mozyo-bridge handoff send`", self.asana_claude)
-        self.assertIn("`mozyo-bridge handoff reply`", self.asana_claude)
-        self.assertIn("`mozyo-bridge reply`", self.asana_claude)
-        # The reminder must explicitly tag the low-level commands as
-        # operator/debug so the boundary is visible at the router level.
-        self.assertIn("operator/debug", self.asana_claude)
-        # No-inference rule must be present so the reminder carries it from
-        # the router into every session boot.
-        self.assertIn("`mozyo-bridge status`", self.asana_claude)
-        self.assertIn("`mozyo-bridge doctor`", self.asana_claude)
+    def test_shared_router_reminder_stays_thin_and_points_to_preset(self) -> None:
+        self.assertIn("${rule_path}", self.router_claude)
+        self.assertIn("${ticket_anchor_label}", self.router_claude)
+        self.assertIn("handoff startup decision", self.router_claude)
+        self.assertIn("operator/debug", self.router_claude)
+        self.assertIn("`mozyo-bridge status`", self.router_claude)
+        self.assertIn("`mozyo-bridge doctor`", self.router_claude)
+        self.assertNotIn("`mozyo-bridge handoff send --to", self.router_claude)
 
-    def test_redmine_claude_reminder_anchors_at_primitive(self) -> None:
-        self.assertIn("`mozyo-bridge handoff send`", self.redmine_claude)
-        self.assertIn("`mozyo-bridge handoff reply`", self.redmine_claude)
-        self.assertIn("`mozyo-bridge reply`", self.redmine_claude)
-        self.assertIn("operator/debug", self.redmine_claude)
-        self.assertIn("`mozyo-bridge status`", self.redmine_claude)
-        self.assertIn("`mozyo-bridge doctor`", self.redmine_claude)
+    def test_shared_agents_router_stays_thin(self) -> None:
+        self.assertIn("${rule_path}", self.router_agents)
+        self.assertIn("${ticket_anchor_label}", self.router_agents)
+        self.assertIn("router に本文を複製しない", self.router_agents)
+        self.assertIn("operator/debug", self.router_agents)
+        self.assertNotIn("Redmine Gate Lifecycle", self.router_agents)
+        self.assertNotIn("Audit-Owned Commit Authority", self.router_agents)
 
-    def test_redmine_agents_guardrail_anchors_at_primitive(self) -> None:
-        # The AGENTS.md guardrail bullet for inter-agent notification must
-        # name the primitive as the standard so the router itself does not
-        # drift back to the old notify-* shell.
-        self.assertIn("`mozyo-bridge handoff send", self.redmine_agents)
-        self.assertIn("`mozyo-bridge handoff reply", self.redmine_agents)
-        self.assertIn("`mozyo-bridge reply", self.redmine_agents)
-        self.assertIn("operator/debug", self.redmine_agents)
+    def test_redmine_rails_preset_layers_on_redmine(self) -> None:
+        self.assertIn("rules/presets/redmine/agent-workflow.md", self.redmine_rails_workflow)
+        self.assertIn("Rails Design Consultation Triggers", self.redmine_rails_workflow)
+        self.assertIn("Data / migration safety", self.redmine_rails_workflow)
+        self.assertIn("Hotwire / UI behavior", self.redmine_rails_workflow)
+        self.assertNotIn("/myapp/Source/rails", self.redmine_rails_workflow)
 
 
 class ScaffoldStatusTest(unittest.TestCase):
@@ -1490,6 +1562,44 @@ class ScaffoldStatusTest(unittest.TestCase):
             self.assertEqual(1, result)
             self.assertIn("central status: missing", output)
             self.assertIn("`mozyo-bridge rules install`", output)
+
+    def test_scaffold_status_reports_missing_extended_base_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup_scaffold(Path(tmp), preset="redmine-rails")
+            shutil.rmtree(home / "rules" / "presets" / "redmine")
+
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("preset: redmine-rails", output)
+            self.assertIn("central status: missing", output)
+            self.assertIn("`mozyo-bridge rules install`", output)
+
+    def test_scaffold_refuses_when_extended_base_preset_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            shutil.rmtree(home / "rules" / "presets" / "redmine")
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "rules",
+                            "redmine-rails",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+
+            self.assertIn("rules preset is not installed: redmine", stderr.getvalue())
 
     def test_scaffold_status_reports_missing_manifest_for_empty_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3596,7 +3706,15 @@ class DoctorEnvironmentTest(unittest.TestCase):
             section = doctor_rules_section(home)
             self.assertEqual("missing-or-outdated", section["status"])
             statuses = {row["preset"]: row["status"] for row in section["presets"]}
-            self.assertEqual({"asana": "missing", "redmine": "missing", "none": "missing"}, statuses)
+            self.assertEqual(
+                {
+                    "asana": "missing",
+                    "redmine": "missing",
+                    "redmine-rails": "missing",
+                    "none": "missing",
+                },
+                statuses,
+            )
             # Custom home was diagnosed, so next_action must target the same home.
             self.assertEqual(
                 [f"mozyo-bridge rules install --home {home}"], section["next_action"]
@@ -6455,6 +6573,38 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn(personal_path, out.getvalue())
             self.assertIn("result: blocker", out.getvalue())
 
+    def test_secret_value_shape_in_tracked_file_is_blocker(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            fake_secret = "REDMINE" + "_API_KEY=" + "abc123"
+            self._commit_file(root, "AGENTS.md", f"{fake_secret}\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn(fake_secret, out.getvalue())
+            self.assertIn("result: blocker", out.getvalue())
+
+    def test_secret_guidance_words_do_not_block_tree_check(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(
+                root,
+                "README.md",
+                "Do not store credentials, tokens, secrets, or passwords.\n",
+            )
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("result: clean", out.getvalue())
+
     def test_pathspec_excludes_skip_generated_trees(self) -> None:
         from mozyo_bridge.application import release as release_mod
 
@@ -6485,7 +6635,9 @@ class ReleaseCheckScaffoldTest(unittest.TestCase):
         # presets and exit zero.
         self.assertEqual(release_mod.EXIT_CLEAN, rc, msg=out.getvalue())
         text = out.getvalue()
-        for preset in ("asana", "redmine", "none"):
+        from mozyo_bridge.scaffold.rules import PRESETS
+
+        for preset in PRESETS:
             self.assertIn(f"scaffold status: clean ({preset})", text)
 
 
@@ -6493,10 +6645,18 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
     """The `release check` family is contractually read-only: invocations
     must not mutate the repo worktree (including the repo's ``dist/``
     directory). This test locks in that invariant by setting up a sentinel
-    file in a fake repo's dist/, mocking ``python -m build``, and asserting
+    file in a fake repo's dist/, mocking ``sys.executable -m build``, and asserting
     (a) the sentinel survives, (b) ``--outdir`` is passed to build, and
     (c) the outdir lives outside the repo root.
     """
+
+    def test_artifact_secret_pattern_matches_values_not_guidance_words(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        pattern = re.compile(release_mod._artifact_grep_pattern())
+        fake_secret = "REDMINE" + "_API_KEY=" + "abc123"
+        self.assertIsNone(pattern.search("Do not store tokens or secrets."))
+        self.assertIsNotNone(pattern.search(fake_secret))
 
     def test_does_not_mutate_repo_dist_directory(self) -> None:
         from mozyo_bridge.application import release as release_mod
@@ -6536,6 +6696,7 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
             build_calls = [c for c in recorded if "build" in c["argv"]]
             self.assertEqual(1, len(build_calls), msg=recorded)
             argv = build_calls[0]["argv"]
+            self.assertEqual(sys.executable, argv[0])
             self.assertIn("--outdir", argv)
             outdir = Path(argv[argv.index("--outdir") + 1]).resolve()
             try:

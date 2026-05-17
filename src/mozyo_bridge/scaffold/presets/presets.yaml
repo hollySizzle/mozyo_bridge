@@ -1,0 +1,14 @@
+presets:
+  asana:
+    ticket_anchor_label: "Asana task / comment"
+    workflow: "asana/agent-workflow.md"
+  redmine:
+    ticket_anchor_label: "Redmine issue / journal"
+    workflow: "redmine/agent-workflow.md"
+  redmine-rails:
+    ticket_anchor_label: "Redmine issue / journal と Rails project docs"
+    workflow: "redmine-rails/agent-workflow.md"
+    extends: "redmine"
+  none:
+    ticket_anchor_label: "project-local docs"
+    workflow: "none/agent-workflow.md"

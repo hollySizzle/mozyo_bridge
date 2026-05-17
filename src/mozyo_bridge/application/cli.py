@@ -411,7 +411,9 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold = sub.add_parser("scaffold")
     scaffold_sub = scaffold.add_subparsers(dest="scaffold_command", required=True)
     scaffold_rules = scaffold_sub.add_parser("rules")
-    scaffold_rules.add_argument("preset", choices=["asana", "redmine", "none"])
+    from mozyo_bridge.scaffold.rules import PRESETS
+
+    scaffold_rules.add_argument("preset", choices=PRESETS)
     add_scaffold_target_option(scaffold_rules)
     scaffold_rules.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
     scaffold_rules.add_argument("--dry-run", action="store_true")

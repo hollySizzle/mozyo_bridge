@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -50,20 +51,24 @@ EXIT_TIMEOUT = 124
 
 
 # Personal home / secret-shape patterns shared between source-tree and
-# artifact checks. The release-flow.md grep adds `.env` to the source tree
-# pattern but not to the artifact pattern (artifacts never carry `.env`
-# files), so the two callers compose their own pattern from these
-# constants.
+# artifact checks. Keep this narrower than a raw `token|secret|password`
+# word scan: release docs and scanner code legitimately discuss those terms.
+# The gate should fail on leak-shaped material, not on safety guidance.
 _PERSONAL_PATH_PATTERNS = (
-    r"/Users/",
-    r"/home/[^/]+/",
-    r"C:\\Users\\",
+    r"/Users/[A-Za-z0-9._-]+/",
+    r"/home/[A-Za-z0-9._-]+/",
+    r"C:\\Users\\[A-Za-z0-9._-]+\\",
 )
-_SECRET_SHAPE_PATTERNS = (
-    r"pypirc",
-    r"token",
-    r"secret",
-    r"password",
+_SECRET_FILE_PATTERNS = (
+    r"\.pypirc",
+)
+_SECRET_VALUE_PATTERNS = (
+    r"(?i:\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\b\s*[:=]\s*[^<\s#][^\s#]*)",
+    r"(?i:\b(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY)\b\s*[:=]\s*[^<\s#][^\s#]*)",
+)
+_TREE_SECRET_VALUE_PATTERNS = (
+    r"(^|[^[:alnum:]_])(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
+    r"(^|[^[:alnum:]_])(ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
 )
 
 
@@ -115,9 +120,26 @@ def _git_grep_pathspecs() -> list[str]:
 
 
 def _tree_grep_pattern() -> str:
-    return "|".join(
-        list(_PERSONAL_PATH_PATTERNS) + [r"\.env"] + list(_SECRET_SHAPE_PATTERNS)
+    return "|".join(_PERSONAL_PATH_PATTERNS)
+
+
+def _tree_secret_value_grep_pattern() -> str:
+    return "|".join(_TREE_SECRET_VALUE_PATTERNS)
+
+
+def _tracked_secret_file_hits(repo_root: Path) -> tuple[list[str], bool]:
+    tracked = _run(
+        ["git", "ls-files", "-z", ".env", ".env.*", ".pypirc"],
+        cwd=repo_root,
     )
+    if tracked.returncode != 0:
+        return [], False
+    hits = [
+        path
+        for path in tracked.stdout.split("\0")
+        if path and path not in {".env.example"}
+    ]
+    return hits, True
 
 
 def cmd_release_check_tree(args: argparse.Namespace) -> int:
@@ -171,21 +193,45 @@ def cmd_release_check_tree(args: argparse.Namespace) -> int:
 
     _print_section("git grep (release blocker)")
     pattern = _tree_grep_pattern()
-    grep = _run(
+    secret_file_hits, secret_file_check_ok = _tracked_secret_file_hits(repo_root)
+    hygiene_grep = _run(
         ["git", "grep", "-nE", pattern, "--", *_git_grep_pathspecs()],
+        cwd=repo_root,
+    )
+    secret_grep = _run(
+        [
+            "git",
+            "grep",
+            "-nEi",
+            _tree_secret_value_grep_pattern(),
+            "--",
+            *_git_grep_pathspecs(),
+        ],
         cwd=repo_root,
     )
     # `git grep` exits 0 on hit and 1 on no-hit. Anything else is an
     # invocation error.
-    if grep.returncode == 0 and grep.stdout:
-        print(grep.stdout, end="" if grep.stdout.endswith("\n") else "\n")
+    matched = False
+    if secret_file_hits:
+        matched = True
+        for path in secret_file_hits:
+            print(f"{path}: tracked local-secret file")
+    elif not secret_file_check_ok:
+        blockers.append("git ls-files failed")
+    for grep in (hygiene_grep, secret_grep):
+        if grep.returncode == 0 and grep.stdout:
+            matched = True
+            print(grep.stdout, end="" if grep.stdout.endswith("\n") else "\n")
+        elif grep.returncode == 1:
+            continue
+        else:
+            if grep.stderr:
+                print(grep.stderr, end="" if grep.stderr.endswith("\n") else "\n")
+            blockers.append("git grep failed")
+    if matched:
         blockers.append("git grep hit personal path or secret-shape token")
-    elif grep.returncode == 1:
+    if not matched and not blockers:
         print("(no matches)")
-    else:
-        if grep.stderr:
-            print(grep.stderr, end="" if grep.stderr.endswith("\n") else "\n")
-        blockers.append("git grep failed")
 
     if blockers:
         print("")
@@ -312,7 +358,7 @@ def cmd_release_check_scaffold(args: argparse.Namespace) -> int:
 
 
 def _artifact_grep_pattern() -> str:
-    return "|".join(list(_PERSONAL_PATH_PATTERNS) + list(_SECRET_SHAPE_PATTERNS))
+    return "|".join(list(_PERSONAL_PATH_PATTERNS) + list(_SECRET_VALUE_PATTERNS))
 
 
 def _extract_artifact(artifact: Path, dest: Path) -> Path:
@@ -335,6 +381,11 @@ def _grep_artifact_tree(root: Path, pattern: re.Pattern[str]) -> list[tuple[Path
     for dirpath, _dirnames, filenames in os.walk(root):
         for filename in filenames:
             path = Path(dirpath) / filename
+            if filename == ".pypirc" or filename == ".env" or (
+                filename.startswith(".env.") and filename != ".env.example"
+            ):
+                hits.append((path, 0, "artifact contains local-secret file"))
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
@@ -350,7 +401,8 @@ def cmd_release_check_artifact(args: argparse.Namespace) -> int:
 
     Honors the `release check` family's read-only / no-mutation invariant:
     the helper never touches the repo's ``dist/`` directory. Instead it
-    asks ``python -m build`` to write into an isolated tmp outdir, then
+    asks the current Python interpreter to run ``-m build`` into an
+    isolated tmp outdir, then
     extracts every produced wheel / sdist and scans the extracted trees
     for personal home paths and secret-shape tokens. The scan is
     strict-fail; matches are printed so the operator can record
@@ -370,7 +422,7 @@ def cmd_release_check_artifact(args: argparse.Namespace) -> int:
         _print_section("python -m build --outdir <tmp>")
         print(f"outdir: {build_outdir}")
         build = _run(
-            ["python", "-m", "build", "--outdir", str(build_outdir)],
+            [sys.executable, "-m", "build", "--outdir", str(build_outdir)],
             cwd=repo_root,
         )
         if build.stdout:

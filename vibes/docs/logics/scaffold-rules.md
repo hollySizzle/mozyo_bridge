@@ -26,10 +26,10 @@ The generated files are routers, not full rule books. They should point agents t
 Central preset rules live under:
 
 ```text
-${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<asana|redmine|none>/
+${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/
 ```
 
-The CLI package is the distribution source for those preset files. `mozyo-bridge rules install` should copy the packaged presets into the mozyo-bridge home, and `mozyo-bridge scaffold rules <preset>` should create thin project routers that reference the installed central preset.
+The CLI package is the distribution source for those preset files. `src/mozyo_bridge/scaffold/presets/presets.yaml` is the preset registry. `mozyo-bridge rules install` should copy the packaged presets into the mozyo-bridge home, and `mozyo-bridge scaffold rules <preset>` should create thin project routers that reference the installed central preset.
 
 Common constraints:
 
@@ -173,13 +173,14 @@ Target command:
 ```bash
 mozyo-bridge scaffold rules asana
 mozyo-bridge scaffold rules redmine
+mozyo-bridge scaffold rules redmine-rails
 mozyo-bridge scaffold rules none
 ```
 
 Expected options:
 
 ```bash
-mozyo-bridge scaffold rules <asana|redmine|none> \
+mozyo-bridge scaffold rules <preset> \
   --target /path/to/project \
   --dry-run \
   --backup \
@@ -234,14 +235,14 @@ beta tester が GitHub `main` から CLI を install した後、user-global rul
 
 tester smoke check 観点:
 
-1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `asana` / `redmine` / `none` を expected version で報告する。
-2. **isolated target を 2 つ作る**。`./tmp/mb-smoke-asana` と `./tmp/mb-smoke-redmine` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold rules` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
-3. dummy target に対して `mozyo-bridge scaffold rules asana --target ./tmp/mb-smoke-asana` と `mozyo-bridge scaffold rules redmine --target ./tmp/mb-smoke-redmine` をそれぞれ実行する。どちらか片方のみで終わらせない (preset 間 boundary の確認が落ちる)。
+1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `presets.yaml` の全 preset を expected version で報告する。
+2. **isolated target を preset ごとに作る**。`./tmp/mb-smoke-asana`、`./tmp/mb-smoke-redmine`、`./tmp/mb-smoke-redmine-rails` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold rules` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
+3. dummy target に対して registry の各 preset を `mozyo-bridge scaffold rules <preset> --target ./tmp/mb-smoke-<preset>` で実行する。片側だけで終わらせない (preset 間 boundary の確認が落ちる)。
 4. 各 dummy target で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
 5. `mozyo-bridge doctor --target ./tmp/mb-smoke-<preset>` を 1 command の acceptance smoke として使う。`scaffold` section が `ok`、`rules` / `codex_skill` / `claude_skill` / `cli` / `tmux` の各 section status と `next_action` を確認する。CI / 機械的 smoke では `--json` で `{"ok": <bool>, "sections": {...}}` を取り、`jq '.sections.scaffold.status == "ok"'` 等で gate を組む。
 6. 生成された `AGENTS.md` / `CLAUDE.md` が preset 期待値を持つ。例:
-   - Redmine: `Redmine issue と journal state` / `Redmine gate lifecycle` / `mozyo-bridge notify-` を含む。`vibes/docs/specs/project-map.md` などの mozyo_bridge 固有 path を含まない。
-   - Asana: `Asana task state と task comment` を含む。Redmine 固有の gate 用語 (`Implementation Done Gate` 等) を含まない。
+   - router は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md` と active anchor label を含む。
+   - router は `Redmine Gate Lifecycle`、`Audit-Owned Commit Authority`、Rails review details などの本文を複製しない。
 
 `mozyo-bridge doctor` は host 全体の `rules status`、対象 project の `scaffold status`、Codex / Claude skill install、CLI 自体の readiness を 1 command で見る 6-section diagnostic。`rules status` / `scaffold status` の責務差は前述の通りで、doctor はそれらを束ねる acceptance gate であり、検証手順の最終 1 行として使う。`--home <path>` を渡すと診断対象 home と一致した `next_action` (例: `mozyo-bridge rules install --home <path>`) が出るため、CI / fresh smoke でそのまま実行できる。
 
@@ -257,11 +258,11 @@ PyPI release との見分け:
 
 Implementation tests should cover:
 
-- Parser accepts `scaffold rules asana`, `redmine`, and `none`.
+- Parser choices come from `presets.yaml`.
 - Parser rejects unsupported ticket systems.
 - Rendering creates both `AGENTS.md` and `CLAUDE.md` for each preset.
 - Rendering creates thin routers that reference `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md`.
-- `rules install` installs central preset docs for `asana`, `redmine`, and `none`.
+- `rules install` installs central preset docs for every registry preset.
 - `scaffold rules <preset>` reports a clear error when the central preset is missing.
 - Default behavior refuses to overwrite either existing router.
 - Existing one-file state is handled atomically and does not leave a mismatched pair.

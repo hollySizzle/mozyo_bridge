@@ -20,7 +20,7 @@ import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.infrastructure.tmux_client import run_tmux
-from mozyo_bridge.scaffold.rules import rules_status, scaffold_status
+from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_status
 
 
 REQUIRED_SKILL_FILE = "SKILL.md"
@@ -259,7 +259,7 @@ def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
     if manifest == "missing":
         section_status = "missing"
         next_action.append(
-            "mozyo-bridge scaffold rules <asana|redmine|none> --target "
+            f"mozyo-bridge scaffold rules <{'|'.join(PRESETS)}> --target "
             + str(target)
             + home_suffix
         )

@@ -10,12 +10,15 @@ from pathlib import Path
 from string import Template
 from time import strftime
 
+import yaml
+
 from mozyo_bridge import __version__
 from mozyo_bridge.shared.errors import die
 
-PRESETS = ("asana", "redmine", "none")
+ROUTER_TEMPLATE_PRESET = "_router"
 RULE_RELATIVE_PATH = Path("rules") / "presets"
 MANIFEST_RELATIVE_PATH = Path(".mozyo-bridge") / "scaffold.json"
+PRESET_REGISTRY_FILENAME = "presets.yaml"
 
 
 @dataclass(frozen=True)
@@ -24,14 +27,89 @@ class RenderedFile:
     content: str
 
 
+@dataclass(frozen=True)
+class PresetDefinition:
+    name: str
+    workflow: str
+    ticket_anchor_label: str
+    extends: str | None = None
+
+
+def _registry_text() -> str:
+    return (
+        resources.files("mozyo_bridge.scaffold.presets")
+        .joinpath(PRESET_REGISTRY_FILENAME)
+        .read_text(encoding="utf-8")
+    )
+
+
+def _load_preset_registry() -> dict[str, PresetDefinition]:
+    raw = yaml.safe_load(_registry_text())
+    if not isinstance(raw, dict) or not isinstance(raw.get("presets"), dict):
+        die(f"{PRESET_REGISTRY_FILENAME} must contain a mapping named `presets`")
+    definitions: dict[str, PresetDefinition] = {}
+    for name, value in raw["presets"].items():
+        if not isinstance(name, str) or not name:
+            die(f"{PRESET_REGISTRY_FILENAME} contains an invalid preset name: {name!r}")
+        if not isinstance(value, dict):
+            die(f"{PRESET_REGISTRY_FILENAME} preset {name!r} must be a mapping")
+        workflow = value.get("workflow")
+        ticket_anchor_label = value.get("ticket_anchor_label")
+        extends = value.get("extends")
+        if not isinstance(workflow, str) or not workflow.endswith("/agent-workflow.md"):
+            die(f"{PRESET_REGISTRY_FILENAME} preset {name!r} has invalid workflow")
+        if not isinstance(ticket_anchor_label, str) or not ticket_anchor_label:
+            die(f"{PRESET_REGISTRY_FILENAME} preset {name!r} has invalid ticket_anchor_label")
+        if extends is not None and not isinstance(extends, str):
+            die(f"{PRESET_REGISTRY_FILENAME} preset {name!r} has invalid extends")
+        workflow_preset = workflow.split("/", 1)[0]
+        if workflow_preset != name:
+            die(
+                f"{PRESET_REGISTRY_FILENAME} preset {name!r} workflow must live under "
+                f"{name!r}, got {workflow!r}"
+            )
+        definitions[name] = PresetDefinition(
+            name=name,
+            workflow=workflow,
+            ticket_anchor_label=ticket_anchor_label,
+            extends=extends,
+        )
+    for definition in definitions.values():
+        if definition.extends is not None and definition.extends not in definitions:
+            die(
+                f"{PRESET_REGISTRY_FILENAME} preset {definition.name!r} extends "
+                f"unknown preset {definition.extends!r}"
+            )
+    return definitions
+
+
+PRESET_DEFINITIONS = _load_preset_registry()
+PRESETS = tuple(PRESET_DEFINITIONS)
+
+
+def preset_definition(preset: str) -> PresetDefinition:
+    try:
+        return PRESET_DEFINITIONS[preset]
+    except KeyError:
+        die(f"unsupported rules preset: {preset}")
+
+
 def mozyo_bridge_home() -> Path:
     return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
 
 
 def package_preset_root(preset: str):
-    if preset not in PRESETS:
-        die(f"unsupported rules preset: {preset}")
+    preset_definition(preset)
     return resources.files("mozyo_bridge.scaffold.presets").joinpath(preset)
+
+
+def router_template_text(filename: str) -> str:
+    return (
+        resources.files("mozyo_bridge.scaffold.presets")
+        .joinpath(ROUTER_TEMPLATE_PRESET)
+        .joinpath(filename)
+        .read_text(encoding="utf-8")
+    )
 
 
 def installed_preset_dir(preset: str, home: Path | None = None) -> Path:
@@ -42,13 +120,24 @@ def installed_agent_workflow(preset: str, home: Path | None = None) -> Path:
     return installed_preset_dir(preset, home) / "agent-workflow.md"
 
 
+def preset_install_requirements(preset: str) -> tuple[str, ...]:
+    seen: list[str] = []
+    current: str | None = preset
+    while current is not None:
+        if current in seen:
+            die(f"preset inheritance cycle detected: {' -> '.join(seen + [current])}")
+        definition = preset_definition(current)
+        seen.append(current)
+        current = definition.extends
+    return tuple(seen)
+
+
 def portable_rule_path(preset: str) -> str:
     # Symbolic path embedded into generated routers and the scaffold manifest so
     # they stay portable across hosts (no user-specific home leakage) while still
     # honoring MOZYO_BRIDGE_HOME at consumption time. The consuming agent expands
     # ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} when it reads the router.
-    if preset not in PRESETS:
-        die(f"unsupported rules preset: {preset}")
+    preset_definition(preset)
     return f"${{MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}}/rules/presets/{preset}/agent-workflow.md"
 
 
@@ -110,20 +199,30 @@ def rules_status(home: Path | None = None) -> list[dict[str, str]]:
 
 
 def require_installed_preset(preset: str, home: Path | None = None) -> Path:
-    workflow = installed_agent_workflow(preset, home)
-    version = installed_preset_dir(preset, home) / "VERSION"
-    if not workflow.exists() or not version.exists():
-        die(f"rules preset is not installed: {preset}. Run `mozyo-bridge rules install` first.")
-    return workflow
+    missing: list[str] = []
+    for required_preset in preset_install_requirements(preset):
+        workflow = installed_agent_workflow(required_preset, home)
+        version = installed_preset_dir(required_preset, home) / "VERSION"
+        if not workflow.exists() or not version.exists():
+            missing.append(required_preset)
+    if missing:
+        die(
+            "rules preset is not installed: "
+            + ", ".join(missing)
+            + ". Run `mozyo-bridge rules install` first."
+        )
+    return installed_agent_workflow(preset, home)
 
 
 def router_context(preset: str, target: Path, workflow_path: Path) -> dict[str, str]:
+    definition = preset_definition(preset)
     return {
         "preset": preset,
         "preset_version": package_version(preset),
         "project_root": str(target),
         "rule_path": portable_rule_path(preset),
         "mozyo_bridge_version": __version__,
+        "ticket_anchor_label": definition.ticket_anchor_label,
     }
 
 
@@ -131,7 +230,7 @@ def render_router_pair(preset: str, target: Path, workflow_path: Path) -> list[R
     context = router_context(preset, target, workflow_path)
     files = []
     for filename in ("AGENTS.md", "CLAUDE.md"):
-        template = Template(package_text(preset, filename))
+        template = Template(router_template_text(filename))
         files.append(RenderedFile(Path(filename), template.safe_substitute(context)))
     return files
 
@@ -239,7 +338,7 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
         result["error"] = "manifest root must be a JSON object"
         return result
     preset = state.get("preset")
-    if not isinstance(preset, str) or preset not in PRESETS:
+    if not isinstance(preset, str) or preset not in PRESET_DEFINITIONS:
         result["manifest"] = "invalid"
         result["error"] = f"manifest preset is missing or unsupported: {preset!r}"
         return result
@@ -273,7 +372,13 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
     central_workflow = installed_agent_workflow(preset, home)
     central_version = installed_preset_version(preset, home)
     central_hash = installed_preset_hash(preset, home)
-    if central_hash is None:
+    missing_requirements = [
+        required_preset
+        for required_preset in preset_install_requirements(preset)
+        if installed_preset_hash(required_preset, home) is None
+        or installed_preset_version(required_preset, home) is None
+    ]
+    if missing_requirements:
         central_status = "missing"
     elif manifest_preset_hash is None:
         # Pre-v2 manifest cannot detect content drift. Fall back to version compare.
