@@ -11,12 +11,21 @@ Claude / Codex 両対応は、共通 skill 本体と tool-specific adapter / pac
 
 ## 配布経路
 
-Claude Code 用の primary install は plugin marketplace 経由とし、Codex は canonical GitHub skill path に対する `$skill-installer`、CLI / rules は pipx + `mozyo-bridge rules install` を使う。curl/script による install は fallback / local smoke 用途のみで primary path にはしない。
+Claude Code 用の primary install は plugin marketplace 経由とし、Codex は canonical GitHub skill path に対する `$skill-installer`、CLI / rules は pipx + `mozyo-bridge rules install` を使う。curl/script による install は **legacy fallback** であり、新規 install では推奨しない。
 
 - Claude Code (primary): `claude plugin marketplace add hollySizzle/mozyo_bridge` → `claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user`
 - Codex (primary): `$skill-installer` に canonical path `https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent` を渡す
 - CLI / rules: `pipx install mozyo-bridge` + `mozyo-bridge rules install`
-- Fallback: `scripts/install_codex_skill.sh`, `scripts/install_claude_skill.sh`
+- Legacy fallback (deprecated for new installs): `scripts/install_codex_skill.sh`, `scripts/install_claude_skill.sh`
+
+## Legacy Global Claude Skill Deprecation
+
+`~/.claude/skills/mozyo-bridge-agent/` 配下に `scripts/install_claude_skill.sh` で配置する Claude personal skill (legacy global Claude skill) は、**新規 install において deprecated** とする (Asana audit `1214732699548536` / `1214733632421625`)。新規 install は Claude plugin marketplace 経由 (`claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user`) のみを推奨する。
+
+- 既存 install の取り扱い: 既に `~/.claude/skills/mozyo-bridge-agent/` を持つ user の home directory を、本 repository から自動削除しない / 強制 cleanup しない。cleanup の判断は user に委ねる。`mozyo-bridge doctor` は legacy directory を引き続き scan するが、`claude_skill: plugin-managed` (plugin が検出された場合) を期待状態として扱う。
+- `scripts/install_claude_skill.sh` の存続条件: 以下のいずれかに当てはまる環境のためにのみ残す: (a) plugin marketplace を使えないオフライン環境、(b) 内部 mirror / 内部 fork からの install、(c) fresh-tester acceptance smoke の検証。これらの条件に当てはまらない通常 install は、本 script を使わず plugin marketplace 経由で行う。
+- 配置 precedence の落とし穴: 同名 skill では personal (`~/.claude/skills/`) が project (`.claude/skills/`) を override する。新規 install が plugin marketplace path のみを使えば、`mozyo-bridge-agent:mozyo-bridge-agent` の namespace 分離が効くため、この precedence gotcha を踏まない。legacy global Claude skill を残したまま plugin path と共存させると、plugin install 後も personal copy が残り続け、user が後で contents drift を気にする必要が出る (本節が deprecated として推奨しない理由)。
+- 廃止 timeline: hard removal は本 task の scope 外。`scripts/install_claude_skill.sh` の即時削除 / 即時 break-only stub 化は禁止 (deprecation 通知 + 推奨経路の切替に留める)。実際の install / cleanup 動作の変更は別 Asana task で取り扱う。
 
 ## Source of Truth と drift 対策
 

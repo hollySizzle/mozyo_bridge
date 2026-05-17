@@ -1,4 +1,29 @@
 #!/usr/bin/env sh
+# DEPRECATED for new installs (Asana task 1214733632421625).
+#
+# The Claude Code primary install path is the plugin marketplace:
+#   claude plugin marketplace add hollySizzle/mozyo_bridge
+#   claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user
+#
+# This script writes the Claude personal skill into
+# ~/.claude/skills/mozyo-bridge-agent/ (the "legacy global Claude skill"),
+# which is now deprecated for new installs because the plugin marketplace
+# path avoids the personal-overrides-project precedence gotcha
+# (`mozyo-bridge-agent:mozyo-bridge-agent` namespace is scope-isolated).
+#
+# This script is kept for environments where the plugin marketplace path
+# is not available, specifically:
+#   (a) offline / air-gapped install,
+#   (b) internal mirrors or internal forks,
+#   (c) fresh-tester acceptance smoke that intentionally exercises the
+#       legacy fallback path.
+#
+# It does NOT remove or migrate existing ~/.claude/skills/mozyo-bridge-agent/
+# from user homes; cleanup is left to the user. Hard removal of this
+# script is intentionally out of scope of the deprecation task; see
+# vibes/docs/logics/skill-distribution.md `## Legacy Global Claude Skill
+# Deprecation` for the policy detail.
+
 set -eu
 
 repo="${MOZYO_BRIDGE_SKILL_REPO:-hollySizzle/mozyo_bridge}"
