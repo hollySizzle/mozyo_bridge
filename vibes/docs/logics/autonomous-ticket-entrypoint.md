@@ -126,6 +126,7 @@ If the pane message is the only artifact and there is no matching ticket record,
 - Repo-local working rules: `vibes/docs/rules/agent-workflow.md`
 - Shared skill workflow: `skills/mozyo-bridge-agent/references/workflow.md`
 - Notification safety: `skills/mozyo-bridge-agent/references/safety.md`
+- ACK / completion / receiver-state boundary doctrine: `vibes/docs/logics/ack-completion-receiver-state.md`
 - Central Asana preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
 - Central Redmine preset: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md`
 - Scaffold rules logic: `vibes/docs/logics/scaffold-rules.md`
