@@ -8,6 +8,32 @@
 
 この file が存在しない場合は、読んだふりをせず `mozyo-bridge rules install` を依頼して停止する。以下は Rails project にだけ追加する guardrail であり、汎用 Redmine preset を置き換えない。
 
+加えて、scaffold 生成された `AGENTS.md` / `CLAUDE.md` は **thin router** であり、target Rails repo の project-local guardrail を置き換えるものではない。詳細は次節 `Project-Local Layer` を読む。
+
+## Project-Local Layer (do not erase on scaffold apply)
+
+成熟した Rails repo に対する `mozyo-bridge scaffold apply redmine-rails` は **新規 install ではなく re-sync** として扱う。scaffold preset は以下のカテゴリの project-local fact を **target repo 側に既に存在することを前提に** layering する。これらを scaffold output だけで覆い被せない。
+
+- **(a) App stack identity** — Ruby version、Rails version、frontend stack (Hotwire / React / その他)、DB、deployment target、workspace path。
+- **(b) Rails extension conventions** — project が採用している Rails 拡張 (Presenter layer / decorator / form object / service object など) と、その保管 directory 規約。
+- **(c) Read-only documentation areas** — 仕様 directory を read-only 扱いするルール、編集禁止 path。
+- **(d) Project-specific safety commands** — project 固有の DB 再生成 script、test runner の必須環境変数 (例えば test 用 DB 環境変数を明示しないと development DB が壊れる、など)、parallel test runner、JS test runner、log capture、lint / 静的検査の起動口。安全要件 (誤った command で project local DB が壊れる等) を含むので scaffold base に持ち上げない。
+- **(e) Project docs governance** — project 固有の docs catalog、active-doc resolver script、nagger 生成物の場所と更新手順・編集禁止ルール。`mozyo-bridge` は generic な reading order を扱い、project 内 catalog の中身は target 側で版管理する。
+- **(f) Local role-boundary overrides** — Redmine gate / オーナー指示で明示された local 例外 (特定種類のファイルだけは Codex 直接編集可、など)。汎用 preset は Claude 実装 / Codex 監査 の標準 split を扱うが、project local 例外はここに残らない。
+- **(g) Project tooling and private convention** — local skill 同期 script、private internal tooling、project 固有 path / file convention。
+
+(a)–(g) の本文は scaffold preset に持たない (host を跨いで再利用できない / project 内に正本がある)。preset release のたびに上書きしない。`scaffold diff redmine-rails` の `-` 行に (a)–(g) のいずれかが出ているなら、それは "scaffold output が project-local layer を erase しようとしている" シグナルである。apply 前に保存と merge を計画する。
+
+## Project-Local Layer Apply Discipline
+
+mature Rails repo に対する `scaffold apply redmine-rails` の手順:
+
+1. `mozyo-bridge scaffold diff redmine-rails --target <repo>` で差分を観察する。`-` 行が `Project-Local Layer` (a)–(g) を含むなら、まだ apply しない。
+2. project-local layer の本文を repo の AGENTS.md / CLAUDE.md / project-local docs に保存してから apply する。または、scaffold base 側の更新が中央 preset 参照行・version label・generator 行だけに限定されている (`scaffold.json` の `preset_version` / `generated_by` 差分が主) と判断できる場合に限り `--backup` で apply し、`.bak.<timestamp>` から project-local layer を手作業 merge する。
+3. `--force` は project-local layer をバックアップ無しで消す可能性があるので、mature repo では使わない。fresh `./tmp/mb-smoke-*` などの isolated target にだけ使う。
+4. project-local layer を `AGENTS.md` / `CLAUDE.md` の "scaffold base + project-local additions" の追記構造に整理しておくと、次回 re-sync の merge コストが下がる。
+5. `scaffold status` は preset_hash と router file hash で drift を検出するため、project-local layer を追記した状態では `drifted` を出す。これは「project-local 追記がある」表示であり、scaffold base が壊れているわけではない。drift 内容と scaffold base が同期しているかを `scaffold diff` で別途確認する。
+
 ## Rails Scope Posture
 
 - scope は controller / model / view だけではない。route、authorization、validation、transaction、migration、seed、background job、mail、cache、asset、Hotwire / Turbo / Stimulus、system spec、manual verification、existing URL / data compatibility を含む。

@@ -1052,10 +1052,36 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Hotwire / UI behavior",
                 "Rails Verification Discipline",
                 "Rails QA / Production Verification",
+                # Project-Local Layer section added in 2026.05.18.3.
+                # The scaffold preset must explicitly tell operators which
+                # categories of project-local facts stay in the target repo
+                # and must not be overwritten by `scaffold apply`.
+                "Project-Local Layer",
+                "Project-Local Layer Apply Discipline",
+                "do not erase on scaffold apply",
+                "App stack identity",
+                "Rails extension conventions",
+                "Read-only documentation areas",
+                "Project-specific safety commands",
+                "Project docs governance",
+                "Local role-boundary overrides",
+                "Project tooling and private convention",
+                "mozyo-bridge scaffold diff redmine-rails",
+                "--backup",
             ):
                 self.assertIn(marker, installed)
+            # Regression rails: the scaffold preset must not import team-specific
+            # paths or convention names, even when describing what stays in
+            # project-local docs. Existing-repo examples are described in
+            # generic terms only.
             self.assertNotIn("/myapp/Source/rails", installed)
             self.assertNotIn("vibes/docs/catalog.yaml", installed)
+            self.assertNotIn(".claude-nagger/file_conventions.yaml", installed)
+            self.assertNotIn("resolve_audit_docs.py", installed)
+            self.assertNotIn("bin/recreate_db.sh", installed)
+            self.assertNotIn("bin/sync-mozyo-bridge-skill", installed)
+            self.assertNotIn("RAILS_ENV=test", installed)
+            self.assertNotIn("app/presenters/", installed)
 
             result, _ = self.run_cli(
                 ["scaffold", "apply", "redmine-rails", "--target", str(project), "--home", str(home)]
@@ -1077,7 +1103,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual("redmine-rails", state["preset"])
-            self.assertEqual("2026.05.18.1", state["preset_version"])
+            self.assertEqual("2026.05.18.3", state["preset_version"])
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

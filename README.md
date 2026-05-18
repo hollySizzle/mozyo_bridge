@@ -369,6 +369,19 @@ mozyo-bridge scaffold diff asana --target /path/to/project
 
 Existing `AGENTS.md` or `CLAUDE.md` files are not overwritten by default. Use `--dry-run` on `scaffold apply` to print the would-write paths, `--backup` to replace with backups, or `--force` to replace without backups.
 
+### Applying to a mature project repo
+
+Scaffold-generated `AGENTS.md` / `CLAUDE.md` は thin router です。成熟した既存 repo (project-local guardrail を持つ Rails / Redmine / その他) に `scaffold apply` するときは、scaffold が project-local additions を消すリスクがあります。手順:
+
+1. `mozyo-bridge scaffold diff <preset> --target /path/to/repo` で `-` 行を確認する。app stack / project-specific safety commands / docs governance / role-boundary override などが消える場合、まだ apply しない。
+2. project-local additions を保存 (別 file に退避、もしくは新しい AGENTS.md に貼り直す前提で覚えておく) する。
+3. `scaffold apply <preset> --target /path/to/repo --backup` で apply する。`--backup` は既存 file を `AGENTS.md.bak.<timestamp>` に退避する。
+4. 退避された `.bak.<timestamp>` から project-local additions を新しい AGENTS.md / CLAUDE.md に手作業 merge する。
+5. mature repo では `--force` は使わない (bak 無しで上書きするため、project-local additions を消す)。
+
+`redmine-rails` preset には `Project-Local Layer` セクションと `Project-Local Layer Apply Discipline` セクションがあり、Rails repo 側で保持すべきカテゴリ (Rails / Ruby version、Presenter / YAML 慣習、`Doc/` 編集禁止、`RAILS_ENV=test` 必須、docs catalog / nagger / active-doc resolver、log capture など) を列挙しています。Rails 以外の preset でも考え方は同じです。
+
+
 After upgrading mozyo-bridge (e.g. `pipx upgrade mozyo-bridge && mozyo-bridge rules install`), check each scaffolded project for drift:
 
 ```bash
