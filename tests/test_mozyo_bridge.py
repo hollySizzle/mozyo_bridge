@@ -958,6 +958,19 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "actual",
                 "version consistency",
                 "`catalog.yaml` / docs resolver / nagger file conventions tooling の標準化は別タスク",
+                # Close Approval Separation codified in 2026.05.18.3: review
+                # approval and owner close approval are distinct gates; the
+                # reviewer (audit role / Codex equivalent) records a separate
+                # journal asking the owner about close after review approval,
+                # and the implementer must not close from review approval
+                # alone.
+                "Close Approval Separation",
+                "owner close approval",
+                "Review Gate approval を owner close approval と読み替えない",
+                "Review Gate とは別 journal",
+                "owner close approval が未取得のまま close してはならない",
+                "同一 issue の **別 journal** を作成し、owner にクローズ可否を確認する",
+                "Review Gate approval だけで issue を close へ進めない",
             ):
                 self.assertIn(marker, installed)
             self.assertIn(
@@ -1039,7 +1052,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.05.18.2", state["preset_version"])
+            self.assertEqual("2026.05.18.3", state["preset_version"])
 
             # The audit-owned commit policy belongs in the central preset only.
             # Root routers stay thin and must not duplicate the policy body.
@@ -1788,6 +1801,25 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         self.assertIn("pane scrollback", section)
         self.assertIn("durable", section)
 
+    def test_audit_owned_commit_section_notes_owner_close_approval_separation(
+        self,
+    ) -> None:
+        """The shared Audit-Owned Commit Authority section must call out that
+        review approval is not the same as owner close approval on systems
+        where the central preset distinguishes them. This keeps Redmine
+        implementers from closing on review approval alone even when they
+        only read the shared workflow reference and not the Redmine central
+        preset directly.
+        """
+        section_start = self.workflow.index("## Audit-Owned Commit Authority")
+        section_end = self.workflow.index(
+            "## Workflow Change Verification", section_start
+        )
+        section = self.workflow[section_start:section_end]
+        self.assertIn("owner close approval", section)
+        self.assertIn("Review approval alone is not close approval", section)
+        self.assertIn("Close Approval Separation", section)
+
     def test_audit_owned_commit_does_not_grant_direct_implementation(self) -> None:
         # The audit-owned commit section must NOT contain wording that could be
         # read as permission for Codex to write implementation diffs as part of
@@ -1966,6 +1998,138 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
         self.assertIn("Data / migration safety", self.redmine_rails_workflow)
         self.assertIn("Hotwire / UI behavior", self.redmine_rails_workflow)
         self.assertNotIn("/myapp/Source/rails", self.redmine_rails_workflow)
+
+    def test_redmine_preset_separates_review_and_owner_close_approval(self) -> None:
+        """Review Gate approval and owner close approval are distinct durable
+        gates on Redmine projects, ported from Rails commit 8645c4d19.
+
+        The reviewer (audit role / Codex equivalent) records `指摘事項なし` or
+        re-review approval on the Review Gate journal, then must record a
+        separate journal asking the owner whether close is permitted. The
+        implementer must NOT close from review approval alone; it must wait
+        for the owner close approval journal. The shared Redmine preset has
+        to make all three responsibilities explicit so a future doc refactor
+        cannot collapse them back into a single review-and-close gate.
+        """
+        # The dedicated section must exist.
+        self.assertIn("## Close Approval Separation", self.redmine_workflow)
+
+        # Section body must name the three responsibilities distinctly.
+        section_start = self.redmine_workflow.index("## Close Approval Separation")
+        section_end = self.redmine_workflow.index("## Close Gate Checklist", section_start)
+        section = self.redmine_workflow[section_start:section_end]
+        # Reviewer side: review approval is not close approval, and reviewer
+        # has the post-approval owner-confirmation responsibility.
+        self.assertIn("これだけで issue を close してはならない", section)
+        self.assertIn("**別 journal**", section)
+        self.assertIn("owner にクローズ可否を確認する", section)
+        self.assertIn("レビュー結果と owner close approval を 1 journal にまとめない", section)
+        # Implementer side: do not advance from review approval alone.
+        self.assertIn("Review Gate approval だけで issue を close へ進めない", section)
+        self.assertIn("owner の close approval journal を読み", section)
+        # Collapsed-roles caveat preserves the record discipline.
+        self.assertIn(
+            "reviewer と owner を同一人物に collapse している場合でも", section
+        )
+
+        # Review Gate bullet must explicitly route the reviewer to the
+        # separation section after a no-blockers verdict.
+        review_gate = self.redmine_workflow[
+            self.redmine_workflow.index("7. **Review Gate**") :
+            self.redmine_workflow.index("8. **QA Verification Gate**")
+        ]
+        self.assertIn("これは close approval ではない", review_gate)
+        self.assertIn("owner にクローズ可否を確認する責務", review_gate)
+        self.assertIn("Close Approval Separation", review_gate)
+
+        # Close Gate bullet must name owner close approval as separate from
+        # Review Gate, not just "owner approval".
+        close_gate = self.redmine_workflow[
+            self.redmine_workflow.index("10. **Close Gate**") :
+            self.redmine_workflow.index("\n\nproject 固有 status / tracker")
+        ]
+        self.assertIn("owner close approval", close_gate)
+        self.assertIn("Review Gate とは別 journal", close_gate)
+        self.assertIn(
+            "passing Review Gate、owner close approval、commit hash record の三つが揃うまで",
+            close_gate,
+        )
+
+        # Close Gate Checklist must add a dedicated bullet for the owner
+        # close approval journal so a future Close Gate cannot be "passed"
+        # against only the Review Gate.
+        checklist_start = self.redmine_workflow.index("## Close Gate Checklist")
+        checklist_end = self.redmine_workflow.index("## Pane Notification", checklist_start)
+        checklist = self.redmine_workflow[checklist_start:checklist_end]
+        self.assertIn(
+            "**owner close approval** が Review Gate とは別 journal として記録されている",
+            checklist,
+        )
+        self.assertIn("Review Gate approval だけで checklist を満たさない", checklist)
+
+        # Completion section must tell the implementer to wait for the owner
+        # close approval journal — review approval alone does not advance to
+        # close.
+        completion_start = self.redmine_workflow.index("## Completion")
+        completion_end = self.redmine_workflow.index("## Audit-Owned Commit Authority", completion_start)
+        completion = self.redmine_workflow[completion_start:completion_end]
+        self.assertIn(
+            "Review Gate approval を owner close approval と読み替えない",
+            completion,
+        )
+        self.assertIn("owner close approval journal が記録されてから close へ進む", completion)
+
+    def test_asana_completion_section_has_no_duplicate_numbered_steps(self) -> None:
+        """Asana preset Completion section must be a contiguous 1..N numbered
+        list with no duplicate numbers and no duplicate body text. A prior
+        generated/rendered output exhibited a duplicated completion
+        requirement line, and a regression here would re-introduce the same
+        ambiguity for any downstream Asana project.
+        """
+        section_start = self.asana_workflow.index("## Completion")
+        section_end = self.asana_workflow.index("## Audit-Owned Commit Authority", section_start)
+        section = self.asana_workflow[section_start:section_end]
+
+        numbered = re.findall(r"^(\d+)\.\s+(.+)$", section, flags=re.MULTILINE)
+        self.assertGreaterEqual(
+            len(numbered),
+            3,
+            msg=f"Completion section should contain a numbered list; got {numbered!r}",
+        )
+        # Contiguous 1..N, no duplicate numeric prefix.
+        numbers = [int(num) for num, _ in numbered]
+        self.assertEqual(
+            numbers,
+            list(range(1, len(numbers) + 1)),
+            msg=(
+                "Completion numbered list must be contiguous 1..N with no "
+                f"duplicate numeric prefix; got {numbers!r}"
+            ),
+        )
+        # No body appears twice (catches a duplicated completion requirement
+        # line even if it were renumbered to keep the list "contiguous").
+        bodies = [body.strip() for _, body in numbered]
+        duplicates = [body for body in bodies if bodies.count(body) > 1]
+        self.assertEqual(
+            duplicates,
+            [],
+            msg=(
+                "Completion section contains duplicate body text: "
+                f"{duplicates!r}"
+            ),
+        )
+        # Defensive: no two consecutive bodies are identical (cheaper to
+        # catch if a future edit accidentally pastes the same line twice
+        # in adjacent steps).
+        for i in range(1, len(bodies)):
+            self.assertNotEqual(
+                bodies[i],
+                bodies[i - 1],
+                msg=(
+                    f"Completion step {i + 1} duplicates the previous step "
+                    f"body verbatim: {bodies[i]!r}"
+                ),
+            )
 
 
 class ScaffoldStatusTest(unittest.TestCase):

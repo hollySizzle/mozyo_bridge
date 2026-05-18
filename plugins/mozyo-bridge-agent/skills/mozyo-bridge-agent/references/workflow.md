@@ -102,6 +102,8 @@ Before an audit-owned commit, Codex must:
 6. Record the commit hash in the durable source of truth: a follow-up Asana comment on the same task, or a Close Gate / Progress Log journal on the Redmine issue. The hash must live in the durable record, not only in pane chat.
 7. Mark the task complete or move the issue to closed only after both the audit record and the commit-hash record are present. Implementation done alone, or a commit landed without a recorded hash, is not completion.
 
+On systems where the central preset distinguishes review approval from owner close approval (Redmine projects: see the Redmine preset's `Close Approval Separation`), both the review approval and the owner close approval must be recorded as separate durable journals before closing. Review approval alone is not close approval; the implementer must wait for the owner close approval journal before advancing to close.
+
 This authority applies to normal development tasks and to guardrail / rule / workflow tasks alike whenever the project splits implementation and audit actors. It does not waive the `Workflow Change Verification` requirement for changes to autonomous workflow, skills, rules, or release / distribution gates — verification of a rule change is still a separate normal development task with the standard handoff.
 
 ## Workflow Change Verification
