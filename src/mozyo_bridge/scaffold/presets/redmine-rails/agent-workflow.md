@@ -26,13 +26,16 @@
 
 ## Project-Local Layer Apply Discipline
 
-mature Rails repo に対する `scaffold apply redmine-rails` の手順:
+scaffold-generated `AGENTS.md` / `CLAUDE.md` には Project-Local Additions マーカー (`<!-- mozyo-bridge:project-local-additions:begin -->` ～ `<!-- mozyo-bridge:project-local-additions:end -->`) が含まれており、その間に書いた project-local layer 本文は `scaffold apply` / `scaffold diff` が機械的に保持する。
 
-1. `mozyo-bridge scaffold diff redmine-rails --target <repo>` で差分を観察する。`-` 行が `Project-Local Layer` (a)–(g) を含むなら、まだ apply しない。
-2. project-local layer の本文を repo の AGENTS.md / CLAUDE.md / project-local docs に保存してから apply する。または、scaffold base 側の更新が中央 preset 参照行・version label・generator 行だけに限定されている (`scaffold.json` の `preset_version` / `generated_by` 差分が主) と判断できる場合に限り `--backup` で apply し、`.bak.<timestamp>` から project-local layer を手作業 merge する。
-3. `--force` は project-local layer をバックアップ無しで消す可能性があるので、mature repo では使わない。fresh `./tmp/mb-smoke-*` などの isolated target にだけ使う。
-4. project-local layer を `AGENTS.md` / `CLAUDE.md` の "scaffold base + project-local additions" の追記構造に整理しておくと、次回 re-sync の merge コストが下がる。
-5. `scaffold status` は preset_hash と router file hash で drift を検出するため、project-local layer を追記した状態では `drifted` を出す。これは「project-local 追記がある」表示であり、scaffold base が壊れているわけではない。drift 内容と scaffold base が同期しているかを `scaffold diff` で別途確認する。
+re-sync の手順:
+
+1. 初回 `scaffold apply redmine-rails --target <repo>` 後、マーカー間にこの project の Rails / Redmine 固有事実 (Project-Local Layer (a)–(g) を埋める内容) を追記する。
+2. 以降の re-sync では `scaffold diff redmine-rails --target <repo>` で **scaffold base 側の差分だけ** が表示される (マーカー間の project-local 追記は rendered template 側に substitute されるので diff から消える)。`-` 行に project-local 追記が出ている場合は、マーカー外に書かれているシグナル — マーカー内へ移動する。
+3. `scaffold apply --backup` (推奨) は existing AGENTS.md / CLAUDE.md を `.bak.<timestamp>` に退避してから新しい router を書き、その新しい router にマーカー内の本文が substitute される。マーカー内に書いた project-local 追記は失われない。`.bak.*` は監査用 fallback。
+4. `scaffold apply --force` は backup を作らずに上書きするが、マーカー preservation は同じく適用されるので、マーカー内の project-local 追記は保持される。マーカー *外* に書いた追記 (古い scaffold で marker pair の外側にあった内容) は上書きで消える。
+5. legacy scaffold (router にマーカー pair が無い古い AGENTS.md / CLAUDE.md) は preservation 対象外。re-sync 前に project-local 追記をマーカー内へ移動するか、`--backup` で退避後に手作業 merge する。
+6. `scaffold status` は preset_hash と router file hash で drift を検出する。マーカー間に追記しただけで scaffold base が同じ場合、status は `drifted` を表示する (router hash が manifest と一致しないため)。次の `scaffold apply --backup` を一度走らせれば manifest が現在のマーカー内本文の hash を記録し、status は clean に戻る (これが想定の運用)。
 
 ## Rails Scope Posture
 
@@ -102,9 +105,41 @@ QA Verification Gate では、仕様から操作手順を作り、implementation
 - 本番確認が必要な変更では Production Verification Gate に deploy version、migration status、確認 user / role、確認 record、rollback / follow-up 要否を残す。
 - seed / data correction / migration 後の確認は、画面表示だけでなく DB state または observable behavior を確認する。
 
+## Active-Doc Resolver Concept
+
+project が "対象 path から、その path に紐づく guardrail / spec / convention doc 群を解決する" 仕組みを持つことがある (active-doc resolver、docs catalog、generated file-conventions ファイル、nagger 出力 など。具体的な script 名や file 名は project ごとに異なる)。preset 側は具体名を強制しない。下記の運用原則だけを共有規約とする。
+
+- 変更対象 path が分かったら、project が active-doc resolver を提供している場合はそれで guardrail / spec / convention doc を解決し、本文を読む。catalog ファイルや generated guardrail ファイルがある場合は、その正本と編集禁止ルール (生成物を手編集しない、catalog を経由する、など) を必ず project-local layer に明記する。
+- resolver / catalog / generator の **具体的な path や command** は project-local layer (router の Project-Local Additions マーカー間) に書く。preset 側に列挙しない。
+- project がこれらを提供していない場合は、preset 側の `Rails Start Gate Additions` で挙げた手書きの doc 読み解き fallback を使う。preset 側に missing 通知 / installer を求めない。
+
+## Dangerous DB / Test Command Category
+
+Rails / Redmine 開発では `test` 用環境変数を付け忘れると development DB を破壊する系の事故が起きやすい。具体的な command と環境変数は project 固有なので preset 側に焼き込まないが、共有 ルールとして次を扱う。
+
+- project に "誤実行で development DB / shared state が壊れる test / db 系 command" がある場合、必須環境変数とその理由を **project-local layer に明記する** (例: `<env-var>=<value> <command>` のセット、リセットせず使うと壊れる shared state、parallel runner 起動時の前提)。マーカー外の preset 説明に頼らず、操作者が AGENTS.md の冒頭近くで気づける位置に置く。
+- 偶発的な「重い・遅い」では済まず DB / state を破壊する系の command は警告だけでは不十分。実行前 / 実行後の確認 step、復旧 command、復旧コスト見積りも project-local layer 側に記録する。preset 側はそのカテゴリの存在だけを伝える。
+- preset 側は project 固有の DB 再生成 script、log capture script、parallel test runner、JS test runner、project 固有 lint といった具体的な command 名を必須要件として列挙しない。これらは project ごとに名前と存在有無が違うため、必須化すると別 project で誤誘導になる。
+
+## Presenter / YAML / Doc-Readonly Category
+
+project が Rails 標準を超える表示層やルールを採用している場合、preset 側はカテゴリだけを認識し、具体 path を列挙しない。project-local layer 側で次を明記する。
+
+- **Presenter / decorator / form object / service object** 等を採用しているか。採用している場合の保管 directory と、各層に乗せてよい責務 / 乗せてはいけない責務 (例: controller 肥大化禁止、view helper への business logic 混入禁止、presenter concerns への業務ロジック混入禁止)。
+- **設定 YAML / 画面定義 YAML** (`config/...` 配下など) を使っているか。使っている場合の保管 directory、命名規則、生成物 / 手書き mix のルール。
+- **Read-only documentation area** (仕様書 directory、外部設計書 directory、生成物 directory) が存在するか。存在する場合の編集禁止 path と、読み取り専用扱いの根拠。
+- これらは project ごとに有無と path が違うため、project-local layer マーカー内へ書く。preset 側は「該当 area があれば project-local layer に書く」というカテゴリ要件だけ持つ。
+
+## Project Tooling / Local Skill / Role-Boundary Override Category
+
+- project が **local skill / sync command** (project root の skill copy を mirror で揃える系の helper) を持つ場合、その同期方法と check command を project-local layer に書く。手編集禁止 / generator 経由必須のルールがあれば併記する。
+- project が **role-boundary の local override** (例: 「ガードレール / agent 運用文書 / local skill だけは Codex 直接編集可」「特定 directory 配下は Codex 監査必須」) を採用している場合、その override の範囲と発動条件を project-local layer に明記する。preset 側の標準 split (Claude implements / Codex audits) を override する形で書く。
+- project が **private internal tooling、private path、private convention** を持つ場合、対象 path と運用 rule を project-local layer に書く。preset 側に名前を持たない。
+
 ## Rails Prohibitions
 
 - 汎用 `redmine` preset に Rails 固有 app path、private docs catalog、controller / model / migration 規約を混ぜ戻さない。
 - migration、authorization、data correction を review なしで close しない。
 - destructive migration、bulk update、external notification、production operation を owner approval / project operation rule なしに実行しない。
 - Redmine journal、commit message、README、logs に credential、token、個人情報、production data excerpt を記録しない。
+- project 固有の path / command / 環境変数 / skill / docs catalog を redmine-rails preset 本文に焼き込まない。これらは router の Project-Local Additions マーカー間に書く (preset 側に書くと別 project で誤誘導になる)。

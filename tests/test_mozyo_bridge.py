@@ -840,8 +840,10 @@ class ScaffoldRulesTest(unittest.TestCase):
             # comment, chat reports stay to a state + task-id pointer.
             self.assertIn("最小ポインタ", claude)
             self.assertIn("chat に貼り直さない", claude)
-            # CLAUDE.md stays thin even with the Claude-specific reminder block.
-            self.assertLess(len(claude.splitlines()), 30)
+            # CLAUDE.md stays thin even with the Claude-specific reminder
+            # block AND the Project-Local Additions marker block + boilerplate
+            # (~9 lines) shipped from the router template.
+            self.assertLess(len(claude.splitlines()), 50)
             # Asana CLAUDE.md must not import Redmine-specific vocabulary.
             for forbidden in ("Redmine journal", "Review Gate", "Implementation Done Gate"):
                 self.assertNotIn(forbidden, claude)
@@ -1009,8 +1011,10 @@ class ScaffoldRulesTest(unittest.TestCase):
             # chat reports stay to a state + issue/journal-id pointer.
             self.assertIn("最小ポインタ", claude)
             self.assertIn("chat に貼り直さない", claude)
-            # Router stays thin: keep CLAUDE.md well below the central preset's depth.
-            self.assertLess(len(claude.splitlines()), 30)
+            # Router stays thin: well below the central preset's depth, even
+            # with the Project-Local Additions marker block + boilerplate
+            # (~9 lines) shipped from the router template.
+            self.assertLess(len(claude.splitlines()), 50)
             self.assertNotIn("Redmine Gate Lifecycle", claude)
             self.assertNotIn("Implementer / Auditor Role Boundary", claude)
 
@@ -1066,8 +1070,17 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "Project docs governance",
                 "Local role-boundary overrides",
                 "Project tooling and private convention",
-                "mozyo-bridge scaffold diff redmine-rails",
+                "scaffold diff redmine-rails",
                 "--backup",
+                # New marker-bounded preservation guidance + concrete
+                # category sections added in 2026.05.18.4.
+                "Project-Local Additions マーカー",
+                "<!-- mozyo-bridge:project-local-additions:begin -->",
+                "<!-- mozyo-bridge:project-local-additions:end -->",
+                "Active-Doc Resolver Concept",
+                "Dangerous DB / Test Command Category",
+                "Presenter / YAML / Doc-Readonly Category",
+                "Project Tooling / Local Skill / Role-Boundary Override Category",
             ):
                 self.assertIn(marker, installed)
             # Regression rails: the scaffold preset must not import team-specific
@@ -1103,7 +1116,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual("redmine-rails", state["preset"])
-            self.assertEqual("2026.05.18.3", state["preset_version"])
+            self.assertEqual("2026.05.18.4", state["preset_version"])
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1398,6 +1411,302 @@ class ScaffoldDiffTest(unittest.TestCase):
                     )
 
             self.assertIn("rules preset is not installed", stderr.getvalue())
+
+
+class ScaffoldProjectLocalAdditionsPreservationTest(unittest.TestCase):
+    """Marker-bounded preservation contract for project-local additions.
+
+    Operators put project-local layer body (Rails / Ruby version, dangerous
+    DB / test commands, Presenter / YAML conventions, docs catalog
+    governance, role-boundary overrides, etc.) between the marker pair shipped
+    inside scaffold-generated AGENTS.md / CLAUDE.md. `scaffold apply` and
+    `scaffold diff` must mechanically preserve that body across re-sync so
+    mature target repos do not lose project-local guardrails when a new
+    preset version lands.
+    """
+
+    BEGIN = "<!-- mozyo-bridge:project-local-additions:begin -->"
+    END = "<!-- mozyo-bridge:project-local-additions:end -->"
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def _setup(self, tmp: Path, preset: str = "redmine-rails") -> tuple[Path, Path]:
+        home = tmp / "home"
+        project = tmp / "project"
+        project.mkdir()
+        self.run_cli(["rules", "install", "--home", str(home)])
+        self.run_cli(
+            ["scaffold", "apply", preset, "--target", str(project), "--home", str(home)]
+        )
+        return home, project
+
+    def _insert_project_local_body(self, file_path: Path, body: str) -> str:
+        """Replace the marker-bounded block in `file_path` with `body`.
+
+        Returns the raw text written to disk so callers can assert against it.
+        """
+        text = file_path.read_text(encoding="utf-8")
+        begin_idx = text.find(self.BEGIN)
+        end_idx = text.find(self.END, begin_idx)
+        assert begin_idx >= 0 and end_idx >= 0, "marker pair must be present"
+        new_text = (
+            text[: begin_idx + len(self.BEGIN)]
+            + "\n"
+            + body
+            + "\n"
+            + text[end_idx:]
+        )
+        file_path.write_text(new_text, encoding="utf-8")
+        return new_text
+
+    def test_router_templates_carry_marker_pair(self) -> None:
+        """Both AGENTS.md and CLAUDE.md ship with the marker pair on fresh apply."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                ["scaffold", "apply", "redmine-rails", "--target", str(project), "--home", str(home)]
+            )
+
+            agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+            claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
+            for text in (agents, claude):
+                self.assertIn(self.BEGIN, text)
+                self.assertIn(self.END, text)
+
+    def test_backup_apply_preserves_project_local_body(self) -> None:
+        """--backup re-apply preserves project-local body inside the markers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup(Path(tmp))
+            project_local_body = (
+                "## Project-Local Layer\n\n"
+                "- Ruby 3.1.5 / Rails 7.0.8.1.\n"
+                "- DB safety: TEST_DB_ENV=test must be set when running rspec.\n"
+                "- Read-only docs directory: Doc/ (edit forbidden).\n"
+            )
+            agents_path = project / "AGENTS.md"
+            claude_path = project / "CLAUDE.md"
+            self._insert_project_local_body(agents_path, project_local_body)
+            self._insert_project_local_body(
+                claude_path, "## Project-Local Reminder\n\nRAILS_ENV=test is mandatory.\n"
+            )
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--backup",
+                ]
+            )
+
+            self.assertEqual(0, result)
+            agents_after = agents_path.read_text(encoding="utf-8")
+            claude_after = claude_path.read_text(encoding="utf-8")
+            # Project-local body must survive re-apply, byte-for-byte.
+            self.assertIn("Ruby 3.1.5 / Rails 7.0.8.1.", agents_after)
+            self.assertIn("TEST_DB_ENV=test", agents_after)
+            self.assertIn("Read-only docs directory: Doc/ (edit forbidden).", agents_after)
+            self.assertIn("RAILS_ENV=test is mandatory.", claude_after)
+            # Markers still present after re-apply.
+            self.assertIn(self.BEGIN, agents_after)
+            self.assertIn(self.END, agents_after)
+            self.assertIn(self.BEGIN, claude_after)
+            self.assertIn(self.END, claude_after)
+            # .bak.<timestamp> files retain the pre-apply state as safety net.
+            self.assertTrue(list(project.glob("AGENTS.md.bak.*")))
+            self.assertTrue(list(project.glob("CLAUDE.md.bak.*")))
+
+    def test_force_apply_preserves_project_local_body(self) -> None:
+        """--force re-apply also preserves project-local body inside the markers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup(Path(tmp))
+            agents_path = project / "AGENTS.md"
+            self._insert_project_local_body(
+                agents_path, "- project-local addition that must survive --force.\n"
+            )
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--force",
+                ]
+            )
+
+            self.assertEqual(0, result)
+            agents_after = agents_path.read_text(encoding="utf-8")
+            self.assertIn("project-local addition that must survive --force.", agents_after)
+            self.assertIn(self.BEGIN, agents_after)
+            self.assertIn(self.END, agents_after)
+            # --force does not produce a .bak.* file (this is the documented
+            # difference between --force and --backup; preservation does not
+            # change that).
+            self.assertFalse(list(project.glob("AGENTS.md.bak.*")))
+
+    def test_diff_is_clean_after_preserving_project_local_body(self) -> None:
+        """scaffold diff returns clean (exit 0) once project-local body is inside markers.
+
+        Once the operator has put their additions between the markers AND
+        re-applied so the manifest records the post-substitution hash, a
+        subsequent `scaffold diff` against the same preset version must not
+        report any pending changes — the rendered router (with substituted
+        project-local body) matches the on-disk router byte-for-byte.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup(Path(tmp))
+            agents_path = project / "AGENTS.md"
+            self._insert_project_local_body(
+                agents_path, "- project-local fact preserved across re-sync.\n"
+            )
+            # Re-apply so the manifest records the post-substitution hash.
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--backup",
+                ]
+            )
+
+            result, output = self.run_cli(
+                [
+                    "scaffold",
+                    "diff",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("scaffold diff: clean", output)
+
+    def test_preservation_skipped_when_markers_absent_on_disk(self) -> None:
+        """Legacy on-disk routers without markers fall through unchanged.
+
+        When the operator's AGENTS.md does NOT contain the marker pair (legacy
+        scaffold or hand-edited content with markers removed), preservation
+        does not fire — re-apply with `--force` overwrites the file with the
+        fresh scaffold base, exactly as the existing safety contract intended.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup(Path(tmp))
+            agents_path = project / "AGENTS.md"
+            # Replace the file entirely with a legacy-style router that has
+            # no marker pair.
+            legacy_body = "# AGENTS (legacy)\n\n- no marker pair here.\n"
+            agents_path.write_text(legacy_body, encoding="utf-8")
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--force",
+                ]
+            )
+
+            self.assertEqual(0, result)
+            agents_after = agents_path.read_text(encoding="utf-8")
+            # Marker pair restored (fresh template).
+            self.assertIn(self.BEGIN, agents_after)
+            self.assertIn(self.END, agents_after)
+            # Legacy body without markers is overwritten — no preservation
+            # fallback for that case (operator must move content into markers
+            # first, as documented in the preset's Apply Discipline section).
+            self.assertNotIn("no marker pair here.", agents_after)
+
+    def test_status_clean_after_preserving_body_and_reapplying(self) -> None:
+        """scaffold status reports clean after preservation + re-apply cycle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home, project = self._setup(Path(tmp))
+            self._insert_project_local_body(
+                project / "AGENTS.md", "- project fact A\n- project fact B\n"
+            )
+            self._insert_project_local_body(
+                project / "CLAUDE.md", "- claude reminder X\n"
+            )
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--backup",
+                ]
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("result: clean", output)
+
+    def test_extract_and_substitute_helpers(self) -> None:
+        """Unit-level coverage for the extract/substitute primitives."""
+        from mozyo_bridge.scaffold.rules import (
+            extract_project_local_block,
+            substitute_project_local_block,
+        )
+
+        on_disk = (
+            "header\n"
+            + self.BEGIN
+            + "\nproject additions\n"
+            + self.END
+            + "\ntrailer\n"
+        )
+        rendered = (
+            "header\n"
+            + self.BEGIN
+            + "\nboilerplate\n"
+            + self.END
+            + "\ntrailer\n"
+        )
+        block = extract_project_local_block(on_disk)
+        self.assertEqual("\nproject additions\n", block)
+        new_rendered = substitute_project_local_block(rendered, block)
+        self.assertIn("\nproject additions\n", new_rendered)
+        self.assertNotIn("boilerplate", new_rendered)
+
+        # Missing markers on either side returns/keeps the input unchanged.
+        self.assertIsNone(extract_project_local_block("no markers here"))
+        self.assertEqual(
+            "no markers here",
+            substitute_project_local_block("no markers here", "ignored"),
+        )
 
 
 class SharedSkillWorkflowTest(unittest.TestCase):

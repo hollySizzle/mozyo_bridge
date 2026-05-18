@@ -369,17 +369,27 @@ mozyo-bridge scaffold diff asana --target /path/to/project
 
 Existing `AGENTS.md` or `CLAUDE.md` files are not overwritten by default. Use `--dry-run` on `scaffold apply` to print the would-write paths, `--backup` to replace with backups, or `--force` to replace without backups.
 
-### Applying to a mature project repo
+### Project-Local Additions (preserved across re-sync)
 
-Scaffold-generated `AGENTS.md` / `CLAUDE.md` は thin router です。成熟した既存 repo (project-local guardrail を持つ Rails / Redmine / その他) に `scaffold apply` するときは、scaffold が project-local additions を消すリスクがあります。手順:
+Scaffold-generated `AGENTS.md` / `CLAUDE.md` ships a marker pair:
 
-1. `mozyo-bridge scaffold diff <preset> --target /path/to/repo` で `-` 行を確認する。app stack / project-specific safety commands / docs governance / role-boundary override などが消える場合、まだ apply しない。
-2. project-local additions を保存 (別 file に退避、もしくは新しい AGENTS.md に貼り直す前提で覚えておく) する。
-3. `scaffold apply <preset> --target /path/to/repo --backup` で apply する。`--backup` は既存 file を `AGENTS.md.bak.<timestamp>` に退避する。
-4. 退避された `.bak.<timestamp>` から project-local additions を新しい AGENTS.md / CLAUDE.md に手作業 merge する。
-5. mature repo では `--force` は使わない (bak 無しで上書きするため、project-local additions を消す)。
+```
+<!-- mozyo-bridge:project-local-additions:begin -->
+... ここに project-local layer を書く ...
+<!-- mozyo-bridge:project-local-additions:end -->
+```
 
-`redmine-rails` preset には `Project-Local Layer` セクションと `Project-Local Layer Apply Discipline` セクションがあり、Rails repo 側で保持すべきカテゴリ (Rails / Ruby version、Presenter / YAML 慣習、`Doc/` 編集禁止、`RAILS_ENV=test` 必須、docs catalog / nagger / active-doc resolver、log capture など) を列挙しています。Rails 以外の preset でも考え方は同じです。
+`mozyo-bridge scaffold apply` と `mozyo-bridge scaffold diff` は、target repo の AGENTS.md / CLAUDE.md にこのマーカー pair が含まれている場合、マーカー間の本文を **rendered template 側に substitute** します。つまり、operator がマーカー間に書いた project-local layer (Rails / Ruby version、Presenter / YAML 慣習、read-only documentation directory、DB / test 必須環境変数、docs catalog / active-doc resolver / nagger ガバナンス、role-boundary override、private internal tooling など) は scaffold re-sync で消えません。マーカーの **外** の内容は scaffold base の正本扱いで、再生成で上書きされます。
+
+re-sync の標準フロー:
+
+1. 初回 `mozyo-bridge scaffold apply <preset> --target /path/to/repo` 後、AGENTS.md / CLAUDE.md の Project-Local Additions マーカー間に project-local layer 本文を書く。
+2. 以降の re-sync では `mozyo-bridge scaffold diff <preset> --target /path/to/repo` を走らせる。マーカー間に書いた project-local 追記は rendered 側に保持されるため、diff は scaffold base 側の更新点 (preset version label、generator 行、preset 本文の参照など) だけを表示する。
+3. `mozyo-bridge scaffold apply <preset> --target /path/to/repo --backup` で apply する。`--backup` は安全網として古い AGENTS.md / CLAUDE.md を `AGENTS.md.bak.<timestamp>` に退避する。マーカー preservation は同じく適用される。
+4. `--force` も marker preservation の対象。バックアップ無しの上書きでも、マーカー *内* の project-local 追記は保持される。マーカー *外* に書いた追記 (古い scaffold で marker pair が無い時代の追記) は上書きされる。
+5. legacy scaffold (router にマーカー pair が無い古い AGENTS.md / CLAUDE.md) は preservation 対象外。再生成前にマーカー pair を含む新しい router へ移行し、project-local layer をマーカー *内* に移すと、以降の re-sync は (3)–(4) のとおり機械的に保持される。
+
+`redmine-rails` preset には `Project-Local Layer (do not erase on scaffold apply)` / `Project-Local Layer Apply Discipline` / `Active-Doc Resolver Concept` / `Dangerous DB / Test Command Category` / `Presenter / YAML / Doc-Readonly Category` / `Project Tooling / Local Skill / Role-Boundary Override Category` セクションがあり、project-local layer に何を書くべきかをカテゴリで列挙しています。具体的な path / command / 環境変数は preset 側に焼き込まれないので、別 repo に apply しても誤誘導になりません。
 
 
 After upgrading mozyo-bridge (e.g. `pipx upgrade mozyo-bridge && mozyo-bridge rules install`), check each scaffolded project for drift:

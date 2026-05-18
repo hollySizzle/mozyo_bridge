@@ -20,6 +20,20 @@ RULE_RELATIVE_PATH = Path("rules") / "presets"
 MANIFEST_RELATIVE_PATH = Path(".mozyo-bridge") / "scaffold.json"
 PRESET_REGISTRY_FILENAME = "presets.yaml"
 
+# Marker pair used to delimit a project-local additions block inside scaffold-
+# generated routers (AGENTS.md / CLAUDE.md). Content between these markers is
+# preserved by `scaffold apply` / `scaffold diff` when the on-disk router
+# carries the pair, so re-syncing the scaffold base does not erase project-
+# local additions the operator put inside the block. The markers are HTML
+# comments so they render invisible in Markdown. Eligibility is per-file:
+# only AGENTS.md and CLAUDE.md preserve; the manifest does not. Preservation
+# requires BOTH the rendered template and the on-disk file to carry the pair;
+# legacy on-disk files without markers fall through to the existing overwrite
+# / backup / force behavior unchanged.
+PROJECT_LOCAL_BEGIN_MARKER = "<!-- mozyo-bridge:project-local-additions:begin -->"
+PROJECT_LOCAL_END_MARKER = "<!-- mozyo-bridge:project-local-additions:end -->"
+PROJECT_LOCAL_PRESERVED_FILENAMES = frozenset({"AGENTS.md", "CLAUDE.md"})
+
 
 @dataclass(frozen=True)
 class RenderedFile:
@@ -275,6 +289,79 @@ def backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.bak.{strftime('%Y%m%d%H%M%S')}")
 
 
+def extract_project_local_block(text: str) -> str | None:
+    """Return the literal content between project-local markers, or None.
+
+    Returns None when either marker is absent so callers can fall through to
+    the existing overwrite-or-protect behavior unchanged. The returned string
+    is the raw inner content including leading/trailing whitespace so
+    substitution is byte-for-byte stable.
+    """
+    begin = text.find(PROJECT_LOCAL_BEGIN_MARKER)
+    if begin < 0:
+        return None
+    block_start = begin + len(PROJECT_LOCAL_BEGIN_MARKER)
+    end = text.find(PROJECT_LOCAL_END_MARKER, block_start)
+    if end < 0:
+        return None
+    return text[block_start:end]
+
+
+def substitute_project_local_block(rendered: str, replacement: str) -> str:
+    """Replace the project-local block in `rendered` with `replacement`.
+
+    Returns `rendered` unchanged if either marker is missing from the
+    rendered template (defensive fallback — preservation requires both sides
+    to carry the marker pair).
+    """
+    begin = rendered.find(PROJECT_LOCAL_BEGIN_MARKER)
+    if begin < 0:
+        return rendered
+    block_start = begin + len(PROJECT_LOCAL_BEGIN_MARKER)
+    end = rendered.find(PROJECT_LOCAL_END_MARKER, block_start)
+    if end < 0:
+        return rendered
+    return rendered[:block_start] + replacement + rendered[end:]
+
+
+def apply_project_local_preservation(
+    rendered_items: list[RenderedFile],
+    target: Path,
+) -> list[RenderedFile]:
+    """Substitute on-disk project-local blocks into the rendered routers.
+
+    For each rendered file whose basename is in PROJECT_LOCAL_PRESERVED_FILENAMES,
+    if the on-disk file exists and contains the marker pair, the content between
+    the markers in the on-disk file is substituted into the rendered template
+    (which also carries the marker pair). The manifest must be built AFTER this
+    step so its per-file sha256 entries reflect the post-substitution content
+    that will land on disk.
+
+    Files not eligible for preservation, files missing on disk, and on-disk
+    files without the marker pair all pass through unchanged.
+    """
+    preserved: list[RenderedFile] = []
+    for item in rendered_items:
+        if item.path.name not in PROJECT_LOCAL_PRESERVED_FILENAMES:
+            preserved.append(item)
+            continue
+        on_disk_path = target / item.path
+        if not on_disk_path.exists():
+            preserved.append(item)
+            continue
+        try:
+            on_disk_text = on_disk_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            preserved.append(item)
+            continue
+        block = extract_project_local_block(on_disk_text)
+        if block is None:
+            preserved.append(item)
+            continue
+        preserved.append(RenderedFile(item.path, substitute_project_local_block(item.content, block)))
+    return preserved
+
+
 def render_scaffold_files(
     preset: str,
     target: Path,
@@ -283,6 +370,7 @@ def render_scaffold_files(
     target = target.expanduser().resolve()
     workflow_path = require_installed_preset(preset, home)
     rendered = render_router_pair(preset, target, workflow_path)
+    rendered = apply_project_local_preservation(rendered, target)
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
         manifest_content(preset, workflow_path, rendered),
@@ -303,10 +391,11 @@ def write_scaffold(
     target = target.expanduser().resolve()
     workflow_path = require_installed_preset(preset, home)
     rendered = render_router_pair(preset, target, workflow_path)
+    rendered = apply_project_local_preservation(rendered, target)
     manifest = RenderedFile(MANIFEST_RELATIVE_PATH, manifest_content(preset, workflow_path, rendered))
     all_files = rendered + [manifest]
     existing = [target / item.path for item in all_files if (target / item.path).exists()]
-    protected = [path for path in existing if path.name in {"AGENTS.md", "CLAUDE.md"}]
+    protected = [path for path in existing if path.name in PROJECT_LOCAL_PRESERVED_FILENAMES]
     if protected and not backup and not force:
         die("refusing to overwrite existing scaffold files: " + ", ".join(str(path) for path in protected))
     if dry_run:
