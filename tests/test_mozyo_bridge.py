@@ -869,6 +869,21 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("Refs: Asana task", agents)
             self.assertNotIn("Refs: Asana task", claude)
 
+            # Tool-specific router split: the rendered routers must not import
+            # each other. CLAUDE.md previously imported AGENTS.md via the
+            # Claude Code `@AGENTS.md` file-import directive; the split makes
+            # each tool's entry standalone so the central preset path and the
+            # active ticket anchor are reachable without touching the peer
+            # file. This rendered-output assertion catches a future template
+            # regression that template-level tests would miss if the import
+            # ever leaked through substitution.
+            self.assertNotIn("@AGENTS.md", claude)
+            self.assertNotIn("@CLAUDE.md", agents)
+            self.assertIn("tool-specific", agents)
+            self.assertIn("tool-specific", claude)
+            self.assertIn("import しない", agents)
+            self.assertIn("import しない", claude)
+
     def test_rules_install_and_scaffold_redmine_thin_router(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -1909,6 +1924,41 @@ class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
         self.assertIn("operator/debug", self.router_agents)
         self.assertNotIn("Redmine Gate Lifecycle", self.router_agents)
         self.assertNotIn("Audit-Owned Commit Authority", self.router_agents)
+
+    def test_router_templates_are_tool_specific_and_independent(self) -> None:
+        """Generated AGENTS.md and CLAUDE.md must be independent tool-specific
+        thin routers. CLAUDE.md must not import AGENTS.md (and vice versa) so
+        each tool can read its own router as the standalone entry, and so a
+        future refactor cannot accidentally restore the old shared-import
+        layout where CLAUDE.md depended on AGENTS.md for session-start framing.
+        """
+        # No cross-import in either direction. The `@AGENTS.md` form is the
+        # Claude Code-style file-import directive that previously made
+        # CLAUDE.md depend on AGENTS.md for its session-start content.
+        self.assertNotIn("@AGENTS.md", self.router_claude)
+        self.assertNotIn("@CLAUDE.md", self.router_agents)
+        # Each router announces its tool identity in the body so a reader (and
+        # an auditor reading the rendered file) can see it stands alone.
+        self.assertIn("Codex", self.router_agents)
+        self.assertIn("tool-specific", self.router_agents)
+        self.assertIn("import しない", self.router_agents)
+        self.assertIn("Claude Code", self.router_claude)
+        self.assertIn("tool-specific", self.router_claude)
+        self.assertIn("import しない", self.router_claude)
+        # Each router must independently reach the central preset and the
+        # active ticket anchor without referencing the other file.
+        for router in (self.router_agents, self.router_claude):
+            self.assertIn("${rule_path}", router)
+            self.assertIn("${ticket_anchor_label}", router)
+        # Marker-bounded preservation must remain on both sides so project-
+        # local additions survive re-sync after the tool-specific split.
+        for router in (self.router_agents, self.router_claude):
+            self.assertIn(
+                "<!-- mozyo-bridge:project-local-additions:begin -->", router
+            )
+            self.assertIn(
+                "<!-- mozyo-bridge:project-local-additions:end -->", router
+            )
 
     def test_redmine_rails_preset_layers_on_redmine(self) -> None:
         self.assertIn("rules/presets/redmine/agent-workflow.md", self.redmine_rails_workflow)

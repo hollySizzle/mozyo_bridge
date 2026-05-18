@@ -1,18 +1,15 @@
 # Claude Code Router
 
-@AGENTS.md
+Claude Code セッションの tool-specific 入口。Claude Code は本ファイルを native に読む。共通の central preset rules は `${rule_path}` を正本とし、router 本文には複製しない。AGENTS.md (Codex tool-specific) を import しない。
 
-## 必須規約
+## セッション開始
 
-非自明な作業を始める前に、mozyo-bridge の central preset を読む:
+1. 現在の working directory がこの project root またはその配下であることを確認する。
+2. mozyo-bridge の central preset rules を読む:
+   - `${rule_path}`
+3. 非自明な作業を始める前に active な `${ticket_anchor_label}` を確認する。
 
-- `${rule_path}`
-
-この file が存在しない場合は停止し、operator に以下の実行を依頼する:
-
-```bash
-mozyo-bridge rules install
-```
+`${rule_path}` が存在しない場合は、読んだふりをせず停止し、operator に `mozyo-bridge rules install` を依頼する。
 
 ## ClaudeCode 起動時の最小 reminder
 
