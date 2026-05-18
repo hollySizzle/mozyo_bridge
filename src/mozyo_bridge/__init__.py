@@ -1,3 +1,3 @@
 """mozyo-bridge package."""
 
-__version__ = "0.2.1a2"
+__version__ = "0.2.1a3"
