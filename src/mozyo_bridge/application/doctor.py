@@ -259,14 +259,14 @@ def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
     if manifest == "missing":
         section_status = "missing"
         next_action.append(
-            f"mozyo-bridge scaffold rules <{'|'.join(PRESETS)}> --target "
+            f"mozyo-bridge scaffold apply <{'|'.join(PRESETS)}> --target "
             + str(target)
             + home_suffix
         )
     elif manifest == "invalid":
         section_status = "invalid"
         next_action.append(
-            "regenerate manifest with `mozyo-bridge scaffold rules <preset> --target "
+            "regenerate manifest with `mozyo-bridge scaffold apply <preset> --target "
             + str(target)
             + home_suffix
             + " --backup`"
@@ -283,7 +283,7 @@ def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
                 next_action.append("mozyo-bridge rules install")
         elif central_status in {"drifted-content", "drifted-version", "ok-version-only"}:
             next_action.append(
-                "mozyo-bridge scaffold rules "
+                "mozyo-bridge scaffold apply "
                 + str(preset_label)
                 + " --target "
                 + str(target)
@@ -292,7 +292,7 @@ def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
             )
         if any(row.get("status") != "ok" for row in detail.get("files", [])):
             next_action.append(
-                "review router files; rerun `mozyo-bridge scaffold rules "
+                "review router files; rerun `mozyo-bridge scaffold apply "
                 + str(preset_label)
                 + " --target "
                 + str(target)

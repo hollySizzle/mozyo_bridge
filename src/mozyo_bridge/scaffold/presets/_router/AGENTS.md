@@ -1,6 +1,6 @@
 # AGENTS
 
-この project は mozyo-bridge scaffold rules を使用する。
+この project は mozyo-bridge scaffold (`scaffold apply` / `scaffold diff` / `scaffold status`) を使用する。
 
 ## セッション開始
 

@@ -92,7 +92,7 @@
 - Codex の audit feedback が Asana コメントまたは明示的な通知として返るまで、Claude 側の task を completed として扱わない。pane に echo されただけの応答を audit pass と判定しない。
 - audit で issue が指摘された場合は修正 commit を打ち、同じ Codex pane に再 audit を依頼する。
 - この mandatory audit rule は `mozyo_bridge` repository の project-local policy であり、shared skill や scaffold preset へ一般化しない。
-- `mozyo-bridge scaffold rules <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
+- `mozyo-bridge scaffold apply <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
 
 ## Workflow Change Verification
 

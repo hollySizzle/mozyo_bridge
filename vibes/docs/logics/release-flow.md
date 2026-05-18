@@ -54,8 +54,8 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 
 Published-package 専用 smoke は追加しない。理由:
 
-- TestPyPI / PyPI fresh install acceptance (`Beta Tester Install` 節) が installed binary に対して `mozyo-bridge doctor` を実行する。primitive subcommand (`handoff send` / `handoff reply` / `reply` alias / `notify-*` standard variants) が installed binary に欠落していれば parser 構築段階で fail し、`scaffold rules` / `scaffold status` フローまで到達できない。
-- 同じ acceptance flow が installed binary に対して `scaffold rules <preset>` を実行するため、scaffold preset の中身 (上記 `ScaffoldPresetHandoffPrimitiveDocsTest` で固定された primitive guidance を含む) が installed package に乗っていることが確認される。
+- TestPyPI / PyPI fresh install acceptance (`Beta Tester Install` 節) が installed binary に対して `mozyo-bridge doctor` を実行する。primitive subcommand (`handoff send` / `handoff reply` / `reply` alias / `notify-*` standard variants) が installed binary に欠落していれば parser 構築段階で fail し、`scaffold apply` / `scaffold status` フローまで到達できない。
+- 同じ acceptance flow が installed binary に対して `scaffold apply <preset>` を実行するため、scaffold preset の中身 (上記 `ScaffoldPresetHandoffPrimitiveDocsTest` で固定された primitive guidance を含む) が installed package に乗っていることが確認される。
 - queue-enter rail の **末端 tmux 挙動** は real Claude / Codex TUI に依存し、`sh` receiver に対しては典型的な smoke にできない (上記 7 ケース手順を Asana task に残す運用で代替する)。`--mode standard` 鉄道は本 smoke で end-to-end 検証済み。
 
 新規 smoke を増やす条件: real TUI receiver を伴う queue-enter 自動化が確立した時、または `notify-*` wrapper が primitive 経路を離れた時 (上記 doc-regression テストが落ちて初めて気づくのでは遅いケース)。両条件は現状 false であるため smoke の追加は deferred とする。
@@ -117,7 +117,7 @@ PY
 ); do
   project="$tmp/project-$preset"
   mkdir -p "$project"
-  python -m mozyo_bridge scaffold rules "$preset" --target "$project" --home "$home"
+  python -m mozyo_bridge scaffold apply "$preset" --target "$project" --home "$home"
   rg -n '/Users/|/home/[^/]+/|C:\\Users\\' \
     "$project/AGENTS.md" "$project/CLAUDE.md" "$project/.mozyo-bridge/scaffold.json" && exit 1
   rg -n --fixed-strings \

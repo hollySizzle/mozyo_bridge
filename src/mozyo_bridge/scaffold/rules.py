@@ -275,6 +275,21 @@ def backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.bak.{strftime('%Y%m%d%H%M%S')}")
 
 
+def render_scaffold_files(
+    preset: str,
+    target: Path,
+    home: Path | None = None,
+) -> list[RenderedFile]:
+    target = target.expanduser().resolve()
+    workflow_path = require_installed_preset(preset, home)
+    rendered = render_router_pair(preset, target, workflow_path)
+    manifest = RenderedFile(
+        MANIFEST_RELATIVE_PATH,
+        manifest_content(preset, workflow_path, rendered),
+    )
+    return rendered + [manifest]
+
+
 def write_scaffold(
     preset: str,
     target: Path,
@@ -365,7 +380,7 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
             result["error"] = (
                 "schema v2 manifest is missing router hash entries for: "
                 + ", ".join(missing_router_entries)
-                + ". Regenerate with `mozyo-bridge scaffold rules <preset> --backup`."
+                + ". Regenerate with `mozyo-bridge scaffold apply <preset> --backup`."
             )
             return result
 

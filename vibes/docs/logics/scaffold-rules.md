@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`mozyo-bridge scaffold rules` installs project-local agent routers for a target ticket system. The routers point to centrally managed mozyo-bridge rule presets under the user's mozyo-bridge home.
+`mozyo-bridge scaffold apply` installs project-local agent routers for a target ticket system. The routers point to centrally managed mozyo-bridge rule presets under the user's mozyo-bridge home.
 
 The split axis is the ticket system, not the agent runtime. Claude Code and Codex should receive the same project rules through `AGENTS.md` and `CLAUDE.md` as a pair.
 
@@ -12,7 +12,7 @@ Supported presets:
 - `redmine`
 - `none`
 
-Preset selection is explicit. `mozyo-bridge scaffold rules <preset>` applies only the chosen preset's workflow, so cross-preset policy matrices should not be duplicated in shared workflow docs. Keep each preset self-contained, and keep project-specific mandatory policies in the target project's local docs or private systems.
+Preset selection is explicit. `mozyo-bridge scaffold apply <preset>` applies only the chosen preset's workflow, so cross-preset policy matrices should not be duplicated in shared workflow docs. Keep each preset self-contained, and keep project-specific mandatory policies in the target project's local docs or private systems.
 
 ## Common Responsibilities
 
@@ -29,7 +29,7 @@ Central preset rules live under:
 ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/
 ```
 
-The CLI package is the distribution source for those preset files. `src/mozyo_bridge/scaffold/presets/presets.yaml` is the preset registry. `mozyo-bridge rules install` should copy the packaged presets into the mozyo-bridge home, and `mozyo-bridge scaffold rules <preset>` should create thin project routers that reference the installed central preset.
+The CLI package is the distribution source for those preset files. `src/mozyo_bridge/scaffold/presets/presets.yaml` is the preset registry. `mozyo-bridge rules install` should copy the packaged presets into the mozyo-bridge home, and `mozyo-bridge scaffold apply <preset>` should create thin project routers that reference the installed central preset.
 
 Common constraints:
 
@@ -144,7 +144,7 @@ Responsibilities:
 
 - `rules install` copies packaged preset rules into `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`.
 - `rules status` reports installed preset versions and missing preset files.
-- `scaffold rules <preset>` refuses to complete if the referenced central preset is missing, unless a future explicit bootstrap flag installs it first.
+- `scaffold apply <preset>` refuses to complete if the referenced central preset is missing, unless a future explicit bootstrap flag installs it first.
 - Agents must not pretend to have read central rules if the referenced file is unavailable.
 
 The central rules store is the only initial distribution mode. Do not add `--vendor` or repo-local copies to the first implementation. If self-contained snapshots become necessary later, add a separate `rules export` or `snapshot` feature instead of mixing it into the normal scaffold path.
@@ -171,16 +171,16 @@ Optional flags for implementation:
 Target command:
 
 ```bash
-mozyo-bridge scaffold rules asana
-mozyo-bridge scaffold rules redmine
-mozyo-bridge scaffold rules redmine-rails
-mozyo-bridge scaffold rules none
+mozyo-bridge scaffold apply asana
+mozyo-bridge scaffold apply redmine
+mozyo-bridge scaffold apply redmine-rails
+mozyo-bridge scaffold apply none
 ```
 
 Expected options:
 
 ```bash
-mozyo-bridge scaffold rules <preset> \
+mozyo-bridge scaffold apply <preset> \
   --target /path/to/project \
   --dry-run \
   --backup \
@@ -207,7 +207,7 @@ States reported per project:
 - `manifest: present` plus `central status: drifted-content` — the central preset's `agent-workflow.md` content changed since scaffold time; the repo's recorded behavior no longer matches what agents will actually read. Exit 1.
 - `manifest: present` plus `central status: drifted-version` — the version label moved without a content change, or the hash check is unavailable. Exit 1.
 - `manifest: present` plus `central status: missing` — the central preset is not installed on this machine; agents will fail at the read-central-preset guard. Run `mozyo-bridge rules install`. Exit 1.
-- `manifest: present` plus `central status: ok-version-only` — the manifest is schema v1 and lacks `preset_hash`; the version matches but content drift cannot be detected. Regenerate the manifest by re-running `mozyo-bridge scaffold rules <preset> --backup`. Exit 1.
+- `manifest: present` plus `central status: ok-version-only` — the manifest is schema v1 and lacks `preset_hash`; the version matches but content drift cannot be detected. Regenerate the manifest by re-running `mozyo-bridge scaffold apply <preset> --backup`. Exit 1.
 - Router file row `drifted` — the on-disk `AGENTS.md` or `CLAUDE.md` differs from the hash recorded at scaffold time; someone edited the generated file locally. Exit 1.
 - `manifest: missing` — the target directory has no `.mozyo-bridge/scaffold.json`; no scaffold was ever run there. Exit 1.
 
@@ -217,10 +217,10 @@ End-user flow after a release ships:
 
 1. `pipx upgrade mozyo-bridge` (or the equivalent pip command).
 2. `mozyo-bridge rules install` — updates `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/` to the newly-packaged version.
-3. In each scaffolded repo, run `mozyo-bridge scaffold status`. If it reports `drifted-content`, decide whether to accept the new guardrails (re-run `mozyo-bridge scaffold rules <preset> --backup`) or pin by regenerating from a specific older release.
+3. In each scaffolded repo, run `mozyo-bridge scaffold status`. If it reports `drifted-content`, decide whether to accept the new guardrails (re-run `mozyo-bridge scaffold apply <preset> --backup`) or pin by regenerating from a specific older release.
 4. CI can run `mozyo-bridge scaffold status --json` and fail the build on non-zero exit so unreviewed central-preset updates do not silently change agent behavior in production repos.
 
-Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. If a project ever needs an immutable snapshot of the preset content, that is a separate "export"/"pin" feature, not a default of `scaffold rules`. Do not conflate the two paths.
+Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. If a project ever needs an immutable snapshot of the preset content, that is a separate "export"/"pin" feature, not a default of `scaffold apply`. Do not conflate the two paths.
 
 ## Beta Tester Verification
 
@@ -229,15 +229,15 @@ beta tester が GitHub `main` から CLI を install した後、user-global rul
 `rules status` と `scaffold status` の責務差:
 
 - `mozyo-bridge rules install` / `mozyo-bridge rules status` は user-global 配置 (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/`) を相手にする。"このホストに preset が install されているか / 古くないか" を答える。host 全体の状態を見る command であり、特定の scaffold 済 project を必要としない。
-- `mozyo-bridge scaffold rules <preset>` / `mozyo-bridge scaffold status` は repo-local routers (`AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/scaffold.json`) を相手にする。"この repo の manifest が user-global preset と on-disk router と整合しているか" を答える。1 つの scaffold 済 project の drift を見る command。
+- `mozyo-bridge scaffold apply <preset>` / `mozyo-bridge scaffold status` は repo-local routers (`AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/scaffold.json`) を相手にする。"この repo の manifest が user-global preset と on-disk router と整合しているか" を答える。1 つの scaffold 済 project の drift を見る command。
 - `rules status` clean でも `scaffold status` は drift を出しうる (例: 古い manifest が新しい preset hash を指していない)。
 - `scaffold status` clean でも、`rules status` で missing が出ていれば agent は起動時 guard で停止する。両方の clean が揃ってはじめて tester 環境は通る。
 
 tester smoke check 観点:
 
 1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `presets.yaml` の全 preset を expected version で報告する。
-2. **isolated target を preset ごとに作る**。`./tmp/mb-smoke-asana`、`./tmp/mb-smoke-redmine`、`./tmp/mb-smoke-redmine-rails` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold rules` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
-3. dummy target に対して registry の各 preset を `mozyo-bridge scaffold rules <preset> --target ./tmp/mb-smoke-<preset>` で実行する。片側だけで終わらせない (preset 間 boundary の確認が落ちる)。
+2. **isolated target を preset ごとに作る**。`./tmp/mb-smoke-asana`、`./tmp/mb-smoke-redmine`、`./tmp/mb-smoke-redmine-rails` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold apply` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
+3. dummy target に対して registry の各 preset を `mozyo-bridge scaffold apply <preset> --target ./tmp/mb-smoke-<preset>` で実行する。片側だけで終わらせない (preset 間 boundary の確認が落ちる)。
 4. 各 dummy target で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
 5. `mozyo-bridge doctor --target ./tmp/mb-smoke-<preset>` を 1 command の acceptance smoke として使う。`scaffold` section が `ok`、`rules` / `codex_skill` / `claude_skill` / `cli` / `tmux` の各 section status と `next_action` を確認する。CI / 機械的 smoke では `--json` で `{"ok": <bool>, "sections": {...}}` を取り、`jq '.sections.scaffold.status == "ok"'` 等で gate を組む。
 6. 生成された `AGENTS.md` / `CLAUDE.md` が preset 期待値を持つ。例:
@@ -263,7 +263,7 @@ Implementation tests should cover:
 - Rendering creates both `AGENTS.md` and `CLAUDE.md` for each preset.
 - Rendering creates thin routers that reference `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md`.
 - `rules install` installs central preset docs for every registry preset.
-- `scaffold rules <preset>` reports a clear error when the central preset is missing.
+- `scaffold apply <preset>` reports a clear error when the central preset is missing.
 - Default behavior refuses to overwrite either existing router.
 - Existing one-file state is handled atomically and does not leave a mismatched pair.
 - `.mozyo-bridge/scaffold.json` is written with preset, version, paths, and file hashes.

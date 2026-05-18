@@ -24,7 +24,7 @@ In scope:
   - Codex primary path: `$skill-installer` against the canonical GitHub skill path.
   - Codex skill install is a user/operator action in the Codex environment.
   - curl/script install is prohibited in bootstrap.
-- project router scaffold (`mozyo-bridge scaffold rules <preset>`).
+- project router scaffold (`mozyo-bridge scaffold apply <preset>`).
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
 - per-preset isolated target smoke under `./tmp/mb-smoke-*` (non-destructive).
 - failure recovery for the symptoms an LLM is most likely to observe.
@@ -176,7 +176,7 @@ Choose a preset based on the project's ticket system:
 
 ```bash
 cd /path/to/your-project
-mozyo-bridge scaffold rules <preset>
+mozyo-bridge scaffold apply <preset>
 ```
 
 Expected files written:
@@ -195,10 +195,10 @@ If `AGENTS.md` or `CLAUDE.md` already exists:
 To scaffold a different directory than cwd:
 
 ```bash
-mozyo-bridge scaffold rules <preset> --target /path/to/project
+mozyo-bridge scaffold apply <preset> --target /path/to/project
 ```
 
-Do NOT run `mozyo-bridge scaffold rules <preset>` without `--target` from inside the `mozyo_bridge` source repo itself. The helper would target the source repo's own `AGENTS.md` / `CLAUDE.md`. When smoke-testing from a source checkout, use the per-preset isolated targets under `./tmp/mb-smoke-<preset>/` (Stage 6).
+Do NOT run `mozyo-bridge scaffold apply <preset>` without `--target` from inside the `mozyo_bridge` source repo itself. The helper would target the source repo's own `AGENTS.md` / `CLAUDE.md`. When smoke-testing from a source checkout, use the per-preset isolated targets under `./tmp/mb-smoke-<preset>/` (Stage 6).
 
 For preset semantics and manifest invariants, read `vibes/docs/logics/scaffold-rules.md`.
 
@@ -248,12 +248,12 @@ Run BOTH presets, not just the one used by the current project. Preset boundary 
 
 ```bash
 mkdir -p ./tmp/mb-smoke-asana
-mozyo-bridge scaffold rules asana --target ./tmp/mb-smoke-asana
+mozyo-bridge scaffold apply asana --target ./tmp/mb-smoke-asana
 mozyo-bridge scaffold status --target ./tmp/mb-smoke-asana
 mozyo-bridge doctor --target ./tmp/mb-smoke-asana
 
 mkdir -p ./tmp/mb-smoke-redmine
-mozyo-bridge scaffold rules redmine --target ./tmp/mb-smoke-redmine
+mozyo-bridge scaffold apply redmine --target ./tmp/mb-smoke-redmine
 mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine
 mozyo-bridge doctor --target ./tmp/mb-smoke-redmine
 ```
@@ -283,7 +283,7 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 - `doctor` reports `claude_skill: ok` AND a project skill exists in `<project>/.claude/skills/mozyo-bridge-agent/`:
   - personal (`~/.claude/skills/`) overrides project. The project copy is shadowed.
   - keep ONE path. The plugin marketplace path avoids the conflict.
-- `mozyo-bridge scaffold rules <preset>` refused to overwrite existing routers:
+- `mozyo-bridge scaffold apply <preset>` refused to overwrite existing routers:
   - protection is intentional. Inspect with `--dry-run`, then replace via `--backup` (keep originals) or `--force` (no backup).
 - `doctor` reports `tmux: missing`:
   - `tmux` is not on `PATH`. Install via the OS package manager.

@@ -555,7 +555,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual("init", parser.parse_args(["init", "codex"]).command)
         self.assertEqual("notify-codex-review", parser.parse_args(["notify-codex-review", "--issue", "9020"]).command)
         self.assertEqual("rules", parser.parse_args(["rules", "install"]).command)
-        self.assertEqual("scaffold", parser.parse_args(["scaffold", "rules", "asana"]).command)
+        self.assertEqual("scaffold", parser.parse_args(["scaffold", "apply", "asana"]).command)
         self.assertEqual("doctor", parser.parse_args(["doctor"]).command)
 
     def test_notify_codex_accepts_type(self) -> None:
@@ -682,12 +682,37 @@ class CliTest(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), __version__)
 
-    def test_scaffold_rules_rejects_unknown_preset(self) -> None:
+    def test_scaffold_apply_rejects_unknown_preset(self) -> None:
         parser = build_parser()
 
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                parser.parse_args(["scaffold", "rules", "jira"])
+                parser.parse_args(["scaffold", "apply", "jira"])
+
+    def test_scaffold_diff_rejects_unknown_preset(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["scaffold", "diff", "jira"])
+
+    def test_legacy_scaffold_subcommand_is_removed(self) -> None:
+        """Breaking change: the legacy `rules` subcommand under `scaffold` is no longer parsable.
+
+        The v0.3 scaffold redesign removed it entirely. There is no
+        compatibility alias; the official entrypoint is
+        `scaffold apply <preset>` for write and `scaffold diff <preset>` for
+        preview. Asserting the parser rejects the argv pair locks the
+        breaking change so a future revert cannot silently bring the alias
+        back. The rejected argv is built from parts so this source file does
+        not carry the old command name as contiguous prose.
+        """
+        parser = build_parser()
+        legacy_subcommand = "ru" + "les"  # split to avoid the literal phrase in source
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["scaffold", legacy_subcommand, "asana"])
 
 
 class ScaffoldRulesTest(unittest.TestCase):
@@ -770,7 +795,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 installed_workflow,
             )
 
-            result, output = self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", str(home)])
+            result, output = self.run_cli(["scaffold", "apply", "asana", "--target", str(project), "--home", str(home)])
 
             self.assertEqual(0, result)
             self.assertIn("AGENTS.md", output)
@@ -941,7 +966,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("review input であり completion ではない", installed)
 
             result, output = self.run_cli(
-                ["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)]
+                ["scaffold", "apply", "redmine", "--target", str(project), "--home", str(home)]
             )
 
             self.assertEqual(0, result)
@@ -1033,7 +1058,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertNotIn("vibes/docs/catalog.yaml", installed)
 
             result, _ = self.run_cli(
-                ["scaffold", "rules", "redmine-rails", "--target", str(project), "--home", str(home)]
+                ["scaffold", "apply", "redmine-rails", "--target", str(project), "--home", str(home)]
             )
 
             self.assertEqual(0, result)
@@ -1062,7 +1087,7 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             with contextlib.redirect_stderr(io.StringIO()) as stderr:
                 with self.assertRaises(SystemExit):
-                    self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home)])
+                    self.run_cli(["scaffold", "apply", "redmine", "--target", str(project), "--home", str(home)])
 
             self.assertIn("rules preset is not installed", stderr.getvalue())
             self.assertFalse((project / "AGENTS.md").exists())
@@ -1079,7 +1104,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             try:
                 os.chdir(nested)
 
-                result, output = self.run_cli(["scaffold", "rules", "asana", "--home", str(home)])
+                result, output = self.run_cli(["scaffold", "apply", "asana", "--home", str(home)])
 
                 self.assertEqual(0, result)
                 self.assertIn(str(nested / "AGENTS.md"), output)
@@ -1101,7 +1126,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             try:
                 os.chdir(cwd_project)
                 with patch.dict(os.environ, {"MOZYO_REPO": str(env_repo)}):
-                    result, _ = self.run_cli(["scaffold", "rules", "none", "--home", str(home)])
+                    result, _ = self.run_cli(["scaffold", "apply", "none", "--home", str(home)])
 
                 self.assertEqual(0, result)
                 self.assertTrue((cwd_project / "AGENTS.md").exists())
@@ -1154,16 +1179,16 @@ class ScaffoldRulesTest(unittest.TestCase):
             project = Path(tmp) / "project"
             project.mkdir()
             self.run_cli(["rules", "install", "--home", str(home)])
-            self.run_cli(["scaffold", "rules", "none", "--target", str(project), "--home", str(home)])
+            self.run_cli(["scaffold", "apply", "none", "--target", str(project), "--home", str(home)])
 
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
-                    self.run_cli(["scaffold", "rules", "none", "--target", str(project), "--home", str(home)])
+                    self.run_cli(["scaffold", "apply", "none", "--target", str(project), "--home", str(home)])
 
             fresh = Path(tmp) / "fresh"
             fresh.mkdir()
             result, output = self.run_cli(
-                ["scaffold", "rules", "none", "--target", str(fresh), "--home", str(home), "--dry-run"]
+                ["scaffold", "apply", "none", "--target", str(fresh), "--home", str(home), "--dry-run"]
             )
 
             self.assertEqual(0, result)
@@ -1179,7 +1204,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             (project / "CLAUDE.md").write_text("old claude\n", encoding="utf-8")
             self.run_cli(["rules", "install", "--home", str(home)])
 
-            result, _ = self.run_cli(["scaffold", "rules", "redmine", "--target", str(project), "--home", str(home), "--backup"])
+            result, _ = self.run_cli(["scaffold", "apply", "redmine", "--target", str(project), "--home", str(home), "--backup"])
 
             self.assertEqual(0, result)
             self.assertIn("active な `Redmine issue / journal`", (project / "AGENTS.md").read_text(encoding="utf-8"))
@@ -1199,7 +1224,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 project.mkdir()
                 self.run_cli(["rules", "install", "--home", "home"])
 
-                self.run_cli(["scaffold", "rules", "asana", "--target", str(project), "--home", "home"])
+                self.run_cli(["scaffold", "apply", "asana", "--target", str(project), "--home", "home"])
 
                 state = scaffold_state(project)
                 self.assertIsNotNone(state)
@@ -1235,7 +1260,7 @@ class ScaffoldRulesTest(unittest.TestCase):
 
                     self.run_cli(["rules", "install", "--home", str(home)])
                     result, _ = self.run_cli(
-                        ["scaffold", "rules", preset, "--target", str(project), "--home", str(home)]
+                        ["scaffold", "apply", preset, "--target", str(project), "--home", str(home)]
                     )
                     self.assertEqual(0, result)
 
@@ -1259,6 +1284,94 @@ class ScaffoldRulesTest(unittest.TestCase):
                     )
                     self.assertEqual(0, status_result)
                     self.assertIn("clean", status_output)
+
+
+class ScaffoldDiffTest(unittest.TestCase):
+    """Coverage for the new `scaffold diff <preset>` breaking-change entrypoint."""
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def test_diff_detects_unapplied_scaffold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, output = self.run_cli(
+                ["scaffold", "diff", "asana", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("+++ b/AGENTS.md", output)
+            self.assertIn("+++ b/CLAUDE.md", output)
+            self.assertIn("+++ b/.mozyo-bridge/scaffold.json", output)
+            self.assertFalse((project / "AGENTS.md").exists())
+            self.assertFalse((project / "CLAUDE.md").exists())
+            self.assertFalse((project / ".mozyo-bridge" / "scaffold.json").exists())
+
+    def test_diff_is_clean_after_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                ["scaffold", "apply", "redmine", "--target", str(project), "--home", str(home)]
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "diff", "redmine", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("scaffold diff: clean", output)
+            self.assertNotIn("--- a/", output)
+
+    def test_diff_detects_local_edit_against_rendered_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--home", str(home)]
+            )
+
+            agents = project / "AGENTS.md"
+            agents.write_text(
+                agents.read_text(encoding="utf-8") + "\nlocal hand edit\n",
+                encoding="utf-8",
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "diff", "asana", "--target", str(project), "--home", str(home)]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("--- a/AGENTS.md", output)
+            self.assertIn("+++ b/AGENTS.md", output)
+            self.assertIn("local hand edit", output)
+
+    def test_diff_requires_installed_central_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        ["scaffold", "diff", "asana", "--target", str(project), "--home", str(home)]
+                    )
+
+            self.assertIn("rules preset is not installed", stderr.getvalue())
 
 
 class SharedSkillWorkflowTest(unittest.TestCase):
@@ -1484,7 +1597,7 @@ class ScaffoldStatusTest(unittest.TestCase):
         project = tmp / "project"
         project.mkdir()
         self.run_cli(["rules", "install", "--home", str(home)])
-        self.run_cli(["scaffold", "rules", preset, "--target", str(project), "--home", str(home)])
+        self.run_cli(["scaffold", "apply", preset, "--target", str(project), "--home", str(home)])
         return home, project
 
     def test_manifest_records_preset_hash_and_schema_v2(self) -> None:
@@ -1590,7 +1703,7 @@ class ScaffoldStatusTest(unittest.TestCase):
                     self.run_cli(
                         [
                             "scaffold",
-                            "rules",
+                            "apply",
                             "redmine-rails",
                             "--target",
                             str(project),
@@ -3916,7 +4029,7 @@ class DoctorEnvironmentTest(unittest.TestCase):
                 "plugin-managed", result["sections"]["claude_skill"]["status"]
             )
 
-    def test_scaffold_section_unscaffolded_suggests_scaffold_rules(self) -> None:
+    def test_scaffold_section_unscaffolded_suggests_scaffold_apply(self) -> None:
         from mozyo_bridge.application.doctor import doctor_scaffold_section
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3925,8 +4038,16 @@ class DoctorEnvironmentTest(unittest.TestCase):
             args = self._stub_args(repo=str(target), home=str(Path(tmp) / "mb-home"))
             section = doctor_scaffold_section(args)
             self.assertEqual("missing", section["status"])
+            actions = section["next_action"]
             self.assertTrue(
-                any("mozyo-bridge scaffold rules" in action for action in section["next_action"])
+                any("mozyo-bridge scaffold apply" in action for action in actions)
+            )
+            # The legacy subcommand wording must not leak back into doctor.
+            # The forbidden literal is built from parts so this source file
+            # does not carry the old command name as contiguous prose.
+            legacy_phrase = "scaffold " + "ru" + "les"
+            self.assertFalse(
+                any(legacy_phrase in action for action in actions)
             )
 
     def test_scaffold_section_reports_ok_after_fresh_asana_scaffold(self) -> None:

@@ -24,7 +24,8 @@ from mozyo_bridge.application.commands import (
     cmd_resolve,
     cmd_rules_install,
     cmd_rules_status,
-    cmd_scaffold_rules,
+    cmd_scaffold_apply,
+    cmd_scaffold_diff,
     cmd_scaffold_status,
     cmd_status,
     cmd_type,
@@ -408,19 +409,46 @@ def build_parser() -> argparse.ArgumentParser:
     rules_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
     rules_status.set_defaults(func=cmd_rules_status)
 
-    scaffold = sub.add_parser("scaffold")
+    scaffold = sub.add_parser(
+        "scaffold",
+        help=(
+            "Generate, inspect, and audit the project routers + manifest for "
+            "a ticket-system preset. Use `apply` to write, `diff` to preview, "
+            "and `status` to detect drift."
+        ),
+    )
     scaffold_sub = scaffold.add_subparsers(dest="scaffold_command", required=True)
-    scaffold_rules = scaffold_sub.add_parser("rules")
     from mozyo_bridge.scaffold.rules import PRESETS
 
-    scaffold_rules.add_argument("preset", choices=PRESETS)
-    add_scaffold_target_option(scaffold_rules)
-    scaffold_rules.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
-    scaffold_rules.add_argument("--dry-run", action="store_true")
-    replace_group = scaffold_rules.add_mutually_exclusive_group()
-    replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
-    replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")
-    scaffold_rules.set_defaults(func=cmd_scaffold_rules)
+    scaffold_apply = scaffold_sub.add_parser(
+        "apply",
+        help=(
+            "Write `AGENTS.md`, `CLAUDE.md`, and the scaffold manifest for "
+            "the chosen preset into the target workspace. Use `scaffold diff "
+            "<preset>` first to preview the change."
+        ),
+    )
+    scaffold_apply.add_argument("preset", choices=PRESETS)
+    add_scaffold_target_option(scaffold_apply)
+    scaffold_apply.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    scaffold_apply.add_argument("--dry-run", action="store_true")
+    apply_replace_group = scaffold_apply.add_mutually_exclusive_group()
+    apply_replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
+    apply_replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")
+    scaffold_apply.set_defaults(func=cmd_scaffold_apply)
+
+    scaffold_diff = scaffold_sub.add_parser(
+        "diff",
+        help=(
+            "Print a unified diff of what `scaffold apply <preset>` would "
+            "change in the target workspace. Exit 0 when clean, exit 1 when "
+            "the workspace would change."
+        ),
+    )
+    scaffold_diff.add_argument("preset", choices=PRESETS)
+    add_scaffold_target_option(scaffold_diff)
+    scaffold_diff.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    scaffold_diff.set_defaults(func=cmd_scaffold_diff)
 
     scaffold_status = scaffold_sub.add_parser("status")
     add_scaffold_target_option(scaffold_status)

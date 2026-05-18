@@ -116,14 +116,14 @@ The acceptance test must verify recovery for **both** presets. Run the sweep bel
 ### Sweep 1 — Asana recovery
 
 ```bash
-mozyo-bridge scaffold rules asana --target .
+mozyo-bridge scaffold apply asana --target .
 mozyo-bridge scaffold status --target .
 mozyo-bridge doctor --target .
 ```
 
 Expected:
 
-- `scaffold rules asana --target .` writes `AGENTS.md`, `CLAUDE.md`, and `.mozyo-bridge/scaffold.json`.
+- `scaffold apply asana --target .` writes `AGENTS.md`, `CLAUDE.md`, and `.mozyo-bridge/scaffold.json`.
 - `scaffold status --target .` reports `result: clean`, `central status: ok`, all router files `ok`.
 - `doctor --target .` reports `scaffold: ok target=<repo>`, with `cli` / `rules` / `codex_skill` / `claude_skill` still `ok`. `tmux` may be `warning` / `skipped` depending on the session; that is informational, not a failure of the acceptance test.
 
@@ -143,7 +143,7 @@ This puts the tree back at "tracked routers deleted, no scaffold manifest", whic
 ### Sweep 2 — Redmine recovery
 
 ```bash
-mozyo-bridge scaffold rules redmine --target .
+mozyo-bridge scaffold apply redmine --target .
 mozyo-bridge scaffold status --target .
 mozyo-bridge doctor --target .
 ```
@@ -158,7 +158,7 @@ After both sweeps pass, set the repo back to the preset under which the subject 
 git checkout HEAD -- AGENTS.md CLAUDE.md
 rm -rf .mozyo-bridge
 rm AGENTS.md CLAUDE.md
-mozyo-bridge scaffold rules asana --target .
+mozyo-bridge scaffold apply asana --target .
 mozyo-bridge scaffold status --target .   # expected: result: clean
 ```
 

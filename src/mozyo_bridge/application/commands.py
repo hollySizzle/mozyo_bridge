@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import re
 import sys
@@ -56,7 +57,13 @@ from mozyo_bridge.infrastructure.tmux_client import (
     session_exists,
     source_tmux_conf,
 )
-from mozyo_bridge.scaffold.rules import install_rules, rules_status, scaffold_status, write_scaffold
+from mozyo_bridge.scaffold.rules import (
+    install_rules,
+    render_scaffold_files,
+    rules_status,
+    scaffold_status,
+    write_scaffold,
+)
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
 
@@ -1175,7 +1182,7 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def cmd_scaffold_rules(args: argparse.Namespace) -> int:
+def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     target = scaffold_target_from_args(args)
     paths = write_scaffold(
@@ -1190,6 +1197,41 @@ def cmd_scaffold_rules(args: argparse.Namespace) -> int:
     for path in paths:
         print(f"{action}: {path}")
     return 0
+
+
+def cmd_scaffold_diff(args: argparse.Namespace) -> int:
+    """Print a unified diff of what ``scaffold apply <preset>`` would change.
+
+    Compares each rendered router / manifest file against the on-disk
+    content (treated as empty when missing). Returns 0 when the worktree
+    already matches the rendered output and 1 when at least one file would
+    change, mirroring ``git diff --exit-code`` so callers can gate.
+    """
+    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
+    target = scaffold_target_from_args(args)
+    rendered = render_scaffold_files(args.preset, target, home=home)
+    any_changes = False
+    for item in rendered:
+        on_disk_path = target / item.path
+        if on_disk_path.exists():
+            current = on_disk_path.read_text(encoding="utf-8")
+        else:
+            current = ""
+        if current == item.content:
+            continue
+        any_changes = True
+        diff = difflib.unified_diff(
+            current.splitlines(keepends=True),
+            item.content.splitlines(keepends=True),
+            fromfile=f"a/{item.path}",
+            tofile=f"b/{item.path}",
+        )
+        for line in diff:
+            print(line, end="" if line.endswith("\n") else "\n")
+    if not any_changes:
+        print(f"scaffold diff: clean ({args.preset} -> {target})")
+        return 0
+    return 1
 
 
 def cmd_scaffold_status(args: argparse.Namespace) -> int:
@@ -1208,7 +1250,7 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
     if status["manifest"] != "present":
         if status["manifest"] == "missing":
             print(f"  no scaffold manifest at {status['manifest_path']}")
-            print("  run `mozyo-bridge scaffold rules <preset>` first")
+            print("  run `mozyo-bridge scaffold apply <preset>` first")
         elif status["manifest"] == "invalid":
             print(f"  manifest at {status['manifest_path']} is invalid")
             if "error" in status:
@@ -1244,7 +1286,7 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
     elif central_status == "drifted-content":
         print("  - central preset content has changed since scaffold time")
         print(
-            "    run `mozyo-bridge scaffold rules <preset> --backup` to regenerate routers,"
+            "    run `mozyo-bridge scaffold apply <preset> --backup` to regenerate routers,"
             " or `--force` to accept the new central preset"
         )
     elif central_status == "drifted-version":
@@ -1252,7 +1294,7 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
     elif central_status == "ok-version-only":
         print(
             "  - manifest is schema v1 (no preset_hash); cannot detect content drift."
-            " Regenerate the manifest by running `mozyo-bridge scaffold rules <preset> --backup` to upgrade."
+            " Regenerate the manifest by running `mozyo-bridge scaffold apply <preset> --backup` to upgrade."
         )
     for row in status.get("files", []):
         if row["status"] == "drifted":

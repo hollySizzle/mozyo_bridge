@@ -294,14 +294,14 @@ def cmd_release_check_scaffold(args: argparse.Namespace) -> int:
             print("rules: already up to date")
 
         for preset in PRESETS:
-            _print_section(f"scaffold rules {preset}")
+            _print_section(f"scaffold apply {preset}")
             project = tmp / f"project-{preset}"
             project.mkdir(parents=True, exist_ok=True)
             try:
                 written = write_scaffold(preset, project, home=home)
             except SystemExit as exc:
-                print(f"scaffold rules {preset} failed: {exc}")
-                blockers.append(f"scaffold rules {preset} failed")
+                print(f"scaffold apply {preset} failed: {exc}")
+                blockers.append(f"scaffold apply {preset} failed")
                 continue
             for path in written:
                 print(f"wrote: {path}")
