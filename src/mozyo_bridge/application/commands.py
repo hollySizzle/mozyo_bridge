@@ -278,6 +278,69 @@ def cmd_keys(args: argparse.Namespace) -> int:
     return 0
 
 
+# Per-agent window status-bar styling under the bare-`mozyo` window model.
+# The window-name rail (`claude` / `codex`) is the resolver and notification
+# routing key, so renaming is not an option for "make it easier to tell which
+# window is which". Instead we attach a subtle per-window status style to the
+# windows we create / promote, so the tmux status bar entry for that window
+# is colored without touching the window name, the pane content background,
+# or the user's global status bar config.
+#
+# Colors are picked from the 256-color palette and stay restrained:
+#   claude → muted sage green  (colour108, fg only)
+#   codex  → muted slate blue  (colour67,  fg only)
+# Other windows are intentionally left at the tmux default (neutral) so the
+# contrast is "agent windows look subtly tinted, anything else looks default".
+# No background fill, no blinking, no icon glyphs, no high-saturation hues.
+AGENT_WINDOW_STATUS_COLORS = {
+    "claude": "colour108",
+    "codex": "colour67",
+}
+
+
+def apply_window_subtle_style(session: str, window_name: str) -> bool:
+    """Attach a restrained per-window status-bar style to ``session:window_name``.
+
+    Returns True when a style was applied for a recognized agent window name
+    (``claude`` / ``codex``). Returns False for any other window — including
+    user-created legacy windows in the same session — so the helper is a
+    no-op for windows the operator owns.
+
+    Idempotent: tmux ``set-window-option`` overwrites the prior value, so
+    repeated invocations from ``ensure_repo_session_windows`` are safe.
+    Window-scoped (``-t session:window``) so the user's global
+    ``set -g window-status-style`` from their ``.tmux.conf`` is preserved
+    for every other window in the session.
+    """
+    color = AGENT_WINDOW_STATUS_COLORS.get(window_name)
+    if color is None:
+        return False
+    target = f"{session}:{window_name}"
+    # Non-current window: just the foreground color so the status entry
+    # reads as a quietly tinted name. No background fill.
+    run_tmux(
+        "set-window-option",
+        "-t",
+        target,
+        "window-status-style",
+        f"fg={color}",
+        check=False,
+    )
+    # Current (focused) window: same hue, made slightly heavier with bold so
+    # operators can still tell "this is the active agent" at a glance. tmux's
+    # default current-window style normally flips fg/bg; this override keeps
+    # the subtle hue and replaces the inversion with a typographic cue.
+    run_tmux(
+        "set-window-option",
+        "-t",
+        target,
+        "window-status-current-style",
+        f"fg={color},bold",
+        check=False,
+    )
+    return True
+
+
 def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
     require_tmux()
     if agent not in AGENT_COMMANDS:
@@ -405,6 +468,12 @@ def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
             ensure_agent_target(pane, agent, force=args.force)
             if args.ready_timeout:
                 wait_for_agent_terminal_pane(pane["id"], agent, args.ready_timeout)
+            # Apply the subtle per-window status-bar tint after the window
+            # exists, the user's `.tmux.conf` has been sourced (above), and
+            # the agent pane is settled. Window-scoped — only the agent
+            # windows we manage are tinted; legacy windows in the same
+            # session stay at the user's global style.
+            apply_window_subtle_style(args.session, agent)
     return created
 
 
@@ -1133,6 +1202,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
 
     rename_window(f"{target_session}:{target_window_index}", args.agent)
+    # `init` is the second entry point that promotes an existing pane into
+    # the agent-window rail (the first being bare `mozyo`). Apply the same
+    # subtle status-bar tint so panes brought in via `init` look identical
+    # in the status bar to panes created via `mozyo`.
+    apply_window_subtle_style(target_session, args.agent)
     print(
         f"initialized {target} as {args.agent} (renamed window "
         f"{target_session}:{target_window_index} -> {args.agent})"

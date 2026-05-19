@@ -108,6 +108,12 @@ session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 
 
 `open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` の pane-split 系 subcommand は廃止されました。標準導線は bare `mozyo` (1 repo = 1 session, 1 agent = 1 window) です。既存の標準 tmux pane や VS Code `tmux-integrated` pane を agent target にしたい場合は、その pane の中で `mozyo-bridge init <agent>` を実行して window 名を `<agent>` に rename してください。
 
+### Subtle window status colors
+
+bare `mozyo` と `mozyo-bridge init <agent>` は agent window の tmux status bar entry に**控えめな色**を付けます。`claude` は muted sage green (`colour108`)、`codex` は muted slate blue (`colour67`)、それ以外の window は user 設定の default のまま無加工です。配色は fg のみで、背景塗りや点滅は使いません。
+
+色は window 識別のためであり、resolver / handoff routing は依然 window 名 (`claude` / `codex`) を exact key として使うため、**window 名は変更されません**。色を外したい場合は `tmux set-window-option -u -t <session>:<window> window-status-style` (および `window-status-current-style`) で個別 unset するか、operator の `.tmux.conf` 側で上書きしてください。`.tmux.conf` / `~/.config/mozyo-bridge/tmux.conf` の読み込み挙動には影響しません。
+
 ## Beta Tester Install (GitHub main)
 
 PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help` / `mozyo-bridge doctor --json`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。

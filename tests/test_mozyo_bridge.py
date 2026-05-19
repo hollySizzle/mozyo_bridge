@@ -22,6 +22,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_doctor,
+    AGENT_WINDOW_STATUS_COLORS,
+    apply_window_subtle_style,
     cmd_init,
     cmd_list,
     cmd_mozyo,
@@ -3454,6 +3456,155 @@ class WaitForTextContractTest(unittest.TestCase):
             self.assertTrue(commands_mod.wait_for_text("%2", marker, 200, 0.01))
 
 
+class AgentWindowSubtleStyleTest(unittest.TestCase):
+    """Subtle per-window status-bar styling for agent windows.
+
+    Asana task 1214949940121288. Window names must stay exactly `claude` /
+    `codex` (resolver / notification routing keys), so identification is
+    done via window-scoped tmux options rather than name changes. Colors
+    are intentionally muted (256-color palette fg-only, no background fill,
+    no blink, no glyphs).
+    """
+
+    def test_color_table_only_covers_known_agents_and_uses_muted_palette(self) -> None:
+        # Locks the contract: only `claude` / `codex` get tinted. Anything
+        # else stays at the user's global window-status-style so unrelated
+        # windows in the session do not get touched.
+        self.assertEqual({"claude", "codex"}, set(AGENT_WINDOW_STATUS_COLORS))
+        # Restrained palette: 256-color foreground numbers only. No `#RRGGBB`
+        # bright hues, no `,bg=...`, no flashing attributes.
+        for window_name, color in AGENT_WINDOW_STATUS_COLORS.items():
+            with self.subTest(window=window_name):
+                self.assertRegex(color, r"^colour\d{1,3}$", f"{window_name} color must be a 256-palette `colourN`")
+
+    def test_apply_window_subtle_style_emits_window_scoped_options_for_claude(self) -> None:
+        calls: list[tuple] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            calls.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux):
+            self.assertTrue(apply_window_subtle_style("my-project", "claude"))
+
+        # Window-scoped target (`session:window_name`), not session-scoped.
+        # The user's global `set -g window-status-style` from .tmux.conf
+        # stays in effect for every other window.
+        self.assertEqual(
+            [
+                ("set-window-option", "-t", "my-project:claude", "window-status-style", "fg=colour108"),
+                ("set-window-option", "-t", "my-project:claude", "window-status-current-style", "fg=colour108,bold"),
+            ],
+            calls,
+        )
+
+    def test_apply_window_subtle_style_emits_window_scoped_options_for_codex(self) -> None:
+        calls: list[tuple] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            calls.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux):
+            self.assertTrue(apply_window_subtle_style("my-project", "codex"))
+
+        self.assertEqual(
+            [
+                ("set-window-option", "-t", "my-project:codex", "window-status-style", "fg=colour67"),
+                ("set-window-option", "-t", "my-project:codex", "window-status-current-style", "fg=colour67,bold"),
+            ],
+            calls,
+        )
+
+    def test_apply_window_subtle_style_is_noop_for_unknown_window_name(self) -> None:
+        # Legacy / operator-owned windows are not retinted, even if they
+        # share the agent session. The task's prohibition on "派手な配色"
+        # would otherwise be at risk if a future caller ran this helper
+        # over every window in the session.
+        calls: list[tuple] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            calls.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux):
+            self.assertFalse(apply_window_subtle_style("my-project", "zsh"))
+            self.assertFalse(apply_window_subtle_style("my-project", "shell"))
+
+        self.assertEqual([], calls)
+
+    def test_ensure_repo_session_windows_applies_subtle_style_to_both_agents(self) -> None:
+        # Wiring assertion: bare-`mozyo` startup tints both agent windows
+        # exactly once, regardless of whether the windows existed already.
+        args = argparse.Namespace(
+            session="my-project",
+            cwd="/repo",
+            config=False,
+            ready_timeout=0,
+            force=False,
+        )
+        claude_pane = {"id": "%1", "command": "claude", "window_name": "claude"}
+        codex_pane = {"id": "%2", "command": "node", "window_name": "codex"}
+        style_calls: list[tuple] = []
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+            patch("mozyo_bridge.application.commands.new_agent_session_window") as new_session_window, \
+            patch("mozyo_bridge.application.commands.new_agent_window") as new_window, \
+            patch("mozyo_bridge.application.commands.list_session_windows", return_value=["claude", "codex"]), \
+            patch(
+                "mozyo_bridge.application.commands.find_agent_window",
+                side_effect=[claude_pane, codex_pane],
+            ), \
+            patch("mozyo_bridge.application.commands.ensure_agent_target"), \
+            patch(
+                "mozyo_bridge.application.commands.apply_window_subtle_style",
+                side_effect=lambda session, name: style_calls.append((session, name)) or True,
+            ):
+            ensure_repo_session_windows(args)
+
+        new_session_window.assert_not_called()
+        new_window.assert_not_called()
+        # One tint call per agent window, in claude-then-codex order so the
+        # default-window flip in bare-`mozyo` lands on the tinted claude
+        # window.
+        self.assertEqual([("my-project", "claude"), ("my-project", "codex")], style_calls)
+
+    def test_cmd_init_applies_subtle_style_after_rename(self) -> None:
+        # `cmd_init` is the second entry point that promotes a pane into the
+        # agent window rail. It must apply the same subtle style so panes
+        # brought in via `init` look identical to panes created via
+        # bare-`mozyo` in the status bar.
+        args = argparse.Namespace(agent="claude", target="%5")
+        panes = [
+            {"id": "%2", "location": "agents:0.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
+            {"id": "%5", "location": "agents:1.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
+        ]
+        style_calls: list[tuple] = []
+
+        def fake_run_tmux(*tmux_args, **_):
+            if tmux_args[:1] == ("display-message",):
+                return argparse.Namespace(returncode=0, stdout="%5\n", stderr="")
+            if tmux_args[:1] == ("set-window-option",):
+                style_calls.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux args: {tmux_args}")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:1.0"), \
+            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.rename_window"), \
+            contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, cmd_init(args))
+
+        # Two style options per init (window-status-style and current-style)
+        # targeting the renamed claude window in the right session.
+        self.assertEqual(2, len(style_calls))
+        for call in style_calls:
+            self.assertEqual(("set-window-option", "-t", "agents:claude"), call[:3])
+
+
 class CommandTest(unittest.TestCase):
     def test_notify_agent_waits_for_marker_before_enter_on_existing_pane(self) -> None:
         args = argparse.Namespace(
@@ -4259,15 +4410,28 @@ class CommandTest(unittest.TestCase):
         self.assertNotIn("(compat)", output)
         self.assertNotIn("duplicate", output)
 
-    def _init_run_tmux_side_effect(self, target_pane_id: str, *, rename_observer: list | None = None):
+    def _init_run_tmux_side_effect(
+        self,
+        target_pane_id: str,
+        *,
+        rename_observer: list | None = None,
+        style_observer: list | None = None,
+    ):
         # display-message resolves the pane reference to its canonical id.
-        # rename-window is the only state-mutating tmux call init makes.
+        # rename-window is the rename mutation init makes.
+        # set-window-option is the subtle window-status-style applied to the
+        # newly-renamed agent window so the tmux status bar entry for that
+        # window is colored without changing the window name.
         def side_effect(*tmux_args, **_):
             if tmux_args[:1] == ("display-message",):
                 return argparse.Namespace(returncode=0, stdout=f"{target_pane_id}\n", stderr="")
             if tmux_args[:1] == ("rename-window",):
                 if rename_observer is not None:
                     rename_observer.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:1] == ("set-window-option",):
+                if style_observer is not None:
+                    style_observer.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux args: {tmux_args}")
         return side_effect
