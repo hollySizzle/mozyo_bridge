@@ -403,10 +403,38 @@ def build_parser() -> argparse.ArgumentParser:
     rules = sub.add_parser("rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)
     rules_install = rules_sub.add_parser("install")
-    rules_install.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    rules_install_store = rules_install.add_mutually_exclusive_group()
+    rules_install_store.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    rules_install_store.add_argument(
+        "--repo-local",
+        dest="repo_local",
+        metavar="REPO",
+        help=(
+            "Install central preset rules into REPO/.mozyo-bridge/rules/presets/ "
+            "instead of the user home. Use this for Dev Container / "
+            "ephemeral-home workspaces where ~/.mozyo_bridge is not persisted. "
+            "Mutually exclusive with --home."
+        ),
+    )
     rules_install.set_defaults(func=cmd_rules_install)
     rules_status = rules_sub.add_parser("status")
-    rules_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    rules_status_store = rules_status.add_mutually_exclusive_group()
+    rules_status_store.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    rules_status_store.add_argument(
+        "--repo-local",
+        dest="repo_local",
+        metavar="REPO",
+        help=(
+            "Read the rules store from REPO/.mozyo-bridge instead of the user "
+            "home. Mutually exclusive with --home."
+        ),
+    )
     rules_status.set_defaults(func=cmd_rules_status)
 
     scaffold = sub.add_parser(
@@ -430,7 +458,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scaffold_apply.add_argument("preset", choices=PRESETS)
     add_scaffold_target_option(scaffold_apply)
-    scaffold_apply.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    apply_store_group = scaffold_apply.add_mutually_exclusive_group()
+    apply_store_group.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    apply_store_group.add_argument(
+        "--repo-local",
+        dest="repo_local",
+        action="store_true",
+        help=(
+            "Read the rules store from the target repo's `.mozyo-bridge/` "
+            "directory and embed a repo-local `rule_path` in the generated "
+            "routers and manifest. Use this for Dev Container / "
+            "ephemeral-home workspaces. Run `mozyo-bridge rules install "
+            "--repo-local <target>` first to populate that store. Mutually "
+            "exclusive with --home."
+        ),
+    )
     scaffold_apply.add_argument("--dry-run", action="store_true")
     apply_replace_group = scaffold_apply.add_mutually_exclusive_group()
     apply_replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
@@ -447,12 +492,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scaffold_diff.add_argument("preset", choices=PRESETS)
     add_scaffold_target_option(scaffold_diff)
-    scaffold_diff.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    diff_store_group = scaffold_diff.add_mutually_exclusive_group()
+    diff_store_group.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    diff_store_group.add_argument(
+        "--repo-local",
+        dest="repo_local",
+        action="store_true",
+        help=(
+            "Preview against the target repo's `.mozyo-bridge/` rules store "
+            "and embed a repo-local `rule_path`. Mutually exclusive with --home."
+        ),
+    )
     scaffold_diff.set_defaults(func=cmd_scaffold_diff)
 
     scaffold_status = scaffold_sub.add_parser("status")
     add_scaffold_target_option(scaffold_status)
-    scaffold_status.add_argument("--home", help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge")
+    scaffold_status.add_argument(
+        "--home",
+        help=(
+            "mozyo-bridge home for central-mode manifests. Defaults to "
+            "MOZYO_BRIDGE_HOME or ~/.mozyo_bridge. Rejected against "
+            "repo-local manifests (the rules store is the target repo's "
+            ".mozyo-bridge); rerun without --home."
+        ),
+    )
     scaffold_status.add_argument("--json", action="store_true", help="Emit structured JSON output instead of human-readable text")
     scaffold_status.set_defaults(func=cmd_scaffold_status)
 

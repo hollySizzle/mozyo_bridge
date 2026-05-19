@@ -1353,6 +1353,308 @@ class ScaffoldRulesTest(unittest.TestCase):
                     self.assertIn("clean", status_output)
 
 
+class ScaffoldRepoLocalModeTest(unittest.TestCase):
+    """Repo-local guardrail rules mode for Dev Container / ephemeral-home workspaces.
+
+    Asana task 1214948474095217. Covers `rules install --repo-local`,
+    `rules status --repo-local`, `scaffold apply --repo-local`, `scaffold diff
+    --repo-local`, the auto-detecting `scaffold status` path, the manifest
+    `mode` field, the repo-local portable `rule_path`, the host-path leak
+    guard for repo-local artifacts, and the `--home` / `--repo-local`
+    mutual exclusion.
+    """
+
+    REPO_LOCAL_RULE_PATH_TEMPLATE = (
+        ".mozyo-bridge/rules/presets/{preset}/agent-workflow.md"
+    )
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def test_rules_install_repo_local_writes_into_target_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, output = self.run_cli(
+                ["rules", "install", "--repo-local", str(project)]
+            )
+
+            self.assertEqual(0, result)
+            for preset in ("asana", "redmine", "redmine-rails", "none"):
+                workflow = (
+                    project
+                    / ".mozyo-bridge"
+                    / "rules"
+                    / "presets"
+                    / preset
+                    / "agent-workflow.md"
+                )
+                version = (
+                    project / ".mozyo-bridge" / "rules" / "presets" / preset / "VERSION"
+                )
+                self.assertTrue(workflow.exists(), f"missing workflow for {preset}")
+                self.assertTrue(version.exists(), f"missing VERSION for {preset}")
+                self.assertIn(str(workflow), output)
+
+    def test_rules_status_repo_local_reports_target_repo_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+
+            result, output = self.run_cli(
+                ["rules", "status", "--repo-local", str(project)]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("asana\tok", output)
+            self.assertIn(
+                str(project.resolve() / ".mozyo-bridge" / "rules" / "presets" / "asana"),
+                output,
+            )
+
+    def test_rules_status_repo_local_flags_uninstalled_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, output = self.run_cli(
+                ["rules", "status", "--repo-local", str(project)]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("asana\tmissing", output)
+
+    def test_rules_install_repo_local_and_home_are_mutually_exclusive(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    ["rules", "install", "--home", "/tmp/x", "--repo-local", "/tmp/y"]
+                )
+
+    def test_scaffold_apply_repo_local_uses_relative_rule_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+
+            result, output = self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--repo-local"]
+            )
+
+            self.assertEqual(0, result)
+            expected_rule_path = self.REPO_LOCAL_RULE_PATH_TEMPLATE.format(preset="asana")
+            for filename in ("AGENTS.md", "CLAUDE.md", ".mozyo-bridge/scaffold.json"):
+                text = (project / filename).read_text(encoding="utf-8")
+                self.assertIn(expected_rule_path, text)
+                # The portable repo-local form must not carry the central
+                # ${MOZYO_BRIDGE_HOME:...} expansion — Dev Container users
+                # have no such home to resolve against.
+                self.assertNotIn("${MOZYO_BRIDGE_HOME", text)
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("repo-local", state["mode"])
+            self.assertEqual(expected_rule_path, state["rule_path"])
+            self.assertEqual(2, state["schema_version"])
+
+    def test_scaffold_apply_repo_local_does_not_leak_host_paths_for_any_preset(self) -> None:
+        # Repo-local artifacts must never carry an absolute host path. The
+        # whole point of the Dev Container mode is portability across hosts.
+        for preset in ("asana", "redmine", "redmine-rails", "none"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--repo-local", str(project)])
+
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--repo-local",
+                        ]
+                    )
+
+                    expected_rule_path = self.REPO_LOCAL_RULE_PATH_TEMPLATE.format(
+                        preset=preset
+                    )
+                    resolved_project = project.resolve()
+                    for filename in ("AGENTS.md", "CLAUDE.md", ".mozyo-bridge/scaffold.json"):
+                        text = (project / filename).read_text(encoding="utf-8")
+                        self.assertNotIn("/Users/", text)
+                        self.assertNotIn(str(resolved_project), text)
+                        self.assertIn(expected_rule_path, text)
+
+    def test_scaffold_apply_repo_local_rejects_combined_home_flag(self) -> None:
+        parser = build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "scaffold",
+                        "apply",
+                        "asana",
+                        "--target",
+                        "/tmp/x",
+                        "--home",
+                        "/tmp/y",
+                        "--repo-local",
+                    ]
+                )
+
+    def test_scaffold_diff_repo_local_clean_after_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+            self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--repo-local"]
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "diff", "asana", "--target", str(project), "--repo-local"]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("scaffold diff: clean", output)
+
+    def test_scaffold_diff_repo_local_detects_router_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+            self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--repo-local"]
+            )
+            agents = project / "AGENTS.md"
+            agents.write_text(
+                agents.read_text(encoding="utf-8") + "\nlocal hand edit\n",
+                encoding="utf-8",
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "diff", "asana", "--target", str(project), "--repo-local"]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("local hand edit", output)
+
+    def test_scaffold_status_auto_detects_repo_local_mode(self) -> None:
+        # Status takes no --repo-local flag; the manifest's `mode` field is
+        # the source of truth so a single status command works for either
+        # mode without operator bookkeeping.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+            self.run_cli(
+                ["scaffold", "apply", "redmine", "--target", str(project), "--repo-local"]
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project)]
+            )
+
+            self.assertEqual(0, result)
+            self.assertIn("mode: repo-local", output)
+            self.assertIn("result: clean", output)
+
+    def test_scaffold_status_repo_local_manifest_with_home_flag_is_invalid(self) -> None:
+        # Passing --home against a repo-local manifest is operator error;
+        # status surfaces it as an invalid manifest rather than silently
+        # comparing against the wrong store.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            unused_home = Path(tmp) / "unused-home"
+            self.run_cli(["rules", "install", "--repo-local", str(project)])
+            self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--repo-local"]
+            )
+
+            result, output = self.run_cli(
+                [
+                    "scaffold",
+                    "status",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(unused_home),
+                ]
+            )
+
+            self.assertEqual(1, result)
+            self.assertIn("repo-local mode; --home is unused", output)
+
+    def test_scaffold_apply_repo_local_requires_repo_local_rules_install(self) -> None:
+        # The repo-local store is read from <target>/.mozyo-bridge, so a
+        # central-mode `rules install` does NOT satisfy `scaffold apply
+        # --repo-local`. The error must point operators at the repo-local
+        # install command, not the central one.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            "asana",
+                            "--target",
+                            str(project),
+                            "--repo-local",
+                        ]
+                    )
+
+            err_text = stderr.getvalue()
+            self.assertIn("rules preset is not installed", err_text)
+            self.assertIn("--repo-local", err_text)
+
+    def test_scaffold_apply_central_mode_default_remains_unchanged(self) -> None:
+        # Backward compatibility: without --repo-local, scaffold apply must
+        # still emit the central ${MOZYO_BRIDGE_HOME:...} portable form and
+        # manifest mode "central". Default behavior is the load-bearing
+        # contract for existing users.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                ["scaffold", "apply", "asana", "--target", str(project), "--home", str(home)]
+            )
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("central", state["mode"])
+            self.assertEqual(
+                "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md",
+                state["rule_path"],
+            )
+            for filename in ("AGENTS.md", "CLAUDE.md"):
+                text = (project / filename).read_text(encoding="utf-8")
+                self.assertIn("${MOZYO_BRIDGE_HOME", text)
+
+
 class ScaffoldDiffTest(unittest.TestCase):
     """Coverage for the new `scaffold diff <preset>` breaking-change entrypoint."""
 

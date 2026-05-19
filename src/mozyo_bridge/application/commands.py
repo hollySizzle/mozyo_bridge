@@ -60,6 +60,7 @@ from mozyo_bridge.infrastructure.tmux_client import (
 from mozyo_bridge.scaffold.rules import (
     install_rules,
     render_scaffold_files,
+    resolve_rules_store,
     rules_status,
     scaffold_status,
     write_scaffold,
@@ -1160,9 +1161,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+def _rules_store_from_args(args: argparse.Namespace):
+    """Resolve the rules store the CLI command should operate against.
+
+    The CLI parser already enforces ``--home`` / ``--repo-local`` as a
+    mutually exclusive group; this helper just translates whichever was
+    supplied into a ``RulesStore`` so command bodies stay declarative.
+    """
+    home = getattr(args, "home", None)
+    repo_local = getattr(args, "repo_local", None)
+    return resolve_rules_store(home=home, repo_local=repo_local)
+
+
 def cmd_rules_install(args: argparse.Namespace) -> int:
-    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
-    written = install_rules(home)
+    store = _rules_store_from_args(args)
+    written = install_rules(store=store)
     if written:
         for path in written:
             print(f"installed: {path}")
@@ -1172,10 +1185,10 @@ def cmd_rules_install(args: argparse.Namespace) -> int:
 
 
 def cmd_rules_status(args: argparse.Namespace) -> int:
-    home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
+    store = _rules_store_from_args(args)
     print("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH")
     ok = True
-    for row in rules_status(home):
+    for row in rules_status(store=store):
         print("\t".join([row["preset"], row["status"], row["installed"], row["packaged"], row["path"]]))
         if row["status"] != "ok":
             ok = False
@@ -1184,6 +1197,7 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
 
 def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
+    repo_local = bool(getattr(args, "repo_local", False))
     target = scaffold_target_from_args(args)
     paths = write_scaffold(
         args.preset,
@@ -1192,6 +1206,7 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
         backup=args.backup,
         force=args.force,
         home=home,
+        repo_local=repo_local,
     )
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
@@ -1208,8 +1223,9 @@ def cmd_scaffold_diff(args: argparse.Namespace) -> int:
     change, mirroring ``git diff --exit-code`` so callers can gate.
     """
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
+    repo_local = bool(getattr(args, "repo_local", False))
     target = scaffold_target_from_args(args)
-    rendered = render_scaffold_files(args.preset, target, home=home)
+    rendered = render_scaffold_files(args.preset, target, home=home, repo_local=repo_local)
     any_changes = False
     for item in rendered:
         on_disk_path = target / item.path
@@ -1259,6 +1275,7 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
 
     print(f"preset: {status['preset']}")
     print(f"schema_version: {status.get('schema_version')}")
+    print(f"mode: {status.get('mode')}")
     print(f"rule_path: {status['rule_path']}")
     print(
         "central preset version: "
@@ -1282,7 +1299,13 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
     print("result: drift detected")
     central_status = status.get("central_status")
     if central_status == "missing":
-        print("  - central preset is missing on disk; run `mozyo-bridge rules install`")
+        if status.get("mode") == "repo-local":
+            print(
+                "  - repo-local preset is missing on disk; run "
+                f"`mozyo-bridge rules install --repo-local {status['target']}`"
+            )
+        else:
+            print("  - central preset is missing on disk; run `mozyo-bridge rules install`")
     elif central_status == "drifted-content":
         print("  - central preset content has changed since scaffold time")
         print(

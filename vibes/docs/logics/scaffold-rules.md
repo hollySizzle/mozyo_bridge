@@ -39,7 +39,6 @@ Common constraints:
 - Treat pane messages as notifications, not authoritative task state.
 - Keep project-specific policy in project-local docs or private systems, not in package templates or central public presets.
 - Do not put repo-local mandatory Claude/Codex audit policies into the shared skill or into unrelated presets.
-- Do not support a repo-local vendor mode in the initial implementation. A second distribution mode would double the update, diff, and diagnostic surface before there is proven need.
 
 ## Preset: redmine
 
@@ -147,7 +146,35 @@ Responsibilities:
 - `scaffold apply <preset>` refuses to complete if the referenced central preset is missing, unless a future explicit bootstrap flag installs it first.
 - Agents must not pretend to have read central rules if the referenced file is unavailable.
 
-The central rules store is the only initial distribution mode. Do not add `--vendor` or repo-local copies to the first implementation. If self-contained snapshots become necessary later, add a separate `rules export` or `snapshot` feature instead of mixing it into the normal scaffold path.
+The central rules store under `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` remains the default distribution mode. The repo-local store described below is an opt-in second mode for Dev Container / ephemeral-home workspaces and shares the same install / status / apply / diff / status surface; do not introduce a third distribution mode (`--vendor`, ad-hoc symlinks, etc.) before retiring one of the existing two.
+
+## Repo-Local Rules Mode (Dev Container / ephemeral home)
+
+Dev Container, Codespace, and other ephemeral-home workspaces do not persist `~/.mozyo_bridge`. The repo-local mode lets the target repo carry its own preset rules store under `<repo>/.mozyo-bridge/rules/presets/<preset>/`, so agents can read guardrails without a user home that survives container rebuilds.
+
+CLI surface (mirrors the central surface):
+
+```bash
+mozyo-bridge rules install --repo-local /path/to/repo
+mozyo-bridge rules status  --repo-local /path/to/repo
+mozyo-bridge scaffold apply <preset> --target /path/to/repo --repo-local
+mozyo-bridge scaffold diff  <preset> --target /path/to/repo --repo-local
+mozyo-bridge scaffold status --target /path/to/repo            # auto-detects mode
+```
+
+Responsibilities and constraints:
+
+- `--home` and `--repo-local` are mutually exclusive on every command that accepts both. Passing both is an operator error and exits non-zero before any filesystem work.
+- `rules install --repo-local <repo>` writes presets into `<repo>/.mozyo-bridge/rules/presets/<preset>/`. It does not touch `~/.mozyo_bridge`.
+- `rules status --repo-local <repo>` inspects only the target repo's store; a missing host install is irrelevant in this mode.
+- `scaffold apply <preset> --target <repo> --repo-local` reads from `<repo>/.mozyo-bridge/rules/presets/...`, embeds `mode: "repo-local"` in `.mozyo-bridge/scaffold.json`, and sets `rule_path` to the **repo-relative** form `.mozyo-bridge/rules/presets/<preset>/agent-workflow.md`. No `${MOZYO_BRIDGE_HOME:...}` expansion is involved at agent read time.
+- `scaffold diff --repo-local` behaves identically to `scaffold diff` but renders against the repo-local store, so a diff between two modes against the same target will show different `rule_path` lines (expected).
+- `scaffold status` reads the manifest's `mode` field and routes its central-preset comparison to whichever store the manifest declares. The user does not pass a mode flag to `status`. Passing `--home` against a `mode: "repo-local"` manifest is rejected as `manifest: invalid` to surface the operator-mode mismatch instead of silently comparing against the wrong store.
+- Default behavior (no `--repo-local` anywhere) is unchanged: central mode, `mode: "central"` in the manifest, and the same `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` portable `rule_path` as before. Switching a repo between modes requires re-running both `rules install --repo-local ...` (or `--home ...`) and `scaffold apply ... [--repo-local]` so the manifest mode matches the store.
+- The repo-local `rule_path` must remain a repo-relative string. Host absolute paths must never leak into committed `AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/scaffold.json`; the existing host-path leak guard is extended to cover the repo-local artifacts.
+- Project-Local Additions marker preservation works in both modes; the marker pair sits in the router templates and is mode-agnostic.
+
+Operationally the two modes are a clean choice, not a layered cake: a repo is either central or repo-local at any given time, and `scaffold status` enforces that by reading the manifest's `mode` field. If the operator wants to switch modes, they re-run `rules install` and `scaffold apply` under the new mode; there is no in-place migration command.
 
 ## File Safety Policy
 
@@ -220,7 +247,7 @@ End-user flow after a release ships:
 3. In each scaffolded repo, run `mozyo-bridge scaffold status`. If it reports `drifted-content`, decide whether to accept the new guardrails (re-run `mozyo-bridge scaffold apply <preset> --backup`) or pin by regenerating from a specific older release.
 4. CI can run `mozyo-bridge scaffold status --json` and fail the build on non-zero exit so unreviewed central-preset updates do not silently change agent behavior in production repos.
 
-Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. If a project ever needs an immutable snapshot of the preset content, that is a separate "export"/"pin" feature, not a default of `scaffold apply`. Do not conflate the two paths.
+Detailed-flow rules are not vendored into each target repo by default. The thin routers (`AGENTS.md` / `CLAUDE.md`) stay thin; the heavy guardrails live in the central preset's `agent-workflow.md`. Repo-local mode (above) carries the preset file inside the target repo's `.mozyo-bridge/rules/presets/` directory for Dev Container portability, but the routers stay thin in either mode. If a project needs an immutable preset snapshot tied to a release tag (rather than a Dev Container portability move), that is still a separate "export"/"pin" feature, not a default of `scaffold apply`. Do not conflate the three paths.
 
 ## Beta Tester Verification
 
@@ -271,7 +298,7 @@ Implementation tests should cover:
 - `--backup` preserves previous files before replacement.
 - `--force` replaces previous files only when explicitly provided.
 - Rendered templates contain no private Notion URLs, credentials, or source-project paths.
-- No `--vendor` path or repo-local preset copy is included in the initial CLI.
+- Repo-local mode covers `rules install --repo-local`, `rules status --repo-local`, `scaffold apply --repo-local`, `scaffold diff --repo-local`, the auto-detecting `scaffold status`, the manifest `mode` field, and the `--home` / `--repo-local` mutual exclusion. Repo-local artifacts must not leak host absolute paths.
 - Redmine templates mention issue and journal gates.
 - Asana templates mention task, project, and comment based handoffs.
 - Asana and Redmine central presets include a Ticket-ID Entrypoint section that requires fetching the durable record before acting on pane or chat framing, and the section preserves each system's vocabulary.

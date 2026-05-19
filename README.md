@@ -402,6 +402,25 @@ mozyo-bridge scaffold status --target /path/to/proj --json
 
 The command compares the project's `.mozyo-bridge/scaffold.json` against the installed central preset (content hash, not only the version label) and the on-disk `AGENTS.md` / `CLAUDE.md`. Exit code is non-zero when central preset content drifted, when a router was modified locally, when the central preset is missing, or when the manifest is missing. Use `mozyo-bridge scaffold apply <preset> --backup` to regenerate routers and accept the new central preset content.
 
+### Dev Container / ephemeral home: repo-local rules mode
+
+Dev Container, Codespace, and similar workspaces do not persist `~/.mozyo_bridge` across container rebuilds, which leaves agents without a guardrail store the first time they start a new session. The repo-local mode keeps the preset inside the target repo so agents can read it without a persistent user home:
+
+```bash
+# 1. Install the preset into <repo>/.mozyo-bridge/rules/presets/<preset>/
+mozyo-bridge rules install --repo-local /path/to/repo
+mozyo-bridge rules status  --repo-local /path/to/repo
+
+# 2. Scaffold routers + manifest in repo-local mode.
+mozyo-bridge scaffold apply <preset> --target /path/to/repo --repo-local
+mozyo-bridge scaffold diff  <preset> --target /path/to/repo --repo-local
+
+# 3. Status auto-detects the mode from .mozyo-bridge/scaffold.json.
+mozyo-bridge scaffold status --target /path/to/repo
+```
+
+In repo-local mode the generated routers point at the repo-relative path `.mozyo-bridge/rules/presets/<preset>/agent-workflow.md` (no `${MOZYO_BRIDGE_HOME:...}` expansion needed) and the manifest records `mode: "repo-local"`. `--home` and `--repo-local` are mutually exclusive on every command that accepts both; passing both is rejected before any filesystem work. Default behavior without `--repo-local` is unchanged: central mode under `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` and `mode: "central"` in the manifest. Switching a repo between modes requires re-running both `rules install` and `scaffold apply` under the new mode so the store and the manifest stay aligned.
+
 Detailed scaffold semantics (preset registry, manifest, apply/diff/status behavior) live in `vibes/docs/logics/scaffold-rules.md`.
 
 ## Notification Commands

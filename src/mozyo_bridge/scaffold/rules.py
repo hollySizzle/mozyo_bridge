@@ -17,8 +17,29 @@ from mozyo_bridge.shared.errors import die
 
 ROUTER_TEMPLATE_PRESET = "_router"
 RULE_RELATIVE_PATH = Path("rules") / "presets"
-MANIFEST_RELATIVE_PATH = Path(".mozyo-bridge") / "scaffold.json"
+REPO_LOCAL_DIRNAME = ".mozyo-bridge"
+MANIFEST_RELATIVE_PATH = Path(REPO_LOCAL_DIRNAME) / "scaffold.json"
 PRESET_REGISTRY_FILENAME = "presets.yaml"
+
+CENTRAL_MODE = "central"
+REPO_LOCAL_MODE = "repo-local"
+VALID_MODES = frozenset({CENTRAL_MODE, REPO_LOCAL_MODE})
+
+# Portable rule_path templates embedded into generated routers and the
+# manifest. Both forms must stay host-independent so the artifact can be
+# committed without leaking the operator's $HOME. Central mode keeps the
+# existing ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} expansion contract that
+# consuming agents already understand. Repo-local mode uses a path that is
+# always relative to the target repo root — AGENTS.md / CLAUDE.md sit at
+# the repo root so a leading `.mozyo-bridge/...` resolves correctly from
+# the agent's cwd without any expansion at all, which is exactly what
+# Dev Container / ephemeral-home workspaces need.
+PORTABLE_RULE_PATH_CENTRAL_TEMPLATE = (
+    "${{MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}}/rules/presets/{preset}/agent-workflow.md"
+)
+PORTABLE_RULE_PATH_REPO_LOCAL_TEMPLATE = (
+    f"{REPO_LOCAL_DIRNAME}/rules/presets/{{preset}}/agent-workflow.md"
+)
 
 # Marker pair used to delimit a project-local additions block inside scaffold-
 # generated routers (AGENTS.md / CLAUDE.md). Content between these markers is
@@ -112,6 +133,74 @@ def mozyo_bridge_home() -> Path:
     return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
 
 
+@dataclass(frozen=True)
+class RulesStore:
+    """Resolved location of a rules store on disk.
+
+    A rules store carries the installed central preset(s) for one or more
+    presets, regardless of whether it lives under the user's mozyo-bridge
+    home (central mode) or under a target repo's ``.mozyo-bridge``
+    directory (repo-local mode).
+
+    Attributes:
+        root: Absolute path under which ``rules/presets/<preset>/`` lives.
+            For central mode this is the mozyo-bridge home; for repo-local
+            mode this is ``<repo>/.mozyo-bridge``.
+        mode: ``"central"`` or ``"repo-local"``.
+        repo: For repo-local mode, the absolute path to the target repo
+            root. ``None`` in central mode.
+    """
+
+    root: Path
+    mode: str
+    repo: Path | None = None
+
+    @property
+    def is_repo_local(self) -> bool:
+        return self.mode == REPO_LOCAL_MODE
+
+
+def resolve_rules_store(
+    *,
+    home: Path | str | None = None,
+    repo_local: Path | str | None = None,
+) -> RulesStore:
+    """Build a ``RulesStore`` from raw CLI inputs.
+
+    ``--home`` and ``--repo-local`` are mutually exclusive; passing both
+    is a deterministic operator error so the helper dies before any
+    filesystem work happens. When neither is given, defaults to central
+    mode using ``MOZYO_BRIDGE_HOME`` (or ``~/.mozyo_bridge``) so existing
+    callers keep their pre-repo-local behavior unchanged.
+    """
+    if home is not None and repo_local is not None:
+        die("--home and --repo-local are mutually exclusive")
+    if repo_local is not None:
+        repo_root = Path(repo_local).expanduser().resolve()
+        return RulesStore(
+            root=repo_root / REPO_LOCAL_DIRNAME,
+            mode=REPO_LOCAL_MODE,
+            repo=repo_root,
+        )
+    if home is not None:
+        root = Path(home).expanduser().resolve()
+    else:
+        root = mozyo_bridge_home()
+    return RulesStore(root=root, mode=CENTRAL_MODE, repo=None)
+
+
+def _coerce_store(
+    store: RulesStore | None,
+    home: Path | str | None,
+) -> RulesStore:
+    """Back-compat coercion: prefer ``store`` when supplied, else build a
+    central store from ``home``. Keeps the pre-repo-local positional/keyword
+    ``home=...`` API working for tests and external callers."""
+    if store is not None:
+        return store
+    return resolve_rules_store(home=home)
+
+
 def package_preset_root(preset: str):
     preset_definition(preset)
     return resources.files("mozyo_bridge.scaffold.presets").joinpath(preset)
@@ -126,12 +215,23 @@ def router_template_text(filename: str) -> str:
     )
 
 
-def installed_preset_dir(preset: str, home: Path | None = None) -> Path:
-    return (home or mozyo_bridge_home()) / RULE_RELATIVE_PATH / preset
+def installed_preset_dir(
+    preset: str,
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> Path:
+    resolved = _coerce_store(store, home)
+    return resolved.root / RULE_RELATIVE_PATH / preset
 
 
-def installed_agent_workflow(preset: str, home: Path | None = None) -> Path:
-    return installed_preset_dir(preset, home) / "agent-workflow.md"
+def installed_agent_workflow(
+    preset: str,
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> Path:
+    return installed_preset_dir(preset, home, store=store) / "agent-workflow.md"
 
 
 def preset_install_requirements(preset: str) -> tuple[str, ...]:
@@ -146,13 +246,23 @@ def preset_install_requirements(preset: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def portable_rule_path(preset: str) -> str:
-    # Symbolic path embedded into generated routers and the scaffold manifest so
-    # they stay portable across hosts (no user-specific home leakage) while still
-    # honoring MOZYO_BRIDGE_HOME at consumption time. The consuming agent expands
-    # ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} when it reads the router.
+def portable_rule_path(preset: str, *, repo_local: bool = False) -> str:
+    """Return the symbolic rule_path embedded into routers and the manifest.
+
+    Both forms are host-independent: ``central`` uses
+    ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`` which the consuming agent
+    expands at read time; ``repo-local`` uses a relative path that
+    resolves against the target repo root so Dev Container / ephemeral
+    workspaces can carry the preset without depending on the operator's
+    $HOME at runtime.
+    """
     preset_definition(preset)
-    return f"${{MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}}/rules/presets/{preset}/agent-workflow.md"
+    template = (
+        PORTABLE_RULE_PATH_REPO_LOCAL_TEMPLATE
+        if repo_local
+        else PORTABLE_RULE_PATH_CENTRAL_TEMPLATE
+    )
+    return template.format(preset=preset)
 
 
 def package_text(preset: str, filename: str) -> str:
@@ -171,11 +281,15 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def install_rules(home: Path | None = None) -> list[Path]:
-    root = home or mozyo_bridge_home()
+def install_rules(
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> list[Path]:
+    resolved = _coerce_store(store, home)
     written: list[Path] = []
     for preset in PRESETS:
-        target_dir = installed_preset_dir(preset, root)
+        target_dir = installed_preset_dir(preset, store=resolved)
         target_dir.mkdir(parents=True, exist_ok=True)
         for filename in ("VERSION", "agent-workflow.md"):
             content = package_text(preset, filename)
@@ -186,12 +300,16 @@ def install_rules(home: Path | None = None) -> list[Path]:
     return written
 
 
-def rules_status(home: Path | None = None) -> list[dict[str, str]]:
-    root = home or mozyo_bridge_home()
+def rules_status(
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> list[dict[str, str]]:
+    resolved = _coerce_store(store, home)
     rows: list[dict[str, str]] = []
     for preset in PRESETS:
         expected_version = package_version(preset)
-        preset_dir = installed_preset_dir(preset, root)
+        preset_dir = installed_preset_dir(preset, store=resolved)
         version_path = preset_dir / "VERSION"
         workflow_path = preset_dir / "agent-workflow.md"
         if not version_path.exists() or not workflow_path.exists():
@@ -212,36 +330,60 @@ def rules_status(home: Path | None = None) -> list[dict[str, str]]:
     return rows
 
 
-def require_installed_preset(preset: str, home: Path | None = None) -> Path:
+def require_installed_preset(
+    preset: str,
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> Path:
+    resolved = _coerce_store(store, home)
     missing: list[str] = []
     for required_preset in preset_install_requirements(preset):
-        workflow = installed_agent_workflow(required_preset, home)
-        version = installed_preset_dir(required_preset, home) / "VERSION"
+        workflow = installed_agent_workflow(required_preset, store=resolved)
+        version = installed_preset_dir(required_preset, store=resolved) / "VERSION"
         if not workflow.exists() or not version.exists():
             missing.append(required_preset)
     if missing:
+        hint = (
+            "mozyo-bridge rules install --repo-local "
+            + str(resolved.repo)
+            if resolved.is_repo_local and resolved.repo is not None
+            else "mozyo-bridge rules install"
+        )
         die(
             "rules preset is not installed: "
             + ", ".join(missing)
-            + ". Run `mozyo-bridge rules install` first."
+            + f". Run `{hint}` first."
         )
-    return installed_agent_workflow(preset, home)
+    return installed_agent_workflow(preset, store=resolved)
 
 
-def router_context(preset: str, target: Path, workflow_path: Path) -> dict[str, str]:
+def router_context(
+    preset: str,
+    target: Path,
+    workflow_path: Path,
+    *,
+    repo_local: bool = False,
+) -> dict[str, str]:
     definition = preset_definition(preset)
     return {
         "preset": preset,
         "preset_version": package_version(preset),
         "project_root": str(target),
-        "rule_path": portable_rule_path(preset),
+        "rule_path": portable_rule_path(preset, repo_local=repo_local),
         "mozyo_bridge_version": __version__,
         "ticket_anchor_label": definition.ticket_anchor_label,
     }
 
 
-def render_router_pair(preset: str, target: Path, workflow_path: Path) -> list[RenderedFile]:
-    context = router_context(preset, target, workflow_path)
+def render_router_pair(
+    preset: str,
+    target: Path,
+    workflow_path: Path,
+    *,
+    repo_local: bool = False,
+) -> list[RenderedFile]:
+    context = router_context(preset, target, workflow_path, repo_local=repo_local)
     files = []
     for filename in ("AGENTS.md", "CLAUDE.md"):
         template = Template(router_template_text(filename))
@@ -249,32 +391,51 @@ def render_router_pair(preset: str, target: Path, workflow_path: Path) -> list[R
     return files
 
 
-def installed_preset_hash(preset: str, home: Path | None = None) -> str | None:
-    workflow = installed_agent_workflow(preset, home)
+def installed_preset_hash(
+    preset: str,
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> str | None:
+    workflow = installed_agent_workflow(preset, home, store=store)
     if not workflow.exists():
         return None
     return sha256_file(workflow)
 
 
-def installed_preset_version(preset: str, home: Path | None = None) -> str | None:
-    version_path = installed_preset_dir(preset, home) / "VERSION"
+def installed_preset_version(
+    preset: str,
+    home: Path | None = None,
+    *,
+    store: RulesStore | None = None,
+) -> str | None:
+    version_path = installed_preset_dir(preset, home, store=store) / "VERSION"
     if not version_path.exists():
         return None
     return version_path.read_text(encoding="utf-8").strip()
 
 
-def manifest_content(preset: str, workflow_path: Path, rendered: list[RenderedFile]) -> str:
+def manifest_content(
+    preset: str,
+    workflow_path: Path,
+    rendered: list[RenderedFile],
+    *,
+    mode: str = CENTRAL_MODE,
+) -> str:
     # `rule_path` is stored in symbolic form so the manifest stays safe to commit
     # in target repositories. Drift detection uses `preset_hash` and per-file
     # sha256 entries, not this field, so sanitizing it does not weaken status.
+    if mode not in VALID_MODES:
+        die(f"unsupported manifest mode: {mode!r}; expected one of {sorted(VALID_MODES)}")
+    repo_local = mode == REPO_LOCAL_MODE
     payload = {
         "schema_version": 2,
-        "mode": "central",
+        "mode": mode,
         "preset": preset,
         "preset_version": package_version(preset),
         "preset_hash": sha256_file(workflow_path),
         "generated_by": f"mozyo-bridge {__version__}",
-        "rule_path": portable_rule_path(preset),
+        "rule_path": portable_rule_path(preset, repo_local=repo_local),
         "files": {
             str(item.path): {
                 "sha256": sha256_text(item.content),
@@ -362,18 +523,40 @@ def apply_project_local_preservation(
     return preserved
 
 
+def _resolve_scaffold_store(
+    target: Path,
+    home: Path | None,
+    repo_local: bool,
+) -> RulesStore:
+    """Build the rules store used by scaffold render/write paths.
+
+    ``repo_local=True`` forces a repo-local store rooted at ``<target>/.mozyo-bridge``;
+    in that case ``home`` must be ``None`` or the call dies (the CLI surface
+    rejects the conflict before we get here, but the assertion is duplicated
+    in-library so library callers cannot bypass it).
+    """
+    if repo_local and home is not None:
+        die("--home and --repo-local are mutually exclusive")
+    if repo_local:
+        return resolve_rules_store(repo_local=target)
+    return resolve_rules_store(home=home)
+
+
 def render_scaffold_files(
     preset: str,
     target: Path,
     home: Path | None = None,
+    *,
+    repo_local: bool = False,
 ) -> list[RenderedFile]:
     target = target.expanduser().resolve()
-    workflow_path = require_installed_preset(preset, home)
-    rendered = render_router_pair(preset, target, workflow_path)
+    store = _resolve_scaffold_store(target, home, repo_local)
+    workflow_path = require_installed_preset(preset, store=store)
+    rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
-        manifest_content(preset, workflow_path, rendered),
+        manifest_content(preset, workflow_path, rendered, mode=store.mode),
     )
     return rendered + [manifest]
 
@@ -385,14 +568,20 @@ def write_scaffold(
     backup: bool = False,
     force: bool = False,
     home: Path | None = None,
+    *,
+    repo_local: bool = False,
 ) -> list[Path]:
     if backup and force:
         die("--backup and --force are mutually exclusive")
     target = target.expanduser().resolve()
-    workflow_path = require_installed_preset(preset, home)
-    rendered = render_router_pair(preset, target, workflow_path)
+    store = _resolve_scaffold_store(target, home, repo_local)
+    workflow_path = require_installed_preset(preset, store=store)
+    rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
-    manifest = RenderedFile(MANIFEST_RELATIVE_PATH, manifest_content(preset, workflow_path, rendered))
+    manifest = RenderedFile(
+        MANIFEST_RELATIVE_PATH,
+        manifest_content(preset, workflow_path, rendered, mode=store.mode),
+    )
     all_files = rendered + [manifest]
     existing = [target / item.path for item in all_files if (target / item.path).exists()]
     protected = [path for path in existing if path.name in PROJECT_LOCAL_PRESERVED_FILENAMES]
@@ -447,6 +636,33 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
         result["error"] = f"manifest preset is missing or unsupported: {preset!r}"
         return result
 
+    manifest_mode = state.get("mode", CENTRAL_MODE)
+    if manifest_mode not in VALID_MODES:
+        result["manifest"] = "invalid"
+        result["error"] = (
+            f"manifest mode is unsupported: {manifest_mode!r}; "
+            f"expected one of {sorted(VALID_MODES)}"
+        )
+        return result
+
+    # Repo-local manifests draw their central preset from the target repo's
+    # own .mozyo-bridge store, not the operator's mozyo-bridge home. Passing
+    # ``--home`` against a repo-local manifest is a sign of operator
+    # confusion (the home is unused for that target), so refuse rather than
+    # silently comparing against the wrong store.
+    if manifest_mode == REPO_LOCAL_MODE and home is not None:
+        result["manifest"] = "invalid"
+        result["error"] = (
+            "manifest is in repo-local mode; --home is unused here. Rerun "
+            "without --home, or regenerate the manifest in central mode."
+        )
+        return result
+
+    if manifest_mode == REPO_LOCAL_MODE:
+        store = resolve_rules_store(repo_local=target)
+    else:
+        store = resolve_rules_store(home=home)
+
     schema_version = state.get("schema_version")
     manifest_preset_version = state.get("preset_version")
     manifest_preset_hash = state.get("preset_hash")
@@ -473,14 +689,14 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
             )
             return result
 
-    central_workflow = installed_agent_workflow(preset, home)
-    central_version = installed_preset_version(preset, home)
-    central_hash = installed_preset_hash(preset, home)
+    central_workflow = installed_agent_workflow(preset, store=store)
+    central_version = installed_preset_version(preset, store=store)
+    central_hash = installed_preset_hash(preset, store=store)
     missing_requirements = [
         required_preset
         for required_preset in preset_install_requirements(preset)
-        if installed_preset_hash(required_preset, home) is None
-        or installed_preset_version(required_preset, home) is None
+        if installed_preset_hash(required_preset, store=store) is None
+        or installed_preset_version(required_preset, store=store) is None
     ]
     if missing_requirements:
         central_status = "missing"
@@ -534,6 +750,7 @@ def scaffold_status(target: Path, home: Path | None = None) -> dict[str, object]
         {
             "manifest": "present",
             "schema_version": schema_version,
+            "mode": manifest_mode,
             "preset": preset,
             "rule_path": str(central_workflow),
             "manifest_preset_version": manifest_preset_version,
