@@ -13,6 +13,8 @@ It is only a notification transport. Redmine remains the source of truth for rev
 > is documented in `vibes/docs/logics/bootstrap.md`. Read that doc to follow the
 > install → rules → skill → scaffold → doctor stages in strict order. The sections
 > below are operator-facing reference material for the individual commands.
+>
+> 人間向けのリリースノートは [`RELEASE_NOTES.md`](RELEASE_NOTES.md) にあります。
 
 Install the CLI:
 
