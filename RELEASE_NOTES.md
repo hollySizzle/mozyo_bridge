@@ -4,6 +4,26 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.4.0 - 2026-05-20
+
+v0.4.0 は、Dev Container などの環境で guardrail を失いにくくし、複数 agent window を少し見分けやすくするリリースです。
+
+### 変更点
+
+- `rules install` と `scaffold apply` で、repo-local な guardrail rules store を使えるようにしました。
+- repo-local mode の使い方を README と scaffold rules documentation に追加しました。
+- tmux の `claude` / `codex` window に、控えめな status color を付けるようにしました。
+- `claude` / `codex` の window 名は変更せず、resolver / handoff routing の互換性を維持しています。
+- release note を日本語で整備しました。
+
+### なぜ必要だったか
+
+Dev Container や Codespace では、home directory が永続化されないことがあります。その場合、user-global な guardrail store だけに依存すると、container rebuild 後に agent が必要な rules を読めなくなる可能性があります。
+
+repo-local mode は、必要な guardrail を対象 repo の中に置けるようにするためのものです。これにより、workspace を開いた agent が同じ repo 内の rules を参照でき、環境差による立ち上がり失敗を減らせます。
+
+tmux の status color は、運用上の小さな混乱を減らすための変更です。派手な見た目にすることが目的ではなく、`claude` / `codex` / その他 window を一目で少し区別しやすくするために入れました。
+
 ## v0.3.0 - 2026-05-19
 
 v0.3.0 はガードレール強化のリリースです。Claude / Codex / Asana / Redmine / Redmine Rails をまたいだ作業引き継ぎと project scaffold を、より安全に繰り返せるようにしました。
