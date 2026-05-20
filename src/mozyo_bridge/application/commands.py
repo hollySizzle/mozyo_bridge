@@ -1269,6 +1269,23 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _skip_categories_from_args(args: argparse.Namespace) -> set[str]:
+    """Collect skip-category flags off the parsed argparse namespace.
+
+    Each `--skip-<category>` flag is namespaced as `skip_<category>` on
+    the argparse object. We only forward labels for flags that are
+    actually present *and* true, so callers building Namespace objects
+    programmatically (tests, library entry points) don't have to know
+    every flag name to opt in to the default behaviour.
+    """
+    labels: set[str] = set()
+    if getattr(args, "skip_tmux_ui", False):
+        labels.add("tmux-ui")
+    if getattr(args, "skip_nagger", False):
+        labels.add("nagger")
+    return labels
+
+
 def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     repo_local = bool(getattr(args, "repo_local", False))
@@ -1281,6 +1298,7 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
         force=args.force,
         home=home,
         repo_local=repo_local,
+        skip_categories=_skip_categories_from_args(args),
     )
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
@@ -1299,7 +1317,13 @@ def cmd_scaffold_diff(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     repo_local = bool(getattr(args, "repo_local", False))
     target = scaffold_target_from_args(args)
-    rendered = render_scaffold_files(args.preset, target, home=home, repo_local=repo_local)
+    rendered = render_scaffold_files(
+        args.preset,
+        target,
+        home=home,
+        repo_local=repo_local,
+        skip_categories=_skip_categories_from_args(args),
+    )
     any_changes = False
     for item in rendered:
         on_disk_path = target / item.path

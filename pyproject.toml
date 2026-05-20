@@ -60,6 +60,10 @@ mozyo_bridge = [
     "scaffold/presets/*/files/.mozyo-bridge/rules/*",
     "scaffold/presets/*/files/.mozyo-bridge/docs/*",
     "scaffold/presets/*/files/.mozyo-bridge/tools/*",
+    "scaffold/presets/*/files/.mozyo-bridge/tmux/*",
+    "scaffold/presets/*/files/.claude-nagger/**/*",
+    "scaffold/presets/*/files/.claude-nagger/*",
+    "scaffold/presets/*/files/.claude-nagger/.gitignore",
 ]
 
 [tool.pytest.ini_options]

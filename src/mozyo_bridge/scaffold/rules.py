@@ -36,6 +36,22 @@ PRESET_FILES_DIRNAME = "files"
 PRESET_FILES_SKIP_DIRS = frozenset({"__pycache__"})
 PRESET_FILES_SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
 
+# Opt-out categories that operators can pass to `scaffold apply` /
+# `scaffold diff` to omit a slice of the governed preset's repo-local
+# artifacts. The mapping is repo-relative POSIX path *prefix* → category
+# label; any rendered file whose relative path starts with one of the
+# prefixes is dropped from the rendered set (and therefore from the
+# manifest) when the corresponding category is in the skip set.
+#
+# Adding a new category here is the entire integration point: the CLI
+# wires `--skip-<category>` into `skip_categories`, and the manifest
+# automatically tracks only what was actually written.
+PRESET_FILES_CATEGORY_PREFIXES: dict[str, str] = {
+    "tmux-ui": ".mozyo-bridge/tmux/",
+    "nagger": ".claude-nagger/",
+}
+PRESET_FILES_CATEGORIES = frozenset(PRESET_FILES_CATEGORY_PREFIXES.keys())
+
 CENTRAL_MODE = "central"
 REPO_LOCAL_MODE = "repo-local"
 VALID_MODES = frozenset({CENTRAL_MODE, REPO_LOCAL_MODE})
@@ -440,17 +456,53 @@ def _walk_preset_files_dir(files_root) -> list[tuple[Path, str]]:
     return sorted(collected, key=lambda item: item[0].as_posix())
 
 
-def render_preset_extra_files(preset: str) -> list[RenderedFile]:
+def _normalize_skip_categories(skip_categories: set[str] | None) -> frozenset[str]:
+    """Validate and freeze the operator-supplied skip category set.
+
+    Unknown labels are an operator error, not a silent miss — the CLI
+    layer raises before we reach here, but a library caller that bypasses
+    the CLI will also be told. The empty / None case is the common
+    default-on path.
+    """
+    if not skip_categories:
+        return frozenset()
+    unknown = set(skip_categories) - PRESET_FILES_CATEGORIES
+    if unknown:
+        die(
+            "unknown scaffold skip categories: "
+            + ", ".join(sorted(unknown))
+            + f"; expected one of {sorted(PRESET_FILES_CATEGORIES)}"
+        )
+    return frozenset(skip_categories)
+
+
+def render_preset_extra_files(
+    preset: str,
+    *,
+    skip_categories: set[str] | None = None,
+) -> list[RenderedFile]:
     """Return the preset's repo-local artifacts as :class:`RenderedFile`.
 
     Returns an empty list when the preset does not ship a ``files/`` subtree.
     The returned paths are repo-relative (e.g. ``.mozyo-bridge/rules/...``)
     so callers can write them directly under the scaffold target.
+
+    ``skip_categories`` drops every artifact whose repo-relative path
+    starts with the category's registered prefix (see
+    ``PRESET_FILES_CATEGORY_PREFIXES``). The dropped entries do not
+    appear in the manifest either, so ``scaffold status`` stays clean
+    after a partial apply.
     """
     preset_definition(preset)
+    skip = _normalize_skip_categories(skip_categories)
+    skip_prefixes = tuple(
+        PRESET_FILES_CATEGORY_PREFIXES[name] for name in skip
+    )
     files_root = package_preset_root(preset).joinpath(PRESET_FILES_DIRNAME)
     rendered: list[RenderedFile] = []
     for relative, content in _walk_preset_files_dir(files_root):
+        if skip_prefixes and relative.as_posix().startswith(skip_prefixes):
+            continue
         rendered.append(RenderedFile(relative, content))
     return rendered
 
@@ -612,19 +664,40 @@ def render_scaffold_files(
     home: Path | None = None,
     *,
     repo_local: bool = False,
+    skip_categories: set[str] | None = None,
 ) -> list[RenderedFile]:
     target = target.expanduser().resolve()
     store = _resolve_scaffold_store(target, home, repo_local)
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
-    extras = render_preset_extra_files(preset)
+    extras = render_preset_extra_files(preset, skip_categories=skip_categories)
     manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
         manifest_content(preset, workflow_path, manifest_inputs, mode=store.mode),
     )
     return rendered + extras + [manifest]
+
+
+def _previously_tracked_relative_paths(target: Path) -> set[str]:
+    """Return repo-relative POSIX paths the prior scaffold manifest tracked.
+
+    Returns an empty set when no manifest exists, when the manifest is
+    unreadable, or when the manifest's ``files`` entry is malformed. The
+    caller treats missing prior state as a fresh apply (no outgoing
+    files to reconcile).
+    """
+    try:
+        state = scaffold_state(target)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not state:
+        return set()
+    files = state.get("files") if isinstance(state, dict) else None
+    if not isinstance(files, dict):
+        return set()
+    return {name for name in files.keys() if isinstance(name, str)}
 
 
 def write_scaffold(
@@ -636,6 +709,7 @@ def write_scaffold(
     home: Path | None = None,
     *,
     repo_local: bool = False,
+    skip_categories: set[str] | None = None,
 ) -> list[Path]:
     if backup and force:
         die("--backup and --force are mutually exclusive")
@@ -644,19 +718,37 @@ def write_scaffold(
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
-    extras = render_preset_extra_files(preset)
+    extras = render_preset_extra_files(preset, skip_categories=skip_categories)
     manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
         manifest_content(preset, workflow_path, manifest_inputs, mode=store.mode),
     )
     all_files = rendered + extras + [manifest]
+
+    # Reconcile "outgoing" files: entries the previous manifest tracked
+    # that the current render no longer claims. These typically come
+    # from operator opt-outs (`--skip-*`) or upstream preset removals.
+    # Leaving them on disk lets `scaffold status` falsely report `clean`
+    # because the new manifest never claimed them — opt-out and drift
+    # visibility silently diverge. We treat outgoing files like a
+    # destructive write so `--backup` / `--force` gate the removal.
+    rendered_rel = {item.path.as_posix() for item in rendered + extras}
+    previously_tracked = _previously_tracked_relative_paths(target)
+    outgoing_rel = previously_tracked - rendered_rel
+    outgoing_existing = [
+        target / relative
+        for relative in sorted(outgoing_rel)
+        if (target / relative).exists()
+    ]
+
     existing = [target / item.path for item in all_files if (target / item.path).exists()]
     # Routers (AGENTS.md / CLAUDE.md) and every preset-shipped extra are
     # protected from silent overwrite. Only the scaffold's own manifest can
     # be safely overwritten because it tracks the scaffold's recorded state.
     protected_paths = {target / item.path for item in rendered + extras}
     protected = [path for path in existing if path in protected_paths]
+    protected.extend(outgoing_existing)
     if protected and not backup and not force:
         die("refusing to overwrite existing scaffold files: " + ", ".join(str(path) for path in protected))
     if dry_run:
@@ -666,10 +758,36 @@ def write_scaffold(
             backup_target = backup_path(path)
             backup_target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, backup_target)
+        for path in outgoing_existing:
+            backup_target = backup_path(path)
+            backup_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backup_target)
     for item in all_files:
         path = target / item.path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(item.content, encoding="utf-8")
+    # Remove outgoing files after the new manifest is in place so a
+    # crash mid-apply still leaves a coherent on-disk state (worst case:
+    # both old artifact and new manifest reference it, which the next
+    # apply will reconcile). Skip files we just wrote — `outgoing_rel`
+    # already excludes them via set subtraction, but the guard is cheap.
+    for path in outgoing_existing:
+        if path in protected_paths:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        # Best-effort directory cleanup: remove now-empty parents up to
+        # the target root so opt-outs don't leave empty `.claude-nagger/`
+        # or `.mozyo-bridge/tmux/` directories behind.
+        parent = path.parent
+        while parent != target and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
     return [target / item.path for item in all_files]
 
 

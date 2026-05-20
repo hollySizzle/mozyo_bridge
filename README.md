@@ -419,6 +419,8 @@ apply すると、router 一式に加えて以下が target repo に書き込ま
 
 catalog には任意 field `coverage_roots` を定義できます。指定した repo-relative path が `validate_catalog.py --check-file-coverage` の走査対象になり、CLI `--coverage-root` が無い場合の default として使われます。CLI が指定されたときは CLI 側が優先されます。missing root は `notice:` として印字され exit code には影響しません。`scaffold status` の出力では manifest 追跡対象を `tracked files:` セクションで表示します (router 2 件 + governed が追加した repo-local artifacts も同じセクションに並びます)。
 
+scaffold には **Claude Nagger 設定 skeleton** (`.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example` + `.gitignore`) と **tmux agent window 用の UI snippet** (`.mozyo-bridge/tmux/agent-ui.conf`) も default-on で同梱されます。これらは agent 誤動作を減らすための実行時 guardrail として扱い、`doctor` の `claude_nagger` セクションと `tmux.artifact` 行で導入状態を確認できます。Claude Nagger を運用するには `.claude-nagger/config.yaml.example` を `config.yaml` にコピーして customise してください。tmux UI を有効化したい operator は `source-file <repo>/.mozyo-bridge/tmux/agent-ui.conf` を `~/.tmux.conf` などに追記します (scaffold は host 設定を一切変更しません)。導入したくない project は `scaffold apply --skip-nagger` / `--skip-tmux-ui` で opt-out できます。スキップした category は manifest にも記録されず、`scaffold status` は引き続き clean を返します。
+
 `redmine-rails` を選んだ project が後から full governance に乗り換える場合は、`mozyo-bridge scaffold apply redmine-rails-governed --target . --backup` で切り替えられます。
 
 

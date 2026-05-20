@@ -1,0 +1,22 @@
+# Claude Nagger MCP usage conventions skeleton.
+#
+# Copy this file to `.claude-nagger/mcp_conventions.yaml` and
+# customise per project. Use this to attach project-level rules to
+# specific MCP tool invocations (e.g. ticket system access, search
+# tools, deployment tools).
+
+version: 1
+
+rules:
+  # Example: remind operators that ticket comments are durable when
+  # using an Asana / Redmine MCP tool to post comments.
+  - id: ticket-comment-durable
+    name: ticket comment is durable
+    mcp_tools:
+      - "mcp__asana__add_comment"
+      - "mcp__redmine__create_journal"
+    severity: warn
+    message: >-
+      Ticket comments are durable. Include actionable summary lines
+      (changed paths, verification, residual scope) so the audit replay
+      is complete.

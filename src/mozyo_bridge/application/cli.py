@@ -480,6 +480,28 @@ def build_parser() -> argparse.ArgumentParser:
     apply_replace_group = scaffold_apply.add_mutually_exclusive_group()
     apply_replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
     apply_replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")
+    scaffold_apply.add_argument(
+        "--skip-tmux-ui",
+        dest="skip_tmux_ui",
+        action="store_true",
+        help=(
+            "Omit the governed preset's `.mozyo-bridge/tmux/` artifacts "
+            "(agent-window status colouring snippet). The artifacts are "
+            "default-on; pass this flag when the project does not want "
+            "the tmux UI helper installed."
+        ),
+    )
+    scaffold_apply.add_argument(
+        "--skip-nagger",
+        dest="skip_nagger",
+        action="store_true",
+        help=(
+            "Omit the governed preset's `.claude-nagger/` artifacts "
+            "(Claude Nagger config / convention skeletons). The artifacts "
+            "are default-on; pass this flag when the project does not "
+            "use Claude Nagger."
+        ),
+    )
     scaffold_apply.set_defaults(func=cmd_scaffold_apply)
 
     scaffold_diff = scaffold_sub.add_parser(
@@ -505,6 +527,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Preview against the target repo's `.mozyo-bridge/` rules store "
             "and embed a repo-local `rule_path`. Mutually exclusive with --home."
         ),
+    )
+    scaffold_diff.add_argument(
+        "--skip-tmux-ui",
+        dest="skip_tmux_ui",
+        action="store_true",
+        help="Preview the diff as if `scaffold apply --skip-tmux-ui` were run.",
+    )
+    scaffold_diff.add_argument(
+        "--skip-nagger",
+        dest="skip_nagger",
+        action="store_true",
+        help="Preview the diff as if `scaffold apply --skip-nagger` were run.",
     )
     scaffold_diff.set_defaults(func=cmd_scaffold_diff)
 

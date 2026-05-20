@@ -9,6 +9,7 @@ reports what is missing and the next command an end user should run.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.infrastructure.tmux_client import run_tmux
-from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_status
+from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
 
 
 REQUIRED_SKILL_FILE = "SKILL.md"
@@ -308,6 +309,150 @@ def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+CLAUDE_NAGGER_DIRNAME = ".claude-nagger"
+CLAUDE_NAGGER_EXAMPLES = (
+    "config.yaml.example",
+    "command_conventions.yaml.example",
+    "mcp_conventions.yaml.example",
+)
+CLAUDE_NAGGER_MANIFEST_PREFIX = ".claude-nagger/"
+TMUX_UI_RELATIVE_PATH = Path(".mozyo-bridge/tmux/agent-ui.conf")
+TMUX_UI_MANIFEST_PATH = ".mozyo-bridge/tmux/agent-ui.conf"
+
+
+def _scaffold_manifest_files(target: Path) -> set[str]:
+    """Return the repo-relative POSIX paths the scaffold manifest tracks.
+
+    Returns an empty set when no manifest exists, when the manifest is
+    unreadable, or when the manifest's ``files`` entry is malformed.
+    Doctor uses this as the source-of-truth for "did the operator
+    intend to install this category" — disk state alone can mislead
+    (e.g. leftover ``.bak.*`` backup files inside a directory that the
+    operator opted out of with ``--skip-* --backup``).
+    """
+    try:
+        state = scaffold_state(target)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not state or not isinstance(state, dict):
+        return set()
+    files = state.get("files")
+    if not isinstance(files, dict):
+        return set()
+    return {name for name in files.keys() if isinstance(name, str)}
+
+
+def doctor_claude_nagger_section(args: argparse.Namespace) -> dict[str, Any]:
+    """Report on the governed preset's Claude Nagger artifacts in the target.
+
+    The scaffold manifest is the source-of-truth for "did the project
+    install Claude Nagger?". A project that scaffolded with
+    ``--skip-nagger`` (or never opted in) is treated as ``skipped``
+    even if backup files (``.bak.*``) or unrelated debris exist under
+    ``.claude-nagger/``. Reading the manifest first avoids the false
+    ``incomplete`` verdict that a directory-only check produces after
+    a ``--skip-nagger --backup`` opt-out.
+    """
+    target = doctor_target(args)
+    nagger_dir = target / CLAUDE_NAGGER_DIRNAME
+
+    example_paths = {name: nagger_dir / name for name in CLAUDE_NAGGER_EXAMPLES}
+    examples = {
+        name: {
+            "path": str(path),
+            "present": path.exists(),
+        }
+        for name, path in example_paths.items()
+    }
+    config_path = nagger_dir / "config.yaml"
+    next_action: list[str] = []
+
+    tracked = _scaffold_manifest_files(target)
+    nagger_tracked = any(p.startswith(CLAUDE_NAGGER_MANIFEST_PREFIX) for p in tracked)
+
+    if not nagger_tracked:
+        # Either no scaffold manifest at all, or the manifest exists
+        # but the operator opted out of the nagger category. Both
+        # collapse to `skipped`; the suggested remedy points operators
+        # at a rerun without --skip-nagger when they want it back.
+        status = "skipped"
+        next_action.append(
+            "Claude Nagger is opt-out (manifest does not track .claude-nagger/); "
+            f"rerun `mozyo-bridge scaffold apply <preset> --target {target}` "
+            "without --skip-nagger to install the skeleton"
+        )
+    elif not all(info["present"] for info in examples.values()):
+        # Tracked by manifest but examples missing on disk → real drift.
+        status = "incomplete"
+        for name, info in examples.items():
+            if not info["present"]:
+                next_action.append(
+                    f"missing {info['path']}; rerun scaffold apply --backup to restore"
+                )
+    elif config_path.exists():
+        status = "ok"
+    else:
+        # Skeleton present, but the operator has not copied it into
+        # `config.yaml` yet. The nagger does nothing until they do.
+        status = "skeleton-only"
+        next_action.append(
+            f"copy {example_paths['config.yaml.example']} to {config_path} "
+            "to activate Claude Nagger"
+        )
+
+    return {
+        "status": status,
+        "target": str(target),
+        "nagger_dir": str(nagger_dir),
+        "manifest_tracks_nagger": nagger_tracked,
+        "examples": examples,
+        "config_yaml": {
+            "path": str(config_path),
+            "present": config_path.exists(),
+        },
+        "next_action": next_action,
+    }
+
+
+def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:
+    """Inspect the governed preset's tmux UI snippet on the target.
+
+    Same source-of-truth contract as ``doctor_claude_nagger_section``:
+    the scaffold manifest decides whether the project installed the
+    snippet. ``skipped`` means the manifest does not track it (or
+    there is no manifest); ``ok`` means the manifest tracks it and
+    the file is on disk; ``incomplete`` means the manifest tracks it
+    but the file was removed locally (real drift).
+    """
+    tracked = _scaffold_manifest_files(target)
+    is_tracked = TMUX_UI_MANIFEST_PATH in tracked
+    snippet_path = target / TMUX_UI_RELATIVE_PATH
+    present = snippet_path.exists()
+    next_action: list[str] = []
+    if not is_tracked:
+        status = "skipped"
+        next_action.append(
+            "tmux UI helper is opt-out (manifest does not track agent-ui.conf); "
+            f"rerun `mozyo-bridge scaffold apply <preset> --target {target}` "
+            "without --skip-tmux-ui to install the snippet"
+        )
+    elif present:
+        status = "ok"
+    else:
+        status = "incomplete"
+        next_action.append(
+            f"manifest tracks {snippet_path} but the file is missing; "
+            "rerun scaffold apply --backup to restore"
+        )
+    return {
+        "status": status,
+        "path": str(snippet_path),
+        "present": present,
+        "manifest_tracks_tmux_ui": is_tracked,
+        "next_action": next_action,
+    }
+
+
 def _in_tmux() -> bool:
     return bool(os.environ.get("TMUX") or os.environ.get("TMUX_PANE"))
 
@@ -448,13 +593,21 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    tmux_section = doctor_tmux_section(args)
+    # Attach the governed-preset tmux-ui artifact state to the existing
+    # tmux section so the diagnostic surface stays small. The artifact
+    # status is independent of tmux server availability — operators
+    # without a running tmux server still need to know whether the
+    # `.mozyo-bridge/tmux/agent-ui.conf` snippet landed on the target.
+    tmux_section["artifact"] = doctor_tmux_ui_artifact_info(doctor_target(args))
     sections: dict[str, dict[str, Any]] = {
         "cli": doctor_cli_section(),
         "rules": doctor_rules_section(doctor_home(args)),
         "codex_skill": doctor_codex_skill_section(),
         "claude_skill": doctor_claude_skill_section(args),
         "scaffold": doctor_scaffold_section(args),
-        "tmux": doctor_tmux_section(args),
+        "claude_nagger": doctor_claude_nagger_section(args),
+        "tmux": tmux_section,
     }
     ok = True
     for section in sections.values():
@@ -564,10 +717,36 @@ def format_doctor_text(result: dict[str, Any]) -> str:
     for action in scaffold.get("next_action", []):
         lines.append(f"  -> {action}")
 
+    nagger = sections.get("claude_nagger") or {}
+    if nagger:
+        nagger_status_label = nagger.get("status", "unknown")
+        lines.append(
+            f"claude_nagger: {nagger_status_label} target={nagger.get('target', '-')}"
+        )
+        if "config_yaml" in nagger:
+            cfg = nagger["config_yaml"]
+            lines.append(
+                f"  config.yaml: present={cfg['present']} path={cfg['path']}"
+            )
+        for name, info in (nagger.get("examples") or {}).items():
+            lines.append(
+                f"  {name}: present={info['present']} path={info['path']}"
+            )
+        for action in nagger.get("next_action", []):
+            lines.append(f"  -> {action}")
+
     tmux = sections["tmux"]
     lines.append(f"tmux: {tmux['status']}")
     if "detail" in tmux and tmux["detail"]:
         lines.append(f"  {tmux['detail']}")
+    artifact = tmux.get("artifact") or {}
+    if artifact:
+        lines.append(
+            f"  agent-ui.conf: present={artifact['present']} "
+            f"status={artifact['status']} path={artifact['path']}"
+        )
+        for action in artifact.get("next_action", []):
+            lines.append(f"  -> {action}")
     if tmux.get("tmux_pane"):
         lines.append(f"  TMUX_PANE: {tmux['tmux_pane']}")
     if "panes_total" in tmux:

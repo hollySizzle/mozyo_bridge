@@ -1,0 +1,35 @@
+# Claude Nagger command conventions skeleton.
+#
+# Copy this file to `.claude-nagger/command_conventions.yaml` and
+# customise per project. The shipped skeleton lists only safe
+# generic command patterns; replace with project-specific risky
+# command guidance.
+#
+# Each entry attaches a message to a command pattern. The nagger
+# surfaces the message before Claude runs a matching command so the
+# operator can confirm the project rule before execution.
+
+version: 1
+
+rules:
+  # Block destructive git operations until the operator confirms.
+  - id: git-destructive
+    name: git destructive operations
+    patterns:
+      - "git reset --hard*"
+      - "git clean -fd*"
+      - "git push --force*"
+      - "git checkout -- *"
+    severity: block
+    message: >-
+      Destructive git operation. Confirm the working tree state and
+      uncommitted changes before running this command.
+
+  # Warn on bulk file deletion.
+  - id: rm-recursive
+    name: recursive removal
+    patterns:
+      - "rm -rf*"
+    severity: warn
+    message: >-
+      Recursive removal. Double-check the path before running.

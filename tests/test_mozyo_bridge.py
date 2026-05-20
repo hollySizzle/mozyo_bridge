@@ -1806,6 +1806,562 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ),
             )
 
+    def test_governed_scaffold_ships_tmux_ui_and_nagger_artifacts_by_default(self) -> None:
+        """Default `scaffold apply` writes the tmux-ui + Claude Nagger artifacts.
+
+        Both are default-on so a fresh `redmine-rails-governed` install
+        carries the agent-window status snippet and the Claude Nagger
+        skeleton. The artifacts land under the standard governed paths
+        and are tracked in the scaffold manifest.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.assertEqual(0, result)
+            for expected_path in (
+                ".mozyo-bridge/tmux/agent-ui.conf",
+                ".claude-nagger/config.yaml.example",
+                ".claude-nagger/command_conventions.yaml.example",
+                ".claude-nagger/mcp_conventions.yaml.example",
+                ".claude-nagger/.gitignore",
+            ):
+                self.assertTrue(
+                    (project / expected_path).exists(),
+                    msg=f"default scaffold did not write {expected_path}",
+                )
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            tracked = set(state["files"].keys())
+            for tracked_path in (
+                ".mozyo-bridge/tmux/agent-ui.conf",
+                ".claude-nagger/config.yaml.example",
+                ".claude-nagger/command_conventions.yaml.example",
+                ".claude-nagger/mcp_conventions.yaml.example",
+                ".claude-nagger/.gitignore",
+            ):
+                self.assertIn(
+                    tracked_path,
+                    tracked,
+                    msg=f"manifest does not track {tracked_path}",
+                )
+
+    def test_governed_doctor_reports_skipped_after_skip_with_backup(self) -> None:
+        """`--skip-* --backup` opt-out: doctor must use the manifest, not disk.
+
+        `--backup` leaves `.bak.<timestamp>` files inside the
+        `.claude-nagger/` directory after the opt-out unlink. A doctor
+        that checks disk state alone would see the directory still
+        exists with the original example files missing and report
+        `incomplete`, even though the operator deliberately opted out.
+        Reading the manifest as source-of-truth keeps the diagnosis
+        consistent with operator intent.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            # Default install first so the next apply has something to
+            # reconcile away under --backup.
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            # Opt-out under --backup. The reconcile path stashes the
+            # tracked artifacts as `.bak.<timestamp>` and unlinks the
+            # originals, leaving the directory in a "backups only"
+            # state that confuses any disk-only check.
+            apply_result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--skip-tmux-ui",
+                    "--skip-nagger",
+                    "--backup",
+                ]
+            )
+            self.assertEqual(0, apply_result)
+
+            # Backup files must still be there (--backup contract); the
+            # manifest must NOT track the .claude-nagger/* / tmux/* paths.
+            self.assertTrue(
+                list((project / ".claude-nagger").glob("*.bak.*")),
+                msg="--backup did not leave any backup files",
+            )
+            self.assertFalse(
+                (project / ".claude-nagger/config.yaml.example").exists()
+            )
+            state = scaffold_state(project)
+            assert state is not None
+            tracked = set(state["files"].keys())
+            self.assertFalse(
+                any(p.startswith(".claude-nagger/") for p in tracked)
+            )
+            self.assertNotIn(".mozyo-bridge/tmux/agent-ui.conf", tracked)
+
+            # Doctor must read manifest, see no nagger / no tmux UI
+            # tracked, and report `skipped` for both. Overall doctor
+            # must stay `ok` — opt-out is not a failure mode.
+            _, output = self.run_cli(
+                [
+                    "doctor",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            payload = json.loads(output)
+            self.assertEqual(
+                "skipped",
+                payload["sections"]["claude_nagger"]["status"],
+                msg=(
+                    "doctor reported nagger status based on disk debris "
+                    "instead of the manifest: "
+                    f"{payload['sections']['claude_nagger']}"
+                ),
+            )
+            self.assertEqual(
+                "skipped",
+                payload["sections"]["tmux"]["artifact"]["status"],
+            )
+            # The new manifest_tracks_* booleans expose the source-of-
+            # truth signal so downstream tooling can rely on it too.
+            self.assertFalse(
+                payload["sections"]["claude_nagger"]["manifest_tracks_nagger"]
+            )
+            self.assertFalse(
+                payload["sections"]["tmux"]["artifact"]["manifest_tracks_tmux_ui"]
+            )
+
+    def test_governed_doctor_reports_incomplete_for_real_drift(self) -> None:
+        """Manifest tracks the artifact but it was removed → `incomplete`.
+
+        Confirms that the manifest-driven doctor still catches genuine
+        drift (operator deleted a tracked file by accident), not just
+        the opt-out case. Without this assertion the move to manifest
+        source-of-truth could silently swallow real failures.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            # Delete one tracked nagger example and the tmux snippet.
+            (project / ".claude-nagger/config.yaml.example").unlink()
+            (project / ".mozyo-bridge/tmux/agent-ui.conf").unlink()
+
+            _, output = self.run_cli(
+                [
+                    "doctor",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            payload = json.loads(output)
+            self.assertEqual(
+                "incomplete",
+                payload["sections"]["claude_nagger"]["status"],
+            )
+            self.assertEqual(
+                "incomplete",
+                payload["sections"]["tmux"]["artifact"]["status"],
+            )
+            self.assertFalse(payload["ok"])  # overall non-ok per BAD set
+
+    def test_governed_scaffold_skip_after_default_apply_removes_stale_artifacts(self) -> None:
+        """Re-applying with `--skip-*` must clean up previously-installed files.
+
+        Earlier behaviour dropped the entries from the new manifest but
+        left the on-disk artifacts in place, so `scaffold status`
+        falsely reported `clean` while `.claude-nagger/` and
+        `.mozyo-bridge/tmux/` files still existed. The reconcile path
+        compares the previous manifest's tracked set with the new
+        render and treats the gap as outgoing files. `--backup` /
+        `--force` gates the destructive removal, same as the
+        overwrite path for routers and extras.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            # Default apply lays down both governed default-on bundles.
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            for tracked_path in (
+                ".mozyo-bridge/tmux/agent-ui.conf",
+                ".claude-nagger/config.yaml.example",
+            ):
+                self.assertTrue((project / tracked_path).exists())
+
+            # A bare re-apply with the opt-out flags must refuse to
+            # remove existing files silently. This is the same
+            # contract as overwriting routers without --backup/--force.
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            "redmine-rails-governed",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                            "--skip-tmux-ui",
+                            "--skip-nagger",
+                        ]
+                    )
+            err = stderr.getvalue()
+            self.assertIn("refusing to overwrite existing scaffold files", err)
+            self.assertIn(".claude-nagger/config.yaml.example", err)
+            self.assertIn(".mozyo-bridge/tmux/agent-ui.conf", err)
+
+            # With --backup, the removal proceeds and previously-tracked
+            # artifacts are stashed to `.bak.<timestamp>` next to the
+            # original paths before deletion. The backups stay on disk
+            # so the directories may still exist, but the originals
+            # themselves must be gone (otherwise the opt-out is a no-op).
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--skip-tmux-ui",
+                    "--skip-nagger",
+                    "--backup",
+                ]
+            )
+            self.assertEqual(0, result)
+            self.assertFalse(
+                (project / ".claude-nagger/config.yaml.example").exists()
+            )
+            self.assertFalse(
+                (project / ".mozyo-bridge/tmux/agent-ui.conf").exists()
+            )
+            # Backups landed next to the original paths.
+            self.assertTrue(
+                list((project / ".claude-nagger").glob("config.yaml.example.bak.*"))
+            )
+            self.assertTrue(
+                list((project / ".mozyo-bridge/tmux").glob("agent-ui.conf.bak.*"))
+            )
+
+            # Manifest reflects reality: only the kept categories.
+            state = scaffold_state(project)
+            assert state is not None
+            tracked = set(state["files"].keys())
+            self.assertNotIn(".claude-nagger/config.yaml.example", tracked)
+            self.assertNotIn(".mozyo-bridge/tmux/agent-ui.conf", tracked)
+            self.assertIn(".mozyo-bridge/rules/development_flow.md", tracked)
+
+            # And status is genuinely clean — not just nominally clean
+            # while stale files remain.
+            status_result, status_output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, status_result)
+            self.assertIn("result: clean", status_output)
+
+    def test_governed_tmux_snippet_evaluates_without_duplicate_status(self) -> None:
+        """Sourcing the snippet under tmux must not duplicate status output.
+
+        The earlier `set -wga` revision left the default fallback
+        (`#I:#W`) in place when the codex-conditional line appended,
+        producing strings like `0:codex#[fg=colour67]0:codex#[default]`
+        on codex windows. The nested-conditional form must render
+        exactly one branch per window name. Skip when no tmux binary
+        is available on PATH (CI environments without tmux still keep
+        the unit-level expectations green via the static checks above).
+        """
+        import shutil as _shutil
+        import subprocess
+
+        if _shutil.which("tmux") is None:
+            self.skipTest("tmux binary not on PATH")
+
+        snippet = (
+            Path(__file__).resolve().parents[1]
+            / "src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/.mozyo-bridge/tmux/agent-ui.conf"
+        )
+        self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
+
+        # Use a dedicated tmux socket so concurrent test runs / the
+        # operator's real tmux server are not touched.
+        socket = f"mozyo-audit-{os.getpid()}"
+        env = os.environ.copy()
+        env.pop("TMUX", None)
+        env.pop("TMUX_PANE", None)
+
+        def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["tmux", "-L", socket, *argv],
+                capture_output=True,
+                text=True,
+                check=check,
+                env=env,
+            )
+
+        # Best-effort cleanup of any prior server on the same socket.
+        subprocess.run(
+            ["tmux", "-L", socket, "kill-server"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        try:
+            tmux("-f", "/dev/null", "new-session", "-d", "-s", "audit", "-n", "codex", "sleep 60")
+            tmux("source-file", str(snippet))
+            fmt = tmux("show-options", "-gqv", "window-status-format").stdout.strip()
+            self.assertTrue(fmt, msg="window-status-format was empty after source-file")
+
+            def render(window_name: str) -> str:
+                tmux("rename-window", "-t", "audit:0", window_name)
+                return tmux("display-message", "-p", "-t", f"audit:{window_name}", fmt).stdout.strip()
+
+            codex = render("codex")
+            other = render("other")
+            claude = render("claude")
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket, "kill-server"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+        # No duplicated output: each rendered string contains the
+        # window name exactly once. The earlier bug yielded
+        # "0:codex#[fg=colour67]0:codex#[default]" — count == 2.
+        self.assertEqual(1, codex.count(":codex"), msg=f"codex render duplicated: {codex!r}")
+        self.assertEqual(1, claude.count(":claude"), msg=f"claude render duplicated: {claude!r}")
+        self.assertEqual(1, other.count(":other"), msg=f"other render duplicated: {other!r}")
+
+        # Agent windows carry the expected colour code; non-agent
+        # windows render plain (no colour escape).
+        self.assertIn("colour67", codex)
+        self.assertIn("colour108", claude)
+        self.assertNotIn("colour", other)
+
+    def test_governed_scaffold_skip_flags_omit_artifacts_and_manifest_entries(self) -> None:
+        """`--skip-tmux-ui` / `--skip-nagger` opt-outs drop the category.
+
+        The dropped category neither lands on disk nor appears in the
+        manifest, so a clean `scaffold status` afterwards confirms the
+        opt-out is consistent (no drift detected from the missing files
+        because the manifest never claimed them).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--skip-tmux-ui",
+                    "--skip-nagger",
+                ]
+            )
+            self.assertEqual(0, result)
+
+            # Skipped artifacts never landed.
+            self.assertFalse(
+                (project / ".mozyo-bridge/tmux/agent-ui.conf").exists()
+            )
+            self.assertFalse((project / ".claude-nagger").exists())
+
+            # Non-skipped artifacts still ship — opt-outs are scoped.
+            self.assertTrue(
+                (project / ".mozyo-bridge/rules/development_flow.md").exists()
+            )
+            self.assertTrue(
+                (project / ".mozyo-bridge/tools/validate_catalog.py").exists()
+            )
+
+            # Manifest tracks only what was written; status stays clean
+            # because the manifest never claimed the skipped files.
+            state = scaffold_state(project)
+            assert state is not None
+            tracked = set(state["files"].keys())
+            self.assertNotIn(".mozyo-bridge/tmux/agent-ui.conf", tracked)
+            for nagger in (
+                ".claude-nagger/config.yaml.example",
+                ".claude-nagger/command_conventions.yaml.example",
+                ".claude-nagger/mcp_conventions.yaml.example",
+                ".claude-nagger/.gitignore",
+            ):
+                self.assertNotIn(nagger, tracked)
+            # Non-skipped categories still tracked.
+            self.assertIn(".mozyo-bridge/rules/development_flow.md", tracked)
+
+            status_result, status_output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, status_result)
+            self.assertIn("result: clean", status_output)
+
+    def test_governed_doctor_reports_nagger_and_tmux_ui_artifact_state(self) -> None:
+        """`doctor` surfaces tmux-ui + Claude Nagger artifact state.
+
+        After a default `scaffold apply`, both the new `claude_nagger`
+        section and the artifact attachment on the `tmux` section show
+        the skeleton + snippet as present.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            result, output = self.run_cli(
+                [
+                    "doctor",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            payload = json.loads(output)
+            sections = payload["sections"]
+            self.assertIn("claude_nagger", sections)
+            nagger = sections["claude_nagger"]
+            # Skeleton landed but config.yaml is not yet copied — the
+            # default-on apply puts the example next to the target's
+            # config slot.
+            self.assertEqual("skeleton-only", nagger["status"])
+            for name in (
+                "config.yaml.example",
+                "command_conventions.yaml.example",
+                "mcp_conventions.yaml.example",
+            ):
+                self.assertTrue(
+                    nagger["examples"][name]["present"],
+                    msg=f"doctor did not see {name}",
+                )
+            self.assertFalse(nagger["config_yaml"]["present"])
+
+            tmux = sections["tmux"]
+            self.assertIn("artifact", tmux)
+            self.assertTrue(tmux["artifact"]["present"])
+            self.assertEqual("ok", tmux["artifact"]["status"])
+
+            # And after opt-out, doctor reports `skipped`.
+            project_skip = Path(tmp) / "project_skip"
+            project_skip.mkdir()
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project_skip),
+                    "--home",
+                    str(home),
+                    "--skip-nagger",
+                    "--skip-tmux-ui",
+                ]
+            )
+            _, skip_output = self.run_cli(
+                [
+                    "doctor",
+                    "--target",
+                    str(project_skip),
+                    "--home",
+                    str(home),
+                    "--json",
+                ]
+            )
+            skip_payload = json.loads(skip_output)
+            self.assertEqual(
+                "skipped", skip_payload["sections"]["claude_nagger"]["status"]
+            )
+            self.assertEqual(
+                "skipped",
+                skip_payload["sections"]["tmux"]["artifact"]["status"],
+            )
+
     def test_governed_preset_artifacts_ship_in_built_wheel(self) -> None:
         """The governed preset's repo-local artifacts must end up in the wheel.
 
@@ -1848,19 +2404,25 @@ class ScaffoldRulesTest(unittest.TestCase):
             governed_prefix = (
                 "mozyo_bridge/scaffold/presets/redmine-rails-governed/"
             )
-            files_prefix = governed_prefix + "files/.mozyo-bridge/"
+            mb_prefix = governed_prefix + "files/.mozyo-bridge/"
+            nagger_prefix = governed_prefix + "files/.claude-nagger/"
             expected = [
                 governed_prefix + "VERSION",
                 governed_prefix + "agent-workflow.md",
-                files_prefix + "rules/development_flow.md",
-                files_prefix + "rules/llm_rule_authoring.md",
-                files_prefix + "rules/docs_catalog_governance.yaml",
-                files_prefix + "docs/catalog.yaml.example",
-                files_prefix + "tools/docs_catalog.py",
-                files_prefix + "tools/validate_catalog.py",
-                files_prefix + "tools/resolve_audit_docs.py",
-                files_prefix + "tools/generate_file_conventions.py",
-                files_prefix + "tools/audit_doc_impact.py",
+                mb_prefix + "rules/development_flow.md",
+                mb_prefix + "rules/llm_rule_authoring.md",
+                mb_prefix + "rules/docs_catalog_governance.yaml",
+                mb_prefix + "docs/catalog.yaml.example",
+                mb_prefix + "tools/docs_catalog.py",
+                mb_prefix + "tools/validate_catalog.py",
+                mb_prefix + "tools/resolve_audit_docs.py",
+                mb_prefix + "tools/generate_file_conventions.py",
+                mb_prefix + "tools/audit_doc_impact.py",
+                mb_prefix + "tmux/agent-ui.conf",
+                nagger_prefix + "config.yaml.example",
+                nagger_prefix + "command_conventions.yaml.example",
+                nagger_prefix + "mcp_conventions.yaml.example",
+                nagger_prefix + ".gitignore",
             ]
             missing = [entry for entry in expected if entry not in names]
             self.assertEqual(
