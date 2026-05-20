@@ -399,6 +399,26 @@ re-sync の標準フロー:
 
 `redmine-rails` preset には `Project-Local Layer (do not erase on scaffold apply)` / `Project-Local Layer Apply Discipline` / `Active-Doc Resolver Concept` / `Dangerous DB / Test Command Category` / `Presenter / YAML / Doc-Readonly Category` / `Project Tooling / Local Skill / Role-Boundary Override Category` セクションがあり、project-local layer に何を書くべきかをカテゴリで列挙しています。具体的な path / command / 環境変数は preset 側に焼き込まれないので、別 repo に apply しても誤誘導になりません。
 
+#### `redmine-rails-governed`: full guardrail governance package
+
+`redmine-rails-governed` preset は `redmine-rails` を extends する full governance 向けの opt-in preset です。`redmine-rails` の薄い preset では project-local layer に書くことが推奨されていた強い文言を preset 側で正本にし、scaffold 時に target repo の `.mozyo-bridge/` 配下に repo-local rules / tools / catalog skeleton を配布します。
+
+```bash
+mozyo-bridge scaffold apply redmine-rails-governed --target /path/to/repo
+```
+
+apply すると、router 一式に加えて以下が target repo に書き込まれます。
+
+- `.mozyo-bridge/rules/development_flow.md` — agent role、編集権限、gate schema、Codex direct edit gate の正本。
+- `.mozyo-bridge/rules/llm_rule_authoring.md` — LLM 向け規約文書の作成・分離・構造化の正本。
+- `.mozyo-bridge/rules/docs_catalog_governance.yaml` — docs catalog、resolver、generator、impact check の統治規約。
+- `.mozyo-bridge/docs/catalog.yaml.example` — 初期 catalog skeleton。target 側で `catalog.yaml` にコピーして埋める。
+- `.mozyo-bridge/tools/{docs_catalog,validate_catalog,resolve_audit_docs,generate_file_conventions,audit_doc_impact}.py` — catalog 統治用 Python tools。
+
+これらは scaffold preset 側を正本とし、`mozyo-bridge scaffold status` が drift を検出します。target 側で個別に編集したい場合は preset へ upstream し、`mozyo-bridge scaffold apply --backup` で再配布してください。configured catalog (`catalog.yaml`) は scaffold が触らないため、project 固有 docs / file_conventions を埋めても上書きされません。`mozyo-bridge scaffold apply --backup` は shipped artifacts も含めて pre-existing files を `.bak.<timestamp>` に退避します。
+
+`redmine-rails` を選んだ project が後から full governance に乗り換える場合は、`mozyo-bridge scaffold apply redmine-rails-governed --target . --backup` で切り替えられます。
+
 
 After upgrading mozyo-bridge (e.g. `pipx upgrade mozyo-bridge && mozyo-bridge rules install`), check each scaffolded project for drift:
 

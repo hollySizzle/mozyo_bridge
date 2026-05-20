@@ -1148,6 +1148,620 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("redmine-rails", state["preset"])
             self.assertEqual("2026.05.18.4", state["preset_version"])
 
+    def test_rules_install_and_scaffold_redmine_rails_governed_full_package(self) -> None:
+        """The governed preset must ship a full guardrail package.
+
+        The central preset must surface strong governance language —
+        gate schema, Codex direct edit gate, docs catalog governance,
+        LLM rule authoring — without leaking nihonidenshi-specific names,
+        paths, or business-domain identifiers. `scaffold apply` must
+        write the repo-local rules / tools / catalog skeleton into the
+        target repository so the package is usable out of the box.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, _ = self.run_cli(["rules", "install", "--home", str(home)])
+            self.assertEqual(0, result)
+            governed_workflow = (
+                home / "rules" / "presets" / "redmine-rails-governed" / "agent-workflow.md"
+            )
+            self.assertTrue(governed_workflow.exists())
+            installed = governed_workflow.read_text(encoding="utf-8")
+
+            # Strong governance language must survive the de-domain pass.
+            for marker in (
+                "Redmine Rails Governed Agent Workflow",
+                "rules/presets/redmine/agent-workflow.md",
+                "rules/presets/redmine-rails/agent-workflow.md",
+                "Scaffolded Repo-Local Artifacts",
+                ".mozyo-bridge/rules/development_flow.md",
+                ".mozyo-bridge/rules/llm_rule_authoring.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                ".mozyo-bridge/tools/resolve_audit_docs.py",
+                "Gate Schema",
+                "Codex Direct Edit Gate",
+                "codex_direct_edit",
+                "allowed_paths",
+                "follow_up_review",
+                "Docs Catalog Governance",
+                "Active-Doc Resolver",
+                "LLM Rule Authoring",
+                "Required Verification",
+                "Close Approval Separation",
+                "Governed Mode Prohibitions",
+            ):
+                self.assertIn(marker, installed)
+
+            # Regression rails: nihonidenshi-specific business domain,
+            # paths, and project identifiers must not leak into the
+            # generalized preset.
+            for forbidden in (
+                "nihonidenshi",
+                "idenshi_youbou",
+                "jgmlife",
+                "/myapp/Source/rails",
+                "/myapp/Doc",
+                "NIPT",
+                "検査依頼",
+                "検体",
+                "帳票",
+                "判定",
+                "集荷",
+                "_機能リスト.json",
+                "FeatureList",
+                ".claude-nagger",
+                "vibes/docs/tools",
+                "bin/recreate_db.sh",
+                "bin/sync-mozyo-bridge-skill",
+            ):
+                self.assertNotIn(forbidden, installed)
+
+            # `scaffold apply` writes the governance artifacts under
+            # .mozyo-bridge/ in the target repo so the package is
+            # immediately usable.
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.assertEqual(0, result)
+            for expected_path in (
+                ".mozyo-bridge/rules/development_flow.md",
+                ".mozyo-bridge/rules/llm_rule_authoring.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                ".mozyo-bridge/tools/docs_catalog.py",
+                ".mozyo-bridge/tools/validate_catalog.py",
+                ".mozyo-bridge/tools/resolve_audit_docs.py",
+                ".mozyo-bridge/tools/generate_file_conventions.py",
+                ".mozyo-bridge/tools/audit_doc_impact.py",
+            ):
+                self.assertTrue(
+                    (project / expected_path).exists(),
+                    msg=f"governed scaffold did not write {expected_path}",
+                )
+
+            # Strong language survives into the shipped repo-local rule
+            # files too. Verifying once across files is enough — the de-
+            # domain regression rails above already guard the workflow doc.
+            dev_flow = (project / ".mozyo-bridge/rules/development_flow.md").read_text(
+                encoding="utf-8"
+            )
+            for marker in (
+                "codex_direct_edit",
+                "allowed_paths",
+                "implementation_done",
+                "owner_close_approval",
+                "禁止_並行表現",
+            ):
+                self.assertIn(marker, dev_flow)
+
+            # The catalog example references the shipped rule files only,
+            # never the nihonidenshi domain catalog ids.
+            catalog_example = (
+                project / ".mozyo-bridge/docs/catalog.yaml.example"
+            ).read_text(encoding="utf-8")
+            for marker in (
+                "rule-mozyo-bridge-development-flow",
+                "rule-llm-rule-authoring",
+                "rule-docs-catalog-governance",
+                ".mozyo-bridge/rules/development_flow.md",
+            ):
+                self.assertIn(marker, catalog_example)
+            for forbidden in ("NIPT", "_機能リスト", "nihonidenshi"):
+                self.assertNotIn(forbidden, catalog_example)
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("redmine-rails-governed", state["preset"])
+            # Every shipped extra is tracked in the manifest so `scaffold
+            # status` can detect drift after operators edit the file.
+            tracked_files = set(state["files"].keys())
+            for expected in (
+                "AGENTS.md",
+                "CLAUDE.md",
+                ".mozyo-bridge/rules/development_flow.md",
+                ".mozyo-bridge/tools/validate_catalog.py",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+            ):
+                self.assertIn(expected, tracked_files)
+
+    def test_governed_scaffold_refuses_to_silently_overwrite_shipped_artifacts(self) -> None:
+        """Shipped governance artifacts are protected from silent overwrite.
+
+        Operators must opt in with `--backup` or `--force`, same as the
+        router pair, because the file body may carry local edits even
+        though the preset side is the source of truth.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.assertEqual(0, result)
+
+            # Second apply without --backup / --force must refuse rather
+            # than clobber the shipped artifacts the operator may have
+            # touched between applies.
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            "redmine-rails-governed",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+            err = stderr.getvalue()
+            self.assertIn("refusing to overwrite existing scaffold files", err)
+            self.assertIn(".mozyo-bridge/rules/development_flow.md", err)
+
+            # --backup re-runs the apply and stashes the pre-existing file.
+            backup_result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--backup",
+                ]
+            )
+            self.assertEqual(0, backup_result)
+            self.assertTrue(
+                list((project / ".mozyo-bridge/rules").glob("development_flow.md.bak.*"))
+            )
+
+    def test_governed_scaffold_status_clean_after_fresh_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            result, output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, result)
+            self.assertIn("preset: redmine-rails-governed", output)
+            self.assertIn("result: clean", output)
+
+    def test_governed_scaffold_tools_resolve_against_shipped_catalog_example(self) -> None:
+        """The shipped resolver + validator must work on the catalog skeleton.
+
+        We treat the example as the project's catalog (copy
+        `catalog.yaml.example` to `catalog.yaml`) and assert that both
+        tools execute cleanly without invoking the mozyo-bridge CLI.
+        Operators rely on this round-trip so the governance package is
+        usable the moment scaffold finishes.
+        """
+        import shutil as _shutil
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            example = project / ".mozyo-bridge/docs/catalog.yaml.example"
+            catalog = project / ".mozyo-bridge/docs/catalog.yaml"
+            _shutil.copyfile(example, catalog)
+
+            tools = project / ".mozyo-bridge/tools"
+            # Use the running interpreter so the subprocess inherits the
+            # same PyYAML installation the test framework relies on.
+            python = sys.executable
+            validate_proc = subprocess.run(
+                [python, str(tools / "validate_catalog.py")],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                validate_proc.returncode,
+                msg=(
+                    "validate_catalog.py failed against the shipped skeleton:\n"
+                    f"stdout={validate_proc.stdout}\nstderr={validate_proc.stderr}"
+                ),
+            )
+            self.assertIn("catalog validation passed", validate_proc.stdout)
+
+            # `--check-file-coverage` must not exit non-zero when the
+            # default Rails coverage roots are absent. The validator
+            # treats missing roots as `notice:` lines (informational)
+            # so a fresh Rails project (or a non-Rails project) can run
+            # the gate the governed workflow requires without failing
+            # purely on missing default layers.
+            coverage_proc = subprocess.run(
+                [python, str(tools / "validate_catalog.py"), "--check-file-coverage"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                coverage_proc.returncode,
+                msg=(
+                    "validate_catalog.py --check-file-coverage failed on missing roots:\n"
+                    f"stdout={coverage_proc.stdout}\nstderr={coverage_proc.stderr}"
+                ),
+            )
+            # The notice line is printed but does not block.
+            self.assertIn("notice:", coverage_proc.stdout)
+            self.assertIn("catalog validation passed", coverage_proc.stdout)
+
+            # Resolver returns the agent-guardrail file_convention's
+            # document_refs when asked about a rule file the catalog
+            # already names.
+            resolve_proc = subprocess.run(
+                [
+                    python,
+                    str(tools / "resolve_audit_docs.py"),
+                    ".mozyo-bridge/rules/development_flow.md",
+                    "--format",
+                    "json",
+                ],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, resolve_proc.returncode, msg=resolve_proc.stderr)
+            import json as _json
+
+            results = _json.loads(resolve_proc.stdout)
+            self.assertEqual(1, len(results))
+            resolved_ids = {doc["id"] for doc in results[0]["documents"]}
+            self.assertIn("rule-mozyo-bridge-development-flow", resolved_ids)
+            self.assertIn("rule-docs-catalog-governance", resolved_ids)
+            self.assertIn("rule-llm-rule-authoring", resolved_ids)
+
+            # Drift check sees the freshly written generated file as up
+            # to date (after one generation). This exercises the
+            # round-trip catalog -> generator -> drift check chain.
+            gen_path = project / ".mozyo-bridge/docs/file_conventions.generated.yaml"
+            subprocess.run(
+                [python, str(tools / "generate_file_conventions.py")],
+                cwd=project,
+                check=True,
+            )
+            self.assertTrue(gen_path.exists())
+            drift_proc = subprocess.run(
+                [python, str(tools / "generate_file_conventions.py"), "--check"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, drift_proc.returncode, msg=drift_proc.stderr)
+
+    def test_preset_files_walker_skips_pycache_and_pyc(self) -> None:
+        """The scaffold walker must drop pip-generated bytecode cruft.
+
+        When the wheel is `pip install`ed, pip can byte-compile shipped
+        `.py` files and place `.pyc` files under `__pycache__/` directories
+        next to them. The walker previously tried to decode every file as
+        UTF-8 and crashed with `UnicodeDecodeError` on the `.pyc` bytes.
+        We inject the cruft into the source tree and assert the walker
+        skips it without crashing.
+        """
+        from mozyo_bridge.scaffold.rules import render_preset_extra_files
+
+        tools_dir = (
+            Path(__file__).resolve().parents[1]
+            / "src/mozyo_bridge/scaffold/presets"
+            / "redmine-rails-governed/files/.mozyo-bridge/tools"
+        )
+        fake_pycache = tools_dir / "__pycache__"
+        fake_pyc = fake_pycache / "docs_catalog.cpython-314.pyc"
+        fake_pycache.mkdir(exist_ok=True)
+        try:
+            fake_pyc.write_bytes(b"\x82\x82\x82bogus pyc bytes")
+            extras = render_preset_extra_files("redmine-rails-governed")
+            paths = {item.path.as_posix() for item in extras}
+            # No __pycache__ entry and no .pyc entry leak through.
+            self.assertFalse(
+                any("__pycache__" in p for p in paths),
+                msg=f"walker leaked __pycache__/* entries: {sorted(paths)}",
+            )
+            self.assertFalse(
+                any(p.endswith(".pyc") for p in paths),
+                msg=f"walker leaked .pyc entries: {sorted(paths)}",
+            )
+            # And the legitimate `.py` source under the same directory
+            # still surfaces — we only filter cache cruft, not real files.
+            self.assertIn(".mozyo-bridge/tools/docs_catalog.py", paths)
+        finally:
+            import shutil as _shutil
+
+            _shutil.rmtree(fake_pycache, ignore_errors=True)
+
+    def test_governed_scaffold_apply_succeeds_after_wheel_install(self) -> None:
+        """End-to-end: build wheel, pip install to a venv, run scaffold apply.
+
+        Earlier iterations passed when running from the source tree but
+        crashed under a real pip install because pip wrote `__pycache__/*.pyc`
+        files next to the shipped catalog tools and the scaffold walker
+        tried to decode them as UTF-8. This test mirrors that exact path
+        so we don't regress.
+        """
+        import subprocess
+        import venv as _venv
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp) / "dist"
+            dist.mkdir()
+            build_proc = subprocess.run(
+                [sys.executable, "-m", "build", "--wheel", "--outdir", str(dist)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            if build_proc.returncode != 0:
+                self.skipTest(
+                    "python -m build failed (probably missing build backend deps); "
+                    f"stderr={build_proc.stderr[:500]}"
+                )
+            wheels = list(dist.glob("mozyo_bridge-*.whl"))
+            self.assertEqual(1, len(wheels), msg=f"unexpected wheels: {wheels}")
+
+            venv_dir = Path(tmp) / "venv"
+            try:
+                _venv.EnvBuilder(with_pip=True, clear=True).create(venv_dir)
+            except subprocess.CalledProcessError as exc:
+                # Some Python distributions (e.g. uv-managed runtimes) abort
+                # in ensurepip. The integration test still has value on CI
+                # where venv works; skip when it doesn't rather than mask
+                # the underlying regression.
+                self.skipTest(f"venv with pip could not be created: {exc}")
+            venv_python = venv_dir / "bin" / "python"
+            venv_bin = venv_dir / "bin" / "mozyo-bridge"
+            self.assertTrue(venv_python.exists(), msg=f"venv python missing: {venv_python}")
+
+            install_proc = subprocess.run(
+                [str(venv_python), "-m", "pip", "install", "-q", str(wheels[0])],
+                capture_output=True,
+                text=True,
+            )
+            if install_proc.returncode != 0:
+                self.skipTest(
+                    "pip install of the built wheel failed (no network or build deps "
+                    f"missing): stderr={install_proc.stderr[:500]}"
+                )
+            self.assertTrue(venv_bin.exists(), msg=f"mozyo-bridge entry-point missing: {venv_bin}")
+
+            home_dir = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            rules_proc = subprocess.run(
+                [str(venv_bin), "rules", "install", "--home", str(home_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                rules_proc.returncode,
+                msg=(
+                    "rules install failed post-wheel-install:\n"
+                    f"stdout={rules_proc.stdout}\nstderr={rules_proc.stderr}"
+                ),
+            )
+
+            apply_proc = subprocess.run(
+                [
+                    str(venv_bin),
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home_dir),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                apply_proc.returncode,
+                msg=(
+                    "scaffold apply failed post-wheel-install (this is the path "
+                    "where pip's __pycache__/*.pyc files break the walker):\n"
+                    f"stdout={apply_proc.stdout}\nstderr={apply_proc.stderr}"
+                ),
+            )
+
+            # Every shipped governance artifact must land in the target
+            # after a real wheel install, not just under the source tree.
+            for expected_path in (
+                ".mozyo-bridge/rules/development_flow.md",
+                ".mozyo-bridge/rules/llm_rule_authoring.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                ".mozyo-bridge/tools/docs_catalog.py",
+                ".mozyo-bridge/tools/validate_catalog.py",
+                ".mozyo-bridge/tools/resolve_audit_docs.py",
+                ".mozyo-bridge/tools/generate_file_conventions.py",
+                ".mozyo-bridge/tools/audit_doc_impact.py",
+            ):
+                self.assertTrue(
+                    (project / expected_path).exists(),
+                    msg=f"post-install scaffold did not write {expected_path}",
+                )
+
+            # And no `.pyc` / `__pycache__` cruft should leak into the
+            # target tree — the walker skips them.
+            stray_pyc = list(project.rglob("*.pyc"))
+            stray_cache = list(project.rglob("__pycache__"))
+            self.assertEqual([], stray_pyc, msg=f"unexpected .pyc copied: {stray_pyc}")
+            self.assertEqual(
+                [], stray_cache, msg=f"unexpected __pycache__ copied: {stray_cache}"
+            )
+
+            # Smoke: the catalog tools shipped by the post-install
+            # scaffold actually run against the catalog skeleton.
+            import shutil as _shutil
+
+            _shutil.copyfile(
+                project / ".mozyo-bridge/docs/catalog.yaml.example",
+                project / ".mozyo-bridge/docs/catalog.yaml",
+            )
+            validate_proc = subprocess.run(
+                [
+                    str(venv_python),
+                    str(project / ".mozyo-bridge/tools/validate_catalog.py"),
+                ],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                validate_proc.returncode,
+                msg=(
+                    "post-install validate_catalog.py failed:\n"
+                    f"stdout={validate_proc.stdout}\nstderr={validate_proc.stderr}"
+                ),
+            )
+
+    def test_governed_preset_artifacts_ship_in_built_wheel(self) -> None:
+        """The governed preset's repo-local artifacts must end up in the wheel.
+
+        setuptools' glob for `package-data` skips hidden directories by
+        default, so the package-data spec must enumerate the `.mozyo-bridge/`
+        subtree explicitly. We build a real wheel via `python -m build`
+        and assert every shipped artifact ends up inside the wheel; this
+        guards against regressions where the source tree builds locally
+        but the wheel released to PyPI is silently missing the governance
+        package.
+        """
+        import subprocess
+        import zipfile
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "dist"
+            out_dir.mkdir()
+            build_proc = subprocess.run(
+                [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            if build_proc.returncode != 0:
+                self.skipTest(
+                    "python -m build failed (probably missing build backend deps); "
+                    f"stderr={build_proc.stderr[:500]}"
+                )
+            wheels = list(out_dir.glob("mozyo_bridge-*.whl"))
+            self.assertEqual(
+                1,
+                len(wheels),
+                msg=f"expected exactly one wheel under {out_dir}, found {wheels}",
+            )
+
+            with zipfile.ZipFile(wheels[0]) as wheel:
+                names = set(wheel.namelist())
+
+            governed_prefix = (
+                "mozyo_bridge/scaffold/presets/redmine-rails-governed/"
+            )
+            files_prefix = governed_prefix + "files/.mozyo-bridge/"
+            expected = [
+                governed_prefix + "VERSION",
+                governed_prefix + "agent-workflow.md",
+                files_prefix + "rules/development_flow.md",
+                files_prefix + "rules/llm_rule_authoring.md",
+                files_prefix + "rules/docs_catalog_governance.yaml",
+                files_prefix + "docs/catalog.yaml.example",
+                files_prefix + "tools/docs_catalog.py",
+                files_prefix + "tools/validate_catalog.py",
+                files_prefix + "tools/resolve_audit_docs.py",
+                files_prefix + "tools/generate_file_conventions.py",
+                files_prefix + "tools/audit_doc_impact.py",
+            ]
+            missing = [entry for entry in expected if entry not in names]
+            self.assertEqual(
+                [],
+                missing,
+                msg=(
+                    "wheel is missing governed preset artifacts (release would ship "
+                    "an empty governance package):\n  " + "\n  ".join(missing)
+                ),
+            )
+
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -1214,10 +1828,15 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             self.assertEqual(0, result)
             self.assertIn("PRESET\tSTATUS\tINSTALLED\tPACKAGED\tPATH", output)
-            self.assertEqual(["ok", "ok", "ok", "ok"], [row["status"] for row in rows])
+            self.assertEqual(["ok"] * len(rows), [row["status"] for row in rows])
             self.assertIn(f"asana\tok\t{package_version('asana')}\t{package_version('asana')}\t", output)
             self.assertIn(
                 f"redmine-rails\tok\t{package_version('redmine-rails')}\t{package_version('redmine-rails')}\t",
+                output,
+            )
+            self.assertIn(
+                f"redmine-rails-governed\tok\t{package_version('redmine-rails-governed')}\t"
+                f"{package_version('redmine-rails-governed')}\t",
                 output,
             )
             self.assertIn(str(home / "rules" / "presets" / "asana" / "agent-workflow.md"), output)
@@ -4839,6 +5458,7 @@ class DoctorEnvironmentTest(unittest.TestCase):
                     "asana": "missing",
                     "redmine": "missing",
                     "redmine-rails": "missing",
+                    "redmine-rails-governed": "missing",
                     "none": "missing",
                 },
                 statuses,

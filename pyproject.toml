@@ -50,6 +50,16 @@ mozyo_bridge = [
     "scaffold/presets/*/CLAUDE.md",
     "scaffold/presets/*/VERSION",
     "scaffold/presets/*/agent-workflow.md",
+    # Preset-shipped repo-local artifacts under `files/`. setuptools' glob
+    # for `package-data` skips hidden directories by default, so the
+    # generic `files/**/*` pattern alone drops the `.mozyo-bridge/`
+    # subtree the governed preset ships. Enumerate the per-subdirectory
+    # patterns explicitly to keep hidden directories in the wheel.
+    "scaffold/presets/*/files/**/*",
+    "scaffold/presets/*/files/.mozyo-bridge/**/*",
+    "scaffold/presets/*/files/.mozyo-bridge/rules/*",
+    "scaffold/presets/*/files/.mozyo-bridge/docs/*",
+    "scaffold/presets/*/files/.mozyo-bridge/tools/*",
 ]
 
 [tool.pytest.ini_options]

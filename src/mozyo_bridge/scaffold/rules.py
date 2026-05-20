@@ -6,7 +6,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePath
 from string import Template
 from time import strftime
 
@@ -20,6 +20,21 @@ RULE_RELATIVE_PATH = Path("rules") / "presets"
 REPO_LOCAL_DIRNAME = ".mozyo-bridge"
 MANIFEST_RELATIVE_PATH = Path(REPO_LOCAL_DIRNAME) / "scaffold.json"
 PRESET_REGISTRY_FILENAME = "presets.yaml"
+
+# Subdirectory inside a preset package that holds repo-local artifacts
+# the scaffold should copy verbatim into the target repository in
+# addition to the router pair. Used by full-governance presets that ship
+# rule / tool / catalog skeleton files alongside the workflow document.
+PRESET_FILES_DIRNAME = "files"
+
+# Filesystem cruft inside a preset's ``files/`` subtree that must NOT be
+# copied to the target repo. `pip install` may write `__pycache__/`
+# entries next to any shipped `.py` source file (the governed preset
+# ships several catalog tools), and reading a `.pyc` as UTF-8 text
+# crashes the walker. These names / suffixes are dropped at walk time
+# regardless of how the preset directory ended up on disk.
+PRESET_FILES_SKIP_DIRS = frozenset({"__pycache__"})
+PRESET_FILES_SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 CENTRAL_MODE = "central"
 REPO_LOCAL_MODE = "repo-local"
@@ -391,6 +406,55 @@ def render_router_pair(
     return files
 
 
+def _walk_preset_files_dir(files_root) -> list[tuple[Path, str]]:
+    """Walk a preset's ``files/`` subdirectory and return (relative_path, content) pairs.
+
+    The walker uses ``importlib.resources`` semantics so the preset package
+    works whether the source tree is on disk or installed from a wheel.
+    ``files_root`` is a ``Traversable`` rooted at the preset's ``files``
+    directory; relative paths returned are POSIX-style strings rooted at
+    that directory.
+    """
+    collected: list[tuple[Path, str]] = []
+
+    def visit(traversable, relative: PurePath) -> None:
+        for child in traversable.iterdir():
+            child_rel = relative / child.name
+            if child.is_dir():
+                # Skip bytecode cache directories that pip can create
+                # next to shipped `.py` files; copying them into the
+                # target repo crashes the walker because `.pyc` is not
+                # UTF-8 text. See PRESET_FILES_SKIP_DIRS.
+                if child.name in PRESET_FILES_SKIP_DIRS:
+                    continue
+                visit(child, child_rel)
+                continue
+            if Path(child.name).suffix in PRESET_FILES_SKIP_SUFFIXES:
+                continue
+            content = child.read_text(encoding="utf-8")
+            collected.append((Path(child_rel.as_posix()), content))
+
+    if not files_root.is_dir():
+        return collected
+    visit(files_root, PurePath(""))
+    return sorted(collected, key=lambda item: item[0].as_posix())
+
+
+def render_preset_extra_files(preset: str) -> list[RenderedFile]:
+    """Return the preset's repo-local artifacts as :class:`RenderedFile`.
+
+    Returns an empty list when the preset does not ship a ``files/`` subtree.
+    The returned paths are repo-relative (e.g. ``.mozyo-bridge/rules/...``)
+    so callers can write them directly under the scaffold target.
+    """
+    preset_definition(preset)
+    files_root = package_preset_root(preset).joinpath(PRESET_FILES_DIRNAME)
+    rendered: list[RenderedFile] = []
+    for relative, content in _walk_preset_files_dir(files_root):
+        rendered.append(RenderedFile(relative, content))
+    return rendered
+
+
 def installed_preset_hash(
     preset: str,
     home: Path | None = None,
@@ -554,11 +618,13 @@ def render_scaffold_files(
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
+    extras = render_preset_extra_files(preset)
+    manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
-        manifest_content(preset, workflow_path, rendered, mode=store.mode),
+        manifest_content(preset, workflow_path, manifest_inputs, mode=store.mode),
     )
-    return rendered + [manifest]
+    return rendered + extras + [manifest]
 
 
 def write_scaffold(
@@ -578,13 +644,19 @@ def write_scaffold(
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
+    extras = render_preset_extra_files(preset)
+    manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
-        manifest_content(preset, workflow_path, rendered, mode=store.mode),
+        manifest_content(preset, workflow_path, manifest_inputs, mode=store.mode),
     )
-    all_files = rendered + [manifest]
+    all_files = rendered + extras + [manifest]
     existing = [target / item.path for item in all_files if (target / item.path).exists()]
-    protected = [path for path in existing if path.name in PROJECT_LOCAL_PRESERVED_FILENAMES]
+    # Routers (AGENTS.md / CLAUDE.md) and every preset-shipped extra are
+    # protected from silent overwrite. Only the scaffold's own manifest can
+    # be safely overwritten because it tracks the scaffold's recorded state.
+    protected_paths = {target / item.path for item in rendered + extras}
+    protected = [path for path in existing if path in protected_paths]
     if protected and not backup and not force:
         die("refusing to overwrite existing scaffold files: " + ", ".join(str(path) for path in protected))
     if dry_run:

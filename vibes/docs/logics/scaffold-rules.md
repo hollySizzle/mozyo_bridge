@@ -10,6 +10,8 @@ Supported presets:
 
 - `asana`
 - `redmine`
+- `redmine-rails` (extends `redmine`)
+- `redmine-rails-governed` (extends `redmine-rails`)
 - `none`
 
 Preset selection is explicit. `mozyo-bridge scaffold apply <preset>` applies only the chosen preset's workflow, so cross-preset policy matrices should not be duplicated in shared workflow docs. Keep each preset self-contained, and keep project-specific mandatory policies in the target project's local docs or private systems.
@@ -112,6 +114,40 @@ Asana-specific guardrails:
 - Do not require Project Custom Fields for the MVP path.
 - Do not put private Notion URLs into package templates.
 - Do not assume every Asana workspace exposes the same custom fields or comment ids.
+
+## Preset: redmine-rails-governed
+
+The `redmine-rails-governed` preset is the opt-in full guardrail governance package for Rails + Redmine projects. It extends `redmine-rails`, which in turn extends `redmine`.
+
+Where `redmine-rails` intentionally defers strong project-local rules (gate schema, docs catalog governance, active-doc resolver tooling) to the target repo's project-local layer, `redmine-rails-governed` treats the strong language and the supporting tooling as central. It is meant for projects that have decided they want the full governance package up-front, not a lightweight bootstrap.
+
+Responsibilities:
+
+- Inherit the layered router behavior from `redmine-rails`.
+- Layer additional governance language in the central `agent-workflow.md`: gate schema field requirements, Codex direct edit gate, docs catalog governance, LLM rule authoring contract, journal templates.
+- Ship a fixed set of repo-local artifacts when `scaffold apply` runs:
+  - `.mozyo-bridge/rules/development_flow.md`
+  - `.mozyo-bridge/rules/llm_rule_authoring.md`
+  - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
+  - `.mozyo-bridge/docs/catalog.yaml.example`
+  - `.mozyo-bridge/tools/{docs_catalog,validate_catalog,resolve_audit_docs,generate_file_conventions,audit_doc_impact}.py`
+- Track every shipped artifact in `.mozyo-bridge/scaffold.json` so `scaffold status` detects drift.
+- Refuse silent overwrite of any shipped artifact; `--backup` or `--force` is required, same as the router pair.
+- Avoid touching `.mozyo-bridge/docs/catalog.yaml` itself (only the `.example` file is shipped); the configured catalog stays under the operator's control.
+
+Non-goals:
+
+- Do not embed project-specific business domain identifiers (NIPT, FeatureList, customer-visible product codes) into the preset or the shipped artifacts. The catalog skeleton is generic.
+- Do not require the operator to keep a specific generated-file consumer (for example, a nagger configuration in some other directory). The generator's default output is `.mozyo-bridge/docs/file_conventions.generated.yaml`; alternative paths are caller-driven via `--output`.
+- Do not collapse the central `redmine-rails` preset into the governed preset. The lightweight `redmine-rails` preset stays a valid choice for projects that prefer to fill the governance layer themselves.
+
+Central preset doc:
+
+- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-rails-governed/agent-workflow.md`
+
+Repo-local artifacts source:
+
+- Files live under `src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/` in the package source tree. The scaffold walks this subdirectory verbatim into the target repo. Any new artifact must be packaged here (and added to `pyproject.toml` package-data) rather than hard-coded into the scaffold module.
 
 ## Preset: none
 

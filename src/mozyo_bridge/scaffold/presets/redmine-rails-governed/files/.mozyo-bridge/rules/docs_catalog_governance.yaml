@@ -1,0 +1,109 @@
+# docs catalog governance
+# mozyo-bridge redmine-rails-governed preset から配布される正本。
+
+メタ情報:
+  正本: true
+  対象:
+    - .mozyo-bridge/docs/catalog.yaml
+    - .mozyo-bridge/tools/
+    - project が採用している場合の generated file_conventions.yaml
+  状態: 有効
+
+目的:
+  要約: >
+    `.mozyo-bridge/docs/catalog.yaml` を docs 管理メタの正本として扱い、
+    規約文書、対象ファイル、生成物、監査入力の対応を再現可能にする。
+  意図:
+    - agent が規約本文を読まずに実装または監査する事故を減らす。
+    - 監査で「どの規約に基づいた判断か」を再現可能にする。
+    - docs と対象ファイルの対応を人間の記憶ではなく catalog から解決する。
+    - 生成物を手編集正本にしない。
+    - 他 repo へ移植しても同じ監査前提を再構築できるようにする。
+
+正本性:
+  docs_catalog: .mozyo-bridge/docs/catalog.yaml
+  generated_file_conventions_default: .mozyo-bridge/docs/file_conventions.generated.yaml
+  generator_options:
+    - project が nagger 互換出力を必要とする場合は generate_file_conventions の --output に
+      project 固有の生成 path を指定する。preset 側で nagger 固有 path を強制しない。
+  ルール:
+    - "`.mozyo-bridge/docs/catalog.yaml` は documents / related_document_refs / file_conventions の正本である。"
+    - 生成物 (例えば nagger 用 file_conventions.yaml) は generator の出力であり、正本ではない。
+    - 生成物に差分が必要な場合は catalog を変更し、generator で反映する。
+    - 監査時は generated file だけで判断せず、catalog で解決された docs 本文を読む。
+    - 同じ正本性・対応関係を AGENTS.md / CLAUDE.md / runbook に重複定義しない。
+
+管理対象:
+  documents:
+    目的: docs の id / type / status / canonical_path / refs を定義する。
+    必須項目:
+      - id
+      - type
+      - status
+      - canonical_path
+      - purpose
+      - audit_role
+    禁止:
+      - 業務固有の顧客名 / 製品コード / 個人名を id に焼く
+      - 同一 canonical_path に複数 active id を重複させる
+  related_document_refs:
+    目的: ある docs を監査する時に同時確認すべき正本・補助文書を定義する。
+    ルール:
+      - 正本性の依存を明示する。
+      - 実装時の便利リンクではなく、監査判断に必要な関係だけを書く。
+  file_conventions:
+    目的: ファイルパターンから確認すべき docs を解決する。
+    ルール:
+      - document_refs は対象ファイル変更時に実際に読むべき docs に絞る。
+      - 生成物や agent 運用文書など、運用事故が起きやすいファイルも対象に含める。
+      - patterns を広げる時は agent へのノイズ増加も評価する。
+
+tooling:
+  validate_catalog:
+    command: python3 .mozyo-bridge/tools/validate_catalog.py
+    役割: catalog の構造、参照、実ファイル整合を検証する。
+  validate_catalog_file_coverage:
+    command: python3 .mozyo-bridge/tools/validate_catalog.py --check-file-coverage
+    役割: project が定める重要 source root が少なくとも1つの file_convention に一致することを検証する。
+  generate_file_conventions:
+    command: python3 .mozyo-bridge/tools/generate_file_conventions.py
+    役割: catalog の file_conventions から生成物 (project 指定 path) を生成する。
+  generate_file_conventions_check:
+    command: python3 .mozyo-bridge/tools/generate_file_conventions.py --check
+    役割: 生成物が catalog と同期しているか確認する。
+  resolve_audit_docs:
+    command: python3 .mozyo-bridge/tools/resolve_audit_docs.py <path> [...]
+    役割: 変更対象ファイルから active docs を解決する。
+  audit_doc_impact:
+    command: python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated
+    役割: 変更対象ファイルに紐づく docs と generated 同期漏れを確認する。
+
+変更方針:
+  catalog更新時:
+    - documents / related_document_refs / file_conventions のいずれを変更したか明確にする。
+    - validate_catalog を通す。
+    - file_conventions または matcher に影響する場合は file coverage check を通す。
+    - generated 物を採用している project は generator を実行し、生成物の差分を同じ変更に含める。
+    - generated check を通す。
+  generated_file更新時:
+    - 手編集しない。
+    - 必ず catalog 変更または generator 実行結果として扱う。
+  governanceまたはagent_docs更新時:
+    - audit-doc-impact で関連 docs の同期漏れを確認する。
+    - staged commit 前は `--staged` を使う。
+    - 作業中の棚卸しでは `--all-changed` を使える。
+
+禁止事項:
+  - catalog と generated file の不一致を放置しない。
+  - 生成物を正本として手編集しない。
+  - audit-doc-impact の成功だけを docs 本文確認の代替にしない。
+  - file_conventions に過剰な docs を紐づけ、agent が実際に読めないノイズを増やさない。
+  - canonical_path に存在しないファイルを active 状態で残さない。
+
+関連ファイル:
+  catalog: .mozyo-bridge/docs/catalog.yaml
+  catalog_example: .mozyo-bridge/docs/catalog.yaml.example
+  validator: .mozyo-bridge/tools/validate_catalog.py
+  generator: .mozyo-bridge/tools/generate_file_conventions.py
+  resolver: .mozyo-bridge/tools/resolve_audit_docs.py
+  impact_checker: .mozyo-bridge/tools/audit_doc_impact.py

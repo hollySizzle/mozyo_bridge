@@ -1,0 +1,85 @@
+# Catalog skeleton example.
+#
+# Copy this file to `.mozyo-bridge/docs/catalog.yaml` and replace the
+# placeholder entries with project-specific docs and file_conventions.
+# All `documents[].canonical_path` entries must resolve to real files in
+# the repo; the validator (`python3 .mozyo-bridge/tools/validate_catalog.py`)
+# will reject dangling canonical paths.
+
+schema_version: 1
+managed_types:
+  - rule
+  - spec
+  - logic
+  - manual_spec
+  - task
+
+documents:
+  - id: rule-mozyo-bridge-development-flow
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/development_flow.md
+    purpose: agent 役割、編集権限、gate schema、Codex direct edit gate、完了条件の正本。
+    audit_role: mozyo_bridge_master_rule
+    related_document_refs:
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
+
+  - id: rule-llm-rule-authoring
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/llm_rule_authoring.md
+    purpose: LLM agent が読む規約文書の正本分離、形式選択、gate 構造化、検証接続の正本。
+    audit_role: llm_rule_authoring_rule
+    related_document_refs:
+      - rule-mozyo-bridge-development-flow
+      - rule-docs-catalog-governance
+
+  - id: rule-docs-catalog-governance
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/docs_catalog_governance.yaml
+    purpose: docs catalog、生成物、resolver、audit-doc impact tooling の統治正本。
+    audit_role: docs_catalog_governance_rule
+    related_document_refs:
+      - rule-mozyo-bridge-development-flow
+      - rule-llm-rule-authoring
+
+file_conventions:
+  - id: fc-agent-guardrails
+    name: agent guardrail docs
+    patterns:
+      - AGENTS.md
+      - CLAUDE.md
+      - .mozyo-bridge/rules/**
+      - .mozyo-bridge/docs/catalog.yaml
+      - .mozyo-bridge/tools/**
+      - .claude/skills/**
+      - .codex/skills/**
+    severity: block
+    document_refs:
+      - rule-mozyo-bridge-development-flow
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
+
+  # Placeholder example for Rails source. Adjust patterns and document_refs
+  # to project-specific docs once project rules / specs are registered above.
+  - id: fc-rails-app
+    name: Rails app source (placeholder)
+    patterns:
+      - app/**/*.rb
+      - config/**/*.rb
+      - db/migrate/**/*.rb
+      - lib/**/*.rb
+    severity: warn
+    document_refs:
+      - rule-mozyo-bridge-development-flow
+
+  - id: fc-rails-tests
+    name: Rails tests (placeholder)
+    patterns:
+      - spec/**/*.rb
+      - test/**/*.rb
+    severity: warn
+    document_refs:
+      - rule-mozyo-bridge-development-flow
