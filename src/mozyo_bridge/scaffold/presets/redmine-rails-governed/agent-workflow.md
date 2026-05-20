@@ -17,13 +17,10 @@
 - `.mozyo-bridge/rules/llm_rule_authoring.md` — LLM 向け規約文書の正本分離、形式選択、gate 構造化、検証接続を定義する authoring 契約。
 - `.mozyo-bridge/rules/docs_catalog_governance.yaml` — docs catalog、generator、resolver、audit-doc impact tooling の統治規約。
 - `.mozyo-bridge/docs/catalog.yaml.example` — target repo が catalog を埋めるための skeleton。固有業務ドメインは含まない。
-- `.mozyo-bridge/tools/docs_catalog.py` — catalog 読み込みと convention matcher の共通 module。
-- `.mozyo-bridge/tools/validate_catalog.py` — catalog 構造検証 + 重要 source の coverage 検証。
-- `.mozyo-bridge/tools/resolve_audit_docs.py` — 対象 path から active docs を解決する resolver。
-- `.mozyo-bridge/tools/generate_file_conventions.py` — catalog から file_conventions 生成物を再生成・drift check するための generator。
-- `.mozyo-bridge/tools/audit_doc_impact.py` — git で changed paths を集計し関連 docs と generated drift を確認する impact check。
 
 これら artifact の **正本は本 preset (scaffold) 側にある**。target repo 側で修正したい場合は preset 側に upstream し、`mozyo-bridge scaffold apply --backup` で再配布する流れを取る。target repo 側の手編集は drift の原因になる。
+
+docs catalog tooling (validator / resolver / generator / impact checker) は **mozyo-bridge package 側に同梱** されている。`mozyo-bridge docs ...` CLI が target repo の `.mozyo-bridge/docs/catalog.yaml` を読んで動く。target repo は Python source を vendor copy しない。CLI 一覧は次節 `Active-Doc Resolver` を読む。
 
 ## Governance Posture
 
@@ -69,17 +66,18 @@ scaffold-shipped `.mozyo-bridge/rules/docs_catalog_governance.yaml` を正本と
 target repo は次の解決経路を持つ:
 
 ```bash
-python3 .mozyo-bridge/tools/resolve_audit_docs.py --format markdown <changed_path> [...]
-python3 .mozyo-bridge/tools/validate_catalog.py
-python3 .mozyo-bridge/tools/validate_catalog.py --check-file-coverage [--coverage-root app/...] [--coverage-root config/...]
-python3 .mozyo-bridge/tools/generate_file_conventions.py --check
-python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated
+mozyo-bridge docs resolve --format markdown <changed_path> [...]
+mozyo-bridge docs validate
+mozyo-bridge docs validate --check-file-coverage [--coverage-root app/...] [--coverage-root config/...]
+mozyo-bridge docs generate-file-conventions --check
+mozyo-bridge docs audit-impact --all-changed --check-generated
 ```
 
 - 変更対象 path が分かったら resolver を実行し、解決された docs 本文を読んでから実装・監査する。
 - catalog 自体や file_convention pattern を変更した場合は validator と coverage check を通す。coverage roots の選択順序は **(1) CLI `--coverage-root`** が指定されていればそれ、**(2) catalog の `coverage_roots` field** が定義されていればそれ、**(3) validator 組み込み default** (Rails 典型 layer)。CLI が catalog より優先される。project が該当 layer を持たない場合は missing root は `notice:` として印字されるだけで exit code には影響しない。project ごとの恒久指定は catalog 側に書く運用が望ましい。
 - file_conventions 生成物 (project が採用している場合) を変える場合は generator を実行し、drift check を通す。
-- staged commit 直前は `audit_doc_impact.py --staged --check-generated` を通す。作業中の棚卸しでは `--all-changed`。
+- staged commit 直前は `mozyo-bridge docs audit-impact --staged --check-generated` を通す。作業中の棚卸しでは `--all-changed`。
+- いずれの command も `--repo <path>` で target repo を、`--catalog <path>` で catalog 位置を override できる。default は cwd / `<repo>/.mozyo-bridge/docs/catalog.yaml`。
 
 これらは catalog が埋まっていれば即座に機能する。catalog が空でも tool 自体は valid catalog skeleton を accept するため、operator は段階的に埋められる。`--check-file-coverage` も Rails layer の有無に関わらず安全に実行できる。
 
@@ -97,10 +95,10 @@ target repo に新規 rule / gate / workflow / skill 入口を足すときは、
 
 target repo 内で次の verification を `Implementation Done` または `Review` の前に実行する。command が存在しないか実行不能な場合は理由を Redmine journal に残す。
 
-- `python3 .mozyo-bridge/tools/validate_catalog.py`
-- `python3 .mozyo-bridge/tools/validate_catalog.py --check-file-coverage`
-- `python3 .mozyo-bridge/tools/generate_file_conventions.py --check` (project が file_conventions 生成物を採用している場合)
-- `python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated`
+- `mozyo-bridge docs validate`
+- `mozyo-bridge docs validate --check-file-coverage`
+- `mozyo-bridge docs generate-file-conventions --check` (project が file_conventions 生成物を採用している場合)
+- `mozyo-bridge docs audit-impact --all-changed --check-generated`
 - project の authoritative Rails test command (例: `bundle exec rspec`, `bundle exec rails test`, project が定める subset)。test 用 DB 環境変数は project-local layer の手順に従う。
 - rubocop / brakeman 等の静的検査は project ルールに従う。
 
@@ -115,7 +113,7 @@ scaffold-shipped `.mozyo-bridge/rules/development_flow.md` に `codex_direct_edi
 - Dev Container / ephemeral home 対応として、target repo は `.mozyo-bridge/rules/presets/redmine-rails-governed/agent-workflow.md` を repo-local preset として読むことができる。
 - preset store を再生成する場合は `mozyo-bridge rules install --repo-local .` を使う。
 - router + governance artifact を再生成する場合は `mozyo-bridge scaffold apply redmine-rails-governed --repo-local --target . --backup` を優先する。`--force` は差分を確認してから使う。
-- governed preset 配布物 (`.mozyo-bridge/rules/development_flow.md`、`.mozyo-bridge/rules/llm_rule_authoring.md`、`.mozyo-bridge/rules/docs_catalog_governance.yaml`、`.mozyo-bridge/tools/**`、`.mozyo-bridge/docs/catalog.yaml.example`) は scaffold preset 側を正本とする。target repo で個別に編集したい変更は preset へ upstream する手順を取る。`.mozyo-bridge/docs/catalog.yaml` (example 不付き) は target repo 側で自由に埋めてよく、scaffold は上書きしない。
+- governed preset 配布物 (`.mozyo-bridge/rules/development_flow.md`、`.mozyo-bridge/rules/llm_rule_authoring.md`、`.mozyo-bridge/rules/docs_catalog_governance.yaml`、`.mozyo-bridge/docs/catalog.yaml.example`) は scaffold preset 側を正本とする。target repo で個別に編集したい変更は preset へ upstream する手順を取る。`.mozyo-bridge/docs/catalog.yaml` (example 不付き) は target repo 側で自由に埋めてよく、scaffold は上書きしない。docs catalog tooling は mozyo-bridge package 側に同梱されており、target repo は Python source を保持しない。`mozyo-bridge` を upgrade すれば tool も同時に更新される。
 
 ## Governed Mode Prohibitions
 

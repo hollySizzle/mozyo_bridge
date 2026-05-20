@@ -1,22 +1,20 @@
-"""Catalog validator distributed by the mozyo-bridge governed preset."""
+"""Catalog validator: structure, references, coverage."""
 
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
+from typing import Any
 
-from docs_catalog import (
-    CATALOG_PATH,
+from .catalog import (
+    CatalogContext,
     MANAGED_TYPES,
     document_index,
     load_catalog,
     matching_file_conventions,
-    repo_abspath,
 )
 
 
-STRICT_METADATA_TYPES = {"rule", "spec", "task"}
+STRICT_METADATA_TYPES = frozenset({"rule", "spec", "task"})
 DEFAULT_COVERAGE_ROOTS = (
     "app/controllers",
     "app/presenters",
@@ -26,8 +24,8 @@ DEFAULT_COVERAGE_ROOTS = (
     "db/migrate",
     "spec",
 )
-DEFAULT_COVERAGE_SUFFIXES = {".rb", ".yml", ".yaml"}
-DEFAULT_COVERAGE_IGNORED_PARTS = {".git", "__pycache__"}
+DEFAULT_COVERAGE_SUFFIXES = frozenset({".rb", ".yml", ".yaml"})
+DEFAULT_COVERAGE_IGNORED_PARTS = frozenset({".git", "__pycache__"})
 
 
 def _has_non_empty_string(document: dict[str, object], field: str) -> bool:
@@ -35,8 +33,13 @@ def _has_non_empty_string(document: dict[str, object], field: str) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def validate_catalog(catalog_path: Path, strict_metadata: bool = False) -> list[str]:
-    catalog = load_catalog(catalog_path)
+def validate_catalog(
+    context: CatalogContext,
+    *,
+    strict_metadata: bool = False,
+) -> list[str]:
+    """Structural validation: ids, refs, canonical paths, coverage_roots shape."""
+    catalog = load_catalog(context.catalog_path)
     errors: list[str] = []
     documents = catalog.get("documents", [])
     seen_ids: set[str] = set()
@@ -46,7 +49,7 @@ def validate_catalog(catalog_path: Path, strict_metadata: bool = False) -> list[
         errors.append("schema_version must be 1")
 
     managed_types = set(catalog.get("managed_types", []))
-    if managed_types != MANAGED_TYPES:
+    if managed_types != set(MANAGED_TYPES):
         errors.append(
             f"managed_types must be exactly {sorted(MANAGED_TYPES)}, got {sorted(managed_types)}"
         )
@@ -87,7 +90,7 @@ def validate_catalog(catalog_path: Path, strict_metadata: bool = False) -> list[
         if (
             isinstance(canonical_path, str)
             and status in {"active", "deprecated"}
-            and not repo_abspath(canonical_path).exists()
+            and not context.repo_abspath(canonical_path).exists()
         ):
             errors.append(f"{document_id}: canonical_path does not exist: {canonical_path}")
 
@@ -139,22 +142,10 @@ def validate_catalog(catalog_path: Path, strict_metadata: bool = False) -> list[
 
 
 def resolve_coverage_roots(
-    catalog: dict,
+    catalog: dict[str, Any],
     cli_roots: list[str] | None,
 ) -> tuple[list[str], str]:
-    """Pick the coverage roots to use and return them with their source.
-
-    Precedence (most specific first):
-
-    1. ``cli_roots`` — when ``--coverage-root`` is passed on the command
-       line. CLI always wins when present so operators can override the
-       checked-in catalog ad hoc.
-    2. ``catalog["coverage_roots"]`` — when the project has declared its
-       required roots in the catalog. Operators don't have to repeat
-       ``--coverage-root`` every invocation.
-    3. ``DEFAULT_COVERAGE_ROOTS`` — Rails-flavoured fallback so a fresh
-       project still gets a reasonable check.
-    """
+    """CLI > catalog > validator default. Returns (roots, source_label)."""
     if cli_roots:
         return list(cli_roots), "cli"
     catalog_roots = catalog.get("coverage_roots")
@@ -166,41 +157,24 @@ def resolve_coverage_roots(
 
 
 def validate_file_coverage(
-    catalog_path: Path,
+    context: CatalogContext,
+    *,
     roots: list[str] | None = None,
     suffixes: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Return (errors, notices).
-
-    ``errors`` block the exit code (a real coverage gap inside an
-    existing project layer). ``notices`` are informational only — for
-    example, when one of the configured coverage roots does not exist
-    yet in the target project. The caller decides how to surface
-    notices (printed but not counted toward failure).
-
-    ``roots`` mirrors the ``--coverage-root`` CLI flag: when provided
-    it overrides any ``coverage_roots`` declared in the catalog. When
-    ``None`` the catalog's ``coverage_roots`` is used if present;
-    otherwise the Rails-flavoured ``DEFAULT_COVERAGE_ROOTS`` is the
-    fallback. The chosen source ("cli" / "catalog" / "default") is
-    emitted as the first notice line so operators can see which list
-    drove the check without re-reading the catalog by hand.
+    """Return (errors, notices). Missing roots are informational notices;
+    real coverage gaps (existing root, file unmatched) are errors.
     """
-    catalog = load_catalog(catalog_path)
+    catalog = load_catalog(context.catalog_path)
     errors: list[str] = []
     notices: list[str] = []
     coverage_roots, source = resolve_coverage_roots(catalog, roots)
     notices.append(f"coverage_roots source: {source} ({len(coverage_roots)} root(s))")
-    coverage_suffixes = suffixes or DEFAULT_COVERAGE_SUFFIXES
+    coverage_suffixes = suffixes or set(DEFAULT_COVERAGE_SUFFIXES)
 
     for root in coverage_roots:
-        absolute_root = repo_abspath(root)
+        absolute_root = context.repo_abspath(root)
         if not absolute_root.exists():
-            # Missing coverage root is informational, not an error: a fresh
-            # Rails project may not yet have every layer. The validator
-            # reports it for visibility but does not fail. Operators can
-            # narrow `DEFAULT_COVERAGE_ROOTS` per-project via the
-            # `--coverage-root` CLI option.
             notices.append(f"coverage root does not exist (informational): {root}")
             continue
         for path in absolute_root.rglob("*"):
@@ -208,62 +182,8 @@ def validate_file_coverage(
                 continue
             if set(path.parts) & DEFAULT_COVERAGE_IGNORED_PARTS:
                 continue
-            relative_path = path.relative_to(repo_abspath(".")).as_posix()
+            relative_path = path.relative_to(context.repo_root).as_posix()
             if not matching_file_conventions(catalog, relative_path):
                 errors.append(f"no file_convention matched: {relative_path}")
 
     return errors, notices
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate .mozyo-bridge/docs/catalog.yaml")
-    parser.add_argument(
-        "--catalog",
-        type=Path,
-        default=CATALOG_PATH,
-        help="Path to catalog YAML",
-    )
-    parser.add_argument(
-        "--strict-metadata",
-        action="store_true",
-        help="Require purpose/audit_role/related_document_refs on active rule/spec/task documents",
-    )
-    parser.add_argument(
-        "--check-file-coverage",
-        action="store_true",
-        help="Require important source files under project roots to match at least one file_convention",
-    )
-    parser.add_argument(
-        "--coverage-root",
-        action="append",
-        default=None,
-        help=(
-            "Override the default coverage roots. Pass once per root. "
-            "Use this when the project does not match the default Rails layer layout."
-        ),
-    )
-    args = parser.parse_args()
-
-    errors = validate_catalog(args.catalog, strict_metadata=args.strict_metadata)
-    notices: list[str] = []
-    if args.check_file_coverage:
-        coverage_errors, coverage_notices = validate_file_coverage(
-            args.catalog, roots=args.coverage_root
-        )
-        errors.extend(coverage_errors)
-        notices.extend(coverage_notices)
-    if notices:
-        for notice in notices:
-            print(f"notice: {notice}")
-    if errors:
-        print("catalog validation failed")
-        for error in errors:
-            print(f"- {error}")
-        return 1
-
-    print("catalog validation passed")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

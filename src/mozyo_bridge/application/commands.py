@@ -1428,3 +1428,127 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
         elif row["status"] == "manifest-missing-hash":
             print(f"  - manifest entry for {row['path']} has no recorded hash")
     return 1
+
+
+def _docs_context_from_args(args: argparse.Namespace):
+    """Build a CatalogContext from argparse `--repo` / `--catalog` values.
+
+    `--repo` defaults to cwd. The catalog defaults to the standard
+    governed-preset path; the import stays local so the docs_tools
+    package only gets pulled in when the operator uses a `docs ...`
+    subcommand.
+    """
+    from mozyo_bridge.docs_tools import CatalogContext
+
+    repo_raw = getattr(args, "repo", None) or os.getcwd()
+    catalog_raw = getattr(args, "catalog", None)
+    return CatalogContext.build(repo_raw, catalog_raw)
+
+
+def cmd_docs_validate(args: argparse.Namespace) -> int:
+    from mozyo_bridge.docs_tools import (
+        validate_catalog,
+        validate_file_coverage,
+    )
+
+    context = _docs_context_from_args(args)
+    errors = validate_catalog(
+        context, strict_metadata=bool(getattr(args, "strict_metadata", False))
+    )
+    notices: list[str] = []
+    if getattr(args, "check_file_coverage", False):
+        coverage_errors, coverage_notices = validate_file_coverage(
+            context, roots=getattr(args, "coverage_root", None)
+        )
+        errors.extend(coverage_errors)
+        notices.extend(coverage_notices)
+    for notice in notices:
+        print(f"notice: {notice}")
+    if errors:
+        print("catalog validation failed")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+    print("catalog validation passed")
+    return 0
+
+
+def cmd_docs_resolve(args: argparse.Namespace) -> int:
+    from mozyo_bridge.docs_tools import (
+        render_resolution_json,
+        render_resolution_markdown,
+        render_resolution_text,
+        resolve_paths,
+    )
+
+    context = _docs_context_from_args(args)
+    results = resolve_paths(context, list(args.paths))
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(render_resolution_json(results))
+    elif fmt == "markdown":
+        print(render_resolution_markdown(results))
+    else:
+        print(render_resolution_text(results))
+    return 0
+
+
+def cmd_docs_generate(args: argparse.Namespace) -> int:
+    from mozyo_bridge.docs_tools import generate_file_conventions, run_generate_check
+
+    context = _docs_context_from_args(args)
+    output = getattr(args, "output", None)
+    if getattr(args, "check", False):
+        ok, output_path, detail = run_generate_check(context, output)
+        if not ok:
+            print(detail, file=sys.stderr)
+            return 1
+        print(detail)
+        return 0
+    output_path = generate_file_conventions(context, output)
+    print(output_path.as_posix())
+    return 0
+
+
+def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
+    from mozyo_bridge.docs_tools import (
+        audit_doc_impact,
+        run_generate_check,
+    )
+
+    context = _docs_context_from_args(args)
+    results = audit_doc_impact(
+        context,
+        staged=bool(getattr(args, "staged", False)),
+        all_changed=bool(getattr(args, "all_changed", False)),
+    )
+    if not results:
+        print("No changed paths.")
+    for result in results:
+        print(f"[{result['path']}]")
+        documents = result["documents"]
+        if documents:
+            print("documents_to_read:")
+            for document in documents:
+                sources = ", ".join(document["sources"])
+                print(
+                    f"- {document['type']} {document['id']} -> {document['canonical_path']} (source: {sources})"
+                )
+        else:
+            print("documents_to_read:")
+            print("- none")
+        notes = result["notes"]
+        if notes:
+            print("notes:")
+            for note in notes:
+                print(f"- {note}")
+        print()
+    if getattr(args, "check_generated", False):
+        ok, _, detail = run_generate_check(
+            context, getattr(args, "generated_output", None)
+        )
+        if not ok:
+            print(detail, file=sys.stderr)
+            return 1
+        print(detail)
+    return 0

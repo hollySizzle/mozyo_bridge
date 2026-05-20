@@ -5,7 +5,7 @@
   正本: true
   対象:
     - .mozyo-bridge/docs/catalog.yaml
-    - .mozyo-bridge/tools/
+    - mozyo-bridge package (docs CLI 経由で catalog を読む runtime)
     - project が採用している場合の generated file_conventions.yaml
   状態: 有効
 
@@ -59,7 +59,7 @@
       - patterns を広げる時は agent へのノイズ増加も評価する。
   coverage_roots:
     目的: |
-      `validate_catalog.py --check-file-coverage` が走査する repo-relative root の集合を
+      `mozyo-bridge docs validate --check-file-coverage` が走査する repo-relative root の集合を
       project 側で宣言する。
     ルール:
       - 任意 field。catalog 直下の `coverage_roots` に repo-relative の string list で書く。
@@ -69,23 +69,28 @@
       - 存在しない root は引き続き `notice:` として印字され exit code には影響しない。既存 root 内の未マッチ file は引き続き exit 1。
 
 tooling:
+  注記: |
+    docs catalog tooling は mozyo-bridge package 側に同梱されており、target repo は Python source
+    を保持しない。`mozyo-bridge` を install / upgrade すると tool も同時に上がる。command 名は
+    CLI 互換 (`mozyo-bridge docs <subcommand>`)。`--repo` で対象 repo、`--catalog` で catalog path を
+    override できる。default は cwd / `<repo>/.mozyo-bridge/docs/catalog.yaml`。
   validate_catalog:
-    command: python3 .mozyo-bridge/tools/validate_catalog.py
+    command: mozyo-bridge docs validate
     役割: catalog の構造、参照、実ファイル整合を検証する。
   validate_catalog_file_coverage:
-    command: python3 .mozyo-bridge/tools/validate_catalog.py --check-file-coverage
+    command: mozyo-bridge docs validate --check-file-coverage
     役割: project が定める重要 source root が少なくとも1つの file_convention に一致することを検証する。
   generate_file_conventions:
-    command: python3 .mozyo-bridge/tools/generate_file_conventions.py
+    command: mozyo-bridge docs generate-file-conventions
     役割: catalog の file_conventions から生成物 (project 指定 path) を生成する。
   generate_file_conventions_check:
-    command: python3 .mozyo-bridge/tools/generate_file_conventions.py --check
+    command: mozyo-bridge docs generate-file-conventions --check
     役割: 生成物が catalog と同期しているか確認する。
   resolve_audit_docs:
-    command: python3 .mozyo-bridge/tools/resolve_audit_docs.py <path> [...]
+    command: mozyo-bridge docs resolve <path> [...]
     役割: 変更対象ファイルから active docs を解決する。
   audit_doc_impact:
-    command: python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated
+    command: mozyo-bridge docs audit-impact --all-changed --check-generated
     役割: 変更対象ファイルに紐づく docs と generated 同期漏れを確認する。
 
 変更方針:
@@ -113,7 +118,7 @@ tooling:
 関連ファイル:
   catalog: .mozyo-bridge/docs/catalog.yaml
   catalog_example: .mozyo-bridge/docs/catalog.yaml.example
-  validator: .mozyo-bridge/tools/validate_catalog.py
-  generator: .mozyo-bridge/tools/generate_file_conventions.py
-  resolver: .mozyo-bridge/tools/resolve_audit_docs.py
-  impact_checker: .mozyo-bridge/tools/audit_doc_impact.py
+  validator: mozyo-bridge docs validate
+  generator: mozyo-bridge docs generate-file-conventions
+  resolver: mozyo-bridge docs resolve
+  impact_checker: mozyo-bridge docs audit-impact

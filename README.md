@@ -413,11 +413,11 @@ apply すると、router 一式に加えて以下が target repo に書き込ま
 - `.mozyo-bridge/rules/llm_rule_authoring.md` — LLM 向け規約文書の作成・分離・構造化の正本。
 - `.mozyo-bridge/rules/docs_catalog_governance.yaml` — docs catalog、resolver、generator、impact check の統治規約。
 - `.mozyo-bridge/docs/catalog.yaml.example` — 初期 catalog skeleton。target 側で `catalog.yaml` にコピーして埋める。
-- `.mozyo-bridge/tools/{docs_catalog,validate_catalog,resolve_audit_docs,generate_file_conventions,audit_doc_impact}.py` — catalog 統治用 Python tools。
+- docs catalog tooling は `mozyo-bridge` package に同梱されており、`mozyo-bridge docs validate / resolve / generate-file-conventions / audit-impact` で呼び出します。target repo には Python source を vendor copy しません。
 
 これらは scaffold preset 側を正本とし、`mozyo-bridge scaffold status` が drift を検出します。target 側で個別に編集したい場合は preset へ upstream し、`mozyo-bridge scaffold apply --backup` で再配布してください。configured catalog (`catalog.yaml`) は scaffold が触らないため、project 固有 docs / file_conventions を埋めても上書きされません。`mozyo-bridge scaffold apply --backup` は shipped artifacts も含めて pre-existing files を `.bak.<timestamp>` に退避します。
 
-catalog には任意 field `coverage_roots` を定義できます。指定した repo-relative path が `validate_catalog.py --check-file-coverage` の走査対象になり、CLI `--coverage-root` が無い場合の default として使われます。CLI が指定されたときは CLI 側が優先されます。missing root は `notice:` として印字され exit code には影響しません。`scaffold status` の出力では manifest 追跡対象を `tracked files:` セクションで表示します (router 2 件 + governed が追加した repo-local artifacts も同じセクションに並びます)。
+catalog には任意 field `coverage_roots` を定義できます。指定した repo-relative path が `mozyo-bridge docs validate --check-file-coverage` の走査対象になり、CLI `--coverage-root` が無い場合の default として使われます。CLI が指定されたときは CLI 側が優先されます。missing root は `notice:` として印字され exit code には影響しません。`scaffold status` の出力では manifest 追跡対象を `tracked files:` セクションで表示します (router 2 件 + governed が追加した repo-local artifacts も同じセクションに並びます)。
 
 scaffold には **Claude Nagger 設定 skeleton** (`.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example` + `.gitignore`) と **tmux agent window 用の UI snippet** (`.mozyo-bridge/tmux/agent-ui.conf`) も default-on で同梱されます。これらは agent 誤動作を減らすための実行時 guardrail として扱い、`doctor` の `claude_nagger` セクションと `tmux.artifact` 行で導入状態を確認できます。Claude Nagger を運用するには `.claude-nagger/config.yaml.example` を `config.yaml` にコピーして customise してください。tmux UI を有効化したい operator は `source-file <repo>/.mozyo-bridge/tmux/agent-ui.conf` を `~/.tmux.conf` などに追記します (scaffold は host 設定を一切変更しません)。導入したくない project は `scaffold apply --skip-nagger` / `--skip-tmux-ui` で opt-out できます。スキップした category は manifest にも記録されず、`scaffold status` は引き続き clean を返します。
 

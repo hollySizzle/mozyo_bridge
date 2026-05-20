@@ -24,6 +24,10 @@ from mozyo_bridge.application.commands import (
     cmd_resolve,
     cmd_rules_install,
     cmd_rules_status,
+    cmd_docs_audit_impact,
+    cmd_docs_generate,
+    cmd_docs_resolve,
+    cmd_docs_validate,
     cmd_scaffold_apply,
     cmd_scaffold_diff,
     cmd_scaffold_status,
@@ -555,6 +559,125 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scaffold_status.add_argument("--json", action="store_true", help="Emit structured JSON output instead of human-readable text")
     scaffold_status.set_defaults(func=cmd_scaffold_status)
+
+    docs = sub.add_parser(
+        "docs",
+        help=(
+            "Docs catalog tooling for governed scaffolds. Replaces the "
+            "Python source previously vendor-copied to the target repo "
+            "under `.mozyo-bridge/tools/`; the same logic now ships in "
+            "the mozyo-bridge package so upgrades follow the CLI."
+        ),
+    )
+    docs_sub = docs.add_subparsers(dest="docs_command", required=True)
+
+    def _add_docs_common(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--repo",
+            help=(
+                "Target project root. Defaults to the cwd. The catalog is "
+                "resolved relative to this root."
+            ),
+        )
+        parser.add_argument(
+            "--catalog",
+            help=(
+                "Catalog YAML path. Defaults to "
+                "`<repo>/.mozyo-bridge/docs/catalog.yaml`."
+            ),
+        )
+
+    docs_validate = docs_sub.add_parser(
+        "validate",
+        help="Validate the docs catalog (structure, refs, canonical paths, coverage roots).",
+    )
+    _add_docs_common(docs_validate)
+    docs_validate.add_argument(
+        "--strict-metadata",
+        action="store_true",
+        help="Require purpose / audit_role / related_document_refs on active rule/spec/task documents.",
+    )
+    docs_validate.add_argument(
+        "--check-file-coverage",
+        action="store_true",
+        help="Require source files under coverage roots to match at least one file_convention.",
+    )
+    docs_validate.add_argument(
+        "--coverage-root",
+        action="append",
+        default=None,
+        help=(
+            "Override the catalog / default coverage roots. Repeatable. "
+            "CLI takes precedence over the catalog's `coverage_roots`."
+        ),
+    )
+    docs_validate.set_defaults(func=cmd_docs_validate)
+
+    docs_resolve = docs_sub.add_parser(
+        "resolve",
+        help="Resolve active docs for one or more changed paths.",
+    )
+    _add_docs_common(docs_resolve)
+    docs_resolve.add_argument(
+        "paths",
+        nargs="+",
+        help="Repository-relative or absolute file paths to resolve.",
+    )
+    docs_resolve.add_argument(
+        "--format",
+        choices=("text", "markdown", "json"),
+        default="text",
+        help="Output format (default: text).",
+    )
+    docs_resolve.set_defaults(func=cmd_docs_resolve)
+
+    docs_generate = docs_sub.add_parser(
+        "generate-file-conventions",
+        help="Render the catalog's file_conventions to a generated YAML.",
+    )
+    _add_docs_common(docs_generate)
+    docs_generate.add_argument(
+        "--output",
+        help=(
+            "Generated YAML path. Defaults to "
+            "`<repo>/.mozyo-bridge/docs/file_conventions.generated.yaml`."
+        ),
+    )
+    docs_generate.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify the recorded output matches the catalog; exit 1 on drift.",
+    )
+    docs_generate.set_defaults(func=cmd_docs_generate)
+
+    docs_impact = docs_sub.add_parser(
+        "audit-impact",
+        help="Resolve docs for git-changed paths and optionally drift-check the generated file.",
+    )
+    _add_docs_common(docs_impact)
+    impact_scope = docs_impact.add_mutually_exclusive_group()
+    impact_scope.add_argument("--staged", action="store_true", help="Use staged changes only.")
+    impact_scope.add_argument(
+        "--all-changed",
+        dest="all_changed",
+        action="store_true",
+        help="Use staged + unstaged + untracked changes.",
+    )
+    docs_impact.add_argument(
+        "--check-generated",
+        dest="check_generated",
+        action="store_true",
+        help="Also run the generate-file-conventions drift check.",
+    )
+    docs_impact.add_argument(
+        "--generated-output",
+        dest="generated_output",
+        help=(
+            "Override the generated file path for --check-generated. "
+            "Defaults to the same path as `docs generate-file-conventions`."
+        ),
+    )
+    docs_impact.set_defaults(func=cmd_docs_audit_impact)
 
     release = sub.add_parser(
         "release",

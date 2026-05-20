@@ -1,43 +1,27 @@
-"""Resolve active docs for audit from catalog and file conventions.
+"""Resolve audit docs for a list of paths.
 
-Distributed by the mozyo-bridge `redmine-rails-governed` preset.
+The CLI exposes three output formats so operators can pipe results
+through review tools, render markdown into ticket comments, or
+consume JSON from automation.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import sys
-from pathlib import Path
+from typing import Any
 
-from docs_catalog import CATALOG_PATH, load_catalog, resolve_audit_documents
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Resolve active docs for audit from catalog and file conventions"
-    )
-    parser.add_argument(
-        "paths",
-        nargs="+",
-        help="Repository-relative or absolute file paths to resolve",
-    )
-    parser.add_argument(
-        "--catalog",
-        type=Path,
-        default=CATALOG_PATH,
-        help="Path to catalog YAML",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("text", "markdown", "json"),
-        default="text",
-        help="Output format",
-    )
-    return parser
+from .catalog import CatalogContext, load_catalog, resolve_audit_documents
 
 
-def render_text(results: list[dict[str, object]]) -> str:
+def resolve_paths(
+    context: CatalogContext,
+    paths: list[str],
+) -> list[dict[str, Any]]:
+    catalog = load_catalog(context.catalog_path)
+    return [resolve_audit_documents(context, catalog, path) for path in paths]
+
+
+def render_resolution_text(results: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for result in results:
         path = result["path"]
@@ -71,11 +55,10 @@ def render_text(results: list[dict[str, object]]) -> str:
             for note in notes:
                 lines.append(f"- {note}")
         lines.append("")
-
     return "\n".join(lines).rstrip()
 
 
-def render_markdown(results: list[dict[str, object]]) -> str:
+def render_resolution_markdown(results: list[dict[str, Any]]) -> str:
     lines: list[str] = ["## 規約マッチ結果"]
     for result in results:
         path = result["path"]
@@ -110,26 +93,8 @@ def render_markdown(results: list[dict[str, object]]) -> str:
             lines.append("- notes:")
             for note in notes:
                 lines.append(f"  - {note}")
-
     return "\n".join(lines)
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    catalog = load_catalog(args.catalog)
-    results = [resolve_audit_documents(catalog, path) for path in args.paths]
-
-    if args.format == "json":
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-    elif args.format == "markdown":
-        print(render_markdown(results))
-    else:
-        print(render_text(results))
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def render_resolution_json(results: list[dict[str, Any]]) -> str:
+    return json.dumps(results, ensure_ascii=False, indent=2)

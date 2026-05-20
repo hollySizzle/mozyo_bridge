@@ -131,9 +131,9 @@ gate:
 
 ```yaml
 必須:
-  - python3 .mozyo-bridge/tools/validate_catalog.py
-  - python3 .mozyo-bridge/tools/generate_file_conventions.py --check
-  - python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated
+  - mozyo-bridge docs validate
+  - mozyo-bridge docs generate-file-conventions --check
+  - mozyo-bridge docs audit-impact --all-changed --check-generated
   - git diff --check
 旧参照確認:
   command: rg --hidden -n "<old_path_or_old_id>" .

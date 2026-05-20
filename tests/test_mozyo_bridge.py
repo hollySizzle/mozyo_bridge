@@ -1181,7 +1181,13 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
-                ".mozyo-bridge/tools/resolve_audit_docs.py",
+                # docs catalog tooling lives in the mozyo-bridge package now,
+                # not vendor-copied into the target repo. The workflow doc
+                # references it by CLI name.
+                "mozyo-bridge docs validate",
+                "mozyo-bridge docs resolve",
+                "mozyo-bridge docs generate-file-conventions",
+                "mozyo-bridge docs audit-impact",
                 "Gate Schema",
                 "Codex Direct Edit Gate",
                 "codex_direct_edit",
@@ -1240,16 +1246,22 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
-                ".mozyo-bridge/tools/docs_catalog.py",
-                ".mozyo-bridge/tools/validate_catalog.py",
-                ".mozyo-bridge/tools/resolve_audit_docs.py",
-                ".mozyo-bridge/tools/generate_file_conventions.py",
-                ".mozyo-bridge/tools/audit_doc_impact.py",
             ):
                 self.assertTrue(
                     (project / expected_path).exists(),
                     msg=f"governed scaffold did not write {expected_path}",
                 )
+            # Vendor-copied Python tools must not ship anymore — the
+            # docs catalog tooling lives inside the mozyo-bridge package
+            # and is invoked through `mozyo-bridge docs ...` instead.
+            self.assertFalse(
+                (project / ".mozyo-bridge/tools").exists(),
+                msg=(
+                    "governed scaffold should no longer vendor-copy "
+                    ".mozyo-bridge/tools/*.py — those tools now live "
+                    "inside the mozyo-bridge package."
+                ),
+            )
 
             # Strong language survives into the shipped repo-local rule
             # files too. Verifying once across files is enough — the de-
@@ -1292,10 +1304,19 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "AGENTS.md",
                 "CLAUDE.md",
                 ".mozyo-bridge/rules/development_flow.md",
-                ".mozyo-bridge/tools/validate_catalog.py",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
             ):
                 self.assertIn(expected, tracked_files)
+            # And the manifest must not claim any `.mozyo-bridge/tools/*`
+            # entries — they moved into the mozyo-bridge package.
+            self.assertFalse(
+                any(p.startswith(".mozyo-bridge/tools/") for p in tracked_files),
+                msg=(
+                    "manifest still references .mozyo-bridge/tools/*; "
+                    "the governed preset should no longer ship those."
+                ),
+            )
 
     def test_governed_scaffold_refuses_to_silently_overwrite_shipped_artifacts(self) -> None:
         """Shipped governance artifacts are protected from silent overwrite.
@@ -1391,20 +1412,19 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("tracked files:", output)
             self.assertNotIn("router files:", output)
 
-    def test_governed_scaffold_validate_catalog_uses_coverage_roots_precedence(self) -> None:
+    def test_docs_validate_coverage_roots_precedence(self) -> None:
         """coverage_roots: CLI overrides catalog overrides default.
 
-        Precedence (most specific first):
+        The docs catalog tooling now ships as the ``mozyo-bridge docs``
+        CLI inside the package. Precedence stays as before:
+
         1. ``--coverage-root`` CLI flag — wins when present.
         2. ``catalog.coverage_roots`` field — used when CLI absent.
         3. Built-in Rails-flavoured default — fallback when neither.
 
         The validator prints which source it used as the first
-        ``notice:`` so operators can see the precedence resolution
-        without re-reading the catalog by hand.
+        ``notice:`` so operators can see the resolution from stdout.
         """
-        import subprocess
-
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             project = Path(tmp) / "project"
@@ -1426,65 +1446,55 @@ class ScaffoldRulesTest(unittest.TestCase):
             base_catalog = (
                 project / ".mozyo-bridge/docs/catalog.yaml.example"
             ).read_text(encoding="utf-8")
-            python = sys.executable
-            validate_tool = project / ".mozyo-bridge/tools/validate_catalog.py"
 
-            def run_coverage(*args: str) -> subprocess.CompletedProcess:
-                return subprocess.run(
-                    [python, str(validate_tool), "--check-file-coverage", *args],
-                    cwd=project,
-                    capture_output=True,
-                    text=True,
+            def run_coverage(*extra: str) -> tuple[int, str]:
+                return self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--check-file-coverage",
+                        "--repo",
+                        str(project),
+                        *extra,
+                    ]
                 )
 
             # (3) No catalog field, no CLI flag — default Rails roots.
             catalog_path.write_text(base_catalog, encoding="utf-8")
-            default_proc = run_coverage()
-            self.assertEqual(0, default_proc.returncode, msg=default_proc.stderr)
-            self.assertIn("coverage_roots source: default", default_proc.stdout)
+            default_code, default_output = run_coverage()
+            self.assertEqual(0, default_code)
+            self.assertIn("coverage_roots source: default", default_output)
 
-            # (2) Catalog declares coverage_roots — used as default
-            # when no CLI flag is given. Pointing at an existing
-            # repo-relative path means no notice for that root, and
-            # the existing example catalog matches `.mozyo-bridge/`
-            # via the fc-agent-guardrails convention.
+            # (2) Catalog declares coverage_roots — used when no CLI flag.
             catalog_path.write_text(
                 base_catalog + "\ncoverage_roots:\n  - .mozyo-bridge\n",
                 encoding="utf-8",
             )
-            catalog_proc = run_coverage()
-            self.assertEqual(0, catalog_proc.returncode, msg=catalog_proc.stderr)
-            self.assertIn("coverage_roots source: catalog", catalog_proc.stdout)
-            self.assertNotIn(
-                "coverage_roots source: default", catalog_proc.stdout
-            )
+            catalog_code, catalog_output = run_coverage()
+            self.assertEqual(0, catalog_code)
+            self.assertIn("coverage_roots source: catalog", catalog_output)
+            self.assertNotIn("coverage_roots source: default", catalog_output)
 
-            # (1) CLI overrides catalog. Pass a non-existent root so we
-            # can tell which list was used just from the notice line.
-            cli_proc = run_coverage("--coverage-root", "unknown_layer")
-            self.assertEqual(0, cli_proc.returncode, msg=cli_proc.stderr)
-            self.assertIn("coverage_roots source: cli", cli_proc.stdout)
-            self.assertIn("coverage root does not exist", cli_proc.stdout)
+            # (1) CLI overrides catalog. Non-existent root → notice only.
+            cli_code, cli_output = run_coverage("--coverage-root", "unknown_layer")
+            self.assertEqual(0, cli_code)
+            self.assertIn("coverage_roots source: cli", cli_output)
+            self.assertIn("coverage root does not exist", cli_output)
 
-            # Bad shape: validator rejects coverage_roots when it is
-            # not a list of non-empty strings. This guards against
-            # silently broken config from typos like `coverage_roots: app`.
+            # Bad shape: catalog with a string-typed coverage_roots
+            # must fail validation (not silently ignored).
             catalog_path.write_text(
                 base_catalog + "\ncoverage_roots: app\n", encoding="utf-8"
             )
-            bad_proc = subprocess.run(
-                [python, str(validate_tool)],
-                cwd=project,
-                capture_output=True,
-                text=True,
+            bad_code, bad_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project)]
             )
-            self.assertEqual(1, bad_proc.returncode, msg=bad_proc.stdout)
-            self.assertIn("coverage_roots must be a list", bad_proc.stdout)
+            self.assertEqual(1, bad_code)
+            self.assertIn("coverage_roots must be a list", bad_output)
 
-            # And: an unmatched file inside an existing root is still
-            # an error. Reset to a clean catalog, point coverage_roots
-            # at a freshly-created directory containing an unmatched
-            # `.rb` file, and assert exit 1.
+            # An unmatched file inside an *existing* coverage root is
+            # still exit 1. This guards against the manifest-driven
+            # refactor accidentally swallowing real coverage gaps.
             unmatched_root = project / "fresh_app"
             unmatched_root.mkdir()
             (unmatched_root / "orphan.rb").write_text("# orphan\n", encoding="utf-8")
@@ -1492,21 +1502,23 @@ class ScaffoldRulesTest(unittest.TestCase):
                 base_catalog + "\ncoverage_roots:\n  - fresh_app\n",
                 encoding="utf-8",
             )
-            real_gap_proc = run_coverage()
-            self.assertEqual(1, real_gap_proc.returncode, msg=real_gap_proc.stdout)
-            self.assertIn("no file_convention matched: fresh_app/orphan.rb", real_gap_proc.stdout)
+            real_gap_code, real_gap_output = run_coverage()
+            self.assertEqual(1, real_gap_code)
+            self.assertIn(
+                "no file_convention matched: fresh_app/orphan.rb",
+                real_gap_output,
+            )
 
-    def test_governed_scaffold_tools_resolve_against_shipped_catalog_example(self) -> None:
-        """The shipped resolver + validator must work on the catalog skeleton.
+    def test_docs_cli_round_trips_against_shipped_catalog_example(self) -> None:
+        """The packaged `docs ...` CLI must work on the catalog skeleton.
 
-        We treat the example as the project's catalog (copy
-        `catalog.yaml.example` to `catalog.yaml`) and assert that both
-        tools execute cleanly without invoking the mozyo-bridge CLI.
-        Operators rely on this round-trip so the governance package is
-        usable the moment scaffold finishes.
+        After `scaffold apply`, copying `catalog.yaml.example` to
+        `catalog.yaml` should immediately let every docs subcommand run
+        cleanly. This is the operator's first-day experience after
+        installing mozyo-bridge — if it fails, the governance package
+        is unusable straight out of `scaffold apply`.
         """
         import shutil as _shutil
-        import subprocess
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -1528,112 +1540,95 @@ class ScaffoldRulesTest(unittest.TestCase):
             catalog = project / ".mozyo-bridge/docs/catalog.yaml"
             _shutil.copyfile(example, catalog)
 
-            tools = project / ".mozyo-bridge/tools"
-            # Use the running interpreter so the subprocess inherits the
-            # same PyYAML installation the test framework relies on.
-            python = sys.executable
-            validate_proc = subprocess.run(
-                [python, str(tools / "validate_catalog.py")],
-                cwd=project,
-                capture_output=True,
-                text=True,
+            # docs validate
+            validate_code, validate_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project)]
             )
-            self.assertEqual(
-                0,
-                validate_proc.returncode,
-                msg=(
-                    "validate_catalog.py failed against the shipped skeleton:\n"
-                    f"stdout={validate_proc.stdout}\nstderr={validate_proc.stderr}"
-                ),
-            )
-            self.assertIn("catalog validation passed", validate_proc.stdout)
+            self.assertEqual(0, validate_code, msg=validate_output)
+            self.assertIn("catalog validation passed", validate_output)
 
-            # `--check-file-coverage` must not exit non-zero when the
-            # default Rails coverage roots are absent. The validator
-            # treats missing roots as `notice:` lines (informational)
-            # so a fresh Rails project (or a non-Rails project) can run
-            # the gate the governed workflow requires without failing
-            # purely on missing default layers.
-            coverage_proc = subprocess.run(
-                [python, str(tools / "validate_catalog.py"), "--check-file-coverage"],
-                cwd=project,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(
-                0,
-                coverage_proc.returncode,
-                msg=(
-                    "validate_catalog.py --check-file-coverage failed on missing roots:\n"
-                    f"stdout={coverage_proc.stdout}\nstderr={coverage_proc.stderr}"
-                ),
-            )
-            # The notice line is printed but does not block.
-            self.assertIn("notice:", coverage_proc.stdout)
-            self.assertIn("catalog validation passed", coverage_proc.stdout)
-
-            # Resolver returns the agent-guardrail file_convention's
-            # document_refs when asked about a rule file the catalog
-            # already names.
-            resolve_proc = subprocess.run(
+            # docs validate --check-file-coverage: missing roots ok.
+            coverage_code, coverage_output = self.run_cli(
                 [
-                    python,
-                    str(tools / "resolve_audit_docs.py"),
-                    ".mozyo-bridge/rules/development_flow.md",
+                    "docs",
+                    "validate",
+                    "--check-file-coverage",
+                    "--repo",
+                    str(project),
+                ]
+            )
+            self.assertEqual(0, coverage_code)
+            self.assertIn("notice:", coverage_output)
+            self.assertIn("catalog validation passed", coverage_output)
+
+            # docs resolve — surfaces the catalog's rule docs via the
+            # agent-guardrail file_convention's document_refs.
+            resolve_code, resolve_output = self.run_cli(
+                [
+                    "docs",
+                    "resolve",
+                    "--repo",
+                    str(project),
                     "--format",
                     "json",
-                ],
-                cwd=project,
-                capture_output=True,
-                text=True,
+                    ".mozyo-bridge/rules/development_flow.md",
+                ]
             )
-            self.assertEqual(0, resolve_proc.returncode, msg=resolve_proc.stderr)
-            import json as _json
-
-            results = _json.loads(resolve_proc.stdout)
+            self.assertEqual(0, resolve_code, msg=resolve_output)
+            results = json.loads(resolve_output)
             self.assertEqual(1, len(results))
             resolved_ids = {doc["id"] for doc in results[0]["documents"]}
             self.assertIn("rule-mozyo-bridge-development-flow", resolved_ids)
             self.assertIn("rule-docs-catalog-governance", resolved_ids)
             self.assertIn("rule-llm-rule-authoring", resolved_ids)
 
-            # Drift check sees the freshly written generated file as up
-            # to date (after one generation). This exercises the
-            # round-trip catalog -> generator -> drift check chain.
+            # docs generate-file-conventions writes the output and a
+            # follow-up --check confirms the round-trip is clean.
+            gen_code, gen_output = self.run_cli(
+                [
+                    "docs",
+                    "generate-file-conventions",
+                    "--repo",
+                    str(project),
+                ]
+            )
+            self.assertEqual(0, gen_code, msg=gen_output)
             gen_path = project / ".mozyo-bridge/docs/file_conventions.generated.yaml"
-            subprocess.run(
-                [python, str(tools / "generate_file_conventions.py")],
-                cwd=project,
-                check=True,
-            )
             self.assertTrue(gen_path.exists())
-            drift_proc = subprocess.run(
-                [python, str(tools / "generate_file_conventions.py"), "--check"],
-                cwd=project,
-                capture_output=True,
-                text=True,
+
+            drift_code, drift_output = self.run_cli(
+                [
+                    "docs",
+                    "generate-file-conventions",
+                    "--check",
+                    "--repo",
+                    str(project),
+                ]
             )
-            self.assertEqual(0, drift_proc.returncode, msg=drift_proc.stderr)
+            self.assertEqual(0, drift_code, msg=drift_output)
 
     def test_preset_files_walker_skips_pycache_and_pyc(self) -> None:
         """The scaffold walker must drop pip-generated bytecode cruft.
 
-        When the wheel is `pip install`ed, pip can byte-compile shipped
-        `.py` files and place `.pyc` files under `__pycache__/` directories
-        next to them. The walker previously tried to decode every file as
-        UTF-8 and crashed with `UnicodeDecodeError` on the `.pyc` bytes.
-        We inject the cruft into the source tree and assert the walker
-        skips it without crashing.
+        The governed preset no longer ships ``.py`` source files, so a
+        normal wheel install will not generate ``__pycache__`` next to
+        the remaining artifacts. The defence-in-depth still matters —
+        a future preset that ships ``.py`` artifacts (or an operator
+        who unpacks a wheel into the preset tree by accident) should
+        not break the walker. We inject the cruft next to an existing
+        shipped artifact and confirm the walker still surfaces the real
+        files while dropping ``__pycache__`` / ``.pyc`` entries.
         """
         from mozyo_bridge.scaffold.rules import render_preset_extra_files
 
-        tools_dir = (
+        rules_dir = (
             Path(__file__).resolve().parents[1]
             / "src/mozyo_bridge/scaffold/presets"
-            / "redmine-rails-governed/files/.mozyo-bridge/tools"
+            / "redmine-rails-governed/files/.mozyo-bridge/rules"
         )
-        fake_pycache = tools_dir / "__pycache__"
-        fake_pyc = fake_pycache / "docs_catalog.cpython-314.pyc"
+        self.assertTrue(rules_dir.exists(), msg=f"rules dir missing: {rules_dir}")
+        fake_pycache = rules_dir / "__pycache__"
+        fake_pyc = fake_pycache / "fake_module.cpython-314.pyc"
         fake_pycache.mkdir(exist_ok=True)
         try:
             fake_pyc.write_bytes(b"\x82\x82\x82bogus pyc bytes")
@@ -1648,9 +1643,9 @@ class ScaffoldRulesTest(unittest.TestCase):
                 any(p.endswith(".pyc") for p in paths),
                 msg=f"walker leaked .pyc entries: {sorted(paths)}",
             )
-            # And the legitimate `.py` source under the same directory
-            # still surfaces — we only filter cache cruft, not real files.
-            self.assertIn(".mozyo-bridge/tools/docs_catalog.py", paths)
+            # The legitimate rule files under the same directory still
+            # surface — we only filter cache cruft, not real artifacts.
+            self.assertIn(".mozyo-bridge/rules/development_flow.md", paths)
         finally:
             import shutil as _shutil
 
@@ -1755,21 +1750,28 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             # Every shipped governance artifact must land in the target
             # after a real wheel install, not just under the source tree.
+            # Docs catalog tooling no longer ships as `.mozyo-bridge/tools/*.py`
+            # — it lives inside the mozyo-bridge package and runs via the
+            # `mozyo-bridge docs ...` CLI on the installed venv. We assert
+            # the target tree does not carry the legacy vendor copy.
             for expected_path in (
                 ".mozyo-bridge/rules/development_flow.md",
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
-                ".mozyo-bridge/tools/docs_catalog.py",
-                ".mozyo-bridge/tools/validate_catalog.py",
-                ".mozyo-bridge/tools/resolve_audit_docs.py",
-                ".mozyo-bridge/tools/generate_file_conventions.py",
-                ".mozyo-bridge/tools/audit_doc_impact.py",
             ):
                 self.assertTrue(
                     (project / expected_path).exists(),
                     msg=f"post-install scaffold did not write {expected_path}",
                 )
+            self.assertFalse(
+                (project / ".mozyo-bridge/tools").exists(),
+                msg=(
+                    "post-install scaffold still wrote .mozyo-bridge/tools/ "
+                    "(legacy vendor copy) — the tooling should live in the "
+                    "mozyo-bridge package now."
+                ),
+            )
 
             # And no `.pyc` / `__pycache__` cruft should leak into the
             # target tree — the walker skips them.
@@ -1780,8 +1782,10 @@ class ScaffoldRulesTest(unittest.TestCase):
                 [], stray_cache, msg=f"unexpected __pycache__ copied: {stray_cache}"
             )
 
-            # Smoke: the catalog tools shipped by the post-install
-            # scaffold actually run against the catalog skeleton.
+            # Smoke: the packaged docs CLI runs against the catalog
+            # skeleton straight after install. This is what operators
+            # actually use; the previous vendor-copy test verified the
+            # wrong thing once the tools moved into the package.
             import shutil as _shutil
 
             _shutil.copyfile(
@@ -1790,10 +1794,12 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             validate_proc = subprocess.run(
                 [
-                    str(venv_python),
-                    str(project / ".mozyo-bridge/tools/validate_catalog.py"),
+                    str(venv_bin),
+                    "docs",
+                    "validate",
+                    "--repo",
+                    str(project),
                 ],
-                cwd=project,
                 capture_output=True,
                 text=True,
             )
@@ -1801,7 +1807,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 0,
                 validate_proc.returncode,
                 msg=(
-                    "post-install validate_catalog.py failed:\n"
+                    "post-install `mozyo-bridge docs validate` failed:\n"
                     f"stdout={validate_proc.stdout}\nstderr={validate_proc.stderr}"
                 ),
             )
@@ -2244,7 +2250,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 (project / ".mozyo-bridge/rules/development_flow.md").exists()
             )
             self.assertTrue(
-                (project / ".mozyo-bridge/tools/validate_catalog.py").exists()
+                (project / ".mozyo-bridge/rules/docs_catalog_governance.yaml").exists()
             )
 
             # Manifest tracks only what was written; status stays clean
@@ -2362,6 +2368,125 @@ class ScaffoldRulesTest(unittest.TestCase):
                 skip_payload["sections"]["tmux"]["artifact"]["status"],
             )
 
+    def test_governed_scaffold_reconciles_legacy_vendor_tools_on_reapply(self) -> None:
+        """Re-apply with the new preset must clean up legacy vendor tools.
+
+        Prior governed-scaffold releases vendor-copied
+        ``.mozyo-bridge/tools/*.py`` into the target and recorded those
+        paths in the scaffold manifest. The new preset does not ship
+        the tools, so the next `scaffold apply` must reconcile them as
+        outgoing files: refuse to overwrite silently, then remove them
+        when ``--backup`` (or ``--force``) is provided. This guards the
+        upgrade path for existing operators.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            # First, run a real apply to lay down routers, manifest,
+            # and the rule/doc files we will keep.
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            # Simulate a legacy scaffold state by writing tool source
+            # files and patching the manifest to claim them. This is
+            # exactly what an older governed release left behind.
+            tools_dir = project / ".mozyo-bridge/tools"
+            tools_dir.mkdir(parents=True, exist_ok=True)
+            legacy_files = {
+                tools_dir / "docs_catalog.py": "# legacy vendor copy\n",
+                tools_dir / "validate_catalog.py": "# legacy vendor copy\n",
+                tools_dir / "resolve_audit_docs.py": "# legacy vendor copy\n",
+                tools_dir / "generate_file_conventions.py": "# legacy vendor copy\n",
+                tools_dir / "audit_doc_impact.py": "# legacy vendor copy\n",
+            }
+            for path, body in legacy_files.items():
+                path.write_text(body, encoding="utf-8")
+
+            manifest_path = project / ".mozyo-bridge/scaffold.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for path in legacy_files:
+                rel = path.relative_to(project).as_posix()
+                manifest["files"][rel] = {
+                    "sha256": "0" * 64,  # arbitrary; reconcile only consults the key set
+                }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            # Re-applying without --backup / --force must refuse: the
+            # outgoing legacy files would be silently destroyed otherwise.
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            "redmine-rails-governed",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+            err = stderr.getvalue()
+            self.assertIn("refusing to overwrite existing scaffold files", err)
+            self.assertIn(".mozyo-bridge/tools/validate_catalog.py", err)
+
+            # With --backup, the reconcile path stashes each legacy tool
+            # to `.bak.<timestamp>` and removes the original. The new
+            # manifest no longer tracks them.
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--backup",
+                ]
+            )
+            self.assertEqual(0, result)
+            for path in legacy_files:
+                self.assertFalse(path.exists(), msg=f"legacy tool not removed: {path}")
+            # And `.bak.<timestamp>` files landed next to where the
+            # originals lived.
+            backups = list(tools_dir.glob("*.bak.*")) if tools_dir.exists() else []
+            self.assertTrue(backups, msg="--backup did not stash any legacy tool files")
+
+            state = scaffold_state(project)
+            assert state is not None
+            tracked = set(state["files"].keys())
+            self.assertFalse(
+                any(p.startswith(".mozyo-bridge/tools/") for p in tracked),
+                msg=(
+                    "post-reconcile manifest still references legacy "
+                    f".mozyo-bridge/tools/ entries: "
+                    f"{[p for p in tracked if p.startswith('.mozyo-bridge/tools/')]}"
+                ),
+            )
+
+            # scaffold status reports clean after reconcile.
+            status_result, status_output = self.run_cli(
+                ["scaffold", "status", "--target", str(project), "--home", str(home)]
+            )
+            self.assertEqual(0, status_result)
+            self.assertIn("result: clean", status_output)
+
     def test_governed_preset_artifacts_ship_in_built_wheel(self) -> None:
         """The governed preset's repo-local artifacts must end up in the wheel.
 
@@ -2413,11 +2538,6 @@ class ScaffoldRulesTest(unittest.TestCase):
                 mb_prefix + "rules/llm_rule_authoring.md",
                 mb_prefix + "rules/docs_catalog_governance.yaml",
                 mb_prefix + "docs/catalog.yaml.example",
-                mb_prefix + "tools/docs_catalog.py",
-                mb_prefix + "tools/validate_catalog.py",
-                mb_prefix + "tools/resolve_audit_docs.py",
-                mb_prefix + "tools/generate_file_conventions.py",
-                mb_prefix + "tools/audit_doc_impact.py",
                 mb_prefix + "tmux/agent-ui.conf",
                 nagger_prefix + "config.yaml.example",
                 nagger_prefix + "command_conventions.yaml.example",
@@ -2433,6 +2553,38 @@ class ScaffoldRulesTest(unittest.TestCase):
                     "an empty governance package):\n  " + "\n  ".join(missing)
                 ),
             )
+            # Docs catalog tooling lives in mozyo_bridge.docs_tools now,
+            # not in the preset's `files/` tree. The wheel must NOT ship
+            # any vendor-copied tools under that prefix anymore.
+            legacy_tools = [
+                name for name in names if mb_prefix + "tools/" in name
+            ]
+            self.assertEqual(
+                [],
+                legacy_tools,
+                msg=(
+                    "wheel still carries vendor-copied .mozyo-bridge/tools/ "
+                    f"entries: {legacy_tools}"
+                ),
+            )
+            # And the docs_tools package itself must ship.
+            docs_tools_prefix = "mozyo_bridge/docs_tools/"
+            for expected_module in (
+                "__init__.py",
+                "catalog.py",
+                "validate.py",
+                "resolve.py",
+                "generate.py",
+                "impact.py",
+            ):
+                self.assertIn(
+                    docs_tools_prefix + expected_module,
+                    names,
+                    msg=(
+                        f"wheel is missing the docs_tools module "
+                        f"`{expected_module}` — the docs CLI cannot run."
+                    ),
+                )
 
     def test_scaffold_requires_installed_central_preset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,27 +1,30 @@
-"""Docs catalog loader and matcher used by the governed-preset tools.
+"""Catalog loader and lookup primitives.
 
-This module is distributed by the mozyo-bridge `redmine-rails-governed`
-preset. It lives under `<repo>/.mozyo-bridge/tools/` once the scaffold is
-applied. Repo-relative paths are resolved against `REPO_ROOT`, which is
-the directory two levels above this file (`.mozyo-bridge/tools/..` =
-`.mozyo-bridge`, then `..` again = repo root).
+The vendor-copied predecessor lived under the target repo, so it
+inferred ``REPO_ROOT`` from its own file location. Now that the code
+lives inside the mozyo-bridge package, the repo root is no longer
+implicit — every entry point takes a :class:`CatalogContext` (or an
+explicit ``repo_root``) so the same code runs identically against any
+target repository.
 """
 
 from __future__ import annotations
 
 import fnmatch
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CATALOG_PATH = REPO_ROOT / ".mozyo-bridge/docs/catalog.yaml"
-MANAGED_TYPES = {"rule", "spec", "logic", "manual_spec", "task"}
+
+MANAGED_TYPES = frozenset({"rule", "spec", "logic", "manual_spec", "task"})
+
 DEFAULT_DOC_MESSAGE = (
     "このファイルを変更する場合は､ {document_paths} をよく確認し従うこと\n"
     "作業を続けるためには､上記ドキュメントを確認したことを示してください\n"
 )
+
 AUDIT_DOCUMENT_ORDER = {
     "rule": 0,
     "spec": 1,
@@ -30,8 +33,42 @@ AUDIT_DOCUMENT_ORDER = {
     "manual_spec": 4,
 }
 
+DEFAULT_CATALOG_RELATIVE_PATH = Path(".mozyo-bridge/docs/catalog.yaml")
 
-def load_catalog(catalog_path: Path = CATALOG_PATH) -> dict[str, Any]:
+
+@dataclass(frozen=True)
+class CatalogContext:
+    """Resolved repo + catalog locations for one docs_tools invocation.
+
+    ``repo_root`` is an absolute path to the project being checked.
+    ``catalog_path`` is an absolute path to the catalog YAML; it
+    defaults to ``<repo_root>/.mozyo-bridge/docs/catalog.yaml`` so the
+    common case stays a single positional flag.
+    """
+
+    repo_root: Path
+    catalog_path: Path
+
+    @classmethod
+    def build(
+        cls,
+        repo_root: Path | str,
+        catalog_path: Path | str | None = None,
+    ) -> "CatalogContext":
+        root = Path(repo_root).expanduser().resolve()
+        if catalog_path is None:
+            catalog_abs = root / DEFAULT_CATALOG_RELATIVE_PATH
+        else:
+            candidate = Path(catalog_path).expanduser()
+            catalog_abs = candidate if candidate.is_absolute() else (root / candidate).resolve()
+        return cls(repo_root=root, catalog_path=catalog_abs)
+
+    def repo_abspath(self, relative_path: str) -> Path:
+        return self.repo_root / relative_path
+
+
+def load_catalog(catalog_path: Path) -> dict[str, Any]:
+    """Read the catalog YAML; raise ``ValueError`` on non-mapping root."""
     data = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("catalog root must be a mapping")
@@ -58,20 +95,19 @@ def document_path_index(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
-def repo_relative(path: Path) -> str:
-    return path.relative_to(REPO_ROOT).as_posix()
+def normalize_repo_relative_path(context: CatalogContext, path_str: str) -> str:
+    """Normalise an input path to a repo-relative POSIX string.
 
-
-def repo_abspath(relative_path: str) -> Path:
-    return REPO_ROOT / relative_path
-
-
-def normalize_repo_relative_path(path_str: str) -> str:
+    Absolute paths are made repo-relative via ``Path.relative_to``;
+    paths that include the parent / repo name prefix get stripped so
+    pasted ``<workspace>/<repo>/foo`` arguments still match. Anything
+    else passes through as a POSIX string.
+    """
     path = Path(path_str)
     if path.is_absolute():
-        return repo_relative(path.resolve())
+        return path.resolve().relative_to(context.repo_root).as_posix()
     normalized = PurePosixPath(path.as_posix()).as_posix()
-    repo_name_prefix = f"{REPO_ROOT.parent.name}/{REPO_ROOT.name}/"
+    repo_name_prefix = f"{context.repo_root.parent.name}/{context.repo_root.name}/"
     if normalized.startswith(repo_name_prefix):
         return normalized[len(repo_name_prefix):]
     return normalized
@@ -82,8 +118,8 @@ def pattern_matches(relative_path: str, pattern: str) -> bool:
         return True
     if "/**/" in pattern:
         # `foo/**/*.rb` should also match `foo/bar.rb`. Python's fnmatch
-        # treats `**` as ordinary `*` segments, so the zero-directory case
-        # needs explicit handling.
+        # treats `**` as ordinary `*` segments, so the zero-directory
+        # case needs explicit handling.
         zero_directory_pattern = pattern.replace("/**/", "/")
         return fnmatch.fnmatchcase(relative_path, zero_directory_pattern)
     return False
@@ -93,7 +129,6 @@ def matching_file_conventions(
     catalog: dict[str, Any], relative_path: str
 ) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
-
     for item in catalog.get("file_conventions", []):
         patterns = item.get("patterns", [])
         exclude_patterns = item.get("exclude_patterns", [])
@@ -102,25 +137,21 @@ def matching_file_conventions(
         if any(pattern_matches(relative_path, pattern) for pattern in exclude_patterns):
             continue
         matched.append(item)
-
     return matched
 
 
 def build_file_conventions_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     documents = document_index(catalog)
     generated_rules: list[dict[str, Any]] = []
-
     for item in catalog.get("file_conventions", []):
         rule: dict[str, Any] = {
             "name": item["name"],
             "patterns": item["patterns"],
             "severity": item["severity"],
         }
-
         for key in ("token_threshold", "scope", "exclude_patterns"):
             if key in item:
                 rule[key] = item[key]
-
         document_refs = item.get("document_refs", [])
         if document_refs:
             document_paths = " と ".join(
@@ -131,17 +162,17 @@ def build_file_conventions_payload(catalog: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             message = item["message"]
-
         rule["message"] = message
         generated_rules.append(rule)
-
     return {"rules": generated_rules}
 
 
 def resolve_audit_documents(
-    catalog: dict[str, Any], relative_path: str
+    context: CatalogContext,
+    catalog: dict[str, Any],
+    relative_path: str,
 ) -> dict[str, Any]:
-    normalized_path = normalize_repo_relative_path(relative_path)
+    normalized_path = normalize_repo_relative_path(context, relative_path)
     docs_by_id = document_index(catalog)
     active_docs_by_id = active_document_index(catalog)
     docs_by_path = document_path_index(catalog)
@@ -162,10 +193,7 @@ def resolve_audit_documents(
             add_document(direct_document, "document_path")
         elif direct_document.get("replacement"):
             replacement_document = docs_by_path.get(direct_document["replacement"])
-            if (
-                replacement_document is not None
-                and replacement_document.get("status") == "active"
-            ):
+            if replacement_document is not None and replacement_document.get("status") == "active":
                 add_document(replacement_document, f"replacement:{direct_document['id']}")
                 notes.append(
                     f"deprecated `{normalized_path}` -> `{direct_document['replacement']}` を参照"
