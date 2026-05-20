@@ -77,7 +77,7 @@ python3 .mozyo-bridge/tools/audit_doc_impact.py --all-changed --check-generated
 ```
 
 - 変更対象 path が分かったら resolver を実行し、解決された docs 本文を読んでから実装・監査する。
-- catalog 自体や file_convention pattern を変更した場合は validator と coverage check を通す。default coverage roots は Rails の典型 layer (`app/controllers`, `app/models`, `db/migrate`, `spec` など) を含むが、project が該当 layer を持たない場合は missing root は `notice:` として印字されるだけで exit code には影響しない。strict に project の layer を限定したい場合は `--coverage-root <path>` を必要回数指定する。
+- catalog 自体や file_convention pattern を変更した場合は validator と coverage check を通す。coverage roots の選択順序は **(1) CLI `--coverage-root`** が指定されていればそれ、**(2) catalog の `coverage_roots` field** が定義されていればそれ、**(3) validator 組み込み default** (Rails 典型 layer)。CLI が catalog より優先される。project が該当 layer を持たない場合は missing root は `notice:` として印字されるだけで exit code には影響しない。project ごとの恒久指定は catalog 側に書く運用が望ましい。
 - file_conventions 生成物 (project が採用している場合) を変える場合は generator を実行し、drift check を通す。
 - staged commit 直前は `audit_doc_impact.py --staged --check-generated` を通す。作業中の棚卸しでは `--all-changed`。
 

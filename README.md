@@ -417,6 +417,8 @@ apply すると、router 一式に加えて以下が target repo に書き込ま
 
 これらは scaffold preset 側を正本とし、`mozyo-bridge scaffold status` が drift を検出します。target 側で個別に編集したい場合は preset へ upstream し、`mozyo-bridge scaffold apply --backup` で再配布してください。configured catalog (`catalog.yaml`) は scaffold が触らないため、project 固有 docs / file_conventions を埋めても上書きされません。`mozyo-bridge scaffold apply --backup` は shipped artifacts も含めて pre-existing files を `.bak.<timestamp>` に退避します。
 
+catalog には任意 field `coverage_roots` を定義できます。指定した repo-relative path が `validate_catalog.py --check-file-coverage` の走査対象になり、CLI `--coverage-root` が無い場合の default として使われます。CLI が指定されたときは CLI 側が優先されます。missing root は `notice:` として印字され exit code には影響しません。`scaffold status` の出力では manifest 追跡対象を `tracked files:` セクションで表示します (router 2 件 + governed が追加した repo-local artifacts も同じセクションに並びます)。
+
 `redmine-rails` を選んだ project が後から full governance に乗り換える場合は、`mozyo-bridge scaffold apply redmine-rails-governed --target . --backup` で切り替えられます。
 
 

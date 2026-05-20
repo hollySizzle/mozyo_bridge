@@ -124,7 +124,45 @@ def validate_catalog(catalog_path: Path, strict_metadata: bool = False) -> list[
                     f"{convention_id}: document_ref `{document_ref}` must point to an active document"
                 )
 
+    coverage_roots = catalog.get("coverage_roots")
+    if coverage_roots is not None:
+        if not isinstance(coverage_roots, list):
+            errors.append("coverage_roots must be a list of repo-relative path strings")
+        else:
+            for index, root in enumerate(coverage_roots):
+                if not isinstance(root, str) or not root.strip():
+                    errors.append(
+                        f"coverage_roots[{index}] must be a non-empty repo-relative string"
+                    )
+
     return errors
+
+
+def resolve_coverage_roots(
+    catalog: dict,
+    cli_roots: list[str] | None,
+) -> tuple[list[str], str]:
+    """Pick the coverage roots to use and return them with their source.
+
+    Precedence (most specific first):
+
+    1. ``cli_roots`` — when ``--coverage-root`` is passed on the command
+       line. CLI always wins when present so operators can override the
+       checked-in catalog ad hoc.
+    2. ``catalog["coverage_roots"]`` — when the project has declared its
+       required roots in the catalog. Operators don't have to repeat
+       ``--coverage-root`` every invocation.
+    3. ``DEFAULT_COVERAGE_ROOTS`` — Rails-flavoured fallback so a fresh
+       project still gets a reasonable check.
+    """
+    if cli_roots:
+        return list(cli_roots), "cli"
+    catalog_roots = catalog.get("coverage_roots")
+    if isinstance(catalog_roots, list) and catalog_roots:
+        cleaned = [r for r in catalog_roots if isinstance(r, str) and r.strip()]
+        if cleaned:
+            return cleaned, "catalog"
+    return list(DEFAULT_COVERAGE_ROOTS), "default"
 
 
 def validate_file_coverage(
@@ -136,14 +174,23 @@ def validate_file_coverage(
 
     ``errors`` block the exit code (a real coverage gap inside an
     existing project layer). ``notices`` are informational only — for
-    example, when one of the default Rails layers does not exist yet
-    in the target project. The caller decides how to surface notices
-    (printed but not counted toward failure).
+    example, when one of the configured coverage roots does not exist
+    yet in the target project. The caller decides how to surface
+    notices (printed but not counted toward failure).
+
+    ``roots`` mirrors the ``--coverage-root`` CLI flag: when provided
+    it overrides any ``coverage_roots`` declared in the catalog. When
+    ``None`` the catalog's ``coverage_roots`` is used if present;
+    otherwise the Rails-flavoured ``DEFAULT_COVERAGE_ROOTS`` is the
+    fallback. The chosen source ("cli" / "catalog" / "default") is
+    emitted as the first notice line so operators can see which list
+    drove the check without re-reading the catalog by hand.
     """
     catalog = load_catalog(catalog_path)
     errors: list[str] = []
     notices: list[str] = []
-    coverage_roots = roots or list(DEFAULT_COVERAGE_ROOTS)
+    coverage_roots, source = resolve_coverage_roots(catalog, roots)
+    notices.append(f"coverage_roots source: {source} ({len(coverage_roots)} root(s))")
     coverage_suffixes = suffixes or DEFAULT_COVERAGE_SUFFIXES
 
     for root in coverage_roots:

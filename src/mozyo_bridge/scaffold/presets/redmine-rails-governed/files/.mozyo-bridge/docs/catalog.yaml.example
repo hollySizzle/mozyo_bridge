@@ -14,6 +14,18 @@ managed_types:
   - manual_spec
   - task
 
+# Optional. Repo-relative directories that `validate_catalog.py
+# --check-file-coverage` walks to assert every important source file
+# matches at least one file_convention. Drop or extend per project;
+# `--coverage-root` on the CLI takes precedence when given. Missing
+# roots stay informational (notice, no exit 1).
+# coverage_roots:
+#   - app
+#   - config
+#   - db/migrate
+#   - lib
+#   - spec
+
 documents:
   - id: rule-mozyo-bridge-development-flow
     type: rule

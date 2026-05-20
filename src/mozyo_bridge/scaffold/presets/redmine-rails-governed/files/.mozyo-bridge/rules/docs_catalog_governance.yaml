@@ -57,6 +57,16 @@
       - document_refs は対象ファイル変更時に実際に読むべき docs に絞る。
       - 生成物や agent 運用文書など、運用事故が起きやすいファイルも対象に含める。
       - patterns を広げる時は agent へのノイズ増加も評価する。
+  coverage_roots:
+    目的: |
+      `validate_catalog.py --check-file-coverage` が走査する repo-relative root の集合を
+      project 側で宣言する。
+    ルール:
+      - 任意 field。catalog 直下の `coverage_roots` に repo-relative の string list で書く。
+      - 指定が無い場合は validator の組み込み default (Rails 標準層) を使う。
+      - CLI `--coverage-root` が指定されたときは CLI 側が優先される (catalog 値は使わない)。
+      - 値は repo-relative の string list でなければならない。空文字列や非 list は validator が error として拒否する。
+      - 存在しない root は引き続き `notice:` として印字され exit code には影響しない。既存 root 内の未マッチ file は引き続き exit 1。
 
 tooling:
   validate_catalog:

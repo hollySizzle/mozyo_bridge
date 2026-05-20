@@ -1385,6 +1385,116 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual(0, result)
             self.assertIn("preset: redmine-rails-governed", output)
             self.assertIn("result: clean", output)
+            # Manifest now tracks router + repo-local artifacts. The
+            # label must reflect that scope rather than misleadingly
+            # calling everything a router file.
+            self.assertIn("tracked files:", output)
+            self.assertNotIn("router files:", output)
+
+    def test_governed_scaffold_validate_catalog_uses_coverage_roots_precedence(self) -> None:
+        """coverage_roots: CLI overrides catalog overrides default.
+
+        Precedence (most specific first):
+        1. ``--coverage-root`` CLI flag — wins when present.
+        2. ``catalog.coverage_roots`` field — used when CLI absent.
+        3. Built-in Rails-flavoured default — fallback when neither.
+
+        The validator prints which source it used as the first
+        ``notice:`` so operators can see the precedence resolution
+        without re-reading the catalog by hand.
+        """
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+
+            catalog_path = project / ".mozyo-bridge/docs/catalog.yaml"
+            base_catalog = (
+                project / ".mozyo-bridge/docs/catalog.yaml.example"
+            ).read_text(encoding="utf-8")
+            python = sys.executable
+            validate_tool = project / ".mozyo-bridge/tools/validate_catalog.py"
+
+            def run_coverage(*args: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [python, str(validate_tool), "--check-file-coverage", *args],
+                    cwd=project,
+                    capture_output=True,
+                    text=True,
+                )
+
+            # (3) No catalog field, no CLI flag — default Rails roots.
+            catalog_path.write_text(base_catalog, encoding="utf-8")
+            default_proc = run_coverage()
+            self.assertEqual(0, default_proc.returncode, msg=default_proc.stderr)
+            self.assertIn("coverage_roots source: default", default_proc.stdout)
+
+            # (2) Catalog declares coverage_roots — used as default
+            # when no CLI flag is given. Pointing at an existing
+            # repo-relative path means no notice for that root, and
+            # the existing example catalog matches `.mozyo-bridge/`
+            # via the fc-agent-guardrails convention.
+            catalog_path.write_text(
+                base_catalog + "\ncoverage_roots:\n  - .mozyo-bridge\n",
+                encoding="utf-8",
+            )
+            catalog_proc = run_coverage()
+            self.assertEqual(0, catalog_proc.returncode, msg=catalog_proc.stderr)
+            self.assertIn("coverage_roots source: catalog", catalog_proc.stdout)
+            self.assertNotIn(
+                "coverage_roots source: default", catalog_proc.stdout
+            )
+
+            # (1) CLI overrides catalog. Pass a non-existent root so we
+            # can tell which list was used just from the notice line.
+            cli_proc = run_coverage("--coverage-root", "unknown_layer")
+            self.assertEqual(0, cli_proc.returncode, msg=cli_proc.stderr)
+            self.assertIn("coverage_roots source: cli", cli_proc.stdout)
+            self.assertIn("coverage root does not exist", cli_proc.stdout)
+
+            # Bad shape: validator rejects coverage_roots when it is
+            # not a list of non-empty strings. This guards against
+            # silently broken config from typos like `coverage_roots: app`.
+            catalog_path.write_text(
+                base_catalog + "\ncoverage_roots: app\n", encoding="utf-8"
+            )
+            bad_proc = subprocess.run(
+                [python, str(validate_tool)],
+                cwd=project,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, bad_proc.returncode, msg=bad_proc.stdout)
+            self.assertIn("coverage_roots must be a list", bad_proc.stdout)
+
+            # And: an unmatched file inside an existing root is still
+            # an error. Reset to a clean catalog, point coverage_roots
+            # at a freshly-created directory containing an unmatched
+            # `.rb` file, and assert exit 1.
+            unmatched_root = project / "fresh_app"
+            unmatched_root.mkdir()
+            (unmatched_root / "orphan.rb").write_text("# orphan\n", encoding="utf-8")
+            catalog_path.write_text(
+                base_catalog + "\ncoverage_roots:\n  - fresh_app\n",
+                encoding="utf-8",
+            )
+            real_gap_proc = run_coverage()
+            self.assertEqual(1, real_gap_proc.returncode, msg=real_gap_proc.stdout)
+            self.assertIn("no file_convention matched: fresh_app/orphan.rb", real_gap_proc.stdout)
 
     def test_governed_scaffold_tools_resolve_against_shipped_catalog_example(self) -> None:
         """The shipped resolver + validator must work on the catalog skeleton.

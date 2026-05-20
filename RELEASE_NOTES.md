@@ -4,6 +4,23 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## Unreleased
+
+次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
+
+### 変更点
+
+- 新しい scaffold preset `redmine-rails-governed` を追加しました。`redmine-rails` を継承しつつ、full guardrail governance package を opt-in で被せられます。
+- `scaffold apply redmine-rails-governed` は target repo の `.mozyo-bridge/` 配下に rule files、docs catalog skeleton (`catalog.yaml.example`)、catalog tooling (validator / resolver / generator / impact checker) を配布します。生成物はすべて scaffold manifest に登録され、`scaffold status` が drift を検出します。
+- docs catalog に `coverage_roots` field を追加しました。`validate_catalog.py --check-file-coverage` は catalog 側 roots を読みつつ、CLI `--coverage-root` が指定された場合は CLI 側が優先されます。
+- `scaffold status` の出力ラベルを実態に合わせて `tracked files:` に変更しました。manifest が router 以外の scaffolded artifact も追跡している現状を誤解させない表現にします。
+
+### なぜ必要だったか
+
+`redmine-rails` preset は薄い router を維持するために、強い gate 文言や docs catalog tooling を project-local layer に委ねていました。実運用で full governance を即時に被せたい project にはこの分離が手数になっていたため、opt-in の governed preset として配布できる形にしました。実運用プロジェクトで実績のある guardrail から、固有業務ドメインや固定 path を取り除き、汎用 Rails+Redmine project に被せられる素材だけを残しています。
+
+`coverage_roots` の構造化は、`--coverage-root` CLI option だけだと「どの roots が必須なのか」が project に残らなかった点を補うためです。catalog 側に書くことで、project が必要な root の集合を docs として宣言でき、`--coverage-root` を毎回打たなくても `validate_catalog.py --check-file-coverage` が project に合った挙動になります。`scaffold status` のラベル変更は、governed preset によって manifest 追跡対象が増えた現状に合わせた表記の修正です。
+
 ## v0.4.0 - 2026-05-20
 
 v0.4.0 は、Dev Container などの環境で guardrail を失いにくくし、複数 agent window を少し見分けやすくするリリースです。

@@ -1362,7 +1362,10 @@ def cmd_scaffold_status(args: argparse.Namespace) -> int:
         f"installed={status.get('installed_preset_hash')!r}"
     )
     print(f"central status: {status.get('central_status')}")
-    print("router files:")
+    # Manifest tracks every file scaffold writes — routers plus the
+    # repo-local artifacts shipped by governed presets — so use a neutral
+    # label rather than "router files:" which understated the scope.
+    print("tracked files:")
     for row in status.get("files", []):
         print(f"  {row['path']}: {row['status']}")
 
