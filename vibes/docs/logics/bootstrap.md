@@ -25,6 +25,9 @@ In scope:
   - Codex skill install is a user/operator action in the Codex environment.
   - curl/script install is prohibited in bootstrap.
 - project router scaffold (`mozyo-bridge scaffold apply <preset>`).
+- governed scaffold catalog setup (`catalog.yaml.example` -> `catalog.yaml`) and
+  `mozyo-bridge docs ...` verification for projects that opt into
+  `redmine-rails-governed`.
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
 - per-preset isolated target smoke under `./tmp/mb-smoke-*` (non-destructive).
 - failure recovery for the symptoms an LLM is most likely to observe.
@@ -82,7 +85,11 @@ mozyo-bridge --version
 # prints: mozyo-bridge <X.Y.Z>
 ```
 
-The current GA version line is `0.2.0`. Any current `X.Y.Z` from PyPI is acceptable here; the doctor in Stage 5 is the substantive check.
+Do not hard-code a release expectation in bootstrap. Any current `X.Y.Z` from
+PyPI is acceptable here; `mozyo-bridge doctor` and the command-surface smoke in
+later stages are the substantive checks. When testing an unreleased checkout,
+use the GitHub-main / editable install path documented in README instead of
+pretending that unreleased commands are already on PyPI.
 
 Fallback (no `pipx`):
 
@@ -105,7 +112,8 @@ mozyo-bridge rules status
 Expected `rules status` output:
 
 - header line `PRESET STATUS INSTALLED PACKAGED PATH`.
-- one row per preset (`asana`, `redmine`, `none`), each with `STATUS=ok`.
+- one row per packaged preset (`asana`, `redmine`, `redmine-rails`,
+  `redmine-rails-governed`, `none`), each with `STATUS=ok`.
 - exit code `0`.
 
 If `STATUS != ok` or exit is non-zero:
@@ -172,6 +180,11 @@ Choose a preset based on the project's ticket system:
 
 - `asana` — Asana-driven projects (most current mozyo-bridge work).
 - `redmine` — Redmine-driven projects.
+- `redmine-rails` — Redmine-driven Rails projects that want thin routers and
+  project-local governance filled in by the target repo.
+- `redmine-rails-governed` — Redmine-driven Rails projects that want the full
+  repo-local governance package, docs catalog skeleton, Claude Nagger skeleton,
+  and tmux UI artifact up front.
 - `none` — projects with no ticket system gate.
 
 ```bash
@@ -184,6 +197,35 @@ Expected files written:
 - `AGENTS.md`
 - `CLAUDE.md`
 - `.mozyo-bridge/scaffold.json`
+
+When the target environment may not persist `~/.mozyo_bridge` (Dev Container,
+Codespace, or other ephemeral-home workspaces), use repo-local mode instead of
+the central home store:
+
+```bash
+mozyo-bridge rules install --repo-local /path/to/your-project
+mozyo-bridge scaffold apply <preset> --target /path/to/your-project --repo-local
+```
+
+Repo-local mode writes the preset store under
+`<repo>/.mozyo-bridge/rules/presets/` and generated routers point at that
+repo-relative path. `scaffold status` auto-detects the mode from the manifest;
+do not pass `--home` to a repo-local manifest.
+
+For `redmine-rails-governed`, initialize the docs catalog after scaffold:
+
+```bash
+cp .mozyo-bridge/docs/catalog.yaml.example .mozyo-bridge/docs/catalog.yaml
+mozyo-bridge docs validate --repo .
+mozyo-bridge docs validate --check-file-coverage --repo .
+```
+
+Then update `.mozyo-bridge/docs/catalog.yaml` with project-specific
+`documents`, `related_document_refs`, `file_conventions`, and optional
+`coverage_roots`. The configured `catalog.yaml` is target-owned data and is not
+overwritten by scaffold re-apply. The tooling is not copied into the target repo
+as `.mozyo-bridge/tools/*.py`; it is provided by the installed
+`mozyo-bridge docs ...` CLI.
 
 If `AGENTS.md` or `CLAUDE.md` already exists:
 
@@ -220,10 +262,13 @@ Expected:
 - 6 sections checked: `cli`, `rules`, `codex_skill`, `claude_skill`, `scaffold`, `tmux`.
 - all `ok` when both primary skill paths and a scaffolded target are in place.
 
-Expected exception when the Claude primary path (plugin marketplace) is used WITHOUT the curl fallback:
+Expected state when the Claude primary path (plugin marketplace) is used:
 
-- `claude_skill: missing` is the expected state, not a failure.
-- `mozyo-bridge doctor` currently scans only `~/.claude/skills/` and `<project>/.claude/skills/`; it does not scan `~/.claude/plugins/cache/` yet. Verify the Claude plugin install via `claude plugin list` (Stage 3a) instead.
+- `mozyo-bridge doctor` scans the plugin cache as well as legacy
+  `~/.claude/skills/` and project-local skill directories.
+- A plugin-only install is healthy when the `claude_skill` section reports the
+  plugin-managed skill as present. `claude plugin list` remains the direct
+  Claude-side confirmation command from Stage 3a.
 
 For machine-readable gating:
 
@@ -238,13 +283,16 @@ Output shape:
 {"ok": <bool>, "sections": {"cli": {...}, "rules": {...}, "codex_skill": {...}, "claude_skill": {...}, "scaffold": {...}, "tmux": {...}}}
 ```
 
-CI gate examples: `jq -e '.sections.scaffold.status == "ok"'`, `jq -e '.ok'`. Exit code is non-zero when `ok` is false. Do NOT gate on `jq '.sections.claude_skill.status == "ok"'` when only the plugin marketplace path is in use (see above).
+CI gate examples: `jq -e '.sections.scaffold.status == "ok"'`, `jq -e '.ok'`. Exit code is non-zero when `ok` is false.
 
 If any section is `missing` or `drifted`, read its `next_action` field. The CLI prints the next command to run; follow it.
 
 ## Stage 6 — Isolated target smoke
 
-Run BOTH presets, not just the one used by the current project. Preset boundary defects often only show up when the other preset is exercised.
+Run multiple presets, not just the one used by the current project. Preset
+boundary defects often only show up when another preset is exercised. At
+minimum, cover Asana, Redmine, Redmine Rails, and the governed Redmine Rails
+preset.
 
 ```bash
 mkdir -p ./tmp/mb-smoke-asana
@@ -256,12 +304,31 @@ mkdir -p ./tmp/mb-smoke-redmine
 mozyo-bridge scaffold apply redmine --target ./tmp/mb-smoke-redmine
 mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine
 mozyo-bridge doctor --target ./tmp/mb-smoke-redmine
+
+mkdir -p ./tmp/mb-smoke-redmine-rails
+mozyo-bridge scaffold apply redmine-rails --target ./tmp/mb-smoke-redmine-rails
+mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine-rails
+mozyo-bridge doctor --target ./tmp/mb-smoke-redmine-rails
+
+mkdir -p ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge scaffold apply redmine-rails-governed --target ./tmp/mb-smoke-redmine-rails-governed
+cp ./tmp/mb-smoke-redmine-rails-governed/.mozyo-bridge/docs/catalog.yaml.example \
+   ./tmp/mb-smoke-redmine-rails-governed/.mozyo-bridge/docs/catalog.yaml
+mozyo-bridge docs validate --repo ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge docs validate --check-file-coverage --repo ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge docs generate-file-conventions --repo ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge docs generate-file-conventions --check --repo ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine-rails-governed
+mozyo-bridge doctor --target ./tmp/mb-smoke-redmine-rails-governed
 ```
 
 Expected per target:
 
 - `scaffold status` exits `0` with the line `result: clean`.
 - `doctor --target` reports the `scaffold` section as `ok`.
+- governed smoke also proves that `mozyo-bridge docs ...` reads
+  `<repo>/.mozyo-bridge/docs/catalog.yaml` without any target-repo
+  `.mozyo-bridge/tools/*.py` vendor copy.
 
 If either preset fails:
 
@@ -278,8 +345,15 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 - `doctor` reports `cli: ok` but `rules: missing`:
   - Stage 2 was skipped or `MOZYO_BRIDGE_HOME` points elsewhere.
   - run `mozyo-bridge rules install`; if `MOZYO_BRIDGE_HOME` is set, pass `--home <path>` to match.
-- `doctor` reports `claude_skill: missing` after only the plugin marketplace install:
-  - expected state. Verify with `claude plugin list` instead.
+- `doctor` reports `claude_skill: missing` after plugin marketplace install:
+  - the plugin is not installed, not visible to the current Claude install, or
+    the CLI/doctor version is older than the plugin-cache scan. Verify with
+    `claude plugin list`, then upgrade/reinstall `mozyo-bridge` if the plugin
+    is listed but doctor still cannot see it.
+- `mozyo-bridge docs validate` fails with `.mozyo-bridge/docs/catalog.yaml` missing:
+  - governed scaffold only ships `catalog.yaml.example`; copy it to
+    `.mozyo-bridge/docs/catalog.yaml` and then fill project-specific docs and
+    file conventions.
 - `doctor` reports `claude_skill: ok` AND a project skill exists in `<project>/.claude/skills/mozyo-bridge-agent/`:
   - personal (`~/.claude/skills/`) overrides project. The project copy is shadowed.
   - keep ONE path. The plugin marketplace path avoids the conflict.

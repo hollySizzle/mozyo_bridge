@@ -130,11 +130,14 @@ Responsibilities:
   - `.mozyo-bridge/rules/llm_rule_authoring.md`
   - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
   - `.mozyo-bridge/docs/catalog.yaml.example`
-  - `.mozyo-bridge/tools/{docs_catalog,validate_catalog,resolve_audit_docs,generate_file_conventions,audit_doc_impact}.py`
+  - `.mozyo-bridge/tmux/agent-ui.conf`
+  - `.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example`
+  - `.claude-nagger/.gitignore`
+- Provide docs catalog tooling from the `mozyo-bridge` package CLI, not as target-repo Python source. Operators run `mozyo-bridge docs validate / resolve / generate-file-conventions / audit-impact` against the target repo's `.mozyo-bridge/docs/catalog.yaml`.
 - Track every shipped artifact in `.mozyo-bridge/scaffold.json` so `scaffold status` detects drift. The status command labels the manifest's file list as `tracked files:` (renamed from the earlier `router files:` to reflect that governed presets also ship repo-local artifacts beyond the router pair).
 - Refuse silent overwrite of any shipped artifact; `--backup` or `--force` is required, same as the router pair.
 - Avoid touching `.mozyo-bridge/docs/catalog.yaml` itself (only the `.example` file is shipped); the configured catalog stays under the operator's control.
-- Catalog supports an optional `coverage_roots` list. `validate_catalog.py --check-file-coverage` walks those repo-relative paths when no `--coverage-root` flag is given; `--coverage-root` always wins when present. Missing roots stay informational (`notice:` line, no exit 1); unmatched files inside an existing root remain exit 1.
+- Catalog supports an optional `coverage_roots` list. `mozyo-bridge docs validate --check-file-coverage` walks those repo-relative paths when no `--coverage-root` flag is given; `--coverage-root` always wins when present. Missing roots stay informational (`notice:` line, no exit 1); unmatched files inside an existing root remain exit 1.
 
 Non-goals:
 

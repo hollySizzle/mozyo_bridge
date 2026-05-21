@@ -401,7 +401,7 @@ re-sync の標準フロー:
 
 #### `redmine-rails-governed`: full guardrail governance package
 
-`redmine-rails-governed` preset は `redmine-rails` を extends する full governance 向けの opt-in preset です。`redmine-rails` の薄い preset では project-local layer に書くことが推奨されていた強い文言を preset 側で正本にし、scaffold 時に target repo の `.mozyo-bridge/` 配下に repo-local rules / tools / catalog skeleton を配布します。
+`redmine-rails-governed` preset は `redmine-rails` を extends する full governance 向けの opt-in preset です。`redmine-rails` の薄い preset では project-local layer に書くことが推奨されていた強い文言を preset 側で正本にし、scaffold 時に target repo の `.mozyo-bridge/` 配下に repo-local rules / catalog skeleton / runtime guardrail artifacts を配布します。docs catalog tooling は target repo に Python source として置かず、`mozyo-bridge docs ...` CLI として package 側から実行します。
 
 ```bash
 mozyo-bridge scaffold apply redmine-rails-governed --target /path/to/repo
