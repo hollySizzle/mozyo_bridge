@@ -1,11 +1,11 @@
 # mozyo-bridge Bootstrap Guide
 
-LLM-first bootstrap for setting up `mozyo-bridge` from a clean machine through
-project initialization. Optimized for Claude / Codex agent execution: each
-stage names exact commands, expected success signals, and the failure branch.
+LLM-first bootstrap for installing or updating `mozyo-bridge` through project
+initialization. Optimized for Claude / Codex agent execution: each stage names
+exact commands, expected success signals, and the failure branch.
 
-This is the canonical entrypoint for "install + project bootstrap". Read this
-BEFORE the install sections of `README.md`, `skill-distribution.md`, or
+This is the canonical entrypoint for "install/update + project bootstrap". Read
+this BEFORE the install sections of `README.md`, `skill-distribution.md`, or
 `scaffold-rules.md`. Those docs remain the authoritative reference for their
 specific surfaces; this doc orders the stages and links into them.
 
@@ -18,6 +18,7 @@ rather than restating its contents here.
 In scope:
 
 - CLI install (primary: PyPI via `pipx`).
+- existing CLI / rules / scaffold update after a release ships.
 - user-global rules install (`mozyo-bridge rules install`).
 - agent skill install:
   - Claude Code primary path: plugin marketplace.
@@ -39,6 +40,19 @@ Out of scope (covered by sibling docs):
 - runtime usage and notification commands (root `README.md` `Notification Commands`).
 - agent work-rules and ticket-system workflow (`vibes/docs/rules/agent-workflow.md`).
 - release helper invocations (`mozyo-bridge release …` is out of bootstrap; see release-flow.md).
+
+## Path selection — fresh install vs existing update
+
+Use this decision point before running the staged flow:
+
+- If the host does not have `mozyo-bridge`, start at Stage 0 and continue
+  through Stage 6.
+- If `mozyo-bridge` is already installed and a project already has
+  `.mozyo-bridge/scaffold.json`, use the Existing Install Update section below.
+  Do not repeat the full bootstrap unless the host or project is being rebuilt
+  from scratch.
+- If the CLI exists but the project was never scaffolded, upgrade the CLI first,
+  then continue at Stage 2 for central mode or Stage 4 for repo-local mode.
 
 ## Stage 0 — Prerequisites
 
@@ -101,6 +115,77 @@ python3 -m mozyo_bridge --version
 This is a fallback because it installs into the user-site Python environment without isolation. Prefer `pipx`.
 
 There is no `curl ... | sh` install path for the CLI. Bootstrap also forbids curl/script install for agent skills; use the primary paths in Stage 3.
+
+## Existing Install Update
+
+Use this path after a `mozyo-bridge` release ships and the user already has a
+scaffolded project. This updates three different surfaces: the installed CLI,
+the preset store agents read at runtime, and each target repo's scaffold
+manifest/artifacts.
+
+Central preset store:
+
+```bash
+pipx upgrade mozyo-bridge
+mozyo-bridge --version
+mozyo-bridge rules install
+mozyo-bridge rules status
+
+cd /path/to/scaffolded-project
+mozyo-bridge scaffold status --target .
+mozyo-bridge scaffold apply <preset> --target . --backup
+mozyo-bridge scaffold status --target .
+mozyo-bridge doctor --target .
+```
+
+Repo-local preset store:
+
+```bash
+pipx upgrade mozyo-bridge
+mozyo-bridge --version
+
+cd /path/to/scaffolded-project
+mozyo-bridge rules install --repo-local .
+mozyo-bridge scaffold status --target .
+mozyo-bridge scaffold apply <preset> --target . --repo-local --backup
+mozyo-bridge scaffold status --target .
+mozyo-bridge doctor --target .
+```
+
+Important update rules:
+
+- `scaffold status` is the decision point. If it is clean, the repo already
+  matches the currently installed preset. If it reports drift, inspect the diff
+  and accept the new shipped guardrails with `scaffold apply <preset> --backup`.
+- Use repo-local mode when the target environment may not preserve
+  `~/.mozyo_bridge` (Dev Container, Codespace, or other ephemeral-home
+  workspaces). Do not pass `--home` to a repo-local manifest.
+- `catalog.yaml` is target-owned data and is not overwritten by scaffold
+  re-apply. The shipped `catalog.yaml.example` may be refreshed by scaffold.
+- `redmine-rails-governed` no longer vendors docs tooling as
+  `.mozyo-bridge/tools/*.py`; use `mozyo-bridge docs ...` from the installed
+  package.
+- From v0.5.0 onward, `agent-workflow.md` is the governed execution contract.
+  Older scaffold-managed artifacts such as
+  `.mozyo-bridge/rules/development_flow.md` and
+  `.mozyo-bridge/tools/*.py` may be removed by outgoing reconcile when
+  `--backup` or `--force` is used. Prefer `--backup` so local state is preserved
+  as `.bak.<timestamp>`.
+- `doctor` may report the Claude Nagger skeleton separately from whether the
+  operator has copied `.claude-nagger/config.yaml.example` to
+  `.claude-nagger/config.yaml`. A skeleton-only state is an integration prompt,
+  not scaffold drift.
+
+If `pipx upgrade mozyo-bridge` fails because the local pipx backend cannot
+install the package, retry with pipx's pip backend using a forced install of the
+desired release:
+
+```bash
+pipx install --force --backend pip mozyo-bridge==<X.Y.Z>
+```
+
+Use the exact version only when pinning to a known release. For routine updates,
+prefer unpinned `pipx upgrade mozyo-bridge`.
 
 ## Stage 2 — Install user-global rules
 
@@ -369,7 +454,7 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 
 ## Where this doc sits relative to the others
 
-- **This doc** owns the bootstrap stage order from a fresh machine through a working scaffold + verified doctor + per-preset isolated smoke.
+- **This doc** owns the fresh-install stage order and the existing-install update path through a working scaffold + verified doctor + per-preset isolated smoke.
 - `README.md` `Quick Start` / `Beta Tester Install` / `Agent Skill Install` / `Agent Rules Scaffold` are the operator reference for the individual commands. Read README when you need a flag detail; read this bootstrap doc when you need the stage order.
 - `vibes/docs/logics/skill-distribution.md` is the source of truth for skill packaging, precedence, marketplace metadata, and drift.
 - `vibes/docs/logics/scaffold-rules.md` is the source of truth for scaffold preset semantics and manifest invariants.
