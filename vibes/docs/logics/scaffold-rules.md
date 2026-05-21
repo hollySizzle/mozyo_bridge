@@ -124,9 +124,11 @@ Where `redmine-rails` intentionally defers strong project-local rules (gate sche
 Responsibilities:
 
 - Inherit the layered router behavior from `redmine-rails`.
+- Keep gate schema, role split, Codex direct edit gate, and completion
+  contract in the preset `agent-workflow.md` itself. Do not distribute a
+  second development-flow rule file that competes with the entry workflow.
 - Layer additional governance language in the central `agent-workflow.md`: gate schema field requirements, Codex direct edit gate, docs catalog governance, LLM rule authoring contract, journal templates.
 - Ship a fixed set of repo-local artifacts when `scaffold apply` runs:
-  - `.mozyo-bridge/rules/development_flow.md`
   - `.mozyo-bridge/rules/llm_rule_authoring.md`
   - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
   - `.mozyo-bridge/docs/catalog.yaml.example`

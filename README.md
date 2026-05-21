@@ -403,13 +403,14 @@ re-sync の標準フロー:
 
 `redmine-rails-governed` preset は `redmine-rails` を extends する full governance 向けの opt-in preset です。`redmine-rails` の薄い preset では project-local layer に書くことが推奨されていた強い文言を preset 側で正本にし、scaffold 時に target repo の `.mozyo-bridge/` 配下に repo-local rules / catalog skeleton / runtime guardrail artifacts を配布します。docs catalog tooling は target repo に Python source として置かず、`mozyo-bridge docs ...` CLI として package 側から実行します。
 
+gate schema、agent role、Codex direct edit gate、完了条件は `redmine-rails-governed/agent-workflow.md` 自体を正本にします。AGENTS.md / CLAUDE.md が読む入口と実行契約を分けないことで、LLM が読むべき正本を 1 本に保ちます。
+
 ```bash
 mozyo-bridge scaffold apply redmine-rails-governed --target /path/to/repo
 ```
 
 apply すると、router 一式に加えて以下が target repo に書き込まれます。
 
-- `.mozyo-bridge/rules/development_flow.md` — agent role、編集権限、gate schema、Codex direct edit gate の正本。
 - `.mozyo-bridge/rules/llm_rule_authoring.md` — LLM 向け規約文書の作成・分離・構造化の正本。
 - `.mozyo-bridge/rules/docs_catalog_governance.yaml` — docs catalog、resolver、generator、impact check の統治規約。
 - `.mozyo-bridge/docs/catalog.yaml.example` — 初期 catalog skeleton。target 側で `catalog.yaml` にコピーして埋める。

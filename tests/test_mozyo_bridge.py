@@ -1155,7 +1155,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         gate schema, Codex direct edit gate, docs catalog governance,
         LLM rule authoring — without leaking nihonidenshi-specific names,
         paths, or business-domain identifiers. `scaffold apply` must
-        write the repo-local rules / tools / catalog skeleton into the
+        write the repo-local rules / catalog skeleton into the
         target repository so the package is usable out of the box.
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -1177,7 +1177,6 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "rules/presets/redmine/agent-workflow.md",
                 "rules/presets/redmine-rails/agent-workflow.md",
                 "Scaffolded Repo-Local Artifacts",
-                ".mozyo-bridge/rules/development_flow.md",
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
@@ -1219,16 +1218,17 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "集荷",
                 "_機能リスト.json",
                 "FeatureList",
-                ".claude-nagger",
                 "vibes/docs/tools",
                 "bin/recreate_db.sh",
                 "bin/sync-mozyo-bridge-skill",
             ):
                 self.assertNotIn(forbidden, installed)
 
-            # `scaffold apply` writes the governance artifacts under
+            # `scaffold apply` writes the repo-local governance artifacts under
             # .mozyo-bridge/ in the target repo so the package is
-            # immediately usable.
+            # immediately usable. The main gate / role contract now lives
+            # in the preset agent-workflow.md itself rather than a second
+            # shipped development_flow.md file.
             result, _ = self.run_cli(
                 [
                     "scaffold",
@@ -1242,7 +1242,6 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             self.assertEqual(0, result)
             for expected_path in (
-                ".mozyo-bridge/rules/development_flow.md",
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
@@ -1263,12 +1262,6 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ),
             )
 
-            # Strong language survives into the shipped repo-local rule
-            # files too. Verifying once across files is enough — the de-
-            # domain regression rails above already guard the workflow doc.
-            dev_flow = (project / ".mozyo-bridge/rules/development_flow.md").read_text(
-                encoding="utf-8"
-            )
             for marker in (
                 "codex_direct_edit",
                 "allowed_paths",
@@ -1276,7 +1269,14 @@ class ScaffoldRulesTest(unittest.TestCase):
                 "owner_close_approval",
                 "禁止_並行表現",
             ):
-                self.assertIn(marker, dev_flow)
+                self.assertIn(marker, installed)
+            self.assertFalse(
+                (project / ".mozyo-bridge/rules/development_flow.md").exists(),
+                msg=(
+                    "development_flow.md should not ship; governed agent "
+                    "execution contract is merged into agent-workflow.md"
+                ),
+            )
 
             # The catalog example references the shipped rule files only,
             # never the nihonidenshi domain catalog ids.
@@ -1284,12 +1284,12 @@ class ScaffoldRulesTest(unittest.TestCase):
                 project / ".mozyo-bridge/docs/catalog.yaml.example"
             ).read_text(encoding="utf-8")
             for marker in (
-                "rule-mozyo-bridge-development-flow",
                 "rule-llm-rule-authoring",
                 "rule-docs-catalog-governance",
-                ".mozyo-bridge/rules/development_flow.md",
             ):
                 self.assertIn(marker, catalog_example)
+            self.assertNotIn("rule-mozyo-bridge-development-flow", catalog_example)
+            self.assertNotIn(".mozyo-bridge/rules/development_flow.md", catalog_example)
             for forbidden in ("NIPT", "_機能リスト", "nihonidenshi"):
                 self.assertNotIn(forbidden, catalog_example)
 
@@ -1303,7 +1303,6 @@ class ScaffoldRulesTest(unittest.TestCase):
             for expected in (
                 "AGENTS.md",
                 "CLAUDE.md",
-                ".mozyo-bridge/rules/development_flow.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
             ):
@@ -1362,7 +1361,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     )
             err = stderr.getvalue()
             self.assertIn("refusing to overwrite existing scaffold files", err)
-            self.assertIn(".mozyo-bridge/rules/development_flow.md", err)
+            self.assertIn(".mozyo-bridge/rules/llm_rule_authoring.md", err)
 
             # --backup re-runs the apply and stashes the pre-existing file.
             backup_result, _ = self.run_cli(
@@ -1379,7 +1378,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             self.assertEqual(0, backup_result)
             self.assertTrue(
-                list((project / ".mozyo-bridge/rules").glob("development_flow.md.bak.*"))
+                list((project / ".mozyo-bridge/rules").glob("llm_rule_authoring.md.bak.*"))
             )
 
     def test_governed_scaffold_status_clean_after_fresh_apply(self) -> None:
@@ -1571,14 +1570,13 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(project),
                     "--format",
                     "json",
-                    ".mozyo-bridge/rules/development_flow.md",
+                    "AGENTS.md",
                 ]
             )
             self.assertEqual(0, resolve_code, msg=resolve_output)
             results = json.loads(resolve_output)
             self.assertEqual(1, len(results))
             resolved_ids = {doc["id"] for doc in results[0]["documents"]}
-            self.assertIn("rule-mozyo-bridge-development-flow", resolved_ids)
             self.assertIn("rule-docs-catalog-governance", resolved_ids)
             self.assertIn("rule-llm-rule-authoring", resolved_ids)
 
@@ -1645,7 +1643,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             # The legitimate rule files under the same directory still
             # surface — we only filter cache cruft, not real artifacts.
-            self.assertIn(".mozyo-bridge/rules/development_flow.md", paths)
+            self.assertIn(".mozyo-bridge/rules/llm_rule_authoring.md", paths)
         finally:
             import shutil as _shutil
 
@@ -1755,7 +1753,6 @@ class ScaffoldRulesTest(unittest.TestCase):
             # `mozyo-bridge docs ...` CLI on the installed venv. We assert
             # the target tree does not carry the legacy vendor copy.
             for expected_path in (
-                ".mozyo-bridge/rules/development_flow.md",
                 ".mozyo-bridge/rules/llm_rule_authoring.md",
                 ".mozyo-bridge/rules/docs_catalog_governance.yaml",
                 ".mozyo-bridge/docs/catalog.yaml.example",
@@ -2120,7 +2117,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             tracked = set(state["files"].keys())
             self.assertNotIn(".claude-nagger/config.yaml.example", tracked)
             self.assertNotIn(".mozyo-bridge/tmux/agent-ui.conf", tracked)
-            self.assertIn(".mozyo-bridge/rules/development_flow.md", tracked)
+            self.assertIn(".mozyo-bridge/rules/llm_rule_authoring.md", tracked)
 
             # And status is genuinely clean — not just nominally clean
             # while stale files remain.
@@ -2247,7 +2244,7 @@ class ScaffoldRulesTest(unittest.TestCase):
 
             # Non-skipped artifacts still ship — opt-outs are scoped.
             self.assertTrue(
-                (project / ".mozyo-bridge/rules/development_flow.md").exists()
+                (project / ".mozyo-bridge/rules/llm_rule_authoring.md").exists()
             )
             self.assertTrue(
                 (project / ".mozyo-bridge/rules/docs_catalog_governance.yaml").exists()
@@ -2267,7 +2264,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             ):
                 self.assertNotIn(nagger, tracked)
             # Non-skipped categories still tracked.
-            self.assertIn(".mozyo-bridge/rules/development_flow.md", tracked)
+            self.assertIn(".mozyo-bridge/rules/llm_rule_authoring.md", tracked)
 
             status_result, status_output = self.run_cli(
                 ["scaffold", "status", "--target", str(project), "--home", str(home)]
@@ -2368,16 +2365,17 @@ class ScaffoldRulesTest(unittest.TestCase):
                 skip_payload["sections"]["tmux"]["artifact"]["status"],
             )
 
-    def test_governed_scaffold_reconciles_legacy_vendor_tools_on_reapply(self) -> None:
-        """Re-apply with the new preset must clean up legacy vendor tools.
+    def test_governed_scaffold_reconciles_legacy_governed_artifacts_on_reapply(self) -> None:
+        """Re-apply with the new preset must clean up legacy governed artifacts.
 
         Prior governed-scaffold releases vendor-copied
-        ``.mozyo-bridge/tools/*.py`` into the target and recorded those
-        paths in the scaffold manifest. The new preset does not ship
-        the tools, so the next `scaffold apply` must reconcile them as
-        outgoing files: refuse to overwrite silently, then remove them
-        when ``--backup`` (or ``--force``) is provided. This guards the
-        upgrade path for existing operators.
+        ``.mozyo-bridge/tools/*.py`` and a separate
+        ``.mozyo-bridge/rules/development_flow.md`` into the target and
+        recorded those paths in the scaffold manifest. The new preset
+        does not ship those files, so the next `scaffold apply` must
+        reconcile them as outgoing files: refuse to overwrite silently,
+        then remove them when ``--backup`` (or ``--force``) is provided.
+        This guards the upgrade path for existing operators.
         """
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -2404,7 +2402,9 @@ class ScaffoldRulesTest(unittest.TestCase):
             # exactly what an older governed release left behind.
             tools_dir = project / ".mozyo-bridge/tools"
             tools_dir.mkdir(parents=True, exist_ok=True)
+            legacy_dev_flow = project / ".mozyo-bridge/rules/development_flow.md"
             legacy_files = {
+                legacy_dev_flow: "# legacy development flow\n",
                 tools_dir / "docs_catalog.py": "# legacy vendor copy\n",
                 tools_dir / "validate_catalog.py": "# legacy vendor copy\n",
                 tools_dir / "resolve_audit_docs.py": "# legacy vendor copy\n",
@@ -2443,6 +2443,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     )
             err = stderr.getvalue()
             self.assertIn("refusing to overwrite existing scaffold files", err)
+            self.assertIn(".mozyo-bridge/rules/development_flow.md", err)
             self.assertIn(".mozyo-bridge/tools/validate_catalog.py", err)
 
             # With --backup, the reconcile path stashes each legacy tool
@@ -2479,6 +2480,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     f"{[p for p in tracked if p.startswith('.mozyo-bridge/tools/')]}"
                 ),
             )
+            self.assertNotIn(".mozyo-bridge/rules/development_flow.md", tracked)
 
             # scaffold status reports clean after reconcile.
             status_result, status_output = self.run_cli(
@@ -2534,7 +2536,6 @@ class ScaffoldRulesTest(unittest.TestCase):
             expected = [
                 governed_prefix + "VERSION",
                 governed_prefix + "agent-workflow.md",
-                mb_prefix + "rules/development_flow.md",
                 mb_prefix + "rules/llm_rule_authoring.md",
                 mb_prefix + "rules/docs_catalog_governance.yaml",
                 mb_prefix + "docs/catalog.yaml.example",

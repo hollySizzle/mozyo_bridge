@@ -108,7 +108,7 @@ gate:
 
 ```yaml
 1ファイル1責務:
-  development_flow: 役割、編集権限、引き継ぎ、完了条件
+  agent_workflow: agent 実行契約、役割、編集権限、引き継ぎ、完了条件
   llm_rule_authoring: LLM向け規約文書の作り方
   docs_catalog_governance: catalog、resolver、generated file の統治
 分割禁止:
