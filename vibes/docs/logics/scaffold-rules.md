@@ -10,6 +10,7 @@ Supported presets:
 
 - `asana`
 - `redmine`
+- `redmine-governed` (extends `redmine`)
 - `redmine-rails` (extends `redmine`)
 - `redmine-rails-governed` (extends `redmine-rails`)
 - `none`
@@ -114,6 +115,36 @@ Asana-specific guardrails:
 - Do not require Project Custom Fields for the MVP path.
 - Do not put private Notion URLs into package templates.
 - Do not assume every Asana workspace exposes the same custom fields or comment ids.
+
+## Preset: redmine-governed
+
+The `redmine-governed` preset is the opt-in full guardrail governance package for non-Rails Redmine projects. It extends `redmine` directly.
+
+Responsibilities:
+
+- Inherit the Redmine issue / journal gate lifecycle from `redmine`.
+- Keep gate schema, role split, Codex direct edit gate, and completion
+  contract in the preset `agent-workflow.md` itself. Do not distribute a
+  second development-flow rule file that competes with the entry workflow.
+- Ship the same governance artifact categories as the Rails governed preset:
+  - `.mozyo-bridge/rules/llm_rule_authoring.md`
+  - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
+  - `.mozyo-bridge/docs/catalog.yaml.example`
+  - `.mozyo-bridge/tmux/agent-ui.conf`
+  - `.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example`
+  - `.claude-nagger/.gitignore`
+- Keep the catalog skeleton framework-neutral. It may use placeholders such as `src/**`, `tests/**`, `lib/**`, and `config/**`, but must not include Rails app, migration, Presenter, or Rails test assumptions.
+- Provide docs catalog tooling from the `mozyo-bridge` package CLI, not as target-repo Python source.
+- Track every shipped artifact in `.mozyo-bridge/scaffold.json` so `scaffold status` detects drift.
+- Avoid touching `.mozyo-bridge/docs/catalog.yaml` itself; only the `.example` file is shipped.
+
+Central preset doc:
+
+- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md`
+
+Repo-local artifacts source:
+
+- Files live under `src/mozyo_bridge/scaffold/presets/redmine-governed/files/` in the package source tree.
 
 ## Preset: redmine-rails-governed
 
@@ -305,7 +336,7 @@ beta tester が GitHub `main` から CLI を install した後、user-global rul
 tester smoke check 観点:
 
 1. `mozyo-bridge rules install` 実行後、`mozyo-bridge rules status` が `presets.yaml` の全 preset を expected version で報告する。
-2. **isolated target を preset ごとに作る**。`./tmp/mb-smoke-asana`、`./tmp/mb-smoke-redmine`、`./tmp/mb-smoke-redmine-rails` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold apply` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
+2. **isolated target を preset ごとに作る**。`./tmp/mb-smoke-asana`、`./tmp/mb-smoke-redmine`、`./tmp/mb-smoke-redmine-governed`、`./tmp/mb-smoke-redmine-rails` 等 (`./tmp/` は本 repo の gitignore 配下) もしくは fresh clone 別 directory を使う。本 repo の working tree (`mozyo_bridge` root) で `scaffold apply` を `--target` 無しで実行しないこと。tracked `AGENTS.md` / `CLAUDE.md` を上書き候補にしない。
 3. dummy target に対して registry の各 preset を `mozyo-bridge scaffold apply <preset> --target ./tmp/mb-smoke-<preset>` で実行する。片側だけで終わらせない (preset 間 boundary の確認が落ちる)。
 4. 各 dummy target で `mozyo-bridge scaffold status --target ...` が `result: clean` を返す。`central status` が `ok`、`router files` が全て `ok` の両方が出ていることを確認する。
 5. `mozyo-bridge doctor --target ./tmp/mb-smoke-<preset>` を 1 command の acceptance smoke として使う。`scaffold` section が `ok`、`rules` / `codex_skill` / `claude_skill` / `cli` / `tmux` の各 section status と `next_action` を確認する。CI / 機械的 smoke では `--json` で `{"ok": <bool>, "sections": {...}}` を取り、`jq '.sections.scaffold.status == "ok"'` 等で gate を組む。

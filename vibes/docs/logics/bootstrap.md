@@ -28,7 +28,7 @@ In scope:
 - project router scaffold (`mozyo-bridge scaffold apply <preset>`).
 - governed scaffold catalog setup (`catalog.yaml.example` -> `catalog.yaml`) and
   `mozyo-bridge docs ...` verification for projects that opt into
-  `redmine-rails-governed`.
+  `redmine-governed` or `redmine-rails-governed`.
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
 - per-preset isolated target smoke under `./tmp/mb-smoke-*` (non-destructive).
 - failure recovery for the symptoms an LLM is most likely to observe.
@@ -197,8 +197,8 @@ mozyo-bridge rules status
 Expected `rules status` output:
 
 - header line `PRESET STATUS INSTALLED PACKAGED PATH`.
-- one row per packaged preset (`asana`, `redmine`, `redmine-rails`,
-  `redmine-rails-governed`, `none`), each with `STATUS=ok`.
+- one row per packaged preset (`asana`, `redmine`, `redmine-governed`,
+  `redmine-rails`, `redmine-rails-governed`, `none`), each with `STATUS=ok`.
 - exit code `0`.
 
 If `STATUS != ok` or exit is non-zero:
@@ -265,6 +265,9 @@ Choose a preset based on the project's ticket system:
 
 - `asana` — Asana-driven projects (most current mozyo-bridge work).
 - `redmine` — Redmine-driven projects.
+- `redmine-governed` — Redmine-driven non-Rails projects that want the full
+  repo-local governance package, docs catalog skeleton, Claude Nagger skeleton,
+  and tmux UI artifact up front.
 - `redmine-rails` — Redmine-driven Rails projects that want thin routers and
   project-local governance filled in by the target repo.
 - `redmine-rails-governed` — Redmine-driven Rails projects that want the full
@@ -297,7 +300,7 @@ Repo-local mode writes the preset store under
 repo-relative path. `scaffold status` auto-detects the mode from the manifest;
 do not pass `--home` to a repo-local manifest.
 
-For `redmine-rails-governed`, initialize the docs catalog after scaffold:
+For `redmine-governed` and `redmine-rails-governed`, initialize the docs catalog after scaffold:
 
 ```bash
 cp .mozyo-bridge/docs/catalog.yaml.example .mozyo-bridge/docs/catalog.yaml
@@ -376,8 +379,8 @@ If any section is `missing` or `drifted`, read its `next_action` field. The CLI 
 
 Run multiple presets, not just the one used by the current project. Preset
 boundary defects often only show up when another preset is exercised. At
-minimum, cover Asana, Redmine, Redmine Rails, and the governed Redmine Rails
-preset.
+minimum, cover Asana, Redmine, Redmine Governed, Redmine Rails, and the
+governed Redmine Rails preset.
 
 ```bash
 mkdir -p ./tmp/mb-smoke-asana
@@ -389,6 +392,17 @@ mkdir -p ./tmp/mb-smoke-redmine
 mozyo-bridge scaffold apply redmine --target ./tmp/mb-smoke-redmine
 mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine
 mozyo-bridge doctor --target ./tmp/mb-smoke-redmine
+
+mkdir -p ./tmp/mb-smoke-redmine-governed
+mozyo-bridge scaffold apply redmine-governed --target ./tmp/mb-smoke-redmine-governed
+cp ./tmp/mb-smoke-redmine-governed/.mozyo-bridge/docs/catalog.yaml.example \
+   ./tmp/mb-smoke-redmine-governed/.mozyo-bridge/docs/catalog.yaml
+mozyo-bridge docs validate --repo ./tmp/mb-smoke-redmine-governed
+mozyo-bridge docs validate --check-file-coverage --repo ./tmp/mb-smoke-redmine-governed
+mozyo-bridge docs generate-file-conventions --repo ./tmp/mb-smoke-redmine-governed
+mozyo-bridge docs generate-file-conventions --check --repo ./tmp/mb-smoke-redmine-governed
+mozyo-bridge scaffold status --target ./tmp/mb-smoke-redmine-governed
+mozyo-bridge doctor --target ./tmp/mb-smoke-redmine-governed
 
 mkdir -p ./tmp/mb-smoke-redmine-rails
 mozyo-bridge scaffold apply redmine-rails --target ./tmp/mb-smoke-redmine-rails

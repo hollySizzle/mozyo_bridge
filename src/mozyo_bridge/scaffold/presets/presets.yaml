@@ -5,6 +5,10 @@ presets:
   redmine:
     ticket_anchor_label: "Redmine issue / journal"
     workflow: "redmine/agent-workflow.md"
+  redmine-governed:
+    ticket_anchor_label: "Redmine issue / journal と project docs"
+    workflow: "redmine-governed/agent-workflow.md"
+    extends: "redmine"
   redmine-rails:
     ticket_anchor_label: "Redmine issue / journal と Rails project docs"
     workflow: "redmine-rails/agent-workflow.md"

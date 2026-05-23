@@ -1148,6 +1148,109 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("redmine-rails", state["preset"])
             self.assertEqual("2026.05.18.4", state["preset_version"])
 
+    def test_rules_install_and_scaffold_redmine_governed_full_package(self) -> None:
+        """The non-Rails governed preset ships the governance package.
+
+        It must extend the generic Redmine workflow, not the Rails layer, and
+        its catalog skeleton must stay framework-neutral.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            result, _ = self.run_cli(["rules", "install", "--home", str(home)])
+            self.assertEqual(0, result)
+            governed_workflow = (
+                home / "rules" / "presets" / "redmine-governed" / "agent-workflow.md"
+            )
+            self.assertTrue(governed_workflow.exists())
+            installed = governed_workflow.read_text(encoding="utf-8")
+
+            for marker in (
+                "Redmine Governed Agent Workflow",
+                "rules/presets/redmine/agent-workflow.md",
+                "Scaffolded Repo-Local Artifacts",
+                ".mozyo-bridge/rules/llm_rule_authoring.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                "mozyo-bridge docs validate",
+                "mozyo-bridge docs resolve",
+                "mozyo-bridge docs generate-file-conventions",
+                "mozyo-bridge docs audit-impact",
+                "Gate Schema",
+                "Codex Direct Edit Gate",
+                "codex_direct_edit",
+                "Governed Mode Prohibitions",
+            ):
+                self.assertIn(marker, installed)
+
+            for forbidden in (
+                "rules/presets/redmine-rails/agent-workflow.md",
+                "redmine-rails-governed",
+                "bundle exec",
+                "rspec",
+                "rubocop",
+                "brakeman",
+                "db/migrate",
+                "app/**/*.rb",
+                "spec/**/*.rb",
+                "fc-rails",
+                "NIPT",
+                "nihonidenshi",
+            ):
+                self.assertNotIn(forbidden, installed)
+
+            result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.assertEqual(0, result)
+            for expected_path in (
+                ".mozyo-bridge/rules/llm_rule_authoring.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                ".mozyo-bridge/tmux/agent-ui.conf",
+                ".claude-nagger/config.yaml.example",
+            ):
+                self.assertTrue((project / expected_path).exists())
+
+            catalog_example = (
+                project / ".mozyo-bridge/docs/catalog.yaml.example"
+            ).read_text(encoding="utf-8")
+            self.assertIn("fc-implementation-source", catalog_example)
+            self.assertIn("fc-tests", catalog_example)
+            for forbidden in (
+                "fc-rails",
+                "Rails app",
+                "app/**/*.rb",
+                "db/migrate",
+                "spec/**/*.rb",
+            ):
+                self.assertNotIn(forbidden, catalog_example)
+
+            state = scaffold_state(project)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("redmine-governed", state["preset"])
+            tracked_files = set(state["files"].keys())
+            for expected in (
+                "AGENTS.md",
+                "CLAUDE.md",
+                ".mozyo-bridge/rules/docs_catalog_governance.yaml",
+                ".mozyo-bridge/docs/catalog.yaml.example",
+                ".mozyo-bridge/tmux/agent-ui.conf",
+                ".claude-nagger/config.yaml.example",
+            ):
+                self.assertIn(expected, tracked_files)
+
     def test_rules_install_and_scaffold_redmine_rails_governed_full_package(self) -> None:
         """The governed preset must ship a full guardrail package.
 
@@ -2660,6 +2763,11 @@ class ScaffoldRulesTest(unittest.TestCase):
                 output,
             )
             self.assertIn(
+                f"redmine-governed\tok\t{package_version('redmine-governed')}\t"
+                f"{package_version('redmine-governed')}\t",
+                output,
+            )
+            self.assertIn(
                 f"redmine-rails-governed\tok\t{package_version('redmine-rails-governed')}\t"
                 f"{package_version('redmine-rails-governed')}\t",
                 output,
@@ -2764,7 +2872,9 @@ class ScaffoldRulesTest(unittest.TestCase):
         # and must instead reference the portable symbolic form. The MOZYO_BRIDGE_HOME
         # override semantics are preserved because consumers expand the env var
         # when they read the router, not when the router is generated.
-        for preset in ("asana", "redmine", "redmine-rails", "none"):
+        from mozyo_bridge.scaffold.rules import PRESETS
+
+        for preset in PRESETS:
             with self.subTest(preset=preset):
                 with tempfile.TemporaryDirectory() as tmp:
                     home = Path(tmp) / "home"
@@ -2832,7 +2942,9 @@ class ScaffoldRepoLocalModeTest(unittest.TestCase):
             )
 
             self.assertEqual(0, result)
-            for preset in ("asana", "redmine", "redmine-rails", "none"):
+            from mozyo_bridge.scaffold.rules import PRESETS
+
+            for preset in PRESETS:
                 workflow = (
                     project
                     / ".mozyo-bridge"
@@ -2916,7 +3028,9 @@ class ScaffoldRepoLocalModeTest(unittest.TestCase):
     def test_scaffold_apply_repo_local_does_not_leak_host_paths_for_any_preset(self) -> None:
         # Repo-local artifacts must never carry an absolute host path. The
         # whole point of the Dev Container mode is portability across hosts.
-        for preset in ("asana", "redmine", "redmine-rails", "none"):
+        from mozyo_bridge.scaffold.rules import PRESETS
+
+        for preset in PRESETS:
             with self.subTest(preset=preset):
                 with tempfile.TemporaryDirectory() as tmp:
                     project = Path(tmp) / "project"
@@ -6282,6 +6396,7 @@ class DoctorEnvironmentTest(unittest.TestCase):
                 {
                     "asana": "missing",
                     "redmine": "missing",
+                    "redmine-governed": "missing",
                     "redmine-rails": "missing",
                     "redmine-rails-governed": "missing",
                     "none": "missing",

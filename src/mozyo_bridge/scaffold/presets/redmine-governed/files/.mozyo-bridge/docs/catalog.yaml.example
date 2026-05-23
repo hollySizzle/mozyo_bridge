@@ -1,0 +1,84 @@
+# Catalog skeleton example.
+#
+# Copy this file to `.mozyo-bridge/docs/catalog.yaml` and replace the
+# placeholder entries with project-specific docs and file_conventions.
+# All `documents[].canonical_path` entries must resolve to real files in
+# the repo; the validator (`mozyo-bridge docs validate`) will reject
+# dangling canonical paths.
+
+schema_version: 1
+managed_types:
+  - rule
+  - spec
+  - logic
+  - manual_spec
+  - task
+
+# Repo-relative directories that
+# `mozyo-bridge docs validate --check-file-coverage` walks to assert
+# every important source file matches at least one file_convention.
+# Drop or extend per project; `--coverage-root` on the CLI takes
+# precedence when given. Missing roots stay informational (notice,
+# no exit 1).
+coverage_roots:
+  - src
+  - tests
+  - docs
+
+documents:
+  - id: rule-llm-rule-authoring
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/llm_rule_authoring.md
+    purpose: LLM agent が読む規約文書の正本分離、形式選択、gate 構造化、検証接続の正本。
+    audit_role: llm_rule_authoring_rule
+    related_document_refs:
+      - rule-docs-catalog-governance
+
+  - id: rule-docs-catalog-governance
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/docs_catalog_governance.yaml
+    purpose: docs catalog、生成物、resolver、audit-doc impact tooling の統治正本。
+    audit_role: docs_catalog_governance_rule
+    related_document_refs:
+      - rule-llm-rule-authoring
+
+file_conventions:
+  - id: fc-agent-guardrails
+    name: agent guardrail docs
+    patterns:
+      - AGENTS.md
+      - CLAUDE.md
+      - .mozyo-bridge/rules/**
+      - .mozyo-bridge/docs/catalog.yaml
+      - .claude/skills/**
+      - .codex/skills/**
+    severity: block
+    document_refs:
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
+
+  # Placeholder example for implementation source. This points at the rule-
+  # authoring doc only so the skeleton validates before project-specific
+  # specs exist.
+  # Replace document_refs with real project rule / spec docs when the catalog
+  # is filled.
+  - id: fc-implementation-source
+    name: implementation source (placeholder)
+    patterns:
+      - src/**
+      - lib/**
+      - config/**
+    severity: warn
+    document_refs:
+      - rule-llm-rule-authoring
+
+  - id: fc-tests
+    name: tests (placeholder)
+    patterns:
+      - tests/**
+      - test/**
+    severity: warn
+    document_refs:
+      - rule-llm-rule-authoring
