@@ -1,26 +1,69 @@
 # Claude Code Router
 
-@AGENTS.md
+Claude Code セッションの tool-specific 入口。Claude Code は本ファイルを native に読む。共通の central preset rules は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` を正本とし、router 本文には複製しない。AGENTS.md (Codex tool-specific) を import しない。
 
-## 必須規約
+## セッション開始
 
-非自明な作業を始める前に、mozyo-bridge の Asana central preset を読む:
+1. 現在の working directory がこの project root またはその配下であることを確認する。
+2. mozyo-bridge の central preset rules を読む:
+   - `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md`
+3. 非自明な作業を始める前に active な `Redmine issue / journal と project docs` を確認する。
 
-- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`
-
-この file が存在しない場合は停止し、operator に以下の実行を依頼する:
-
-```bash
-mozyo-bridge rules install
-```
+`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` が存在しない場合は、読んだふりをせず停止し、operator に `mozyo-bridge rules install` を依頼する。
 
 ## ClaudeCode 起動時の最小 reminder
 
-- 迎合せず事実に基づいて結論を述べる。意見の不一致は Asana task comment に残す (chat だけで終わらせない)。
-- implementation done は task complete ではない。review / audit comment が Asana task に記録されるまで完了報告しない。
-- pane 通知は通知でしかない。判断の正本は常に Asana task description と task comment を読む。
-- audit / design consultation を送ったら、受領方法を Asana task comment に必ず含める。受領方法は順序付きで考える: (1) **必須デフォルト** = standard path 通知 (高レベル primitive: `mozyo-bridge handoff send` / `mozyo-bridge handoff reply` / 上位 alias `mozyo-bridge reply`; `notify-*` は内部で同じ primitive を呼ぶ Redmine 互換 wrapper) をまず試行する。`mozyo-bridge read` + `mozyo-bridge message` + `mozyo-bridge type` / `keys` を手で組み立てる経路は operator/debug 用であり、standard handoff/reply の代替にしない。(2) **precondition-gated fallback** = receiver pane が解決不能 (agent-name window が存在せず in-session で立ち上げられない) のときに限り `mozyo-bridge init <agent>` 案内 fallback。(3) **failure-only fallback** = standard path を実際に試行して delivery guard が hard failure を返した / 結果が使えないときに限り `未通知の明記` fallback。voluntary に standard path を skip して `未通知の明記` を選ぶのは禁止 (audit-only / revalidation / doc-only でも、receiver の `I will pull from the task record` 等 pickup 意思宣言があっても、standard path 試行義務は waiver されない)。receive-method comment には standard path の試行コマンドと結果 (試行不可なら不可と判断した precondition) を verbatim で残す。Asana comment / story id が利用可能ならそれを、利用できなければ task permalink + comment timestamp / context を受領 id として記録する。受領方法を書かずに handoff を完結させない。
-- `mozyo-bridge status` / `mozyo-bridge doctor` / pane scrollback は operator/debug 用。durable Asana anchor (task description / 指定 comment) が利用可能なときに、それらから receiver state や task state を推測しない。判断の正本は常に Asana task description と task comment を読む。
-- handoff chat (audit / 未通知 / 受領 pending 系) は state + task id の最小ポインタにとどめる。受領方法・retry 計画・試行コマンドは task comment 側に置き、chat に貼り直さない。
-- agent pane handoff (`mozyo-bridge handoff send` / `handoff reply` / `notify-*` 標準 variants) は v0.4 以降 `--mode queue-enter` が default。Claude / Codex agent pane に限定され、`--force` 不可、typing 前に deterministic preflight (a) explicit `--target` は receiver の tmux window 配下、(b) target pane は sender と同じ tmux session、(c) target pane は所属 window の active split、(d) foreground process が receiver の allowlist (`claude` literal=claude-strong、`codex` literal=codex-strong、`node` literal と versioned native binary basename は両 receiver で weak admit) を要求する。1 つでも false なら typing 前に `blocked` で die する。preflight を通過した送信は marker 未観測でも Enter を発行し durable outcome は `sent` / `queue_enter` として記録する (confirmed landing の約束ではない; 受信側は引き続き Asana task comment を正本として読む)。strict landing observation が必要な送信 (regression check / brand-new pane / observability test / 厳格な landing evidence が監査要件) または default scope 外 (`mozyo-bridge message` / non-agent pane) のときは `--mode standard` を explicit fallback として明示する。strict rail の挙動は v0.1 と同じで、marker 未観測は `C-u` rollback + `blocked` / `marker_timeout` で fail-closed する。default を黙って弱化せず、strict fallback を選んだ理由は task comment に記録する。
-- 詳細・例外・section templates は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md` を読む。重複させない。
+- 迎合せず事実に基づいて結論を述べる。意見の不一致は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` が指定する durable record に残す。
+- implementation done / implementation_done は completion ではない。review / audit / close 条件は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` に従う。
+- pane 通知は通知でしかない。判断の正本は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` と active な `Redmine issue / journal と project docs` を読む。
+- handoff を送る場合は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` の handoff startup decision / receive-method rule に従い、受領方法を durable record に残す。
+- `mozyo-bridge status` / `mozyo-bridge doctor` / pane scrollback は operator/debug 用。durable anchor が利用可能なときに、それらから receiver state や ticket state を推測しない。
+- handoff chat は state + durable anchor の最小ポインタにとどめる。受領方法・retry 計画・試行コマンドは durable record 側に置き、chat に貼り直さない。
+- 詳細・例外・gate templates は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md` を読む。router に重複させない。
+
+## Project-Local Additions
+
+<!-- mozyo-bridge:project-local-additions:begin -->
+
+## mozyo_bridge Project-Local Rules
+
+- Repository: `mozyo_bridge` Python package / CLI project.
+- Runtime package path: `src/mozyo_bridge/`.
+- Test path: `tests/`.
+- Project docs namespace: `vibes/docs/`.
+- Skill source: `skills/mozyo-bridge-agent/`.
+- Plugin mirror: `plugins/mozyo-bridge-agent/`.
+- Do not reintroduce `vibes/tools/mozyo_bridge` as a runtime path.
+- Generated build outputs are not committed: `build/`, `dist/`, `*.egg-info/`, `__pycache__/`.
+
+## Local Source Of Truth
+
+- Redmine project: `giken-3800-mozyo-bridge`.
+- Redmine issue / journal is the durable work record for new work.
+- `AGENTS.md` and `CLAUDE.md` are thin routers. Keep detailed rules in the central preset, `.mozyo-bridge/rules/**`, or cataloged docs.
+- Local references:
+  - `skills/mozyo-bridge-agent/references/workflow.md`
+  - `skills/mozyo-bridge-agent/references/project-map.md`
+  - `skills/mozyo-bridge-agent/references/release.md`
+  - `skills/mozyo-bridge-agent/references/safety.md`
+  - `vibes/docs/logics/scaffold-rules.md`
+  - `vibes/docs/logics/bootstrap.md`
+
+## Claude Code Role
+
+- Claude Code is the default implementer for normal development tasks.
+- Start normal development from the active Redmine issue and parent Feature / Epic, not from chat text alone.
+- Record Implementation Done and Review Request gates in Redmine before asking for Codex review.
+- Do not mark an issue complete after implementation only. Review Gate, owner close approval, and commit hash record must exist before close.
+
+## Verification And Commit
+
+- Use focused `python -m unittest ...` targets when `pytest` is unavailable. Do not install packages just to run tests unless the user approves.
+- For scaffold changes, run `mozyo-bridge scaffold status --target .` before commit.
+- For governed catalog changes, run `mozyo-bridge docs validate --repo .` and the relevant generator / coverage checks when `catalog.yaml` exists.
+- Run `git diff --check` or `git diff --cached --check` before commit.
+- Commit only files in the active Redmine issue scope. Leave unrelated dirty files untouched.
+- Commit messages for Redmine-scoped work include `Refs: Redmine #<issue_id>` and `issue_<issue_id>`.
+- After committing, record the commit hash in the same Redmine issue journal.
+
+<!-- mozyo-bridge:project-local-additions:end -->
