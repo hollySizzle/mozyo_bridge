@@ -17,6 +17,61 @@ Supported presets:
 
 Preset selection is explicit. `mozyo-bridge scaffold apply <preset>` applies only the chosen preset's workflow, so cross-preset policy matrices should not be duplicated in shared workflow docs. Keep each preset self-contained, and keep project-specific mandatory policies in the target project's local docs or private systems.
 
+## Startup Preset Selection
+
+Select the preset from durable work state first, then framework, then governance
+depth. Do not infer the preset from which agent is currently open.
+
+Decision order:
+
+1. Durable work system:
+   - Asana task/comment is the source of truth -> `asana`.
+   - Redmine issue/journal is the source of truth -> a Redmine preset.
+   - No durable ticket system -> `none`.
+2. Framework specialization:
+   - Rails + Redmine -> `redmine-rails` or `redmine-rails-governed`.
+   - Non-Rails + Redmine -> `redmine` or `redmine-governed`.
+3. Governance depth:
+   - Full governance -> governed preset.
+   - Thin routers only -> lightweight preset.
+
+Use a governed preset only when the project is prepared to operate the full
+package:
+
+- Redmine journals are the durable replay record for start, handoff, review,
+  verification, commit hash, and close gates.
+- Agents must resolve active docs from changed paths before implementation or
+  audit.
+- `catalog.yaml` will be owned by the target project, reviewed in diffs, and
+  kept in sync with generated file conventions.
+- Project-Local Additions carry repo-specific role boundaries, path rules,
+  verification commands, and local docs namespaces.
+- `scaffold status`, `docs validate`, file coverage, generator, and generated
+  check are part of the normal verification path.
+
+Stay on a lightweight preset when:
+
+- the project only needs Claude/Codex routers that point at a ticket workflow;
+- a docs catalog would be created but not maintained;
+- the repo is a throwaway sandbox, short-lived demo, or hand-edited experiment;
+- there is no durable Redmine journal lifecycle to replay;
+- role split and direct-edit gates would be ceremonial rather than enforced.
+
+The `none` preset is not a weak governed preset. It is the honest choice for
+projects that have no external execution queue. It must not pretend pane
+messages or chat history are durable state.
+
+Project-Local Additions and catalog have different jobs:
+
+- Project-Local Additions are concise target-owned policy in the generated
+  routers. They preserve local routing facts across scaffold re-sync.
+- `.mozyo-bridge/docs/catalog.yaml` is the active-doc map. It answers which
+  rule/spec/logic docs must be read for a changed path.
+- `.mozyo-bridge/docs/file_conventions.generated.yaml` is generated output, not
+  the source of truth. Change the catalog and regenerate it.
+- Workflow verification is a later behavioral check using a real work issue; it
+  is not satisfied by scaffold status alone.
+
 ## Common Responsibilities
 
 Every preset must generate or update the same project-local router pair:

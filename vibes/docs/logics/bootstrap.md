@@ -54,6 +54,55 @@ Use this decision point before running the staged flow:
 - If the CLI exists but the project was never scaffolded, upgrade the CLI first,
   then continue at Stage 2 for central mode or Stage 4 for repo-local mode.
 
+## Startup Decision Flow
+
+Run this decision flow before choosing a scaffold preset. The goal is to decide
+the minimum governance layer that will be true for the project on day 2, not to
+install the strongest preset everywhere.
+
+1. Identify the durable work system.
+   - Redmine issue / journal gates -> choose a Redmine preset.
+   - Asana task / comment gates -> choose `asana`.
+   - No durable ticket system -> choose `none` and keep the project lightweight.
+   - Mixed or unclear systems -> stop and record the intended source of truth
+     before scaffolding. Do not guess from pane text or chat history.
+2. Identify the framework surface.
+   - Rails repository with Rails-specific review, DB, route, or test
+     conventions -> use a `redmine-rails*` preset when the durable system is
+     Redmine.
+   - Non-Rails repository -> use `redmine*`, `asana`, or `none` as appropriate.
+3. Decide whether full governance is justified.
+   - Use full governance when agents will repeatedly edit or audit the repo,
+     work must be replayable from Redmine journals, role boundaries or direct
+     edit gates matter, or path-to-doc resolution must be machine-checkable.
+   - Stay lightweight when the project only needs router files, has no active
+     docs catalog owner, is a one-off/sandbox project, or would not maintain
+     `catalog.yaml` and generated checks after bootstrap.
+4. Choose central vs repo-local rules storage.
+   - Central mode is the default for normal local machines with a persistent
+     `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`.
+   - Repo-local mode is for Dev Containers, Codespaces, or ephemeral-home
+     workspaces where agents must read the preset from the repository itself.
+5. Plan verification before writing files.
+   - Every scaffolded repo needs `scaffold status` and `doctor --target`.
+   - Governed repos additionally need `catalog.yaml` initialization,
+     docs validation, file coverage, file-conventions generation, and generated
+     check.
+   - Workflow / guardrail changes need a later workflow verification task; the
+     bootstrap smoke proves installation shape, not agent behavior in a real
+     work issue.
+
+Preset selection summary:
+
+| Situation | Preset |
+| --- | --- |
+| Asana is the durable work queue | `asana` |
+| Redmine, non-Rails, lightweight routers only | `redmine` |
+| Redmine, non-Rails, full governance package | `redmine-governed` |
+| Redmine, Rails, lightweight routers + project-owned local policy | `redmine-rails` |
+| Redmine, Rails, full governance package | `redmine-rails-governed` |
+| No durable ticket system | `none` |
+
 ## Stage 0 — Prerequisites
 
 ```bash
@@ -261,19 +310,24 @@ For deeper packaging / precedence details, read `vibes/docs/logics/skill-distrib
 
 ## Stage 4 — Scaffold a project
 
-Choose a preset based on the project's ticket system:
+Choose the preset using the Startup Decision Flow above, then scaffold exactly
+that preset. Do not apply a governed preset just because it is available, and do
+not apply a lightweight preset when the project has already committed to
+Redmine journal gates plus catalog-driven audit.
 
-- `asana` — Asana-driven projects (most current mozyo-bridge work).
-- `redmine` — Redmine-driven projects.
-- `redmine-governed` — Redmine-driven non-Rails projects that want the full
-  repo-local governance package, docs catalog skeleton, Claude Nagger skeleton,
-  and tmux UI artifact up front.
-- `redmine-rails` — Redmine-driven Rails projects that want thin routers and
-  project-local governance filled in by the target repo.
-- `redmine-rails-governed` — Redmine-driven Rails projects that want the full
-  repo-local governance package, docs catalog skeleton, Claude Nagger skeleton,
-  and tmux UI artifact up front.
-- `none` — projects with no ticket system gate.
+Full governance means the scaffold provides more than routers:
+
+- central governed workflow rules that require durable gates;
+- repo-local rule authoring and docs catalog governance artifacts;
+- `catalog.yaml.example` as the starting point for project-owned active docs;
+- optional runtime guardrail artifacts such as Claude Nagger skeleton and tmux
+  UI snippet;
+- a verification obligation to keep catalog and generated file conventions in
+  sync.
+
+Lightweight scaffold means routers plus `.mozyo-bridge/scaffold.json` only. The
+target project may still add Project-Local Additions, but the scaffold does not
+claim that docs catalog governance, file coverage, or role gates are active.
 
 ```bash
 cd /path/to/your-project
@@ -285,6 +339,17 @@ Expected files written:
 - `AGENTS.md`
 - `CLAUDE.md`
 - `.mozyo-bridge/scaffold.json`
+
+Project-Local Additions:
+
+- The marker block in generated `AGENTS.md` / `CLAUDE.md` is where target-owned
+  policy belongs.
+- Put repository-specific role boundaries, local docs namespaces, forbidden
+  paths, required verification, and durable-source notes there.
+- Keep the marker block concise. Do not paste the full preset workflow into it;
+  routers stay thin and point at the selected preset.
+- Re-run `scaffold diff` / `scaffold apply --backup` for preset updates; the
+  marker content is preserved.
 
 When the target environment may not persist `~/.mozyo_bridge` (Dev Container,
 Codespace, or other ephemeral-home workspaces), use repo-local mode instead of
@@ -306,6 +371,8 @@ For `redmine-governed` and `redmine-rails-governed`, initialize the docs catalog
 cp .mozyo-bridge/docs/catalog.yaml.example .mozyo-bridge/docs/catalog.yaml
 mozyo-bridge docs validate --repo .
 mozyo-bridge docs validate --check-file-coverage --repo .
+mozyo-bridge docs generate-file-conventions --repo .
+mozyo-bridge docs generate-file-conventions --check --repo .
 ```
 
 Then update `.mozyo-bridge/docs/catalog.yaml` with project-specific
@@ -314,6 +381,16 @@ Then update `.mozyo-bridge/docs/catalog.yaml` with project-specific
 overwritten by scaffold re-apply. The tooling is not copied into the target repo
 as `.mozyo-bridge/tools/*.py`; it is provided by the installed
 `mozyo-bridge docs ...` CLI.
+
+Catalog adoption is not complete until:
+
+- every active `documents[].canonical_path` resolves to a real file;
+- key implementation and docs roots are covered by `file_conventions`;
+- generated file conventions are created from the catalog and pass `--check`;
+- agents can resolve changed paths with `mozyo-bridge docs resolve <path>`.
+
+If the project cannot maintain these checks, use the lightweight preset instead
+and record that full governance was intentionally not adopted.
 
 If `AGENTS.md` or `CLAUDE.md` already exists:
 

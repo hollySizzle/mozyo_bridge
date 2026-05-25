@@ -11,8 +11,9 @@ It is only a notification transport. Redmine remains the source of truth for rev
 
 > First-time install + project bootstrap, executed end-to-end by Claude / Codex agents,
 > is documented in `vibes/docs/logics/bootstrap.md`. Read that doc to follow the
-> install → rules → skill → scaffold → doctor stages in strict order. The sections
-> below are operator-facing reference material for the individual commands.
+> startup decision flow and the install → rules → skill → scaffold → catalog /
+> doctor stages in strict order. The sections below are operator-facing reference
+> material for the individual commands.
 >
 > 人間向けのリリースノートは [`RELEASE_NOTES.md`](RELEASE_NOTES.md) にあります。
 
@@ -349,6 +350,20 @@ Detailed distribution rules live in `vibes/docs/logics/skill-distribution.md`.
 ## Agent Rules Scaffold
 
 `mozyo-bridge` can install ticket-system-specific development flow rules and scaffold thin project routers for Claude Code and Codex.
+
+Choose the preset before applying scaffold. The selection order is:
+
+1. durable work system (`asana`, Redmine, or `none`);
+2. framework surface (Rails vs non-Rails for Redmine projects);
+3. governance depth (lightweight routers vs full governed catalog package).
+
+Use `redmine-governed` / `redmine-rails-governed` only when the project will
+maintain Project-Local Additions, `.mozyo-bridge/docs/catalog.yaml`, generated
+file conventions, and the corresponding validation checks. Use `redmine` /
+`redmine-rails` when thin routers and project-owned local policy are enough.
+Use `none` when there is no durable ticket system. The full decision flow lives
+in `vibes/docs/logics/bootstrap.md`; preset semantics live in
+`vibes/docs/logics/scaffold-rules.md`.
 
 Install the central rules store:
 
