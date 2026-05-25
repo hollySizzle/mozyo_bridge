@@ -7,8 +7,12 @@ managed_types:
   - task
 
 coverage_roots:
+  - .claude-plugin
+  - .github
   - src
   - tests
+  - scripts
+  - smoke
   - skills
   - plugins
   - vibes/docs
@@ -31,6 +35,7 @@ documents:
     audit_role: docs_catalog_governance_rule
     related_document_refs:
       - rule-llm-rule-authoring
+      - spec-project-map
 
   - id: rule-project-agent-workflow
     type: rule
@@ -51,6 +56,7 @@ documents:
     related_document_refs:
       - logic-release-flow
       - logic-release-helper-contract
+      - skill-release-reference
 
   - id: spec-project-map
     type: spec
@@ -61,6 +67,17 @@ documents:
     related_document_refs:
       - skill-project-map-reference
 
+  - id: manual-readme
+    type: manual_spec
+    status: active
+    canonical_path: README.md
+    purpose: public user-facing install、command、safety summary。
+    audit_role: public_readme_manual_spec
+    related_document_refs:
+      - spec-project-map
+      - logic-bootstrap
+      - logic-skill-distribution
+
   - id: skill-workflow-reference
     type: rule
     status: active
@@ -70,6 +87,8 @@ documents:
     related_document_refs:
       - rule-project-agent-workflow
       - skill-project-map-reference
+      - logic-autonomous-ticket-entrypoint
+      - logic-ack-completion-receiver-state
 
   - id: skill-project-map-reference
     type: spec
@@ -79,6 +98,7 @@ documents:
     audit_role: skill_project_map_spec
     related_document_refs:
       - spec-project-map
+      - logic-skill-distribution
 
   - id: skill-release-reference
     type: rule
@@ -89,6 +109,7 @@ documents:
     related_document_refs:
       - rule-release-distribution
       - logic-release-flow
+      - logic-release-helper-contract
 
   - id: skill-safety-reference
     type: rule
@@ -98,6 +119,8 @@ documents:
     audit_role: skill_safety_rule
     related_document_refs:
       - logic-tmux-send-safety-contract
+      - logic-autonomous-ticket-entrypoint
+      - logic-ack-completion-receiver-state
 
   - id: logic-scaffold-rules
     type: logic
@@ -108,6 +131,7 @@ documents:
     related_document_refs:
       - logic-bootstrap
       - rule-docs-catalog-governance
+      - spec-project-map
 
   - id: logic-bootstrap
     type: logic
@@ -117,6 +141,8 @@ documents:
     audit_role: bootstrap_logic
     related_document_refs:
       - logic-scaffold-rules
+      - logic-skill-distribution
+      - logic-turnkey-e2e-acceptance
 
   - id: logic-release-flow
     type: logic
@@ -127,6 +153,7 @@ documents:
     related_document_refs:
       - logic-release-helper-contract
       - skill-release-reference
+      - rule-release-distribution
 
   - id: logic-release-helper-contract
     type: logic
@@ -136,6 +163,7 @@ documents:
     audit_role: release_helper_contract_logic
     related_document_refs:
       - logic-release-flow
+      - rule-release-distribution
 
   - id: logic-skill-distribution
     type: logic
@@ -145,6 +173,8 @@ documents:
     audit_role: skill_distribution_logic
     related_document_refs:
       - skill-workflow-reference
+      - skill-project-map-reference
+      - skill-safety-reference
 
   - id: logic-tmux-send-safety-contract
     type: logic
@@ -154,6 +184,8 @@ documents:
     audit_role: tmux_send_safety_contract_logic
     related_document_refs:
       - skill-safety-reference
+      - logic-ack-completion-receiver-state
+      - logic-autonomous-ticket-entrypoint
 
   - id: logic-turnkey-e2e-acceptance
     type: logic
@@ -164,6 +196,7 @@ documents:
     related_document_refs:
       - logic-bootstrap
       - logic-release-flow
+      - skill-release-reference
 
   - id: logic-autonomous-ticket-entrypoint
     type: logic
@@ -173,6 +206,7 @@ documents:
     audit_role: autonomous_ticket_entrypoint_logic
     related_document_refs:
       - skill-workflow-reference
+      - logic-tmux-send-safety-contract
 
   - id: logic-ack-completion-receiver-state
     type: logic
@@ -182,16 +216,29 @@ documents:
     audit_role: ack_completion_receiver_state_logic
     related_document_refs:
       - skill-workflow-reference
+      - logic-tmux-send-safety-contract
 
 file_conventions:
-  - id: fc-agent-entrypoints
-    name: agent entrypoint routers and governed rules
+  - id: fc-agent-routers
+    name: agent entrypoint routers
     patterns:
       - AGENTS.md
       - CLAUDE.md
+    severity: block
+    document_refs:
+      - rule-project-agent-workflow
+      - rule-docs-catalog-governance
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: fc-governance-artifacts
+    name: governed local rule and catalog artifacts
+    patterns:
       - .mozyo-bridge/rules/**
       - .mozyo-bridge/docs/catalog.yaml
       - .mozyo-bridge/docs/catalog.yaml.example
+      - .mozyo-bridge/docs/file_conventions.generated.yaml
+      - .mozyo-bridge/scaffold.json
       - .claude-nagger/**
     severity: block
     document_refs:
@@ -199,8 +246,19 @@ file_conventions:
       - rule-docs-catalog-governance
       - rule-project-agent-workflow
 
+  - id: fc-public-readme
+    name: public README and user-facing install guidance
+    patterns:
+      - README.md
+    severity: warn
+    document_refs:
+      - manual-readme
+      - logic-bootstrap
+      - logic-skill-distribution
+      - skill-safety-reference
+
   - id: fc-package-source
-    name: mozyo_bridge package source
+    name: generic mozyo_bridge package source
     patterns:
       - src/mozyo_bridge/**/*.py
     severity: warn
@@ -209,12 +267,41 @@ file_conventions:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: fc-cli-entrypoints
+    name: package CLI and command entrypoints
+    patterns:
+      - src/mozyo_bridge/__main__.py
+      - src/mozyo_bridge/application/cli.py
+      - src/mozyo_bridge/application/commands.py
+    severity: block
+    document_refs:
+      - spec-project-map
+      - rule-project-agent-workflow
+      - skill-safety-reference
+      - logic-scaffold-rules
+      - logic-release-helper-contract
+      - logic-tmux-send-safety-contract
+
+  - id: fc-handoff-notification-source
+    name: handoff notification and tmux transport source
+    patterns:
+      - src/mozyo_bridge/domain/handoff.py
+      - src/mozyo_bridge/domain/notification.py
+      - src/mozyo_bridge/domain/pane_resolver.py
+      - src/mozyo_bridge/infrastructure/tmux_client.py
+      - src/mozyo_bridge/infrastructure/queue_reader.py
+    severity: block
+    document_refs:
+      - logic-tmux-send-safety-contract
+      - logic-autonomous-ticket-entrypoint
+      - logic-ack-completion-receiver-state
+      - skill-safety-reference
+
   - id: fc-scaffold-source
     name: scaffold implementation and packaged presets
     patterns:
       - src/mozyo_bridge/scaffold/**
       - src/mozyo_bridge/application/doctor.py
-      - src/mozyo_bridge/application/cli.py
     severity: block
     document_refs:
       - logic-scaffold-rules
@@ -229,6 +316,7 @@ file_conventions:
     document_refs:
       - rule-docs-catalog-governance
       - logic-scaffold-rules
+      - spec-project-map
 
   - id: fc-release-source
     name: release helper source and workflows
@@ -236,12 +324,40 @@ file_conventions:
       - src/mozyo_bridge/application/release.py
       - .github/workflows/**
       - pyproject.toml
+      - .github/ISSUE_TEMPLATE/**
     severity: block
     document_refs:
       - rule-release-distribution
       - logic-release-flow
       - logic-release-helper-contract
       - skill-release-reference
+
+  - id: fc-skill-distribution-scripts
+    name: skill distribution scripts and plugin metadata
+    patterns:
+      - scripts/install_claude_skill.sh
+      - scripts/install_codex_skill.sh
+      - scripts/sync_plugin_skill.sh
+      - .claude-plugin/**
+      - plugins/mozyo-bridge-agent/.claude-plugin/**
+      - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/agents/**
+    severity: block
+    document_refs:
+      - logic-skill-distribution
+      - skill-project-map-reference
+      - skill-safety-reference
+      - rule-release-distribution
+
+  - id: fc-smoke-tests
+    name: real tmux and distribution smoke checks
+    patterns:
+      - smoke/**
+    severity: block
+    document_refs:
+      - logic-tmux-send-safety-contract
+      - logic-turnkey-e2e-acceptance
+      - skill-release-reference
+      - skill-safety-reference
 
   - id: fc-tests
     name: unit and regression tests
@@ -251,12 +367,13 @@ file_conventions:
     document_refs:
       - spec-project-map
       - skill-workflow-reference
+      - logic-turnkey-e2e-acceptance
 
   - id: fc-skill-source
-    name: mozyo-bridge agent skill source and mirror
+    name: mozyo-bridge agent skill source and mirrored runtime body
     patterns:
       - skills/mozyo-bridge-agent/**
-      - plugins/mozyo-bridge-agent/**
+      - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/**
     severity: block
     document_refs:
       - skill-workflow-reference
@@ -273,6 +390,30 @@ file_conventions:
       - rule-project-agent-workflow
       - spec-project-map
       - skill-workflow-reference
+
+  - id: fc-agent-workflow-docs
+    name: project agent workflow docs
+    patterns:
+      - vibes/docs/rules/agent-workflow.md
+      - skills/mozyo-bridge-agent/references/workflow.md
+    severity: block
+    document_refs:
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - logic-autonomous-ticket-entrypoint
+      - logic-ack-completion-receiver-state
+
+  - id: fc-skill-distribution-docs
+    name: skill and plugin distribution docs
+    patterns:
+      - vibes/docs/logics/skill-distribution.md
+      - skills/mozyo-bridge-agent/SKILL.md
+      - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/SKILL.md
+    severity: block
+    document_refs:
+      - logic-skill-distribution
+      - skill-project-map-reference
+      - skill-safety-reference
 
   - id: fc-scaffold-docs
     name: scaffold and bootstrap docs
@@ -296,6 +437,7 @@ file_conventions:
       - rule-release-distribution
       - logic-release-flow
       - logic-release-helper-contract
+      - skill-release-reference
 
   - id: fc-tmux-handoff-docs
     name: tmux and handoff safety docs

@@ -1,13 +1,24 @@
 # This file is generated from .mozyo-bridge/docs/catalog.yaml.
 # Do not edit manually.
 rules:
-- name: agent entrypoint routers and governed rules
+- name: agent entrypoint routers
   patterns:
   - AGENTS.md
   - CLAUDE.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml と @skills/mozyo-bridge-agent/references/workflow.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: governed local rule and catalog artifacts
+  patterns:
   - .mozyo-bridge/rules/**
   - .mozyo-bridge/docs/catalog.yaml
   - .mozyo-bridge/docs/catalog.yaml.example
+  - .mozyo-bridge/docs/file_conventions.generated.yaml
+  - .mozyo-bridge/scaffold.json
   - .claude-nagger/**
   severity: block
   message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/llm_rule_authoring.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
@@ -16,7 +27,17 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
-- name: mozyo_bridge package source
+- name: public README and user-facing install guidance
+  patterns:
+  - README.md
+  severity: warn
+  message: 'このファイルを変更する場合は､ @README.md と @vibes/docs/logics/bootstrap.md と @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/safety.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: generic mozyo_bridge package source
   patterns:
   - src/mozyo_bridge/**/*.py
   severity: warn
@@ -26,11 +47,37 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: package CLI and command entrypoints
+  patterns:
+  - src/mozyo_bridge/__main__.py
+  - src/mozyo_bridge/application/cli.py
+  - src/mozyo_bridge/application/commands.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/safety.md
+    と @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/release-helper-contract.md と @vibes/docs/logics/tmux-send-safety-contract.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: handoff notification and tmux transport source
+  patterns:
+  - src/mozyo_bridge/domain/handoff.py
+  - src/mozyo_bridge/domain/notification.py
+  - src/mozyo_bridge/domain/pane_resolver.py
+  - src/mozyo_bridge/infrastructure/tmux_client.py
+  - src/mozyo_bridge/infrastructure/queue_reader.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/autonomous-ticket-entrypoint.md
+    と @vibes/docs/logics/ack-completion-receiver-state.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: scaffold implementation and packaged presets
   patterns:
   - src/mozyo_bridge/scaffold/**
   - src/mozyo_bridge/application/doctor.py
-  - src/mozyo_bridge/application/cli.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/bootstrap.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
     をよく確認し従うこと
@@ -42,7 +89,8 @@ rules:
   patterns:
   - src/mozyo_bridge/docs_tools/**
   severity: block
-  message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/docs_catalog_governance.yaml と @vibes/docs/logics/scaffold-rules.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/docs_catalog_governance.yaml と @vibes/docs/logics/scaffold-rules.md と @vibes/docs/specs/project-map.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -52,9 +100,35 @@ rules:
   - src/mozyo_bridge/application/release.py
   - .github/workflows/**
   - pyproject.toml
+  - .github/ISSUE_TEMPLATE/**
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
     と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: skill distribution scripts and plugin metadata
+  patterns:
+  - scripts/install_claude_skill.sh
+  - scripts/install_codex_skill.sh
+  - scripts/sync_plugin_skill.sh
+  - .claude-plugin/**
+  - plugins/mozyo-bridge-agent/.claude-plugin/**
+  - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/agents/**
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/project-map.md
+    と @skills/mozyo-bridge-agent/references/safety.md と @vibes/docs/rules/release-distribution.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: real tmux and distribution smoke checks
+  patterns:
+  - smoke/**
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/turnkey-e2e-acceptance.md
+    と @skills/mozyo-bridge-agent/references/release.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -63,15 +137,16 @@ rules:
   patterns:
   - tests/**
   severity: warn
-  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/logics/turnkey-e2e-acceptance.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
-- name: mozyo-bridge agent skill source and mirror
+- name: mozyo-bridge agent skill source and mirrored runtime body
   patterns:
   - skills/mozyo-bridge-agent/**
-  - plugins/mozyo-bridge-agent/**
+  - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/**
   severity: block
   message: 'このファイルを変更する場合は､ @skills/mozyo-bridge-agent/references/workflow.md と @skills/mozyo-bridge-agent/references/project-map.md
     と @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
@@ -85,6 +160,29 @@ rules:
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md
     をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: project agent workflow docs
+  patterns:
+  - vibes/docs/rules/agent-workflow.md
+  - skills/mozyo-bridge-agent/references/workflow.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/logics/autonomous-ticket-entrypoint.md
+    と @vibes/docs/logics/ack-completion-receiver-state.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: skill and plugin distribution docs
+  patterns:
+  - vibes/docs/logics/skill-distribution.md
+  - skills/mozyo-bridge-agent/SKILL.md
+  - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/SKILL.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/project-map.md
+    と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -107,7 +205,7 @@ rules:
   - vibes/docs/rules/release-distribution.md
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
-    をよく確認し従うこと
+    と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
