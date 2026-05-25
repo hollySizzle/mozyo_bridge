@@ -1,0 +1,126 @@
+# This file is generated from .mozyo-bridge/docs/catalog.yaml.
+# Do not edit manually.
+rules:
+- name: agent entrypoint routers and governed rules
+  patterns:
+  - AGENTS.md
+  - CLAUDE.md
+  - .mozyo-bridge/rules/**
+  - .mozyo-bridge/docs/catalog.yaml
+  - .mozyo-bridge/docs/catalog.yaml.example
+  - .claude-nagger/**
+  severity: block
+  message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/llm_rule_authoring.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
+    と @vibes/docs/rules/agent-workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: mozyo_bridge package source
+  patterns:
+  - src/mozyo_bridge/**/*.py
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: scaffold implementation and packaged presets
+  patterns:
+  - src/mozyo_bridge/scaffold/**
+  - src/mozyo_bridge/application/doctor.py
+  - src/mozyo_bridge/application/cli.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/bootstrap.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: docs catalog tooling source
+  patterns:
+  - src/mozyo_bridge/docs_tools/**
+  severity: block
+  message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/docs_catalog_governance.yaml と @vibes/docs/logics/scaffold-rules.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: release helper source and workflows
+  patterns:
+  - src/mozyo_bridge/application/release.py
+  - .github/workflows/**
+  - pyproject.toml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
+    と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: unit and regression tests
+  patterns:
+  - tests/**
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: mozyo-bridge agent skill source and mirror
+  patterns:
+  - skills/mozyo-bridge-agent/**
+  - plugins/mozyo-bridge-agent/**
+  severity: block
+  message: 'このファイルを変更する場合は､ @skills/mozyo-bridge-agent/references/workflow.md と @skills/mozyo-bridge-agent/references/project-map.md
+    と @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: project docs under vibes
+  patterns:
+  - vibes/docs/**
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: scaffold and bootstrap docs
+  patterns:
+  - vibes/docs/logics/scaffold-rules.md
+  - vibes/docs/logics/bootstrap.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/bootstrap.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: release docs
+  patterns:
+  - vibes/docs/logics/release-flow.md
+  - vibes/docs/logics/release-helper-contract.md
+  - vibes/docs/rules/release-distribution.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: tmux and handoff safety docs
+  patterns:
+  - vibes/docs/logics/tmux-send-safety-contract.md
+  - vibes/docs/logics/ack-completion-receiver-state.md
+  - vibes/docs/logics/autonomous-ticket-entrypoint.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/ack-completion-receiver-state.md
+    と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '

@@ -1,0 +1,311 @@
+schema_version: 1
+managed_types:
+  - rule
+  - spec
+  - logic
+  - manual_spec
+  - task
+
+coverage_roots:
+  - src
+  - tests
+  - skills
+  - plugins
+  - vibes/docs
+
+documents:
+  - id: rule-llm-rule-authoring
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/llm_rule_authoring.md
+    purpose: LLM agent が読む規約文書の正本分離、形式選択、gate 構造化、検証接続の正本。
+    audit_role: llm_rule_authoring_rule
+    related_document_refs:
+      - rule-docs-catalog-governance
+
+  - id: rule-docs-catalog-governance
+    type: rule
+    status: active
+    canonical_path: .mozyo-bridge/rules/docs_catalog_governance.yaml
+    purpose: docs catalog、生成物、resolver、audit-doc impact tooling の統治正本。
+    audit_role: docs_catalog_governance_rule
+    related_document_refs:
+      - rule-llm-rule-authoring
+
+  - id: rule-project-agent-workflow
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/agent-workflow.md
+    purpose: mozyo_bridge project 固有の agent workflow と作業規約。
+    audit_role: project_agent_workflow_rule
+    related_document_refs:
+      - spec-project-map
+      - skill-workflow-reference
+
+  - id: rule-release-distribution
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/release-distribution.md
+    purpose: release artifact と distribution の project-local guardrail。
+    audit_role: release_distribution_rule
+    related_document_refs:
+      - logic-release-flow
+      - logic-release-helper-contract
+
+  - id: spec-project-map
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/project-map.md
+    purpose: repository 構造、重要 path、source-of-truth routing の仕様。
+    audit_role: project_map_spec
+    related_document_refs:
+      - skill-project-map-reference
+
+  - id: skill-workflow-reference
+    type: rule
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/workflow.md
+    purpose: mozyo-bridge-agent skill の作業 lifecycle と role boundary。
+    audit_role: skill_workflow_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - skill-project-map-reference
+
+  - id: skill-project-map-reference
+    type: spec
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/project-map.md
+    purpose: skill が参照する repository map と重要 path。
+    audit_role: skill_project_map_spec
+    related_document_refs:
+      - spec-project-map
+
+  - id: skill-release-reference
+    type: rule
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/release.md
+    purpose: release 前検証、artifact check、distribution check の skill reference。
+    audit_role: skill_release_rule
+    related_document_refs:
+      - rule-release-distribution
+      - logic-release-flow
+
+  - id: skill-safety-reference
+    type: rule
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/safety.md
+    purpose: tmux notification と destructive operation を含む安全規約。
+    audit_role: skill_safety_rule
+    related_document_refs:
+      - logic-tmux-send-safety-contract
+
+  - id: logic-scaffold-rules
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/scaffold-rules.md
+    purpose: scaffold preset registry、router、manifest、governed artifacts の設計正本。
+    audit_role: scaffold_rules_logic
+    related_document_refs:
+      - logic-bootstrap
+      - rule-docs-catalog-governance
+
+  - id: logic-bootstrap
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/bootstrap.md
+    purpose: install、rules、skill、scaffold、doctor、smoke の bootstrap 手順。
+    audit_role: bootstrap_logic
+    related_document_refs:
+      - logic-scaffold-rules
+
+  - id: logic-release-flow
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/release-flow.md
+    purpose: TestPyPI / PyPI release flow と release gate。
+    audit_role: release_flow_logic
+    related_document_refs:
+      - logic-release-helper-contract
+      - skill-release-reference
+
+  - id: logic-release-helper-contract
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/release-helper-contract.md
+    purpose: release check / workflow helper CLI の contract。
+    audit_role: release_helper_contract_logic
+    related_document_refs:
+      - logic-release-flow
+
+  - id: logic-skill-distribution
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/skill-distribution.md
+    purpose: Codex / Claude skill と plugin marketplace distribution の設計。
+    audit_role: skill_distribution_logic
+    related_document_refs:
+      - skill-workflow-reference
+
+  - id: logic-tmux-send-safety-contract
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/tmux-send-safety-contract.md
+    purpose: tmux pane send / handoff safety contract。
+    audit_role: tmux_send_safety_contract_logic
+    related_document_refs:
+      - skill-safety-reference
+
+  - id: logic-turnkey-e2e-acceptance
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/turnkey-e2e-acceptance.md
+    purpose: destructive acceptance smoke と turnkey e2e validation の設計。
+    audit_role: turnkey_e2e_acceptance_logic
+    related_document_refs:
+      - logic-bootstrap
+      - logic-release-flow
+
+  - id: logic-autonomous-ticket-entrypoint
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/autonomous-ticket-entrypoint.md
+    purpose: ticket-ID entrypoint と durable ticket record 起点の自律作業設計。
+    audit_role: autonomous_ticket_entrypoint_logic
+    related_document_refs:
+      - skill-workflow-reference
+
+  - id: logic-ack-completion-receiver-state
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/ack-completion-receiver-state.md
+    purpose: completion acknowledgement と receiver state の扱い。
+    audit_role: ack_completion_receiver_state_logic
+    related_document_refs:
+      - skill-workflow-reference
+
+file_conventions:
+  - id: fc-agent-entrypoints
+    name: agent entrypoint routers and governed rules
+    patterns:
+      - AGENTS.md
+      - CLAUDE.md
+      - .mozyo-bridge/rules/**
+      - .mozyo-bridge/docs/catalog.yaml
+      - .mozyo-bridge/docs/catalog.yaml.example
+      - .claude-nagger/**
+    severity: block
+    document_refs:
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
+      - rule-project-agent-workflow
+
+  - id: fc-package-source
+    name: mozyo_bridge package source
+    patterns:
+      - src/mozyo_bridge/**/*.py
+    severity: warn
+    document_refs:
+      - spec-project-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-scaffold-source
+    name: scaffold implementation and packaged presets
+    patterns:
+      - src/mozyo_bridge/scaffold/**
+      - src/mozyo_bridge/application/doctor.py
+      - src/mozyo_bridge/application/cli.py
+    severity: block
+    document_refs:
+      - logic-scaffold-rules
+      - logic-bootstrap
+      - rule-docs-catalog-governance
+
+  - id: fc-docs-tools-source
+    name: docs catalog tooling source
+    patterns:
+      - src/mozyo_bridge/docs_tools/**
+    severity: block
+    document_refs:
+      - rule-docs-catalog-governance
+      - logic-scaffold-rules
+
+  - id: fc-release-source
+    name: release helper source and workflows
+    patterns:
+      - src/mozyo_bridge/application/release.py
+      - .github/workflows/**
+      - pyproject.toml
+    severity: block
+    document_refs:
+      - rule-release-distribution
+      - logic-release-flow
+      - logic-release-helper-contract
+      - skill-release-reference
+
+  - id: fc-tests
+    name: unit and regression tests
+    patterns:
+      - tests/**
+    severity: warn
+    document_refs:
+      - spec-project-map
+      - skill-workflow-reference
+
+  - id: fc-skill-source
+    name: mozyo-bridge agent skill source and mirror
+    patterns:
+      - skills/mozyo-bridge-agent/**
+      - plugins/mozyo-bridge-agent/**
+    severity: block
+    document_refs:
+      - skill-workflow-reference
+      - skill-project-map-reference
+      - logic-skill-distribution
+      - skill-safety-reference
+
+  - id: fc-project-docs
+    name: project docs under vibes
+    patterns:
+      - vibes/docs/**
+    severity: warn
+    document_refs:
+      - rule-project-agent-workflow
+      - spec-project-map
+      - skill-workflow-reference
+
+  - id: fc-scaffold-docs
+    name: scaffold and bootstrap docs
+    patterns:
+      - vibes/docs/logics/scaffold-rules.md
+      - vibes/docs/logics/bootstrap.md
+    severity: block
+    document_refs:
+      - logic-scaffold-rules
+      - logic-bootstrap
+      - rule-docs-catalog-governance
+
+  - id: fc-release-docs
+    name: release docs
+    patterns:
+      - vibes/docs/logics/release-flow.md
+      - vibes/docs/logics/release-helper-contract.md
+      - vibes/docs/rules/release-distribution.md
+    severity: block
+    document_refs:
+      - rule-release-distribution
+      - logic-release-flow
+      - logic-release-helper-contract
+
+  - id: fc-tmux-handoff-docs
+    name: tmux and handoff safety docs
+    patterns:
+      - vibes/docs/logics/tmux-send-safety-contract.md
+      - vibes/docs/logics/ack-completion-receiver-state.md
+      - vibes/docs/logics/autonomous-ticket-entrypoint.md
+    severity: block
+    document_refs:
+      - logic-tmux-send-safety-contract
+      - logic-ack-completion-receiver-state
+      - logic-autonomous-ticket-entrypoint
+      - skill-safety-reference
