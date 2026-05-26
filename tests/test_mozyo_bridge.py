@@ -10082,5 +10082,209 @@ class ReleasePublishTest(unittest.TestCase):
         self.assertIn("9999", out.getvalue())
 
 
+class CodexDirectEditGuardrailHardeningTest(unittest.TestCase):
+    """Guardrail: distributed surfaces must agree that guardrail / docs /
+    catalog changes require a Redmine ``codex_direct_edit`` gate journal
+    (with ``allowed_paths``) before Codex creates new repo diffs, and
+    that ``.mozyo-bridge/docs/file_conventions.generated.yaml`` is
+    generator-only.
+
+    Motivation: hardening prompted by a past incident pattern where
+    Codex committed guardrail / docs / catalog changes without the gate
+    journal. The wording across the central preset, the project routers,
+    the canonical skill reference, and the project-local rules drifts
+    easily; this test pins each surface to the post-hardening wording.
+
+    Each assertion below names the surface and the exact requirement so
+    that a regression failure points at one file and one fix.
+    """
+
+    GUARDRAIL_HARDENING_PATHS = (
+        ".mozyo-bridge/docs/catalog.yaml",
+        ".mozyo-bridge/docs/file_conventions.generated.yaml",
+        "vibes/docs/**",
+        "README.md",
+    )
+
+    PRESET_REQUIRED_MARKERS = (
+        # The guardrail-edit condition must be tied to the gate, not to
+        # a chat-level "user said it's fine".
+        "codex_direct_edit gate が有効 (allowed_paths にガードレール path を明示)",
+        # generated artifacts must be called out as generator-only.
+        ".mozyo-bridge/docs/file_conventions.generated.yaml",
+        "手編集: 禁止",
+        "mozyo-bridge docs generate-file-conventions",
+        # The Codex Direct Edit Gate must explicitly cover guardrail
+        # paths now, not only implementation files.
+        "ガードレールおよび docs/catalog 周辺",
+    )
+
+    PRESET_FORBIDDEN_MARKERS = (
+        # The pre-hardening wording allowed Codex to edit guardrails on
+        # bare user authorization. This exact phrase, used alone as the
+        # guardrail-editor condition, must not reappear.
+        "codex編集条件: ユーザーがガードレール変更を明示\n",
+    )
+
+    def _packaged_preset(self, preset: str) -> str:
+        path = (
+            ROOT
+            / "src"
+            / "mozyo_bridge"
+            / "scaffold"
+            / "presets"
+            / preset
+            / "agent-workflow.md"
+        )
+        self.assertTrue(path.is_file(), f"missing packaged preset: {path}")
+        return path.read_text(encoding="utf-8")
+
+    def test_packaged_redmine_governed_preset_has_hardened_wording(self) -> None:
+        body = self._packaged_preset("redmine-governed")
+        for marker in self.PRESET_REQUIRED_MARKERS:
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"redmine-governed preset is missing hardened marker "
+                    f"{marker!r}; see Codex direct edit hardening."
+                ),
+            )
+        for forbidden in self.PRESET_FORBIDDEN_MARKERS:
+            self.assertNotIn(
+                forbidden,
+                body,
+                msg=(
+                    f"redmine-governed preset still carries pre-hardening "
+                    f"permissive wording {forbidden!r}; Codex direct edit "
+                    f"on guardrails must require the gate journal."
+                ),
+            )
+
+    def test_packaged_redmine_rails_governed_preset_has_hardened_wording(
+        self,
+    ) -> None:
+        body = self._packaged_preset("redmine-rails-governed")
+        for marker in self.PRESET_REQUIRED_MARKERS:
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"redmine-rails-governed preset is missing hardened "
+                    f"marker {marker!r}; see Codex direct edit hardening."
+                ),
+            )
+        for forbidden in self.PRESET_FORBIDDEN_MARKERS:
+            self.assertNotIn(
+                forbidden,
+                body,
+                msg=(
+                    f"redmine-rails-governed preset still carries "
+                    f"pre-hardening permissive wording {forbidden!r}."
+                ),
+            )
+
+    def test_canonical_skill_reference_workflow_aligns_with_hardening(
+        self,
+    ) -> None:
+        ref = (
+            ROOT
+            / "skills"
+            / "mozyo-bridge-agent"
+            / "references"
+            / "workflow.md"
+        )
+        body = ref.read_text(encoding="utf-8")
+        # Must explicitly name the Redmine gate journal as the durable
+        # record for Redmine projects.
+        for marker in (
+            "Redmine `codex_direct_edit` gate journal",
+            "allowed_paths",
+            "role: 実装者",
+            "follow_up_review",
+            # Generator-only artifact rule must live in the skill reference too.
+            ".mozyo-bridge/docs/file_conventions.generated.yaml",
+            # The hardening must be tied to a concrete failure mode
+            # without publishing internal ticket identifiers.
+            "Past incident pattern",
+            "Review Gate-approved audit-owned commit path",
+        ):
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"skills/mozyo-bridge-agent/references/workflow.md is "
+                    f"missing hardened marker {marker!r}."
+                ),
+            )
+
+    def test_project_local_agent_workflow_aligns_with_hardening(self) -> None:
+        body = (
+            ROOT / "vibes" / "docs" / "rules" / "agent-workflow.md"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "Redmine `codex_direct_edit` gate journal",
+            "allowed_paths",
+            "follow_up_review",
+            ".mozyo-bridge/docs/file_conventions.generated.yaml",
+            "過去 incident pattern",
+            "Review Gate 承認済み audit-owned commit path",
+        ):
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"vibes/docs/rules/agent-workflow.md is missing "
+                    f"hardened marker {marker!r}."
+                ),
+            )
+
+    def test_root_routers_name_full_guardrail_scope(self) -> None:
+        """AGENTS.md and CLAUDE.md must enumerate the docs / guardrail
+        paths the hardening covers, so a reader of the router alone
+        cannot mistake `.mozyo-bridge/docs/catalog.yaml` or
+        `vibes/docs/**` for "free to direct-edit on chat instruction"."""
+        for router_name in ("AGENTS.md", "CLAUDE.md"):
+            body = (ROOT / router_name).read_text(encoding="utf-8")
+            for marker in (
+                "vibes/docs/**",
+                ".mozyo-bridge/docs/catalog.yaml",
+                "file_conventions.generated.yaml",
+                "codex_direct_edit",
+                "allowed_paths",
+            ):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        f"{router_name} Project-Local Additions is missing "
+                        f"hardened marker {marker!r}; the router pair must "
+                        f"agree on the hardening scope."
+                    ),
+                )
+
+    def test_plugin_skill_mirror_carries_hardened_workflow_reference(
+        self,
+    ) -> None:
+        """The plugin marketplace mirror must reflect the same hardened
+        skill reference as the canonical body. The drift test
+        (``PluginMarketplaceTest``) already enforces byte equality, but
+        we keep an explicit marker check here so a regression points at
+        ``Codex Direct Edit Gate hardening`` rather than at the generic
+        "mirror drifted" message."""
+        mirror = (
+            ROOT
+            / "plugins"
+            / "mozyo-bridge-agent"
+            / "skills"
+            / "mozyo-bridge-agent"
+            / "references"
+            / "workflow.md"
+        )
+        body = mirror.read_text(encoding="utf-8")
+        self.assertIn("Redmine `codex_direct_edit` gate journal", body)
+        self.assertIn(".mozyo-bridge/docs/file_conventions.generated.yaml", body)
+
+
 if __name__ == "__main__":
     unittest.main()

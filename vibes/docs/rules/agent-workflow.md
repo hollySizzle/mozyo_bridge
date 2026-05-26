@@ -72,12 +72,16 @@
 ## Policy / Skill Authoring Boundary
 
 - 自律フロー、規約、skill、handoff、audit、release / distribution gate の変更では、Codex は方針整理、文案作成、ユーザー対話、audit を担当する。
-- 上記の repo ファイル変更実装者は原則 Claude とする。Codex は通常時、規約や skill reference の repo ファイルを直接編集して commit しない。
+- 上記の repo ファイル変更実装者は原則 Claude とする。Codex は通常時、規約や skill reference の repo ファイルを直接編集して commit しない。保護 scope は実装ファイル (`src/**`, `tests/**`, `docs/**`, `vibes/docs/**`, `README.md`, release workflow, CLI behavior) と guardrail / docs / catalog surfaces (`AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, `.mozyo-bridge/docs/catalog.yaml`, `.codex/skills/**`, `.claude/skills/**`, `skills/mozyo-bridge-agent/**`, `plugins/mozyo-bridge-agent/**`, `src/mozyo_bridge/scaffold/presets/**`) の両方を含む。chat 上の「ユーザーがガードレール変更を明示」だけでは bypass にならない。
 - Codex direct edit が許される例外は、以下のいずれかに当てはまる場合に限る。条件は narrow に運用し、ユーザー指示が曖昧な場合や、複数の解釈ができる場合は default に戻して Claude handoff にする。
   1. ユーザーが `Codex direct edit` または「Codex が直接編集してよい」「Codex に直接実装させてよい」と同等の文言で、対象 task または対象 file を限定して明示的に許可した場合。「実行せよ」「対応して」「やって」「お願いします」「進めて」など一般的な命令形・依頼形・激励形は該当しない。
   2. 既存の誤実装、誤 commit、または誤手順を Asana / repo に correction として記録するための最小の変更である場合。
   3. Claude に handoff する暇がない真に緊急の小修正である場合(例: 数分以内に進行する release / publish / CI を止めるための1〜数行の修正)。この例外を使う前に Codex は実装を停止し、Asana に「緊急 direct edit 申請」として状況、対象ファイル、想定変更、影響範囲を記録し、可能ならユーザー確認を得る。状況が曖昧な場合や、確認を得られない場合は適用しない。
-- Codex が例外として直接実装した場合は、Asana に `Codex direct edit` として、(a) 該当した例外条件、(b) ユーザー指示の原文または引用、(c) 変更ファイル、(d) 実施した verification、(e) 後続反映確認の要否、を必ず記録する。これらが欠けた direct edit は事後 correction の対象とする。
+- Codex が例外として直接実装した場合の durable record は ticket system に依存する。edit が land する **前** に作成する。
+  - Asana projects: Asana task comment に `Codex direct edit` を残し、(a) 該当した例外条件、(b) ユーザー指示の原文または引用、(c) 変更ファイル、(d) 実施した verification、(e) 後続反映確認の要否、を記録する。
+  - Redmine projects (`mozyo_bridge` repo を含む。`redmine-governed` preset を採用): active issue に Redmine `codex_direct_edit` gate journal を起票する。必須 field は `role: 実装者`, `direct_edit: true`, `allowed_paths` (Codex が触る全 path を列挙), `reason`, `follow_up_review`。journal が存在しないまま edit を commit した場合は invalid とみなす。
+- 上記の record が欠けた direct edit は事後 correction の対象とする。過去 incident pattern: `codex_direct_edit` gate journal なし、または Review Gate 承認済み audit-owned commit path なしで Codex が repo diff を作成した場合は、correction journal に記録し、governed implementation/review flow に戻す。
+- `.mozyo-bridge/docs/file_conventions.generated.yaml` をはじめとする catalog generator output は Claude / Codex / owner いずれも手編集しない。`.mozyo-bridge/docs/catalog.yaml` を変更して `mozyo-bridge docs generate-file-conventions` で再生成し、`--check` で drift 確認する。
 - 自律フローや role boundary の変更を Codex が直接実装した場合でも、変更後の反映確認 requirement は免除されない。
 
 ## Audit Handoff (Claude → Codex)
