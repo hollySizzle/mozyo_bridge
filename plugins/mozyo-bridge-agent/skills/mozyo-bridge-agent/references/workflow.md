@@ -2,10 +2,10 @@
 
 ## Start Of Work
 
-- Fetch the global Notion rules page from `AGENTS.md`.
+- Fetch the central preset rules named in `AGENTS.md` (`mozyo_bridge` uses `redmine-governed`; other repos may use `redmine`, `asana`, or `none`).
 - Confirm the repository root and current `cwd`.
-- Confirm the active Asana task. If the task does not exist, create it before implementation.
-- Confirm Asana project notes for `mozyo_bridge`.
+- Confirm the active ticket in the repo's ticket system: a Redmine issue / journal for Redmine-preset repos (including `mozyo_bridge`), an Asana task for Asana-preset repos. If the ticket does not exist, create it before implementation.
+- Confirm the project notes / parent issue / parent task for `mozyo_bridge`.
 
 ## Ticket-ID Entrypoint
 
@@ -17,19 +17,27 @@ When the inbound is only a ticket ID, a ticket URL, or pane / chat text naming a
 - If any required framing field is missing, ambiguous, or contradicts the parent ticket, do not start implementation. Record the gap in the ticket's durable log first.
 - Imperative or request phrases from the user (such as "実行せよ", "対応して", "やって", "implement it") do not override the Codex / Claude role boundary defined below; the entrypoint still routes through the durable record.
 
-## Asana
+## Ticket System Conventions
 
-- Asana is the execution queue.
-- Use tasks as executable units with purpose, target paths, output paths, references, done criteria, and prohibitions.
-- Update the task when work is completed, blocked, or materially changes scope.
-- Do not treat chat as the durable work log.
-- Split follow-up work into new Asana tasks when scope expands.
-- For a normal development completion comment, record a short audit trail:
-  - global Notion rules fetched;
+The active ticket system is whichever the repo's central preset selects. For `mozyo_bridge` itself this is Redmine; other adopting repos may use Asana. Do not interchange the two vocabularies — the per-system gate names, comment / journal semantics, and required fields live in the central preset, not here.
+
+Common to both:
+
+- The ticket is the execution queue, not chat.
+- Treat tickets as executable units with purpose, target paths, output paths, references, done criteria, and prohibitions.
+- Update the ticket when work completes, blocks, or materially changes scope.
+- Split follow-up work into new tickets when scope expands.
+- For a normal development completion entry, record a short audit trail:
+  - central preset rules fetched;
   - `mozyo-bridge-agent` skill loaded;
-  - active Asana task and project notes confirmed;
+  - active ticket and project notes confirmed;
   - any additional relevant rule or reference paths consulted.
 - This audit trail is for reviewability. It does not require reading every reference file on every task.
+
+System-specific entry points:
+
+- **Redmine** (default for `mozyo_bridge`; preset `redmine-governed`): the durable work log is the Redmine issue and its journals. Gates such as Start / Implementation Done / Review Request / Review / Owner Close Approval / Close land as separate journal entries on the issue. The central preset (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-governed/agent-workflow.md`) defines the required fields per gate; this skill must not duplicate those tables.
+- **Asana** (for Asana-preset repos): the durable work log is the Asana task and its comments / stories. Completion notes, audit comments, and follow-up scope changes land on the task itself. The Asana central preset (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/asana/agent-workflow.md`) is authoritative for that vocabulary.
 
 ## Local Documentation
 
@@ -64,10 +72,10 @@ A project-local rule that requires the sender to notify the receiver for every h
 - When Codex receives a normal development task ID, the standard action is to convert it into a Claude handoff, not to implement it. Task size, urgency, implementation difficulty, user impatience, or the user writing directly into the Codex pane do not override this default.
 - Imperative or request phrases from the user — for example "実行せよ", "対応して", "やって", "お願いします", "進めて", "implement it", "go ahead", "please do it" — are not by themselves authorization for Codex to perform a direct edit. They express "I want this done", not "you may bypass Claude".
 - The standard handoff is overridden only by an explicit Codex-direct-edit exception defined in the Policy / Skill Authoring Boundary section.
-- When Codex receives a workflow-change verification task, Codex selects a valid normal development task, records the selection in Asana, and hands it off to Claude.
+- When Codex receives a workflow-change verification task, Codex selects a valid normal development task, records the selection in the active ticket system (Redmine journal for `mozyo_bridge`; Asana comment for Asana-preset repos), and hands it off to Claude.
 - The verification task only counts if Claude performs the normal development work and Codex performs the audit path.
 - If Codex mistakenly implements a normal development task directly, that run does not count as the task's normal completion. If it occurred during a verification task, it also does not satisfy workflow-change verification.
-- After such a mistake, reopen the affected task, record the mistake, the impact scope, and the follow-up decision (adopt, discard, reimplement) in Asana as a correction, then rerun the flow from Claude implementation through Codex audit. This correction flow applies to every normal development task, not only verification-target tasks.
+- After such a mistake, reopen the affected ticket, record the mistake, the impact scope, and the follow-up decision (adopt, discard, reimplement) in the active ticket system as a correction (Redmine correction journal or Asana correction comment), then rerun the flow from Claude implementation through Codex audit. This correction flow applies to every normal development task, not only verification-target tasks.
 
 ## Policy / Skill Authoring Boundary
 
@@ -76,8 +84,8 @@ A project-local rule that requires the sender to notify the receiver for every h
 - Codex must not directly edit and commit policy or skill reference files during ordinary operation. The protected scope covers both implementation files (`src/**`, `tests/**`, `docs/**`, `vibes/docs/**`, `README.md`, release workflow, CLI behavior) AND the guardrail / docs / catalog surfaces (`AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, `.mozyo-bridge/docs/catalog.yaml`, `.codex/skills/**`, `.claude/skills/**`, `skills/mozyo-bridge-agent/**`, `plugins/mozyo-bridge-agent/**`, scaffold packaged preset / router templates under `src/mozyo_bridge/scaffold/presets/**`). A chat-level "ユーザーがガードレール変更を明示" is NOT by itself authorization for Codex to bypass Claude on these surfaces.
 - A Codex direct edit is permitted only when one of the following narrow exceptions applies. Operate the exception conservatively; when in doubt, or when the user instruction admits more than one reading, fall back to the default and produce a Claude handoff.
   1. The user explicitly authorized a Codex direct edit using wording equivalent to `Codex direct edit`, "Codex が直接編集してよい", or "Codex に直接実装させてよい", scoped to a specific task or file. Generic imperative or request forms ("実行せよ", "対応して", "やって", "お願いします", "進めて", "implement it", "please do it") do not qualify.
-  2. The change is the minimal record-keeping correction needed to capture an existing mistaken implementation, mistaken commit, or mistaken procedure in Asana or the repo.
-  3. The change is a genuinely urgent small fix that would be damaged by handoff (for example, a one- or few-line fix needed within minutes to halt an in-progress release, publish, or CI run). Before invoking this exception Codex must stop implementation, record an "urgent direct-edit request" in Asana with the situation, target files, intended change, and impact scope, and obtain user confirmation when possible. Do not apply this exception when the situation is ambiguous or when confirmation cannot be obtained.
+  2. The change is the minimal record-keeping correction needed to capture an existing mistaken implementation, mistaken commit, or mistaken procedure in the active ticket system (Asana task / Redmine issue) or the repo.
+  3. The change is a genuinely urgent small fix that would be damaged by handoff (for example, a one- or few-line fix needed within minutes to halt an in-progress release, publish, or CI run). Before invoking this exception Codex must stop implementation, record an "urgent direct-edit request" in the active ticket system (Redmine journal for `mozyo_bridge`; Asana comment for Asana-preset repos) with the situation, target files, intended change, and impact scope, and obtain user confirmation when possible. Do not apply this exception when the situation is ambiguous or when confirmation cannot be obtained.
 - When Codex makes a direct edit under an exception, the durable record is **system-specific** and must exist BEFORE the edit lands:
   - Asana projects: record `Codex direct edit` in an Asana comment on the task with (a) which exception applied, (b) the verbatim or quoted user instruction, (c) the changed files, (d) the verification performed, and (e) whether follow-up verification is required.
   - Redmine projects (including the `mozyo_bridge` repo, which uses the `redmine-governed` preset): create a Redmine `codex_direct_edit` gate journal on the active issue with `role: 実装者`, `direct_edit: true`, `allowed_paths` (list every path Codex will touch), `reason`, and `follow_up_review`. The journal must exist on the issue before any Codex edit. A direct edit without the gate journal is itself a violation subject to correction.
@@ -122,5 +130,6 @@ This authority applies to normal development tasks and to guardrail / rule / wor
 - Do not choose the verification target based on task size or production impact.
   The criterion is whether the task directly changes the workflow, skill, or
   gate under verification.
-- Record the verification result in Asana and create follow-up tasks for any
-  gaps.
+- Record the verification result in the active ticket system (Redmine journal
+  for `mozyo_bridge`; Asana comment for Asana-preset repos) and create
+  follow-up tickets there for any gaps.

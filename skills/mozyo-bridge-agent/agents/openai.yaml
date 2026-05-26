@@ -1,7 +1,7 @@
 interface:
   display_name: "mozyo Bridge Agent"
-  short_description: "Asana-driven workflow for mozyo_bridge"
-  default_prompt: "Use $mozyo-bridge-agent to handle the next mozyo_bridge task from Asana with the repo rules."
+  short_description: "Ticket-driven workflow for mozyo_bridge (Redmine by default; Asana supported)"
+  default_prompt: "Use $mozyo-bridge-agent to handle the next mozyo_bridge ticket — a Redmine issue / journal by default for this repo, or an Asana task if the active scaffold preset is Asana — and follow the repo rules."
 
 policy:
   allow_implicit_invocation: true

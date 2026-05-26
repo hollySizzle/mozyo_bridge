@@ -1,18 +1,18 @@
 ---
 name: mozyo-bridge-agent
-description: Follow the mozyo_bridge project workflow for Asana-driven work, Notion rules, release checks, and safe tmux notification handling. Use when working in the mozyo_bridge repository, preparing PyPI/TestPyPI releases, updating agent rules, or coordinating Claude/Codex work through mozyo-bridge.
+description: Follow the mozyo_bridge project workflow for ticket-driven work (Redmine or Asana, per the repo's scaffold preset), preset rule fetches, release checks, and safe tmux notification handling. Use when working in the mozyo_bridge repository, preparing PyPI/TestPyPI releases, updating agent rules, or coordinating Claude/Codex work through mozyo-bridge.
 ---
 
 # mozyo-bridge-agent
 
 ## Core Workflow
 
-1. Fetch the global Notion rules page named in the repository `AGENTS.md`.
+1. Fetch the repository's central preset rules named in `AGENTS.md` (the `mozyo_bridge` repo itself uses the `redmine-governed` preset; other adopting projects may use `redmine`, `asana`, or `none`).
 2. Confirm the current `cwd`.
-3. Confirm the active Asana task and `mozyo_bridge` project notes.
+3. Confirm the active ticket in the repo's ticket system (Redmine issue / journal for Redmine-preset repos including `mozyo_bridge`; Asana task / comment for Asana-preset repos) and the project notes.
 4. Read only the reference files needed for the current work.
 5. Run verification that matches the risk of the change.
-6. Record material results, blockers, and remaining risks in Asana.
+6. Record material results, blockers, and remaining risks in the active ticket system (Redmine journal or Asana comment, whichever the repo uses).
 
 ## References
 
@@ -23,7 +23,7 @@ description: Follow the mozyo_bridge project workflow for Asana-driven work, Not
 
 ## Guardrails
 
-- Do not store secrets, tokens, personal credentials, or personal information in repo files, Notion, or Asana.
+- Do not store secrets, tokens, personal credentials, or personal information in repo files, preset rule docs, or ticket-system entries (Asana tasks / comments, Redmine issues / journals).
 - Keep root `AGENTS.md` and `CLAUDE.md` as routers. Do not turn them into full rule books.
 - Treat `mozyo-bridge` pane messages as notifications, not authoritative task state.
 - Do not reintroduce `vibes/tools/mozyo_bridge` as a runtime path.

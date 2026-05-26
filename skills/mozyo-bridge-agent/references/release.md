@@ -23,7 +23,7 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 
 ## Release Flow
 
-1. Start from an Asana release task.
+1. Start from a release ticket in the active ticket system (Redmine issue for `mozyo_bridge`; Asana task for Asana-preset repos).
 2. Run local unit tests and build checks.
 3. Run release artifact guardrails.
 4. Push to `main` and confirm GitHub Actions `Test` succeeds.
@@ -52,7 +52,7 @@ Before release, inspect all three surfaces:
 - Build artifacts: build both wheel and sdist, extract them, and scan the
   extracted files. Do not inspect the wheel only; sdist can include root docs.
 
-Record any false positives and their rationale in the Asana release task.
+Record any false positives and their rationale in the active release ticket (Redmine journal on the release issue, or an Asana comment on the release task, depending on the repo's central preset).
 
 ## Release Ref Consistency
 

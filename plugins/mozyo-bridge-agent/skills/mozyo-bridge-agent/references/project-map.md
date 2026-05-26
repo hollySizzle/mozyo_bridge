@@ -7,7 +7,8 @@
 - Package name: `mozyo-bridge`
 - Repository: https://github.com/hollySizzle/mozyo_bridge
 - Workspace: repository root
-- Asana project: configure per user or private workspace
+- Ticket system for `mozyo_bridge`: Redmine project `giken-3800-mozyo-bridge` (preset `redmine-governed`); the durable work record is the Redmine issue / journal.
+- Asana project: configure per user or private workspace (used by adopting repos whose central preset is `asana`, not by `mozyo_bridge` itself).
 
 ## Important Paths
 

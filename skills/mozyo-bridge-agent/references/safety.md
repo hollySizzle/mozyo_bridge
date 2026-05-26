@@ -4,7 +4,7 @@
 
 - Do not commit or paste real PyPI/TestPyPI tokens, API keys, personal credentials, or personal information.
 - `.env`, `.env.*`, and `.pypirc` are local-only secret surfaces and must stay ignored.
-- Do not store secrets in Asana task descriptions, Notion rules, Notion knowledge pages, or repository docs.
+- Do not store secrets in any ticket-system entries (Asana task descriptions / comments, Redmine issue descriptions / journals), preset rule docs, knowledge base pages, or repository docs.
 
 ## Notification Safety
 
@@ -43,7 +43,7 @@ When asking another agent to work through `mozyo-bridge`, the sending agent shou
 - Submit the message when the delivery guard allows it. Default for agent pane handoff is `--mode queue-enter` (v0.4 normative default); use `--mode standard` only when strict landing observation is required (regression check, brand-new pane, observability test, strict-landing audit requirement) or when the target is outside the v0.4 default scope (`mozyo-bridge message`, non-agent pane).
 - Optionally read the pane once immediately after delivery to catch obvious blockers such as a missing skill, missing Notion MCP access, or an unsubmitted prompt.
 
-Do not keep polling or watching the target pane as standard practice. After the handoff is delivered, rely on the durable source of truth named in the request, normally Asana task comments, repository changes, or an explicit completion notification from the target agent.
+Do not keep polling or watching the target pane as standard practice. After the handoff is delivered, rely on the durable source of truth named in the request, normally Redmine journals (for `mozyo_bridge` and other Redmine-preset repos) or Asana task comments (for Asana-preset repos), repository changes, or an explicit completion notification from the target agent.
 
 When a project's central preset or rule mandates a sender notification for every handoff of a given direction, that requirement is not relaxed by audit-only, revalidation, or doc-only framing of the task, nor by the receiver's prior pickup-intent statement; the sender must attempt the notification on every such handoff. Recording an "un-notified" state without first attempting the standard-path notification is a sender-side rationalization, not a satisfied fallback condition.
 
@@ -51,7 +51,7 @@ When a project's central preset or rule mandates a sender notification for every
 
 Writing the durable result is necessary but not always sufficient for a handoff. When work or audit began from another agent's request, notify that sender after recording the result so they know to read the durable source of truth.
 
-The return notification should be short and should point back to the durable record. Do not use the return notification as a substitute for the Asana comment, Redmine journal, repository change, or other named source of truth.
+The return notification should be short and should point back to the durable record. Do not use the return notification as a substitute for the Redmine journal (default for `mozyo_bridge`), Asana comment (for Asana-preset repos), repository change, or other named source of truth.
 
 ## Release Safety
 
