@@ -19,6 +19,7 @@ from typing import Any
 
 import mozyo_bridge
 from mozyo_bridge import __version__
+from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.infrastructure.tmux_client import run_tmux
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
@@ -423,6 +424,13 @@ def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:
     there is no manifest); ``ok`` means the manifest tracks it and
     the file is on disk; ``incomplete`` means the manifest tracks it
     but the file was removed locally (real drift).
+
+    The ``host_wiring`` sub-record reports whether the host tmux
+    config (default ``~/.tmux.conf``) currently sources the snippet
+    via the managed block written by ``mozyo-bridge tmux-ui install``.
+    Host wiring is independent of the artifact landing — operators
+    may have the artifact installed but choose not to wire it (the
+    snippet works just as well via per-session ``source-file``).
     """
     tracked = _scaffold_manifest_files(target)
     is_tracked = TMUX_UI_MANIFEST_PATH in tracked
@@ -444,11 +452,37 @@ def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:
             f"manifest tracks {snippet_path} but the file is missing; "
             "rerun scaffold apply --backup to restore"
         )
+
+    host_conf = tmux_ui_module.default_host_tmux_conf()
+    host_wiring = tmux_ui_module.compute_status(target, host_conf)
+    wiring_actions: list[str] = []
+    if is_tracked and present:
+        if host_wiring["state"] == tmux_ui_module.STATE_NOT_INSTALLED:
+            wiring_actions.append(
+                "host tmux config does not source agent-ui.conf; run "
+                f"`mozyo-bridge tmux-ui install --target {target}` to wire it"
+            )
+        elif host_wiring["state"] == tmux_ui_module.STATE_DRIFT:
+            wiring_actions.append(
+                "host tmux config has a managed block pointing elsewhere "
+                f"({host_wiring.get('drift_reason')}); rerun "
+                f"`mozyo-bridge tmux-ui install --target {target} --force` to refresh"
+            )
+
     return {
         "status": status,
         "path": str(snippet_path),
         "present": present,
         "manifest_tracks_tmux_ui": is_tracked,
+        "host_wiring": {
+            "state": host_wiring["state"],
+            "tmux_conf": host_wiring["tmux_conf"],
+            "tmux_conf_exists": host_wiring["tmux_conf_exists"],
+            "current_source_path": host_wiring["current_source_path"],
+            "expected_snippet": host_wiring["expected_snippet"],
+            "drift_reason": host_wiring["drift_reason"],
+            "next_action": wiring_actions,
+        },
         "next_action": next_action,
     }
 
@@ -747,6 +781,20 @@ def format_doctor_text(result: dict[str, Any]) -> str:
         )
         for action in artifact.get("next_action", []):
             lines.append(f"  -> {action}")
+        host_wiring = artifact.get("host_wiring") or {}
+        if host_wiring:
+            lines.append(
+                f"  host_wiring: {host_wiring.get('state', 'unknown')} "
+                f"tmux_conf={host_wiring.get('tmux_conf', '-')}"
+            )
+            current = host_wiring.get("current_source_path")
+            if current:
+                lines.append(f"    current_source_path: {current}")
+            drift = host_wiring.get("drift_reason")
+            if drift:
+                lines.append(f"    drift_reason: {drift}")
+            for action in host_wiring.get("next_action", []) or []:
+                lines.append(f"  -> {action}")
     if tmux.get("tmux_pane"):
         lines.append(f"  TMUX_PANE: {tmux['tmux_pane']}")
     if "panes_total" in tmux:

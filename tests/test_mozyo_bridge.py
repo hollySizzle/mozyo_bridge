@@ -10372,5 +10372,543 @@ class CodexDirectEditGuardrailHardeningTest(unittest.TestCase):
         self.assertIn(".mozyo-bridge/docs/file_conventions.generated.yaml", body)
 
 
+class TmuxUiHostWiringTest(unittest.TestCase):
+    """Direct unit tests for the tmux UI host wiring install/uninstall/status.
+
+    Covers the byte-stability contract (no surrounding content changes,
+    no extra blank lines on round-trip), idempotency, drift detection,
+    --force replacement, backup, dry-run, and the snippet-missing
+    precondition.
+    """
+
+    def _make_repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        snippet = repo / ".mozyo-bridge" / "tmux" / "agent-ui.conf"
+        snippet.parent.mkdir(parents=True, exist_ok=True)
+        snippet.write_text("# repo snippet\n", encoding="utf-8")
+        return repo
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def test_install_fresh_creates_managed_block_only(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text(
+                "# user existing content\nset -g status on\n",
+                encoding="utf-8",
+            )
+
+            result = tmux_ui.apply_install(
+                repo_root=repo, tmux_conf=host_conf
+            )
+            self.assertTrue(result.changed)
+            self.assertEqual("appended", result.action)
+            text = host_conf.read_text(encoding="utf-8")
+            # Existing content survives untouched at the head.
+            self.assertTrue(text.startswith("# user existing content\nset -g status on\n"))
+            # Managed block present at the tail.
+            self.assertIn(tmux_ui.MANAGED_BLOCK_BEGIN, text)
+            self.assertIn(tmux_ui.MANAGED_BLOCK_END, text)
+            absolute = str((repo / ".mozyo-bridge/tmux/agent-ui.conf").resolve())
+            self.assertIn(absolute, text)
+            self.assertIn("if-shell", text)
+
+    def test_install_into_missing_file_creates_minimal_file(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"  # does not exist
+
+            result = tmux_ui.apply_install(
+                repo_root=repo, tmux_conf=host_conf
+            )
+            self.assertEqual("created", result.action)
+            text = host_conf.read_text(encoding="utf-8")
+            # File contains only the managed block (no user content).
+            self.assertTrue(text.startswith(tmux_ui.MANAGED_BLOCK_BEGIN))
+            self.assertTrue(text.rstrip("\n").endswith(tmux_ui.MANAGED_BLOCK_END))
+
+    def test_install_is_idempotent(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# user\n", encoding="utf-8")
+
+            first = tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            after_first = host_conf.read_text(encoding="utf-8")
+            second = tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            after_second = host_conf.read_text(encoding="utf-8")
+
+            self.assertEqual("appended", first.action)
+            self.assertEqual("noop", second.action)
+            self.assertFalse(second.changed)
+            self.assertEqual(after_first, after_second)
+
+    def test_install_drift_requires_force(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo_a = self._make_repo(tmp)
+            # Second repo with its own snippet to trigger drift.
+            repo_b = tmp / "repo_b"
+            (repo_b / ".mozyo-bridge" / "tmux").mkdir(parents=True)
+            (repo_b / ".mozyo-bridge" / "tmux" / "agent-ui.conf").write_text(
+                "# other snippet\n", encoding="utf-8"
+            )
+            host_conf = tmp / ".tmux.conf"
+
+            tmux_ui.apply_install(repo_root=repo_a, tmux_conf=host_conf)
+            with self.assertRaises(tmux_ui.TmuxUiError):
+                tmux_ui.apply_install(repo_root=repo_b, tmux_conf=host_conf)
+
+            forced = tmux_ui.apply_install(
+                repo_root=repo_b, tmux_conf=host_conf, force=True
+            )
+            self.assertEqual("replaced", forced.action)
+            text = host_conf.read_text(encoding="utf-8")
+            self.assertIn(
+                str((repo_b / ".mozyo-bridge/tmux/agent-ui.conf").resolve()),
+                text,
+            )
+            self.assertNotIn(
+                str((repo_a / ".mozyo-bridge/tmux/agent-ui.conf").resolve()),
+                text,
+            )
+
+    def test_install_dry_run_does_not_write(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# untouched\n", encoding="utf-8")
+
+            result = tmux_ui.apply_install(
+                repo_root=repo, tmux_conf=host_conf, dry_run=True
+            )
+            self.assertTrue(result.changed)
+            self.assertTrue(result.dry_run)
+            self.assertEqual(
+                "# untouched\n", host_conf.read_text(encoding="utf-8")
+            )
+
+    def test_install_backup_preserves_original(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# original\nset -g foo on\n", encoding="utf-8")
+
+            result = tmux_ui.apply_install(
+                repo_root=repo, tmux_conf=host_conf, backup=True
+            )
+            self.assertIsNotNone(result.backup_path)
+            assert result.backup_path is not None
+            self.assertEqual(
+                "# original\nset -g foo on\n",
+                result.backup_path.read_text(encoding="utf-8"),
+            )
+
+    def test_install_rejects_missing_snippet(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            empty_repo = tmp / "empty"
+            empty_repo.mkdir()
+            host_conf = tmp / ".tmux.conf"
+
+            with self.assertRaises(tmux_ui.TmuxUiError):
+                tmux_ui.apply_install(
+                    repo_root=empty_repo, tmux_conf=host_conf
+                )
+            # No partial file written.
+            self.assertFalse(host_conf.exists())
+
+    def test_uninstall_round_trip_is_byte_stable(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            original = "# user content\nset -g status on\nset -g foo bar\n"
+            host_conf.write_text(original, encoding="utf-8")
+
+            tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            uninstall = tmux_ui.apply_uninstall(tmux_conf=host_conf)
+            self.assertEqual("removed", uninstall.action)
+            self.assertEqual(
+                original,
+                host_conf.read_text(encoding="utf-8"),
+                msg="install → uninstall did not round-trip byte-for-byte",
+            )
+
+    def test_uninstall_when_not_installed_is_noop(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# user\n", encoding="utf-8")
+
+            result = tmux_ui.apply_uninstall(tmux_conf=host_conf)
+            self.assertEqual("noop", result.action)
+            self.assertEqual("# user\n", host_conf.read_text(encoding="utf-8"))
+
+    def test_uninstall_dry_run_does_not_write(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# user\n", encoding="utf-8")
+            tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            before = host_conf.read_text(encoding="utf-8")
+
+            result = tmux_ui.apply_uninstall(tmux_conf=host_conf, dry_run=True)
+            self.assertTrue(result.changed)
+            self.assertTrue(result.dry_run)
+            self.assertEqual(before, host_conf.read_text(encoding="utf-8"))
+
+    def test_uninstall_backup_preserves_original(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# user\n", encoding="utf-8")
+            tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            with_block = host_conf.read_text(encoding="utf-8")
+
+            result = tmux_ui.apply_uninstall(tmux_conf=host_conf, backup=True)
+            self.assertIsNotNone(result.backup_path)
+            assert result.backup_path is not None
+            self.assertEqual(
+                with_block,
+                result.backup_path.read_text(encoding="utf-8"),
+            )
+
+    def test_status_states(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+
+            # not-installed when host conf is missing.
+            info = tmux_ui.compute_status(repo, host_conf)
+            self.assertEqual("not-installed", info["state"])
+            self.assertFalse(info["tmux_conf_exists"])
+
+            tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            info = tmux_ui.compute_status(repo, host_conf)
+            self.assertEqual("installed", info["state"])
+            self.assertEqual(
+                str((repo / ".mozyo-bridge/tmux/agent-ui.conf").resolve()),
+                info["current_source_path"],
+            )
+
+            # Simulate drift: rename the snippet so its absolute path
+            # no longer matches the managed block.
+            moved = tmp / "moved" / "agent-ui.conf"
+            moved.parent.mkdir(parents=True)
+            (repo / ".mozyo-bridge" / "tmux" / "agent-ui.conf").rename(moved)
+            info = tmux_ui.compute_status(repo, host_conf)
+            self.assertEqual("drift", info["state"])
+            self.assertIsNotNone(info["drift_reason"])
+
+    def test_cli_install_status_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# user\n", encoding="utf-8")
+
+            code, out = self._run_cli(
+                [
+                    "tmux-ui",
+                    "install",
+                    "--repo",
+                    str(repo),
+                    "--tmux-conf",
+                    str(host_conf),
+                ]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("appended", out)
+
+            code, out = self._run_cli(
+                [
+                    "tmux-ui",
+                    "status",
+                    "--repo",
+                    str(repo),
+                    "--tmux-conf",
+                    str(host_conf),
+                ]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("installed", out)
+
+            code, out = self._run_cli(
+                [
+                    "tmux-ui",
+                    "uninstall",
+                    "--tmux-conf",
+                    str(host_conf),
+                ]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("removed", out)
+            self.assertEqual("# user\n", host_conf.read_text(encoding="utf-8"))
+
+    def test_cli_status_json_drift_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo = self._make_repo(tmp)
+            host_conf = tmp / ".tmux.conf"
+
+            self._run_cli(
+                [
+                    "tmux-ui",
+                    "install",
+                    "--repo",
+                    str(repo),
+                    "--tmux-conf",
+                    str(host_conf),
+                ]
+            )
+            # Drift: delete the snippet so the managed block points at
+            # a missing path.
+            (repo / ".mozyo-bridge" / "tmux" / "agent-ui.conf").unlink()
+
+            code, out = self._run_cli(
+                [
+                    "tmux-ui",
+                    "status",
+                    "--repo",
+                    str(repo),
+                    "--tmux-conf",
+                    str(host_conf),
+                    "--json",
+                ]
+            )
+            payload = json.loads(out)
+            self.assertEqual("drift", payload["state"])
+            self.assertEqual(1, code)
+
+    def test_doctor_reports_host_wiring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            home = tmp / "home"
+            project = tmp / "project"
+            project.mkdir()
+            host_conf = tmp / ".tmux.conf"
+
+            # Bring the governed preset into the project so the manifest
+            # tracks agent-ui.conf and doctor reports host_wiring.
+            parser = build_parser()
+            for argv in (
+                ["rules", "install", "--home", str(home)],
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-rails-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ],
+            ):
+                args = parser.parse_args(argv)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(0, args.func(args))
+
+            # Before install: host_wiring=not-installed (and exists fine).
+            with patch.object(
+                __import__(
+                    "mozyo_bridge.application.tmux_ui",
+                    fromlist=["default_host_tmux_conf"],
+                ),
+                "default_host_tmux_conf",
+                return_value=host_conf,
+            ):
+                args = parser.parse_args(
+                    [
+                        "doctor",
+                        "--target",
+                        str(project),
+                        "--home",
+                        str(home),
+                        "--json",
+                    ]
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    args.func(args)
+                payload = json.loads(buf.getvalue())
+                wiring = payload["sections"]["tmux"]["artifact"]["host_wiring"]
+                self.assertEqual("not-installed", wiring["state"])
+
+                # Install via CLI, doctor now reports `installed`.
+                install_args = parser.parse_args(
+                    [
+                        "tmux-ui",
+                        "install",
+                        "--repo",
+                        str(project),
+                        "--tmux-conf",
+                        str(host_conf),
+                    ]
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    install_args.func(install_args)
+
+                args = parser.parse_args(
+                    [
+                        "doctor",
+                        "--target",
+                        str(project),
+                        "--home",
+                        str(home),
+                        "--json",
+                    ]
+                )
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    args.func(args)
+                payload = json.loads(buf.getvalue())
+                wiring = payload["sections"]["tmux"]["artifact"]["host_wiring"]
+                self.assertEqual("installed", wiring["state"])
+
+    def _install_repo_at_dir(self, parent: Path, dir_name: str) -> tuple[Path, Path, str]:
+        repo = parent / dir_name
+        snippet = repo / ".mozyo-bridge" / "tmux" / "agent-ui.conf"
+        snippet.parent.mkdir(parents=True, exist_ok=True)
+        snippet.write_text("# repo snippet\n", encoding="utf-8")
+        return repo, snippet, str(snippet.resolve())
+
+    def test_render_managed_block_rejects_single_quote_path(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            _, snippet, _ = self._install_repo_at_dir(tmp, "repo-with-'quote'")
+            with self.assertRaises(tmux_ui.TmuxUiError):
+                tmux_ui.render_managed_block(snippet)
+
+    def test_install_rejects_single_quote_path_without_writing(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            repo, _, _ = self._install_repo_at_dir(tmp, "repo-with-'quote'")
+            host_conf = tmp / ".tmux.conf"
+            host_conf.write_text("# untouched\n", encoding="utf-8")
+
+            with self.assertRaises(tmux_ui.TmuxUiError):
+                tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+            self.assertEqual(
+                "# untouched\n", host_conf.read_text(encoding="utf-8")
+            )
+
+    def test_render_managed_block_escapes_special_chars(self) -> None:
+        """Each path-significant tmux byte is escaped exactly once.
+
+        The directive line is the parsed-once tmux form, so:
+        - ``"`` → ``\\"``
+        - ``$`` → ``\\$``
+        - ``#`` → ``##`` (the ``\\#`` escape is not recognised by tmux
+          and would silently leak a ``#`` through format substitution).
+        The byte-literal comment line carries the unescaped path so
+        comparators are not coupled to the escape table.
+        """
+        from mozyo_bridge.application import tmux_ui
+
+        for dir_name in (
+            'repo with spaces',
+            'repo-with-"dquote"',
+            'repo-with-$dollar',
+            'repo-with-#hash',
+        ):
+            with tempfile.TemporaryDirectory() as tmp_str:
+                tmp = Path(tmp_str)
+                _, snippet, absolute = self._install_repo_at_dir(tmp, dir_name)
+                block = tmux_ui.render_managed_block(snippet)
+                self.assertIn(
+                    f"{tmux_ui.SOURCE_COMMENT_PREFIX}{absolute}\n",
+                    block,
+                )
+                directive = next(
+                    line for line in block.splitlines() if line.startswith("if-shell ")
+                )
+                if '"' in absolute:
+                    self.assertIn('\\"', directive)
+                if '$' in absolute:
+                    self.assertIn('\\$', directive)
+                if '#' in absolute:
+                    self.assertIn('##', directive)
+                    # Lone backslash-hash must not appear: tmux does not
+                    # recognise it and would leak a live ``#``.
+                    self.assertNotIn('\\#', directive)
+
+    def test_install_uninstall_round_trip_with_special_chars(self) -> None:
+        from mozyo_bridge.application import tmux_ui
+
+        original_host = "# user content\nset -g status on\n"
+        for dir_name in (
+            'repo with spaces',
+            'repo-with-"dquote"',
+            'repo-with-$dollar',
+            'repo-with-#hash',
+        ):
+            with tempfile.TemporaryDirectory() as tmp_str:
+                tmp = Path(tmp_str)
+                repo, _, absolute = self._install_repo_at_dir(tmp, dir_name)
+                host_conf = tmp / ".tmux.conf"
+                host_conf.write_text(original_host, encoding="utf-8")
+
+                tmux_ui.apply_install(repo_root=repo, tmux_conf=host_conf)
+                status = tmux_ui.compute_status(repo, host_conf)
+                self.assertEqual(
+                    "installed",
+                    status["state"],
+                    msg=f"install state for path={dir_name!r}",
+                )
+                # Source comment is the byte-literal path, so status
+                # parses it back regardless of the escape table.
+                self.assertEqual(absolute, status["current_source_path"])
+
+                tmux_ui.apply_uninstall(tmux_conf=host_conf)
+                self.assertEqual(
+                    original_host,
+                    host_conf.read_text(encoding="utf-8"),
+                    msg=f"round-trip did not restore byte-for-byte for path={dir_name!r}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

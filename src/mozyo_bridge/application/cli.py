@@ -32,6 +32,9 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_diff,
     cmd_scaffold_status,
     cmd_status,
+    cmd_tmux_ui_install,
+    cmd_tmux_ui_status,
+    cmd_tmux_ui_uninstall,
     cmd_type,
 )
 from mozyo_bridge.application.release import (
@@ -182,6 +185,115 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_option(config)
     config.add_argument("--path")
     config.set_defaults(func=cmd_config)
+
+    tmux_ui = sub.add_parser(
+        "tmux-ui",
+        help=(
+            "Host-side wiring helper for the governed preset's "
+            "`.mozyo-bridge/tmux/agent-ui.conf` snippet. Adds or removes "
+            "a managed source-file block in the host tmux config "
+            "(default ~/.tmux.conf) without touching surrounding settings."
+        ),
+    )
+    tmux_ui_sub = tmux_ui.add_subparsers(dest="tmux_ui_command", required=True)
+
+    def _add_tmux_ui_common(parser_: argparse.ArgumentParser, *, include_repo: bool = True) -> None:
+        if include_repo:
+            parser_.add_argument(
+                "--repo",
+                help=(
+                    "Repo root that ships the `.mozyo-bridge/tmux/agent-ui.conf` "
+                    "snippet. Defaults to MOZYO_REPO or the current working "
+                    "directory."
+                ),
+            )
+            parser_.add_argument(
+                "--target",
+                dest="repo",
+                help="Alias for --repo.",
+            )
+        parser_.add_argument(
+            "--tmux-conf",
+            dest="tmux_conf",
+            help=(
+                "Host tmux config file to edit. Defaults to ~/.tmux.conf. "
+                "Only the managed block (between mozyo-bridge tmux-ui markers) "
+                "is created, replaced, or removed; surrounding settings stay "
+                "untouched."
+            ),
+        )
+
+    tmux_ui_install = tmux_ui_sub.add_parser(
+        "install",
+        help=(
+            "Insert a managed `source-file` block for the repo's "
+            "agent-ui.conf snippet into the host tmux config. Idempotent on "
+            "the same repo path; --force replaces a block pointing elsewhere."
+        ),
+    )
+    _add_tmux_ui_common(tmux_ui_install)
+    tmux_ui_install.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show the planned change without writing to the host tmux config.",
+    )
+    tmux_ui_install.add_argument(
+        "--backup",
+        action="store_true",
+        help=(
+            "Copy the current tmux config to "
+            "`<path>.bak.<timestamp>` before writing the new content."
+        ),
+    )
+    tmux_ui_install.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Replace an existing managed block that points to a different "
+            "snippet path (drift). Without --force the command exits with a "
+            "drift error so the operator confirms the intent."
+        ),
+    )
+    tmux_ui_install.set_defaults(func=cmd_tmux_ui_install)
+
+    tmux_ui_uninstall = tmux_ui_sub.add_parser(
+        "uninstall",
+        help=(
+            "Remove the managed `mozyo-bridge tmux-ui` block from the host "
+            "tmux config. Leaves surrounding content untouched and is a "
+            "no-op when the block is not present."
+        ),
+    )
+    _add_tmux_ui_common(tmux_ui_uninstall, include_repo=False)
+    tmux_ui_uninstall.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show the planned removal without writing to the host tmux config.",
+    )
+    tmux_ui_uninstall.add_argument(
+        "--backup",
+        action="store_true",
+        help="Copy the tmux config to `<path>.bak.<timestamp>` before removal.",
+    )
+    tmux_ui_uninstall.set_defaults(func=cmd_tmux_ui_uninstall)
+
+    tmux_ui_status = tmux_ui_sub.add_parser(
+        "status",
+        help=(
+            "Report whether the host tmux config currently wires the repo's "
+            "agent-ui.conf snippet: not-installed / installed / drift."
+        ),
+    )
+    _add_tmux_ui_common(tmux_ui_status)
+    tmux_ui_status.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output instead of human-readable text.",
+    )
+    tmux_ui_status.set_defaults(func=cmd_tmux_ui_status)
 
     sub.add_parser("id").set_defaults(func=cmd_id)
 

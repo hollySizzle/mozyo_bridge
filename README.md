@@ -115,6 +115,37 @@ bare `mozyo` と `mozyo-bridge init <agent>` は agent window の tmux status ba
 
 色は window 識別のためであり、resolver / handoff routing は依然 window 名 (`claude` / `codex`) を exact key として使うため、**window 名は変更されません**。色を外したい場合は `tmux set-window-option -u -t <session>:<window> window-status-style` (および `window-status-current-style`) で個別 unset するか、operator の `.tmux.conf` 側で上書きしてください。`.tmux.conf` / `~/.config/mozyo-bridge/tmux.conf` の読み込み挙動には影響しません。
 
+### tmux UI host wiring (`tmux-ui install`)
+
+governed preset が配布する `.mozyo-bridge/tmux/agent-ui.conf` を host 側 tmux 設定 (default `~/.tmux.conf`) から自動 source したい場合は、`mozyo-bridge tmux-ui install` を使います。**operator の既存 `~/.tmux.conf` を丸ごと上書きすることはなく**、`# >>> mozyo-bridge tmux-ui >>>` / `# <<< mozyo-bridge tmux-ui <<<` で囲んだ管理ブロックのみを追加 / 更新 / 削除します。ブロック内部は `if-shell` で snippet の存在確認をしてから `source-file` するため、repo を移動 / 削除しても tmux 起動が壊れません。
+
+主な操作:
+
+```
+# repo に scaffold 済みの agent-ui.conf を ~/.tmux.conf に wiring する
+mozyo-bridge tmux-ui install --target <repo>
+
+# 何が書き換わるか確認だけしたい
+mozyo-bridge tmux-ui install --target <repo> --dry-run
+
+# 既存 ~/.tmux.conf のバックアップを残してから wiring する
+mozyo-bridge tmux-ui install --target <repo> --backup
+
+# 既存ブロックが別 repo の path を指している (drift) ときに上書きする
+mozyo-bridge tmux-ui install --target <repo> --force
+
+# wiring を解除する (管理ブロックのみ削除、surrounding 設定は無傷)
+mozyo-bridge tmux-ui uninstall
+
+# wiring 状態を確認する (not-installed / installed / drift)
+mozyo-bridge tmux-ui status --target <repo>
+mozyo-bridge tmux-ui status --target <repo> --json   # drift 時は exit 1
+```
+
+idempotent な操作です。同じ repo path に対する 2 回目の `install` は no-op、`install` → `uninstall` の round-trip は byte-for-byte で原状復帰します (managed block 周辺の blank line 含む)。host 側の tmux 設定パスを上書きしたい場合 (例: `$XDG_CONFIG_HOME/tmux/tmux.conf`) は `--tmux-conf <path>` を指定してください。
+
+`doctor` は `tmux.artifact.host_wiring` で同じ状態を report します。`installed` / `not-installed` / `drift` の三状態と、現在 source している path、推奨復旧コマンドを表示します。導入したくない operator は単に `install` を実行しなければよく、scaffold は host 設定に一切触れません。
+
 ## Beta Tester Install (GitHub main)
 
 PyPI release 前の beta tester 向け手順です。`Quick Start` の PyPI install とは別経路で、GitHub `main` の最新 commit を直接 install します。`mozyo-bridge --version` が表示する package version 文字列は `pyproject.toml` の値なので、PyPI release と GitHub `main` で同じ string になる場合があります。実体差は新規 sub-command (例: `mozyo-bridge scaffold status --help` / `mozyo-bridge doctor --json`) や、`mozyo-bridge rules install` が配布する preset 内容で確認してください。

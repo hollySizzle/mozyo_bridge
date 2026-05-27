@@ -19,6 +19,7 @@
 - `mozyo-bridge doctor` に `claude_nagger` セクションを追加し、`tmux` セクションには tmux UI snippet の設置状態 (`artifact:` 行) を表示するようにしました。default-on の guardrail がどこまで届いているかを 1 command で確認できます。
 - 旧 governed scaffold が target repo に vendor copy していた `.mozyo-bridge/tools/*.py` を廃止し、docs catalog tooling を mozyo-bridge package 側の CLI として提供するように移しました。`mozyo-bridge docs validate / resolve / generate-file-conventions / audit-impact` で同等の運用が可能です。再 apply 時は scaffold の outgoing reconcile が旧 vendor copy を `--backup` / `--force` 経由で安全に除去します。
 - `redmine-rails-governed` の gate schema、role split、Codex direct edit gate、完了条件を preset の `agent-workflow.md` に統合しました。別配布していた `.mozyo-bridge/rules/development_flow.md` は廃止し、再 apply 時は manifest 管理下の旧 file を `--backup` / `--force` 経由で安全に除去します。
+- governed preset 配布の `.mozyo-bridge/tmux/agent-ui.conf` を host 側 tmux 設定 (`~/.tmux.conf` など) から安全に source できる新 subcommand `mozyo-bridge tmux-ui {install,uninstall,status}` を追加しました。**operator の既存 tmux 設定を丸ごと上書きせず**、`# >>> mozyo-bridge tmux-ui >>>` / `# <<< mozyo-bridge tmux-ui <<<` で囲んだ管理ブロックだけを安全に追加 / 更新 / 削除します。ブロック内部は `if-shell` で snippet の存在を確認してから `source-file` するため、repo を移動・削除しても tmux 起動が壊れません。同じ repo path への 2 回目の install は no-op で、`uninstall` は byte-for-byte で原状復元します。`--dry-run` / `--backup` / `--force` をサポートし、`status --json` は drift 時に exit 1 を返します。`doctor` の `tmux.artifact.host_wiring` セクションでも同じ状態 (`not-installed` / `installed` / `drift`) と推奨復旧コマンドを表示します。
 
 ### なぜ必要だったか
 
@@ -31,6 +32,8 @@ Claude Nagger と tmux UI snippet は、単なる便利機能ではなく、agen
 docs catalog tooling を target repo へ vendor copy する形は、project 固有コードなのか mozyo-bridge runtime なのかが曖昧で、配布・upgrade・drift 管理がいずれも重くなっていました。今回 tooling 本体を mozyo-bridge package に同梱し、`mozyo-bridge docs ...` CLI に寄せることで、target repo には catalog 等の data だけが残り、runtime tool の version は `mozyo-bridge` の install と一致するようになります。既存環境からの移行は `scaffold apply --backup` (または `--force`) で旧 `.mozyo-bridge/tools/*.py` が outgoing reconcile されるため、operator は 1 command で切り替えられます。
 
 `development_flow.md` を別 file として配る設計は、agent が読むべき正本を増やし、`agent-workflow.md` との責務境界を人間にも LLM にも分かりにくくしていました。governed preset では AGENTS.md / CLAUDE.md がまず `agent-workflow.md` を読むため、実行契約もそこに統合し、入口から正本までの経路を単純にしました。
+
+`tmux-ui install` を新設したのは、governed preset が配布する `agent-ui.conf` を host 側 tmux 設定に組み込む手順を operator 任せにすると、抜けや手書き drift、`source-file` 行の追記事故 (snippet が無いと tmux 起動が壊れる) が起きやすかったためです。phase A で repo-local artifact 配布と doctor 表示は完了していましたが、host 設定への組み込みは「手で `~/.tmux.conf` を編集する」前提のままで、複数 repo を横断する operator にとって reproducible でない手順が残っていました。今回の subcommand は managed block 方式を採用し、`if-shell` で snippet 不在時に no-op になる安全策をブロック内部に組み込み、operator の既存設定は決して触れないことを byte-for-byte の round-trip test で担保しています。`uninstall` / `status` / `--dry-run` / `--backup` / `--force` を同時に揃えたのは、host 設定という最も触りたくない領域を変更する以上、変更前確認・原状復帰・drift の検出を operator 側で自由に組み合わせられる必要があったからです。
 
 ## v0.4.0 - 2026-05-20
 
