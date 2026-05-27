@@ -10,6 +10,15 @@ from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.domain.agent_discovery import (
+    AGENT_KINDS,
+    AGENT_KIND_CLAUDE,
+    AGENT_KIND_CODEX,
+    AGENT_KIND_UNKNOWN,
+    discover_agents,
+    filter_agents,
+    infer_repo_root,
+)
 from mozyo_bridge.domain.handoff import (
     AnchorError,
     KIND_LABELS,
@@ -113,6 +122,61 @@ def cmd_list(_: argparse.Namespace) -> int:
                     pane["command"],
                     pane.get("window_name") or "-",
                     pane["cwd"],
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_agents_list(args: argparse.Namespace) -> int:
+    """Cross-session agent discovery surface (Redmine #10332).
+
+    Emits one row per tmux pane carrying the structured fields a sender needs
+    in order to name an explicit cross-workspace handoff target: session,
+    window name and index, pane id and index, active flag, classified
+    ``agent_kind`` (``claude`` / ``codex`` / ``unknown``), foreground process,
+    inferred ``repo_root`` (walked up via PROJECT_MARKERS from the pane's
+    ``cwd``), the pane's ``cwd``, and an ``ambiguous`` flag when the
+    ``(session, window_name)`` pair spans multiple windows in the session.
+
+    Read-only. Does not change tmux state, does not interact with
+    Asana / Redmine, and is intentionally separate from the legacy ``list`` /
+    ``status`` surfaces so existing scripts that scrape those outputs keep
+    working.
+    """
+    require_tmux()
+    agent_filter = getattr(args, "agent", None)
+    if agent_filter is not None and agent_filter not in AGENT_KINDS:
+        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    session_filter = getattr(args, "session", None)
+    records = filter_agents(
+        discover_agents(),
+        session=session_filter,
+        agent_kind=agent_filter,
+    )
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = [record.to_dict() for record in records]
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(
+        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS"
+    )
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.session or "-",
+                    record.window_name or "-",
+                    record.window_index or "-",
+                    record.pane_id or "-",
+                    "1" if record.pane_active else "0",
+                    record.agent_kind,
+                    record.process or "-",
+                    record.repo_root or "-",
+                    record.cwd or "-",
+                    "1" if record.ambiguous else "0",
                 ]
             )
         )
@@ -1052,6 +1116,86 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 f"target_session={(target_session or '<unknown>')!r}. "
                 "Run `mozyo-bridge` from inside the receiver's tmux session, "
                 "or pass a pane id in the sender's session."
+            )
+            raise AssertionError("unreachable")
+
+    # Cross-Workspace Handoff Gate (Redmine #10332).
+    #
+    # When the resolved target lives in a different tmux session from the
+    # sender, ``--to claude`` is rejected at the CLI. The cross-workspace
+    # path must route through the target session's Codex window so the
+    # target workspace's audit boundary is preserved; an origin Codex typing
+    # directly into another workspace's Claude pane bypasses that boundary.
+    #
+    # Same-session ``--to claude`` is unaffected (existing window-only
+    # resolver). Cross-session ``--to codex`` is the explicit gateway path.
+    # When the sender is outside tmux (`sender_session` is None) the check
+    # is skipped because we cannot prove cross-session intent; the
+    # queue-enter rail's own session check below still applies in that
+    # mode. The optional ``--target-repo`` check below adds repo-mismatch
+    # fail-closed on top of this gate.
+    sender_session_xw = current_session_name()
+    target_location_xw = target_info.get("location") or ""
+    target_session_xw = (
+        target_location_xw.split(":", 1)[0] if ":" in target_location_xw else ""
+    )
+    if (
+        sender_session_xw
+        and target_session_xw
+        and sender_session_xw != target_session_xw
+        and receiver == "claude"
+    ):
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="cross_session_claude",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "cross-session handoff to Claude is not allowed; "
+            f"sender_session={sender_session_xw!r} target_session={target_session_xw!r}. "
+            "Route through the target session's Codex window with `--to codex` "
+            "and ask that Codex to perform the local Claude handoff. See the "
+            "Cross-Workspace Handoff rule in the agent workflow."
+        )
+        raise AssertionError("unreachable")
+
+    expected_target_repo = getattr(args, "target_repo", None)
+    if expected_target_repo:
+        expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
+        observed_repo = infer_repo_root(target_info.get("cwd") or "")
+        if observed_repo != expected_resolved:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_repo_mismatch",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "target pane is not in the expected repo; "
+                f"expected={expected_resolved!r} "
+                f"observed={(observed_repo or '<unknown>')!r} "
+                f"target_cwd={(target_info.get('cwd') or '<unknown>')!r}. "
+                "Pass a target pane whose cwd resolves under the expected "
+                "repo root, or drop `--target-repo` to skip the check."
             )
             raise AssertionError("unreachable")
 

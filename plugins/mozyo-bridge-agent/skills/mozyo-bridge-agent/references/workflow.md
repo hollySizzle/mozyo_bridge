@@ -60,6 +60,16 @@ Use handoff only when the active project workflow or the user explicitly asks fo
 
 Pane messages are notification edges in this lifecycle. They are not review passes, task completion, release approval, or the work log.
 
+## Cross-Workspace Handoff
+
+When the sender (Claude or Codex) needs to notify an agent that lives in another tmux session — for example, a different repo's workspace — the routing is constrained at the CLI as well as at the workflow level (Redmine #10332).
+
+- Use `mozyo-bridge agents list` (optionally `--json`, `--session NAME`, `--agent claude|codex|unknown`) to enumerate the target workspace's sessions, windows, panes, processes, cwds, inferred repo roots, and agent kinds before naming a target. Discovery is read-only and is separate from `mozyo-bridge list` / `status`.
+- Cross-session `mozyo-bridge handoff send --to claude` is rejected at the CLI with `blocked` / `cross_session_claude`. The origin agent must route through the target session's Codex window with `--to codex --target <target_session>:codex` and ask that target Codex to perform the local Claude handoff. The reason: typing directly into a foreign workspace's Claude pane bypasses that workspace's audit boundary.
+- Cross-session `--to codex` is the explicit gateway path and is allowed.
+- `--target-repo PATH` is an opt-in repo gate. When supplied, the target pane's cwd must walk up to that repo root or the handoff is rejected with `blocked` / `target_repo_mismatch`. Use it to harden against same-named sessions opened against different repos.
+- The durable source of truth for the cross-workspace request stays on Redmine / Asana; the pane notification is still only the pointer. The target Codex reads the durable anchor and decides how to ingest the request in the target workspace.
+
 The low-level `mozyo-bridge read`, `mozyo-bridge message`, `mozyo-bridge type`, and `mozyo-bridge keys` commands are operator/debug primitives (pane inspection, ad-hoc operator messages, raw typing, raw keys). They are not the standard handoff/reply path and must not be assembled by hand as a routine substitute for the primitive; the only sanctioned uses are the operator-driven `--no-submit` retry path in step 3 of the Retry Path Checklist (per-preset central rules) and explicit operator debugging.
 
 A project-local rule that requires the sender to notify the receiver for every handoff of a given direction applies to every task in that scope, including audit-only, revalidation, and doc-only tasks; the "every" is not relaxed by how the task is framed, by the receiver's prior pickup-intent statement (for example "I will pull from the task record"), or by the sender's judgement that the receiver will read the durable record anyway. Skipping the notification on that basis is a sender-side rationalization, not a satisfied condition.

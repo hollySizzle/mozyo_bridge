@@ -4,6 +4,7 @@ import argparse
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
+    cmd_agents_list,
     cmd_config,
     cmd_doctor,
     cmd_handoff_reply,
@@ -47,6 +48,7 @@ from mozyo_bridge.application.release import (
     cmd_release_workflow_runs,
     cmd_release_workflow_wait,
 )
+from mozyo_bridge.domain.agent_discovery import AGENT_KINDS
 from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     MODE_QUEUE_ENTER,
@@ -181,6 +183,53 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=cmd_status)
 
     sub.add_parser("list").set_defaults(func=cmd_list)
+
+    agents = sub.add_parser(
+        "agents",
+        help=(
+            "Cross-workspace agent discovery (Redmine #10332). Read-only "
+            "structured surface of every tmux pane carrying session, window, "
+            "pane id, process, cwd, inferred repo_root, and classified agent "
+            "kind. Use before issuing a Codex-gated cross-workspace handoff "
+            "with `mozyo-bridge handoff send`."
+        ),
+    )
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+
+    agents_list = agents_sub.add_parser(
+        "list",
+        help=(
+            "Enumerate every tmux pane with structured discovery fields. "
+            "Does not modify tmux state; safe to call from any session. "
+            "Distinct from `mozyo-bridge list` (raw single-session pane "
+            "table) and `mozyo-bridge status` (current session diagnostics)."
+        ),
+    )
+    agents_list.add_argument(
+        "--session",
+        help=(
+            "Filter to panes whose tmux session matches this name exactly. "
+            "Omit to enumerate every visible session."
+        ),
+    )
+    agents_list.add_argument(
+        "--agent",
+        choices=sorted(AGENT_KINDS),
+        help=(
+            "Filter by classified agent kind. `claude` and `codex` match "
+            "panes whose tmux window name equals that agent label "
+            "(the window-only model identity rail); `unknown` matches every "
+            "other pane. Omit the filter to list all panes."
+        ),
+    )
+    agents_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output instead of the tab-separated table.",
+    )
+    agents_list.set_defaults(func=cmd_agents_list)
+
     config = sub.add_parser("tmux-ui-config")
     add_repo_option(config)
     config.add_argument("--path")
@@ -406,6 +455,17 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.add_argument(
             "--target",
             help="Optional tmux target override; defaults to same-session agent-window resolution from --to",
+        )
+        parser_.add_argument(
+            "--target-repo",
+            dest="target_repo",
+            help=(
+                "Optional cross-workspace gate (Redmine #10332): the target "
+                "pane's cwd must resolve to this repo root, otherwise the "
+                "handoff is rejected with `target_repo_mismatch`. Use when "
+                "the sender wants to assert which workspace the target lives "
+                "in before delivery. Drop the flag to skip the repo gate."
+            ),
         )
         parser_.add_argument(
             "--mode",

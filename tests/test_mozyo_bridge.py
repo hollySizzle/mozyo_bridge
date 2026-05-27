@@ -7445,6 +7445,10 @@ class HandoffOrchestratorTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value=None,
+            ), \
             patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
             patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
@@ -8842,6 +8846,10 @@ class HandoffRecordEmissionTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value=None,
+            ), \
             patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
             patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
@@ -10908,6 +10916,500 @@ class TmuxUiHostWiringTest(unittest.TestCase):
                     host_conf.read_text(encoding="utf-8"),
                     msg=f"round-trip did not restore byte-for-byte for path={dir_name!r}",
                 )
+
+
+class AgentDiscoveryTest(unittest.TestCase):
+    """Read-only cross-workspace discovery (Redmine #10332).
+
+    Coverage for ``mozyo_bridge.domain.agent_discovery``: classification by
+    window-name agent rail, per-session ambiguity detection, repo-root
+    inference via PROJECT_MARKERS, and the ``mozyo-bridge agents list``
+    CLI surface (text + JSON).
+    """
+
+    def test_discover_agents_classifies_by_window_name(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import discover_agents
+
+        records = discover_agents(
+            panes=[
+                {
+                    "id": "%1",
+                    "location": "sess_a:0.0",
+                    "command": "claude",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "sess_b:1.0",
+                    "command": "node",
+                    "cwd": "/repo",
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%3",
+                    "location": "sess_a:2.0",
+                    "command": "zsh",
+                    "cwd": "/tmp",
+                    "window_name": "shell",
+                    "pane_active": "0",
+                },
+            ]
+        )
+        kinds = {(r.pane_id, r.agent_kind) for r in records}
+        self.assertEqual(
+            {("%1", "claude"), ("%2", "codex"), ("%3", "unknown")},
+            kinds,
+        )
+
+    def test_discover_agents_flags_same_session_duplicate_window_name(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import discover_agents
+
+        records = discover_agents(
+            panes=[
+                {
+                    "id": "%1",
+                    "location": "sess_a:0.0",
+                    "command": "claude",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "sess_a:2.0",
+                    "command": "node",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+            ]
+        )
+        # Both panes in the same session sharing `claude` window name surface
+        # the ambiguity flag so callers can fail closed before issuing a
+        # handoff. find_agent_window already raises on this within a single
+        # session; discovery surfaces it without raising so cross-workspace
+        # readers can see it.
+        self.assertTrue(all(r.ambiguous for r in records))
+
+    def test_discover_agents_does_not_cross_flag_same_window_in_different_sessions(
+        self,
+    ) -> None:
+        from mozyo_bridge.domain.agent_discovery import discover_agents
+
+        records = discover_agents(
+            panes=[
+                {
+                    "id": "%1",
+                    "location": "sess_a:0.0",
+                    "command": "claude",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "sess_b:0.0",
+                    "command": "claude",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+            ]
+        )
+        # Each session has exactly one `claude` window — not ambiguous. The
+        # ambiguity flag is per-session, not global; cross-session same-name
+        # windows are the *expected* shape under bare-`mozyo`.
+        self.assertFalse(any(r.ambiguous for r in records))
+
+    def test_infer_repo_root_walks_up_to_project_markers(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo = Path(tmp_str) / "repo"
+            nested = repo / "src" / "deep" / "leaf"
+            nested.mkdir(parents=True)
+            (repo / "pyproject.toml").write_text("", encoding="utf-8")
+            self.assertEqual(str(repo.resolve()), infer_repo_root(str(nested)))
+
+    def test_infer_repo_root_returns_none_when_no_markers_above(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            no_markers = Path(tmp_str) / "no_markers"
+            no_markers.mkdir(parents=True)
+            self.assertIsNone(infer_repo_root(str(no_markers)))
+
+    def test_filter_agents_session_and_kind(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import (
+            discover_agents,
+            filter_agents,
+        )
+
+        records = discover_agents(
+            panes=[
+                {
+                    "id": "%1",
+                    "location": "sess_a:0.0",
+                    "command": "claude",
+                    "cwd": "/repo",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%2",
+                    "location": "sess_b:0.0",
+                    "command": "node",
+                    "cwd": "/repo",
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+            ]
+        )
+        self.assertEqual(
+            ["%2"],
+            [r.pane_id for r in filter_agents(records, session="sess_b")],
+        )
+        self.assertEqual(
+            ["%1"],
+            [r.pane_id for r in filter_agents(records, agent_kind="claude")],
+        )
+
+    def test_cmd_agents_list_text_output_emits_structured_columns(self) -> None:
+        from mozyo_bridge.application.commands import cmd_agents_list
+
+        panes = [
+            {
+                "id": "%1",
+                "location": "sess_a:0.0",
+                "command": "claude",
+                "cwd": "/no/such/path",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+        args = argparse.Namespace(session=None, agent=None, as_json=False)
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch(
+                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                return_value=panes,
+            ), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(0, cmd_agents_list(args))
+        output = stdout.getvalue()
+        self.assertIn(
+            "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS",
+            output,
+        )
+        self.assertIn("sess_a\tclaude\t0\t%1\t1\tclaude\tclaude", output)
+
+    def test_cmd_agents_list_json_output_carries_all_fields(self) -> None:
+        from mozyo_bridge.application.commands import cmd_agents_list
+
+        panes = [
+            {
+                "id": "%1",
+                "location": "sess_a:0.0",
+                "command": "claude",
+                "cwd": "/no/such/path",
+                "window_name": "claude",
+                "pane_active": "1",
+            },
+        ]
+        args = argparse.Namespace(session=None, agent=None, as_json=True)
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch(
+                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                return_value=panes,
+            ), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(0, cmd_agents_list(args))
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        record = payload[0]
+        self.assertEqual("%1", record["pane_id"])
+        self.assertEqual("sess_a", record["session"])
+        self.assertEqual("claude", record["window_name"])
+        self.assertEqual("claude", record["agent_kind"])
+        self.assertEqual(True, record["pane_active"])
+        self.assertEqual(False, record["ambiguous"])
+        # repo_root is informational only; it is None when the pane cwd
+        # cannot be walked to a PROJECT_MARKERS-bearing directory.
+        self.assertIn("repo_root", record)
+
+    def test_cmd_agents_list_rejects_unknown_agent_filter(self) -> None:
+        from mozyo_bridge.application.commands import cmd_agents_list
+
+        args = argparse.Namespace(session=None, agent="bogus", as_json=False)
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch(
+                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                return_value=[],
+            ), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                cmd_agents_list(args)
+        self.assertIn("--agent must be one of", stderr.getvalue())
+
+
+class CrossWorkspaceHandoffGateTest(unittest.TestCase):
+    """Cross-workspace handoff gate (Redmine #10332).
+
+    Origin Codex must not deliver directly to a foreign workspace's Claude
+    pane. The gate enforces: cross-session `--to claude` is rejected; the
+    sender must route through the target session's Codex window with
+    `--to codex`. The optional `--target-repo` flag adds a repo-mismatch
+    fail-closed check on top.
+    """
+
+    def run_handoff(self, argv, pane, sender_session="local"):
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        sent: list[tuple[str, ...]] = []
+
+        def fake_run_tmux(*tmux_args, check: bool = True):
+            sent.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch(
+                "mozyo_bridge.application.commands.capture_pane",
+                return_value="",
+            ), \
+            patch(
+                "mozyo_bridge.application.commands.run_tmux",
+                side_effect=fake_run_tmux,
+            ), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value=sender_session,
+            ), \
+            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch(
+                "mozyo_bridge.domain.pane_resolver.pane_lines",
+                return_value=[pane],
+            ), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout, \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as exit_ctx:
+                args.func(args)
+        return exit_ctx.exception, sent, stdout.getvalue(), stderr.getvalue()
+
+    def test_cross_session_claude_handoff_is_rejected(self) -> None:
+        # Origin lives in `local`, target pane lives in `other`; receiver is
+        # claude — the gate must fail closed with `cross_session_claude` and
+        # no tmux send-keys must be issued.
+        pane = {
+            "id": "%9",
+            "location": "other:1.0",
+            "command": "claude",
+            "cwd": "/repo",
+            "window_name": "claude",
+            "pane_active": "1",
+        }
+        _exc, sent, stdout, stderr = self.run_handoff(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "redmine",
+                "--issue",
+                "10332",
+                "--journal",
+                "49623",
+                "--kind",
+                "implementation_request",
+                "--target",
+                "%9",
+                "--mode",
+                "standard",
+            ],
+            pane=pane,
+            sender_session="local",
+        )
+
+        # No tmux input was typed into the target pane — fail-closed before
+        # any send-keys runs.
+        self.assertFalse(
+            any(
+                call[:2] == ("send-keys", "-t")
+                for call in sent
+            ),
+            f"unexpected send-keys: {sent}",
+        )
+        # Outcome JSON carries the new reason and no notification_marker
+        # (no body was assembled past the gate).
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("cross_session_claude", outcome["reason"])
+        self.assertEqual("claude", outcome["receiver"])
+        self.assertIn(
+            "cross-session handoff to Claude is not allowed", stderr
+        )
+
+    def test_cross_session_codex_handoff_is_allowed_through_the_gate(self) -> None:
+        # `--to codex` is the gateway path: routing into a foreign workspace
+        # through that workspace's Codex window is what the gate permits.
+        # The handoff dies later (no marker observed) under `standard`, but
+        # NOT with `cross_session_claude`. Different `reason` proves the
+        # cross-session gate let it through.
+        pane = {
+            "id": "%9",
+            "location": "other:1.0",
+            "command": "codex",
+            "cwd": "/repo",
+            "window_name": "codex",
+            "pane_active": "1",
+        }
+        _exc, _sent, stdout, _stderr = self.run_handoff(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "codex",
+                "--source",
+                "redmine",
+                "--issue",
+                "10332",
+                "--journal",
+                "49623",
+                "--kind",
+                "review_request",
+                "--target",
+                "%9",
+                "--mode",
+                "standard",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            pane=pane,
+            sender_session="local",
+        )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        # The gate did NOT trigger. The handoff dies on marker_timeout
+        # (strict mode, no marker observed) instead.
+        self.assertEqual("blocked", outcome["status"])
+        self.assertNotEqual("cross_session_claude", outcome["reason"])
+
+    def test_same_session_claude_handoff_is_not_blocked_by_the_gate(self) -> None:
+        # In-session `--to claude` is the existing window-only resolver path;
+        # the cross-workspace gate must not regress it. The handoff itself
+        # still dies on marker_timeout under strict standard mode.
+        pane = {
+            "id": "%9",
+            "location": "local:1.0",
+            "command": "claude",
+            "cwd": "/repo",
+            "window_name": "claude",
+            "pane_active": "1",
+        }
+        _exc, _sent, stdout, _stderr = self.run_handoff(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "redmine",
+                "--issue",
+                "10332",
+                "--journal",
+                "49623",
+                "--kind",
+                "implementation_request",
+                "--target",
+                "%9",
+                "--mode",
+                "standard",
+                "--landing-timeout",
+                "0.01",
+                "--submit-delay",
+                "0",
+            ],
+            pane=pane,
+            sender_session="local",
+        )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertNotEqual("cross_session_claude", outcome["reason"])
+
+    def test_target_repo_mismatch_is_rejected(self) -> None:
+        # `--target-repo` opts the sender into a repo-mismatch fail-closed
+        # gate. When the target pane's cwd does not walk up to the named
+        # repo root, the handoff is rejected before any send-keys.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            expected_repo = Path(tmp_str) / "expected"
+            other_repo = Path(tmp_str) / "other"
+            (expected_repo / "src").mkdir(parents=True)
+            (other_repo / "src").mkdir(parents=True)
+            (expected_repo / "pyproject.toml").write_text("", encoding="utf-8")
+            (other_repo / "pyproject.toml").write_text("", encoding="utf-8")
+
+            pane = {
+                "id": "%9",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(other_repo / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, stderr = self.run_handoff(
+                [
+                    "handoff",
+                    "send",
+                    "--to",
+                    "claude",
+                    "--source",
+                    "redmine",
+                    "--issue",
+                    "10332",
+                    "--journal",
+                    "49623",
+                    "--kind",
+                    "implementation_request",
+                    "--target",
+                    "%9",
+                    "--target-repo",
+                    str(expected_repo),
+                    "--mode",
+                    "standard",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+
+        self.assertFalse(
+            any(call[:2] == ("send-keys", "-t") for call in sent),
+            f"unexpected send-keys: {sent}",
+        )
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_repo_mismatch", outcome["reason"])
+        self.assertIn("target pane is not in the expected repo", stderr)
 
 
 if __name__ == "__main__":

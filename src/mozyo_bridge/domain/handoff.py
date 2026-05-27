@@ -187,6 +187,8 @@ Reason = Literal[
     "invalid_anchor",
     "invalid_args",
     "queue_enter",
+    "cross_session_claude",
+    "target_repo_mismatch",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -389,6 +391,26 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
         return "sender", "supply a valid durable anchor for the chosen source"
     if reason == "invalid_args":
         return "sender", "supply the required arguments for handoff send/reply"
+    if reason == "cross_session_claude":
+        return (
+            "sender",
+            (
+                "route the handoff through the target session's Codex window: "
+                "re-run with `--to codex --target <target_session>:codex` and "
+                "ask that Codex to perform the local Claude handoff. Naming a "
+                "cross-session Claude pane directly is rejected by the "
+                "Cross-Workspace Handoff gate."
+            ),
+        )
+    if reason == "target_repo_mismatch":
+        return (
+            "sender",
+            (
+                "verify `--target-repo` matches the receiver pane's inferred "
+                "repo root, or drop the flag to skip the repo gate. Pass a "
+                "target whose cwd lives under the expected repo."
+            ),
+        )
     return "sender", "inspect handoff failure and decide the next step"
 
 
@@ -459,6 +481,18 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
         return (
             "Required arguments for handoff send/reply were missing or invalid; "
             "handoff aborted before resolving the receiver pane. No notification was typed."
+        )
+    if reason == "cross_session_claude":
+        return (
+            "Cross-Workspace Handoff gate: sender and target live in different "
+            "tmux sessions, and `--to claude` was used. Route through the "
+            "target session's Codex window with `--to codex`. No notification "
+            "was typed."
+        )
+    if reason == "target_repo_mismatch":
+        return (
+            "Target pane's inferred repo root does not match `--target-repo`; "
+            "handoff aborted before typing. No notification was typed."
         )
     return "Handoff did not deliver; see structured outcome for details."
 

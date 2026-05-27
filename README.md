@@ -324,6 +324,31 @@ mozyo-bridge status
 
 これまで存在した `@agent_name` label による互換 path は廃止しました。標準 tmux pane を target にしたい場合は `mozyo-bridge init <agent>` で window 名を正規化してください。
 
+### Cross-workspace agent discovery (`agents list`)
+
+複数 workspace を同時に開いている場合、session / window / pane / process / cwd / repo root / agent 種別を一括で取得できる read-only な discovery surface が必要です。これは `mozyo-bridge list` (raw single-session pane table) や `mozyo-bridge status` (current session diagnostics) とは別 namespace に分離してあります。
+
+```bash
+mozyo-bridge agents list
+mozyo-bridge agents list --session other-repo
+mozyo-bridge agents list --agent claude --json
+```
+
+- `--session NAME` で session 名を完全一致 filter できます。
+- `--agent claude|codex|unknown` で window-name agent rail に基づく分類で filter できます。`unknown` は agent window でない pane を意味します。
+- `--json` で JSON output が出ます (`session`, `window_index`, `window_name`, `pane_id`, `pane_index`, `pane_active`, `agent_kind`, `process`, `cwd`, `repo_root`, `ambiguous`)。
+- `repo_root` は pane の `cwd` から `.git` / `.tmux.conf` / `pyproject.toml` を遡って推定します。markers が見つからない場合は `null` です。情報用 field で、ここを根拠に handoff を拒否したい場合は下記の `--target-repo` を使ってください。
+- `ambiguous=true` は同一 session 内で同じ window name が複数 window に存在する状態です (resolver 既存 fail-closed と同じ条件)。
+
+### Cross-Workspace Handoff Gate
+
+別 workspace の Claude に直接通知を投げると target workspace の audit boundary (Codex 監査) を bypass してしまいます。これを防ぐため、`mozyo-bridge handoff send` / `reply` には次の制約が CLI レベルで入っています (Redmine #10332)。
+
+- **Cross-session `--to claude` は拒否される**。sender の tmux session と target pane の session が異なるとき `--to claude` で送ろうとすると `blocked` / `cross_session_claude` で止まります。送信側は `--to codex --target <target_session>:codex` で target workspace の Codex window 経由に切り替え、target Codex から local Claude handoff を実行してもらいます。
+- **Cross-session `--to codex` は許可される** — gateway path です。
+- **`--target-repo PATH` の repo mismatch check (opt-in)** — `--target-repo /path/to/repo` を渡すと、target pane の cwd から walk-up した repo root が一致しない場合 `blocked` / `target_repo_mismatch` で止まります。同名 session を別 repo で開いている場合の mis-route 防止に使います。
+- queue-enter mode は元から cross-session 全面禁止です。本 gate はそれより緩い strict / pending mode でも cross-session の Claude 直撃を遮断する layer です。
+
 Claude Code の project skill は repo root の `.claude/skills/` から解決されます。
 `mozyo-bridge status` / `doctor` が `claude_pane cwd is outside repo root` を出した場合、その pane では `/mozyo-bridge-agent` などの project skill が解決されない可能性があります。
 repo root で Claude Code を起動し直してから `mozyo-bridge init claude` を再実行してください。
