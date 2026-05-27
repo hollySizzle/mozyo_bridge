@@ -344,10 +344,10 @@ mozyo-bridge agents list --agent claude --json
 
 別 workspace の Claude に直接通知を投げると target workspace の audit boundary (Codex 監査) を bypass してしまいます。これを防ぐため、`mozyo-bridge handoff send` / `reply` には次の制約が CLI レベルで入っています (Redmine #10332)。
 
-- **Cross-session `--to claude` は拒否される**。sender の tmux session と target pane の session が異なるとき `--to claude` で送ろうとすると `blocked` / `cross_session_claude` で止まります。送信側は `--to codex --target <target_session>:codex` で target workspace の Codex window 経由に切り替え、target Codex から local Claude handoff を実行してもらいます。
-- **Cross-session `--to codex` は許可される** — gateway path です。
+- **Cross-session `--to claude` は拒否される**。sender の tmux session と target pane の session が異なるとき `--to claude` で送ろうとすると `blocked` / `cross_session_claude` で止まります。送信側は `--to codex --target <target_session>:codex --mode standard` (もしくは `--mode pending`) で target workspace の Codex window 経由に切り替え、target Codex から local Claude handoff を実行してもらいます。
+- **Cross-session `--to codex` は gateway path として許可される。ただし `--mode standard` か `--mode pending` を明示する**。default の `queue-enter` rail (v0.4 以降) は no-rollback 契約を sender session に縛るため、cross-session target を receiver に依らず `invalid_args` で全面拒否します。`--mode` を省略した cross-session gateway は同じく失敗するので、cross-workspace 送信時は必ず `--mode` を付けます。
 - **`--target-repo PATH` の repo mismatch check (opt-in)** — `--target-repo /path/to/repo` を渡すと、target pane の cwd から walk-up した repo root が一致しない場合 `blocked` / `target_repo_mismatch` で止まります。同名 session を別 repo で開いている場合の mis-route 防止に使います。
-- queue-enter mode は元から cross-session 全面禁止です。本 gate はそれより緩い strict / pending mode でも cross-session の Claude 直撃を遮断する layer です。
+- queue-enter mode は cross-session 全面禁止 (`invalid_args`)。本 gate はそれより緩い strict / pending mode でも cross-session の Claude 直撃を遮断する layer です。strict / pending mode 自体は cross-session を許可しますが、`--to claude` だけは本 gate で fail-closed します。
 
 Claude Code の project skill は repo root の `.claude/skills/` から解決されます。
 `mozyo-bridge status` / `doctor` が `claude_pane cwd is outside repo root` を出した場合、その pane では `/mozyo-bridge-agent` などの project skill が解決されない可能性があります。

@@ -1163,9 +1163,12 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         die(
             "cross-session handoff to Claude is not allowed; "
             f"sender_session={sender_session_xw!r} target_session={target_session_xw!r}. "
-            "Route through the target session's Codex window with `--to codex` "
-            "and ask that Codex to perform the local Claude handoff. See the "
-            "Cross-Workspace Handoff rule in the agent workflow."
+            "Route through the target session's Codex window with `--to codex "
+            "--target <target_session>:codex --mode standard` (or `--mode "
+            "pending`) and ask that Codex to perform the local Claude handoff. "
+            "`--mode` is required because the default `queue-enter` rail "
+            "rejects every cross-session target — see the Cross-Workspace "
+            "Handoff rule in the agent workflow."
         )
         raise AssertionError("unreachable")
 

@@ -396,10 +396,14 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
             "sender",
             (
                 "route the handoff through the target session's Codex window: "
-                "re-run with `--to codex --target <target_session>:codex` and "
-                "ask that Codex to perform the local Claude handoff. Naming a "
-                "cross-session Claude pane directly is rejected by the "
-                "Cross-Workspace Handoff gate."
+                "re-run with `--to codex --target <target_session>:codex "
+                "--mode standard` (or `--mode pending`) and ask that Codex to "
+                "perform the local Claude handoff. `--mode` is required because "
+                "the default `queue-enter` rail rejects every cross-session "
+                "target — including `--to codex` — to keep its no-rollback "
+                "contract bound to the sender's session. Naming a cross-session "
+                "Claude pane directly is rejected by the Cross-Workspace "
+                "Handoff gate."
             ),
         )
     if reason == "target_repo_mismatch":
@@ -486,8 +490,10 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
         return (
             "Cross-Workspace Handoff gate: sender and target live in different "
             "tmux sessions, and `--to claude` was used. Route through the "
-            "target session's Codex window with `--to codex`. No notification "
-            "was typed."
+            "target session's Codex window with `--to codex` and `--mode "
+            "standard` (or `--mode pending`); the default `queue-enter` rail "
+            "rejects every cross-session target, so the gateway path needs an "
+            "explicit `--mode`. No notification was typed."
         )
     if reason == "target_repo_mismatch":
         return (

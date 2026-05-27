@@ -11353,6 +11353,122 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         outcome = json.loads(json_lines[-1])
         self.assertNotEqual("cross_session_claude", outcome["reason"])
 
+    def test_default_queue_enter_cross_session_codex_is_rejected_as_invalid_args(
+        self,
+    ) -> None:
+        # Regression for Redmine #10332 review #49646. Cross-session `--to
+        # codex` is the documented gateway path, but the v0.4 default
+        # `queue-enter` rail rejects every cross-session target — including
+        # `--to codex` — because its no-rollback contract is bound to the
+        # sender's tmux session. Omitting `--mode` therefore breaks the
+        # gateway send too. The CLI guidance (cross_session_claude
+        # next_action and skill workflow) must point at `--mode standard`
+        # explicitly, and this test pins the underlying queue-enter
+        # invariant so the guidance does not drift.
+        pane = {
+            "id": "%9",
+            "location": "other:1.0",
+            "command": "codex",
+            "cwd": "/repo",
+            "window_name": "codex",
+            "pane_active": "1",
+        }
+        _exc, sent, stdout, stderr = self.run_handoff(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "codex",
+                "--source",
+                "redmine",
+                "--issue",
+                "10332",
+                "--journal",
+                "49623",
+                "--kind",
+                "review_request",
+                "--target",
+                "%9",
+                # No `--mode` → default queue-enter (since v0.4).
+            ],
+            pane=pane,
+            sender_session="local",
+        )
+
+        # No tmux input typed before the rail rejects the cross-session
+        # target.
+        self.assertFalse(
+            any(call[:2] == ("send-keys", "-t") for call in sent),
+            f"unexpected send-keys: {sent}",
+        )
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn(
+            "queue-enter requires the target pane to live in the sender's tmux session",
+            stderr,
+        )
+
+    def test_cross_session_claude_outcome_guides_to_mode_standard(self) -> None:
+        # Regression for Redmine #10332 review #49646. The recovery path
+        # from a `cross_session_claude` block must steer the sender to
+        # `--to codex --mode standard` (or `--mode pending`); naming
+        # `--to codex` without `--mode` re-fails under the queue-enter
+        # default. The next_action_for / outcome narrative / die() message
+        # must all carry the explicit mode hint.
+        pane = {
+            "id": "%9",
+            "location": "other:1.0",
+            "command": "claude",
+            "cwd": "/repo",
+            "window_name": "claude",
+            "pane_active": "1",
+        }
+        _exc, _sent, stdout, stderr = self.run_handoff(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "redmine",
+                "--issue",
+                "10332",
+                "--journal",
+                "49623",
+                "--kind",
+                "implementation_request",
+                "--target",
+                "%9",
+                "--mode",
+                "standard",
+            ],
+            pane=pane,
+            sender_session="local",
+        )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("cross_session_claude", outcome["reason"])
+        # The structured outcome's next_action must spell out the mode flag
+        # so the sender's next attempt does not re-fail under queue-enter
+        # default. The die() trailer on stderr must carry the same hint.
+        self.assertIn("--mode standard", outcome["next_action"])
+        self.assertIn("--to codex", outcome["next_action"])
+        self.assertIn("--mode standard", stderr)
+        # The durable record (markdown) must repeat the mode hint so
+        # auditors and downstream agents see it even when the structured
+        # outcome is consumed and discarded.
+        self.assertIn("--mode standard", stdout)
+
     def test_target_repo_mismatch_is_rejected(self) -> None:
         # `--target-repo` opts the sender into a repo-mismatch fail-closed
         # gate. When the target pane's cwd does not walk up to the named
