@@ -11742,5 +11742,64 @@ class CodexAutonomousGuardrailLaneTest(unittest.TestCase):
         self.assertIn("vibes/docs/rules/codex-autonomous-guardrail-lane.md", body)
 
 
+class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
+    """Pin the #10332 cross-workspace `--mode` guidance in the skill body.
+
+    The canonical skill workflow and its plugin mirror previously regressed
+    to the pre-correction wording (Redmine #10338 review #49720). The
+    `cross_session_claude` recovery path must always name `--mode standard`
+    (or `--mode pending`) because the default `queue-enter` rail rejects
+    every cross-session target. README and the runtime CLI already agree;
+    this test pins the skill side so a future rule-edit cannot silently
+    drop the mode hint again.
+    """
+
+    REQUIRED_GUIDANCE_MARKERS = (
+        # Cross-Workspace Handoff section heading must be present.
+        "## Cross-Workspace Handoff",
+        # The gateway-path bullet must spell out the mode flag verbatim.
+        "--mode standard",
+        "--mode pending",
+        # The reason the mode flag is required must remain in the bullet.
+        "queue-enter",
+        # The window-only resolver naming convention for the gateway
+        # target must stay so callers can copy-paste it.
+        "--to codex --target <target_session>:codex",
+    )
+
+    def _skill_workflow_body(self, *parts: str) -> str:
+        return (ROOT.joinpath(*parts) / "references" / "workflow.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_canonical_skill_keeps_mode_standard_gateway_guidance(self) -> None:
+        body = self._skill_workflow_body("skills", "mozyo-bridge-agent")
+        for marker in self.REQUIRED_GUIDANCE_MARKERS:
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"skills/mozyo-bridge-agent/references/workflow.md is "
+                    f"missing #10332 marker {marker!r}; gateway guidance "
+                    f"would re-fail under default queue-enter."
+                ),
+            )
+
+    def test_plugin_mirror_keeps_mode_standard_gateway_guidance(self) -> None:
+        body = self._skill_workflow_body(
+            "plugins", "mozyo-bridge-agent", "skills", "mozyo-bridge-agent"
+        )
+        for marker in self.REQUIRED_GUIDANCE_MARKERS:
+            self.assertIn(
+                marker,
+                body,
+                msg=(
+                    f"plugin skill mirror is missing #10332 marker "
+                    f"{marker!r}; sync_plugin_skill.sh drift or upstream "
+                    f"canonical regressed."
+                ),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
