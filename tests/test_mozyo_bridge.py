@@ -9209,6 +9209,143 @@ class PluginMarketplaceTest(unittest.TestCase):
             "plugin must ship SKILL.md so Claude Code can discover the skill after install",
         )
 
+    # ------------------------------------------------------------------
+    # Redmine #10663: pin the sync script's --check mode so CI can gate
+    # on plugin mirror drift without modifying the worktree. The Python
+    # walker in test_plugin_skill_mirror_matches_canonical above does the
+    # same check via a different code path; both must agree.
+    # ------------------------------------------------------------------
+
+    SYNC_SCRIPT_PATH = ROOT / "scripts" / "sync_plugin_skill.sh"
+
+    def test_sync_script_check_mode_clean_exits_zero(self) -> None:
+        """`scripts/sync_plugin_skill.sh --check` exits 0 when in sync.
+
+        This pins the operator-facing CI gate for plugin mirror drift.
+        If the check mode regresses to silently writing to the mirror,
+        or to always-exit-0, this test fails.
+        """
+        self.assertTrue(self.SYNC_SCRIPT_PATH.is_file())
+        result = subprocess.run(
+            ["sh", str(self.SYNC_SCRIPT_PATH), "--check"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            result.returncode,
+            msg=(
+                f"sync_plugin_skill.sh --check exited {result.returncode}; "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}. "
+                "Either the mirror drifted or the --check mode regressed."
+            ),
+        )
+        self.assertIn("up to date", result.stdout)
+
+    def test_sync_script_check_mode_detects_drift(self) -> None:
+        """`--check` must exit non-zero on drift and name the recovery command."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            (stage / "scripts").mkdir()
+            shutil.copy(self.SYNC_SCRIPT_PATH, stage / "scripts" / "sync_plugin_skill.sh")
+            (stage / "scripts" / "sync_plugin_skill.sh").chmod(0o755)
+            shutil.copytree(self.canonical_skill_dir, stage / "skills" / "mozyo-bridge-agent")
+            shutil.copytree(
+                self.plugin_skill_dir,
+                stage / "plugins" / "mozyo-bridge-agent" / "skills" / "mozyo-bridge-agent",
+            )
+
+            tampered = (
+                stage
+                / "plugins"
+                / "mozyo-bridge-agent"
+                / "skills"
+                / "mozyo-bridge-agent"
+                / "references"
+                / "workflow.md"
+            )
+            tampered.write_text(
+                tampered.read_text(encoding="utf-8") + "\nTAMPER\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                1,
+                result.returncode,
+                msg=(
+                    f"--check did not flag drift; stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r}"
+                ),
+            )
+            # Recovery hint must name the actual script so an operator can
+            # copy-paste it verbatim.
+            self.assertIn("sync_plugin_skill.sh", result.stderr)
+            self.assertIn("references/workflow.md", result.stderr)
+
+    def test_sync_script_check_mode_does_not_modify_worktree(self) -> None:
+        """`--check` must be read-only — no rsync to disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            (stage / "scripts").mkdir()
+            shutil.copy(self.SYNC_SCRIPT_PATH, stage / "scripts" / "sync_plugin_skill.sh")
+            (stage / "scripts" / "sync_plugin_skill.sh").chmod(0o755)
+            shutil.copytree(self.canonical_skill_dir, stage / "skills" / "mozyo-bridge-agent")
+            shutil.copytree(
+                self.plugin_skill_dir,
+                stage / "plugins" / "mozyo-bridge-agent" / "skills" / "mozyo-bridge-agent",
+            )
+
+            mirror_workflow = (
+                stage
+                / "plugins"
+                / "mozyo-bridge-agent"
+                / "skills"
+                / "mozyo-bridge-agent"
+                / "references"
+                / "workflow.md"
+            )
+            # Force a drift the script's check would report.
+            mirror_workflow.write_text(
+                mirror_workflow.read_text(encoding="utf-8") + "\nTAMPER\n",
+                encoding="utf-8",
+            )
+            before = mirror_workflow.read_bytes()
+
+            subprocess.run(
+                ["sh", str(stage / "scripts" / "sync_plugin_skill.sh"), "--check"],
+                cwd=str(stage),
+                capture_output=True,
+                text=True,
+            )
+
+            after = mirror_workflow.read_bytes()
+            self.assertEqual(
+                before,
+                after,
+                msg=(
+                    "--check modified the mirror file; the recovery command "
+                    "is the rewrite path, not --check."
+                ),
+            )
+
+    def test_sync_script_rejects_unknown_flag(self) -> None:
+        """Reject typos to avoid silently running the wrong mode."""
+        result = subprocess.run(
+            ["sh", str(self.SYNC_SCRIPT_PATH), "--bogus"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(64, result.returncode)
+        self.assertIn("unknown argument", result.stderr)
+
 
 class ReleaseHelperParserTest(unittest.TestCase):
     """The contract-admitted release helper subcommands must round-trip
@@ -11930,6 +12067,128 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
                     f"canonical regressed."
                 ),
             )
+
+
+class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
+    """Pin Redmine #10663: broaden semantic anchors beyond #10332.
+
+    `PluginMarketplaceTest::test_plugin_skill_mirror_matches_canonical`
+    detects *byte* drift between the canonical skill body and the
+    plugin mirror. `SkillCrossWorkspaceGuidanceTest` pins the #10332
+    cross-workspace marker subset.
+
+    This class extends the semantic anchor set to cover the rest of
+    the workflow body's load-bearing sections — handoff lifecycle,
+    role boundary, Codex direct-edit gate, autonomous lane, audit-
+    owned commit authority, workflow-change verification. A future
+    canonical edit that quietly drops one of these sections passes the
+    byte-drift gate (canonical + mirror in sync) but would still need
+    to clear this test, so a single missing marker fails CI loudly.
+
+    Markers are deliberately verbatim substrings from the canonical
+    body. Wording changes that intentionally rename a section MUST
+    update this list in the same commit; the explicit failure surfaces
+    the intent.
+    """
+
+    SECTION_MARKERS: tuple[str, ...] = (
+        # Major section headings — drop any of these and the workflow
+        # body has lost a primary topic.
+        "## Start Of Work",
+        "## Ticket-ID Entrypoint",
+        "## Ticket System Conventions",
+        "## Handoff Lifecycle",
+        "## Cross-Workspace Handoff",
+        "## Claude / Codex Role Boundary",
+        "## Policy / Skill Authoring Boundary",
+        "### Repo-Local Guardrail Autonomous Lane",
+        "## Audit-Owned Commit Authority",
+        "## Workflow Change Verification",
+    )
+
+    PHRASE_MARKERS: tuple[str, ...] = (
+        # Role boundary — Claude implements, Codex audits, and the
+        # gateway can't be reframed by short imperatives.
+        "Claude owns implementation for normal development tasks",
+        "Codex does not directly implement normal development tasks",
+        "are not by themselves authorization for Codex to perform a direct edit",
+        # Codex direct-edit gate vocabulary (Redmine path).
+        "`codex_direct_edit` gate journal",
+        "role: 実装者",
+        "direct_edit: true",
+        "allowed_paths",
+        # Autonomous lane — the carve-out and its required journal.
+        "Repo-Local Guardrail Autonomous Lane",
+        "codex_autonomous_edit",
+        "vibes/docs/rules/**",
+        "vibes/docs/logics/**",
+        "vibes/docs/specs/**",
+        # Audit-owned commit authority — close approval separation
+        # and the per-system commit message contracts must stay
+        # verbatim so operators can copy-paste them.
+        "Audit-Owned Commit Authority",
+        "Codex audit-owned commit",
+        "Refs: Redmine #<issue_id>",
+        "Journal: <journal_id>",
+        "Refs: Asana task <task_id>",
+        "Audit: Asana comment <comment_id>",
+        # Close-Approval-Separation reminder pulled from the central
+        # preset is the load-bearing distinction between Review Gate
+        # and Close Gate.
+        "Review approval alone is not close approval",
+        "owner close approval journal",
+        # Handoff Lifecycle vocabulary — durable record is the source
+        # of truth, pane is a pointer.
+        "the durable source of truth",
+        "pane notification is still only the pointer",
+        # Workflow Change Verification policy.
+        "Workflow Change Verification",
+        "Claude implements the normal development task",
+    )
+
+    SKILL_PATH = (
+        "skills",
+        "mozyo-bridge-agent",
+        "references",
+        "workflow.md",
+    )
+    PLUGIN_MIRROR_PATH = (
+        "plugins",
+        "mozyo-bridge-agent",
+        "skills",
+        "mozyo-bridge-agent",
+        "references",
+        "workflow.md",
+    )
+
+    def _body(self, *parts: str) -> str:
+        return ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+    def _check_markers(self, body: str, *, label: str) -> None:
+        for marker in self.SECTION_MARKERS + self.PHRASE_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        f"{label} is missing workflow semantic anchor "
+                        f"{marker!r}. Either the canonical skill body lost a "
+                        f"load-bearing section / phrase, or this anchor list "
+                        f"needs an intentional update in the same commit."
+                    ),
+                )
+
+    def test_canonical_skill_carries_workflow_semantic_anchors(self) -> None:
+        self._check_markers(
+            self._body(*self.SKILL_PATH),
+            label="skills/mozyo-bridge-agent/references/workflow.md",
+        )
+
+    def test_plugin_mirror_carries_workflow_semantic_anchors(self) -> None:
+        self._check_markers(
+            self._body(*self.PLUGIN_MIRROR_PATH),
+            label="plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md",
+        )
 
 
 class CanonicalRendererTest(unittest.TestCase):

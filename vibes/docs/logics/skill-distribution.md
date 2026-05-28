@@ -56,7 +56,10 @@ Removal criteria (本 grace period を解除する条件):
 canonical な skill 本体は `skills/mozyo-bridge-agent/` に置き、Claude plugin marketplace が配布する `plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/` はその mirror として扱う。
 
 - canonical を変更したら必ず `scripts/sync_plugin_skill.sh` を実行して mirror を更新する。
-- 両者の drift は `tests/test_mozyo_bridge.py::PluginMarketplaceTest` が file list と content hash で検証する。drift があると unit test が失敗するので、CI で確実に検出できる。
+- CI / pre-commit gate には `scripts/sync_plugin_skill.sh --check` を使う。`--check` は dry-run (rsync `-an --delete --itemize-changes`) で、何も書き込まずに drift があれば exit 1 を返し、recovery command (`scripts/sync_plugin_skill.sh`、no `--check`) を stderr で案内する。書き込みを伴わないので CI で worktree を汚さない。
+- 両者の drift は `tests/test_mozyo_bridge.py::PluginMarketplaceTest` が二つの経路で検証する: (a) Python の sha256 walker による file list + content hash 比較 (`test_plugin_skill_mirror_matches_canonical`)、(b) `sync_plugin_skill.sh --check` の exit code と stderr の動作 pin (`test_sync_script_check_mode_*` 群)。両者が同じ drift を独立に検出する。
+- workflow body の semantic drift (canonical と mirror を同期して両方から重要 section を抜き落とすケース) は `SkillCrossWorkspaceGuidanceTest` と `SkillWorkflowSemanticAnchorsTest` が pin する。前者は Redmine #10332 cross-workspace / `--mode standard` guidance を、後者は handoff lifecycle、role boundary、Codex direct-edit gate、Repo-Local Guardrail Autonomous Lane、audit-owned commit authority、workflow change verification の代表 phrase / section heading を verbatim で要求する。byte 一致だけでは捕まらない governance regression をここで止める。
+- skill / plugin mirror に対して canonical renderer (`mozyo-bridge scaffold canonical [--check]`) は採用しない。両者は **pure byte mirror** であり、conditional rendering が必要な router pair / governed preset workflow と性質が異なるため、`sync_plugin_skill.sh` の rsync gate + 上記 test 群を正本 mechanism とする。
 - plugin の install 時 Claude Code は plugin directory を cache にコピーするため、plugin root の外を参照する symlink (例: `../../../skills/mozyo-bridge-agent`) は使えない。docs: <https://code.claude.com/docs/en/plugins-reference#plugin-caching-and-file-resolution>
 - mirror が手動編集された場合も drift test で落ちる。`plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/` を直接編集せず、canonical を編集してから sync する。
 
