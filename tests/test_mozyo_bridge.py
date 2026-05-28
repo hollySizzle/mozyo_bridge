@@ -2881,20 +2881,25 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn(f"none\toutdated\t0.0.0\t{package_version('none')}\t", output)
 
     def test_rules_home_default_prints_portable_expression_only(self) -> None:
-        # Spoof a realistic operator $HOME and a custom env override to confirm
-        # the default output never leaks either of them. Stable text is what
-        # makes the output safe to paste into committed docs / snippets.
-        with patch.dict(
-            os.environ,
-            {"HOME": "/Users/example", "MOZYO_BRIDGE_HOME": "/Users/example/.mozyo_bridge_custom"},
-        ):
-            result, output = self.run_cli(["rules", "home"])
+        # Spoof env values via a tempdir so the fixture itself never carries
+        # a literal personal-home-shaped path (the release tree scanner
+        # rejects `/Users/<name>/` in tracked source). The assertions still
+        # prove the default output cannot leak the env override or HOME.
+        with tempfile.TemporaryDirectory() as tmp:
+            spoofed_home = Path(tmp) / "fake-home"
+            spoofed_home.mkdir()
+            spoofed_override = Path(tmp) / "mozyo-bridge-override"
+            with patch.dict(
+                os.environ,
+                {"HOME": str(spoofed_home), "MOZYO_BRIDGE_HOME": str(spoofed_override)},
+            ):
+                result, output = self.run_cli(["rules", "home"])
 
-        self.assertEqual(0, result)
-        self.assertEqual("${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}\n", output)
-        self.assertNotIn("/Users/example", output)
-        self.assertNotIn(".mozyo_bridge_custom", output)
-        self.assertNotIn(str(Path.home()), output)
+            self.assertEqual(0, result)
+            self.assertEqual("${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}\n", output)
+            self.assertNotIn(str(spoofed_home), output)
+            self.assertNotIn(str(spoofed_override), output)
+            self.assertNotIn(str(Path.home()), output)
 
     def test_rules_home_resolved_honors_env_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
