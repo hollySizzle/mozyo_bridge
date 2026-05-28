@@ -89,7 +89,7 @@ mozyo-bridge scaffold canonical --check [--repo <root>]    # 全 canonical sourc
 1. **on-disk file が canonical render と異なる** (`is out of date`): renderer が変わった / canonical source が変わった / だれかが committed template を手編集した。
 2. **on-disk file が存在しない** (`is missing`): 生成 file が削除された / 新規 output を canonical source に追加して未 render。
 
-両者とも `mozyo-bridge scaffold canonical render` で復旧する。
+両者とも `mozyo-bridge scaffold canonical` (`--check` を付けない既定動作 = render) で復旧する。
 
 ## Generated File Policy
 

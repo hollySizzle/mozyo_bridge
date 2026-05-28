@@ -1772,7 +1772,7 @@ def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
             for result in drifted:
                 print(
                     f"{_relative(result.output_path)} is {result.reason}; rerun "
-                    f"`mozyo-bridge scaffold canonical render`.",
+                    f"`mozyo-bridge scaffold canonical` (without --check) to regenerate.",
                     file=sys.stderr,
                 )
             return 1

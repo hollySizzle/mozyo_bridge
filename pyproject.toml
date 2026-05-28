@@ -66,7 +66,8 @@ mozyo_bridge = [
     # Canonical conditional-renderer sources for the router pair
     # (Redmine #10345). Outputs are committed under scaffold/presets/_router/;
     # the YAML and adjacent body files travel with the wheel so an editable
-    # install can run `mozyo-bridge scaffold canonical {render,check}`.
+    # install can run `mozyo-bridge scaffold canonical` (default render) or
+    # `mozyo-bridge scaffold canonical --check` (drift gate).
     "scaffold/canonical_sources/*.yaml",
     "scaffold/canonical_sources/*/bodies/*.md",
 ]

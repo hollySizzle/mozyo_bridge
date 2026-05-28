@@ -11977,7 +11977,7 @@ class CanonicalRendererTest(unittest.TestCase):
                 msg=(
                     f"{result.output_path} drifted from canonical source "
                     f"{result.source_id!r}; rerun `mozyo-bridge scaffold "
-                    f"canonical render` and recommit."
+                    f"canonical` (no flag = render) and recommit."
                 ),
             )
 
@@ -12091,6 +12091,62 @@ class CanonicalRendererTest(unittest.TestCase):
             )
             self.assertEqual(0, result, msg=stdout + stderr)
             self.assertEqual("", stderr)
+
+    def test_drift_recovery_message_names_only_valid_subcommand(self) -> None:
+        """Pin the drift stderr message to a runnable CLI invocation.
+
+        Codex review #49845 caught the regression where the recovery
+        message named `mozyo-bridge scaffold canonical render` — a
+        non-existent sub-subcommand (the actual surface is `scaffold
+        canonical` for render and `scaffold canonical --check` for the
+        gate). A drifted router would still fail correctly, but a copy-
+        pasted recovery command would error out with `unrecognized
+        arguments: render`, defeating the operator-recovery half of the
+        review focus "drift detection の実用性".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            shutil.copytree(
+                ROOT / "src",
+                repo / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            agents_path = repo / self.AGENTS_RELATIVE
+            agents_path.write_text(
+                agents_path.read_text(encoding="utf-8") + "\nDRIFT\n",
+                encoding="utf-8",
+            )
+            result, _, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            # The valid invocation must appear in the recovery hint so an
+            # operator can copy-paste it.
+            self.assertIn(
+                "mozyo-bridge scaffold canonical",
+                stderr,
+                msg="drift stderr must name the actual `scaffold canonical` CLI",
+            )
+            # And the invalid `canonical render` shape must not be
+            # reintroduced. Use a substring check that allows
+            # `scaffold canonical` (alone) and `scaffold canonical --check`
+            # but rejects the sub-subcommand wording explicitly.
+            self.assertNotIn(
+                "canonical render",
+                stderr,
+                msg=(
+                    "drift stderr regressed to the invalid sub-subcommand "
+                    "wording; `scaffold canonical render` is not a real CLI"
+                ),
+            )
+            self.assertNotIn(
+                "canonical check",
+                stderr,
+                msg=(
+                    "drift stderr names a non-existent `canonical check` "
+                    "sub-subcommand; the real surface is `--check` flag"
+                ),
+            )
 
     def test_check_reports_missing_output_as_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

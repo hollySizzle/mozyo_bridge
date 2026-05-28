@@ -1,8 +1,8 @@
 # Canonical source for the tool-specific scaffold router templates
 # (AGENTS.md for Codex, CLAUDE.md for Claude Code). Generated outputs
 # live under `src/mozyo_bridge/scaffold/presets/_router/`; regenerate
-# with `mozyo-bridge scaffold canonical render` and verify drift with
-# `mozyo-bridge scaffold canonical check`.
+# with `mozyo-bridge scaffold canonical` and verify drift with
+# `mozyo-bridge scaffold canonical --check`.
 #
 # Fragments are concatenated in declaration order; a fragment emits
 # only when every `when` key/value matches the active output context.
