@@ -63,7 +63,7 @@ outputs:
 - URL は `http://` または `https://` のみ。`file://` や JavaScript URL は invalid。
 - `verification.verified: true` でも `verification_date` / `verified_by` のいずれかが空文字なら **unverified 扱い** で render する。「verified と書いてあるが date 空欄」は agent が事実として扱えないため。
 - credential-shape key (`api_key`、`access_token`、`refresh_token`、`client_secret`、`password`、`cookie`、`bearer_token`、`session_cookie`、`auth_token` 等) を含む YAML は die。
-- 値が credential 代入形 (`API_KEY=...` / `REDMINE_TOKEN=...` 等) でも die。
+- 値が credential 代入形 (例: `API_KEY=<value>` / `REDMINE_TOKEN=<value>` のような `<NAME>=<value>` シェイプ) でも die。プレースホルダの `<value>` は説明用で、release-flow の Source Tree Hygiene gate が検知する `<KEY>=<実値>` 形式そのものを committed docs に貼らないための表記。
 
 ### 現状の supported output kinds
 
