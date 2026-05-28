@@ -63,6 +63,16 @@ canonical な skill 本体は `skills/mozyo-bridge-agent/` に置き、Claude pl
 - plugin の install 時 Claude Code は plugin directory を cache にコピーするため、plugin root の外を参照する symlink (例: `../../../skills/mozyo-bridge-agent`) は使えない。docs: <https://code.claude.com/docs/en/plugins-reference#plugin-caching-and-file-resolution>
 - mirror が手動編集された場合も drift test で落ちる。`plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/` を直接編集せず、canonical を編集してから sync する。
 
+### Install Command Drift (Redmine #10699)
+
+operator-facing install command snippet (`claude plugin marketplace add hollySizzle/mozyo_bridge` / `claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user` / `pipx install mozyo-bridge` / `mozyo-bridge rules install` / Codex `$skill-installer https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent`) は README.md / 本 file / `vibes/docs/logics/bootstrap.md` / `vibes/docs/logics/scaffold-rules.md` の複数箇所に verbatim で出現する。これは exact-string copy であり audience-specific variant ではないため、1 箇所だけ更新されると user が doc 間で異なる copy-paste recipe を得る drift 実害がある。
+
+owner decision で README / ReleaseDocs 全体 canonical 化は対象外、また install 手順は user-facing readability を最重視するため canonical render / 共有 include は採用しない。代わりに最軽量機構として `tests/test_mozyo_bridge.py::InstallCommandConsistencyTest` が正本 install command 列を verbatim で pin し、`PINNED_INSTALL_COMMANDS` 表に列挙した各 command が列挙した各 doc に出現することを assert する。同 test は intentional な audience variant (`pipx install --force git+https://...` Beta Tester form) も pin し、PyPI 形式と git-main 形式が誤って同型化される regression も止める。
+
+- 新規 doc に install command を追加する場合は `PINNED_INSTALL_COMMANDS` の paths tuple に追加する。
+- 命令文字列を更新する (例: marketplace name 変更、scope flag 変更) 場合は同 test の command 文字列と全 doc を同 commit で更新する。
+- 共有 include / canonical render / 新規 logic doc は **意図的に追加しない**。drift 検出は unit test 層に集約する (`SkillCrossWorkspaceGuidanceTest` / `SkillWorkflowSemanticAnchorsTest` precedent と同じ)。
+
 ## Marketplace / plugin metadata
 
 - `.claude-plugin/marketplace.json` は `name`, `owner`, `plugins` を持ち、`mozyo-bridge-agent` plugin を `./plugins/mozyo-bridge-agent` の explicit path で参照する (marketplace root から resolve)。

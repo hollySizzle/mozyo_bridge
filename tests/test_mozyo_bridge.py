@@ -13518,5 +13518,148 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
         )
 
 
+class InstallCommandConsistencyTest(unittest.TestCase):
+    """Pin Redmine #10699: install-command snippets stay byte-equal across docs.
+
+    Investigation cataloged the install guidance duplication. The
+    operator-facing install commands (plugin marketplace add / plugin
+    install / pipx install / rules install / Codex `$skill-installer`)
+    appear verbatim in README.md, skill-distribution.md, and bootstrap.md
+    — multiple occurrences in each. These are *exact-string* copies,
+    not audience-specific variants: if one drifts (e.g. a marketplace
+    name change updates README but not skill-distribution), users get
+    inconsistent copy-paste recipes.
+
+    Owner decision explicitly excludes whole-file README / ReleaseDocs
+    canonicalization. So drift is gated at the test layer — the lightest
+    available mechanic — mirroring the `SkillCrossWorkspaceGuidanceTest`
+    / `SkillWorkflowSemanticAnchorsTest` pattern. The canonical commands
+    are listed here; each must appear verbatim in every doc in
+    REQUIRED_DOCS, and the test fails loudly when a doc drops or
+    rewrites it. A future consolidation that intentionally removes a
+    copy updates this list in the same commit.
+
+    The intentionally audience-specific variants (`pipx install --force
+    git+https://...` for Beta Tester Install, `claude plugin install
+    --scope <other>` for fallback paths) are NOT pinned here — they are
+    legitimate variants serving different scenarios.
+    """
+
+    # Each canonical install command appears verbatim in every doc in
+    # the second tuple. Adding a new doc that ships the command is
+    # additive (extend the tuple). Removing an occurrence is intentional
+    # and updates this list in the same commit.
+    PINNED_INSTALL_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "claude plugin marketplace add hollySizzle/mozyo_bridge",
+            (
+                "README.md",
+                "vibes/docs/logics/skill-distribution.md",
+                "vibes/docs/logics/bootstrap.md",
+            ),
+        ),
+        (
+            "claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user",
+            (
+                "README.md",
+                "vibes/docs/logics/skill-distribution.md",
+                "vibes/docs/logics/bootstrap.md",
+            ),
+        ),
+        (
+            "pipx install mozyo-bridge",
+            (
+                "README.md",
+                "vibes/docs/logics/skill-distribution.md",
+                "vibes/docs/logics/bootstrap.md",
+            ),
+        ),
+        (
+            "mozyo-bridge rules install",
+            (
+                "README.md",
+                "vibes/docs/logics/skill-distribution.md",
+                "vibes/docs/logics/bootstrap.md",
+                "vibes/docs/logics/scaffold-rules.md",
+            ),
+        ),
+        # Codex `$skill-installer` canonical URL. The full
+        # `tree/main/skills/...` form is what the user pastes; the
+        # branch ref (`main`) matters here, so the substring is
+        # pinned with the path intact.
+        (
+            "$skill-installer https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent",
+            (
+                "README.md",
+                "vibes/docs/logics/bootstrap.md",
+            ),
+        ),
+        # The canonical-path string Codex must call the installer
+        # against. Wording around it differs by doc, but the URL
+        # itself is verbatim shared and is the most drift-prone
+        # field (a repo move would invalidate every occurrence at once).
+        (
+            "https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent",
+            (
+                "README.md",
+                "vibes/docs/logics/skill-distribution.md",
+                "vibes/docs/logics/bootstrap.md",
+            ),
+        ),
+    )
+
+    # The Beta Tester Install variant is intentionally distinct from
+    # the PyPI `pipx install mozyo-bridge` form. Pin BOTH so a future
+    # edit that accidentally collapses them into the same form fails
+    # loudly — the variants serve different audiences (PyPI release vs
+    # GitHub main) and must remain distinguishable.
+    INTENTIONAL_VARIANTS: tuple[tuple[str, str], ...] = (
+        (
+            "pipx install --force git+https://github.com/hollySizzle/mozyo_bridge.git",
+            "README.md",
+        ),
+    )
+
+    def _read(self, relative: str) -> str:
+        return (ROOT / relative).read_text(encoding="utf-8")
+
+    def test_canonical_install_commands_appear_verbatim_in_each_doc(self) -> None:
+        for command, paths in self.PINNED_INSTALL_COMMANDS:
+            for path in paths:
+                with self.subTest(command=command, doc=path):
+                    body = self._read(path)
+                    self.assertIn(
+                        command,
+                        body,
+                        msg=(
+                            f"{path} is missing the canonical install snippet "
+                            f"{command!r}. Either the doc dropped the command "
+                            f"(consolidation? — update PINNED_INSTALL_COMMANDS "
+                            f"in the same commit) or the command drifted from "
+                            f"the verbatim form pinned here."
+                        ),
+                    )
+
+    def test_intentional_install_variants_remain_distinct(self) -> None:
+        """The Beta Tester `--force git+...` form must stay distinguishable
+        from the standard PyPI form. A future edit that accidentally
+        rewrites Beta Tester to the standard form (or vice versa) loses
+        the audience distinction."""
+        for variant, path in self.INTENTIONAL_VARIANTS:
+            with self.subTest(variant=variant, doc=path):
+                body = self._read(path)
+                self.assertIn(
+                    variant,
+                    body,
+                    msg=(
+                        f"{path} lost the intentional install variant "
+                        f"{variant!r}. This form serves Beta Tester / "
+                        f"git-main install and must remain present to "
+                        f"avoid silently routing those operators through "
+                        f"the PyPI form."
+                    ),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
