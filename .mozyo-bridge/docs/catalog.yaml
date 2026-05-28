@@ -156,6 +156,18 @@ documents:
       - rule-docs-catalog-governance
       - spec-project-map
 
+  - id: logic-workspace-defaults-renderer
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workspace-defaults-renderer.md
+    purpose: workspace-local Redmine default project 設定を single source YAML から Codex / Claude 共通 snippet へ生成する renderer の設計、schema、secret rejection、検証手順。
+    audit_role: workspace_defaults_renderer_logic
+    related_document_refs:
+      - logic-canonical-renderer
+      - rule-docs-catalog-governance
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-bootstrap
     type: logic
     status: active
@@ -262,6 +274,8 @@ file_conventions:
       - .mozyo-bridge/docs/catalog.yaml.example
       - .mozyo-bridge/docs/file_conventions.generated.yaml
       - .mozyo-bridge/scaffold.json
+      - .mozyo-bridge/workspace-defaults.yaml
+      - .mozyo-bridge/redmine-defaults.md
       - .claude-nagger/**
     severity: block
     document_refs:
@@ -269,6 +283,7 @@ file_conventions:
       - rule-docs-catalog-governance
       - rule-project-agent-workflow
       - rule-codex-autonomous-guardrail-lane
+      - logic-workspace-defaults-renderer
 
   - id: fc-public-readme
     name: public README and user-facing install guidance

@@ -19,10 +19,13 @@ rules:
   - .mozyo-bridge/docs/catalog.yaml.example
   - .mozyo-bridge/docs/file_conventions.generated.yaml
   - .mozyo-bridge/scaffold.json
+  - .mozyo-bridge/workspace-defaults.yaml
+  - .mozyo-bridge/redmine-defaults.md
   - .claude-nagger/**
   severity: block
   message: 'このファイルを変更する場合は､ @.mozyo-bridge/rules/llm_rule_authoring.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
-    と @vibes/docs/rules/agent-workflow.md と @vibes/docs/rules/codex-autonomous-guardrail-lane.md をよく確認し従うこと
+    と @vibes/docs/rules/agent-workflow.md と @vibes/docs/rules/codex-autonomous-guardrail-lane.md と @vibes/docs/logics/workspace-defaults-renderer.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

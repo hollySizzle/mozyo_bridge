@@ -12158,6 +12158,15 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
+        # Redmine default-project resolution (Redmine #10689). The
+        # workspace-local snippet path and the "explicit wins over
+        # default" / "UNVERIFIED escalates" rules must stay in the
+        # skill body so agents pick them up at session start.
+        "Default project resolution",
+        ".mozyo-bridge/redmine-defaults.md",
+        ".mozyo-bridge/workspace-defaults.yaml",
+        "An explicit `project_id` always wins over the default",
+        "UNVERIFIED",
     )
 
     SKILL_PATH = (
@@ -12915,6 +12924,418 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertEqual(1, result)
             self.assertIn("missing sync script", stdout)
             self.assertIn("result: blocker", stdout)
+
+
+class WorkspaceDefaultsRendererTest(unittest.TestCase):
+    """Pin Redmine #10689: workspace-local Redmine default-project renderer.
+
+    Single source: `<repo>/.mozyo-bridge/workspace-defaults.yaml`.
+    Default output: `<repo>/.mozyo-bridge/redmine-defaults.md`.
+
+    Tests pin:
+    - clean repo (mozyo_bridge itself) round-trips byte-equal through
+      the renderer (the committed output IS the canonical render);
+    - drift detection (mutation, missing-output, body-edit recovery);
+    - schema validation (missing required fields, malformed url,
+      missing outputs);
+    - secret rejection on both key names and value shapes;
+    - unverified default surfaces an UNVERIFIED warning in the output,
+      and verified default does not;
+    - the cloud-drive-management acceptance fixture renders without
+      leaking the fixture into distributed source.
+    """
+
+    INPUT_RELATIVE = Path(".mozyo-bridge/workspace-defaults.yaml")
+    OUTPUT_RELATIVE = Path(".mozyo-bridge/redmine-defaults.md")
+    CLOUD_DRIVE_FIXTURE = {
+        "identifier": "giken-cloud-drive-management",
+        "name": "クラウドドライブ管理",
+        "url": "https://redmine.giken.or.jp/projects/giken-cloud-drive-management",
+        "parent_label": "3800_情報処理促進部",
+    }
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = args.func(args)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def _stage_repo(self, dest: Path, *, yaml_body: str) -> Path:
+        (dest / ".mozyo-bridge").mkdir(parents=True)
+        (dest / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+            yaml_body, encoding="utf-8"
+        )
+        return dest
+
+    def _yaml_for(
+        self,
+        *,
+        identifier: str = "giken-3800-mozyo-bridge",
+        name: str = "mozyo_bridge",
+        url: str = "https://redmine.giken.or.jp/projects/giken-3800-mozyo-bridge",
+        parent_label: str = "3800_情報処理促進部",
+        verified: bool = True,
+        verification_date: str = "2026-05-28",
+        verified_by: str = "hollySizzle",
+        outputs: tuple[str, ...] = (".mozyo-bridge/redmine-defaults.md",),
+        schema_version: int = 1,
+        extra: str = "",
+    ) -> str:
+        outputs_block = "\n".join(f"  - target: {target}" for target in outputs)
+        return (
+            f"schema_version: {schema_version}\n"
+            "redmine:\n"
+            "  default_project:\n"
+            f"    identifier: {identifier}\n"
+            f"    name: {name}\n"
+            f"    url: {url}\n"
+            f"    parent_label: {parent_label}\n"
+            "  verification:\n"
+            f"    verified: {str(verified).lower()}\n"
+            f'    verification_date: "{verification_date}"\n'
+            f"    verified_by: {verified_by}\n"
+            "outputs:\n"
+            f"{outputs_block}\n"
+            f"{extra}"
+        )
+
+    # ------------------------------------------------------------------
+    # Round-trip + CLI surface
+    # ------------------------------------------------------------------
+
+    def test_committed_repo_renders_byte_equal(self) -> None:
+        from mozyo_bridge.workspace_defaults import collect_render_results
+
+        results = collect_render_results(ROOT)
+        self.assertEqual(1, len(results))
+        result = results[0]
+        self.assertEqual(
+            result.rendered,
+            result.on_disk,
+            msg=(
+                f"{result.output_path} drifted from workspace-defaults source; "
+                "rerun `mozyo-bridge workspace-defaults` and recommit."
+            ),
+        )
+
+    def test_cli_check_clean_then_drift_then_recover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=self._yaml_for())
+            # First render seeds the output.
+            result, _, _ = self.run_cli(
+                ["workspace-defaults", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            # Clean --check.
+            result, stdout, stderr = self.run_cli(
+                ["workspace-defaults", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            self.assertIn("redmine-defaults.md is up to date", stdout)
+            self.assertEqual("", stderr)
+            # Tamper.
+            output = repo / self.OUTPUT_RELATIVE
+            output.write_text(
+                output.read_text(encoding="utf-8") + "\nTAMPER\n",
+                encoding="utf-8",
+            )
+            result, _, stderr = self.run_cli(
+                ["workspace-defaults", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("is out of date", stderr)
+            # Recovery command must be the actual CLI; #10345 / #10663
+            # correction precedent. Reject bare-basename or non-runnable
+            # forms.
+            self.assertIn("mozyo-bridge workspace-defaults", stderr)
+            self.assertIn("from the repo root", stderr)
+            # Recovery and check is clean again.
+            result, _, _ = self.run_cli(
+                ["workspace-defaults", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            result, _, stderr = self.run_cli(
+                ["workspace-defaults", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            self.assertEqual("", stderr)
+
+    def test_cli_check_reports_missing_output_as_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=self._yaml_for())
+            # Do not render first; just --check. Output is missing.
+            result, _, stderr = self.run_cli(
+                ["workspace-defaults", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("is missing", stderr)
+
+    def test_render_survives_yaml_body_edit(self) -> None:
+        """Editing the YAML must rotate the rendered output deterministically."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=self._yaml_for())
+            self.run_cli(["workspace-defaults", "--repo", str(repo)])
+            before = (repo / self.OUTPUT_RELATIVE).read_text(encoding="utf-8")
+
+            (repo / self.INPUT_RELATIVE).write_text(
+                self._yaml_for(name="renamed"),
+                encoding="utf-8",
+            )
+            result, _, _ = self.run_cli(
+                ["workspace-defaults", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            after = (repo / self.OUTPUT_RELATIVE).read_text(encoding="utf-8")
+            self.assertNotEqual(before, after)
+            self.assertIn("- name: renamed", after)
+
+    # ------------------------------------------------------------------
+    # Schema validation
+    # ------------------------------------------------------------------
+
+    def test_missing_input_yaml_dies_with_actionable_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".mozyo-bridge").mkdir(parents=True)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--check", "--repo", str(repo)]
+                )
+
+    def test_missing_required_field_dies(self) -> None:
+        body = (
+            "schema_version: 1\n"
+            "redmine:\n"
+            "  default_project:\n"
+            "    identifier: foo\n"
+            # name + url missing.
+            "    parent_label: bar\n"
+            "  verification:\n"
+            "    verified: true\n"
+            '    verification_date: "2026-01-01"\n'
+            "    verified_by: tester\n"
+            "outputs:\n"
+            "  - target: .mozyo-bridge/redmine-defaults.md\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_wrong_schema_version_dies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(
+                Path(tmp) / "repo", yaml_body=self._yaml_for(schema_version=99)
+            )
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_non_http_url_dies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(
+                Path(tmp) / "repo",
+                yaml_body=self._yaml_for(url="file:///etc/passwd"),
+            )
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_outputs_must_be_repo_relative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(
+                Path(tmp) / "repo",
+                yaml_body=self._yaml_for(outputs=("../escape.md",)),
+            )
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    # ------------------------------------------------------------------
+    # Secret rejection
+    # ------------------------------------------------------------------
+
+    def test_credential_shape_key_is_rejected(self) -> None:
+        body = self._yaml_for(extra="api_key: AKIA0000000000000000\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_credential_shape_value_is_rejected(self) -> None:
+        # Even with a non-credential key name, a value matching a
+        # secret assignment pattern must die. This catches operators
+        # pasting `REDMINE_API_KEY=abc123` into a free-form note.
+        body = self._yaml_for(
+            extra='note: "REDMINE_API_KEY=abc123secretvalue"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_nested_credential_key_is_rejected(self) -> None:
+        body = (
+            "schema_version: 1\n"
+            "redmine:\n"
+            "  default_project:\n"
+            "    identifier: foo\n"
+            "    name: foo\n"
+            "    url: https://example.invalid/\n"
+            "    parent_label: ''\n"
+            "    extra:\n"
+            "      client_secret: nope\n"
+            "  verification:\n"
+            "    verified: true\n"
+            '    verification_date: "2026-01-01"\n'
+            "    verified_by: tester\n"
+            "outputs:\n"
+            "  - target: .mozyo-bridge/redmine-defaults.md\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    # ------------------------------------------------------------------
+    # Verified vs unverified rendering
+    # ------------------------------------------------------------------
+
+    def test_verified_default_renders_without_warning(self) -> None:
+        from mozyo_bridge.workspace_defaults import (
+            load_workspace_defaults,
+            render_redmine_defaults_markdown,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=self._yaml_for())
+            defaults = load_workspace_defaults(repo / self.INPUT_RELATIVE)
+            rendered = render_redmine_defaults_markdown(defaults)
+            self.assertNotIn("(UNVERIFIED)", rendered)
+            self.assertIn("- verified: yes", rendered)
+            self.assertIn("Verified default", rendered)
+            # Should NOT warn against using the default.
+            self.assertNotIn("default is unverified", rendered)
+
+    def test_unverified_default_surfaces_warning_in_output(self) -> None:
+        from mozyo_bridge.workspace_defaults import (
+            load_workspace_defaults,
+            render_redmine_defaults_markdown,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(
+                Path(tmp) / "repo",
+                yaml_body=self._yaml_for(verified=False),
+            )
+            defaults = load_workspace_defaults(repo / self.INPUT_RELATIVE)
+            rendered = render_redmine_defaults_markdown(defaults)
+            self.assertIn("(UNVERIFIED)", rendered)
+            self.assertIn("Default is NOT yet verified", rendered)
+            self.assertIn("**NO**", rendered)
+            self.assertIn("Do NOT use this default for issue creation", rendered)
+
+    def test_verified_true_but_empty_date_is_treated_as_unverified(self) -> None:
+        from mozyo_bridge.workspace_defaults import (
+            load_workspace_defaults,
+            render_redmine_defaults_markdown,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(
+                Path(tmp) / "repo",
+                yaml_body=self._yaml_for(verification_date=""),
+            )
+            defaults = load_workspace_defaults(repo / self.INPUT_RELATIVE)
+            rendered = render_redmine_defaults_markdown(defaults)
+            self.assertIn("(UNVERIFIED)", rendered)
+
+    # ------------------------------------------------------------------
+    # Acceptance fixture: cloud-drive-management is test-only
+    # ------------------------------------------------------------------
+
+    def test_cloud_drive_fixture_renders_cleanly(self) -> None:
+        from mozyo_bridge.workspace_defaults import (
+            load_workspace_defaults,
+            render_redmine_defaults_markdown,
+        )
+
+        body = self._yaml_for(
+            identifier=self.CLOUD_DRIVE_FIXTURE["identifier"],
+            name=self.CLOUD_DRIVE_FIXTURE["name"],
+            url=self.CLOUD_DRIVE_FIXTURE["url"],
+            parent_label=self.CLOUD_DRIVE_FIXTURE["parent_label"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            defaults = load_workspace_defaults(repo / self.INPUT_RELATIVE)
+            rendered = render_redmine_defaults_markdown(defaults)
+            self.assertIn(
+                f"identifier: `{self.CLOUD_DRIVE_FIXTURE['identifier']}`",
+                rendered,
+            )
+            self.assertIn(self.CLOUD_DRIVE_FIXTURE["name"], rendered)
+            self.assertIn(self.CLOUD_DRIVE_FIXTURE["url"], rendered)
+
+    def test_distributed_source_does_not_carry_cloud_drive_identifier(self) -> None:
+        """The acceptance fixture must NOT appear in distributed source.
+
+        Per #10689 constraint: do not hardcode `giken-cloud-drive-management`
+        into distributed mozyo_bridge defaults. The fixture is allowed
+        only in test code (this file) and in workspace-local docs that
+        ship to a workspace, not to the package.
+        """
+        forbidden = self.CLOUD_DRIVE_FIXTURE["identifier"]
+        distributed_roots = [
+            ROOT / "src" / "mozyo_bridge",
+            ROOT / "skills",
+            ROOT / "plugins",
+            ROOT / "vibes" / "docs",
+            ROOT / ".mozyo-bridge" / "workspace-defaults.yaml",
+            ROOT / ".mozyo-bridge" / "redmine-defaults.md",
+        ]
+        hits: list[str] = []
+        for root in distributed_roots:
+            if root.is_file():
+                paths = [root]
+            elif root.is_dir():
+                paths = [
+                    p
+                    for p in root.rglob("*")
+                    if p.is_file()
+                    and not p.name.endswith(".pyc")
+                    and "__pycache__" not in p.parts
+                ]
+            else:
+                continue
+            for path in paths:
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if forbidden in text:
+                    hits.append(path.relative_to(ROOT).as_posix())
+        self.assertFalse(
+            hits,
+            msg=(
+                f"distributed source carries the acceptance-fixture "
+                f"identifier {forbidden!r}: {hits}. Move the value to "
+                "test code or a workspace-local example only."
+            ),
+        )
 
 
 if __name__ == "__main__":

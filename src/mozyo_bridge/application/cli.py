@@ -33,6 +33,7 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_canonical,
     cmd_scaffold_diff,
     cmd_scaffold_status,
+    cmd_workspace_defaults,
     cmd_status,
     cmd_tmux_ui_install,
     cmd_tmux_ui_status,
@@ -873,6 +874,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     docs_impact.set_defaults(func=cmd_docs_audit_impact)
+
+    workspace_defaults = sub.add_parser(
+        "workspace-defaults",
+        help=(
+            "Render or drift-check the workspace-local Redmine default-"
+            "project snippet (Redmine #10689). Single source is "
+            "`<repo>/.mozyo-bridge/workspace-defaults.yaml`; default "
+            "output is `.mozyo-bridge/redmine-defaults.md`. Distributed "
+            "mozyo_bridge code does not carry project-specific values; "
+            "the workspace YAML does. Pass `--check` to verify drift; "
+            "default action regenerates the output(s)."
+        ),
+    )
+    add_repo_option(workspace_defaults)
+    workspace_defaults.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Re-render in memory and compare against the committed "
+            "output(s). Exit 1 on drift; writes nothing."
+        ),
+    )
+    workspace_defaults.set_defaults(func=cmd_workspace_defaults)
 
     release = sub.add_parser(
         "release",

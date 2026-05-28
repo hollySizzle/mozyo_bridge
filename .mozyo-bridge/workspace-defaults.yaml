@@ -1,0 +1,30 @@
+# Workspace-local Redmine default project configuration for the
+# mozyo_bridge workspace itself. Generated outputs are read by Codex
+# and Claude when no explicit project_id is supplied. Source-of-truth
+# for project-specific defaults; distributed mozyo_bridge code MUST
+# NOT carry these values.
+#
+# Regenerate: mozyo-bridge workspace-defaults
+# Drift gate: mozyo-bridge workspace-defaults --check
+#
+# SECURITY: do not record API keys, OAuth tokens, cookies, or any
+# other credential here. The renderer rejects credential-shape values
+# on load and refuses to emit. Secrets live in environment variables
+# or system-managed secret stores, not in this file.
+
+schema_version: 1
+
+redmine:
+  default_project:
+    identifier: giken-3800-mozyo-bridge
+    name: mozyo_bridge
+    url: https://redmine.giken.or.jp/projects/giken-3800-mozyo-bridge
+    parent_label: 3800_情報処理促進部
+
+  verification:
+    verified: true
+    verification_date: "2026-05-28"
+    verified_by: hollySizzle
+
+outputs:
+  - target: .mozyo-bridge/redmine-defaults.md
