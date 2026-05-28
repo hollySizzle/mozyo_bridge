@@ -42,6 +42,7 @@ from mozyo_bridge.application.commands import (
 from mozyo_bridge.application.release import (
     cmd_release_bump,
     cmd_release_check_artifact,
+    cmd_release_check_drift,
     cmd_release_check_scaffold,
     cmd_release_check_tree,
     cmd_release_check_workflow,
@@ -923,6 +924,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_repo_option(release_check_artifact)
     release_check_artifact.set_defaults(func=cmd_release_check_artifact)
+
+    release_check_drift = release_check_sub.add_parser(
+        "drift",
+        help=(
+            "Run canonical renderer + plugin mirror drift gates as one "
+            "release check. Reproduces `mozyo-bridge scaffold canonical "
+            "--check` (router pair + governed workflow pair) and "
+            "`scripts/sync_plugin_skill.sh --check` (plugin mirror). "
+            "Strict-fail on either drift; recovery hints name the "
+            "real CLI commands operators copy-paste."
+        ),
+    )
+    add_repo_option(release_check_drift)
+    release_check_drift.set_defaults(func=cmd_release_check_drift)
 
     release_check_workflow = release_check_sub.add_parser(
         "workflow",

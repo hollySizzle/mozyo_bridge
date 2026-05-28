@@ -9384,6 +9384,12 @@ class ReleaseHelperParserTest(unittest.TestCase):
 
         self.assertIs(args.func, cmd_release_check_artifact)
 
+    def test_release_check_drift(self) -> None:
+        args = self.parse("release", "check", "drift")
+        from mozyo_bridge.application.release import cmd_release_check_drift
+
+        self.assertIs(args.func, cmd_release_check_drift)
+
     def test_release_check_workflow_requires_run_id(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -12747,6 +12753,168 @@ class GovernedWorkflowCanonicalTest(unittest.TestCase):
         rendered = render_output(source, source.outputs[0])
         self.assertEqual("A is {{B}}\n", rendered)
         self.assertNotIn("REPLACED", rendered)
+
+
+class ReleaseCheckDriftTest(unittest.TestCase):
+    """Pin Redmine #10688: `mozyo-bridge release check drift` runs both
+    pre-existing drift gates and strict-fails on either side.
+
+    The unittest suite already gates each drift surface independently:
+    - `CanonicalRendererTest::test_committed_templates_match_canonical_render`
+      and `GovernedWorkflowCanonicalTest::test_both_governed_outputs_match_canonical_render`
+      for `scaffold canonical --check`;
+    - `PluginMarketplaceTest::test_plugin_skill_mirror_matches_canonical`
+      and `test_sync_script_check_mode_*` for the plugin mirror.
+
+    This class pins the *release helper* surface: the operator-facing
+    command that bundles both checks into one call (mirroring the
+    `release check tree` / `release check scaffold` / `release check
+    artifact` pattern). A future helper edit that, for example, swallows
+    a sub-check's non-zero exit and reports `result: clean` would slip
+    past the per-surface tests but fails here.
+    """
+
+    SOURCE_TREE_PATHS = (
+        Path("src/mozyo_bridge"),
+        Path("scripts/sync_plugin_skill.sh"),
+        Path("skills/mozyo-bridge-agent"),
+        Path("plugins/mozyo-bridge-agent"),
+        Path("vibes/docs/logics"),
+        Path(".mozyo-bridge/docs/catalog.yaml"),
+        Path(".mozyo-bridge/docs/file_conventions.generated.yaml"),
+        Path(".mozyo-bridge/scaffold.json"),
+        Path("AGENTS.md"),
+        Path("CLAUDE.md"),
+        Path("pyproject.toml"),
+        Path("README.md"),
+        Path(".claude-plugin"),
+    )
+
+    def _stage_repo(self, dest: Path) -> Path:
+        """Copy just the slices the drift helper needs into ``dest``.
+
+        Copying the full repo is wasteful when the helper only consumes
+        the source tree, canonical sources, presets, scaffold, sync
+        script, skill body, plugin mirror, and the docs catalog. A
+        minimal stage also keeps the test fast.
+        """
+        for relative in self.SOURCE_TREE_PATHS:
+            src = ROOT / relative
+            if not src.exists():
+                continue
+            target = dest / relative
+            if src.is_dir():
+                shutil.copytree(
+                    src,
+                    target,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+        return dest
+
+    def _run_helper(self, repo: Path) -> tuple[int, str, str]:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["release", "check", "drift", "--repo", str(repo)]
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = args.func(args)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_clean_tree_exits_zero_and_reports_both_checks(self) -> None:
+        result, stdout, stderr = self._run_helper(ROOT)
+        self.assertEqual(0, result, msg=stdout + stderr)
+        # Both sub-check section headers must appear so operators can
+        # see what ran without re-reading the source.
+        self.assertIn("scaffold canonical --check", stdout)
+        self.assertIn("sync_plugin_skill.sh --check", stdout)
+        # Both sub-checks must report up-to-date on a clean tree.
+        self.assertIn("AGENTS.md is up to date", stdout)
+        self.assertIn("plugin skill mirror is up to date", stdout)
+        self.assertIn("result: clean", stdout)
+
+    def test_canonical_drift_causes_strict_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            agents = repo / "src/mozyo_bridge/scaffold/presets/_router/AGENTS.md"
+            agents.write_text(
+                agents.read_text(encoding="utf-8") + "\nDRIFT\n",
+                encoding="utf-8",
+            )
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("AGENTS.md is out of date", stdout)
+            self.assertIn("result: blocker", stdout)
+            # Recovery hint must name the real CLI verbatim so the
+            # operator can copy-paste from the release-flow doc.
+            self.assertIn("mozyo-bridge scaffold canonical", stdout)
+            # The mirror check must still have run; its section header
+            # is the proof.
+            self.assertIn("sync_plugin_skill.sh --check", stdout)
+
+    def test_mirror_drift_causes_strict_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            mirror.write_text(
+                mirror.read_text(encoding="utf-8") + "\nDRIFT\n",
+                encoding="utf-8",
+            )
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("plugin skill mirror drift detected", stdout)
+            self.assertIn("result: blocker", stdout)
+            # Recovery hint must be repo-root runnable per Codex review
+            # #50344 (correction landed in #10663 commit 867396a).
+            self.assertIn("scripts/sync_plugin_skill.sh", stdout)
+            self.assertIn("from the repo root", stdout)
+            # The canonical check must still have run on the same
+            # invocation; failing fast on one side without reporting
+            # the other defeats the bundled-helper purpose.
+            self.assertIn("scaffold canonical --check", stdout)
+
+    def test_helper_reports_both_drifts_in_one_run(self) -> None:
+        """When both sides drift, the operator sees both findings in
+        one run rather than chasing two separate failures."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            agents = repo / "src/mozyo_bridge/scaffold/presets/_router/AGENTS.md"
+            agents.write_text(
+                agents.read_text(encoding="utf-8") + "\nDRIFT-A\n",
+                encoding="utf-8",
+            )
+            mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            mirror.write_text(
+                mirror.read_text(encoding="utf-8") + "\nDRIFT-B\n",
+                encoding="utf-8",
+            )
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("AGENTS.md is out of date", stdout)
+            self.assertIn("plugin skill mirror drift detected", stdout)
+            # Two blocker bullets, one per side.
+            self.assertIn("scaffold canonical drift detected", stdout)
+            self.assertIn("plugin skill mirror drift detected", stdout)
+
+    def test_missing_sync_script_is_release_blocker(self) -> None:
+        """The helper must fail loudly when the sync script is absent,
+        not silently pass the mirror gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (repo / "scripts/sync_plugin_skill.sh").unlink()
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("missing sync script", stdout)
+            self.assertIn("result: blocker", stdout)
 
 
 if __name__ == "__main__":

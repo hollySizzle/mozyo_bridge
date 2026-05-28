@@ -353,6 +353,85 @@ def cmd_release_check_scaffold(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# release check drift
+# ---------------------------------------------------------------------------
+
+
+_PLUGIN_SKILL_SYNC_RELATIVE = Path("scripts/sync_plugin_skill.sh")
+
+
+def cmd_release_check_drift(args: argparse.Namespace) -> int:
+    """Run canonical-renderer and plugin-mirror drift gates as one release check.
+
+    Bundles two pre-existing drift gates so a release operator (and CI)
+    can fail fast on either canonical-rendered guardrail output drift or
+    plugin-mirror drift without invoking the unit-test suite. Reproduces:
+
+    - ``mozyo-bridge scaffold canonical --check --repo <root>`` (Redmine
+      #10345 / #10426): router pair + governed preset workflow pair.
+    - ``scripts/sync_plugin_skill.sh --check`` (Redmine #10663): plugin
+      skill mirror (`plugins/mozyo-bridge-agent/skills/...`).
+
+    Honors the ``release check`` family invariants: read-only, idempotent,
+    strict-fail (exit 1) on any drift, no implicit mutation. Each sub-check
+    runs independently so a clean tree on one side still fails the
+    overall command if the other side drifted.
+    """
+    repo_root = resolve_repo_root(getattr(args, "repo", None))
+    blockers: list[str] = []
+
+    _print_section("scaffold canonical --check")
+    canonical = _run(
+        [sys.executable, "-m", "mozyo_bridge", "scaffold", "canonical", "--check", "--repo", str(repo_root)],
+        cwd=repo_root,
+    )
+    if canonical.stdout:
+        print(canonical.stdout, end="" if canonical.stdout.endswith("\n") else "\n")
+    if canonical.stderr:
+        print(canonical.stderr, end="" if canonical.stderr.endswith("\n") else "\n")
+    if canonical.returncode != 0:
+        blockers.append(
+            "scaffold canonical drift detected; rerun "
+            "`mozyo-bridge scaffold canonical` (no --check) and recommit."
+        )
+
+    _print_section("sync_plugin_skill.sh --check")
+    sync_script = repo_root / _PLUGIN_SKILL_SYNC_RELATIVE
+    if not sync_script.is_file():
+        # Missing script is itself a release blocker — the gate would
+        # otherwise pass silently because nothing ran.
+        print(f"missing sync script: {sync_script}")
+        blockers.append(
+            f"plugin skill sync script missing at {sync_script}; "
+            "restore from the repo or branch source."
+        )
+    else:
+        _require_command("sh")
+        mirror = _run(
+            ["sh", str(sync_script), "--check"],
+            cwd=repo_root,
+        )
+        if mirror.stdout:
+            print(mirror.stdout, end="" if mirror.stdout.endswith("\n") else "\n")
+        if mirror.stderr:
+            print(mirror.stderr, end="" if mirror.stderr.endswith("\n") else "\n")
+        if mirror.returncode != 0:
+            blockers.append(
+                "plugin skill mirror drift detected; rerun "
+                "`scripts/sync_plugin_skill.sh` (no --check, from the repo root) and recommit."
+            )
+
+    print("")
+    if blockers:
+        print("result: blocker")
+        for item in blockers:
+            print(f"- {item}")
+        return EXIT_BLOCKER
+    print("result: clean")
+    return EXIT_CLEAN
+
+
+# ---------------------------------------------------------------------------
 # release check artifact
 # ---------------------------------------------------------------------------
 

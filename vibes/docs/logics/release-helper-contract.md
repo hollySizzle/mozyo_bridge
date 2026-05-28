@@ -17,6 +17,7 @@ local guardrail と artifact / workflow 状態を検査するための read-only
 - `release check tree` — `release-flow.md` の `Source Tree Hygiene` (`git status --short --branch` / `git log -S'/Users/'` / `git grep` で個人ホーム絶対パス・secret-shape を探す検査) を 1 command として再現する。release blocker を検出したら non-zero で終了する。
 - `release check scaffold` — `release-flow.md` の `Fresh Scaffold Smoke` (isolated home / isolated target で全 preset の fresh scaffold + `scaffold status`) を 1 command として再現する。生成物に host 固有パスが含まれていないことと、portable `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 表現が残ることを assert する。
 - `release check artifact` — `release-flow.md` の `Build Artifact Inspection` (`python -m build` 結果の wheel / sdist を展開し、`/Users/` 等の personal path と secret-shape token を grep する) を 1 command として再現する。dist artifact path と false-positive 候補を stdout に列挙し、judgment は人間に残す。
+- `release check drift` — `release-flow.md` の `Canonical Renderer / Plugin Mirror Drift` を 1 command として再現する。`mozyo-bridge scaffold canonical --check` (router pair + governed workflow pair, Redmine #10345 / #10426) と `scripts/sync_plugin_skill.sh --check` (plugin mirror, Redmine #10663) を順に subprocess として実行し、いずれかが drift を検出したら strict-fail (exit 1) で `result: blocker` を返す。helper 自身は worktree を mutate せず、復旧 command (`mozyo-bridge scaffold canonical` / `scripts/sync_plugin_skill.sh`, いずれも `--check` なし) を stdout に verbatim で列挙する。判断 (例: drift を accept して release を進める) は operator に残す。
 - `release check workflow --run-id <id>` — GitHub Actions `Test` / `Publish to TestPyPI` / `Publish to PyPI` の run status / conclusion を取得し、`success` / `failure` / `in_progress` を出力する。judgment (例: 「`failure` でも release を進める」) は実行しない。
 
 `release check` 全体としての挙動は read-only / idempotent / dry-run-by-default で固定する。`--fix` / `--auto-correct` 系の flag は導入しない。
@@ -118,6 +119,7 @@ helper が触ってよい層と触ってはいけない層を明示する。
 | `Source Tree Hygiene` (git status / git log / git grep) | `release check tree` | strict-fail 検査として実行 |
 | `Fresh Scaffold Smoke` | `release check scaffold` | strict-fail 検査として実行 |
 | `Build Artifact Inspection` (`python -m build` + grep) | `release check artifact` | strict-fail 検査として実行 |
+| `Canonical Renderer / Plugin Mirror Drift` | `release check drift` | strict-fail 検査として実行 |
 | `Release Ref Consistency` (pyproject version / tag / install ref) | `release bump --check` + `release check workflow` | read-only の参照情報を表示。mirror set 内 version 不一致は exit non-zero |
 | `Version Bump` (release-version mirror set の書き換え + 単独 commit) | `release bump --to <version>` | mirror set 全 file (現状: `pyproject.toml` + `src/mozyo_bridge/__init__.py`) を worktree に書き換えるだけ |
 | TestPyPI publish workflow の dispatch | `release publish --testpypi --version <X.Y.Z>` | workflow dispatch のみ |
