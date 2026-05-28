@@ -27,4 +27,5 @@ redmine:
     verified_by: hollySizzle
 
 outputs:
-  - target: .mozyo-bridge/redmine-defaults.md
+  - kind: redmine_markdown
+    target: .mozyo-bridge/redmine-defaults.md

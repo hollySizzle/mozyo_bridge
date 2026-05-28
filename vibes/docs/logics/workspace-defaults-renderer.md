@@ -48,19 +48,29 @@ redmine:
     verified_by: <handle / actor>        # 必須
 
 outputs:
-  - target: .mozyo-bridge/redmine-defaults.md   # 必須 (repo-relative)
-  # 追加 output を生やす場合はここに重ねる
+  - kind: redmine_markdown                       # 必須 (renderer kind)
+    target: .mozyo-bridge/redmine-defaults.md    # 必須 (repo-relative)
+  # 追加 output kind を生やす場合は code 改修が必要。詳しくは Extending To New Outputs 節。
 ```
 
 ### バリデーション規則
 
 - `schema_version` は固定 `1`。将来の breaking change は schema bump を経て移行する。
+- `outputs[].kind` は必須かつ `KNOWN_OUTPUT_KINDS` のいずれか。現状は `redmine_markdown` のみ。未知の kind は load 時に die し、stderr に supported set を列挙する。これは Codex review #50989 が捕捉した「`.codex/config.toml` を target に書くと Markdown が `.toml` に書き出される」footgun を schema 層で塞ぐためのもの。
 - `outputs[].target` は repo-relative。`..` を含む path や absolute path は invalid。
-- 同一 target を 2 度宣言できない。
+- 同一 target を 2 度宣言できない (kind が違っても重複扱い)。
 - URL は `http://` または `https://` のみ。`file://` や JavaScript URL は invalid。
 - `verification.verified: true` でも `verification_date` / `verified_by` のいずれかが空文字なら **unverified 扱い** で render する。「verified と書いてあるが date 空欄」は agent が事実として扱えないため。
 - credential-shape key (`api_key`、`access_token`、`refresh_token`、`client_secret`、`password`、`cookie`、`bearer_token`、`session_cookie`、`auth_token` 等) を含む YAML は die。
 - 値が credential 代入形 (`API_KEY=...` / `REDMINE_TOKEN=...` 等) でも die。
+
+### 現状の supported output kinds
+
+| kind | renderer | output 形式 |
+| --- | --- | --- |
+| `redmine_markdown` | `render_redmine_defaults_markdown` | Markdown snippet (Codex / Claude 両用)。Resolution Priority / Verification / Constraints セクションを含む。|
+
+`KNOWN_OUTPUT_KINDS` は `src/mozyo_bridge/workspace_defaults.py` で定義され、`tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest::test_supported_kinds_list_is_pinned` が `{redmine_markdown}` で pin している。set を増やすときは同 test を更新し、本表と `_render_for_kind` dispatch を **同一 commit で同期** する。
 
 ## Rendered Output Shape
 
@@ -123,12 +133,15 @@ acceptance criteria は次を要求する。
 
 ## Extending To New Outputs
 
-新規 output (例: project-local doc snippet、`.mcd.json` の verified-only 生成、Codex 向け JSON config) を追加する手順。
+新規 output kind (例: project-local doc snippet、`.mcd.json` の verified-only 生成、Codex 向け TOML config) を追加する手順。**output kind を増やすことは config change ではなく code change である**。schema は kind を明示要求し、未知の kind は load 時に die する。これは Codex review #50989 が捕捉した、generic な `target` から非 Markdown content target に Markdown が書き込まれる footgun を schema 層で塞ぐためのものである。
 
-1. 本 logic doc の Schema / Rendered Output Shape / `.mcd.json` Deferral 等の関係節を update する。
-2. `workspace_defaults.py` に新 output の render 関数と `collect_render_results` への wiring を追加する。
-3. test を追加し、output が byte-equal で再現できることと、drift gate が機能することを pin する。
-4. 既存 workspace の YAML を更新するときは renderer が graceful migration できる (`outputs: [...]` の追加だけで足りる) ように schema を保つ。breaking change は schema_version bump を経る。
-5. catalog の fc-workspace-defaults エントリに新 path を追加する。
+新 kind を追加する commit に含めるべきもの (4 点とも同 commit で同期):
 
-`outputs` を YAML 側で簡単に増やせる shape にすることで、output 追加は config-driven にとどまり、renderer code 改修なしで済む slice もある (target target を増やすだけで shared body を再利用する場合)。本 PR の v1 では `redmine-defaults.md` 1 output だが、複数 output を YAML から指定する余地は schema に残してある。
+1. **dispatch arm**: `src/mozyo_bridge/workspace_defaults.py` の `_render_for_kind` に新 kind の分岐と専用 render 関数 (例: `render_codex_toml(defaults) -> str`) を追加する。
+2. **typed renderer の content 形式**: 生成する文字列は kind が含意する format (Markdown / TOML / JSON / etc.) として valid であること。test で format validation を pin する (例: TOML 出力は `tomllib.loads` でパース可能であることを assert)。
+3. **set 拡張と test**: `KNOWN_OUTPUT_KINDS` に追加し、`test_supported_kinds_list_is_pinned` を新 set で更新する。新 kind に対する render 結果 byte-equal / drift / 不正 schema reject の各 test を足す。
+4. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表, Extending To New Outputs を更新する。`.mcd.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
+
+config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `vibes/docs/temps/redmine-defaults.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい format を要求しない限り、新 kind を増やす必要はない。
+
+catalog 関連: 新 path を `fc-governance-artifacts` か新規 fc エントリに追加し、generator を回して `file_conventions.generated.yaml` を再生成する。

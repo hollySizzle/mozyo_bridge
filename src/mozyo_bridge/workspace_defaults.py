@@ -40,6 +40,18 @@ WORKSPACE_DEFAULTS_INPUT_RELATIVE = Path(".mozyo-bridge/workspace-defaults.yaml"
 DEFAULT_REDMINE_OUTPUT_RELATIVE = Path(".mozyo-bridge/redmine-defaults.md")
 SCHEMA_VERSION = 1
 
+# Typed output kinds. Each kind has a dedicated renderer; adding a new
+# kind is a code change (new render function + dispatch + tests + design
+# doc update), NOT just adding another `target` line in the YAML. The
+# schema rejects unknown kinds at load time so an operator cannot
+# accidentally route Markdown content into a TOML / JSON config target.
+#
+# Per Codex review #50989: a generic `outputs[].target` is a footgun
+# because every kind would otherwise inherit the same Markdown body.
+# Typed dispatch makes the renderer extension contract explicit.
+KIND_REDMINE_MARKDOWN = "redmine_markdown"
+KNOWN_OUTPUT_KINDS = frozenset({KIND_REDMINE_MARKDOWN})
+
 # Credential-shape patterns. Mirrors the tree-grep heuristics in
 # `application.release._SECRET_VALUE_PATTERNS` so the workspace YAML
 # gate is consistent with the release-flow Source Tree Hygiene gate.
@@ -111,11 +123,17 @@ class Verification:
 
 
 @dataclass(frozen=True)
+class OutputSpec:
+    kind: str
+    target: Path
+
+
+@dataclass(frozen=True)
 class WorkspaceDefaults:
     schema_version: int
     default_project: DefaultProject
     verification: Verification
-    outputs: tuple[Path, ...]
+    outputs: tuple[OutputSpec, ...]
     source_path: Path
 
 
@@ -283,10 +301,22 @@ def load_workspace_defaults(source: Path) -> WorkspaceDefaults:
         die(
             f"workspace-defaults {source.as_posix()} must declare at least one output"
         )
-    outputs: list[Path] = []
+    outputs: list[OutputSpec] = []
     seen: set[str] = set()
     for index, item in enumerate(outputs_raw):
         item_map = _require_mapping(item, label=f"outputs[{index}]", source=source)
+        kind = _require_string(
+            item_map.get("kind"), label=f"outputs[{index}].kind", source=source
+        )
+        if kind not in KNOWN_OUTPUT_KINDS:
+            die(
+                f"workspace-defaults {source.as_posix()} outputs[{index}].kind "
+                f"is not a supported renderer kind: {kind!r}. "
+                f"Supported kinds: {sorted(KNOWN_OUTPUT_KINDS)}. Adding a new "
+                f"kind requires a code change (new render function + dispatch + "
+                f"tests + design-doc update), not just declaring a new target. "
+                f"See vibes/docs/logics/workspace-defaults-renderer.md."
+            )
         target = _require_string(
             item_map.get("target"), label=f"outputs[{index}].target", source=source
         )
@@ -303,7 +333,7 @@ def load_workspace_defaults(source: Path) -> WorkspaceDefaults:
                 f"is duplicated: {target!r}"
             )
         seen.add(key)
-        outputs.append(target_path)
+        outputs.append(OutputSpec(kind=kind, target=target_path))
 
     return WorkspaceDefaults(
         schema_version=schema_version,
@@ -449,12 +479,29 @@ def resolve_output_path(repo_root: Path, target: Path) -> Path:
     return (repo_root / target).resolve()
 
 
+def _render_for_kind(kind: str, defaults: WorkspaceDefaults) -> str:
+    """Dispatch to the typed renderer for ``kind``.
+
+    Unknown kinds were already rejected at load time, so reaching this
+    branch with an unknown kind would indicate a code-side regression
+    (forgot to add the dispatch arm after adding to KNOWN_OUTPUT_KINDS).
+    Fail loudly rather than silently writing nothing.
+    """
+    if kind == KIND_REDMINE_MARKDOWN:
+        return render_redmine_defaults_markdown(defaults)
+    die(
+        f"workspace-defaults renderer is missing a dispatch arm for "
+        f"output kind {kind!r}; add the typed render in "
+        f"`_render_for_kind` before re-declaring the kind as supported."
+    )
+
+
 def collect_render_results(repo_root: Path) -> list[RenderResult]:
     defaults = load_workspace_defaults(resolve_input_path(repo_root))
-    rendered = render_redmine_defaults_markdown(defaults)
     results: list[RenderResult] = []
-    for target in defaults.outputs:
-        output_path = resolve_output_path(repo_root, target)
+    for output in defaults.outputs:
+        output_path = resolve_output_path(repo_root, output.target)
+        rendered = _render_for_kind(output.kind, defaults)
         on_disk = (
             output_path.read_text(encoding="utf-8") if output_path.exists() else None
         )

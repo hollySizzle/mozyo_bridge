@@ -12979,11 +12979,17 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
         verified: bool = True,
         verification_date: str = "2026-05-28",
         verified_by: str = "hollySizzle",
-        outputs: tuple[str, ...] = (".mozyo-bridge/redmine-defaults.md",),
+        outputs: tuple[tuple[str, str], ...] = (
+            ("redmine_markdown", ".mozyo-bridge/redmine-defaults.md"),
+        ),
         schema_version: int = 1,
         extra: str = "",
     ) -> str:
-        outputs_block = "\n".join(f"  - target: {target}" for target in outputs)
+        output_lines: list[str] = []
+        for kind, target in outputs:
+            output_lines.append(f"  - kind: {kind}")
+            output_lines.append(f"    target: {target}")
+        outputs_block = "\n".join(output_lines)
         return (
             f"schema_version: {schema_version}\n"
             "redmine:\n"
@@ -13151,12 +13157,86 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._stage_repo(
                 Path(tmp) / "repo",
-                yaml_body=self._yaml_for(outputs=("../escape.md",)),
+                yaml_body=self._yaml_for(
+                    outputs=(("redmine_markdown", "../escape.md"),)
+                ),
             )
             with self.assertRaises(SystemExit):
                 self.run_cli(
                     ["workspace-defaults", "--repo", str(repo)]
                 )
+
+    # ------------------------------------------------------------------
+    # Typed outputs (Codex review #50989 correction)
+    # ------------------------------------------------------------------
+
+    def test_unknown_output_kind_is_rejected(self) -> None:
+        """A bare target with a foreign extension cannot inherit the
+        Markdown body. The schema requires an explicit `kind` and only
+        accepts the kinds the renderer supports.
+
+        Codex review #50989 reproduced the original footgun: adding
+        `.codex/config.toml` as a target wrote Markdown into a TOML
+        file. Typed outputs make that unreachable from the schema.
+        """
+        body = self._yaml_for(
+            outputs=(("codex_toml", ".codex/config.toml"),)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_missing_output_kind_is_rejected(self) -> None:
+        """Outputs without a `kind` field cannot fall back to Markdown."""
+        body = (
+            "schema_version: 1\n"
+            "redmine:\n"
+            "  default_project:\n"
+            "    identifier: foo\n"
+            "    name: foo\n"
+            "    url: https://example.invalid/\n"
+            "    parent_label: ''\n"
+            "  verification:\n"
+            "    verified: true\n"
+            '    verification_date: "2026-01-01"\n'
+            "    verified_by: tester\n"
+            "outputs:\n"
+            "  - target: .mozyo-bridge/redmine-defaults.md\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_supported_kinds_list_is_pinned(self) -> None:
+        """The supported kinds set is part of the public contract.
+
+        Extending it without updating the design doc / dispatch table
+        is the regression Codex review #50989 surfaced. If this
+        assertion fails, also update
+        `vibes/docs/logics/workspace-defaults-renderer.md` and the
+        `_render_for_kind` dispatch in the same commit.
+        """
+        from mozyo_bridge.workspace_defaults import (
+            KNOWN_OUTPUT_KINDS,
+            KIND_REDMINE_MARKDOWN,
+        )
+
+        self.assertEqual(
+            {KIND_REDMINE_MARKDOWN},
+            set(KNOWN_OUTPUT_KINDS),
+            msg=(
+                "KNOWN_OUTPUT_KINDS changed; update "
+                "vibes/docs/logics/workspace-defaults-renderer.md, "
+                "the `_render_for_kind` dispatch arms, and the typed "
+                "renderer for the new kind in the same commit."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Secret rejection
