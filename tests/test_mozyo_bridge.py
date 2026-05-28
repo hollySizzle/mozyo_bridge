@@ -12214,5 +12214,273 @@ class CanonicalRendererTest(unittest.TestCase):
                 )
 
 
+class GovernedWorkflowCanonicalTest(unittest.TestCase):
+    """Pin Redmine #10426: governed preset agent-workflow.md canonicalization.
+
+    `governed-workflow.yaml` renders both `redmine-governed/agent-workflow.md`
+    and `redmine-rails-governed/agent-workflow.md` from a single body file
+    plus per-output `{{name}}` substitutions. These tests pin:
+
+    - byte-equal render for both governed presets (drift gate);
+    - critical workflow keywords survive in both renders (gate / role /
+      autonomous lane / cross-workspace / close approval), so a future
+      placeholder rename or fragment edit cannot silently drop a gate or
+      a role boundary clause;
+    - the substitution engine itself: undefined placeholders die loudly
+      and missing-substitutions-with-placeholders fails before write.
+    """
+
+    SOURCE_RELATIVE = Path(
+        "src/mozyo_bridge/scaffold/canonical_sources/governed-workflow.yaml"
+    )
+    REDMINE_GOVERNED_RELATIVE = Path(
+        "src/mozyo_bridge/scaffold/presets/redmine-governed/agent-workflow.md"
+    )
+    REDMINE_RAILS_GOVERNED_RELATIVE = Path(
+        "src/mozyo_bridge/scaffold/presets/redmine-rails-governed/agent-workflow.md"
+    )
+
+    # Semantic anchors that MUST appear in both governed renders. If a
+    # future canonical edit drops any of these, governance behavior
+    # silently weakens — exactly the drift this canonicalization is
+    # meant to prevent. Each marker is a verbatim substring pulled from
+    # the workflow body; quoting is preserved so a partial-rename does
+    # not pass.
+    GOVERNED_KEYWORD_MARKERS: tuple[str, ...] = (
+        # Gate vocabulary — separation of Implementation Done vs Close
+        # is the governed preset's central promise.
+        "Implementation Done は completion ではない",
+        "Review Gate approval も Close ではない",
+        "owner_close_approval",
+        "Close Approval Separation",
+        # Role boundary — implementer vs auditor distinction must stay
+        # legible in the preset body.
+        "claude_code: 実装者",
+        "codex: 監査者",
+        "owner: 最終判断者",
+        # Codex Direct Edit Gate — the gate-vs-short-imperative
+        # distinction is the wording that prior #10332 / #10338 reviews
+        # required to stay verbatim.
+        "Codex Direct Edit Gate",
+        "短い命令は file edit 許可ではない",
+        "Repo-Local Guardrail Autonomous Lane",
+        "codex_autonomous_edit",
+        # Docs catalog governance contract.
+        "catalog 駆動の docs 解決",
+        ".mozyo-bridge/docs/catalog.yaml",
+        # The recovery wording corrected in #10345 must stay verifiable.
+        "mozyo-bridge docs generate-file-conventions",
+    )
+
+    def _governed_outputs(self):
+        from mozyo_bridge.scaffold.canonical import (
+            load_canonical_source,
+            render_output,
+        )
+
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+        return {
+            output.target.name: render_output(source, output)
+            for output in source.outputs
+        }
+
+    def test_both_governed_outputs_match_canonical_render(self) -> None:
+        from mozyo_bridge.scaffold.canonical import collect_render_results
+
+        results_by_target = {
+            result.output_path.relative_to(ROOT).as_posix(): result
+            for result in collect_render_results(ROOT)
+        }
+        for relative in (
+            self.REDMINE_GOVERNED_RELATIVE,
+            self.REDMINE_RAILS_GOVERNED_RELATIVE,
+        ):
+            with self.subTest(target=relative.as_posix()):
+                key = relative.as_posix()
+                self.assertIn(key, results_by_target)
+                result = results_by_target[key]
+                self.assertEqual(
+                    result.rendered,
+                    result.on_disk,
+                    msg=(
+                        f"{relative.as_posix()} drifted from canonical source; "
+                        f"rerun `mozyo-bridge scaffold canonical` and recommit."
+                    ),
+                )
+
+    def test_governed_renders_carry_framework_specific_phrases(self) -> None:
+        """Confirm the per-output `substitutions` actually swap framework markers.
+
+        This is the inter-preset drift gate: if `redmine-governed` ever
+        accidentally renders Rails-only paths (or vice versa), the
+        canonical source has lost its conditional contract.
+        """
+        rendered = self._governed_outputs()
+        rg = rendered["agent-workflow.md"]  # there are two; reload by preset
+
+        # Re-resolve by full path keys to disambiguate the two outputs.
+        from mozyo_bridge.scaffold.canonical import (
+            load_canonical_source,
+            render_output,
+        )
+
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+        by_preset = {}
+        for output in source.outputs:
+            preset_name = output.target.parts[-2]
+            by_preset[preset_name] = render_output(source, output)
+        del rg
+
+        redmine = by_preset["redmine-governed"]
+        rails = by_preset["redmine-rails-governed"]
+
+        # Title: each preset names itself.
+        self.assertIn("# Redmine Governed Agent Workflow", redmine)
+        self.assertNotIn("# Redmine Governed Agent Workflow", rails)
+        self.assertIn("# Redmine Rails Governed Agent Workflow", rails)
+
+        # Implementation paths: redmine ships generic; rails ships Rails layout.
+        self.assertIn("    - src/**", redmine)
+        self.assertIn("    - tests/**", redmine)
+        self.assertNotIn("    - app/**", redmine)
+        self.assertNotIn("    - spec/**", redmine)
+
+        self.assertIn("    - app/**", rails)
+        self.assertIn("    - spec/**", rails)
+        self.assertNotIn("    - src/**", rails)
+        self.assertNotIn("    - tests/**", rails)
+
+        # Layered Source: rails references both base layers.
+        self.assertIn(
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md`",
+            redmine,
+        )
+        self.assertIn(
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md`",
+            rails,
+        )
+        self.assertIn(
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-rails/agent-workflow.md`",
+            rails,
+        )
+        self.assertNotIn("redmine-rails/agent-workflow.md", redmine)
+
+        # Required-Verification framework-specific commands.
+        self.assertIn("project の authoritative test command", redmine)
+        self.assertNotIn("bundle exec rspec", redmine)
+        self.assertIn("bundle exec rspec", rails)
+        self.assertIn("rubocop / brakeman", rails)
+
+        # Governed Mode Prohibitions last bullet names the base preset.
+        self.assertIn(
+            "shared preset の `redmine` だけで完了報告すること",
+            redmine,
+        )
+        self.assertIn(
+            "shared preset の `redmine-rails` だけで完了報告すること",
+            rails,
+        )
+
+    def test_both_governed_outputs_preserve_governance_keywords(self) -> None:
+        rendered = {}
+        from mozyo_bridge.scaffold.canonical import (
+            load_canonical_source,
+            render_output,
+        )
+
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+        for output in source.outputs:
+            rendered[output.target.parts[-2]] = render_output(source, output)
+
+        for preset_name, body in rendered.items():
+            for marker in self.GOVERNED_KEYWORD_MARKERS:
+                with self.subTest(preset=preset_name, marker=marker):
+                    self.assertIn(
+                        marker,
+                        body,
+                        msg=(
+                            f"{preset_name}/agent-workflow.md lost governance "
+                            f"marker {marker!r}; a substitution or fragment "
+                            f"edit silently weakened the preset body."
+                        ),
+                    )
+
+    def test_unresolved_placeholder_dies_loudly(self) -> None:
+        """An undefined `{{name}}` placeholder must fail before any write."""
+        from mozyo_bridge.scaffold.canonical import (
+            CanonicalSource,
+            Fragment,
+            OutputSpec,
+            render_output,
+        )
+
+        source = CanonicalSource(
+            id="probe",
+            source_path=Path("/tmp/probe.yaml"),
+            outputs=(
+                OutputSpec(
+                    target=Path("probe.md"),
+                    context={},
+                    substitutions={"GOOD": "value"},
+                ),
+            ),
+            fragments=(
+                Fragment(id="f", when={}, body="hello {{GOOD}} and {{MISSING}}\n"),
+            ),
+        )
+        with self.assertRaises(SystemExit):
+            render_output(source, source.outputs[0])
+
+    def test_placeholder_without_substitutions_mapping_dies(self) -> None:
+        """A body with `{{name}}` but no `substitutions` mapping must die."""
+        from mozyo_bridge.scaffold.canonical import (
+            CanonicalSource,
+            Fragment,
+            OutputSpec,
+            render_output,
+        )
+
+        source = CanonicalSource(
+            id="probe",
+            source_path=Path("/tmp/probe.yaml"),
+            outputs=(OutputSpec(target=Path("probe.md"), context={}, substitutions={}),),
+            fragments=(
+                Fragment(id="f", when={}, body="hello {{ANY}}\n"),
+            ),
+        )
+        with self.assertRaises(SystemExit):
+            render_output(source, source.outputs[0])
+
+    def test_substitution_is_single_pass(self) -> None:
+        """A value containing a placeholder string must NOT be re-substituted.
+
+        Without this guarantee, a substitution value of `{{A}}` would
+        recurse into `A`'s mapping, producing surprising output.
+        Single-pass keeps the renderer deterministic.
+        """
+        from mozyo_bridge.scaffold.canonical import (
+            CanonicalSource,
+            Fragment,
+            OutputSpec,
+            render_output,
+        )
+
+        source = CanonicalSource(
+            id="probe",
+            source_path=Path("/tmp/probe.yaml"),
+            outputs=(
+                OutputSpec(
+                    target=Path("probe.md"),
+                    context={},
+                    substitutions={"A": "{{B}}", "B": "REPLACED"},
+                ),
+            ),
+            fragments=(Fragment(id="f", when={}, body="A is {{A}}\n"),),
+        )
+        rendered = render_output(source, source.outputs[0])
+        self.assertEqual("A is {{B}}\n", rendered)
+        self.assertNotIn("REPLACED", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

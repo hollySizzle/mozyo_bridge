@@ -1,0 +1,65 @@
+# Canonical source for the governed-preset agent-workflow.md pair
+# (redmine-governed and redmine-rails-governed). The two presets share
+# ~90% of their workflow bytes; this source keeps them in lock-step via
+# `{{name}}` placeholders for the small per-framework variant phrases.
+# Generated outputs live under
+# `src/mozyo_bridge/scaffold/presets/<preset>/agent-workflow.md`.
+# Regenerate with `mozyo-bridge scaffold canonical`; verify drift with
+# `mozyo-bridge scaffold canonical --check`.
+
+id: governed-workflow
+
+description: |
+  Single source for `redmine-governed` and `redmine-rails-governed`
+  agent workflows. Conditional rendering is expressed entirely through
+  per-output `substitutions` for inline phrases (preset name, base
+  preset name, file path lists, framework-specific verification
+  commands, etc.). The body fragment is shared verbatim across both
+  outputs so any future workflow edit lands on both presets at once.
+
+outputs:
+  - target: presets/redmine-governed/agent-workflow.md
+    substitutions:
+      TITLE: "Redmine Governed Agent Workflow"
+      PRESET_NAME: "redmine-governed"
+      BASE_PRESET_NAME: "redmine"
+      LAYERED_SOURCE_PREAMBLE: "この preset は特定 framework に依存しない Redmine 開発に full governance package を被せる preset である。まず汎用 Redmine workflow を読む:"
+      LAYERED_SOURCE_PATHS: "- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md`"
+      LAYERED_SOURCE_OUTRO: "この file が存在しない場合は、読んだふりをせず `mozyo-bridge rules install` を依頼して停止する。本 governed preset は Redmine base を **置き換えず、上乗せする**。base の本文を複製しない。"
+      IMPL_FILE_PATTERNS: "    - src/**\n    - tests/**\n    - config/**\n    - lib/**\n    - docs/**"
+      GUARDRAIL_NO_TOUCH_PATHS: "  - src/**\n  - tests/**\n  - config/**\n  - lib/**\n  - docs/**"
+      DISTRIBUTED_SURFACE_SHORT: "`src/**` /\n    `tests/**`"
+      IMPL_FILE_PATH_EXAMPLES: "`src/**`, `tests/**`, `config/**`, `lib/**`, `docs/**`"
+      LANE_DISTRIBUTED_SURFACE_FULL: "`src/**`, `tests/**`, `docs/**`, `README.md`, `RELEASE_NOTES.md`"
+      LANE_BREAKAWAY_EXAMPLE_PATH: "`src/**`"
+      PLANTUML_LAYERED_PRESET_ARGS: "redmine, redmine-governed"
+      COVERAGE_ROOT_BASH_EXAMPLES: "[--coverage-root src/...] [--coverage-root tests/...]"
+      VALIDATOR_DEFAULT_QUALIFIER: ""
+      COVERAGE_LAYER_LABEL: "project 固有 layer"
+      REQUIRED_VERIFICATION_TEST_CMD: "project の authoritative test command (例: package test、unit test、integration smoke、project が定める subset)。"
+      REQUIRED_VERIFICATION_LINT: "lint / type check / static analysis は project ルールに従う。"
+
+  - target: presets/redmine-rails-governed/agent-workflow.md
+    substitutions:
+      TITLE: "Redmine Rails Governed Agent Workflow"
+      PRESET_NAME: "redmine-rails-governed"
+      BASE_PRESET_NAME: "redmine-rails"
+      LAYERED_SOURCE_PREAMBLE: "この preset は Rails + Redmine 開発に full governance package を被せる preset である。まず汎用 Redmine workflow と Rails 追加 guardrail を読む:"
+      LAYERED_SOURCE_PATHS: "- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine/agent-workflow.md`\n- `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/redmine-rails/agent-workflow.md`"
+      LAYERED_SOURCE_OUTRO: "この file が存在しない場合は、読んだふりをせず `mozyo-bridge rules install` を依頼して停止する。本 governed preset は上記 2 層を **置き換えず、上乗せする**。base 2 層の本文を複製しない。"
+      IMPL_FILE_PATTERNS: "    - app/**\n    - spec/**\n    - test/**\n    - config/**\n    - db/**\n    - lib/**"
+      GUARDRAIL_NO_TOUCH_PATHS: "  - app/**\n  - spec/**\n  - test/**\n  - config/**\n  - db/**\n  - lib/**"
+      DISTRIBUTED_SURFACE_SHORT: "`app/**` /\n    `spec/**`"
+      IMPL_FILE_PATH_EXAMPLES: "`app/**`, `spec/**`, `config/**`, `db/**`, `lib/**`"
+      LANE_DISTRIBUTED_SURFACE_FULL: "`app/**`, `spec/**`, `test/**`, `config/**`, `db/**`, `lib/**`, `docs/**`, `README.md`, `RELEASE_NOTES.md`"
+      LANE_BREAKAWAY_EXAMPLE_PATH: "`app/**`"
+      PLANTUML_LAYERED_PRESET_ARGS: "redmine, redmine-rails, redmine-rails-governed"
+      COVERAGE_ROOT_BASH_EXAMPLES: "[--coverage-root app/...] [--coverage-root config/...]"
+      VALIDATOR_DEFAULT_QUALIFIER: " (Rails 典型 layer)"
+      COVERAGE_LAYER_LABEL: "Rails layer"
+      REQUIRED_VERIFICATION_TEST_CMD: "project の authoritative Rails test command (例: `bundle exec rspec`, `bundle exec rails test`, project が定める subset)。test 用 DB 環境変数は project-local layer の手順に従う。"
+      REQUIRED_VERIFICATION_LINT: "rubocop / brakeman 等の静的検査は project ルールに従う。"
+
+fragments:
+  - id: workflow
+    body_file: bodies/workflow.md

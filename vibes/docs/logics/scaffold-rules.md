@@ -424,6 +424,15 @@ mozyo-bridge scaffold canonical --check  # drift を検出 (exit 1 で fail)
 - 新規 canonical 出力 (skill router 雛形、preset workflow など) を増やす場合は canonical-renderer.md の Extending To New Outputs に従う。
 - canonical render は `scaffold apply` の **上流**。`scaffold apply` の downstream pipeline (`apply_project_local_preservation` 等) は引き続き `_router/*.md` を template として読む。両 layer は独立。
 
+## Governed Preset Workflow Single Source
+
+`redmine-governed` と `redmine-rails-governed` の `agent-workflow.md` は ~90% byte-shared だが framework 別 path / command / preset 名 で divergence が点在し、手作業同期で drift しやすい。`src/mozyo_bridge/scaffold/canonical_sources/governed-workflow.yaml` を canonical source として両 preset workflow を 1 つの body file + per-output `substitutions` (`{{PRESET_NAME}}` / `{{IMPL_FILE_PATTERNS}}` 等、計約 17 key) から生成する。
+
+- `presets/redmine-governed/agent-workflow.md` と `presets/redmine-rails-governed/agent-workflow.md` は **generated artifact**。手編集禁止。
+- gate schema / role boundary / autonomous lane / cross-workspace guidance / close approval 条件などの **governance keyword** は body file 側に inline で残し、参照リンク化しない。test (`GovernedWorkflowCanonicalTest`) が両 render の keyword 集合を pin する。
+- 新しい framework 軸 (例: 別 stack の governed preset) を増やす場合は同じ canonical source に output を追記し、substitutions を埋める。
+- substitution の値は double-quoted YAML 文字列で書き、複数行は `\n` でエスケープする (block scalar は indent 取り扱いで drift しやすい)。
+
 ## Test Strategy
 
 Implementation tests should cover:

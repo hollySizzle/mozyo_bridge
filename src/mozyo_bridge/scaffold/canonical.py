@@ -15,7 +15,8 @@ module stays pure (no argparse, no stdout); the CLI surface is
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -25,6 +26,12 @@ from mozyo_bridge.shared.errors import die
 
 CANONICAL_SOURCES_RELATIVE = Path("src/mozyo_bridge/scaffold/canonical_sources")
 SCAFFOLD_OUTPUT_ROOT_RELATIVE = Path("src/mozyo_bridge/scaffold")
+
+# Canonical-time placeholder syntax. Distinct from the scaffold-time
+# `${var}` substitution so literal `${MOZYO_BRIDGE_HOME...}` in body
+# content passes through unchanged. `{{name}}` is replaced once per
+# render, in a single pass, by the per-output `substitutions` map.
+SUBSTITUTION_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
 @dataclass(frozen=True)
@@ -38,6 +45,7 @@ class Fragment:
 class OutputSpec:
     target: Path
     context: dict[str, str]
+    substitutions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,6 +100,77 @@ def _normalize_context(raw: object, *, source_path: Path, label: str) -> dict[st
     return normalized
 
 
+def _normalize_substitutions(
+    raw: object, *, source_path: Path, label: str
+) -> dict[str, str]:
+    """Normalize an output's ``substitutions`` mapping for {{name}} placeholders.
+
+    Empty / missing is fine — the existing router canonical source uses
+    fragment-level conditional dispatch with no substitutions. Once a
+    canonical source opts in, every value must be an explicit string;
+    booleans / None / nested structures are rejected so the rendered
+    output is deterministic. Placeholder names must satisfy the
+    ``SUBSTITUTION_PLACEHOLDER_RE`` regex (``\\w+``); otherwise the
+    rendered body could never reference them anyway.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        die(
+            f"canonical source {source_path.as_posix()} {label} must be a mapping"
+        )
+    normalized: dict[str, str] = {}
+    name_re = re.compile(r"^\w+$")
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key or not name_re.match(key):
+            die(
+                f"canonical source {source_path.as_posix()} {label} key {key!r} "
+                f"must match {{name}} placeholder shape (\\w+)"
+            )
+        if isinstance(value, bool) or value is None:
+            die(
+                f"canonical source {source_path.as_posix()} {label} value for {key!r} "
+                f"must be a string"
+            )
+        normalized[key] = str(value)
+    return normalized
+
+
+def apply_substitutions(
+    body: str,
+    substitutions: dict[str, str],
+    *,
+    source_path: Path,
+    target: Path,
+) -> str:
+    """Replace every ``{{name}}`` placeholder with ``substitutions[name]``.
+
+    Single-pass: substituted text is NOT re-scanned for placeholders so
+    a value containing ``{{x}}`` literal stays literal. Every placeholder
+    must have a value; an unresolved placeholder is an authoring error
+    and dies with the full placeholder list so the operator can fill the
+    map in one edit cycle.
+    """
+    missing: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in substitutions:
+            missing.append(name)
+            return match.group(0)
+        return substitutions[name]
+
+    rendered = SUBSTITUTION_PLACEHOLDER_RE.sub(_replace, body)
+    if missing:
+        die(
+            f"canonical source {source_path.as_posix()} output {target.as_posix()} "
+            f"has unresolved {{name}} placeholders: "
+            + ", ".join(sorted(set(missing)))
+            + "; every placeholder must be declared in the output's `substitutions` mapping."
+        )
+    return rendered
+
+
 def load_canonical_source(source_path: Path) -> CanonicalSource:
     if not source_path.exists():
         die(f"canonical source not found: {source_path.as_posix()}")
@@ -133,7 +212,14 @@ def load_canonical_source(source_path: Path) -> CanonicalSource:
         context = _normalize_context(
             spec.get("context"), source_path=source_path, label="output context"
         )
-        outputs.append(OutputSpec(target=target_path, context=context))
+        substitutions = _normalize_substitutions(
+            spec.get("substitutions"),
+            source_path=source_path,
+            label=f"output {target!r} substitutions",
+        )
+        outputs.append(
+            OutputSpec(target=target_path, context=context, substitutions=substitutions)
+        )
 
     fragments: list[Fragment] = []
     for spec in fragments_raw:
@@ -212,7 +298,25 @@ def render_for_context(source: CanonicalSource, context: dict[str, str]) -> str:
 
 
 def render_output(source: CanonicalSource, output: OutputSpec) -> str:
-    return render_for_context(source, output.context)
+    body = render_for_context(source, output.context)
+    if output.substitutions:
+        body = apply_substitutions(
+            body,
+            output.substitutions,
+            source_path=source.source_path,
+            target=output.target,
+        )
+    elif SUBSTITUTION_PLACEHOLDER_RE.search(body):
+        # A body file declares `{{name}}` placeholders but the output
+        # provides no substitutions. This is an authoring error — the
+        # rendered file would ship literal placeholders, which never
+        # survives drift detection or downstream rendering.
+        die(
+            f"canonical source {source.source_path.as_posix()} output "
+            f"{output.target.as_posix()} contains {{name}} placeholders but the "
+            "output declares no `substitutions` mapping."
+        )
+    return body
 
 
 def resolve_canonical_dir(repo_root: Path) -> Path:
