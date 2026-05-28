@@ -13239,6 +13239,106 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
+    # Kind ↔ target suffix compatibility (Codex correction-review #50995)
+    # ------------------------------------------------------------------
+
+    def test_redmine_markdown_kind_rejects_toml_target(self) -> None:
+        """Codex correction review #50995 reproduced the residual footgun.
+
+        Even with typed kinds, `kind: redmine_markdown` + target
+        `.codex/config.toml` passed and wrote Markdown body into a
+        TOML path. The kind→suffix gate must reject the mismatch at
+        load time so an operator cannot silently generate invalid
+        config by selecting the only documented kind and pointing it
+        at a non-Markdown path.
+        """
+        body = self._yaml_for(
+            outputs=(("redmine_markdown", ".codex/config.toml"),)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+            # The TOML file must not have been created by a half-completed
+            # run before the validation error fired.
+            self.assertFalse(
+                (repo / ".codex" / "config.toml").exists(),
+                "load-time validation must run before any write",
+            )
+
+    def test_redmine_markdown_kind_rejects_json_target(self) -> None:
+        """Same gate must block `.mcd.json` (the other documented MCP
+        config candidate Codex called out as the motivating use case)."""
+        body = self._yaml_for(
+            outputs=(("redmine_markdown", ".mcd.json"),)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+            self.assertFalse(
+                (repo / ".mcd.json").exists(),
+                "load-time validation must run before any write",
+            )
+
+    def test_redmine_markdown_kind_rejects_extensionless_target(self) -> None:
+        """A target with no suffix at all is also unsafe — the renderer
+        could write Markdown body to e.g. `README` and the operator
+        would see content that looks intentional."""
+        body = self._yaml_for(
+            outputs=(("redmine_markdown", "docs/README"),)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["workspace-defaults", "--repo", str(repo)]
+                )
+
+    def test_redmine_markdown_kind_accepts_markdown_suffix_alias(self) -> None:
+        """Both `.md` and `.markdown` are valid Markdown suffixes; the
+        gate must accept the alias so operators don't get a false-positive
+        rejection on a legitimate Markdown target."""
+        body = self._yaml_for(
+            outputs=(("redmine_markdown", ".mozyo-bridge/redmine-defaults.markdown"),)
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo", yaml_body=body)
+            result, _, _ = self.run_cli(
+                ["workspace-defaults", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            self.assertTrue(
+                (repo / ".mozyo-bridge" / "redmine-defaults.markdown").is_file()
+            )
+
+    def test_kind_allowed_suffixes_table_is_pinned(self) -> None:
+        """Per-kind suffix sets are part of the public contract.
+
+        If the renderer learns to emit a new format for an existing
+        kind (or a new kind is added), the table must be updated in
+        the same commit and this test refreshed alongside.
+        """
+        from mozyo_bridge.workspace_defaults import (
+            KIND_ALLOWED_SUFFIXES,
+            KIND_REDMINE_MARKDOWN,
+        )
+
+        self.assertEqual(
+            {KIND_REDMINE_MARKDOWN: {".md", ".markdown"}},
+            {k: set(v) for k, v in KIND_ALLOWED_SUFFIXES.items()},
+            msg=(
+                "KIND_ALLOWED_SUFFIXES changed; sync the design doc's "
+                "Supported Output Kinds table and add regression tests "
+                "for the new accept / reject cases in the same commit."
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Secret rejection
     # ------------------------------------------------------------------
 

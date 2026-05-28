@@ -58,6 +58,7 @@ outputs:
 - `schema_version` は固定 `1`。将来の breaking change は schema bump を経て移行する。
 - `outputs[].kind` は必須かつ `KNOWN_OUTPUT_KINDS` のいずれか。現状は `redmine_markdown` のみ。未知の kind は load 時に die し、stderr に supported set を列挙する。これは Codex review #50989 が捕捉した「`.codex/config.toml` を target に書くと Markdown が `.toml` に書き出される」footgun を schema 層で塞ぐためのもの。
 - `outputs[].target` は repo-relative。`..` を含む path や absolute path は invalid。
+- `outputs[].target` の **suffix は kind が許可する set のいずれか** でなければならない (`KIND_ALLOWED_SUFFIXES`)。例: `redmine_markdown` は `.md` または `.markdown` のみ。`kind: redmine_markdown` + `target: .codex/config.toml` のような組み合わせは load 時に die する。Codex correction review #50995 が捕捉した「typed kind だけでは `.toml` / `.json` target に Markdown が書き出される」残存 footgun を schema 層で塞ぐためのもの。非 Markdown 出力を必要とする場合は新 kind を追加する (Extending To New Outputs 節を読む)。
 - 同一 target を 2 度宣言できない (kind が違っても重複扱い)。
 - URL は `http://` または `https://` のみ。`file://` や JavaScript URL は invalid。
 - `verification.verified: true` でも `verification_date` / `verified_by` のいずれかが空文字なら **unverified 扱い** で render する。「verified と書いてあるが date 空欄」は agent が事実として扱えないため。
@@ -66,11 +67,13 @@ outputs:
 
 ### 現状の supported output kinds
 
-| kind | renderer | output 形式 |
-| --- | --- | --- |
-| `redmine_markdown` | `render_redmine_defaults_markdown` | Markdown snippet (Codex / Claude 両用)。Resolution Priority / Verification / Constraints セクションを含む。|
+| kind | renderer | output 形式 | allowed target suffixes |
+| --- | --- | --- | --- |
+| `redmine_markdown` | `render_redmine_defaults_markdown` | Markdown snippet (Codex / Claude 両用)。Resolution Priority / Verification / Constraints セクションを含む。| `.md`, `.markdown` |
 
-`KNOWN_OUTPUT_KINDS` は `src/mozyo_bridge/workspace_defaults.py` で定義され、`tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest::test_supported_kinds_list_is_pinned` が `{redmine_markdown}` で pin している。set を増やすときは同 test を更新し、本表と `_render_for_kind` dispatch を **同一 commit で同期** する。
+`KNOWN_OUTPUT_KINDS` と `KIND_ALLOWED_SUFFIXES` は `src/mozyo_bridge/workspace_defaults.py` で定義される。`tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest::test_supported_kinds_list_is_pinned` と `test_kind_allowed_suffixes_table_is_pinned` がそれぞれ verbatim で pin する。set / suffix を増やすときは両 test、本表、`_render_for_kind` dispatch を **同一 commit で同期** する。
+
+target suffix の判定は lowercase。`.MD` 等は `.md` と同一視される。kind が allowed suffix を持たない (= 空 set) ことを意味する宣言は禁止 — 新 kind を追加する場合は必ず allowed suffix を 1 つ以上指定する。
 
 ## Rendered Output Shape
 
@@ -135,13 +138,14 @@ acceptance criteria は次を要求する。
 
 新規 output kind (例: project-local doc snippet、`.mcd.json` の verified-only 生成、Codex 向け TOML config) を追加する手順。**output kind を増やすことは config change ではなく code change である**。schema は kind を明示要求し、未知の kind は load 時に die する。これは Codex review #50989 が捕捉した、generic な `target` から非 Markdown content target に Markdown が書き込まれる footgun を schema 層で塞ぐためのものである。
 
-新 kind を追加する commit に含めるべきもの (4 点とも同 commit で同期):
+新 kind を追加する commit に含めるべきもの (5 点とも同 commit で同期):
 
 1. **dispatch arm**: `src/mozyo_bridge/workspace_defaults.py` の `_render_for_kind` に新 kind の分岐と専用 render 関数 (例: `render_codex_toml(defaults) -> str`) を追加する。
 2. **typed renderer の content 形式**: 生成する文字列は kind が含意する format (Markdown / TOML / JSON / etc.) として valid であること。test で format validation を pin する (例: TOML 出力は `tomllib.loads` でパース可能であることを assert)。
 3. **set 拡張と test**: `KNOWN_OUTPUT_KINDS` に追加し、`test_supported_kinds_list_is_pinned` を新 set で更新する。新 kind に対する render 結果 byte-equal / drift / 不正 schema reject の各 test を足す。
-4. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表, Extending To New Outputs を更新する。`.mcd.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
+4. **allowed-suffix 表**: `KIND_ALLOWED_SUFFIXES` に新 kind の許可 suffix set を 1 つ以上指定する。`test_kind_allowed_suffixes_table_is_pinned` を更新し、新 kind に対する mismatch reject / accept 双方の test を足す。
+5. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表 (renderer + allowed suffixes 列), Extending To New Outputs を更新する。`.mcd.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
 
-config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `vibes/docs/temps/redmine-defaults.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい format を要求しない限り、新 kind を増やす必要はない。
+config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `vibes/docs/temps/redmine-defaults.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい target の suffix は **既存 kind の allowed suffix set** に含まれていなければならず、`.codex/config.toml` のような非 Markdown path は schema 層で reject される。新しい format / config を要求する場合は新 kind を追加するルート (上記 5 点) を踏む。
 
 catalog 関連: 新 path を `fc-governance-artifacts` か新規 fc エントリに追加し、generator を回して `file_conventions.generated.yaml` を再生成する。

@@ -52,6 +52,21 @@ SCHEMA_VERSION = 1
 KIND_REDMINE_MARKDOWN = "redmine_markdown"
 KNOWN_OUTPUT_KINDS = frozenset({KIND_REDMINE_MARKDOWN})
 
+# Per-kind allowed target-path suffixes. Codex review #50995 caught the
+# remaining footgun: `kind: redmine_markdown` alone does not stop an
+# operator from pointing the target at `.codex/config.toml` or
+# `.mcd.json`, which would still write Markdown body into a config
+# path. The kind→suffix map blocks that at load time: each kind
+# advertises the suffixes its renderer's output is valid for, and the
+# loader rejects any target whose suffix is not in the kind's set.
+#
+# When adding a new kind, also declare its allowed suffixes here AND
+# update the design doc's Supported Output Kinds table in the same
+# commit.
+KIND_ALLOWED_SUFFIXES: dict[str, frozenset[str]] = {
+    KIND_REDMINE_MARKDOWN: frozenset({".md", ".markdown"}),
+}
+
 # Credential-shape patterns. Mirrors the tree-grep heuristics in
 # `application.release._SECRET_VALUE_PATTERNS` so the workspace YAML
 # gate is consistent with the release-flow Source Tree Hygiene gate.
@@ -325,6 +340,19 @@ def load_workspace_defaults(source: Path) -> WorkspaceDefaults:
             die(
                 f"workspace-defaults {source.as_posix()} outputs[{index}].target "
                 f"must be a repo-relative path: got {target!r}"
+            )
+        allowed_suffixes = KIND_ALLOWED_SUFFIXES.get(kind, frozenset())
+        actual_suffix = target_path.suffix.lower()
+        if allowed_suffixes and actual_suffix not in allowed_suffixes:
+            die(
+                f"workspace-defaults {source.as_posix()} outputs[{index}] "
+                f"target {target!r} has suffix {actual_suffix or '(none)'!r}, "
+                f"which kind {kind!r} cannot produce. Allowed suffixes for "
+                f"this kind: {sorted(allowed_suffixes)}. Routing Markdown "
+                f"content into a non-Markdown config path (e.g. "
+                f"`.codex/config.toml`, `.mcd.json`) would generate invalid "
+                f"config; declare a new typed kind with its own renderer "
+                f"instead. See vibes/docs/logics/workspace-defaults-renderer.md."
             )
         key = target_path.as_posix()
         if key in seen:
