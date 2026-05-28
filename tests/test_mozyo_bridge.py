@@ -11742,6 +11742,137 @@ class CodexAutonomousGuardrailLaneTest(unittest.TestCase):
         self.assertIn("vibes/docs/rules/codex-autonomous-guardrail-lane.md", body)
 
 
+class DocsAuditImpactDirtyFileTest(unittest.TestCase):
+    """Pin docs audit-impact + --check-generated behavior on unrelated dirty files.
+
+    Workflow-change verification target for Redmine #10338 lane policy
+    (parent #10338, this task #10344). `mozyo-bridge docs audit-impact
+    --all-changed --check-generated` must surface every git-changed path,
+    including unrelated dirty files that the catalog does not map to any
+    document, while still returning 0 when the generated drift check is
+    clean. Otherwise the operator pre-commit gate would block every
+    commit that happens to share a worktree with one stray untracked
+    file (e.g., `.claude/settings.local.json`), and the
+    `codex_autonomous_edit` verification command list in the lane
+    policy would be impossible to run cleanly.
+
+    The test sets up a real `git init` repo with a catalog +
+    fresh-regenerated file_conventions, drops an untracked file outside
+    every file_convention pattern, and drives `cmd_docs_audit_impact`
+    end-to-end.
+    """
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def _run_git(self, repo: Path, *cmd: str) -> None:
+        subprocess.run(
+            ["git", *cmd],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_audit_impact_returns_clean_on_unrelated_dirty_file_when_generated_check_passes(
+        self,
+    ) -> None:
+        import shutil as _shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+
+            # Bring up a governed scaffold so the catalog skeleton ships.
+            self._run_cli(["rules", "install", "--home", str(home)])
+            self._run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            # The skeleton is the safe minimal catalog to drive resolver +
+            # generator against; we promote it to the live catalog as the
+            # docs `## Quick Start` invocation does.
+            example = project / ".mozyo-bridge" / "docs" / "catalog.yaml.example"
+            catalog = project / ".mozyo-bridge" / "docs" / "catalog.yaml"
+            _shutil.copyfile(example, catalog)
+
+            # Regenerate the generated file so the drift check is clean on
+            # the first audit-impact call. Without this the test would
+            # measure missing-output behavior instead of the dirty-file
+            # interaction.
+            gen_code, _ = self._run_cli(
+                [
+                    "docs",
+                    "generate-file-conventions",
+                    "--repo",
+                    str(project),
+                ]
+            )
+            self.assertEqual(0, gen_code)
+
+            # Initialize a git repo so `audit_doc_impact` can read the
+            # all-changed listing via `git ls-files --others --exclude-standard`.
+            self._run_git(project, "init", "--initial-branch=main")
+            self._run_git(project, "config", "user.email", "test@example.invalid")
+            self._run_git(project, "config", "user.name", "Test")
+            # Commit the scaffold so subsequent untracked files are the
+            # only unstaged work; otherwise every scaffold file would
+            # also report and noise the assertion.
+            self._run_git(project, "add", ".")
+            self._run_git(project, "commit", "-m", "scaffold")
+
+            # Drop an unrelated dirty file. It is intentionally outside
+            # every governed-preset file_convention so the resolver
+            # surfaces `documents_to_read: - none`, mirroring the real
+            # `.claude/settings.local.json` operator pattern that prompted
+            # this verification (see Redmine #10338 review #49720 note 3
+            # and #49743 note 4 — both treated such a dirty file as
+            # unrelated).
+            unrelated = project / "untracked_notes.txt"
+            unrelated.write_text("scratch\n", encoding="utf-8")
+
+            code, output = self._run_cli(
+                [
+                    "docs",
+                    "audit-impact",
+                    "--all-changed",
+                    "--check-generated",
+                    "--repo",
+                    str(project),
+                ]
+            )
+
+            # Contract pin: exit 0 even when an unrelated dirty file is
+            # reported, provided --check-generated is clean.
+            self.assertEqual(0, code, msg=output)
+            # The unrelated file MUST appear in the output — surfacing it
+            # is the whole point of `--all-changed`; silently swallowing
+            # the path would be the real regression.
+            self.assertIn("[untracked_notes.txt]", output)
+            self.assertIn("documents_to_read:", output)
+            # `documents_to_read: - none` is the expected shape for an
+            # unrelated path; if a future catalog edit accidentally
+            # broadened a file_convention to catch `untracked_notes.txt`,
+            # this assertion would tighten the test before it could rot.
+            self.assertIn("- none", output)
+            # The generated check trailer must confirm cleanliness so the
+            # 0 exit was not from missing-output suppression.
+            self.assertIn("is up to date", output)
+
+
 class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
     """Pin the #10332 cross-workspace `--mode` guidance in the skill body.
 
