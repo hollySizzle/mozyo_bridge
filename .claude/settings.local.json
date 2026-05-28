@@ -3,7 +3,12 @@
     "allow": [
       "mcp__asana__get_task",
       "Bash(git log *)",
-      "mcp__asana__get_project"
+      "mcp__asana__get_project",
+      "Skill(mozyo-bridge-agent)",
+      "Bash(mozyo-bridge --version)",
+      "Bash(mozyo-bridge --help)",
+      "Bash(env)",
+      "mcp__redmine_epic_grid__get_issue_detail_tool"
     ]
   }
 }
