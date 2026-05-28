@@ -11932,5 +11932,231 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
             )
 
 
+class CanonicalRendererTest(unittest.TestCase):
+    """Cover the Redmine #10345 single-source conditional renderer.
+
+    The canonical YAML under `src/mozyo_bridge/scaffold/canonical_sources/`
+    is the source of truth for the router pair templates at
+    `src/mozyo_bridge/scaffold/presets/_router/{AGENTS,CLAUDE}.md`. These
+    tests pin:
+
+    - byte-equal round-trip between canonical render and the committed
+      template files (drift is the only thing `--check` should report);
+    - tool-conditional dispatch (codex vs claude fragments land in the
+      right output);
+    - Project-Local Additions marker preservation through the render
+      pipeline so the downstream `apply_project_local_preservation` in
+      `scaffold.rules` continues to work;
+    - the CLI `scaffold canonical [--check]` surface returns the
+      expected exit codes on clean state, drift, and missing files.
+    """
+
+    SOURCE_RELATIVE = Path("src/mozyo_bridge/scaffold/canonical_sources/router.yaml")
+    AGENTS_RELATIVE = Path("src/mozyo_bridge/scaffold/presets/_router/AGENTS.md")
+    CLAUDE_RELATIVE = Path("src/mozyo_bridge/scaffold/presets/_router/CLAUDE.md")
+    BEGIN_MARKER = "<!-- mozyo-bridge:project-local-additions:begin -->"
+    END_MARKER = "<!-- mozyo-bridge:project-local-additions:end -->"
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = args.func(args)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_committed_templates_match_canonical_render(self) -> None:
+        from mozyo_bridge.scaffold.canonical import collect_render_results
+
+        results = collect_render_results(ROOT)
+        self.assertGreater(len(results), 0, "expected at least one canonical output")
+        for result in results:
+            self.assertEqual(
+                result.rendered,
+                result.on_disk,
+                msg=(
+                    f"{result.output_path} drifted from canonical source "
+                    f"{result.source_id!r}; rerun `mozyo-bridge scaffold "
+                    f"canonical render` and recommit."
+                ),
+            )
+
+    def test_conditional_dispatch_isolates_tool_specific_fragments(self) -> None:
+        from mozyo_bridge.scaffold.canonical import (
+            load_canonical_source,
+            render_for_context,
+        )
+
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+        codex = render_for_context(source, {"tool": "codex"})
+        claude = render_for_context(source, {"tool": "claude"})
+
+        # Title and tool intro split. Codex carries the cross-tool agents.md
+        # framing; Claude does not. Claude carries the ClaudeCode reminder
+        # heading; Codex does not.
+        self.assertIn("# AGENTS (Codex 入口)", codex)
+        self.assertNotIn("# Claude Code Router", codex)
+        self.assertIn("cross-tool agents.md", codex)
+
+        self.assertIn("# Claude Code Router", claude)
+        self.assertNotIn("# AGENTS (Codex 入口)", claude)
+        self.assertIn("ClaudeCode 起動時の最小 reminder", claude)
+        self.assertNotIn("## Preset", claude)
+
+        # Codex body holds the Preset + Guardrails block; Claude body does
+        # not. Each side keeps the other tool's body out.
+        self.assertIn("## Preset", codex)
+        self.assertIn("## Guardrails", codex)
+        self.assertNotIn("ClaudeCode 起動時の最小 reminder", codex)
+
+        # The shared session-start opening (steps 1-2 + `${rule_path}`) is
+        # byte-shared between both renders.
+        shared_opening = (
+            "## セッション開始\n\n"
+            "1. 現在の working directory がこの project root またはその配下であることを確認する。\n"
+            "2. mozyo-bridge の central preset rules を読む:\n"
+            "   - `${rule_path}`\n"
+        )
+        self.assertIn(shared_opening, codex)
+        self.assertIn(shared_opening, claude)
+
+    def test_render_preserves_project_local_marker_pair(self) -> None:
+        from mozyo_bridge.scaffold.canonical import (
+            load_canonical_source,
+            render_for_context,
+        )
+
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+        for tool in ("codex", "claude"):
+            with self.subTest(tool=tool):
+                rendered = render_for_context(source, {"tool": tool})
+                begin = rendered.find(self.BEGIN_MARKER)
+                end = rendered.find(self.END_MARKER)
+                self.assertNotEqual(
+                    -1,
+                    begin,
+                    msg=f"{tool}: begin marker missing from canonical render",
+                )
+                self.assertNotEqual(
+                    -1,
+                    end,
+                    msg=f"{tool}: end marker missing from canonical render",
+                )
+                self.assertLess(
+                    begin,
+                    end,
+                    msg=f"{tool}: marker pair is out of order in canonical render",
+                )
+
+    def test_check_clean_then_drift_then_recover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            shutil.copytree(
+                ROOT / "src",
+                repo / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+
+            # Pristine copy: --check passes.
+            result, stdout, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result, msg=stdout + stderr)
+            self.assertIn("AGENTS.md is up to date", stdout)
+            self.assertIn("CLAUDE.md is up to date", stdout)
+            self.assertEqual("", stderr)
+
+            # Mutating the committed template must surface drift.
+            agents_path = repo / self.AGENTS_RELATIVE
+            agents_path.write_text(
+                agents_path.read_text(encoding="utf-8") + "\nDRIFT MARKER\n",
+                encoding="utf-8",
+            )
+            result, stdout, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("is out of date", stderr)
+            self.assertIn("AGENTS.md", stderr)
+
+            # `render` (no --check) rewrites the file from canonical source.
+            result, stdout, stderr = self.run_cli(
+                ["scaffold", "canonical", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result, msg=stdout + stderr)
+
+            # And the next --check is clean again.
+            result, stdout, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result, msg=stdout + stderr)
+            self.assertEqual("", stderr)
+
+    def test_check_reports_missing_output_as_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            shutil.copytree(
+                ROOT / "src",
+                repo / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            (repo / self.CLAUDE_RELATIVE).unlink()
+            result, stdout, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("CLAUDE.md is missing", stderr)
+
+    def test_canonical_render_survives_body_file_edit(self) -> None:
+        """A canonical body-file edit must show up in the rendered output.
+
+        Concretely: editing a body file rotates the canonical render and
+        the committed `_router/*.md` template stops matching. This
+        confirms the body files are the source of truth — not a stale
+        copy that happens to share content.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            shutil.copytree(
+                ROOT / "src",
+                repo / "src",
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            body_path = (
+                repo
+                / "src/mozyo_bridge/scaffold/canonical_sources/router/bodies/title_codex.md"
+            )
+            body_path.write_text(
+                body_path.read_text(encoding="utf-8") + "EDITED\n",
+                encoding="utf-8",
+            )
+
+            # --check must detect AGENTS.md drift (codex output); CLAUDE.md
+            # stays clean because the edit only touches a codex-when fragment.
+            result, _, stderr = self.run_cli(
+                ["scaffold", "canonical", "--check", "--repo", str(repo)]
+            )
+            self.assertEqual(1, result)
+            self.assertIn("AGENTS.md", stderr)
+            self.assertNotIn("CLAUDE.md", stderr)
+
+            # `render` rewrites AGENTS.md so the new body lands on disk.
+            result, _, _ = self.run_cli(
+                ["scaffold", "canonical", "--repo", str(repo)]
+            )
+            self.assertEqual(0, result)
+            updated = (repo / self.AGENTS_RELATIVE).read_text(encoding="utf-8")
+            self.assertIn("EDITED", updated)
+
+    def test_check_fails_when_canonical_source_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "src/mozyo_bridge/scaffold").mkdir(parents=True)
+            with self.assertRaises(SystemExit):
+                self.run_cli(
+                    ["scaffold", "canonical", "--check", "--repo", str(repo)]
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

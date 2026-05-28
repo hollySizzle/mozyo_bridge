@@ -30,6 +30,7 @@ from mozyo_bridge.application.commands import (
     cmd_docs_resolve,
     cmd_docs_validate,
     cmd_scaffold_apply,
+    cmd_scaffold_canonical,
     cmd_scaffold_diff,
     cmd_scaffold_status,
     cmd_status,
@@ -717,6 +718,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preview the diff as if `scaffold apply --skip-nagger` were run.",
     )
     scaffold_diff.set_defaults(func=cmd_scaffold_diff)
+
+    scaffold_canonical = scaffold_sub.add_parser(
+        "canonical",
+        help=(
+            "Render or drift-check the canonical-sourced router templates. "
+            "Operates on the mozyo-bridge source tree (`--repo`, default cwd); "
+            "use `render` to regenerate `_router/AGENTS.md` and `_router/CLAUDE.md` "
+            "from `scaffold/canonical_sources/router.yaml`, or `--check` to "
+            "verify the committed outputs match (exit 1 on drift)."
+        ),
+    )
+    add_repo_option(scaffold_canonical)
+    scaffold_canonical.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Re-render every canonical source in memory and compare against "
+            "the committed output. Exit 1 on drift; writes nothing."
+        ),
+    )
+    scaffold_canonical.set_defaults(func=cmd_scaffold_canonical)
 
     scaffold_status = scaffold_sub.add_parser("status")
     add_scaffold_target_option(scaffold_status)

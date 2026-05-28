@@ -1,0 +1,62 @@
+# Canonical source for the tool-specific scaffold router templates
+# (AGENTS.md for Codex, CLAUDE.md for Claude Code). Generated outputs
+# live under `src/mozyo_bridge/scaffold/presets/_router/`; regenerate
+# with `mozyo-bridge scaffold canonical render` and verify drift with
+# `mozyo-bridge scaffold canonical check`.
+#
+# Fragments are concatenated in declaration order; a fragment emits
+# only when every `when` key/value matches the active output context.
+
+id: router
+
+description: |
+  Single source of truth for AGENTS.md and CLAUDE.md router templates.
+  The router pair stays nearly identical in structure, but the bytes
+  differ by tool: title and intro paragraph, the project-local-docs
+  hint in the session-start step list, the inline guardrail body
+  (Preset + Guardrails for Codex; ClaudeCode reminder block for
+  Claude), and the project-local-additions hint comment.
+
+outputs:
+  - target: presets/_router/AGENTS.md
+    context:
+      tool: codex
+  - target: presets/_router/CLAUDE.md
+    context:
+      tool: claude
+
+fragments:
+  - id: title_intro
+    when:
+      tool: codex
+    body_file: bodies/title_codex.md
+  - id: title_intro
+    when:
+      tool: claude
+    body_file: bodies/title_claude.md
+  - id: session_start
+    body_file: bodies/session_start.md
+  - id: step_close
+    when:
+      tool: codex
+    body_file: bodies/step_close_codex.md
+  - id: step_close
+    when:
+      tool: claude
+    body_file: bodies/step_close_claude.md
+  - id: tool_body
+    when:
+      tool: codex
+    body_file: bodies/body_codex.md
+  - id: tool_body
+    when:
+      tool: claude
+    body_file: bodies/body_claude.md
+  - id: project_local
+    when:
+      tool: codex
+    body_file: bodies/project_local_codex.md
+  - id: project_local
+    when:
+      tool: claude
+    body_file: bodies/project_local_claude.md

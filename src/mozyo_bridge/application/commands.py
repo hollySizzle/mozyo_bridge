@@ -1743,6 +1743,49 @@ def cmd_docs_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
+    """Render or check the canonical-sourced scaffold artifacts.
+
+    Operates on the mozyo-bridge source tree pointed at by ``--repo``
+    (default cwd). ``--check`` re-renders every canonical source and
+    fails on drift; without ``--check`` the rendered outputs are
+    written to disk.
+    """
+    from mozyo_bridge.scaffold.canonical import (
+        collect_render_results,
+        write_render_results,
+    )
+
+    repo_root = repo_root_from_args(args)
+    results = collect_render_results(repo_root)
+    check_only = bool(getattr(args, "check", False))
+
+    def _relative(path: Path) -> str:
+        try:
+            return path.relative_to(repo_root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    if check_only:
+        drifted = [result for result in results if result.drift]
+        if drifted:
+            for result in drifted:
+                print(
+                    f"{_relative(result.output_path)} is {result.reason}; rerun "
+                    f"`mozyo-bridge scaffold canonical render`.",
+                    file=sys.stderr,
+                )
+            return 1
+        for result in results:
+            print(f"{_relative(result.output_path)} is up to date")
+        return 0
+
+    written = write_render_results(results)
+    for path in written:
+        print(_relative(path))
+    return 0
+
+
 def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
         audit_doc_impact,

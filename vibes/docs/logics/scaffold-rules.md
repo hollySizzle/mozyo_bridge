@@ -409,6 +409,21 @@ PyPI release との見分け:
 
 詳細な drift 状態の意味は本節の `Drift Detection` を正本にする。
 
+## Router Template Single Source
+
+`src/mozyo_bridge/scaffold/presets/_router/AGENTS.md` と `CLAUDE.md` は手作業で双子保守すると drift するため、`src/mozyo_bridge/scaffold/canonical_sources/router.yaml` を **canonical source** として一元管理する。tool (`codex` / `claude`) に応じた conditional fragment を canonical renderer が連結し、両 template を byte-equal に生成する。設計は `vibes/docs/logics/canonical-renderer.md` を読む。
+
+操作:
+
+```bash
+mozyo-bridge scaffold canonical          # 全 canonical source を render し template に書き戻す
+mozyo-bridge scaffold canonical --check  # drift を検出 (exit 1 で fail)
+```
+
+- `_router/AGENTS.md` / `_router/CLAUDE.md` は **generated artifact** として扱う。手編集禁止。canonical source 側を編集して `scaffold canonical` で再生成する。
+- 新規 canonical 出力 (skill router 雛形、preset workflow など) を増やす場合は canonical-renderer.md の Extending To New Outputs に従う。
+- canonical render は `scaffold apply` の **上流**。`scaffold apply` の downstream pipeline (`apply_project_local_preservation` 等) は引き続き `_router/*.md` を template として読む。両 layer は独立。
+
 ## Test Strategy
 
 Implementation tests should cover:

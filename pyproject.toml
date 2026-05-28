@@ -63,6 +63,12 @@ mozyo_bridge = [
     "scaffold/presets/*/files/.claude-nagger/**/*",
     "scaffold/presets/*/files/.claude-nagger/*",
     "scaffold/presets/*/files/.claude-nagger/.gitignore",
+    # Canonical conditional-renderer sources for the router pair
+    # (Redmine #10345). Outputs are committed under scaffold/presets/_router/;
+    # the YAML and adjacent body files travel with the wheel so an editable
+    # install can run `mozyo-bridge scaffold canonical {render,check}`.
+    "scaffold/canonical_sources/*.yaml",
+    "scaffold/canonical_sources/*/bodies/*.md",
 ]
 
 [tool.pytest.ini_options]

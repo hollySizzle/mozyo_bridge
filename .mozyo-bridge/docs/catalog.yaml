@@ -145,6 +145,17 @@ documents:
       - rule-docs-catalog-governance
       - spec-project-map
 
+  - id: logic-canonical-renderer
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/canonical-renderer.md
+    purpose: scaffold guardrail outputs を単一 canonical source から条件分岐生成する renderer の設計と drift 検出 contract。
+    audit_role: canonical_renderer_logic
+    related_document_refs:
+      - logic-scaffold-rules
+      - rule-docs-catalog-governance
+      - spec-project-map
+
   - id: logic-bootstrap
     type: logic
     status: active
@@ -318,6 +329,7 @@ file_conventions:
     severity: block
     document_refs:
       - logic-scaffold-rules
+      - logic-canonical-renderer
       - logic-bootstrap
       - rule-docs-catalog-governance
 
@@ -445,9 +457,11 @@ file_conventions:
     patterns:
       - vibes/docs/logics/scaffold-rules.md
       - vibes/docs/logics/bootstrap.md
+      - vibes/docs/logics/canonical-renderer.md
     severity: block
     document_refs:
       - logic-scaffold-rules
+      - logic-canonical-renderer
       - logic-bootstrap
       - rule-docs-catalog-governance
 

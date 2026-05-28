@@ -79,8 +79,8 @@ rules:
   - src/mozyo_bridge/scaffold/**
   - src/mozyo_bridge/application/doctor.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/bootstrap.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/canonical-renderer.md と @vibes/docs/logics/bootstrap.md
+    と @.mozyo-bridge/rules/docs_catalog_governance.yaml をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -203,9 +203,10 @@ rules:
   patterns:
   - vibes/docs/logics/scaffold-rules.md
   - vibes/docs/logics/bootstrap.md
+  - vibes/docs/logics/canonical-renderer.md
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/bootstrap.md と @.mozyo-bridge/rules/docs_catalog_governance.yaml
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/canonical-renderer.md と @vibes/docs/logics/bootstrap.md
+    と @.mozyo-bridge/rules/docs_catalog_governance.yaml をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
