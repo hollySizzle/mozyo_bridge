@@ -421,6 +421,20 @@ Use `none` when there is no durable ticket system. The full decision flow lives
 in `vibes/docs/logics/bootstrap.md`; preset semantics live in
 `vibes/docs/logics/scaffold-rules.md`.
 
+> **Repo-Local Guardrail Autonomous Lane (governed presets only)** — the
+> `redmine-governed` and `redmine-rails-governed` presets ship a Codex
+> autonomous-edit carve-out for `vibes/docs/rules/**`, `vibes/docs/logics/**`,
+> `vibes/docs/specs/**`, and `.mozyo-bridge/docs/catalog.yaml`. Inside the lane
+> Codex may edit without a pre-edit `codex_direct_edit` gate journal; instead
+> the preset requires a `codex_autonomous_edit` journal recorded with the
+> commit (`lane`, `changed_paths`, `intent`, `verification`, `commit_hash`,
+> `follow_up_review_required`). Distributed surfaces — `AGENTS.md`,
+> `CLAUDE.md`, `.mozyo-bridge/rules/**`, skills / plugins, packaged preset
+> templates, `src/**`, `tests/**` — stay under the standard gate. See the
+> preset's `### Repo-Local Guardrail Autonomous Lane` section for the policy,
+> and `vibes/docs/rules/codex-autonomous-guardrail-lane.md` in this repo for a
+> concrete adoption example.
+
 Install the central rules store:
 
 ```bash

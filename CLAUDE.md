@@ -48,17 +48,19 @@ Claude Code セッションの tool-specific 入口。Claude Code は本ファ�
   - `skills/mozyo-bridge-agent/references/safety.md`
   - `vibes/docs/logics/scaffold-rules.md`
   - `vibes/docs/logics/bootstrap.md`
+  - `vibes/docs/rules/codex-autonomous-guardrail-lane.md`
 
 ## Claude Code Role
 
 - Claude Code is the default implementer for normal development tasks AND for guardrail / docs / catalog scope work in this repository. Surfaces include:
   - Implementation files: `src/**`, `tests/**`, `docs/**`, `vibes/docs/**`, `README.md`, `RELEASE_NOTES.md`, release workflow, CLI behavior.
   - Guardrail / custom-instruction / scaffold-rule surfaces: `AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, `.mozyo-bridge/docs/catalog.yaml`, `.codex/skills/**`, `.claude/skills/**`, `skills/mozyo-bridge-agent/**`, `plugins/mozyo-bridge-agent/**`, scaffold packaged preset / router templates under `src/mozyo_bridge/scaffold/presets/**`.
+- Repo-Local Guardrail Autonomous Lane (Redmine #10338, mozyo-bridge product-wide policy distributed via `redmine-governed` / `redmine-rails-governed` presets): `vibes/docs/rules/**`, `vibes/docs/logics/**`, `vibes/docs/specs/**`, `.mozyo-bridge/docs/catalog.yaml` are a Codex-autonomous carve-out from the standard `codex_direct_edit` gate. Codex may edit these paths without a pre-edit gate journal; instead the central preset's `### Repo-Local Guardrail Autonomous Lane` section requires a `codex_autonomous_edit` journal recorded with the commit (lane / changed_paths / intent / verification / commit_hash / follow_up_review_required). Claude remains an allowed implementer for these paths and follows the standard Implementation Done / Review Request flow when handed off. The carve-out does NOT extend to `AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, skills, plugins, scaffold preset templates, `src/**`, or `tests/**`. See `vibes/docs/rules/codex-autonomous-guardrail-lane.md` for the repo-specific adoption details and the required verification commands when `.mozyo-bridge/docs/catalog.yaml` is touched.
 - Start normal development from the active Redmine issue and parent Feature / Epic, not from chat text alone.
 - Record Implementation Done and Review Request gates in Redmine before asking for Codex review. The Audit Handoff is mandatory for every Claude-implemented task, including doc-only and rule-only changes.
 - Do not mark an issue complete after implementation only. Review Gate, owner close approval, and commit hash record must exist before close.
 - `.mozyo-bridge/docs/file_conventions.generated.yaml` is generator output. Do NOT hand-edit it from Claude either. Change `.mozyo-bridge/docs/catalog.yaml` and regenerate with `mozyo-bridge docs generate-file-conventions`, then verify with `--check`.
-- When Codex receives a normal development or guardrail/docs/catalog request, the default action is a Claude handoff. Short imperative phrases (`進めて`, `対応して`, `Codex でやって`, `go ahead`, `please do it`) do not authorize a Codex direct edit — only a Redmine `codex_direct_edit` gate journal with `allowed_paths` does. If Claude receives those instructions, Claude implements; Codex does not get repurposed as the implementer for that surface.
+- When Codex receives a normal development or guardrail/docs/catalog request **outside the autonomous lane**, the default action is a Claude handoff. Short imperative phrases (`進めて`, `対応して`, `Codex でやって`, `go ahead`, `please do it`) do not authorize a Codex direct edit on those gated surfaces — only a Redmine `codex_direct_edit` gate journal with `allowed_paths` does. For autonomous-lane paths Codex may proceed directly and record `codex_autonomous_edit` instead. If Claude receives instructions targeting a gated surface, Claude implements; Codex does not get repurposed as the implementer for that surface.
 
 ## Verification And Commit
 

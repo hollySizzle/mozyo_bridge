@@ -58,6 +58,18 @@ documents:
       - logic-release-helper-contract
       - skill-release-reference
 
+  - id: rule-codex-autonomous-guardrail-lane
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/codex-autonomous-guardrail-lane.md
+    purpose: mozyo-bridge 配布 preset が定義する Repo-Local Guardrail Autonomous Lane の本 project 採用記録。
+    audit_role: codex_autonomous_guardrail_lane_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - rule-docs-catalog-governance
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-project-map
     type: spec
     status: active
@@ -245,6 +257,7 @@ file_conventions:
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
       - rule-project-agent-workflow
+      - rule-codex-autonomous-guardrail-lane
 
   - id: fc-public-readme
     name: public README and user-facing install guidance
@@ -389,6 +402,18 @@ file_conventions:
     document_refs:
       - rule-project-agent-workflow
       - spec-project-map
+      - skill-workflow-reference
+
+  - id: fc-codex-autonomous-guardrail-lane
+    name: Codex autonomous guardrail lane paths
+    patterns:
+      - vibes/docs/rules/**
+      - vibes/docs/logics/**
+      - vibes/docs/specs/**
+    severity: warn
+    document_refs:
+      - rule-codex-autonomous-guardrail-lane
+      - rule-project-agent-workflow
       - skill-workflow-reference
 
   - id: fc-agent-workflow-docs
