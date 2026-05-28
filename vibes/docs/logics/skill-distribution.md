@@ -67,9 +67,21 @@ canonical な skill 本体は `skills/mozyo-bridge-agent/` に置き、Claude pl
 
 operator-facing install command snippet (`claude plugin marketplace add hollySizzle/mozyo_bridge` / `claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user` / `pipx install mozyo-bridge` / `mozyo-bridge rules install` / Codex `$skill-installer https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent`) は README.md / 本 file / `vibes/docs/logics/bootstrap.md` / `vibes/docs/logics/scaffold-rules.md` の複数箇所に verbatim で出現する。これは exact-string copy であり audience-specific variant ではないため、1 箇所だけ更新されると user が doc 間で異なる copy-paste recipe を得る drift 実害がある。
 
-owner decision で README / ReleaseDocs 全体 canonical 化は対象外、また install 手順は user-facing readability を最重視するため canonical render / 共有 include は採用しない。代わりに最軽量機構として `tests/test_mozyo_bridge.py::InstallCommandConsistencyTest` が正本 install command 列を verbatim で pin し、`PINNED_INSTALL_COMMANDS` 表に列挙した各 command が列挙した各 doc に出現することを assert する。同 test は intentional な audience variant (`pipx install --force git+https://...` Beta Tester form) も pin し、PyPI 形式と git-main 形式が誤って同型化される regression も止める。
+owner decision で README / ReleaseDocs 全体 canonical 化は対象外、また install 手順は user-facing readability を最重視するため canonical render / 共有 include は採用しない。代わりに最軽量機構として `tests/test_mozyo_bridge.py::InstallCommandConsistencyTest` が正本 install command 列を **per-doc 出現回数** で pin する。`PINNED_INSTALL_OCCURRENCES` 表に各 (command, doc) → expected count を列挙し、`body.count(command)` が expected 値と一致することを assert する。intentional な audience variant (`pipx install --force git+https://...` Beta Tester form) も `INTENTIONAL_VARIANT_OCCURRENCES` で同じ count gate に乗せ、PyPI 形式と git-main 形式が誤って同型化される regression を止める。
 
-- 新規 doc に install command を追加する場合は `PINNED_INSTALL_COMMANDS` の paths tuple に追加する。
+#### 単数 occurrence drift の検出
+
+初版 (#10699 commit `2014e1a`) は `assertIn` ベースで「各 doc に少なくとも 1 回出現する」ことだけを pin していた。Codex correction review #51114 が unsound と指摘: 1 つの doc に N occurrences ある command で、その内 1 occurrence だけ drift しても残りの (N-1) occurrences が `assertIn` を満たし、test は pass してしまう (single-occurrence drift escape)。
+
+correction (#10699 commit `<this commit>`) で per-doc 出現回数を verbatim pin する形に書き換えた:
+
+- 1 occurrence drift → count が expected → expected - 1 にずれる → equality check が落ちる。
+- `test_count_gate_catches_single_occurrence_drift` は README の `claude plugin marketplace add hollySizzle/mozyo_bridge` (count = 2) の 1 occurrence だけ mutate した body を作り、count gate が落ちる一方で旧 `assertIn` gate は通っていたことを明示的に pin する meta-test。
+
+#### 運用
+
+- 新規 doc に install command を追加する場合は `PINNED_INSTALL_OCCURRENCES` の doc map に新 entry を追加し、初期 count を pin する。
+- 既存 doc の install command を増減する (例: 別 section に説明を追加して `mozyo-bridge rules install` 回数が 5 → 6 になる) 場合は同 test の expected count を同 commit で更新する。
 - 命令文字列を更新する (例: marketplace name 変更、scope flag 変更) 場合は同 test の command 文字列と全 doc を同 commit で更新する。
 - 共有 include / canonical render / 新規 logic doc は **意図的に追加しない**。drift 検出は unit test 層に集約する (`SkillCrossWorkspaceGuidanceTest` / `SkillWorkflowSemanticAnchorsTest` precedent と同じ)。
 

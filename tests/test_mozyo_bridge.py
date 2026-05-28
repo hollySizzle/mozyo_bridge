@@ -13533,132 +13533,185 @@ class InstallCommandConsistencyTest(unittest.TestCase):
     Owner decision explicitly excludes whole-file README / ReleaseDocs
     canonicalization. So drift is gated at the test layer — the lightest
     available mechanic — mirroring the `SkillCrossWorkspaceGuidanceTest`
-    / `SkillWorkflowSemanticAnchorsTest` pattern. The canonical commands
-    are listed here; each must appear verbatim in every doc in
-    REQUIRED_DOCS, and the test fails loudly when a doc drops or
-    rewrites it. A future consolidation that intentionally removes a
-    copy updates this list in the same commit.
+    / `SkillWorkflowSemanticAnchorsTest` pattern.
+
+    Codex correction review #51114 caught the soundness gap in the
+    original `assertIn`-based gate: a doc with N occurrences whose
+    single occurrence drifts still satisfies `assertIn` because the
+    other (N-1) occurrences remain. The fix is to pin **exact
+    occurrence counts** per (command, doc). One occurrence drifting
+    flips the count by 1 and fails the gate. The counts are small
+    (<10 per doc) and stable enough that intentional doc edits update
+    the same map in the same commit, mirroring how
+    `SkillWorkflowSemanticAnchorsTest` adds new markers.
 
     The intentionally audience-specific variants (`pipx install --force
     git+https://...` for Beta Tester Install, `claude plugin install
-    --scope <other>` for fallback paths) are NOT pinned here — they are
-    legitimate variants serving different scenarios.
+    --scope <other>` for fallback paths) are pinned separately so a
+    future edit cannot collapse them into the canonical form.
     """
 
-    # Each canonical install command appears verbatim in every doc in
-    # the second tuple. Adding a new doc that ships the command is
-    # additive (extend the tuple). Removing an occurrence is intentional
-    # and updates this list in the same commit.
-    PINNED_INSTALL_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Per (canonical command, doc) → expected exact occurrence count.
+    # Counts come from `str.count(command)` over the doc body. A 0 means
+    # the command must NOT appear in that doc (audience scope guard).
+    #
+    # Updating counts: when a doc legitimately gains or loses an
+    # install-command mention (prose addition, section removal, etc.),
+    # update the count in the same commit. The test failure message
+    # spells out the expected vs actual count to make the diff obvious.
+    PINNED_INSTALL_OCCURRENCES: tuple[tuple[str, dict[str, int]], ...] = (
         (
             "claude plugin marketplace add hollySizzle/mozyo_bridge",
-            (
-                "README.md",
-                "vibes/docs/logics/skill-distribution.md",
-                "vibes/docs/logics/bootstrap.md",
-            ),
+            {
+                "README.md": 2,
+                "vibes/docs/logics/skill-distribution.md": 4,
+                "vibes/docs/logics/bootstrap.md": 1,
+            },
         ),
         (
             "claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user",
-            (
-                "README.md",
-                "vibes/docs/logics/skill-distribution.md",
-                "vibes/docs/logics/bootstrap.md",
-            ),
+            {
+                "README.md": 2,
+                "vibes/docs/logics/skill-distribution.md": 4,
+                "vibes/docs/logics/bootstrap.md": 1,
+            },
         ),
         (
             "pipx install mozyo-bridge",
-            (
-                "README.md",
-                "vibes/docs/logics/skill-distribution.md",
-                "vibes/docs/logics/bootstrap.md",
-            ),
+            {
+                "README.md": 1,
+                "vibes/docs/logics/skill-distribution.md": 3,
+                "vibes/docs/logics/bootstrap.md": 2,
+                "vibes/docs/logics/scaffold-rules.md": 1,
+            },
         ),
         (
             "mozyo-bridge rules install",
-            (
-                "README.md",
-                "vibes/docs/logics/skill-distribution.md",
-                "vibes/docs/logics/bootstrap.md",
-                "vibes/docs/logics/scaffold-rules.md",
-            ),
+            {
+                "README.md": 5,
+                "vibes/docs/logics/skill-distribution.md": 5,
+                "vibes/docs/logics/bootstrap.md": 9,
+                "vibes/docs/logics/scaffold-rules.md": 9,
+            },
         ),
-        # Codex `$skill-installer` canonical URL. The full
-        # `tree/main/skills/...` form is what the user pastes; the
-        # branch ref (`main`) matters here, so the substring is
-        # pinned with the path intact.
+        # Codex `$skill-installer` invocation against the canonical
+        # GitHub skill path. The `$` shell sigil is included so the
+        # full operator-pasted command is pinned. The single
+        # skill-distribution occurrence is in the Install Command
+        # Drift subsection that records this gate's policy.
         (
             "$skill-installer https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent",
-            (
-                "README.md",
-                "vibes/docs/logics/bootstrap.md",
-            ),
+            {
+                "README.md": 1,
+                "vibes/docs/logics/skill-distribution.md": 1,
+                "vibes/docs/logics/bootstrap.md": 1,
+            },
         ),
         # The canonical-path string Codex must call the installer
-        # against. Wording around it differs by doc, but the URL
-        # itself is verbatim shared and is the most drift-prone
-        # field (a repo move would invalidate every occurrence at once).
+        # against. The URL is the most drift-prone token (a repo move
+        # would invalidate every occurrence at once) and appears in
+        # multiple wording shapes per doc; pinning the exact count
+        # catches a single-occurrence rename.
         (
             "https://github.com/hollySizzle/mozyo_bridge/tree/main/skills/mozyo-bridge-agent",
-            (
-                "README.md",
-                "vibes/docs/logics/skill-distribution.md",
-                "vibes/docs/logics/bootstrap.md",
-            ),
+            {
+                "README.md": 2,
+                "vibes/docs/logics/skill-distribution.md": 4,
+                "vibes/docs/logics/bootstrap.md": 1,
+            },
         ),
     )
 
-    # The Beta Tester Install variant is intentionally distinct from
-    # the PyPI `pipx install mozyo-bridge` form. Pin BOTH so a future
-    # edit that accidentally collapses them into the same form fails
-    # loudly — the variants serve different audiences (PyPI release vs
-    # GitHub main) and must remain distinguishable.
-    INTENTIONAL_VARIANTS: tuple[tuple[str, str], ...] = (
+    # Intentional audience-specific variants. Each (variant, doc) →
+    # expected count. The variant must remain present at the recorded
+    # count so an accidental collapse to the canonical PyPI form fails
+    # loudly. Beta Tester / GitHub main install + Fresh Install Smoke
+    # are intentionally distinguishable from the standard PyPI form.
+    INTENTIONAL_VARIANT_OCCURRENCES: tuple[tuple[str, dict[str, int]], ...] = (
         (
             "pipx install --force git+https://github.com/hollySizzle/mozyo_bridge.git",
-            "README.md",
+            {"README.md": 1},
         ),
     )
 
     def _read(self, relative: str) -> str:
         return (ROOT / relative).read_text(encoding="utf-8")
 
-    def test_canonical_install_commands_appear_verbatim_in_each_doc(self) -> None:
-        for command, paths in self.PINNED_INSTALL_COMMANDS:
-            for path in paths:
-                with self.subTest(command=command, doc=path):
-                    body = self._read(path)
-                    self.assertIn(
-                        command,
-                        body,
-                        msg=(
-                            f"{path} is missing the canonical install snippet "
-                            f"{command!r}. Either the doc dropped the command "
-                            f"(consolidation? — update PINNED_INSTALL_COMMANDS "
-                            f"in the same commit) or the command drifted from "
-                            f"the verbatim form pinned here."
-                        ),
+    def _assert_count(self, body: str, command: str, *, doc: str, expected: int) -> None:
+        actual = body.count(command)
+        self.assertEqual(
+            expected,
+            actual,
+            msg=(
+                f"{doc} occurrence count for {command!r} drifted: "
+                f"expected {expected}, found {actual}. "
+                f"Either one occurrence was rewritten while others stayed "
+                f"intact (single-occurrence drift — fix the rewrite), or "
+                f"a doc edit intentionally added/removed a mention "
+                f"(update PINNED_INSTALL_OCCURRENCES in the same commit). "
+                f"Codex review #51114 introduced count-pinning specifically "
+                f"to catch single-occurrence drift that assertIn missed."
+            ),
+        )
+
+    def test_canonical_install_commands_have_pinned_occurrence_counts(self) -> None:
+        for command, doc_counts in self.PINNED_INSTALL_OCCURRENCES:
+            for doc, expected in doc_counts.items():
+                with self.subTest(command=command, doc=doc):
+                    self._assert_count(
+                        self._read(doc), command, doc=doc, expected=expected
                     )
 
-    def test_intentional_install_variants_remain_distinct(self) -> None:
-        """The Beta Tester `--force git+...` form must stay distinguishable
-        from the standard PyPI form. A future edit that accidentally
-        rewrites Beta Tester to the standard form (or vice versa) loses
-        the audience distinction."""
-        for variant, path in self.INTENTIONAL_VARIANTS:
-            with self.subTest(variant=variant, doc=path):
-                body = self._read(path)
-                self.assertIn(
-                    variant,
-                    body,
-                    msg=(
-                        f"{path} lost the intentional install variant "
-                        f"{variant!r}. This form serves Beta Tester / "
-                        f"git-main install and must remain present to "
-                        f"avoid silently routing those operators through "
-                        f"the PyPI form."
-                    ),
-                )
+    def test_intentional_install_variants_have_pinned_occurrence_counts(self) -> None:
+        for variant, doc_counts in self.INTENTIONAL_VARIANT_OCCURRENCES:
+            for doc, expected in doc_counts.items():
+                with self.subTest(variant=variant, doc=doc):
+                    self._assert_count(
+                        self._read(doc), variant, doc=doc, expected=expected
+                    )
+
+    def test_count_gate_catches_single_occurrence_drift(self) -> None:
+        """Regression meta-test: prove the count-pinning gate detects
+        single-occurrence drift that the prior `assertIn` gate missed.
+
+        Codex correction review #51114 requested explicit proof that a
+        single-occurrence rewrite (one of N copies drifts while the
+        others stay verbatim) fails the gate. This test takes a real
+        doc with N > 1 occurrences of a pinned command, mutates the
+        FIRST occurrence in memory, and asserts the count delta would
+        fail the gate's equality check.
+        """
+        # Pick a command whose pinned count is > 1 in at least one doc.
+        # README.md has marketplace_add count == 2.
+        command = "claude plugin marketplace add hollySizzle/mozyo_bridge"
+        doc = "README.md"
+        expected = next(
+            counts[doc]
+            for cmd, counts in self.PINNED_INSTALL_OCCURRENCES
+            if cmd == command and doc in counts
+        )
+        self.assertGreater(
+            expected,
+            1,
+            msg="meta-test premise: pick a (command, doc) with count > 1",
+        )
+
+        body = self._read(doc)
+        # Mutate FIRST occurrence only (the typo a real reviewer might
+        # introduce when only updating one mention).
+        drifted_form = "claude plugin marketplace add hollyizzle/mozyo_bridge"
+        mutated = body.replace(command, drifted_form, 1)
+
+        # Sanity: the mutation was applied AND only the first occurrence
+        # was changed.
+        self.assertEqual(expected - 1, mutated.count(command))
+        self.assertEqual(1, mutated.count(drifted_form))
+
+        # The count gate fires on the (expected vs expected-1) mismatch.
+        # The prior `assertIn(command, mutated)` would still pass
+        # because (expected - 1) >= 1 (one intact occurrence remains).
+        self.assertNotEqual(expected, mutated.count(command))
+        self.assertIn(command, mutated)  # documents the gap assertIn left
 
 
 if __name__ == "__main__":
