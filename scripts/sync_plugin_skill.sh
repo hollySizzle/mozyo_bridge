@@ -56,7 +56,7 @@ if [ "$check_only" -eq 1 ]; then
   # directory is read-only.
   if [ ! -d "$dest" ]; then
     echo "plugin skill mirror missing: $dest" >&2
-    echo "Rerun '$(basename "$0")' (no --check) to regenerate the mirror." >&2
+    echo "Rerun 'scripts/sync_plugin_skill.sh' (no --check, from the repo root) to regenerate the mirror." >&2
     exit 1
   fi
   output=$(rsync -an --delete --itemize-changes "$src" "$dest")
@@ -64,7 +64,7 @@ if [ "$check_only" -eq 1 ]; then
     echo "plugin skill mirror drift detected; would change:" >&2
     echo "$output" >&2
     echo "" >&2
-    echo "Rerun '$(basename "$0")' (no --check) to regenerate the mirror." >&2
+    echo "Rerun 'scripts/sync_plugin_skill.sh' (no --check, from the repo root) to regenerate the mirror." >&2
     exit 1
   fi
   echo "plugin skill mirror is up to date"

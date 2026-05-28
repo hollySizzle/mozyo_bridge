@@ -9284,10 +9284,18 @@ class PluginMarketplaceTest(unittest.TestCase):
                     f"stderr={result.stderr!r}"
                 ),
             )
-            # Recovery hint must name the actual script so an operator can
-            # copy-paste it verbatim.
-            self.assertIn("sync_plugin_skill.sh", result.stderr)
+            # Recovery hint must be copy-paste runnable from the repo root,
+            # not just the basename. Codex review #50344 caught a regression
+            # where `$(basename "$0")` printed only `sync_plugin_skill.sh`,
+            # which fails with `command not found` when pasted into a
+            # repo-root shell. Pin the full `scripts/<name>` form so a
+            # future edit cannot quietly drop the directory prefix.
+            self.assertIn("scripts/sync_plugin_skill.sh", result.stderr)
+            self.assertIn("from the repo root", result.stderr)
             self.assertIn("references/workflow.md", result.stderr)
+            # And the bare basename without a directory prefix must never
+            # appear as a standalone recovery command.
+            self.assertNotIn("'sync_plugin_skill.sh'", result.stderr)
 
     def test_sync_script_check_mode_does_not_modify_worktree(self) -> None:
         """`--check` must be read-only — no rsync to disk."""
