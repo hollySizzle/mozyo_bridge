@@ -71,6 +71,10 @@ preset 側 schema をそのまま採用する。journal field の最小例:
 - 検証 task では Claude が実装し、Codex は lane を実際に 1 回以上利用して repo-local guardrail を更新する。`codex_autonomous_edit` journal が破綻なく回ることを durable record として残す。
 - 結果を Redmine issue に記録する。lane policy 自身に gap が見つかれば preset / project-local doc / catalog のいずれかへ follow-up issue を起票する。
 
+### 実施記録
+
+- 2026-05-28: Redmine #10344 を通常開発 task として選び、Claude が test-only commit `5b6201b3` を実装、Codex が review し、本 doc への追記を autonomous lane 実演として実施した。durable record は #10344 review gate と #10338 `codex_autonomous_edit` journal を参照する。
+
 ## 関連 Doc
 
 - distributed lane policy 本体: preset agent-workflow.md `### Repo-Local Guardrail Autonomous Lane`
