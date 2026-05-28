@@ -2880,6 +2880,59 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn(f"redmine\tmissing\t-\t{package_version('redmine')}\t", output)
             self.assertIn(f"none\toutdated\t0.0.0\t{package_version('none')}\t", output)
 
+    def test_rules_home_default_prints_portable_expression_only(self) -> None:
+        # Spoof a realistic operator $HOME and a custom env override to confirm
+        # the default output never leaks either of them. Stable text is what
+        # makes the output safe to paste into committed docs / snippets.
+        with patch.dict(
+            os.environ,
+            {"HOME": "/Users/example", "MOZYO_BRIDGE_HOME": "/Users/example/.mozyo_bridge_custom"},
+        ):
+            result, output = self.run_cli(["rules", "home"])
+
+        self.assertEqual(0, result)
+        self.assertEqual("${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}\n", output)
+        self.assertNotIn("/Users/example", output)
+        self.assertNotIn(".mozyo_bridge_custom", output)
+        self.assertNotIn(str(Path.home()), output)
+
+    def test_rules_home_resolved_honors_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            override = Path(tmp) / "custom_home"
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(override)}):
+                result, output = self.run_cli(["rules", "home", "--resolved"])
+
+            self.assertEqual(0, result)
+            self.assertEqual(f"{override.resolve()}\n", output)
+
+    def test_rules_home_resolved_expands_tilde_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "fake_home"
+            fake_home.mkdir()
+            env = {"HOME": str(fake_home)}
+            env_clear = {"MOZYO_BRIDGE_HOME": ""}
+            with patch.dict(os.environ, env), patch.dict(os.environ, env_clear, clear=False):
+                os.environ.pop("MOZYO_BRIDGE_HOME", None)
+                result, output = self.run_cli(["rules", "home", "--resolved"])
+
+            self.assertEqual(0, result)
+            self.assertEqual(f"{(fake_home / '.mozyo_bridge').resolve()}\n", output)
+
+    def test_rules_home_help_text_distinguishes_portable_and_resolved(self) -> None:
+        parser = build_parser()
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["rules", "home", "--help"])
+        help_text = stdout.getvalue()
+
+        # argparse wraps long descriptions; normalize whitespace before
+        # checking that the portable-vs-resolved distinction is documented.
+        flat = " ".join(help_text.split())
+        self.assertIn("${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}", flat)
+        self.assertIn("committed docs", flat)
+        self.assertIn("--resolved", flat)
+        self.assertIn("local diagnostics", flat)
+
     def test_scaffold_refuses_overwrite_by_default_and_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"

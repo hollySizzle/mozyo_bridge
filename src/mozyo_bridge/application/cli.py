@@ -23,6 +23,7 @@ from mozyo_bridge.application.commands import (
     cmd_notify_codex_review,
     cmd_read,
     cmd_resolve,
+    cmd_rules_home,
     cmd_rules_install,
     cmd_rules_status,
     cmd_docs_audit_impact,
@@ -615,6 +616,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rules_status.set_defaults(func=cmd_rules_status)
+    rules_home_help = (
+        "Print the mozyo-bridge home root. Default output is the portable "
+        "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` expression safe to paste "
+        "into committed docs. Use --resolved to expand the env override "
+        "and `~` for local diagnostics; that output may contain the "
+        "operator's $HOME and must not be committed."
+    )
+    rules_home = rules_sub.add_parser(
+        "home",
+        help=rules_home_help,
+        description=rules_home_help,
+    )
+    rules_home.add_argument(
+        "--resolved",
+        action="store_true",
+        help=(
+            "Print the resolved absolute path honoring MOZYO_BRIDGE_HOME "
+            "and expanding `~`. Intended for local debugging only; do not "
+            "paste the output into committed documents."
+        ),
+    )
+    rules_home.set_defaults(func=cmd_rules_home)
 
     scaffold = sub.add_parser(
         "scaffold",

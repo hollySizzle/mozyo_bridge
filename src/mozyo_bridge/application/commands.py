@@ -68,7 +68,9 @@ from mozyo_bridge.infrastructure.tmux_client import (
     source_tmux_conf,
 )
 from mozyo_bridge.scaffold.rules import (
+    PORTABLE_HOME_EXPRESSION,
     install_rules,
+    mozyo_bridge_home,
     render_scaffold_files,
     resolve_rules_store,
     rules_status,
@@ -1500,6 +1502,14 @@ def cmd_rules_status(args: argparse.Namespace) -> int:
         if row["status"] != "ok":
             ok = False
     return 0 if ok else 1
+
+
+def cmd_rules_home(args: argparse.Namespace) -> int:
+    if getattr(args, "resolved", False):
+        print(str(mozyo_bridge_home()))
+    else:
+        print(PORTABLE_HOME_EXPRESSION)
+    return 0
 
 
 def _skip_categories_from_args(args: argparse.Namespace) -> set[str]:

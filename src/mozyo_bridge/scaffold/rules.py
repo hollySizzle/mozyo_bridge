@@ -56,6 +56,12 @@ CENTRAL_MODE = "central"
 REPO_LOCAL_MODE = "repo-local"
 VALID_MODES = frozenset({CENTRAL_MODE, REPO_LOCAL_MODE})
 
+# Portable expression for the mozyo-bridge home root. Carries the
+# ${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge} fallback verbatim so committed
+# documents (routers, READMEs, generator output) never leak the operator's
+# resolved $HOME.
+PORTABLE_HOME_EXPRESSION = "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}"
+
 # Portable rule_path templates embedded into generated routers and the
 # manifest. Both forms must stay host-independent so the artifact can be
 # committed without leaking the operator's $HOME. Central mode keeps the
