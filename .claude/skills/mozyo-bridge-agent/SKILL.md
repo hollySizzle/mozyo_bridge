@@ -1,6 +1,6 @@
 ---
 name: mozyo-bridge-agent
-description: Follow the mozyo_bridge project workflow for Asana-driven work, Notion rules, release checks, and safe tmux notification handling. Use when working in the mozyo_bridge repository, preparing PyPI/TestPyPI releases, updating agent rules, or coordinating Claude/Codex work through mozyo-bridge.
+description: Follow the mozyo_bridge project workflow for ticket-driven work (Redmine or Asana, per the repo's scaffold preset), preset rule fetches, release checks, and safe tmux notification handling. Use when working in the mozyo_bridge repository, preparing PyPI/TestPyPI releases, updating agent rules, or coordinating Claude/Codex work through mozyo-bridge.
 ---
 
 # mozyo-bridge-agent
