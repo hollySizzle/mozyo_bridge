@@ -4846,7 +4846,32 @@ class MessageContractTest(unittest.TestCase):
 
         self.assertTrue(args.submit)
         self.assertEqual(0.2, args.submit_delay)
-        self.assertEqual(5.0, args.landing_timeout)
+        self.assertEqual(8.0, args.landing_timeout)
+
+    def test_landing_timeout_default_is_eight_seconds_for_tui_redraw(self) -> None:
+        # Redmine #10756: the landing-timeout default was raised 5.0 -> 8.0 to
+        # absorb Claude/Codex TUI redraw delay. The marker rail still returns
+        # as soon as the marker is observed, so this does not add success-path
+        # latency. read-lines and submit-delay defaults are intentionally
+        # unchanged. Pin the default across the parser surfaces that share the
+        # timing flags (message / notify-delivery / handoff send).
+        parser = build_parser()
+
+        message_args = parser.parse_args(["message", "%2", "hi"])
+        self.assertEqual(8.0, message_args.landing_timeout)
+        self.assertEqual(0.2, message_args.submit_delay)
+
+        notify_args = parser.parse_args(["notify-codex", "--target", "%2"])
+        self.assertEqual(8.0, notify_args.landing_timeout)
+        self.assertEqual(0.2, notify_args.submit_delay)
+        self.assertEqual(20, notify_args.read_lines)
+
+        handoff_args = parser.parse_args(
+            ["handoff", "send", "--to", "codex", "--source", "redmine", "--kind", "reply"]
+        )
+        self.assertEqual(8.0, handoff_args.landing_timeout)
+        self.assertEqual(0.2, handoff_args.submit_delay)
+        self.assertEqual(50, handoff_args.read_lines)
 
     def test_message_submits_enter_when_marker_wraps_in_capture(self) -> None:
         # Receiver TUI (codex / claude code) word-wraps long input at the

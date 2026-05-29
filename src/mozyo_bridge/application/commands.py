@@ -402,7 +402,7 @@ def cmd_message(args: argparse.Namespace) -> int:
     header = f"[mozyo-bridge from:{sender_id} pane:{sender} at:{pane_location(sender)}]"
     run_tmux("send-keys", "-t", target, "-l", "--", f"{header} {args.text}")
     if getattr(args, "submit", True):
-        landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
+        landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
         read_lines = int(getattr(args, "read_lines", 50) or 50)
         landing_lines = max(read_lines, 200)
         if not wait_for_text(target, header, landing_lines, landing_timeout):
@@ -837,7 +837,7 @@ def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_k
         mode=MODE_QUEUE_ENTER,
         summary=summary,
         force=bool(getattr(args, "force", False)),
-        landing_timeout=float(getattr(args, "landing_timeout", 5.0) or 5.0),
+        landing_timeout=float(getattr(args, "landing_timeout", 8.0) or 8.0),
         submit_delay=float(getattr(args, "submit_delay", 0.2) or 0.0),
         read_lines=int(getattr(args, "read_lines", 50) or 50),
         record_format=getattr(args, "record_format", RECORD_FORMAT_BOTH),
@@ -1333,7 +1333,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         _emit_outcome(outcome, record_format=record_format, command=record_command)
         return 0
 
-    landing_timeout = float(getattr(args, "landing_timeout", 5.0) or 5.0)
+    landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
     landing_lines = max(read_lines, 200)
     marker_observed = wait_for_text(target, marker, landing_lines, landing_timeout)
 

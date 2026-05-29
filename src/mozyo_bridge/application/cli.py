@@ -96,7 +96,17 @@ def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required:
     parser.add_argument("--target")
     parser.add_argument("--prompt")
     parser.add_argument("--read-lines", type=int, default=20)
-    parser.add_argument("--landing-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--landing-timeout",
+        type=float,
+        default=8.0,
+        help=(
+            "Seconds to wait for the header marker to render in the target "
+            "pane before pressing Enter. Larger values absorb Claude/Codex "
+            "TUI redraw delay; the command proceeds as soon as the marker is "
+            "observed. Marker observation is not a delivery guarantee."
+        ),
+    )
     parser.add_argument("--submit-delay", type=float, default=0.2, help="Seconds to wait after text is observed before pressing Enter")
     parser.add_argument("--force", action="store_true", help="Allow sending to a non-agent-looking pane")
 
@@ -376,8 +386,15 @@ def build_parser() -> argparse.ArgumentParser:
     message.add_argument(
         "--landing-timeout",
         type=float,
-        default=5.0,
-        help="Seconds to wait for the header marker to appear in the target pane before pressing Enter",
+        default=8.0,
+        help=(
+            "Seconds to wait for the header marker to render in the target "
+            "pane before pressing Enter. Larger values absorb Claude/Codex "
+            "TUI redraw delay; the command proceeds as soon as the marker is "
+            "observed. Marker observation is not a delivery guarantee. "
+            "Claude TUI redraw-delay environments may also want "
+            "`--submit-delay 0.5`."
+        ),
     )
     message.add_argument(
         "--submit-delay",
@@ -495,7 +512,17 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Allow sending to a non-agent-looking pane",
         )
-        parser_.add_argument("--landing-timeout", dest="landing_timeout", type=float, default=5.0)
+        parser_.add_argument(
+            "--landing-timeout",
+            dest="landing_timeout",
+            type=float,
+            default=8.0,
+            help=(
+                "Seconds to wait for the landing marker to render before "
+                "pressing Enter. Larger values absorb Claude/Codex TUI redraw "
+                "delay; delivery proceeds as soon as the marker is observed."
+            ),
+        )
         parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
         parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
         parser_.add_argument(
