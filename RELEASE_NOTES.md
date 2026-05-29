@@ -8,16 +8,29 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.2 - 2026-05-29
+
+v0.5.2 は、v0.5.1 以降に入った LLM instruction runtime の健全化と、この repository 自身の governed scaffold 追従、handoff の体感改善をまとめた increment です。機能の大きな追加ではなく、runtime guardrail が想定どおり読まれ・配布物と repo が揃い・Claude TUI 環境で誤失敗しにくくなる、という運用品質の底上げが中心です。
+
 ### 変更点
 
 - project Claude skill mirror (`.claude/skills/mozyo-bridge-agent/**`) を canonical (`skills/mozyo-bridge-agent/`) と同期し、`SKILL.md` の `description` と `references/` 一式 (`safety.md` / `workflow.md` / `project-map.md` / `release.md`) を最新化しました。あわせて、project skill を precedence で override していた deprecated な legacy global skill (`~/.claude/skills/mozyo-bridge-agent`) を整理し、`mozyo-bridge doctor` の `claude_skill` warning を解消しました (`doctor` が `claude_skill: ok` / `ok=true` を返す状態)。(#10744)
 - 入口 router (`AGENTS.md` / `CLAUDE.md`) に、central preset を読む前の bootstrap として `mozyo-bridge rules home --resolved` の使い方を短く明記しました。committed docs には portable な `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 表記を残し、runtime で実ファイルを読むときだけ `--resolved` 出力に `/rules/presets/<preset>/agent-workflow.md` を連結します。あわせて catalog resolver (`mozyo-bridge docs resolve`) の使用契約を central workflow / skill workflow 側に明文化し、governed preset version を `2026.05.29.1` に更新しました。(#10746)
+- この repository 自身の root scaffold を、現行の `redmine-governed` preset (`2026.05.29.1`) に追従させました。`AGENTS.md` / `CLAUDE.md` に `rules home --resolved` の runtime bootstrap 文言を反映し、`.mozyo-bridge/scaffold.json` の preset metadata (`preset_version` / `generated_by` / router hashes) を再生成結果へ更新しました。mode は `central` のまま、project-local 追記は保持しています。(#10745)
+- Redmine default project の startup 設定を docs 化しました。`<repo>/.mozyo-bridge/workspace-defaults.yaml` と `redmine-defaults.md` を正本に、agent が起動時に default project を解決する手順を README / `vibes/docs/logics/bootstrap.md` に明記し、verified / unverified default の扱いを揃えました。(#10753)
+- `mozyo-bridge message` / `notify-*` / `handoff send` の `--landing-timeout` default を `5.0` から `8.0` 秒へ引き上げました。Claude / Codex TUI の描画遅延で marker 観測が間に合わず誤失敗するケースを減らすためで、marker を観測した時点で即座に進むため正常時の待ち時間は増えません。`read-lines` と `submit-delay` の default は据え置き、CLI help text に Claude TUI 環境向けの `--submit-delay 0.5` 推奨を併記しました。strict rail の rollback / fail-closed と queue-enter semantics は変更していません。(#10756)
 
 ### なぜ必要だったか
 
 #10744 は、LLM instruction runtime の health check (`mozyo-bridge doctor`) が `claude_skill: warning` で `ok=false` を返していた問題を解消するためのものです。warning は、personal scope の legacy global skill が project skill を precedence で override していたことと、project mirror が canonical から drift していたことの複合でした。canonical を source of truth とした mirror 同期と legacy global の整理により、runtime guardrail が想定どおりの skill 内容で読まれる状態へ戻しています。
 
 #10746 は、router が portable 表記で central preset を指していても、LLM が実ファイルを読むには rules home の resolved path が必要になる、という bootstrap の段差を埋めるためのものです。「committed docs に貼ってよい portable 表記」と「runtime でだけ使う resolved path」を入口で明確に分け、catalog resolver も「いつ・何のために使うか」を workflow / skill 側の実行契約として書くことで、agent が作業開始時に正本 docs へ迷わず辿り着けるようにしました。
+
+#10745 は、#10746 で canonical / packaged 側に入れた bootstrap 文言と preset version が、この repository 自身の root router にはまだ反映されていなかった drift を解消するためのものです。mozyo_bridge は自分自身の governed preset を dogfood する repo であり、配布物と repo の入口が食い違ったままだと、ここで作業する agent が古い router を正本として読んでしまいます。root を現行 preset に揃えることで、配布する内容とこの repo で実際に読まれる内容を一致させました。
+
+#10753 は、default project の解決を agent の推測に委ねず、検証済みの正本ファイルに寄せるためのものです。起動時にどの Redmine project を default とするかが docs 化されていないと、issue 作成や検索の宛先がぶれます。`workspace-defaults.yaml` を単一の入力とし、verified / unverified を明示することで、未検証の default を誤って使う事故を防ぎます。
+
+#10756 は、Claude TUI の描画遅延環境で `mozyo-bridge message` の marker 観測が timeout し、実際には届いているのに誤って失敗扱いになるケースを減らすためのものです。polling rail は marker を観測した時点で即 return するため、default を 8.0 秒へ広げても正常時の体感 latency は増えません。`read-lines` を広げないのは、marker landing が内部で十分な capture window を別に使っており、読み取り範囲の拡大が主因に直接効かないためです。strict rail の安全性 (未観測時の rollback / fail-closed) は維持しています。
 
 ## v0.5.1 - 2026-05-29
 
