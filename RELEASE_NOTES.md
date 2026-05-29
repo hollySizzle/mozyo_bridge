@@ -8,8 +8,14 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.1 - 2026-05-29
+
+v0.5.1 は、v0.5.0 以降に積み上げた governed scaffold / docs catalog 周りの運用改善をまとめて出すリリースです。あわせて、commit される router / docs に個人ホームパスを貼る事故を減らす `rules home` CLI と、release 前の source tree hygiene を妨げていた fixture / docs 例の表現を整理しました。
+
 ### 変更点
 
+- `mozyo-bridge rules home` を追加しました。引数なしでは committed docs に貼れる portable な `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 表記だけを出力し、`--resolved` を付けたときだけ `MOZYO_BRIDGE_HOME` と `~` を展開した machine-local の絶対パスを出力します。help text と README で、どちらを docs に貼ってよいか / debug 専用かを明示しています。既存の `doctor` / `rules status` の動作は変えていません。
+- workspace-defaults renderer の credential-shape rejection テストと、その説明 docs (`vibes/docs/logics/workspace-defaults-renderer.md`) を、release tree hygiene scanner と両立する表現へ整理しました。テストは credential-shape 文字列を実行時に組み立てる形にし、docs は `<value>` placeholder 表記にすることで、tracked source に release-blocking な literal を残さずに「credential 代入形は拒否される」という検証・説明を維持しています。real secret detection は一切弱めていません (scanner / renderer のロジックは未変更、broad な allowlist も追加していません)。
 - 新しい scaffold preset `redmine-rails-governed` を追加しました。`redmine-rails` を継承しつつ、full guardrail governance package を opt-in で被せられます。
 - `scaffold apply redmine-rails-governed` は target repo の `.mozyo-bridge/` 配下に rule files と docs catalog skeleton (`catalog.yaml.example`) を配布します。docs catalog tooling (validator / resolver / generator / impact checker) は target repo に vendor copy せず、`mozyo-bridge` package に同梱された `mozyo-bridge docs ...` CLI として提供されます。配布された artifact は scaffold manifest に登録され、`scaffold status` が drift を検出します。
 - docs catalog に `coverage_roots` field を追加しました。`mozyo-bridge docs validate --check-file-coverage` は catalog 側 roots を読みつつ、CLI `--coverage-root` が指定された場合は CLI 側が優先されます。
@@ -22,6 +28,10 @@
 - governed preset 配布の `.mozyo-bridge/tmux/agent-ui.conf` を host 側 tmux 設定 (`~/.tmux.conf` など) から安全に source できる新 subcommand `mozyo-bridge tmux-ui {install,uninstall,status}` を追加しました。**operator の既存 tmux 設定を丸ごと上書きせず**、`# >>> mozyo-bridge tmux-ui >>>` / `# <<< mozyo-bridge tmux-ui <<<` で囲んだ管理ブロックだけを安全に追加 / 更新 / 削除します。ブロック内部は `if-shell` で snippet の存在を確認してから `source-file` するため、repo を移動・削除しても tmux 起動が壊れません。同じ repo path への 2 回目の install は no-op で、`uninstall` は byte-for-byte で原状復元します。`--dry-run` / `--backup` / `--force` をサポートし、`status --json` は drift 時に exit 1 を返します。`doctor` の `tmux.artifact.host_wiring` セクションでも同じ状態 (`not-installed` / `installed` / `drift`) と推奨復旧コマンドを表示します。
 
 ### なぜ必要だったか
+
+`rules home` を追加したのは、`AGENTS.md` / `CLAUDE.md` のような commit される router 文書に、operator の `/Users/<name>/...` のような解決済み絶対パスが紛れ込む事故を減らすためです。これまで mozyo-bridge home を確認する手段は `doctor` / `rules status` で、いずれも resolved な絶対パスを表示していました。docs に貼る portable 表記と、手元 debug 用の resolved path を 1 つの CLI で明確に分けることで、「確認のつもりで出した出力をそのまま docs に貼る」経路を断ちます。`--resolved` 出力は意図的に絶対パスを出すため、help text と README に「committed docs には貼らない」注意を併記しています。
+
+credential-shape fixture / docs 例の整理は、release 直前の source tree hygiene gate (`release check tree`) が、実 secret ではない rejection テスト fixture と説明用 docs 例で blocker を出していた問題を解消するためです。これらは「credential 形の入力は拒否される」ことを保証・説明するために必要な文字列でしたが、tracked source に credential 代入形の literal が残ると release scanner が誤検知します。テスト側は実行時に文字列を組み立て、docs 側は placeholder 表記にすることで、検証・説明の意図を保ったまま scanner を green にしました。real secret detection を弱めない形 (scanner / renderer 本体は未変更) で両立させた点が要点です。
 
 `redmine-rails` preset は薄い router を維持するために、強い gate 文言や docs catalog tooling を project-local layer に委ねていました。実運用で full governance を即時に被せたい project にはこの分離が手数になっていたため、opt-in の governed preset として配布できる形にしました。実運用プロジェクトで実績のある guardrail から、固有業務ドメインや固定 path を取り除き、汎用 Rails+Redmine project に被せられる素材だけを残しています。
 
