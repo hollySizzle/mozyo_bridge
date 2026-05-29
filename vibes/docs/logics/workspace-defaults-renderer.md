@@ -99,6 +99,61 @@ mozyo-bridge workspace-defaults --check [--repo <root>]    # drift check (exit 1
 - `--check` は generated output を rerender し on-disk と比較。差異があれば exit 1、stderr に出力 path + 復旧 command (`mozyo-bridge workspace-defaults` no `--check`, from the repo root) を verbatim で出す。#10345 / #10663 correction の precedent に従う。
 - input YAML が無い場合は die し、schema doc (本 file) を参照する hint を出す。
 
+## LLM Startup Placement Guidance
+
+LLM startup の責務は、workspace-local default project の **存在確認、
+配置先確認、検証** である。どの業務をどの Redmine project に置くか、project
+が無い場合どの parent の下へ作るか、Epic / Feature / UserStory をどう切るかは
+distributed `mozyo_bridge` 側で決めない。そこは target workspace / owner の
+判断であり、agent は未設定なら推測せず operator に確認する。
+
+Startup sequence:
+
+1. `<repo>/.mozyo-bridge/redmine-defaults.md` があれば読む。verified default が
+   ある場合でも、明示 `project_id` が user / ticket / MCP call にあればそれを
+   優先する。
+2. generated snippet が無い場合は `<repo>/.mozyo-bridge/workspace-defaults.yaml`
+   の有無を確認する。YAML があれば `mozyo-bridge workspace-defaults` と
+   `--check` で snippet を生成・検証する。
+3. YAML も無い場合は、project identifier / display name / URL / optional parent
+   label を operator に確認する。Redmine project を推測で作成しない。
+4. credential / token / API key / cookie / password は workspace-local config、
+   generated snippet、ticket journal、chat output に書かない。認証は user-level
+   tool config または secret store に残す。
+5. agent / MCP runtime を再起動または reload した後、Redmine MCP を `project_id`
+   なしで呼び、default project が期待 identifier に解決されることを確認する。
+   比較として明示 `project_id` 付きでも呼び、同じ project になることを確認する。
+
+### `.codex/config.toml` example
+
+Codex 側で Redmine MCP default project を workspace-local に明示したい場合は、
+次のような TOML を target repo の `.codex/config.toml` に置ける。これは
+`workspace-defaults` renderer の出力ではなく、LLM startup / operator 向けの
+配置例である。
+
+```toml
+[redmine]
+default_project = "<project-identifier>"
+default_project_name = "<project display name>"
+default_project_url = "https://redmine.example.invalid/projects/<project-identifier>"
+
+[mcp_servers.redmine_epic_grid]
+url = "https://redmine.example.invalid/mcp/rpc"
+http_headers = { X-Default-Project = "<project-identifier>" }
+```
+
+この file に API key、OAuth token、cookie、password、client secret を置かない。
+authenticated Redmine MCP server の credential は user-level Codex config または
+system-managed secret store に残す。agent は `.codex/config.toml` を作成・更新した
+場合、Codex restart 後に `project_id` なしの Redmine MCP call で default 解決を
+検証する。
+
+`.codex/config.toml` を自動生成したい場合は、新しい output kind (例:
+`codex_toml`) を追加する必要がある。既存 `redmine_markdown` kind で
+`.codex/config.toml` を target にすることは禁止されており、suffix gate が reject
+する。新 kind は TOML parse test、secret rejection、allowed suffix `.toml`、
+byte-equal / drift tests を同一 commit で追加する。
+
 ## `.mcd.json` Deferral
 
 acceptance criteria は次を要求する。

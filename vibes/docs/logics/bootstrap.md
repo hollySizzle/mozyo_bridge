@@ -29,6 +29,9 @@ In scope:
 - governed scaffold catalog setup (`catalog.yaml.example` -> `catalog.yaml`) and
   `mozyo-bridge docs ...` verification for projects that opt into
   `redmine-governed` or `redmine-rails-governed`.
+- workspace-local Redmine default project startup (`.mozyo-bridge/workspace-defaults.yaml`
+  -> `.mozyo-bridge/redmine-defaults.md`) and optional LLM/MCP runtime config
+  placement guidance.
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
 - per-preset isolated target smoke under `./tmp/mb-smoke-*` (non-destructive).
 - failure recovery for the symptoms an LLM is most likely to observe.
@@ -83,7 +86,16 @@ install the strongest preset everywhere.
      `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`.
    - Repo-local mode is for Dev Containers, Codespaces, or ephemeral-home
      workspaces where agents must read the preset from the repository itself.
-5. Plan verification before writing files.
+5. Plan workspace-local Redmine default project handling when Redmine is the
+   durable system.
+   - If `.mozyo-bridge/redmine-defaults.md` exists, read it before creating
+     Redmine issues without an explicit `project_id`.
+   - If default project config is missing, do not guess or create a Redmine
+     project. Ask the operator for the project name, identifier, URL, and
+     optional parent label.
+   - Keep business placement decisions in the target workspace / owner context,
+     not in distributed `mozyo_bridge` docs.
+6. Plan verification before writing files.
    - Every scaffolded repo needs `scaffold status` and `doctor --target`.
    - Governed repos additionally need `catalog.yaml` initialization,
      docs validation, file coverage, file-conventions generation, and generated
@@ -391,6 +403,71 @@ Catalog adoption is not complete until:
 
 If the project cannot maintain these checks, use the lightweight preset instead
 and record that full governance was intentionally not adopted.
+
+### Redmine default project startup
+
+For Redmine-backed projects, configure the workspace-local default project
+after scaffold and before final `doctor` verification. This does not decide
+which business work belongs in which Redmine project; that remains an
+operator / workspace decision. Bootstrap only records and verifies the selected
+default so LLM agents and MCP calls do not silently create issues in the wrong
+project.
+
+If the workspace already has the generated snippet, read it first:
+
+```bash
+test -f .mozyo-bridge/redmine-defaults.md && sed -n '1,160p' .mozyo-bridge/redmine-defaults.md
+```
+
+If it is missing, ask the operator for:
+
+- Redmine project identifier.
+- Redmine project display name.
+- Redmine project URL.
+- Optional parent project label.
+
+Then create or update `.mozyo-bridge/workspace-defaults.yaml` with those
+workspace-specific values and render the generated snippet:
+
+```bash
+mozyo-bridge workspace-defaults
+mozyo-bridge workspace-defaults --check
+```
+
+Do not store Redmine API keys, OAuth tokens, cookies, passwords, or other
+credentials in `.mozyo-bridge/workspace-defaults.yaml`, generated snippets,
+`.codex/config.toml`, `.mcp.json`, ticket journals, or chat output. Authentication
+belongs in user-level tool config or secret stores.
+
+Optional Codex workspace config may point Codex's Redmine MCP calls at the
+verified default project. Use only the project identifier and non-secret MCP URL:
+
+```toml
+[redmine]
+default_project = "<project-identifier>"
+default_project_name = "<project display name>"
+default_project_url = "https://redmine.example.invalid/projects/<project-identifier>"
+
+[mcp_servers.redmine_epic_grid]
+url = "https://redmine.example.invalid/mcp/rpc"
+http_headers = { X-Default-Project = "<project-identifier>" }
+```
+
+This file is a startup example, not a generated output kind. Do not point
+`workspace-defaults.yaml` at `.codex/config.toml` unless a future typed
+`codex_toml` renderer exists and validates TOML, suffixes, and secret rejection.
+
+Do not create `.mcp.json` as authoritative runtime config unless the target
+Claude / MCP runtime has been verified to read it. Until then, `.mcp.json`
+belongs in examples or project-local experiments only, and must not contain
+credentials.
+
+After restarting or reloading the relevant LLM/MCP runtime, verify the default
+project with a Redmine MCP call that omits `project_id`. A successful result
+must resolve to the same project identifier recorded in
+`.mozyo-bridge/redmine-defaults.md`. For comparison, repeat the call with the
+explicit `project_id` and confirm both results name the same project. If either
+check fails, stop and ask the operator to correct the workspace-local config.
 
 If `AGENTS.md` or `CLAUDE.md` already exists:
 
