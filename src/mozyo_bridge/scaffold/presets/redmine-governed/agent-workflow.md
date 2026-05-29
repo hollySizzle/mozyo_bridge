@@ -373,7 +373,8 @@ mozyo-bridge docs generate-file-conventions --check
 mozyo-bridge docs audit-impact --all-changed --check-generated
 ```
 
-- 変更対象 path が分かったら resolver を実行し、解決された docs 本文を読んでから実装・監査する。
+- **使用契約**: 作業対象 path が分かった時点で `mozyo-bridge docs resolve <path...>` を実行し、解決された docs 本文を **実装前 / review 前 / guardrail 変更前** に読んでから着手する。`docs resolve` は catalog の代替ではなく、その path に紐づく catalog エントリ (guardrail / spec / convention) を読むための入口である。
+- resolver が失敗した (catalog 不在 / path 未解決 / command 実行不能) 場合は、読んだふりをせず停止するか、Redmine journal に未確認事項として記録してから進める。
 - catalog 自体や file_convention pattern を変更した場合は validator と coverage check を通す。coverage roots の選択順序は **(1) CLI `--coverage-root`** が指定されていればそれ、**(2) catalog の `coverage_roots` field** が定義されていればそれ、**(3) validator 組み込み default**。CLI が catalog より優先される。project が該当 layer を持たない場合は missing root は `notice:` として印字されるだけで exit code には影響しない。project ごとの恒久指定は catalog 側に書く運用が望ましい。
 - file_conventions 生成物 (project が採用している場合) を変える場合は generator を実行し、drift check を通す。
 - staged commit 直前は `mozyo-bridge docs audit-impact --staged --check-generated` を通す。作業中の棚卸しでは `--all-changed`。

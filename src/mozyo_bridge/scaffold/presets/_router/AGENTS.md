@@ -6,7 +6,9 @@ Codex セッションの tool-specific 入口。Codex は本ファイルを nati
 
 1. 現在の working directory がこの project root またはその配下であることを確認する。
 2. mozyo-bridge の central preset rules を読む:
-   - `${rule_path}`
+   - committed docs では portable 表記 `${rule_path}` を使う。
+   - runtime で実ファイルを読む際は `mozyo-bridge rules home --resolved` の出力に `/rules/presets/${preset}/agent-workflow.md` を連結した絶対 path を読む。`--resolved` 出力は debug / runtime 用で、committed docs に貼らない。
+   - resolved path や central preset を読めない場合は、読んだふりをせず停止し、`mozyo-bridge rules install` 等の復旧を operator に求める。
 3. project-local docs (例: target project の README、codebase 規約 docs、運用 docs) が存在する場合は読む。これらの path は target project 側の任意の convention であり、mozyo-bridge の runtime 必須参照ではない。
 4. 非自明な作業を始める前に active な `${ticket_anchor_label}` を確認する。
 

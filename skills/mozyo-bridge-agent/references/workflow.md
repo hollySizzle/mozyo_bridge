@@ -48,6 +48,12 @@ System-specific entry points:
 - `vibes/docs/logics/` holds decision and release logic.
 - `vibes/docs/temps/` holds reusable templates.
 
+### Catalog Resolver Usage Contract
+
+- Once the target path(s) for a task are known, run `mozyo-bridge docs resolve <path...>` to surface the catalog-linked docs (guardrails / specs / conventions) for those paths.
+- Read the resolved docs before implementation, before review, and before any guardrail change. `docs resolve` is the entry point for reading the catalog, not a substitute for it.
+- If the resolver fails (no catalog, an unresolved path, or the command is unavailable), do not pretend to have read the docs: stop, or record the gap as an open item in the Redmine journal before proceeding.
+
 ## Handoff Lifecycle
 
 Use handoff only when the active project workflow or the user explicitly asks for another agent to participate.

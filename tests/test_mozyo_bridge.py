@@ -12349,13 +12349,19 @@ class CanonicalRendererTest(unittest.TestCase):
         self.assertIn("## Guardrails", codex)
         self.assertNotIn("ClaudeCode 起動時の最小 reminder", codex)
 
-        # The shared session-start opening (steps 1-2 + `${rule_path}`) is
-        # byte-shared between both renders.
+        # The shared session-start opening (steps 1-2 + `${rule_path}` and the
+        # `rules home --resolved` bootstrap sub-notes) is byte-shared between
+        # both renders.
         shared_opening = (
             "## セッション開始\n\n"
             "1. 現在の working directory がこの project root またはその配下であることを確認する。\n"
             "2. mozyo-bridge の central preset rules を読む:\n"
-            "   - `${rule_path}`\n"
+            "   - committed docs では portable 表記 `${rule_path}` を使う。\n"
+            "   - runtime で実ファイルを読む際は `mozyo-bridge rules home --resolved` の出力に "
+            "`/rules/presets/${preset}/agent-workflow.md` を連結した絶対 path を読む。"
+            "`--resolved` 出力は debug / runtime 用で、committed docs に貼らない。\n"
+            "   - resolved path や central preset を読めない場合は、読んだふりをせず停止し、"
+            "`mozyo-bridge rules install` 等の復旧を operator に求める。\n"
         )
         self.assertIn(shared_opening, codex)
         self.assertIn(shared_opening, claude)
