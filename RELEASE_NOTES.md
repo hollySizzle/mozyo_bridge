@@ -8,9 +8,26 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+### 変更点
+
+- project Claude skill mirror (`.claude/skills/mozyo-bridge-agent/**`) を canonical (`skills/mozyo-bridge-agent/`) と同期し、`SKILL.md` の `description` と `references/` 一式 (`safety.md` / `workflow.md` / `project-map.md` / `release.md`) を最新化しました。あわせて、project skill を precedence で override していた deprecated な legacy global skill (`~/.claude/skills/mozyo-bridge-agent`) を整理し、`mozyo-bridge doctor` の `claude_skill` warning を解消しました (`doctor` が `claude_skill: ok` / `ok=true` を返す状態)。(#10744)
+- 入口 router (`AGENTS.md` / `CLAUDE.md`) に、central preset を読む前の bootstrap として `mozyo-bridge rules home --resolved` の使い方を短く明記しました。committed docs には portable な `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 表記を残し、runtime で実ファイルを読むときだけ `--resolved` 出力に `/rules/presets/<preset>/agent-workflow.md` を連結します。あわせて catalog resolver (`mozyo-bridge docs resolve`) の使用契約を central workflow / skill workflow 側に明文化し、governed preset version を `2026.05.29.1` に更新しました。(#10746)
+
+### なぜ必要だったか
+
+#10744 は、LLM instruction runtime の health check (`mozyo-bridge doctor`) が `claude_skill: warning` で `ok=false` を返していた問題を解消するためのものです。warning は、personal scope の legacy global skill が project skill を precedence で override していたことと、project mirror が canonical から drift していたことの複合でした。canonical を source of truth とした mirror 同期と legacy global の整理により、runtime guardrail が想定どおりの skill 内容で読まれる状態へ戻しています。
+
+#10746 は、router が portable 表記で central preset を指していても、LLM が実ファイルを読むには rules home の resolved path が必要になる、という bootstrap の段差を埋めるためのものです。「committed docs に貼ってよい portable 表記」と「runtime でだけ使う resolved path」を入口で明確に分け、catalog resolver も「いつ・何のために使うか」を workflow / skill 側の実行契約として書くことで、agent が作業開始時に正本 docs へ迷わず辿り着けるようにしました。
+
 ## v0.5.1 - 2026-05-29
 
-v0.5.1 は、v0.5.0 以降に積み上げた governed scaffold / docs catalog 周りの運用改善をまとめて出すリリースです。あわせて、commit される router / docs に個人ホームパスを貼る事故を減らす `rules home` CLI と、release 前の source tree hygiene を妨げていた fixture / docs 例の表現を整理しました。
+v0.5.1 は、v0.5.0 で導入した governed scaffold / docs catalog 一式を package version として前進させた increment です。機能面の追加はなく、主な変更は version 表記を 0.5.0 から 0.5.1 へ上げたことです。
+
+当初の v0.5.1 リリースノートは v0.5.0 期に実装した内容まで取り込んでおり、release 単位の履歴としては境界が崩れていました。本ファイルではその内容を下の `## v0.5.0` セクションへ独立させ、v0.5.1 は実際の差分 (version の前進) に絞って記載しています。
+
+## v0.5.0 - 2026-05-29
+
+v0.5.0 は、v0.4.0 以降に積み上げた governed scaffold / docs catalog 周りの運用改善をまとめて出すリリースです。あわせて、commit される router / docs に個人ホームパスを貼る事故を減らす `rules home` CLI と、release 前の source tree hygiene を妨げていた fixture / docs 例の表現を整理しました。
 
 ### 変更点
 
