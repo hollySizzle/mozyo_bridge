@@ -126,11 +126,12 @@ Startup sequence:
 
 ### `.codex/config.toml` example
 
-Codex workspace が Redmine MCP を使う場合は、target repo の
-`.codex/config.toml` に verified default project があるか確認する。存在しない、
-または Redmine default が未設定なら operator に確認してから次のような TOML を置ける。
-これは `workspace-defaults` renderer の出力ではなく、LLM startup / operator
-向けの checkpoint / 配置例である。
+Codex workspace が Redmine MCP を使う場合は、target repo root の
+`<repo>/.codex/config.toml` に verified default project があるか確認する。home
+directory 側の config に workspace default を置かない。存在しない、または
+Redmine default が未設定なら operator に確認してから次のような TOML を置ける。
+これは `workspace-defaults` renderer の出力ではなく、LLM startup / operator 向けの
+checkpoint / 配置例である。
 
 ```toml
 [redmine]
@@ -155,22 +156,25 @@ system-managed secret store に残す。agent は `.codex/config.toml` を作成
 する。新 kind は TOML parse test、secret rejection、allowed suffix `.toml`、
 byte-equal / drift tests を同一 commit で追加する。
 
-## `.mcd.json` Deferral
+## `.mcp.json` Deferral
 
 acceptance criteria は次を要求する。
 
-> `.mcd.json` is not generated as an authoritative runtime config unless verified to be read by the target Claude/MCP environment; otherwise it is only documented as an example or deferred.
+> `.mcp.json` is not generated as an authoritative runtime config unless verified to be read by the target Claude/MCP environment; otherwise it is only documented as an example or deferred.
 
-現時点で mozyo_bridge repo は target Claude / MCP runtime が `.mcd.json` を読むことを **検証していない**。よって本 PR では `.mcd.json` の自動生成を **deferred** とし、本 renderer は emit しない。
+現時点で mozyo_bridge repo は target Claude / MCP runtime が repo root の
+`<repo>/.mcp.json` を読むことを **検証していない**。よって本 PR では `.mcp.json` の
+自動生成を **deferred** とし、本 renderer は emit しない。検証済み runtime で使う場合も
+配置先は home directory ではなく `<repo>/.mcp.json` とする。
 
-将来 `.mcd.json` を generated output に追加する場合は以下を満たしてから行う。
+将来 `.mcp.json` を generated output に追加する場合は以下を満たしてから行う。
 
 - 対象 Claude / MCP runtime が当該 path から default project を実際に読み込む経路を docs (公式 or 検証済 issue) で立証する。
 - workspace YAML に `outputs.mcp_config: enabled: true` を追加するための schema 拡張 (schema bump or 後方互換オプション) を本 file で定義する。
-- secret rejection を含む同じ load-validate-render pipeline を通す。`.mcd.json` に server credentials を書かないことを assert する test を追加する。
+- secret rejection を含む同じ load-validate-render pipeline を通す。`.mcp.json` に server credentials を書かないことを assert する test を追加する。
 - 検証手順を本 file に追記する (agent restart / MCP reload / 再現可能な確認 step)。
 
-検証なしの段階で `.mcd.json` を emit すると、agent が「実は読まれていない config」を fact として扱う risk がある。本 renderer はそれを避ける設計を選ぶ。
+検証なしの段階で `.mcp.json` を emit すると、agent が「実は読まれていない config」を fact として扱う risk がある。本 renderer はそれを避ける設計を選ぶ。
 
 ## Tests
 
@@ -192,7 +196,7 @@ acceptance criteria は次を要求する。
 
 ## Extending To New Outputs
 
-新規 output kind (例: project-local doc snippet、`.mcd.json` の verified-only 生成、Codex 向け TOML config) を追加する手順。**output kind を増やすことは config change ではなく code change である**。schema は kind を明示要求し、未知の kind は load 時に die する。これは Codex review #50989 が捕捉した、generic な `target` から非 Markdown content target に Markdown が書き込まれる footgun を schema 層で塞ぐためのものである。
+新規 output kind (例: project-local doc snippet、`.mcp.json` の verified-only 生成、Codex 向け TOML config) を追加する手順。**output kind を増やすことは config change ではなく code change である**。schema は kind を明示要求し、未知の kind は load 時に die する。これは Codex review #50989 が捕捉した、generic な `target` から非 Markdown content target に Markdown が書き込まれる footgun を schema 層で塞ぐためのものである。
 
 新 kind を追加する commit に含めるべきもの (5 点とも同 commit で同期):
 
@@ -200,7 +204,7 @@ acceptance criteria は次を要求する。
 2. **typed renderer の content 形式**: 生成する文字列は kind が含意する format (Markdown / TOML / JSON / etc.) として valid であること。test で format validation を pin する (例: TOML 出力は `tomllib.loads` でパース可能であることを assert)。
 3. **set 拡張と test**: `KNOWN_OUTPUT_KINDS` に追加し、`test_supported_kinds_list_is_pinned` を新 set で更新する。新 kind に対する render 結果 byte-equal / drift / 不正 schema reject の各 test を足す。
 4. **allowed-suffix 表**: `KIND_ALLOWED_SUFFIXES` に新 kind の許可 suffix set を 1 つ以上指定する。`test_kind_allowed_suffixes_table_is_pinned` を更新し、新 kind に対する mismatch reject / accept 双方の test を足す。
-5. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表 (renderer + allowed suffixes 列), Extending To New Outputs を更新する。`.mcd.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
+5. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表 (renderer + allowed suffixes 列), Extending To New Outputs を更新する。`.mcp.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
 
 config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `vibes/docs/temps/redmine-defaults.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい target の suffix は **既存 kind の allowed suffix set** に含まれていなければならず、`.codex/config.toml` のような非 Markdown path は schema 層で reject される。新しい format / config を要求する場合は新 kind を追加するルート (上記 5 点) を踏む。
 

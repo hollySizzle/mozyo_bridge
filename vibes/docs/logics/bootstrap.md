@@ -439,10 +439,12 @@ credentials in `.mozyo-bridge/workspace-defaults.yaml`, generated snippets,
 `.codex/config.toml`, `.mcp.json`, ticket journals, or chat output. Authentication
 belongs in user-level tool config or secret stores.
 
-For a Codex workspace that will use the Redmine MCP, check whether
-`.codex/config.toml` already declares the verified default project. If the file
-is missing or has no Redmine default, ask the operator before creating or
-updating it. Use only the project identifier and non-secret MCP URL:
+For a Codex workspace that will use the Redmine MCP, check whether the
+repo-root `<repo>/.codex/config.toml` already declares the verified default
+project. Do not put this workspace default in a home-directory config; it is a
+repo-local fact. If the file is missing or has no Redmine default, ask the
+operator before creating or updating it. Use only the project identifier and
+non-secret MCP URL:
 
 ```toml
 [redmine]
@@ -461,10 +463,11 @@ typed `codex_toml` renderer exists and validates TOML, suffixes, and secret
 rejection. If `.codex/config.toml` is created or updated, restart or reload
 Codex before verification.
 
-Do not create `.mcp.json` as authoritative runtime config unless the target
-Claude / MCP runtime has been verified to read it. Until then, `.mcp.json`
-belongs in examples or project-local experiments only, and must not contain
-credentials.
+When a target Claude / MCP runtime uses `.mcp.json`, place it at the repo root
+as `<repo>/.mcp.json`, not in the home directory. Do not treat it as
+authoritative runtime config unless the target runtime has been verified to read
+that repo-root file. Until then, `<repo>/.mcp.json` belongs in examples or
+project-local experiments only, and must not contain credentials.
 
 After restarting or reloading the relevant LLM/MCP runtime, verify the default
 project with a Redmine MCP call that omits `project_id`. A successful result
