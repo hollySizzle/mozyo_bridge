@@ -7,7 +7,7 @@
       "sha256": "a88052af5effaa155cf3636f94472c812ff42ca35ad1a61a4a2b79b824624b69"
     },
     ".claude-nagger/config.yaml.example": {
-      "sha256": "44cbab706464c834b731c1a7ecfc0d7ebfc83264050049455a443ae75a25d3f8"
+      "sha256": "be8d3ae72fa3f30f82f08aea72d7f1832a4206344bb5fad2f5806608c3905826"
     },
     ".claude-nagger/mcp_conventions.yaml.example": {
       "sha256": "75d559e0fcdf0e4828ac9c02e70dacef250538eb685d40409118b77d2f8383e3"
@@ -25,13 +25,13 @@
       "sha256": "d27aa1b8a0216654e14049a23b8b8d087b249d19a2a84725bd40587d5d69752a"
     },
     "AGENTS.md": {
-      "sha256": "940affc2eb4be869a65f91e832258ae72fce7c2758208cdb0e4c644162fda872"
+      "sha256": "f5c34eb2735575f6beae2b9eb731637d83306cbcddc5586b7b1983da7946bb4d"
     },
     "CLAUDE.md": {
       "sha256": "36f12ee2737642cb23d0573736885ed30f5fd737f66b420e77065a7b47b3ef60"
     }
   },
-  "generated_by": "mozyo-bridge 0.5.1",
+  "generated_by": "mozyo-bridge 0.5.2",
   "mode": "central",
   "preset": "redmine-governed",
   "preset_hash": "1ff23ccb4259c5ab28897e66d9da827a425be76448e771da20c75ba2b3f84950",
