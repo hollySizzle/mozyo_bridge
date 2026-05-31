@@ -439,8 +439,10 @@ credentials in `.mozyo-bridge/workspace-defaults.yaml`, generated snippets,
 `.codex/config.toml`, `.mcp.json`, ticket journals, or chat output. Authentication
 belongs in user-level tool config or secret stores.
 
-Optional Codex workspace config may point Codex's Redmine MCP calls at the
-verified default project. Use only the project identifier and non-secret MCP URL:
+For a Codex workspace that will use the Redmine MCP, check whether
+`.codex/config.toml` already declares the verified default project. If the file
+is missing or has no Redmine default, ask the operator before creating or
+updating it. Use only the project identifier and non-secret MCP URL:
 
 ```toml
 [redmine]
@@ -453,9 +455,11 @@ url = "https://redmine.example.invalid/mcp/rpc"
 http_headers = { X-Default-Project = "<project-identifier>" }
 ```
 
-This file is a startup example, not a generated output kind. Do not point
-`workspace-defaults.yaml` at `.codex/config.toml` unless a future typed
-`codex_toml` renderer exists and validates TOML, suffixes, and secret rejection.
+This file is a startup checkpoint and example, not a generated output kind. Do
+not point `workspace-defaults.yaml` at `.codex/config.toml` unless a future
+typed `codex_toml` renderer exists and validates TOML, suffixes, and secret
+rejection. If `.codex/config.toml` is created or updated, restart or reload
+Codex before verification.
 
 Do not create `.mcp.json` as authoritative runtime config unless the target
 Claude / MCP runtime has been verified to read it. Until then, `.mcp.json`

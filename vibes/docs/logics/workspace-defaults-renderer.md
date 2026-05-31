@@ -126,10 +126,11 @@ Startup sequence:
 
 ### `.codex/config.toml` example
 
-Codex 側で Redmine MCP default project を workspace-local に明示したい場合は、
-次のような TOML を target repo の `.codex/config.toml` に置ける。これは
-`workspace-defaults` renderer の出力ではなく、LLM startup / operator 向けの
-配置例である。
+Codex workspace が Redmine MCP を使う場合は、target repo の
+`.codex/config.toml` に verified default project があるか確認する。存在しない、
+または Redmine default が未設定なら operator に確認してから次のような TOML を置ける。
+これは `workspace-defaults` renderer の出力ではなく、LLM startup / operator
+向けの checkpoint / 配置例である。
 
 ```toml
 [redmine]
@@ -145,8 +146,8 @@ http_headers = { X-Default-Project = "<project-identifier>" }
 この file に API key、OAuth token、cookie、password、client secret を置かない。
 authenticated Redmine MCP server の credential は user-level Codex config または
 system-managed secret store に残す。agent は `.codex/config.toml` を作成・更新した
-場合、Codex restart 後に `project_id` なしの Redmine MCP call で default 解決を
-検証する。
+場合、Codex restart / reload 後に `project_id` なしの Redmine MCP call で default
+解決を検証する。
 
 `.codex/config.toml` を自動生成したい場合は、新しい output kind (例:
 `codex_toml`) を追加する必要がある。既存 `redmine_markdown` kind で
