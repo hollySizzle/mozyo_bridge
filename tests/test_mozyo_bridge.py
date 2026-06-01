@@ -14015,5 +14015,62 @@ class InstructionDoctorTest(unittest.TestCase):
         self.assertIs(mod._TOMLDecodeError, mod._toml.TOMLDecodeError)
 
 
+class BootstrapEntrypointDocsTest(unittest.TestCase):
+    """Redmine #10857: README is the install/bootstrap entrypoint.
+
+    Pins the refactor's intent so the docs cannot silently regress to
+    routing first-time readers straight into the deep bootstrap doc:
+    - README routes through `doctor` + `instruction doctor` first;
+    - README no longer calls bootstrap.md the canonical / read-first
+      entrypoint;
+    - bootstrap.md no longer self-describes as the canonical entrypoint
+      to read before README;
+    - the instruction-doctor FAQ lives in bootstrap.md.
+    """
+
+    def setUp(self) -> None:
+        self.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.bootstrap = (
+            ROOT / "vibes" / "docs" / "logics" / "bootstrap.md"
+        ).read_text(encoding="utf-8")
+
+    def test_readme_quick_start_routes_through_both_doctors(self) -> None:
+        quick_start = self.readme.split("## Quick Start", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("mozyo-bridge doctor --target .", quick_start)
+        self.assertIn(
+            "mozyo-bridge instruction doctor --target . --profile redmine-codex",
+            quick_start,
+        )
+        # The README states it is the entrypoint.
+        self.assertIn("entrypoint for install and bootstrap", quick_start)
+
+    def test_readme_does_not_call_bootstrap_the_canonical_entrypoint(self) -> None:
+        self.assertNotIn("canonical LLM-first bootstrap guide", self.readme)
+        self.assertNotIn("Read this first for end-to-end setup", self.readme)
+
+    def test_readme_links_instruction_doctor_failures_to_faq(self) -> None:
+        self.assertIn("instruction doctor` failures", self.readme)
+        for symptom in ("`<repo>/.codex/config.toml` is missing", "X-Default-Project"):
+            self.assertIn(symptom, self.readme)
+
+    def test_bootstrap_demoted_from_canonical_entrypoint(self) -> None:
+        # Must not re-assert "canonical entrypoint ... Read this BEFORE README".
+        self.assertNotIn("canonical entrypoint for", self.bootstrap)
+        self.assertIn("detailed stage-order / FAQ / troubleshooting reference", self.bootstrap)
+
+    def test_bootstrap_has_instruction_doctor_faq(self) -> None:
+        faq = self.bootstrap.split("### `instruction doctor` FAQ", 1)
+        self.assertEqual(2, len(faq), msg="instruction doctor FAQ section missing")
+        section = faq[1]
+        for needle in (
+            "config.toml is missing",
+            "X-Default-Project` mismatch",
+            ".mcp.json` is `info",
+            "home config must not",
+            "auto-fix vs",
+        ):
+            self.assertIn(needle, section, msg=f"FAQ missing {needle!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

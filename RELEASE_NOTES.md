@@ -8,6 +8,14 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+### 変更点
+
+- bootstrap docs の入口を整理しました。`README.md` の Quick Start を install / bootstrap の入口に戻し、最初に `mozyo-bridge doctor --target .` と `mozyo-bridge instruction doctor --target . --profile redmine-codex` を順に実行する判断順を README に置きました。`doctor`(toolchain health)と `instruction doctor`(repo-local LLM runtime config の合否正本)の責務差分、`instruction doctor` の代表的 failure(`.codex/config.toml` missing / `X-Default-Project` mismatch / `.mcp.json` deferral / credential 混入)と次に読む FAQ への導線を README に追加しています。`vibes/docs/logics/bootstrap.md` は「canonical entrypoint」から、詳細 stage order / FAQ / troubleshooting の reference へ降格し、`instruction doctor` FAQ(各 failure の原因・対処、home config 禁止理由、agent が自動修復してよい範囲と operator 確認が必要な範囲)を Stage 7 に追加しました。(#10857)
+
+### なぜ必要だったか
+
+#10857 は、最初に読む入口が深い docs 側(`bootstrap.md`)に残っていると、LLM が詳細 docs を読み飛ばして設定漏れを再発させる、という問題を断つためのものです。v0.5.3 で `instruction doctor` という機械判定が入ったので、README を入口にして「まず 2 つの doctor を実行し、結果で判断する」導線を一番上に置き、詳細・背景・失敗時の解釈は FAQ / troubleshooting へ降ろすことで、入口の軽さと詳細の網羅を両立させます。
+
 ## v0.5.3 - 2026-06-01
 
 v0.5.3 は、v0.5.2 以降に入った LLM instruction runtime / repo-local runtime config 周りの guardrail 強化をまとめた increment です。Claude / Codex が startup docs を読み飛ばしたり、別 workspace の default project を取り違えたりする運用事故を、docs の明確化と機械的な検査(`instruction doctor`)の両面で減らします。

@@ -4,10 +4,15 @@ LLM-first bootstrap for installing or updating `mozyo-bridge` through project
 initialization. Optimized for Claude / Codex agent execution: each stage names
 exact commands, expected success signals, and the failure branch.
 
-This is the canonical entrypoint for "install/update + project bootstrap". Read
-this BEFORE the install sections of `README.md`, `skill-distribution.md`, or
-`scaffold-rules.md`. Those docs remain the authoritative reference for their
-specific surfaces; this doc orders the stages and links into them.
+This is the detailed stage-order / FAQ / troubleshooting reference for
+"install/update + project bootstrap". The entrypoint is `README.md` `Quick
+Start`: run `mozyo-bridge doctor --target .` then
+`mozyo-bridge instruction doctor --target . --profile redmine-codex` first, and
+follow the link here when a step fails or you need the full stage sequence. This
+doc is no longer the first thing to read. `README.md`,
+`skill-distribution.md`, and `scaffold-rules.md` remain the authoritative
+reference for their specific surfaces; this doc orders the stages and links into
+them.
 
 The doc is also human-readable, but it does not duplicate prose available
 elsewhere. When a stage points at another doc, prefer following the link
@@ -627,10 +632,63 @@ The symptoms below are the ones an LLM is most likely to observe while executing
   - run bare `mozyo` from the repo root: `cd /path/to/repo && mozyo`. This creates `claude` and `codex` windows in a repo-scoped tmux session.
   - for an existing pane (VS Code tmux terminal, hand-managed tmux pane), run `mozyo-bridge init <agent>` from inside that pane to rename its window.
 
+### `instruction doctor` FAQ (repo-local LLM runtime config)
+
+`mozyo-bridge instruction doctor --target . --profile redmine-codex` is the
+machine check for a Redmine/Codex workspace's repo-root runtime config. It is
+read-only: it never creates, edits, or autofixes config, and it makes no network
+call. The README Quick Start runs it second (after `doctor`); the failures it
+reports and their fixes:
+
+- **`<repo>/.codex/config.toml is missing`**:
+  - cause: the workspace has no repo-root Redmine default project config. The
+    docs require this file at `<repo>/.codex/config.toml`, not in a home config.
+  - fix: an agent must **ask the operator before creating it** — the default
+    project is a workspace-specific fact, not something to guess. Once the
+    operator confirms the project identity, create the file with `[redmine]`
+    `default_project` / `default_project_name` / `default_project_url` and the
+    `[mcp_servers.redmine_epic_grid]` `url` + `http_headers.X-Default-Project`.
+    Restart / reload the runtime, then verify with a Redmine MCP call that omits
+    `project_id`.
+- **`X-Default-Project` mismatch**:
+  - cause: `http_headers.X-Default-Project` does not equal
+    `[redmine].default_project`. The MCP header and the declared default
+    disagree, so MCP calls resolve a different project than the docs claim.
+  - fix: an operator decides which value is correct and reconciles the two.
+    Do not silently pick one — a wrong default project routes issues/searches to
+    the wrong place.
+- **`.mcp.json` is `info` / non-authoritative**:
+  - reason: no runtime has been verified to read the repo-root `<repo>/.mcp.json`,
+    so the command reports its presence/absence as `info` and never fails on it
+    alone (deferral). `instruction doctor` still parses it and scans it for
+    credential shapes when present, but does not treat it as authoritative
+    runtime config. Treating an unread file as fact is the risk this avoids.
+- **home config must not hold the default project**:
+  - reason: a default project placed in a home-directory config leaks across
+    every workspace on the machine — opening a different repo would inherit the
+    wrong default. Repo-root placement (`<repo>/.codex/config.toml`,
+    `<repo>/.mcp.json`) isolates the default as a workspace-local fact.
+- **what an agent may auto-fix vs must confirm with an operator**:
+  - auto-fix (no confirmation): mechanical, reversible, fact-preserving edits
+    once the project identity is already established — e.g. correcting an
+    `X-Default-Project` header to match an operator-confirmed
+    `[redmine].default_project`, or removing an obviously misplaced credential.
+  - operator confirmation required: choosing or changing the default project
+    identity itself, creating `<repo>/.codex/config.toml` from scratch, or
+    anything that decides *which* project a workspace targets. `instruction
+    doctor` itself never writes; these are actions an agent takes only after the
+    check reports a failure and the operator has confirmed intent.
+
 ## Where this doc sits relative to the others
 
-- **This doc** owns the fresh-install stage order and the existing-install update path through a working scaffold + verified doctor + per-preset isolated smoke.
-- `README.md` `Quick Start` / `Beta Tester Install` / `Agent Skill Install` / `Agent Rules Scaffold` are the operator reference for the individual commands. Read README when you need a flag detail; read this bootstrap doc when you need the stage order.
+- **`README.md` `Quick Start`** is the entrypoint: install, then `doctor` +
+  `instruction doctor` first, with the `instruction doctor` failure summary.
+  Start there.
+- **This doc** is the detailed reference reached from the README: it owns the
+  fresh-install stage order, the existing-install update path through a working
+  scaffold + verified doctor + per-preset isolated smoke, and the failure /
+  `instruction doctor` FAQ. Read it when a Quick Start step fails or you need the
+  full stage sequence — not as the first doc.
 - `vibes/docs/logics/skill-distribution.md` is the source of truth for skill packaging, precedence, marketplace metadata, and drift.
 - `vibes/docs/logics/scaffold-rules.md` is the source of truth for scaffold preset semantics and manifest invariants.
 - `vibes/docs/logics/turnkey-e2e-acceptance.md` is the destructive post-release acceptance; not a bootstrap step.

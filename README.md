@@ -9,31 +9,80 @@ It is only a notification transport. Redmine remains the source of truth for rev
 
 ## Quick Start
 
-> First-time install + project bootstrap, executed end-to-end by Claude / Codex agents,
-> is documented in `vibes/docs/logics/bootstrap.md`. Read that doc to follow the
-> startup decision flow and the install → rules → skill → scaffold → catalog /
-> doctor stages in strict order. The sections below are operator-facing reference
-> material for the individual commands.
->
+This README is the entrypoint for install and bootstrap. Run the steps below
+first; follow the links into the detailed docs only when a step fails or you
+need the full stage order.
+
 > 人間向けのリリースノートは [`RELEASE_NOTES.md`](RELEASE_NOTES.md) にあります。
 
-Install the CLI:
+1. **Install the CLI** and confirm `tmux` is on `PATH`:
 
-```bash
-pipx install mozyo-bridge
-```
+   ```bash
+   pipx install mozyo-bridge
+   mozyo-bridge --version
+   ```
 
-Alternative install path:
+   Alternative install path:
 
-```bash
-python3 -m pip install mozyo-bridge
-python3 -m mozyo_bridge --help
-```
+   ```bash
+   python3 -m pip install mozyo-bridge
+   python3 -m mozyo_bridge --help
+   ```
 
-System dependency:
+2. **Run the two health checks, in order**, from your project root:
 
-- `tmux` must be installed and available on `PATH`.
-- Use `mozyo-bridge doctor` to check CLI, central rules, agent skills, scaffold, and tmux readiness in one command. Add `--target <project>` to also verify a scaffolded project. See `Beta Tester Install (GitHub main)` for the full acceptance smoke.
+   ```bash
+   # Toolchain health: CLI, central rules, agent skills, scaffold, tmux.
+   mozyo-bridge doctor --target .
+
+   # Repo-local LLM runtime config health (Redmine/Codex workspaces).
+   mozyo-bridge instruction doctor --target . --profile redmine-codex
+   ```
+
+3. **Read the result**:
+   - `doctor` exits non-zero on a toolchain gap (missing rules, skill, scaffold
+     drift, tmux). It prints the next command for each finding.
+   - `instruction doctor` is the source of truth for whether a Redmine/Codex
+     workspace's repo-root runtime config is correct. It is read-only: it never
+     creates, fixes, or writes config. On a failure, see
+     `instruction doctor` failures below and the FAQ it links to.
+
+For first-time install on a clean machine, or to follow the full
+install → rules → skill → scaffold → doctor stage order end-to-end, use
+`vibes/docs/logics/bootstrap.md` as the detailed stage-order / troubleshooting
+reference (it is no longer the first thing you read; this Quick Start is).
+
+### `doctor` vs `instruction doctor`
+
+- `mozyo-bridge doctor --target .` — toolchain readiness: CLI, central rules,
+  agent skills, scaffold manifest, tmux. Run this first.
+- `mozyo-bridge instruction doctor --target . --profile redmine-codex` —
+  repo-local LLM runtime config: `<repo>/.codex/config.toml` Redmine default
+  project, the `redmine_epic_grid` MCP header, and credential-shape hygiene of
+  `.codex/config.toml` / `.mcp.json`. This is the machine check that the
+  Redmine-Codex startup config actually exists and is consistent, so an agent
+  cannot silently skip it by skimming the docs.
+
+### `instruction doctor` failures
+
+`instruction doctor` is read-only and never autofixes. The common failures and
+the operator action they require:
+
+- **`<repo>/.codex/config.toml` is missing** — the workspace has no repo-root
+  Redmine default. Ask the operator before creating it; do not put it in a home
+  config. See the FAQ in `vibes/docs/logics/bootstrap.md`.
+- **`X-Default-Project` mismatch** — the MCP header and `[redmine].default_project`
+  disagree. One of them is wrong; an operator must reconcile them.
+- **`.mcp.json` present/absent** — reported as `info`, never a failure on its
+  own. `.mcp.json` stays non-authoritative until a runtime is verified to read
+  the repo-root file (deferral).
+- **credential-shape value** — a token/key/secret was found in a repo-local
+  config. Remove it; credentials belong in user-level config or a secret store,
+  never in `<repo>/.codex/config.toml` or `<repo>/.mcp.json`.
+
+Detailed cause/fix for each, plus the home-config-prohibition rationale and what
+an agent may auto-fix vs must confirm with an operator, is in
+`vibes/docs/logics/bootstrap.md` (`Stage 7 — Failure recovery and common pitfalls`).
 
 Use the full command in docs and durable task records:
 
@@ -697,8 +746,8 @@ mozyo-bridge doctor
 
 ## Documentation Map
 
-- `README.md`: user-facing install, core commands, and safety summary.
-- `vibes/docs/logics/bootstrap.md`: canonical LLM-first bootstrap guide. Strict stage order from a clean machine through a verified scaffold (install → rules → skill → scaffold → doctor → isolated smoke). Read this first for end-to-end setup.
+- `README.md`: install/bootstrap entrypoint, core commands, and safety summary. Start here; run `doctor` + `instruction doctor` first.
+- `vibes/docs/logics/bootstrap.md`: detailed LLM-first stage-order reference, FAQ, and troubleshooting. Strict stage order from a clean machine through a verified scaffold (install → rules → skill → scaffold → doctor → isolated smoke), plus `instruction doctor` failure recovery. Follow it from the README Quick Start when a step fails or you need the full sequence — it is no longer the first doc to read.
 - `vibes/docs/rules/agent-workflow.md`: AI agent work rules for this repository.
 - `vibes/docs/specs/project-map.md`: repository structure and source-of-truth routing.
 - `vibes/docs/logics/skill-distribution.md`: Claude/Codex skill layout and install logic.
