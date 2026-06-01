@@ -8,6 +8,10 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.3 - 2026-06-01
+
+v0.5.3 は、v0.5.2 以降に入った LLM instruction runtime / repo-local runtime config 周りの guardrail 強化をまとめた increment です。Claude / Codex が startup docs を読み飛ばしたり、別 workspace の default project を取り違えたりする運用事故を、docs の明確化と機械的な検査(`instruction doctor`)の両面で減らします。
+
 ### 変更点
 
 - Claude Nagger の config skeleton に、Redmine-governed implementer 向けの session `startup_checkpoint` を追加しました。作業開始時に自分の role と現在の gate を宣言し、Implementation Done で止まらず Review Request gate と Codex への通知まで進み、通知の delivery result(または blocked reason)を durable record に残すことを促します。両 governed preset (`redmine-governed` / `redmine-rails-governed`) の skeleton と repo root の配置を同期しています。あくまで reminder であり、強制はしません(durable contract は引き続き central preset の `agent-workflow.md`)。(#10795)
