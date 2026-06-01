@@ -13977,6 +13977,43 @@ class InstructionDoctorTest(unittest.TestCase):
             self.assertIn("instruction doctor: FAIL", out)
             self.assertIn("codex_config_present", out)
 
+    def test_target_defaults_to_mozyo_repo_env(self) -> None:
+        # Regression for Codex review #52114 Finding 2: with no --target, the
+        # command must honour MOZYO_REPO (matching the --target help text and
+        # the rest of the CLI's repo resolution), not just cwd.
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as cwd_tmp:
+            project = Path(repo_tmp)
+            self._write_codex(project, self.VALID_TOML)
+            prev_repo = os.environ.get("MOZYO_REPO")
+            prev_cwd = os.getcwd()
+            try:
+                os.environ["MOZYO_REPO"] = str(project)
+                os.chdir(cwd_tmp)  # cwd is a DIFFERENT dir with no .codex config
+                rc, out = self.run_cli(
+                    ["instruction", "doctor", "--profile", "redmine-codex", "--json"]
+                )
+                payload = json.loads(out)
+            finally:
+                os.chdir(prev_cwd)
+                if prev_repo is None:
+                    os.environ.pop("MOZYO_REPO", None)
+                else:
+                    os.environ["MOZYO_REPO"] = prev_repo
+            self.assertEqual(0, rc)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(str(project.resolve()), payload["target"])
+
+    def test_toml_parser_falls_back_for_python_310(self) -> None:
+        # Regression for Codex review #52114 Finding 1: the package supports
+        # Python >=3.10 but `tomllib` is stdlib only on 3.11+. The module must
+        # bind a TOML parser (tomllib on 3.11+, tomli on 3.10) rather than
+        # importing tomllib unconditionally.
+        from mozyo_bridge.application import instruction_doctor as mod
+
+        self.assertIn(mod._toml.__name__, ("tomllib", "tomli"))
+        self.assertTrue(hasattr(mod._toml, "loads"))
+        self.assertIs(mod._TOMLDecodeError, mod._toml.TOMLDecodeError)
+
 
 if __name__ == "__main__":
     unittest.main()

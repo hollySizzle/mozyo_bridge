@@ -29,7 +29,18 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mozyo_bridge.shared.paths import resolve_repo_root
 from mozyo_bridge.workspace_defaults import _is_secret_key, _value_looks_secret
+
+# `tomllib` is stdlib on Python 3.11+. The package supports >=3.10, so fall
+# back to the third-party `tomli` (same API) on 3.10. Resolved at import time
+# so a genuinely missing TOML parser surfaces clearly rather than at call time.
+try:  # Python 3.11+
+    import tomllib as _toml
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as _toml  # type: ignore[no-redef]
+
+_TOMLDecodeError = _toml.TOMLDecodeError
 
 # Status vocabulary for individual checks. `fail` drives a non-zero exit;
 # `warn` / `info` are surfaced but do not fail the command (the `.mcp.json`
@@ -102,12 +113,10 @@ def _codex_config_checks(target: Path) -> list[dict[str, str]]:
         return checks
     checks.append(_check("codex_config_present", STATUS_OK, f"{rel} exists"))
 
-    import tomllib  # 3.11+; resolved lazily so import errors localise here.
-
     try:
         raw_bytes = config_path.read_bytes()
-        parsed = tomllib.loads(raw_bytes.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        parsed = _toml.loads(raw_bytes.decode("utf-8"))
+    except (_TOMLDecodeError, UnicodeDecodeError) as exc:
         checks.append(
             _check("codex_config_parse", STATUS_FAIL, f"{rel} is not valid TOML: {exc}")
         )
@@ -308,7 +317,10 @@ def _mcp_json_checks(target: Path) -> list[dict[str, str]]:
 
 def run_instruction_doctor(args: argparse.Namespace) -> dict[str, Any]:
     profile = getattr(args, "profile", PROFILE_REDMINE_CODEX) or PROFILE_REDMINE_CODEX
-    target = Path(getattr(args, "target", None) or ".").resolve()
+    # Match the rest of the CLI's repo resolution: explicit --target/--repo wins,
+    # else MOZYO_REPO, else the nearest repo marker from cwd. This is what the
+    # `--target` help text promises (Redmine #10854 review #52114 Finding 2).
+    target = resolve_repo_root(getattr(args, "target", None))
 
     checks: list[dict[str, str]] = []
     if profile == PROFILE_REDMINE_CODEX:
