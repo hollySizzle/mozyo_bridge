@@ -8,6 +8,20 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+### 変更点
+
+- Claude Nagger の config skeleton に、Redmine-governed implementer 向けの session `startup_checkpoint` を追加しました。作業開始時に自分の role と現在の gate を宣言し、Implementation Done で止まらず Review Request gate と Codex への通知まで進み、通知の delivery result(または blocked reason)を durable record に残すことを促します。両 governed preset (`redmine-governed` / `redmine-rails-governed`) の skeleton と repo root の配置を同期しています。あくまで reminder であり、強制はしません(durable contract は引き続き central preset の `agent-workflow.md`)。(#10795)
+- Codex workspace 向け bootstrap docs で、`.codex/config.toml` の Redmine MCP default project 設定を「optional な配置例」から **startup checkpoint** に格上げしました。起動時に設定の有無を確認し、無ければ operator に確認してから作成・更新し、restart / reload 後に `project_id` を省いた MCP call で default 解決を検証する、という手順を明記しています。(#10814)
+- runtime config の配置先を明確化しました。`.codex/config.toml` と `.mcp.json` は home directory ではなく `<repo>/.codex/config.toml` / `<repo>/.mcp.json` という repo-root 配置を前提とすることを docs に明記しています。`.mcp.json` は repo-root 候補としつつ、対象 runtime が実際にその file を読むことを検証するまでは authoritative にしない deferral 制約を維持しています。いずれの repo-local config にも credential は置きません。(#10821)
+
+### なぜ必要だったか
+
+これらはいずれも、LLM が runtime guardrail / config を「読んだつもり」で読み飛ばしたり、別 workspace の事実を取り違えたりする運用事故を減らすための変更です。
+
+#10795 は、Redmine-governed task で Claude が Implementation Done の journal を残しただけで「完了」と判断し、Review Request gate と Codex への review 通知を省略してしまう事故を防ぐためのものです。central workflow には `Implementation Done → Review Request → Codex 通知` が明記されているにもかかわらず、明示指示に通知が含まれないと省略され得たため、session 起動時の checkpoint として workflow 遵守を促します。
+
+#10814 / #10821 は、Redmine default project の解決を agent の推測や home-directory 設定に委ねないためのものです。`.codex/config.toml` を単なる例ではなく起動時の確認対象(checkpoint)とし、設定の検証手順まで示すことで、未設定・未検証の default を黙って使う事故を防ぎます。さらに `.codex/config.toml` / `.mcp.json` を home ではなく repo root 配置に固定することで、ある workspace の default project が別 workspace へ漏れることを防ぎ、workspace-local な事実として隔離します。`.mcp.json` の authoritative 化を runtime 検証まで保留する制約は維持し、「実際には読まれていない config」を fact として扱う risk を避けています。
+
 ## v0.5.2 - 2026-05-29
 
 v0.5.2 は、v0.5.1 以降に入った LLM instruction runtime の健全化と、この repository 自身の governed scaffold 追従、handoff の体感改善をまとめた increment です。機能の大きな追加ではなく、runtime guardrail が想定どおり読まれ・配布物と repo が揃い・Claude TUI 環境で誤失敗しにくくなる、という運用品質の底上げが中心です。
