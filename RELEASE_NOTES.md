@@ -13,6 +13,7 @@
 - Claude Nagger の config skeleton に、Redmine-governed implementer 向けの session `startup_checkpoint` を追加しました。作業開始時に自分の role と現在の gate を宣言し、Implementation Done で止まらず Review Request gate と Codex への通知まで進み、通知の delivery result(または blocked reason)を durable record に残すことを促します。両 governed preset (`redmine-governed` / `redmine-rails-governed`) の skeleton と repo root の配置を同期しています。あくまで reminder であり、強制はしません(durable contract は引き続き central preset の `agent-workflow.md`)。(#10795)
 - Codex workspace 向け bootstrap docs で、`.codex/config.toml` の Redmine MCP default project 設定を「optional な配置例」から **startup checkpoint** に格上げしました。起動時に設定の有無を確認し、無ければ operator に確認してから作成・更新し、restart / reload 後に `project_id` を省いた MCP call で default 解決を検証する、という手順を明記しています。(#10814)
 - runtime config の配置先を明確化しました。`.codex/config.toml` と `.mcp.json` は home directory ではなく `<repo>/.codex/config.toml` / `<repo>/.mcp.json` という repo-root 配置を前提とすることを docs に明記しています。`.mcp.json` は repo-root 候補としつつ、対象 runtime が実際にその file を読むことを検証するまでは authoritative にしない deferral 制約を維持しています。いずれの repo-local config にも credential は置きません。(#10821)
+- repo-local LLM runtime config を read-only で検査する opt-in command `mozyo-bridge instruction doctor --target . --profile redmine-codex`(`--json` 対応)を追加しました。`<repo>/.codex/config.toml` の存在・TOML parse・`[redmine]` の default_project / default_project_name / default_project_url・`[mcp_servers.redmine_epic_grid]` の url / `http_headers.X-Default-Project`、そして `X-Default-Project` が `[redmine].default_project` と一致するかを確認します。`.codex/config.toml` と(存在する場合の)`<repo>/.mcp.json` に credential 形状の値が無いことも検査します。Redmine MCP への network call・自動生成・自動修復・home config への書き込みは行わず、`.mcp.json` は欠落しても deferral として info 扱いにとどめ authoritative と断定しません。既存の `mozyo-bridge doctor` は変更せず、Asana / Claude-only / none preset を既定で fail させない opt-in slice です。(#10854)
 
 ### なぜ必要だったか
 
@@ -21,6 +22,8 @@
 #10795 は、Redmine-governed task で Claude が Implementation Done の journal を残しただけで「完了」と判断し、Review Request gate と Codex への review 通知を省略してしまう事故を防ぐためのものです。central workflow には `Implementation Done → Review Request → Codex 通知` が明記されているにもかかわらず、明示指示に通知が含まれないと省略され得たため、session 起動時の checkpoint として workflow 遵守を促します。
 
 #10814 / #10821 は、Redmine default project の解決を agent の推測や home-directory 設定に委ねないためのものです。`.codex/config.toml` を単なる例ではなく起動時の確認対象(checkpoint)とし、設定の検証手順まで示すことで、未設定・未検証の default を黙って使う事故を防ぎます。さらに `.codex/config.toml` / `.mcp.json` を home ではなく repo root 配置に固定することで、ある workspace の default project が別 workspace へ漏れることを防ぎ、workspace-local な事実として隔離します。`.mcp.json` の authoritative 化を runtime 検証まで保留する制約は維持し、「実際には読まれていない config」を fact として扱う risk を避けています。
+
+#10854 は、上記の docs 方針(repo-root の runtime config)を文章だけに頼らず機械的に検出できるようにするためのものです。LLM が startup docs を読み飛ばすと設定漏れに気付けないため、`instruction doctor` で `.codex/config.toml` の欠落・不整合・credential 混入を CI / agent が読める形で fail させます。既存 `doctor` を全 project で hard-fail させると Redmine/Codex 以外の workspace を巻き込むため、profile-aware な opt-in command として切り出し、`.mcp.json` の deferral も崩さない設計にしています。
 
 ## v0.5.2 - 2026-05-29
 

@@ -11,6 +11,7 @@ from mozyo_bridge.application.commands import (
     cmd_handoff_send,
     cmd_id,
     cmd_init,
+    cmd_instruction_doctor,
     cmd_keys,
     cmd_list,
     cmd_message,
@@ -40,6 +41,10 @@ from mozyo_bridge.application.commands import (
     cmd_tmux_ui_status,
     cmd_tmux_ui_uninstall,
     cmd_type,
+)
+from mozyo_bridge.application.instruction_doctor import (
+    KNOWN_PROFILES,
+    PROFILE_REDMINE_CODEX,
 )
 from mozyo_bridge.application.release import (
     cmd_release_bump,
@@ -606,6 +611,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON output instead of human-readable text",
     )
     doctor.set_defaults(func=cmd_doctor)
+
+    instruction = sub.add_parser(
+        "instruction",
+        help="Opt-in checks for repo-local LLM runtime config (read-only)",
+    )
+    instruction_sub = instruction.add_subparsers(
+        dest="instruction_command", required=True
+    )
+    instruction_doctor = instruction_sub.add_parser(
+        "doctor",
+        help=(
+            "Profile-aware, read-only check that a Redmine/Codex workspace "
+            "carries the repo-root runtime config the bootstrap docs require "
+            "(`<repo>/.codex/config.toml`, optional `<repo>/.mcp.json`). Does "
+            "not call the network, autogenerate, or write home config."
+        ),
+    )
+    instruction_doctor.add_argument(
+        "--target",
+        dest="target",
+        help="Project root to check. Defaults to MOZYO_REPO or the current "
+        "working directory.",
+    )
+    instruction_doctor.add_argument(
+        "--repo",
+        dest="target",
+        help="Alias for --target.",
+    )
+    instruction_doctor.add_argument(
+        "--profile",
+        choices=list(KNOWN_PROFILES),
+        default=PROFILE_REDMINE_CODEX,
+        help="Config profile to check. Only `redmine-codex` is defined today; "
+        "other presets are intentionally not failed by this command.",
+    )
+    instruction_doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    instruction_doctor.set_defaults(func=cmd_instruction_doctor)
 
     rules = sub.add_parser("rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)

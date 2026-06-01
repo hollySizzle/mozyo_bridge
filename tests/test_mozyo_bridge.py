@@ -13815,5 +13815,168 @@ class InstallCommandConsistencyTest(unittest.TestCase):
         self.assertIn(command, mutated)  # documents the gap assertIn left
 
 
+class InstructionDoctorTest(unittest.TestCase):
+    """Redmine #10854: opt-in `instruction doctor --profile redmine-codex`.
+
+    Read-only, profile-aware check that a Redmine/Codex workspace carries
+    the repo-root runtime config the bootstrap docs require. Pins the
+    completion conditions: missing config fails, valid config passes,
+    X-Default-Project mismatch fails, credential-shape values fail, and
+    `.mcp.json` is parsed + secret-scanned while staying non-authoritative.
+    """
+
+    VALID_TOML = (
+        "[redmine]\n"
+        'default_project = "giken-3800-mozyo-bridge"\n'
+        'default_project_name = "mozyo-bridge"\n'
+        'default_project_url = "https://redmine.example.invalid/projects/x"\n'
+        "\n"
+        "[mcp_servers.redmine_epic_grid]\n"
+        'url = "https://redmine.example.invalid/mcp/rpc"\n'
+        'http_headers = { X-Default-Project = "giken-3800-mozyo-bridge" }\n'
+    )
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def _write_codex(self, project: Path, toml_text: str) -> None:
+        (project / ".codex").mkdir(parents=True, exist_ok=True)
+        (project / ".codex" / "config.toml").write_text(toml_text, encoding="utf-8")
+
+    def _result(self, project: Path) -> dict:
+        rc, out = self.run_cli(
+            ["instruction", "doctor", "--target", str(project), "--json"]
+        )
+        payload = json.loads(out)
+        return {"rc": rc, "payload": payload}
+
+    def _check_status(self, payload: dict, name: str) -> str | None:
+        for check in payload["checks"]:
+            if check["name"] == name:
+                return check["status"]
+        return None
+
+    def test_missing_codex_config_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            r = self._result(project)
+            self.assertEqual(1, r["rc"])
+            self.assertFalse(r["payload"]["ok"])
+            self.assertEqual(
+                "fail", self._check_status(r["payload"], "codex_config_present")
+            )
+
+    def test_valid_repo_root_config_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._write_codex(project, self.VALID_TOML)
+            r = self._result(project)
+            self.assertEqual(0, r["rc"])
+            self.assertTrue(r["payload"]["ok"])
+            self.assertEqual(
+                "ok",
+                self._check_status(r["payload"], "codex_default_project_consistent"),
+            )
+            # No .mcp.json: deferral keeps it informational, not a failure.
+            self.assertEqual(
+                "info", self._check_status(r["payload"], "mcp_json_present")
+            )
+
+    def test_default_project_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            mismatched = self.VALID_TOML.replace(
+                'X-Default-Project = "giken-3800-mozyo-bridge"',
+                'X-Default-Project = "some-other-project"',
+            )
+            self._write_codex(project, mismatched)
+            r = self._result(project)
+            self.assertEqual(1, r["rc"])
+            self.assertEqual(
+                "fail",
+                self._check_status(r["payload"], "codex_default_project_consistent"),
+            )
+
+    def test_credential_shaped_value_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            # Build the secret-shaped assignment at runtime so the test file
+            # itself carries no release-tree-blocking credential literal.
+            secret_line = "api_key" + " = " + '"' + "x" * 24 + '"\n'
+            self._write_codex(project, self.VALID_TOML + secret_line)
+            r = self._result(project)
+            self.assertEqual(1, r["rc"])
+            self.assertEqual(
+                "fail",
+                self._check_status(r["payload"], "codex_config_no_credentials"),
+            )
+
+    def test_invalid_toml_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._write_codex(project, "[redmine\nnot valid toml")
+            r = self._result(project)
+            self.assertEqual(1, r["rc"])
+            self.assertEqual(
+                "fail", self._check_status(r["payload"], "codex_config_parse")
+            )
+
+    def test_mcp_json_present_is_parsed_and_secret_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._write_codex(project, self.VALID_TOML)
+
+            # Clean .mcp.json: parsed, no secrets, stays non-authoritative
+            # (present check is info, not fail) -> overall ok.
+            (project / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"redmine": {"url": "https://x.invalid"}}}),
+                encoding="utf-8",
+            )
+            r = self._result(project)
+            self.assertEqual(0, r["rc"])
+            self.assertEqual("info", self._check_status(r["payload"], "mcp_json_present"))
+            self.assertEqual("ok", self._check_status(r["payload"], "mcp_json_parse"))
+            self.assertEqual(
+                "ok", self._check_status(r["payload"], "mcp_json_no_credentials")
+            )
+
+            # Malformed .mcp.json fails the parse check.
+            (project / ".mcp.json").write_text("{not json", encoding="utf-8")
+            r2 = self._result(project)
+            self.assertEqual(1, r2["rc"])
+            self.assertEqual("fail", self._check_status(r2["payload"], "mcp_json_parse"))
+
+            # Credential-shaped key in .mcp.json fails the secret scan. Use a
+            # key name the shared workspace-defaults heuristic flags
+            # (`client_secret`) so this stays consistent with the release-tree
+            # hygiene gate rather than inventing a second heuristic. Build the
+            # value at runtime so the test file carries no literal secret.
+            secret_key = "client_secret"
+            (project / ".mcp.json").write_text(
+                json.dumps({"servers": {"redmine": {secret_key: "x" * 30}}}),
+                encoding="utf-8",
+            )
+            r3 = self._result(project)
+            self.assertEqual(1, r3["rc"])
+            self.assertEqual(
+                "fail", self._check_status(r3["payload"], "mcp_json_no_credentials")
+            )
+
+    def test_text_output_is_human_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            rc, out = self.run_cli(
+                ["instruction", "doctor", "--target", str(project)]
+            )
+            self.assertEqual(1, rc)
+            self.assertIn("instruction doctor: FAIL", out)
+            self.assertIn("codex_config_present", out)
+
+
 if __name__ == "__main__":
     unittest.main()
