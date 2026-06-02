@@ -11,10 +11,13 @@
 ### 変更点
 
 - bootstrap docs の入口を整理しました。`README.md` の Quick Start を install / bootstrap の入口に戻し、最初に `mozyo-bridge doctor --target .` と `mozyo-bridge instruction doctor --target . --profile redmine-codex` を順に実行する判断順を README に置きました。`doctor`(toolchain health)と `instruction doctor`(repo-local LLM runtime config の合否正本)の責務差分、`instruction doctor` の代表的 failure(`.codex/config.toml` missing / `X-Default-Project` mismatch / `.mcp.json` deferral / credential 混入)と次に読む FAQ への導線を README に追加しています。`vibes/docs/logics/bootstrap.md` は「canonical entrypoint」から、詳細 stage order / FAQ / troubleshooting の reference へ降格し、`instruction doctor` FAQ(各 failure の原因・対処、home config 禁止理由、agent が自動修復してよい範囲と operator 確認が必要な範囲)を Stage 7 に追加しました。(#10857)
+- distributed governed preset (`redmine-governed` / `redmine-rails-governed`) の `agent-workflow.md` に **Codex Pre-Edit Classification Gate** を追加しました。Codex が `apply_patch` / file 作成・更新 / commit の前に「どの実装主体に属するか」を分類することを求め、repo 内の正本成果物は拡張子・内容種別に関係なく(Markdown / HTML / 調査メモ / ドラフト / 表 / report / runbook / 設定例も)実装成果物として扱う、「コードではない」「commit hash を journal に書く必要がある」を direct edit の根拠にしない、direct edit は Repo-Local Guardrail Autonomous Lane か `codex_direct_edit` gate のみ、誤った先行成果物は完了扱いにせず correction flow へ戻す、を distributed preset 側で明文化しています。canonical source から両 preset を再生成し、両 governed preset VERSION を `2026.06.02.1` に bump しました(配布内容変更に伴う version mirror 整合)。(#10899)
 
 ### なぜ必要だったか
 
 #10857 は、最初に読む入口が深い docs 側(`bootstrap.md`)に残っていると、LLM が詳細 docs を読み飛ばして設定漏れを再発させる、という問題を断つためのものです。v0.5.3 で `instruction doctor` という機械判定が入ったので、README を入口にして「まず 2 つの doctor を実行し、結果で判断する」導線を一番上に置き、詳細・背景・失敗時の解釈は FAQ / troubleshooting へ降ろすことで、入口の軽さと詳細の網羅を両立させます。
+
+#10899 は、#10898 で project-local doc に追加した Codex pre-edit classification gate を、downstream の governed repo にも効かせるためのものです。Codex が Markdown / 調査メモ / ドラフトなどの repo 正本成果物を「コードではないから安全」と誤分類して直接編集する事故は、配布 preset を採用した repo でも同様に起こり得ます。distributed preset に同じ分類 gate を載せることで、commit / journal 要件を direct edit の免罪符にせず、autonomous lane か `codex_direct_edit` gate が成立した場合だけ direct edit に切り替える運用を、配布先でも既定にします。
 
 ## v0.5.3 - 2026-06-01
 
