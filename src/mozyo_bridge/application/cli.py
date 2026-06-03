@@ -619,7 +619,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     instruction = sub.add_parser(
         "instruction",
-        help="Opt-in checks for repo-local LLM runtime config (read-only)",
+        help=(
+            "Repo-local LLM runtime config commands: `doctor` (read-only check) "
+            "and `install` (write-capable, dry-run by default)"
+        ),
     )
     instruction_sub = instruction.add_subparsers(
         dest="instruction_command", required=True

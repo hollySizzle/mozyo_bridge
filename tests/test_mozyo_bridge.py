@@ -560,6 +560,35 @@ class CliTest(unittest.TestCase):
         self.assertEqual("scaffold", parser.parse_args(["scaffold", "apply", "asana"]).command)
         self.assertEqual("doctor", parser.parse_args(["doctor"]).command)
 
+    def _help_text(self, argv: list[str]) -> str:
+        parser = build_parser()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+        return stdout.getvalue()
+
+    def test_top_level_instruction_help_is_not_falsely_read_only(self) -> None:
+        # Regression (Redmine #10932): once `instruction install --write` landed
+        # (#10930), calling the whole `instruction` group "(read-only)" became
+        # false and blocked the v0.5.5 production publish. Pin that the stale
+        # group summary cannot return, and that the summary now signals the
+        # write-capable subcommand.
+        top = self._help_text(["--help"])
+        self.assertNotIn(
+            "Opt-in checks for repo-local LLM runtime config (read-only)", top
+        )
+        self.assertIn("write-capable", top)
+
+    def test_instruction_subcommands_keep_responsibility_split(self) -> None:
+        instruction = self._help_text(["instruction", "--help"])
+        # Both subcommands are listed.
+        self.assertIn("doctor", instruction)
+        self.assertIn("install", instruction)
+        # doctor stays described as read-only; install as write-capable / dry-run.
+        self.assertIn("read-only", instruction)
+        self.assertIn("dry-run", instruction)
+
     def test_notify_codex_accepts_type(self) -> None:
         parser = build_parser()
 

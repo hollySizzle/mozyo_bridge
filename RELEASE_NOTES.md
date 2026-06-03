@@ -8,7 +8,21 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.6 - 2026-06-03
+
+v0.5.6 は、v0.5.5 の TestPyPI smoke で見つかった top-level CLI help の矛盾を直す correction patch release です。**v0.5.5 は TestPyPI にのみ配布され、production PyPI には出していません。** production 配布対象は本 v0.5.6 です。
+
+### 変更点
+
+- `mozyo-bridge --help` の `instruction` group summary を修正しました。v0.5.4 まで `instruction` は read-only group でしたが、#10930 で write 可能な `instruction install --write` が加わったため、group 全体を `(read-only)` と表示するのは誤りでした。top-level summary を「`doctor`(read-only check)と `install`(write-capable, dry-run by default)」と責務差分が分かる文言に改めています。`instruction doctor` の read-only 説明と `instruction install` の write-capable / dry-run default 説明はそれぞれ維持し、top-level help に stale な `(read-only)` group 表現が戻らないことを test で pin しました。(#10932)
+
+### なぜ必要だったか
+
+#10932 は、v0.5.5 を production PyPI へ出す前に CLI help の事実誤認を正すためのものです。#10930 で `instruction` は read-only group ではなくなったのに top-level help は古い `Opt-in checks for repo-local LLM runtime config (read-only)` のままで、新機能 `instruction install --write` と矛盾していました。help は利用者が最初に読む契約面なので、誤表記のまま production へ出すと「instruction は read-only」という誤解を配布することになります。v0.5.5 TestPyPI smoke でこの矛盾を検出し production publish を blocker としたため、文言修正 + 回帰 test を入れた v0.5.6 を production target にしています。
+
 ## v0.5.5 - 2026-06-03
+
+> 注: v0.5.5 は TestPyPI にのみ配布されました。production PyPI へは出していません(top-level help correction のため v0.5.6 に差し替え。#10932 参照)。
 
 v0.5.5 は、v0.5.4 で入れた session identity / runtime config 周りの仕上げとして、`workspace-defaults.yaml` の正本から Codex runtime config を生成する install 経路を追加する patch release です。
 
