@@ -1812,6 +1812,34 @@ def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_session_name(args: argparse.Namespace) -> int:
+    """Print the derived tmux session name for the repo (Redmine #10796).
+
+    Resolves the repo root from ``--repo`` (default cwd), derives a
+    collision-safe ASCII session name (preferring the workspace-defaults
+    Redmine identifier, otherwise a hash-suffixed repo-path fallback), and
+    prints it on a single line for shell use. ``--json`` emits the name plus
+    its derivation source. Read-only: does not touch tmux, Redmine, or disk.
+    """
+    from mozyo_bridge.domain.session_naming import derive_session_name
+
+    repo_root = repo_root_from_args(args)
+    result = derive_session_name(repo_root)
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "name": result.name,
+            "source": result.source,
+            "identifier": result.identifier,
+            "repo_root": str(result.repo_root),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(result.name)
+    return 0
+
+
 def cmd_workspace_defaults(args: argparse.Namespace) -> int:
     """Render or check the workspace-local Redmine default-project snippet.
 

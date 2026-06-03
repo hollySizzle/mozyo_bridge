@@ -35,6 +35,7 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_canonical,
     cmd_scaffold_diff,
     cmd_scaffold_status,
+    cmd_session_name,
     cmd_workspace_defaults,
     cmd_status,
     cmd_tmux_ui_install,
@@ -970,6 +971,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     docs_impact.set_defaults(func=cmd_docs_audit_impact)
+
+    session = sub.add_parser(
+        "session",
+        help=(
+            "Derive the mozyo-bridge tmux session name for a repo "
+            "(Redmine #10796). Read-only; does not modify tmux state."
+        ),
+    )
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_name = session_sub.add_parser(
+        "name",
+        help=(
+            "Print the collision-safe ASCII tmux session name derived from the "
+            "repo. Prefers `redmine.default_project.identifier` in "
+            "`<repo>/.mozyo-bridge/workspace-defaults.yaml`; otherwise falls "
+            "back to a hash-suffixed repo-path name so non-ASCII or duplicate "
+            "basenames never collapse to a low-information `____`-style name. "
+            "Use it as the VS Code `tmux-integrated` session name (per "
+            "workspace) instead of a sanitized basename or a user-global fixed "
+            "value. Single-line output by default; pass `--json` for the name "
+            "plus derivation source."
+        ),
+    )
+    add_repo_option(session_name)
+    session_name.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON (name, source, identifier, repo_root) instead of the bare name.",
+    )
+    session_name.set_defaults(func=cmd_session_name)
 
     workspace_defaults = sub.add_parser(
         "workspace-defaults",

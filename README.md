@@ -158,6 +158,27 @@ session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 
 
 `open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` の pane-split 系 subcommand は廃止されました。標準導線は bare `mozyo` (1 repo = 1 session, 1 agent = 1 window) です。既存の標準 tmux pane や VS Code `tmux-integrated` pane を agent target にしたい場合は、その pane の中で `mozyo-bridge init <agent>` を実行して window 名を `<agent>` に rename してください。
 
+### VS Code `tmux-integrated` の session 名 (`mozyo-bridge session name`)
+
+VS Code の `tmux-integrated` 拡張は workspace basename から tmux session 名を導出します。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など)、拡張側の sanitize で `2026PBL_____` のような低情報量名に潰れます。同名の `____` session が複数 workspace で衝突すると、`mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。
+
+`mozyo-bridge session name` は repo path から **衝突しにくい ASCII session 名**を導出します。`<repo>/.mozyo-bridge/workspace-defaults.yaml` の `redmine.default_project.identifier` があればそれを優先し (`mozyo-<identifier-slug>`)、無ければ repo path の短い hash を付けた fallback (`mozyo-<basename-slug>-<hash>`) を返します。非 ASCII basename を `____` に潰すことはなく、同名 basename でも path hash で区別されます。
+
+```bash
+# 単一行出力 (shell / task script から使う)
+mozyo-bridge session name --repo /path/to/your-repo
+# => mozyo-giken-3800-mozyo-bridge
+
+# 導出元込みの JSON
+mozyo-bridge session name --repo /path/to/your-repo --json
+```
+
+運用方針:
+
+- **user-global の `tmux-integrated.sessionName` 固定値は使わない**でください。全 workspace が同一 session 名に collapse し、別 repo へ誤送信する危険が出ます。
+- 代わりに **workspace-local** で固定します。`<repo>/.vscode/settings.json` に CLI 導出値を `"tmux-integrated.sessionName"` として置くか、task menu / wrapper script から `mozyo-bridge session name --repo .` の出力を session 名として渡してください。
+- この CLI は read-only で、tmux state も Redmine も disk も変更しません。bare `mozyo` の既存の session 解決・誤 attach 防止・`--target-repo` 安全境界は変更していません。
+
 ### Subtle window status colors
 
 bare `mozyo` と `mozyo-bridge init <agent>` は agent window の tmux status bar entry に**控えめな色**を付けます。`claude` は muted sage green (`colour108`)、`codex` は muted slate blue (`colour67`)、それ以外の window は user 設定の default のまま無加工です。配色は fg のみで、背景塗りや点滅は使いません。

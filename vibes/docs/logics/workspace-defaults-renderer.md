@@ -193,6 +193,7 @@ acceptance criteria は次を要求する。
 - **scaffold preset の `agent-workflow.md`**: 今回 workspace defaults renderer に新規 binding は追加しない。preset workflow は引き続き Redmine issue / journal を主軸とし、default project 解決は workspace-local snippet に委ねる。
 - **release helper**: `mozyo-bridge release check drift` (#10688) は canonical + plugin mirror を bundling する。`workspace-defaults --check` は worktree (workspace-local) を対象とするため、release helper 経由ではなく **CI unittest 経由** で gating する (`WorkspaceDefaultsRendererTest::test_committed_repo_renders_byte_equal`)。drift があれば毎 push / PR で fail する。
 - **docs catalog**: 新 logic doc (`logic-workspace-defaults-renderer`) と新 file pattern (`.mozyo-bridge/workspace-defaults.yaml` / `.mozyo-bridge/redmine-defaults.md`) を catalog に登録する。fc-governance-artifacts に追加する。
+- **tmux session naming (`mozyo-bridge session name`, Redmine #10796)**: `redmine.default_project.identifier` を **tmux session 名導出の優先入力**として消費する (`mozyo-<identifier-slug>`)。これは display / grouping identity であり issue 作成判断ではないため、`verification.verified` flag では gate しない (unverified でも identifier があれば使う)。reader (`src/mozyo_bridge/domain/session_naming.py`) は identifier のみを best-effort で読む非 die path で、`load_workspace_defaults` の schema / secret gate は通さない (render command 側の責務)。identifier が無い / 非 ASCII で slug が空になる場合は repo path hash を付けた collision-safe fallback (`mozyo-<basename-slug>-<hash>`) に落ちる。
 
 ## Extending To New Outputs
 

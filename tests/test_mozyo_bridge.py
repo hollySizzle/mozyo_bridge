@@ -14072,5 +14072,267 @@ class BootstrapEntrypointDocsTest(unittest.TestCase):
             self.assertIn(needle, section, msg=f"FAQ missing {needle!r}")
 
 
+class SessionNamingTest(unittest.TestCase):
+    """Pin Redmine #10796: collision-safe ASCII tmux session name derivation.
+
+    A non-ASCII workspace basename (e.g. `2026PBL_ローカル`) must never collapse
+    to a low-information `____`-style name, and two distinct repos that share a
+    basename must get distinct session names so the `--target-repo` handoff
+    gate keeps a recoverable repo identity. The workspace-defaults Redmine
+    identifier is the preferred, stable source.
+    """
+
+    from mozyo_bridge.domain.session_naming import (  # noqa: E402 (test-local import)
+        SOURCE_REPO_FALLBACK,
+        SOURCE_WORKSPACE_DEFAULTS,
+    )
+
+    def _write_workspace_defaults(self, repo: Path, *, identifier: str) -> None:
+        (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        (repo / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+            "schema_version: 1\n"
+            "redmine:\n"
+            "  default_project:\n"
+            f"    identifier: {identifier}\n"
+            "    name: Example\n"
+            "    url: https://redmine.example.test/projects/example\n"
+            "    parent_label: parent\n"
+            "  verification:\n"
+            "    verified: false\n"
+            '    verification_date: ""\n'
+            "    verified_by: \"\"\n"
+            "outputs:\n"
+            "  - kind: redmine_markdown\n"
+            "    target: .mozyo-bridge/redmine-defaults.md\n",
+            encoding="utf-8",
+        )
+
+    def test_workspace_defaults_identifier_is_preferred(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+
+            result = derive_session_name(repo)
+
+            self.assertEqual("mozyo-giken-3800-mozyo-bridge", result.name)
+            self.assertEqual(self.SOURCE_WORKSPACE_DEFAULTS, result.source)
+            self.assertEqual("giken-3800-mozyo-bridge", result.identifier)
+
+    def test_unverified_identifier_is_still_used(self) -> None:
+        # Session naming is a display/grouping identity, not an issue-creation
+        # decision, so it intentionally does NOT gate on the verification flag.
+        # The fixture above is written with `verified: false`.
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="some-project")
+
+            result = derive_session_name(repo)
+
+            self.assertEqual("mozyo-some-project", result.name)
+            self.assertEqual(self.SOURCE_WORKSPACE_DEFAULTS, result.source)
+
+    def test_japanese_basename_is_not_collapsed_to_underscores(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "2026PBL_ローカル"
+            repo.mkdir()
+
+            result = derive_session_name(repo)
+
+            self.assertEqual(self.SOURCE_REPO_FALLBACK, result.source)
+            self.assertIsNone(result.identifier)
+            # Must NOT be the `____`-style low-information name.
+            self.assertNotIn("_", result.name)
+            self.assertNotRegex(result.name, r"-{2,}")
+            # The ASCII-recoverable part is preserved, plus a hash suffix.
+            self.assertTrue(
+                result.name.startswith("mozyo-2026pbl-"),
+                msg=f"unexpected fallback name {result.name!r}",
+            )
+
+    def test_all_non_ascii_basename_yields_hash_only_name(self) -> None:
+        from mozyo_bridge.domain.session_naming import (
+            REPO_HASH_LENGTH,
+            derive_session_name,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "動画制作"
+            repo.mkdir()
+
+            result = derive_session_name(repo)
+
+            # No ASCII slug to keep, so the name is just `mozyo-<hash>` — still
+            # non-empty, ASCII, and never a bare `____`.
+            self.assertRegex(result.name, rf"^mozyo-[0-9a-f]{{{REPO_HASH_LENGTH}}}$")
+            self.assertEqual(self.SOURCE_REPO_FALLBACK, result.source)
+
+    def test_same_basename_in_different_paths_is_collision_safe(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a" / "2026PBL_ローカル"
+            second = Path(tmp) / "b" / "2026PBL_ローカル"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+
+            name_a = derive_session_name(first).name
+            name_b = derive_session_name(second).name
+
+            self.assertNotEqual(name_a, name_b)
+            # Both share the recoverable basename slug but differ by hash.
+            self.assertTrue(name_a.startswith("mozyo-2026pbl-"))
+            self.assertTrue(name_b.startswith("mozyo-2026pbl-"))
+
+    def test_derivation_is_deterministic_for_same_repo(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "2026PBL_ローカル"
+            repo.mkdir()
+
+            self.assertEqual(
+                derive_session_name(repo).name, derive_session_name(repo).name
+            )
+
+    def test_missing_workspace_defaults_falls_back(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "plain_repo"
+            repo.mkdir()
+
+            result = derive_session_name(repo)
+
+            self.assertEqual(self.SOURCE_REPO_FALLBACK, result.source)
+            self.assertTrue(result.name.startswith("mozyo-plain-repo-"))
+
+    def test_absent_or_malformed_identifier_falls_back_without_raising(self) -> None:
+        from mozyo_bridge.domain.session_naming import (
+            derive_session_name,
+            read_redmine_identifier,
+        )
+
+        bodies = {
+            "not a mapping": "- just\n- a\n- list\n",
+            "no redmine key": "schema_version: 1\nother: value\n",
+            "identifier absent": (
+                "redmine:\n  default_project:\n    name: X\n"
+            ),
+            "identifier non-string": (
+                "redmine:\n  default_project:\n    identifier: 12345\n"
+            ),
+            "broken yaml": "redmine: [unterminated\n",
+            "empty identifier": (
+                "redmine:\n  default_project:\n    identifier: '   '\n"
+            ),
+        }
+        for label, body in bodies.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp) / "repo_dir"
+                    (repo / ".mozyo-bridge").mkdir(parents=True)
+                    (repo / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+                        body, encoding="utf-8"
+                    )
+                    self.assertIsNone(read_redmine_identifier(repo.resolve()))
+                    result = derive_session_name(repo)
+                    self.assertEqual(self.SOURCE_REPO_FALLBACK, result.source)
+                    self.assertTrue(result.name.startswith("mozyo-repo-dir-"))
+
+    def test_non_ascii_only_identifier_falls_back(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo_dir"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="動画制作")
+
+            result = derive_session_name(repo)
+
+            # An identifier that slugs to empty cannot anchor identity, so we
+            # fall back rather than emit a bare `mozyo-` prefix.
+            self.assertEqual(self.SOURCE_REPO_FALLBACK, result.source)
+            self.assertTrue(result.name.startswith("mozyo-repo-dir-"))
+
+    def test_derived_name_never_contains_tmux_illegal_chars(self) -> None:
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            # `.` and `:` are tmux window/pane separators; whitespace is unsafe.
+            self._write_workspace_defaults(
+                repo, identifier="Foo.Bar:Baz Qux_2026"
+            )
+
+            name = derive_session_name(repo).name
+
+            for illegal in (".", ":", " "):
+                self.assertNotIn(illegal, name)
+            self.assertEqual("mozyo-foo-bar-baz-qux-2026", name)
+
+    def test_session_name_cli_parses(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["session", "name", "--repo", "/some/repo"])
+
+        self.assertEqual("session", args.command)
+        self.assertEqual("name", args.session_command)
+        self.assertEqual("/some/repo", args.repo)
+        self.assertFalse(args.as_json)
+
+    def test_session_subcommand_requires_action(self) -> None:
+        parser = build_parser()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["session"])
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = args.func(args)
+        return result, stdout.getvalue()
+
+    def test_session_name_cli_prints_bare_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+
+            code, out = self._run_cli(["session", "name", "--repo", str(repo)])
+
+            self.assertEqual(0, code)
+            self.assertEqual("mozyo-giken-3800-mozyo-bridge", out.strip())
+
+    def test_session_name_cli_json_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+
+            code, out = self._run_cli(
+                ["session", "name", "--repo", str(repo), "--json"]
+            )
+
+            self.assertEqual(0, code)
+            payload = json.loads(out)
+            self.assertEqual("mozyo-giken-3800-mozyo-bridge", payload["name"])
+            self.assertEqual(
+                self.SOURCE_WORKSPACE_DEFAULTS, payload["source"]
+            )
+            self.assertEqual("giken-3800-mozyo-bridge", payload["identifier"])
+            self.assertEqual(str(repo.resolve()), payload["repo_root"])
+
+
 if __name__ == "__main__":
     unittest.main()
