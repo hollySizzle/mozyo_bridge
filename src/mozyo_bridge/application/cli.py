@@ -12,6 +12,7 @@ from mozyo_bridge.application.commands import (
     cmd_id,
     cmd_init,
     cmd_instruction_doctor,
+    cmd_instruction_install,
     cmd_keys,
     cmd_list,
     cmd_message,
@@ -656,6 +657,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON output instead of human-readable text",
     )
     instruction_doctor.set_defaults(func=cmd_instruction_doctor)
+
+    instruction_install = instruction_sub.add_parser(
+        "install",
+        help=(
+            "Project the verified Redmine default project from "
+            "`<repo>/.mozyo-bridge/workspace-defaults.yaml` into the repo-root "
+            "`<repo>/.codex/config.toml` so `instruction doctor` turns green. "
+            "Source of truth stays workspace-defaults; only the repo-root config "
+            "is written (never home config), no credentials are generated, and "
+            "the default is a dry-run (pass `--write` to apply)."
+        ),
+    )
+    instruction_install.add_argument(
+        "--target",
+        dest="target",
+        help="Project root to install into. Defaults to MOZYO_REPO or the "
+        "current working directory.",
+    )
+    instruction_install.add_argument(
+        "--repo",
+        dest="target",
+        help="Alias for --target.",
+    )
+    instruction_install.add_argument(
+        "--profile",
+        choices=list(KNOWN_PROFILES),
+        default=PROFILE_REDMINE_CODEX,
+        help="Config profile to install. Only `redmine-codex` is defined today.",
+    )
+    instruction_install.add_argument(
+        "--write",
+        action="store_true",
+        help="Apply the change to `<repo>/.codex/config.toml` (default: dry-run).",
+    )
+    instruction_install.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "When the managed [redmine] / [mcp_servers.redmine_epic_grid] tables "
+            "already exist but disagree with workspace-defaults, regenerate them "
+            "(other tables are preserved). Without --force a conflict fails."
+        ),
+    )
+    instruction_install.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    instruction_install.set_defaults(func=cmd_instruction_install)
 
     rules = sub.add_parser("rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)

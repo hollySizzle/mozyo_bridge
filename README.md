@@ -69,8 +69,12 @@ reference (it is no longer the first thing you read; this Quick Start is).
 the operator action they require:
 
 - **`<repo>/.codex/config.toml` is missing** — the workspace has no repo-root
-  Redmine default. Ask the operator before creating it; do not put it in a home
-  config. See the FAQ in `vibes/docs/logics/bootstrap.md`.
+  Redmine default. If `<repo>/.mozyo-bridge/workspace-defaults.yaml` already
+  carries a **verified** default project, generate the config from it with
+  `mozyo-bridge instruction install --profile redmine-codex --target . --write`
+  (see `instruction install` below). Otherwise ask the operator before creating
+  it; do not put it in a home config. See the FAQ in
+  `vibes/docs/logics/bootstrap.md`.
 - **`X-Default-Project` mismatch** — the MCP header and `[redmine].default_project`
   disagree. One of them is wrong; an operator must reconcile them.
 - **`.mcp.json` present/absent** — reported as `info`, never a failure on its
@@ -83,6 +87,34 @@ the operator action they require:
 Detailed cause/fix for each, plus the home-config-prohibition rationale and what
 an agent may auto-fix vs must confirm with an operator, is in
 `vibes/docs/logics/bootstrap.md` (`Stage 7 — Failure recovery and common pitfalls`).
+
+### `instruction install` (workspace-defaults → runtime config → doctor)
+
+`instruction doctor` only checks; `mozyo-bridge instruction install --profile
+redmine-codex --target .` closes the gap by projecting the **verified** Redmine
+default project from the single source of truth
+(`<repo>/.mozyo-bridge/workspace-defaults.yaml`) into the repo-root
+`<repo>/.codex/config.toml`. The flow is: edit `workspace-defaults.yaml` →
+`mozyo-bridge workspace-defaults --check` clean → `instruction install --write`
+→ `instruction doctor` green.
+
+```bash
+mozyo-bridge instruction install --profile redmine-codex --target .            # dry-run
+mozyo-bridge instruction install --profile redmine-codex --target . --write    # apply
+```
+
+- Source of truth stays `workspace-defaults.yaml`; install never invents values.
+- Writes **only** `<repo>/.codex/config.toml` (the `[redmine]` and
+  `[mcp_servers.redmine_epic_grid]` tables). Home config is never read or
+  written, and no credentials are generated.
+- Default is a dry-run; `--write` applies. An **unverified** default project is
+  refused (verify it first) — generating runtime config from an unverified
+  default is exactly what the doctor guards against.
+- An existing config is preserved: when the managed tables are absent they are
+  appended (other keys untouched). When they already exist and disagree, install
+  fails and asks you to resolve it, unless `--force` regenerates just those
+  tables. Invalid TOML is never clobbered.
+- `.mcp.json` stays deferred; install does not generate it.
 
 Use the full command in docs and durable task records:
 

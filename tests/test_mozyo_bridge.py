@@ -14626,5 +14626,257 @@ class SessionNamingTest(unittest.TestCase):
         self.assertTrue(args.write)
 
 
+class InstructionInstallTest(unittest.TestCase):
+    """Pin Redmine #10930: project workspace-defaults into Codex runtime config.
+
+    The single source of truth stays `<repo>/.mozyo-bridge/workspace-defaults.yaml`;
+    `instruction install` renders/merges the verified Redmine default project into
+    `<repo>/.codex/config.toml` so `instruction doctor` turns green, without ever
+    touching home config or generating credentials.
+    """
+
+    def _stage(self, repo: Path, *, verified: bool = True, identifier: str = "giken-3800-mozyo-bridge") -> None:
+        (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        verification_date = "2026-05-28" if verified else ""
+        verified_by = "hollySizzle" if verified else '""'
+        (repo / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+            "schema_version: 1\n"
+            "redmine:\n"
+            "  default_project:\n"
+            f"    identifier: {identifier}\n"
+            "    name: mozyo_bridge\n"
+            f"    url: https://redmine.giken.or.jp/projects/{identifier}\n"
+            "    parent_label: parent\n"
+            "  verification:\n"
+            f"    verified: {str(verified).lower()}\n"
+            f'    verification_date: "{verification_date}"\n'
+            f"    verified_by: {verified_by}\n"
+            "outputs:\n"
+            "  - kind: redmine_markdown\n"
+            "    target: .mozyo-bridge/redmine-defaults.md\n",
+            encoding="utf-8",
+        )
+
+    def _run(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = args.func(args)
+        return code, stdout.getvalue()
+
+    def _doctor_green(self, repo: Path) -> bool:
+        from mozyo_bridge.application.instruction_doctor import run_instruction_doctor
+
+        return bool(
+            run_instruction_doctor(
+                argparse.Namespace(target=str(repo), profile="redmine-codex")
+            )["ok"]
+        )
+
+    def test_missing_config_dry_run_then_write_makes_doctor_green(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            config = repo / ".codex" / "config.toml"
+
+            # Dry-run must not write.
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo)]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("would write", out)
+            self.assertFalse(config.exists())
+            self.assertFalse(self._doctor_green(repo))
+
+            # Write makes the doctor green.
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(0, code)
+            self.assertTrue(config.exists())
+            self.assertIn("instruction doctor is green", out)
+            self.assertTrue(self._doctor_green(repo))
+
+    def test_generated_config_has_consistent_default_project(self) -> None:
+        from mozyo_bridge.application.instruction_install import _toml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo, identifier="giken-3800-mozyo-bridge")
+            self._run(["instruction", "install", "--target", str(repo), "--write"])
+
+            parsed = _toml.loads(
+                (repo / ".codex" / "config.toml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                "giken-3800-mozyo-bridge", parsed["redmine"]["default_project"]
+            )
+            self.assertEqual(
+                "https://redmine.giken.or.jp/mcp/rpc",
+                parsed["mcp_servers"]["redmine_epic_grid"]["url"],
+            )
+            self.assertEqual(
+                "giken-3800-mozyo-bridge",
+                parsed["mcp_servers"]["redmine_epic_grid"]["http_headers"][
+                    "X-Default-Project"
+                ],
+            )
+
+    def test_existing_unrelated_table_is_preserved_on_append(self) -> None:
+        from mozyo_bridge.application.instruction_install import _toml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            config = repo / ".codex"
+            config.mkdir()
+            (config / "config.toml").write_text(
+                "[history]\nmax_size = 1000\n", encoding="utf-8"
+            )
+
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(0, code)
+            parsed = _toml.loads((config / "config.toml").read_text(encoding="utf-8"))
+            # Unrelated table preserved AND managed block added.
+            self.assertEqual(1000, parsed["history"]["max_size"])
+            self.assertEqual(
+                "giken-3800-mozyo-bridge", parsed["redmine"]["default_project"]
+            )
+            self.assertTrue(self._doctor_green(repo))
+
+    def test_conflict_fails_and_does_not_write_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            config = repo / ".codex"
+            config.mkdir()
+            original = '[redmine]\ndefault_project = "other-proj"\n[history]\nx = 1\n'
+            (config / "config.toml").write_text(original, encoding="utf-8")
+
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(1, code)
+            self.assertIn("--force", out)
+            # File must be left untouched.
+            self.assertEqual(
+                original, (config / "config.toml").read_text(encoding="utf-8")
+            )
+
+    def test_force_regenerates_managed_tables_and_preserves_others(self) -> None:
+        from mozyo_bridge.application.instruction_install import _toml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            config = repo / ".codex"
+            config.mkdir()
+            (config / "config.toml").write_text(
+                '[redmine]\ndefault_project = "other-proj"\n\n[history]\nx = 1\n',
+                encoding="utf-8",
+            )
+
+            code, _ = self._run(
+                ["instruction", "install", "--target", str(repo), "--write", "--force"]
+            )
+            self.assertEqual(0, code)
+            parsed = _toml.loads((config / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(
+                "giken-3800-mozyo-bridge", parsed["redmine"]["default_project"]
+            )
+            self.assertEqual(1, parsed["history"]["x"])  # unrelated table preserved
+            self.assertTrue(self._doctor_green(repo))
+
+    def test_already_up_to_date_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            self._run(["instruction", "install", "--target", str(repo), "--write"])
+            before = (repo / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(0, code)
+            self.assertIn("already matches", out)
+            self.assertEqual(
+                before, (repo / ".codex" / "config.toml").read_text(encoding="utf-8")
+            )
+
+    def test_unverified_default_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo, verified=False)
+
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(1, code)
+            self.assertIn("verification is incomplete", out)
+            self.assertFalse((repo / ".codex" / "config.toml").exists())
+
+    def test_credential_shape_in_workspace_defaults_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".mozyo-bridge").mkdir(parents=True)
+            # A credential-shape value must make load fail (die -> SystemExit),
+            # so no runtime config is ever generated from it.
+            secret_key = "api" + "_key"
+            (repo / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+                "schema_version: 1\n"
+                "redmine:\n"
+                "  default_project:\n"
+                "    identifier: giken-3800-mozyo-bridge\n"
+                "    name: mozyo_bridge\n"
+                "    url: https://redmine.giken.or.jp/projects/giken-3800-mozyo-bridge\n"
+                "    parent_label: parent\n"
+                f"    {secret_key}: AKIAEXAMPLEEXAMPLE12\n"
+                "  verification:\n"
+                "    verified: true\n"
+                '    verification_date: "2026-05-28"\n'
+                "    verified_by: hollySizzle\n"
+                "outputs:\n"
+                "  - kind: redmine_markdown\n"
+                "    target: .mozyo-bridge/redmine-defaults.md\n",
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self._run(["instruction", "install", "--target", str(repo), "--write"])
+            self.assertFalse((repo / ".codex" / "config.toml").exists())
+
+    def test_invalid_existing_toml_is_not_clobbered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._stage(repo)
+            config = repo / ".codex"
+            config.mkdir()
+            original = "this is = not valid = toml ]["
+            (config / "config.toml").write_text(original, encoding="utf-8")
+
+            code, out = self._run(
+                ["instruction", "install", "--target", str(repo), "--write"]
+            )
+            self.assertEqual(1, code)
+            self.assertIn("not valid TOML", out)
+            self.assertEqual(
+                original, (config / "config.toml").read_text(encoding="utf-8")
+            )
+
+    def test_instruction_install_cli_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["instruction", "install", "--target", "/r", "--write", "--force"]
+        )
+        self.assertEqual("instruction", args.command)
+        self.assertEqual("install", args.instruction_command)
+        self.assertEqual("/r", args.target)
+        self.assertTrue(args.write)
+        self.assertTrue(args.force)
+
+
 if __name__ == "__main__":
     unittest.main()

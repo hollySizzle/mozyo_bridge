@@ -648,10 +648,19 @@ reports and their fixes:
 - **`<repo>/.codex/config.toml is missing`**:
   - cause: the workspace has no repo-root Redmine default project config. The
     docs require this file at `<repo>/.codex/config.toml`, not in a home config.
-  - fix: an agent must **ask the operator before creating it** — the default
-    project is a workspace-specific fact, not something to guess. Once the
-    operator confirms the project identity, create the file with `[redmine]`
-    `default_project` / `default_project_name` / `default_project_url` and the
+  - fix (preferred, when a verified source of truth exists): if
+    `<repo>/.mozyo-bridge/workspace-defaults.yaml` already carries a **verified**
+    Redmine default project (`mozyo-bridge workspace-defaults --check` clean),
+    generate the config from it with `mozyo-bridge instruction install --profile
+    redmine-codex --target . --write` (dry-run first without `--write`). This
+    projects the source of truth into `<repo>/.codex/config.toml` and leaves
+    `instruction doctor` green. See the `instruction install` FAQ below.
+  - fix (no source of truth yet): an agent must **ask the operator before
+    creating it** — the default project is a workspace-specific fact, not
+    something to guess. Once the operator confirms the project identity, populate
+    `<repo>/.mozyo-bridge/workspace-defaults.yaml` (then `instruction install`),
+    or hand-create the file with `[redmine]` `default_project` /
+    `default_project_name` / `default_project_url` and the
     `[mcp_servers.redmine_epic_grid]` `url` + `http_headers.X-Default-Project`.
     Restart / reload the runtime, then verify with a Redmine MCP call that omits
     `project_id`.
@@ -678,11 +687,35 @@ reports and their fixes:
     once the project identity is already established — e.g. correcting an
     `X-Default-Project` header to match an operator-confirmed
     `[redmine].default_project`, or removing an obviously misplaced credential.
+    Running `mozyo-bridge instruction install --write` against a **verified**
+    workspace-defaults is in this category: it only projects an
+    already-established, verified fact into the runtime config.
   - operator confirmation required: choosing or changing the default project
     identity itself, creating `<repo>/.codex/config.toml` from scratch, or
     anything that decides *which* project a workspace targets. `instruction
     doctor` itself never writes; these are actions an agent takes only after the
     check reports a failure and the operator has confirmed intent.
+
+### `instruction install` FAQ (workspace-defaults → runtime config)
+
+`mozyo-bridge instruction install --profile redmine-codex --target .` is the
+write side that `instruction doctor` lacks. It projects the verified Redmine
+default project from `<repo>/.mozyo-bridge/workspace-defaults.yaml` (the single
+source of truth) into the repo-root `<repo>/.codex/config.toml`, so the flow is
+`workspace-defaults.yaml` → `workspace-defaults --check` clean →
+`instruction install --write` → `instruction doctor` green.
+
+- source of truth: stays `workspace-defaults.yaml`; install never invents
+  values and only writes `<repo>/.codex/config.toml` (the `[redmine]` and
+  `[mcp_servers.redmine_epic_grid]` tables). Home config is never read/written.
+- safety: default is a dry-run (`--write` applies); no credentials are
+  generated; an **unverified** default project is refused (verify it first); an
+  existing config is preserved (managed tables appended when absent, conflicts
+  fail unless `--force` regenerates just those tables), and invalid TOML is never
+  clobbered.
+- the MCP RPC URL is derived from the host of `redmine.default_project.url`, so
+  no project-specific host is hard-coded in distributed source.
+- `.mcp.json` stays deferred; install does not generate it.
 
 ## Where this doc sits relative to the others
 
