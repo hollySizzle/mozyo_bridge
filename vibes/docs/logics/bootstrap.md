@@ -632,8 +632,10 @@ The symptoms below are the ones an LLM is most likely to observe while executing
   - run bare `mozyo` from the repo root: `cd /path/to/repo && mozyo`. This creates `claude` and `codex` windows in a repo-scoped tmux session.
   - for an existing pane (VS Code tmux terminal, hand-managed tmux pane), run `mozyo-bridge init <agent>` from inside that pane to rename its window.
 - VS Code `tmux-integrated` collapses a non-ASCII workspace basename to a low-information session name (for example `2026PBL_ローカル` → `2026PBL_____`), and same-named `____` sessions across workspaces break `agents list` / `--target-repo` repo-identity recovery (Redmine #10796):
-  - derive a collision-safe ASCII session name with `mozyo-bridge session name --repo <repo>` (prefers `redmine.default_project.identifier` from `.mozyo-bridge/workspace-defaults.yaml`, else a `mozyo-<basename-slug>-<hash>` fallback).
-  - set it **per workspace** — in `<repo>/.vscode/settings.json` as `"tmux-integrated.sessionName"`, or pass `mozyo-bridge session name --repo .` from a task/wrapper script. Do **not** set a user-global fixed `tmux-integrated.sessionName`; it collapses every workspace onto one session and risks cross-repo misdelivery.
+  - bare `mozyo` already derives a collision-safe ASCII session name (prefers `redmine.default_project.identifier` from `.mozyo-bridge/workspace-defaults.yaml`, else `mozyo-<basename-slug>-<hash>`). Inspect it with `mozyo-bridge session name --repo <repo>`. An explicit `mozyo --session NAME` still overrides.
+  - VS Code starts its own session (not via `mozyo`), so pin the same name **per workspace**: run `mozyo-bridge session vscode-settings --repo . --write` to set `"tmux-integrated.sessionName"` in `<repo>/.vscode/settings.json` (workspace-local only; user-global settings are never touched; JSONC files are refused, not clobbered). For a custom task menu, replace `basename "$PWD" | sed ...` with `mozyo-bridge session name --repo .`.
+  - do **not** set a user-global fixed `tmux-integrated.sessionName`; it collapses every workspace onto one session and risks cross-repo misdelivery.
+  - migration: if a legacy basename-named session lingers, bare `mozyo` prints a notice; attach it with `mozyo --session <old>` or remove it once empty with `tmux kill-session -t <old>`.
 
 ### `instruction doctor` FAQ (repo-local LLM runtime config)
 

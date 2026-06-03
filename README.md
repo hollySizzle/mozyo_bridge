@@ -142,7 +142,7 @@ mozyo
 これは以下を一括で行います。
 
 - repo root を解決 (`--repo` → `MOZYO_REPO` → `.git` / `.tmux.conf` / `pyproject.toml` を遡る)
-- session 名を repo basename にして、無ければ作る
+- session 名を `mozyo-bridge session name` と同じ衝突しにくい ASCII 名に導出して、無ければ作る (`<repo>/.mozyo-bridge/workspace-defaults.yaml` の Redmine identifier 優先、無ければ `mozyo-<basename-slug>-<hash>`)。`--session NAME` を明示した場合はそれを優先 (Redmine #10796)
 - 1 つの repo-scoped session の中に `claude` window と `codex` window を ensure (window 別に分離)
 - `claude` window を default にしてから attach
 
@@ -156,11 +156,15 @@ mozyo --no-attach
 
 session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に session 名を分離する場合は `mozyo --session NAME` で session 名を上書きするか、bare `mozyo --repo /path/to/another` で別 repo root を指定してください。
 
+**移行メモ**: 以前の bare `mozyo` は session 名を repo basename にしていました。導出名へ移行したため、古い basename session が残っている repo では bare `mozyo` 実行時に notice を出します。古い session に入りたい場合は `mozyo --session <旧basename>` (または `tmux attach -t <旧basename>`)、空になったら `tmux kill-session -t <旧basename>` で片付けてください。`--target-repo` gate と `init` の同名 window fail-closed は従来どおりです。
+
 `open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` の pane-split 系 subcommand は廃止されました。標準導線は bare `mozyo` (1 repo = 1 session, 1 agent = 1 window) です。既存の標準 tmux pane や VS Code `tmux-integrated` pane を agent target にしたい場合は、その pane の中で `mozyo-bridge init <agent>` を実行して window 名を `<agent>` に rename してください。
 
 ### VS Code `tmux-integrated` の session 名 (`mozyo-bridge session name`)
 
-VS Code の `tmux-integrated` 拡張は workspace basename から tmux session 名を導出します。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など)、拡張側の sanitize で `2026PBL_____` のような低情報量名に潰れます。同名の `____` session が複数 workspace で衝突すると、`mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。
+VS Code の `tmux-integrated` 拡張 / TaskPilot menu は workspace basename から tmux session 名を導出します (典型的には `basename "$PWD" | sed ...`)。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など) `2026PBL_____` のような低情報量名に潰れ、同名の `____` session が複数 workspace で衝突すると `mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。
+
+bare `mozyo` は既にこの導出名で session を作りますが、VS Code は `mozyo` を経由せず自前で session を立てるため、VS Code 側にも同じ導出名を渡す必要があります。
 
 `mozyo-bridge session name` は repo path から **衝突しにくい ASCII session 名**を導出します。`<repo>/.mozyo-bridge/workspace-defaults.yaml` の `redmine.default_project.identifier` があればそれを優先し (`mozyo-<identifier-slug>`)、無ければ repo path の短い hash を付けた fallback (`mozyo-<basename-slug>-<hash>`) を返します。非 ASCII basename を `____` に潰すことはなく、同名 basename でも path hash で区別されます。
 
@@ -176,8 +180,21 @@ mozyo-bridge session name --repo /path/to/your-repo --json
 運用方針:
 
 - **user-global の `tmux-integrated.sessionName` 固定値は使わない**でください。全 workspace が同一 session 名に collapse し、別 repo へ誤送信する危険が出ます。
-- 代わりに **workspace-local** で固定します。`<repo>/.vscode/settings.json` に CLI 導出値を `"tmux-integrated.sessionName"` として置くか、task menu / wrapper script から `mozyo-bridge session name --repo .` の出力を session 名として渡してください。
-- この CLI は read-only で、tmux state も Redmine も disk も変更しません。bare `mozyo` の既存の session 解決・誤 attach 防止・`--target-repo` 安全境界は変更していません。
+- **workspace-local で固定する (推奨・機械化)**。`mozyo-bridge session vscode-settings --repo . --write` を実行すると、`<repo>/.vscode/settings.json` の `"tmux-integrated.sessionName"` を導出名に設定します。**workspace-local 設定のみ**を触り、credential を含み得る user-global 設定は読み書きしません。コメント付き (JSONC) の settings は壊さず、手編集を促して停止します。`--write` 無しは適用内容を表示する dry-run です。
+
+  ```bash
+  mozyo-bridge session vscode-settings --repo .            # dry-run
+  mozyo-bridge session vscode-settings --repo . --write    # .vscode/settings.json に書き込み
+  ```
+
+- TaskPilot / 自前 task menu で動的に session 名を組む場合は、`basename "$PWD" | sed ...` を `mozyo-bridge session name --repo .` の出力に置き換えてください。例:
+
+  ```bash
+  s=$(mozyo-bridge session name --repo .)
+  tmux new-session -A -s "$s"
+  ```
+
+- `session name` / `session vscode-settings` (dry-run) は tmux state も Redmine も変更しません。`--target-repo` gate と `init` の同名 window fail-closed の安全境界は変更していません。
 
 ### Subtle window status colors
 

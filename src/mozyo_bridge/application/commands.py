@@ -39,6 +39,7 @@ from mozyo_bridge.domain.handoff import (
     normalize_anchor,
 )
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
+from mozyo_bridge.domain.session_naming import derive_session_name
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
     AGENT_LABELS,
@@ -632,13 +633,17 @@ def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
 def cmd_mozyo(args: argparse.Namespace) -> int:
     """Bare ``mozyo`` entrypoint: repo-aware session with one window per agent.
 
-    Resolves the repo root, derives the session name from the repo basename,
-    ensures a single repo-scoped session containing a ``claude`` window and a
-    ``codex`` window, and attaches unless ``--no-attach`` was given.
+    Resolves the repo root, derives the session name via
+    :func:`derive_session_name` (the workspace-defaults Redmine identifier when
+    present, otherwise a collision-safe repo-path fallback — never a
+    low-information ``____``-style name), ensures a single repo-scoped session
+    containing a ``claude`` window and a ``codex`` window, and attaches unless
+    ``--no-attach`` was given. An explicit ``--session NAME`` still overrides
+    the derived name (Redmine #10796).
     """
     require_tmux()
     repo_root = repo_root_from_args(args)
-    derived = repo_root.name
+    derived = derive_session_name(repo_root).name
     if not derived:
         die("could not derive a session name from repo root; cd into a project directory or pass a subcommand explicitly")
     user_session = getattr(args, "session", None)
@@ -653,6 +658,10 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
                 "Re-run from the matching repo root, or pass an explicit `--session NAME` "
                 "to bare `mozyo` to disambiguate."
             )
+    if not user_session:
+        notice = legacy_basename_session_notice(repo_root, session)
+        if notice:
+            print(notice)
     config_path = getattr(args, "config_path", None)
     config_path_was_default = config_path is None
     resolved_config_path = config_path or str(default_tmux_conf(repo_root))
@@ -711,14 +720,44 @@ def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:
     return [pane.get("cwd") or "?" for pane in same_session_panes]
 
 
+def legacy_basename_session_notice(repo_root: Path, derived_session: str) -> str | None:
+    """Return a migration notice when a legacy basename-named session lingers.
+
+    Before Redmine #10796, bare ``mozyo`` named the session after the repo
+    basename. Now it derives ``derived_session``. If a session still exists
+    under the old basename name *and* it belongs to this repo (at least one
+    pane under ``repo_root`` / not clearly another repo's), point the operator
+    at it so the old session is not silently orphaned. Returns ``None`` when
+    there is nothing to migrate. The notice is advisory only — it never blocks
+    the bare-``mozyo`` flow.
+    """
+    legacy = repo_root.name
+    if not legacy or legacy == derived_session:
+        return None
+    if not session_exists(legacy):
+        return None
+    if session_cwd_mismatch(legacy, repo_root):
+        # The legacy-named session's panes are all outside this repo, so it is
+        # a different repo's session that merely shares the basename. Not ours.
+        return None
+    return (
+        f"notice: legacy session '{legacy}' (named by repo basename) exists for this repo; "
+        f"bare `mozyo` now derives '{derived_session}'. Attach the old one explicitly with "
+        f"`mozyo --session {legacy}` (or `tmux attach -t {legacy}`), or remove it once empty "
+        f"with `tmux kill-session -t {legacy}`."
+    )
+
+
 def resolve_status_session(args: argparse.Namespace) -> str:
     """Pick the session ``cmd_status`` should describe.
 
     Order: explicit ``--session`` > current tmux session (when run inside
-    tmux) > repo basename (window-model derived). The hard-coded ``agents``
-    default is intentionally not used; it produced misleading
-    ``session: agents (missing)`` output under the bare-``mozyo`` window
-    model (see Asana task 1214758916882465).
+    tmux) > the bare-``mozyo`` derived session name (see
+    :func:`derive_session_name`). The final fallback matches what bare
+    ``mozyo`` creates so ``status`` finds that session by name (Redmine
+    #10796). The hard-coded ``agents`` default is intentionally not used; it
+    produced misleading ``session: agents (missing)`` output under the
+    bare-``mozyo`` window model (see Asana task 1214758916882465).
     """
     explicit = getattr(args, "session", None)
     if explicit:
@@ -727,11 +766,7 @@ def resolve_status_session(args: argparse.Namespace) -> str:
     if current:
         return current
     repo_root = repo_root_from_args(args)
-    derived = repo_root.name
-    if derived:
-        return derived
-    die("could not derive a session name; pass --session explicitly or run from inside a tmux pane")
-    raise AssertionError("unreachable")
+    return derive_session_name(repo_root).name
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1837,6 +1872,58 @@ def cmd_session_name(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     print(result.name)
+    return 0
+
+
+def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
+    """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
+
+    Sets ``tmux-integrated.sessionName`` in ``<repo>/.vscode/settings.json`` to
+    the derived collision-safe session name, so the VS Code `tmux-integrated`
+    extension stops sanitizing the workspace basename down to a low-information
+    ``____``-style name. Only the **workspace-local** settings file is ever
+    touched — user-global settings (which can carry credentials) are never
+    read or written. Without ``--write`` it prints what would be set;
+    ``--write`` applies it. An existing settings file with comments/trailing
+    commas (JSONC) is refused rather than clobbered.
+    """
+    from mozyo_bridge.domain.session_naming import (
+        VSCODE_SESSION_NAME_KEY,
+        VSCODE_SETTINGS_RELATIVE,
+        derive_session_name,
+        merge_vscode_session_name,
+    )
+
+    repo_root = repo_root_from_args(args)
+    result = derive_session_name(repo_root)
+    settings_path = repo_root / VSCODE_SETTINGS_RELATIVE
+    existing = (
+        settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
+    )
+
+    if not getattr(args, "write", False):
+        verb = "would update" if existing is not None else "would create"
+        print(
+            f'{verb} {settings_path}: "{VSCODE_SESSION_NAME_KEY}": "{result.name}"'
+        )
+        print(
+            "re-run with --write to apply (workspace-local only; "
+            "user-global VS Code settings are never touched)"
+        )
+        return 0
+
+    try:
+        new_text = merge_vscode_session_name(existing, result.name)
+    except ValueError as exc:
+        die(
+            f"{settings_path} is not plain JSON ({exc}); it likely contains "
+            "comments or trailing commas (JSONC). Add "
+            f'"{VSCODE_SESSION_NAME_KEY}": "{result.name}" by hand to avoid '
+            "clobbering the existing content."
+        )
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(new_text, encoding="utf-8")
+    print(f'wrote "{VSCODE_SESSION_NAME_KEY}": "{result.name}" to {settings_path}')
     return 0
 
 

@@ -36,6 +36,7 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_diff,
     cmd_scaffold_status,
     cmd_session_name,
+    cmd_session_vscode_settings,
     cmd_workspace_defaults,
     cmd_status,
     cmd_tmux_ui_install,
@@ -183,9 +184,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--session",
         default=None,
         help=(
-            "Bare `mozyo`: override the tmux session name. Defaults to the repo "
-            "root basename; pass an explicit name to disambiguate when two repos "
-            "share a basename."
+            "Bare `mozyo`: override the tmux session name. Defaults to the "
+            "derived collision-safe name (`mozyo-bridge session name`): the "
+            "workspace-defaults Redmine identifier when present, else a "
+            "hash-suffixed repo-path name. Pass an explicit name to override."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=False)
@@ -197,7 +199,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Tmux session to describe. Defaults to the current session when "
-            "run inside tmux, or the repo basename (bare-`mozyo` window model)."
+            "run inside tmux, else the bare-`mozyo` derived session name "
+            "(`mozyo-bridge session name`)."
         ),
     )
     status.set_defaults(func=cmd_status)
@@ -1002,6 +1005,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON (name, source, identifier, repo_root) instead of the bare name.",
     )
     session_name.set_defaults(func=cmd_session_name)
+
+    session_vscode = session_sub.add_parser(
+        "vscode-settings",
+        help=(
+            "Pin `tmux-integrated.sessionName` in the workspace-local "
+            "`<repo>/.vscode/settings.json` to the derived session name so VS "
+            "Code stops sanitizing the basename to a `____`-style name. "
+            "Workspace-local only; user-global settings are never touched. "
+            "Without `--write` it prints what would change; `--write` applies "
+            "it (refuses to clobber a JSONC file with comments)."
+        ),
+    )
+    add_repo_option(session_vscode)
+    session_vscode.add_argument(
+        "--write",
+        action="store_true",
+        help="Apply the change to `<repo>/.vscode/settings.json` (default: dry-run print only).",
+    )
+    session_vscode.set_defaults(func=cmd_session_vscode_settings)
 
     workspace_defaults = sub.add_parser(
         "workspace-defaults",

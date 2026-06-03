@@ -32,6 +32,7 @@ a valid stable grouping key.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,12 @@ REPO_HASH_LENGTH = 8
 # branch produced the name without re-deriving it.
 SOURCE_WORKSPACE_DEFAULTS = "workspace-defaults-redmine-identifier"
 SOURCE_REPO_FALLBACK = "repo-path-fallback"
+
+# Workspace-local VS Code settings that pin the `tmux-integrated` session name.
+# Only the workspace-local file is ever touched; user-global settings (which can
+# carry credentials) are out of scope by design.
+VSCODE_SETTINGS_RELATIVE = Path(".vscode/settings.json")
+VSCODE_SESSION_NAME_KEY = "tmux-integrated.sessionName"
 
 # tmux treats ``:`` as a window separator and ``.`` as a pane separator, so a
 # session name must avoid them. We go further and keep only ``[a-z0-9]``,
@@ -153,3 +160,26 @@ def derive_session_name(repo_root: Path | str) -> SessionName:
         repo_root=resolved,
         identifier=None,
     )
+
+
+def merge_vscode_session_name(existing_text: str | None, session_name: str) -> str:
+    """Return ``.vscode/settings.json`` text with the session-name key set.
+
+    Preserves every other key in an existing plain-JSON file and only
+    updates ``tmux-integrated.sessionName``. Raises ``ValueError`` when the
+    existing content is non-empty but not valid JSON (e.g. JSONC with comments
+    or trailing commas) so the caller can refuse to clobber it rather than
+    silently dropping the operator's content. Output is 2-space-indented JSON
+    with a trailing newline; insertion order of existing keys is preserved.
+    """
+    if existing_text is None or not existing_text.strip():
+        data: dict = {}
+    else:
+        try:
+            data = json.loads(existing_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(str(exc)) from exc
+        if not isinstance(data, dict):
+            raise ValueError("settings.json root is not a JSON object")
+    data[VSCODE_SESSION_NAME_KEY] = session_name
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"

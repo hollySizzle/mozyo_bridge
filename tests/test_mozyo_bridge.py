@@ -5606,7 +5606,13 @@ class CommandTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "attached"):
                     cmd_mozyo(args)
 
-        self.assertEqual("my-project", captured["args"].session)
+        # Bare `mozyo` now derives a collision-safe session name (Redmine
+        # #10796) instead of using the raw repo basename.
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        expected = derive_session_name(repo).name
+        self.assertEqual(expected, captured["args"].session)
+        self.assertTrue(expected.startswith("mozyo-my-project-"))
         self.assertEqual(str(repo), captured["args"].cwd)
         self.assertTrue(captured["args"].config)
         self.assertTrue(captured["args"].config_path_was_default)
@@ -5634,7 +5640,10 @@ class CommandTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_mozyo(args))
 
-        self.assertIn("attach: tmux attach -t my-project", stdout.getvalue())
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        expected = derive_session_name(repo).name
+        self.assertIn(f"attach: tmux attach -t {expected}", stdout.getvalue())
 
     def test_cmd_mozyo_dies_when_claude_window_select_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5679,8 +5688,13 @@ class CommandTest(unittest.TestCase):
                 force=False,
                 no_attach=False,
             )
+            # The mismatch guard keys on the derived session name (Redmine
+            # #10796), so the lingering pane must live in that same session.
+            from mozyo_bridge.domain.session_naming import derive_session_name
+
+            derived = derive_session_name(repo).name
             panes = [
-                {"id": "%1", "location": "my-project:0.0", "command": "zsh", "label": "", "cwd": str(other)},
+                {"id": "%1", "location": f"{derived}:0.0", "command": "zsh", "label": "", "cwd": str(other)},
             ]
 
             with patch("mozyo_bridge.application.commands.require_tmux"), \
@@ -5694,7 +5708,7 @@ class CommandTest(unittest.TestCase):
 
         ensure.assert_not_called()
         execvp.assert_not_called()
-        self.assertIn("my-project", stderr.getvalue())
+        self.assertIn(derived, stderr.getvalue())
         self.assertIn("outside repo root", stderr.getvalue())
         # The disambiguation hint must point operators at the bare-`mozyo`
         # `--session` flag, not at the retired `open-here` subcommand.
@@ -6308,14 +6322,23 @@ class CommandTest(unittest.TestCase):
         with patch("mozyo_bridge.application.commands.current_session_name", return_value="mozyo_bridge"):
             self.assertEqual("mozyo_bridge", resolve_status_session(args))
 
-    def test_resolve_status_session_falls_back_to_repo_basename(self) -> None:
+    def test_resolve_status_session_falls_back_to_derived_name(self) -> None:
+        # The non-tmux fallback now matches what bare `mozyo` creates: the
+        # derived collision-safe session name, not the raw repo basename
+        # (Redmine #10796). Keeping these in sync lets `status` find the
+        # bare-`mozyo` session by name.
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "my_project"
             repo.mkdir()
             args = argparse.Namespace(session=None, repo=str(repo))
 
             with patch("mozyo_bridge.application.commands.current_session_name", return_value=None):
-                self.assertEqual("my_project", resolve_status_session(args))
+                resolved = resolve_status_session(args)
+
+            self.assertEqual(derive_session_name(repo).name, resolved)
+            self.assertTrue(resolved.startswith("mozyo-my-project-"))
 
     def test_resolve_status_session_respects_explicit_session(self) -> None:
         args = argparse.Namespace(session="custom", repo=None)
@@ -14332,6 +14355,275 @@ class SessionNamingTest(unittest.TestCase):
             )
             self.assertEqual("giken-3800-mozyo-bridge", payload["identifier"])
             self.assertEqual(str(repo.resolve()), payload["repo_root"])
+
+    # ------------------------------------------------------------------
+    # Bare `mozyo` / status unification (Redmine #10796 follow-up #52324)
+    # ------------------------------------------------------------------
+
+    def _run_bare_mozyo_capture_session(self, repo: Path) -> str:
+        """Run bare `mozyo --no-attach` with tmux mocked; return the session.
+
+        Captures the session name handed to `ensure_repo_session_windows` so
+        the test asserts the derivation without touching a real tmux server.
+        """
+        args = argparse.Namespace(
+            repo=str(repo),
+            session=None,
+            cwd=None,
+            config_path=None,
+            ready_timeout=0,
+            force=False,
+            no_attach=True,
+        )
+        captured: dict[str, argparse.Namespace] = {}
+
+        def fake_ensure(inner: argparse.Namespace) -> list[str]:
+            captured["args"] = inner
+            return []
+
+        list_result = argparse.Namespace(returncode=0, stdout="", stderr="")
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+            patch(
+                "mozyo_bridge.application.commands.ensure_repo_session_windows",
+                side_effect=fake_ensure,
+            ), \
+            patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+            patch(
+                "mozyo_bridge.application.commands.os.execvp",
+                side_effect=AssertionError("must not attach"),
+            ), \
+            contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, cmd_mozyo(args))
+        return captured["args"].session
+
+    def test_bare_mozyo_uses_workspace_defaults_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "any-basename").resolve()
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+
+            self.assertEqual(
+                "mozyo-giken-3800-mozyo-bridge",
+                self._run_bare_mozyo_capture_session(repo),
+            )
+
+    def test_bare_mozyo_japanese_basename_is_not_collapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "2026PBL_ローカル").resolve()
+            repo.mkdir()
+
+            session = self._run_bare_mozyo_capture_session(repo)
+
+            self.assertNotIn("_", session)
+            self.assertTrue(session.startswith("mozyo-2026pbl-"))
+
+    def test_bare_mozyo_respects_explicit_session_override(self) -> None:
+        # The explicit `--session` override must still win over the derived
+        # name; the derivation only fills the default.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "2026PBL_ローカル").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session="explicit-name",
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+            )
+            captured: dict[str, argparse.Namespace] = {}
+
+            def fake_ensure(inner: argparse.Namespace) -> list[str]:
+                captured["args"] = inner
+                return []
+
+            list_result = argparse.Namespace(returncode=0, stdout="", stderr="")
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch(
+                    "mozyo_bridge.application.commands.ensure_repo_session_windows",
+                    side_effect=fake_ensure,
+                ), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch(
+                    "mozyo_bridge.application.commands.os.execvp",
+                    side_effect=AssertionError("must not attach"),
+                ), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_mozyo(args))
+
+            self.assertEqual("explicit-name", captured["args"].session)
+
+    def test_resolve_status_session_fallback_uses_derived_name(self) -> None:
+        from mozyo_bridge.application.commands import resolve_status_session
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "2026PBL_ローカル").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(repo=str(repo), session=None)
+
+            # Not inside tmux (no current session) and no explicit --session:
+            # the fallback must match what bare `mozyo` creates.
+            with patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value=None,
+            ):
+                resolved = resolve_status_session(args)
+
+            self.assertEqual(derive_session_name(repo).name, resolved)
+
+    def test_legacy_basename_session_notice_cases(self) -> None:
+        from mozyo_bridge.application.commands import legacy_basename_session_notice
+
+        repo = Path("/tmp/some/2026PBL_ローカル")
+        derived = "mozyo-2026pbl-deadbeef"
+
+        # Legacy session exists and belongs to this repo -> notice.
+        with patch(
+            "mozyo_bridge.application.commands.session_exists", return_value=True
+        ), patch(
+            "mozyo_bridge.application.commands.session_cwd_mismatch", return_value=[]
+        ):
+            notice = legacy_basename_session_notice(repo, derived)
+        self.assertIsNotNone(notice)
+        self.assertIn("2026PBL_ローカル", notice)
+        self.assertIn(derived, notice)
+
+        # No legacy session -> no notice.
+        with patch(
+            "mozyo_bridge.application.commands.session_exists", return_value=False
+        ):
+            self.assertIsNone(legacy_basename_session_notice(repo, derived))
+
+        # Legacy-named session belongs to another repo (cwd mismatch) -> no notice.
+        with patch(
+            "mozyo_bridge.application.commands.session_exists", return_value=True
+        ), patch(
+            "mozyo_bridge.application.commands.session_cwd_mismatch",
+            return_value=["/elsewhere"],
+        ):
+            self.assertIsNone(legacy_basename_session_notice(repo, derived))
+
+        # Derived name equals the basename (ASCII repo) -> nothing to migrate.
+        with patch(
+            "mozyo_bridge.application.commands.session_exists", return_value=True
+        ):
+            self.assertIsNone(
+                legacy_basename_session_notice(Path("/tmp/foo"), "foo")
+            )
+
+    # ------------------------------------------------------------------
+    # VS Code `tmux-integrated.sessionName` writer (#52324 mechanization)
+    # ------------------------------------------------------------------
+
+    def test_merge_vscode_session_name_creates_and_preserves(self) -> None:
+        from mozyo_bridge.domain.session_naming import merge_vscode_session_name
+
+        # Empty / None -> fresh object with just the key.
+        for empty in (None, "", "   \n"):
+            created = json.loads(merge_vscode_session_name(empty, "mozyo-x"))
+            self.assertEqual({"tmux-integrated.sessionName": "mozyo-x"}, created)
+
+        # Existing keys are preserved; the session key is updated in place.
+        existing = json.dumps(
+            {"editor.tabSize": 2, "tmux-integrated.sessionName": "old"}
+        )
+        merged = json.loads(merge_vscode_session_name(existing, "mozyo-new"))
+        self.assertEqual(2, merged["editor.tabSize"])
+        self.assertEqual("mozyo-new", merged["tmux-integrated.sessionName"])
+
+    def test_merge_vscode_session_name_refuses_jsonc_and_non_object(self) -> None:
+        from mozyo_bridge.domain.session_naming import merge_vscode_session_name
+
+        with self.assertRaises(ValueError):
+            merge_vscode_session_name('{\n  // comment\n  "a": 1\n}', "mozyo-x")
+        with self.assertRaises(ValueError):
+            merge_vscode_session_name("[1, 2, 3]", "mozyo-x")
+
+    def test_vscode_settings_cli_dry_run_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+
+            code, out = self._run_cli(
+                ["session", "vscode-settings", "--repo", str(repo)]
+            )
+
+            self.assertEqual(0, code)
+            self.assertIn("mozyo-giken-3800-mozyo-bridge", out)
+            self.assertFalse((repo / ".vscode" / "settings.json").exists())
+
+    def test_vscode_settings_cli_write_creates_and_merges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._write_workspace_defaults(repo, identifier="giken-3800-mozyo-bridge")
+            settings = repo / ".vscode" / "settings.json"
+
+            code, _ = self._run_cli(
+                ["session", "vscode-settings", "--repo", str(repo), "--write"]
+            )
+            self.assertEqual(0, code)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "mozyo-giken-3800-mozyo-bridge",
+                data["tmux-integrated.sessionName"],
+            )
+
+            # A second write preserving an unrelated key.
+            settings.write_text(
+                json.dumps(
+                    {
+                        "editor.tabSize": 4,
+                        "tmux-integrated.sessionName": "stale",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, _ = self._run_cli(
+                ["session", "vscode-settings", "--repo", str(repo), "--write"]
+            )
+            self.assertEqual(0, code)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(4, data["editor.tabSize"])
+            self.assertEqual(
+                "mozyo-giken-3800-mozyo-bridge",
+                data["tmux-integrated.sessionName"],
+            )
+
+    def test_vscode_settings_cli_refuses_to_clobber_jsonc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            settings = repo / ".vscode"
+            settings.mkdir()
+            jsonc = settings / "settings.json"
+            original = '{\n  // a comment\n  "editor.tabSize": 2\n}\n'
+            jsonc.write_text(original, encoding="utf-8")
+
+            parser = build_parser()
+            args = parser.parse_args(
+                ["session", "vscode-settings", "--repo", str(repo), "--write"]
+            )
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    args.func(args)
+
+            # The JSONC file must be left byte-for-byte untouched.
+            self.assertEqual(original, jsonc.read_text(encoding="utf-8"))
+            self.assertIn("JSONC", stderr.getvalue())
+
+    def test_session_vscode_settings_cli_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["session", "vscode-settings", "--repo", "/r", "--write"]
+        )
+        self.assertEqual("vscode-settings", args.session_command)
+        self.assertTrue(args.write)
 
 
 if __name__ == "__main__":
