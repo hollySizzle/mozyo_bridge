@@ -8,6 +8,18 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.5 - 2026-06-03
+
+v0.5.5 は、v0.5.4 で入れた session identity / runtime config 周りの仕上げとして、`workspace-defaults.yaml` の正本から Codex runtime config を生成する install 経路を追加する patch release です。
+
+### 変更点
+
+- `mozyo-bridge instruction install --profile redmine-codex --target .` を追加しました。`instruction doctor` が「正本はあるが `<repo>/.codex/config.toml` が無い」状態を検出するだけだったのに対し、これは検査と修復の間の手作業を埋める write 側経路です。`<repo>/.mozyo-bridge/workspace-defaults.yaml` の **verified** な Redmine default project を正本として、repo-root `<repo>/.codex/config.toml` の `[redmine]`(`default_project` / `default_project_name` / `default_project_url`)と `[mcp_servers.redmine_epic_grid]`(`url` + `http_headers.X-Default-Project`)を生成 / merge します。MCP RPC URL は `default_project.url` の host から導出するため、配布 source に project 固有 host を焼きません。default は dry-run で、実書き込みは `--write` を明示したときだけ行います。既存 config がある場合は無関係 table を保持して append し、managed table が既存値と conflict する場合は fail して operator 確認を促します(`--force` は managed table のみ再生成し、他 table は保持)。unverified な default project や credential-shape 値は拒否し、credential は一切生成しません。書き込み後は `instruction doctor` が green になることを検証する lockstep を持ちます。`.mcp.json` は引き続き deferral(runtime 検証なしに authoritative 生成しない)です。(#10930)
+
+### なぜ必要だったか
+
+#10930 は、Redmine default project の正本(`workspace-defaults.yaml`)が存在し `mozyo-bridge workspace-defaults --check` が clean でも、`<repo>/.codex/config.toml` が無ければ `instruction doctor` が fail する、という「検査はあるが修復は手作業」の段差を埋めるためのものです。v0.5.4 までで「正本の docs 化」「session identity の機械化」「runtime config の read-only 検査」は揃っていましたが、正本から runtime config を反映する install 経路だけが欠けていました。`instruction install` で `workspace-defaults.yaml` → `workspace-defaults --check` → `instruction install --write` → `instruction doctor` green という一連の流れを機械化し、LLM startup / bootstrap の設定漏れを減らします。正本の二重管理を避けるため値は projection に限定し、unverified default や home config 書き込み、credential 生成といった危険な近道は塞いでいます。
+
 ## v0.5.4 - 2026-06-03
 
 v0.5.4 は、v0.5.3 以降に入った bootstrap 入口の整理、distributed governed preset への Codex pre-edit 分類 gate 配布、そして日本語 / 非 ASCII workspace と VS Code tmux-integrated 環境での agent repo identity 喪失の抜本対応をまとめた increment です。
