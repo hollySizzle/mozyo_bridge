@@ -8,16 +8,23 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+## v0.5.4 - 2026-06-03
+
+v0.5.4 は、v0.5.3 以降に入った bootstrap 入口の整理、distributed governed preset への Codex pre-edit 分類 gate 配布、そして日本語 / 非 ASCII workspace と VS Code tmux-integrated 環境での agent repo identity 喪失の抜本対応をまとめた increment です。
+
 ### 変更点
 
 - bootstrap docs の入口を整理しました。`README.md` の Quick Start を install / bootstrap の入口に戻し、最初に `mozyo-bridge doctor --target .` と `mozyo-bridge instruction doctor --target . --profile redmine-codex` を順に実行する判断順を README に置きました。`doctor`(toolchain health)と `instruction doctor`(repo-local LLM runtime config の合否正本)の責務差分、`instruction doctor` の代表的 failure(`.codex/config.toml` missing / `X-Default-Project` mismatch / `.mcp.json` deferral / credential 混入)と次に読む FAQ への導線を README に追加しています。`vibes/docs/logics/bootstrap.md` は「canonical entrypoint」から、詳細 stage order / FAQ / troubleshooting の reference へ降格し、`instruction doctor` FAQ(各 failure の原因・対処、home config 禁止理由、agent が自動修復してよい範囲と operator 確認が必要な範囲)を Stage 7 に追加しました。(#10857)
 - distributed governed preset (`redmine-governed` / `redmine-rails-governed`) の `agent-workflow.md` に **Codex Pre-Edit Classification Gate** を追加しました。Codex が `apply_patch` / file 作成・更新 / commit の前に「どの実装主体に属するか」を分類することを求め、repo 内の正本成果物は拡張子・内容種別に関係なく(Markdown / HTML / 調査メモ / ドラフト / 表 / report / runbook / 設定例も)実装成果物として扱う、「コードではない」「commit hash を journal に書く必要がある」を direct edit の根拠にしない、direct edit は Repo-Local Guardrail Autonomous Lane か `codex_direct_edit` gate のみ、誤った先行成果物は完了扱いにせず correction flow へ戻す、を distributed preset 側で明文化しています。canonical source から両 preset を再生成し、両 governed preset VERSION を `2026.06.02.1` に bump しました(配布内容変更に伴う version mirror 整合)。(#10899)
+- 日本語 / 非 ASCII workspace basename や VS Code tmux-integrated 環境で tmux session identity が失われる問題に抜本対応しました。VS Code tmux-integrated / TaskPilot menu は basename を sanitize して session 名を作るため、`2026PBL_ローカル` のような basename は `2026PBL_____` のような低情報量名へ潰れ、複数 workspace の `____` session が衝突して `mozyo-bridge agents list` / `--target-repo` handoff gate が実 repo identity を復元できなくなっていました。新 CLI `mozyo-bridge session name --repo <path>`(`--json` 対応)を追加し、`<repo>/.mozyo-bridge/workspace-defaults.yaml` の `redmine.default_project.identifier` があれば `mozyo-<identifier-slug>` を、無ければ repo path の短い hash を suffix した collision-safe fallback `mozyo-<basename-slug>-<hash>` を返す導出に統一しました。非 ASCII basename は `____` に潰さず、同名 / 非 ASCII basename でも path hash で区別されます。bare `mozyo` と `mozyo-bridge status` の session 解決もこの導出に揃え(明示 `--session` override と current tmux session 優先は維持)、旧 basename session が残っている場合は移行 notice を表示します。さらに `mozyo-bridge session vscode-settings --repo . --write` を追加し、workspace-local `<repo>/.vscode/settings.json` の `tmux-integrated.sessionName` を導出名に設定します(user-global VS Code settings / credential は読み書きせず、コメント付き JSONC は壊さず手編集を促して停止)。README / bootstrap / workspace-defaults renderer docs に VS Code 向け運用・移行手順・TaskPilot snippet を追記しています。`--session` override / 誤 attach guard / `init` の同名 window fail-closed / `--target-repo` gate の安全境界は変更していません。(#10796)
 
 ### なぜ必要だったか
 
 #10857 は、最初に読む入口が深い docs 側(`bootstrap.md`)に残っていると、LLM が詳細 docs を読み飛ばして設定漏れを再発させる、という問題を断つためのものです。v0.5.3 で `instruction doctor` という機械判定が入ったので、README を入口にして「まず 2 つの doctor を実行し、結果で判断する」導線を一番上に置き、詳細・背景・失敗時の解釈は FAQ / troubleshooting へ降ろすことで、入口の軽さと詳細の網羅を両立させます。
 
 #10899 は、#10898 で project-local doc に追加した Codex pre-edit classification gate を、downstream の governed repo にも効かせるためのものです。Codex が Markdown / 調査メモ / ドラフトなどの repo 正本成果物を「コードではないから安全」と誤分類して直接編集する事故は、配布 preset を採用した repo でも同様に起こり得ます。distributed preset に同じ分類 gate を載せることで、commit / journal 要件を direct edit の免罪符にせず、autonomous lane か `codex_direct_edit` gate が成立した場合だけ direct edit に切り替える運用を、配布先でも既定にします。
+
+#10796 は、tmux session 名を「workspace basename の ASCII sanitize」に依存させていたことが root cause でした。日本語など非 ASCII を含む basename は `____` のような低情報量名に潰れ、別 workspace の同名 session と衝突して、どの session がどの repo に属するか復元できなくなります。この状態では安全な `--target-repo` gate が false negative になり、operator が gate を外して送る誘惑が生じます。session identity の入力を、既に workspace-local の正本である Redmine project identifier(+ path hash fallback)に寄せ、bare `mozyo` / status / VS Code 入口を同じ導出に統一することで、「運用でカバー」ではなく入口そのものを修正しました。VS Code は `mozyo` を経由せず自前で session を立てるため、workspace-local settings writer を用意して機械的に同じ名前を渡せるようにし、user-global settings や credential には一切触れない制約を維持しています。
 
 ## v0.5.3 - 2026-06-01
 
