@@ -1,0 +1,8 @@
+[redmine]
+default_project = "giken-3800-mozyo-bridge"
+default_project_name = "mozyo_bridge"
+default_project_url = "https://redmine.giken.or.jp/projects/giken-3800-mozyo-bridge"
+
+[mcp_servers.redmine_epic_grid]
+url = "https://redmine.giken.or.jp/mcp/rpc"
+http_headers = { X-Default-Project = "giken-3800-mozyo-bridge" }
