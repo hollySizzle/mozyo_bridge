@@ -8,7 +8,9 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
-破壊的変更を含みます(CLI command rename)。次 release は minor bump 相当(v0.6.0 想定)を見込みますが、version 文字列の確定 / publish / tag は本 notes では行わず、別 release task で扱います。
+## v0.6.0 - 2026-06-07
+
+v0.6.0 は、#11050 / #11051 系で実装した read-only な復旧導線 `mozyo-bridge doctor instruction` の追加と、repo-local LLM runtime config command の `instruction doctor` / `instruction install` → `runtime-config check` / `runtime-config install` への rename をまとめた minor release です。破壊的 CLI rename を含むため patch ではなく minor bump とし、旧 `instruction doctor` / `instruction install` は deprecated alias + stderr 警告として 1 minor cycle(削除候補は v0.7.0 以降)維持します。push / tag / TestPyPI / PyPI publish は本 release notes では行わず、別 gate と owner 明示承認のもとで実施します。
 
 ### 変更点
 
