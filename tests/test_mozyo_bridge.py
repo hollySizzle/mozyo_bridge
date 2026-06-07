@@ -588,6 +588,10 @@ class CliTest(unittest.TestCase):
         # doctor stays described as read-only; install as write-capable / dry-run.
         self.assertIn("read-only", instruction)
         self.assertIn("dry-run", instruction)
+        # Redmine #11051: the whole `instruction` group is now a deprecated alias
+        # for `runtime-config`. The help must say so without breaking the split.
+        self.assertIn("deprecated alias", instruction.lower())
+        self.assertIn("runtime-config", instruction)
 
     def test_notify_codex_accepts_type(self) -> None:
         parser = build_parser()
@@ -744,6 +748,215 @@ class CliTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["scaffold", legacy_subcommand, "asana"])
+
+
+class DoctorInstructionTaxonomyTest(unittest.TestCase):
+    """Redmine #11051: `doctor instruction` runbook + `runtime-config` rename.
+
+    Design consultation answer #53306 fixed the taxonomy: option A (rename the
+    top-level `instruction` group to `runtime-config`, add a read-only
+    `doctor instruction` runbook), a 1-cycle deprecated alias that warns on
+    stderr, and additive JSON.
+    """
+
+    def _help_text(self, argv: list[str]) -> str:
+        parser = build_parser()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+        return stdout.getvalue()
+
+    def test_doctor_instruction_is_a_doctor_subcommand(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["doctor", "instruction"])
+        self.assertEqual("doctor", args.command)
+        self.assertEqual("instruction", args.doctor_command)
+        self.assertEqual("cmd_doctor_instruction", args.func.__name__)
+
+    def test_bare_doctor_still_runs_diagnostics(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["doctor"])
+        self.assertEqual("doctor", args.command)
+        self.assertIsNone(args.doctor_command)
+        self.assertEqual("cmd_doctor", args.func.__name__)
+
+    def test_runtime_config_group_parses(self) -> None:
+        parser = build_parser()
+        check = parser.parse_args(["runtime-config", "check"])
+        self.assertEqual("runtime-config", check.command)
+        self.assertEqual("check", check.runtime_config_command)
+        self.assertEqual("cmd_instruction_doctor", check.func.__name__)
+        install = parser.parse_args(["runtime-config", "install", "--write"])
+        self.assertEqual("install", install.runtime_config_command)
+        self.assertEqual("cmd_instruction_install", install.func.__name__)
+        self.assertTrue(install.write)
+
+    def test_canonical_runtime_config_is_not_a_deprecated_alias(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["runtime-config", "check"])
+        self.assertIsNone(getattr(args, "deprecated_alias", None))
+
+    def test_instruction_alias_carries_deprecation_metadata(self) -> None:
+        parser = build_parser()
+        doctor_alias = parser.parse_args(["instruction", "doctor"])
+        self.assertEqual(
+            "mozyo-bridge instruction doctor", doctor_alias.deprecated_alias
+        )
+        self.assertEqual(
+            "mozyo-bridge runtime-config check", doctor_alias.canonical_command
+        )
+        # Same underlying implementation as the canonical command.
+        self.assertEqual("cmd_instruction_doctor", doctor_alias.func.__name__)
+        install_alias = parser.parse_args(["instruction", "install"])
+        self.assertEqual(
+            "mozyo-bridge instruction install", install_alias.deprecated_alias
+        )
+        self.assertEqual(
+            "mozyo-bridge runtime-config install", install_alias.canonical_command
+        )
+
+    def test_deprecated_alias_warns_on_stderr_only(self) -> None:
+        from mozyo_bridge.application.cli import _warn_deprecated_alias
+
+        # Alias -> warning on stderr.
+        args = argparse.Namespace(
+            deprecated_alias="mozyo-bridge instruction doctor",
+            canonical_command="mozyo-bridge runtime-config check",
+        )
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+            _warn_deprecated_alias(args)
+        self.assertIn("deprecated", stderr.getvalue())
+        self.assertIn("runtime-config check", stderr.getvalue())
+        # stdout untouched so JSON consumers stay additive.
+        self.assertEqual("", stdout.getvalue())
+
+        # Canonical command -> no warning.
+        quiet = io.StringIO()
+        with contextlib.redirect_stderr(quiet):
+            _warn_deprecated_alias(argparse.Namespace(deprecated_alias=None))
+        self.assertEqual("", quiet.getvalue())
+
+    def test_runtime_config_help_describes_responsibility_split(self) -> None:
+        help_text = self._help_text(["runtime-config", "--help"])
+        self.assertIn("check", help_text)
+        self.assertIn("install", help_text)
+        self.assertIn("read-only", help_text)
+        self.assertIn("dry-run", help_text)
+
+
+class DoctorInstructionRunbookTest(unittest.TestCase):
+    """The runbook synthesis (`build_runbook`) is pure given doctor results."""
+
+    def _doctor_result(self, **overrides: str) -> dict:
+        sections = {
+            "cli": {"status": "ok", "version": "9.9.9", "executable": "/x/mozyo-bridge"},
+            "rules": {"status": "ok", "next_action": []},
+            "codex_skill": {"status": "ok"},
+            "claude_skill": {"status": "plugin-managed"},
+            "scaffold": {"status": "ok", "detail": {"preset": "redmine-governed"}},
+            "claude_nagger": {"status": "ok"},
+            "tmux": {"status": "ok", "artifact": {"host_wiring": {"next_action": []}}},
+        }
+        for key, status in overrides.items():
+            sections[key] = {**sections.get(key, {}), "status": status}
+        ok = all(
+            s.get("status") not in {"missing", "drifted", "warning", "incomplete"}
+            for s in sections.values()
+        )
+        return {"ok": ok, "sections": sections}
+
+    def test_runbook_order_and_migration_present(self) -> None:
+        from mozyo_bridge.application.doctor_instruction import build_runbook
+
+        steps = build_runbook(
+            self._doctor_result(), {"ok": True}, "/repo", "redmine-codex"
+        )
+        ids = [s["id"] for s in steps]
+        self.assertEqual(
+            ids,
+            [
+                "cli",
+                "rules",
+                "agent_skills",
+                "scaffold",
+                "runtime_config",
+                "optional_utilities",
+                "final_verification",
+            ],
+        )
+
+    def test_clean_environment_needs_no_action(self) -> None:
+        from mozyo_bridge.application.doctor_instruction import (
+            STATUS_ACTION,
+            build_runbook,
+        )
+
+        steps = build_runbook(
+            self._doctor_result(), {"ok": True}, "/repo", "redmine-codex"
+        )
+        self.assertFalse([s for s in steps if s["status"] == STATUS_ACTION])
+
+    def test_skill_step_labels_primary_and_fallback(self) -> None:
+        from mozyo_bridge.application.doctor_instruction import build_runbook
+
+        steps = build_runbook(
+            self._doctor_result(claude_skill="missing", codex_skill="missing"),
+            {"ok": True},
+            "/repo",
+            "redmine-codex",
+        )
+        skills = next(s for s in steps if s["id"] == "agent_skills")
+        self.assertEqual("action", skills["status"])
+        roles = {c["role"] for c in skills["commands"]}
+        self.assertIn("primary", roles)
+        self.assertIn("fallback", roles)
+        # Claude primary path is the plugin marketplace, not curl.
+        primary_claude = next(
+            c for c in skills["commands"]
+            if c["role"] == "primary" and "claude" in c.get("for", "")
+        )
+        self.assertIn("plugin", primary_claude["command"])
+
+    def test_scaffold_drift_is_review_before_restore(self) -> None:
+        from mozyo_bridge.application.doctor_instruction import build_runbook
+
+        steps = build_runbook(
+            self._doctor_result(scaffold="drifted"),
+            {"ok": True},
+            "/repo",
+            "redmine-codex",
+        )
+        scaffold = next(s for s in steps if s["id"] == "scaffold")
+        self.assertEqual("action", scaffold["status"])
+        commands = scaffold["commands"]
+        # status/diff are primary; apply --backup is the fallback that comes last.
+        self.assertEqual("primary", commands[0]["role"])
+        self.assertIn("scaffold status", commands[0]["command"])
+        self.assertEqual("fallback", commands[-1]["role"])
+        self.assertIn("--backup", commands[-1]["command"])
+
+    def test_result_reports_pending_and_migrations(self) -> None:
+        from mozyo_bridge.application.doctor_instruction import run_doctor_instruction
+
+        with patch(
+            "mozyo_bridge.application.doctor_instruction.run_doctor",
+            return_value=self._doctor_result(rules="missing"),
+        ), patch(
+            "mozyo_bridge.application.doctor_instruction.run_instruction_doctor",
+            return_value={"ok": True},
+        ), patch(
+            "mozyo_bridge.application.doctor_instruction.doctor_target",
+            return_value=Path("/repo"),
+        ):
+            result = run_doctor_instruction(argparse.Namespace(repo="/repo"))
+        self.assertFalse(result["ok"])
+        self.assertIn("rules", result["pending_step_ids"])
+        olds = {m["old"] for m in result["migrations"]}
+        self.assertIn("mozyo-bridge instruction doctor", olds)
+        self.assertIn("mozyo-bridge instruction install", olds)
 
 
 class ScaffoldRulesTest(unittest.TestCase):
@@ -14072,12 +14285,14 @@ class BootstrapEntrypointDocsTest(unittest.TestCase):
 
     Pins the refactor's intent so the docs cannot silently regress to
     routing first-time readers straight into the deep bootstrap doc:
-    - README routes through `doctor` + `instruction doctor` first;
+    - README routes through `doctor` + `runtime-config check` first
+      (renamed from `instruction doctor` in Redmine #11051);
     - README no longer calls bootstrap.md the canonical / read-first
       entrypoint;
     - bootstrap.md no longer self-describes as the canonical entrypoint
       to read before README;
-    - the instruction-doctor FAQ lives in bootstrap.md.
+    - the runtime-config-check FAQ lives in bootstrap.md;
+    - the CLI taxonomy migration (old `instruction` names) is documented.
     """
 
     def setUp(self) -> None:
@@ -14090,18 +14305,28 @@ class BootstrapEntrypointDocsTest(unittest.TestCase):
         quick_start = self.readme.split("## Quick Start", 1)[1].split("\n## ", 1)[0]
         self.assertIn("mozyo-bridge doctor --target .", quick_start)
         self.assertIn(
-            "mozyo-bridge instruction doctor --target . --profile redmine-codex",
+            "mozyo-bridge runtime-config check --target . --profile redmine-codex",
             quick_start,
         )
+        # The new read-only recovery runbook is advertised in the Quick Start.
+        self.assertIn("mozyo-bridge doctor instruction --target .", quick_start)
         # The README states it is the entrypoint.
         self.assertIn("entrypoint for install and bootstrap", quick_start)
+
+    def test_readme_documents_taxonomy_migration(self) -> None:
+        # Redmine #11051: README must teach the rename + deprecation so users
+        # are not stranded on the old names.
+        quick_start = self.readme.split("## Quick Start", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("runtime-config check", quick_start)
+        self.assertIn("runtime-config install", quick_start)
+        self.assertIn("deprecated", quick_start.lower())
 
     def test_readme_does_not_call_bootstrap_the_canonical_entrypoint(self) -> None:
         self.assertNotIn("canonical LLM-first bootstrap guide", self.readme)
         self.assertNotIn("Read this first for end-to-end setup", self.readme)
 
-    def test_readme_links_instruction_doctor_failures_to_faq(self) -> None:
-        self.assertIn("instruction doctor` failures", self.readme)
+    def test_readme_links_runtime_config_check_failures_to_faq(self) -> None:
+        self.assertIn("runtime-config check` failures", self.readme)
         for symptom in ("`<repo>/.codex/config.toml` is missing", "X-Default-Project"):
             self.assertIn(symptom, self.readme)
 
@@ -14110,9 +14335,9 @@ class BootstrapEntrypointDocsTest(unittest.TestCase):
         self.assertNotIn("canonical entrypoint for", self.bootstrap)
         self.assertIn("detailed stage-order / FAQ / troubleshooting reference", self.bootstrap)
 
-    def test_bootstrap_has_instruction_doctor_faq(self) -> None:
-        faq = self.bootstrap.split("### `instruction doctor` FAQ", 1)
-        self.assertEqual(2, len(faq), msg="instruction doctor FAQ section missing")
+    def test_bootstrap_has_runtime_config_check_faq(self) -> None:
+        faq = self.bootstrap.split("### `runtime-config check` FAQ", 1)
+        self.assertEqual(2, len(faq), msg="runtime-config check FAQ section missing")
         section = faq[1]
         for needle in (
             "config.toml is missing",
@@ -14122,6 +14347,12 @@ class BootstrapEntrypointDocsTest(unittest.TestCase):
             "auto-fix vs",
         ):
             self.assertIn(needle, section, msg=f"FAQ missing {needle!r}")
+
+    def test_bootstrap_documents_taxonomy_migration_and_runbook(self) -> None:
+        # The migration section names old -> new and points at the runbook.
+        self.assertIn("CLI taxonomy migration", self.bootstrap)
+        self.assertIn("mozyo-bridge doctor instruction", self.bootstrap)
+        self.assertIn("runtime-config check", self.bootstrap)
 
 
 class SessionNamingTest(unittest.TestCase):

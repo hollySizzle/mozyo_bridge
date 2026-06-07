@@ -7,7 +7,7 @@ exact commands, expected success signals, and the failure branch.
 This is the detailed stage-order / FAQ / troubleshooting reference for
 "install/update + project bootstrap". The entrypoint is `README.md` `Quick
 Start`: run `mozyo-bridge doctor --target .` then
-`mozyo-bridge instruction doctor --target . --profile redmine-codex` first, and
+`mozyo-bridge runtime-config check --target . --profile redmine-codex` first, and
 follow the link here when a step fails or you need the full stage sequence. This
 doc is no longer the first thing to read. `README.md`,
 `skill-distribution.md`, and `scaffold-rules.md` remain the authoritative
@@ -637,9 +637,30 @@ The symptoms below are the ones an LLM is most likely to observe while executing
   - do **not** set a user-global fixed `tmux-integrated.sessionName`; it collapses every workspace onto one session and risks cross-repo misdelivery.
   - migration: if a legacy basename-named session lingers, bare `mozyo` prints a notice; attach it with `mozyo --session <old>` or remove it once empty with `tmux kill-session -t <old>`.
 
-### `instruction doctor` FAQ (repo-local LLM runtime config)
+### CLI taxonomy migration (Redmine #11051)
 
-`mozyo-bridge instruction doctor --target . --profile redmine-codex` is the
+The repo-local runtime config commands were renamed so the word "instruction"
+is free for the `doctor instruction` recovery runbook:
+
+- `mozyo-bridge instruction doctor` → `mozyo-bridge runtime-config check`
+- `mozyo-bridge instruction install` → `mozyo-bridge runtime-config install`
+
+The old names still run for one minor cycle but print a deprecation warning to
+stderr and are a removal candidate next minor. The warning goes to stderr only,
+so `--json` stdout stays unchanged for existing consumers. Update scripts and
+docs to the new names; the old names are migration-only.
+
+`mozyo-bridge doctor instruction --target .` is the read-only **recovery
+runbook**: it consumes the current `doctor` diagnostics and prints the ordered
+fix sequence (central rules → agent skills with primary-plugin vs legacy-curl
+fallback → scaffold drift via review-before-restore → runtime config → final
+verification), plus these migration notes. It never writes, installs, or hits the
+network. Use it when you want "what do I run, in what order" rather than the raw
+section-by-section diagnosis from `doctor`.
+
+### `runtime-config check` FAQ (repo-local LLM runtime config)
+
+`mozyo-bridge runtime-config check --target . --profile redmine-codex` is the
 machine check for a Redmine/Codex workspace's repo-root runtime config. It is
 read-only: it never creates, edits, or autofixes config, and it makes no network
 call. The README Quick Start runs it second (after `doctor`); the failures it
@@ -651,14 +672,14 @@ reports and their fixes:
   - fix (preferred, when a verified source of truth exists): if
     `<repo>/.mozyo-bridge/workspace-defaults.yaml` already carries a **verified**
     Redmine default project (`mozyo-bridge workspace-defaults --check` clean),
-    generate the config from it with `mozyo-bridge instruction install --profile
+    generate the config from it with `mozyo-bridge runtime-config install --profile
     redmine-codex --target . --write` (dry-run first without `--write`). This
     projects the source of truth into `<repo>/.codex/config.toml` and leaves
-    `instruction doctor` green. See the `instruction install` FAQ below.
+    `runtime-config check` green. See the `runtime-config install` FAQ below.
   - fix (no source of truth yet): an agent must **ask the operator before
     creating it** — the default project is a workspace-specific fact, not
     something to guess. Once the operator confirms the project identity, populate
-    `<repo>/.mozyo-bridge/workspace-defaults.yaml` (then `instruction install`),
+    `<repo>/.mozyo-bridge/workspace-defaults.yaml` (then `runtime-config install`),
     or hand-create the file with `[redmine]` `default_project` /
     `default_project_name` / `default_project_url` and the
     `[mcp_servers.redmine_epic_grid]` `url` + `http_headers.X-Default-Project`.
@@ -674,7 +695,7 @@ reports and their fixes:
 - **`.mcp.json` is `info` / non-authoritative**:
   - reason: no runtime has been verified to read the repo-root `<repo>/.mcp.json`,
     so the command reports its presence/absence as `info` and never fails on it
-    alone (deferral). `instruction doctor` still parses it and scans it for
+    alone (deferral). `runtime-config check` still parses it and scans it for
     credential shapes when present, but does not treat it as authoritative
     runtime config. Treating an unread file as fact is the risk this avoids.
 - **home config must not hold the default project**:
@@ -687,7 +708,7 @@ reports and their fixes:
     once the project identity is already established — e.g. correcting an
     `X-Default-Project` header to match an operator-confirmed
     `[redmine].default_project`, or removing an obviously misplaced credential.
-    Running `mozyo-bridge instruction install --write` against a **verified**
+    Running `mozyo-bridge runtime-config install --write` against a **verified**
     workspace-defaults is in this category: it only projects an
     already-established, verified fact into the runtime config.
   - operator confirmation required: choosing or changing the default project
@@ -696,14 +717,14 @@ reports and their fixes:
     doctor` itself never writes; these are actions an agent takes only after the
     check reports a failure and the operator has confirmed intent.
 
-### `instruction install` FAQ (workspace-defaults → runtime config)
+### `runtime-config install` FAQ (workspace-defaults → runtime config)
 
-`mozyo-bridge instruction install --profile redmine-codex --target .` is the
-write side that `instruction doctor` lacks. It projects the verified Redmine
+`mozyo-bridge runtime-config install --profile redmine-codex --target .` is the
+write side that `runtime-config check` lacks. It projects the verified Redmine
 default project from `<repo>/.mozyo-bridge/workspace-defaults.yaml` (the single
 source of truth) into the repo-root `<repo>/.codex/config.toml`, so the flow is
 `workspace-defaults.yaml` → `workspace-defaults --check` clean →
-`instruction install --write` → `instruction doctor` green.
+`runtime-config install --write` → `runtime-config check` green.
 
 - source of truth: stays `workspace-defaults.yaml`; install never invents
   values and only writes `<repo>/.codex/config.toml` (the `[redmine]` and
@@ -720,12 +741,12 @@ source of truth) into the repo-root `<repo>/.codex/config.toml`, so the flow is
 ## Where this doc sits relative to the others
 
 - **`README.md` `Quick Start`** is the entrypoint: install, then `doctor` +
-  `instruction doctor` first, with the `instruction doctor` failure summary.
+  `runtime-config check` first, with the `runtime-config check` failure summary.
   Start there.
 - **This doc** is the detailed reference reached from the README: it owns the
   fresh-install stage order, the existing-install update path through a working
   scaffold + verified doctor + per-preset isolated smoke, and the failure /
-  `instruction doctor` FAQ. Read it when a Quick Start step fails or you need the
+  `runtime-config check` FAQ. Read it when a Quick Start step fails or you need the
   full stage sequence — not as the first doc.
 - `vibes/docs/logics/skill-distribution.md` is the source of truth for skill packaging, precedence, marketplace metadata, and drift.
 - `vibes/docs/logics/scaffold-rules.md` is the source of truth for scaffold preset semantics and manifest invariants.

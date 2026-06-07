@@ -1505,6 +1505,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+def cmd_doctor_instruction(args: argparse.Namespace) -> int:
+    from mozyo_bridge.application.doctor_instruction import (
+        format_doctor_instruction_text,
+        run_doctor_instruction,
+    )
+
+    result = run_doctor_instruction(args)
+    if getattr(args, "json", False):
+        import json as _json
+
+        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_doctor_instruction_text(result))
+    return 0 if result["ok"] else 1
+
+
 def cmd_instruction_doctor(args: argparse.Namespace) -> int:
     from mozyo_bridge.application.instruction_doctor import (
         format_instruction_doctor_text,

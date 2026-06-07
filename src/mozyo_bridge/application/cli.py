@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_agents_list,
     cmd_config,
     cmd_doctor,
+    cmd_doctor_instruction,
     cmd_handoff_reply,
     cmd_handoff_send,
     cmd_id,
@@ -152,6 +154,144 @@ def add_legacy_notify_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-id", required=True, help="Retired queue task id used only for legacy cleanup")
     add_repo_option(parser)
     parser.add_argument("--queue", help="Retired queue path used only with --task-id")
+
+
+def _add_doctor_diagnostic_options(parser: argparse.ArgumentParser) -> None:
+    """Shared --target/--repo/--home/--json for `doctor` and `doctor instruction`."""
+    parser.add_argument(
+        "--target",
+        dest="repo",
+        help="Project root to check for scaffold and Claude project-skill readiness. "
+        "Defaults to MOZYO_REPO or the current working directory.",
+    )
+    parser.add_argument(
+        "--repo",
+        dest="repo",
+        help="Alias for --target.",
+    )
+    parser.add_argument(
+        "--home",
+        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+
+
+def _add_runtime_config_check_parser(
+    subparsers: argparse._SubParsersAction,
+    *,
+    name: str,
+    deprecated_alias: str | None = None,
+    canonical_command: str | None = None,
+) -> argparse.ArgumentParser:
+    """Add the read-only runtime-config check parser under `name`.
+
+    Used twice: as the canonical `runtime-config check`, and as the deprecated
+    `instruction doctor` alias. The alias path records deprecation metadata so
+    `main()` can warn before dispatch.
+    """
+    parser = subparsers.add_parser(
+        name,
+        help=(
+            "Profile-aware, read-only check that a Redmine/Codex workspace "
+            "carries the repo-root runtime config the bootstrap docs require "
+            "(`<repo>/.codex/config.toml`, optional `<repo>/.mcp.json`). Does "
+            "not call the network, autogenerate, or write home config."
+            + ("" if deprecated_alias is None else " [deprecated alias]")
+        ),
+    )
+    parser.add_argument(
+        "--target",
+        dest="target",
+        help="Project root to check. Defaults to MOZYO_REPO or the current "
+        "working directory.",
+    )
+    parser.add_argument("--repo", dest="target", help="Alias for --target.")
+    parser.add_argument(
+        "--profile",
+        choices=list(KNOWN_PROFILES),
+        default=PROFILE_REDMINE_CODEX,
+        help="Config profile to check. Only `redmine-codex` is defined today; "
+        "other presets are intentionally not failed by this command.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    parser.set_defaults(
+        func=cmd_instruction_doctor,
+        deprecated_alias=deprecated_alias,
+        canonical_command=canonical_command,
+    )
+    return parser
+
+
+def _add_runtime_config_install_parser(
+    subparsers: argparse._SubParsersAction,
+    *,
+    name: str,
+    deprecated_alias: str | None = None,
+    canonical_command: str | None = None,
+) -> argparse.ArgumentParser:
+    """Add the write-capable runtime-config install parser under `name`.
+
+    Used twice: as the canonical `runtime-config install`, and as the
+    deprecated `instruction install` alias.
+    """
+    parser = subparsers.add_parser(
+        name,
+        help=(
+            "Project the verified Redmine default project from "
+            "`<repo>/.mozyo-bridge/workspace-defaults.yaml` into the repo-root "
+            "`<repo>/.codex/config.toml` so `runtime-config check` turns green. "
+            "Source of truth stays workspace-defaults; only the repo-root config "
+            "is written (never home config), no credentials are generated, and "
+            "the default is a dry-run (pass `--write` to apply)."
+            + ("" if deprecated_alias is None else " [deprecated alias]")
+        ),
+    )
+    parser.add_argument(
+        "--target",
+        dest="target",
+        help="Project root to install into. Defaults to MOZYO_REPO or the "
+        "current working directory.",
+    )
+    parser.add_argument("--repo", dest="target", help="Alias for --target.")
+    parser.add_argument(
+        "--profile",
+        choices=list(KNOWN_PROFILES),
+        default=PROFILE_REDMINE_CODEX,
+        help="Config profile to install. Only `redmine-codex` is defined today.",
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Apply the change to `<repo>/.codex/config.toml` (default: dry-run).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "When the managed [redmine] / [mcp_servers.redmine_epic_grid] tables "
+            "already exist but disagree with workspace-defaults, regenerate them "
+            "(other tables are preserved). Without --force a conflict fails."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    parser.set_defaults(
+        func=cmd_instruction_install,
+        deprecated_alias=deprecated_alias,
+        canonical_command=canonical_command,
+    )
+    return parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -595,120 +735,75 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Diagnose CLI, central rules, agent skills, and scaffold readiness",
     )
-    doctor.add_argument(
-        "--target",
-        dest="repo",
-        help="Project root to check for scaffold and Claude project-skill readiness. "
-        "Defaults to MOZYO_REPO or the current working directory.",
-    )
-    doctor.add_argument(
-        "--repo",
-        dest="repo",
-        help="Alias for --target.",
-    )
-    doctor.add_argument(
-        "--home",
-        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
-    )
-    doctor.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
+    _add_doctor_diagnostic_options(doctor)
     doctor.set_defaults(func=cmd_doctor)
+
+    # `doctor instruction` is the read-only recovery runbook (Redmine #11051):
+    # given the doctor diagnostics, it prints the ordered fix procedure with
+    # primary vs legacy-fallback commands. Bare `doctor` keeps running the
+    # diagnostics (subparser is optional so set_defaults(func=cmd_doctor) wins).
+    doctor_sub = doctor.add_subparsers(dest="doctor_command", required=False)
+    doctor_instruction = doctor_sub.add_parser(
+        "instruction",
+        help=(
+            "Read-only recovery runbook: orders the fix steps for the current "
+            "doctor diagnostics, distinguishing primary (Claude plugin) from "
+            "legacy fallback paths and routing scaffold drift through "
+            "review-before-restore. Does not write, install, or hit the network."
+        ),
+    )
+    _add_doctor_diagnostic_options(doctor_instruction)
+    doctor_instruction.add_argument(
+        "--profile",
+        choices=list(KNOWN_PROFILES),
+        default=PROFILE_REDMINE_CODEX,
+        help="Runtime-config profile to fold into the runbook. Only "
+        "`redmine-codex` is defined today.",
+    )
+    doctor_instruction.set_defaults(func=cmd_doctor_instruction)
+
+    # `runtime-config` is the canonical repo-local LLM runtime config group
+    # (renamed from `instruction` in Redmine #11051 to free the word
+    # "instruction" for the `doctor instruction` runbook). `check` is read-only,
+    # `install` is write-capable (dry-run by default). The legacy `instruction`
+    # group below is a deprecated alias that warns and is a removal candidate
+    # next minor.
+    runtime_config = sub.add_parser(
+        "runtime-config",
+        help=(
+            "Repo-local LLM runtime config commands: `check` (read-only) and "
+            "`install` (write-capable, dry-run by default)"
+        ),
+    )
+    runtime_config_sub = runtime_config.add_subparsers(
+        dest="runtime_config_command", required=True
+    )
+    _add_runtime_config_check_parser(runtime_config_sub, name="check")
+    _add_runtime_config_install_parser(runtime_config_sub, name="install")
 
     instruction = sub.add_parser(
         "instruction",
         help=(
-            "Repo-local LLM runtime config commands: `doctor` (read-only check) "
-            "and `install` (write-capable, dry-run by default)"
+            "Deprecated alias for `runtime-config` (write-capable). Use "
+            "`runtime-config check` / `runtime-config install`; the old names "
+            "still run but warn and are a removal candidate next minor."
         ),
     )
     instruction_sub = instruction.add_subparsers(
         dest="instruction_command", required=True
     )
-    instruction_doctor = instruction_sub.add_parser(
-        "doctor",
-        help=(
-            "Profile-aware, read-only check that a Redmine/Codex workspace "
-            "carries the repo-root runtime config the bootstrap docs require "
-            "(`<repo>/.codex/config.toml`, optional `<repo>/.mcp.json`). Does "
-            "not call the network, autogenerate, or write home config."
-        ),
+    _add_runtime_config_check_parser(
+        instruction_sub,
+        name="doctor",
+        deprecated_alias="mozyo-bridge instruction doctor",
+        canonical_command="mozyo-bridge runtime-config check",
     )
-    instruction_doctor.add_argument(
-        "--target",
-        dest="target",
-        help="Project root to check. Defaults to MOZYO_REPO or the current "
-        "working directory.",
+    _add_runtime_config_install_parser(
+        instruction_sub,
+        name="install",
+        deprecated_alias="mozyo-bridge instruction install",
+        canonical_command="mozyo-bridge runtime-config install",
     )
-    instruction_doctor.add_argument(
-        "--repo",
-        dest="target",
-        help="Alias for --target.",
-    )
-    instruction_doctor.add_argument(
-        "--profile",
-        choices=list(KNOWN_PROFILES),
-        default=PROFILE_REDMINE_CODEX,
-        help="Config profile to check. Only `redmine-codex` is defined today; "
-        "other presets are intentionally not failed by this command.",
-    )
-    instruction_doctor.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
-    instruction_doctor.set_defaults(func=cmd_instruction_doctor)
-
-    instruction_install = instruction_sub.add_parser(
-        "install",
-        help=(
-            "Project the verified Redmine default project from "
-            "`<repo>/.mozyo-bridge/workspace-defaults.yaml` into the repo-root "
-            "`<repo>/.codex/config.toml` so `instruction doctor` turns green. "
-            "Source of truth stays workspace-defaults; only the repo-root config "
-            "is written (never home config), no credentials are generated, and "
-            "the default is a dry-run (pass `--write` to apply)."
-        ),
-    )
-    instruction_install.add_argument(
-        "--target",
-        dest="target",
-        help="Project root to install into. Defaults to MOZYO_REPO or the "
-        "current working directory.",
-    )
-    instruction_install.add_argument(
-        "--repo",
-        dest="target",
-        help="Alias for --target.",
-    )
-    instruction_install.add_argument(
-        "--profile",
-        choices=list(KNOWN_PROFILES),
-        default=PROFILE_REDMINE_CODEX,
-        help="Config profile to install. Only `redmine-codex` is defined today.",
-    )
-    instruction_install.add_argument(
-        "--write",
-        action="store_true",
-        help="Apply the change to `<repo>/.codex/config.toml` (default: dry-run).",
-    )
-    instruction_install.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "When the managed [redmine] / [mcp_servers.redmine_epic_grid] tables "
-            "already exist but disagree with workspace-defaults, regenerate them "
-            "(other tables are preserved). Without --force a conflict fails."
-        ),
-    )
-    instruction_install.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
-    instruction_install.set_defaults(func=cmd_instruction_install)
 
     rules = sub.add_parser("rules")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)
@@ -1336,9 +1431,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _warn_deprecated_alias(args: argparse.Namespace) -> None:
+    """Emit a stderr migration warning when a deprecated command alias is used.
+
+    The warning goes to stderr only, so JSON output on stdout stays additive /
+    unbroken for existing `jq` consumers (Redmine #11051 / #53306).
+    """
+    alias = getattr(args, "deprecated_alias", None)
+    if not alias:
+        return
+    canonical = getattr(args, "canonical_command", None) or "the renamed command"
+    print(
+        f"deprecated: `{alias}` is a deprecated alias; use `{canonical}` instead "
+        "(the alias is a removal candidate next minor).",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if not getattr(args, "command", None):
         return cmd_mozyo(args)
     args = normalize_paths(args)
+    _warn_deprecated_alias(args)
     return args.func(args)

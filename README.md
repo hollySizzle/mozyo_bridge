@@ -36,43 +36,65 @@ need the full stage order.
    mozyo-bridge doctor --target .
 
    # Repo-local LLM runtime config health (Redmine/Codex workspaces).
-   mozyo-bridge instruction doctor --target . --profile redmine-codex
+   mozyo-bridge runtime-config check --target . --profile redmine-codex
    ```
 
 3. **Read the result**:
    - `doctor` exits non-zero on a toolchain gap (missing rules, skill, scaffold
      drift, tmux). It prints the next command for each finding.
-   - `instruction doctor` is the source of truth for whether a Redmine/Codex
+   - `runtime-config check` is the source of truth for whether a Redmine/Codex
      workspace's repo-root runtime config is correct. It is read-only: it never
      creates, fixes, or writes config. On a failure, see
-     `instruction doctor` failures below and the FAQ it links to.
+     `runtime-config check` failures below and the FAQ it links to.
+
+When you want the *ordered recovery procedure* rather than a raw diagnosis, run
+the read-only runbook:
+
+```bash
+mozyo-bridge doctor instruction --target .
+```
+
+It turns the current `doctor` diagnostics into a numbered fix sequence —
+central rules, agent skills (primary plugin path vs legacy curl fallback),
+scaffold drift (review-before-restore), runtime config, then a final
+verification — and prints the CLI taxonomy migration notes.
 
 For first-time install on a clean machine, or to follow the full
 install → rules → skill → scaffold → doctor stage order end-to-end, use
 `vibes/docs/logics/bootstrap.md` as the detailed stage-order / troubleshooting
 reference (it is no longer the first thing you read; this Quick Start is).
 
-### `doctor` vs `instruction doctor`
+> **CLI taxonomy migration (breaking, deprecated alias for one minor):** the old
+> `mozyo-bridge instruction doctor` / `instruction install` were renamed to
+> `mozyo-bridge runtime-config check` / `runtime-config install`. The old names
+> still run but print a deprecation warning to stderr and are a removal
+> candidate next minor. `doctor instruction` is the *new* read-only recovery
+> runbook (distinct from the renamed `runtime-config check`).
+
+### `doctor` vs `runtime-config check` vs `doctor instruction`
 
 - `mozyo-bridge doctor --target .` — toolchain readiness: CLI, central rules,
   agent skills, scaffold manifest, tmux. Run this first.
-- `mozyo-bridge instruction doctor --target . --profile redmine-codex` —
+- `mozyo-bridge runtime-config check --target . --profile redmine-codex` —
   repo-local LLM runtime config: `<repo>/.codex/config.toml` Redmine default
   project, the `redmine_epic_grid` MCP header, and credential-shape hygiene of
   `.codex/config.toml` / `.mcp.json`. This is the machine check that the
   Redmine-Codex startup config actually exists and is consistent, so an agent
   cannot silently skip it by skimming the docs.
+- `mozyo-bridge doctor instruction --target .` — read-only recovery runbook that
+  orders the fixes for whatever `doctor` found, distinguishing primary from
+  legacy-fallback commands. It only reads; it never installs or writes.
 
-### `instruction doctor` failures
+### `runtime-config check` failures
 
-`instruction doctor` is read-only and never autofixes. The common failures and
+`runtime-config check` is read-only and never autofixes. The common failures and
 the operator action they require:
 
 - **`<repo>/.codex/config.toml` is missing** — the workspace has no repo-root
   Redmine default. If `<repo>/.mozyo-bridge/workspace-defaults.yaml` already
   carries a **verified** default project, generate the config from it with
-  `mozyo-bridge instruction install --profile redmine-codex --target . --write`
-  (see `instruction install` below). Otherwise ask the operator before creating
+  `mozyo-bridge runtime-config install --profile redmine-codex --target . --write`
+  (see `runtime-config install` below). Otherwise ask the operator before creating
   it; do not put it in a home config. See the FAQ in
   `vibes/docs/logics/bootstrap.md`.
 - **`X-Default-Project` mismatch** — the MCP header and `[redmine].default_project`
@@ -88,19 +110,19 @@ Detailed cause/fix for each, plus the home-config-prohibition rationale and what
 an agent may auto-fix vs must confirm with an operator, is in
 `vibes/docs/logics/bootstrap.md` (`Stage 7 — Failure recovery and common pitfalls`).
 
-### `instruction install` (workspace-defaults → runtime config → doctor)
+### `runtime-config install` (workspace-defaults → runtime config → check)
 
-`instruction doctor` only checks; `mozyo-bridge instruction install --profile
+`runtime-config check` only checks; `mozyo-bridge runtime-config install --profile
 redmine-codex --target .` closes the gap by projecting the **verified** Redmine
 default project from the single source of truth
 (`<repo>/.mozyo-bridge/workspace-defaults.yaml`) into the repo-root
 `<repo>/.codex/config.toml`. The flow is: edit `workspace-defaults.yaml` →
-`mozyo-bridge workspace-defaults --check` clean → `instruction install --write`
-→ `instruction doctor` green.
+`mozyo-bridge workspace-defaults --check` clean → `runtime-config install --write`
+→ `runtime-config check` green.
 
 ```bash
-mozyo-bridge instruction install --profile redmine-codex --target .            # dry-run
-mozyo-bridge instruction install --profile redmine-codex --target . --write    # apply
+mozyo-bridge runtime-config install --profile redmine-codex --target .            # dry-run
+mozyo-bridge runtime-config install --profile redmine-codex --target . --write    # apply
 ```
 
 - Source of truth stays `workspace-defaults.yaml`; install never invents values.
@@ -816,8 +838,8 @@ mozyo-bridge doctor
 
 ## Documentation Map
 
-- `README.md`: install/bootstrap entrypoint, core commands, and safety summary. Start here; run `doctor` + `instruction doctor` first.
-- `vibes/docs/logics/bootstrap.md`: detailed LLM-first stage-order reference, FAQ, and troubleshooting. Strict stage order from a clean machine through a verified scaffold (install → rules → skill → scaffold → doctor → isolated smoke), plus `instruction doctor` failure recovery. Follow it from the README Quick Start when a step fails or you need the full sequence — it is no longer the first doc to read.
+- `README.md`: install/bootstrap entrypoint, core commands, and safety summary. Start here; run `doctor` + `runtime-config check` first.
+- `vibes/docs/logics/bootstrap.md`: detailed LLM-first stage-order reference, FAQ, and troubleshooting. Strict stage order from a clean machine through a verified scaffold (install → rules → skill → scaffold → doctor → isolated smoke), plus `runtime-config check` failure recovery. Follow it from the README Quick Start when a step fails or you need the full sequence — it is no longer the first doc to read.
 - `vibes/docs/rules/agent-workflow.md`: AI agent work rules for this repository.
 - `vibes/docs/specs/project-map.md`: repository structure and source-of-truth routing.
 - `vibes/docs/logics/skill-distribution.md`: Claude/Codex skill layout and install logic.
