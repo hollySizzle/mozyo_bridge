@@ -8,6 +8,22 @@
 
 次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
 
+破壊的変更を含みます(CLI command rename)。次 release は minor bump 相当(v0.6.0 想定)を見込みますが、version 文字列の確定 / publish / tag は本 notes では行わず、別 release task で扱います。
+
+### 変更点
+
+- 環境復旧導線の read-only runbook として `mozyo-bridge doctor instruction` を追加しました。`doctor` は従来どおり read-only な env 診断(`cli` / `rules` / `codex_skill` / `claude_skill` / `scaffold` / `claude_nagger` / `tmux`)に徹し、`doctor instruction` はその診断結果を消費して「どの順で何を直すか」を番号付きの復旧手順に並べます。手順は central rules → agent skills → scaffold drift → runtime config → 最終検証の順で、agent skill では Claude の primary path(plugin marketplace)と legacy fallback(curl script)、Codex の primary path(`$skill-installer`)と fallback を明示し、scaffold drift は `scaffold status` / `scaffold diff` で差分を確認してから `scaffold apply --backup` で復元する review-before-restore 導線として案内します。`doctor instruction` は read-only で、install / write / network call は行いません。text 出力には CLI taxonomy の migration(旧名→新名)セクションも含みます。(#11050 / #11051)
+- **破壊的変更**: repo-local LLM runtime config command を rename しました。`mozyo-bridge instruction doctor` → `mozyo-bridge runtime-config check`(read-only)、`mozyo-bridge instruction install` → `mozyo-bridge runtime-config install`(write-capable, dry-run default)です。新 `doctor instruction` runbook と旧 `instruction doctor` の語順衝突を解消し、"instruction" という語を `doctor` 配下の runbook に限定するための整理です。canonical command の text 出力ヘッダ・write 後メッセージ・docs はすべて新名を正本とします。(#11051)
+- 旧 `mozyo-bridge instruction doctor` / `instruction install` は **deprecated alias** として 1 minor cycle 残します。実行すると機能は新 command と等価のまま動きますが、stderr に `deprecated: ... use mozyo-bridge runtime-config check/install ...` の警告を出します。旧 alias の削除は次 minor 以降(v0.7.0 想定)の候補で、最終時期は release planning 側で確定します。(#11051)
+- 後方互換のため、`mozyo-bridge doctor --json` の schema は additive に保ちました。top-level `ok` と `sections.*` の既存 key / 形状は変更しておらず、`jq '.sections.scaffold.status'` などの既存 CI gate はそのまま動きます。`doctor instruction --json` は別 shape(`steps` / `migrations` / `pending_step_ids` 等)です。deprecated alias の警告は **stderr のみ**で、alias を `--json` 付きで実行しても stdout の JSON は汚染されず、そのまま parse できます。(#11051)
+- 本 repository 自身の `mozyo-bridge doctor` を green に復旧しました。repo-root `<repo>/.codex/config.toml` の整備と scaffold manifest の更新による drift 解消で、`doctor` が `result: ok` を返す状態に戻しています。これは配布 CLI の挙動変更ではなく、本 repo の self-host 環境を taxonomy 変更後の状態に追従させた運用復旧です。(#11112)
+
+### なぜ必要だったか
+
+#11050 / #11051 は、`doctor` / skill / scaffold / instruction 系 command が増えるにつれ、環境復旧時に「どの command を、どの順で、primary とfallback のどちらで」実行すべきかが分かりにくくなっていた問題に対する整理です。`doctor` は診断に徹したまま、復旧手順そのものは read-only な `doctor instruction` runbook に切り出すことで、診断(何が壊れているか)と復旧導線(どう直すか)の責務を分けました。同時に、新しい `doctor instruction` と既存 `instruction doctor` は語順が紛らわしく、まさに今回解消したかった「分かりにくさ」の典型だったため、後者を含む `instruction` group を `runtime-config` へ rename しています。
+
+破壊的 rename は published CLI のユーザに影響するため、いきなり旧名を削除せず 1 minor cycle の deprecated alias + stderr 警告で猶予を設け、既存スクリプトや手癖を即座に壊さないようにしました。一方で恒久 alias にすると taxonomy 整理の効果が薄れるため、削除候補であることを明記しています。`doctor --json` を additive に保ったのは、`doctor --json` を gate に使う CI / 自動化を壊さないためで、alias 警告を stderr に限定したのも同じく JSON 消費者を守るためです。version bump / publish / tag を本 issue scope 外に切ったのは、taxonomy + docs + tests の実装と、実際の release 操作を別 task として分離する合意(#11051 設計相談)に従ったものです。
+
 ## v0.5.6 - 2026-06-03
 
 v0.5.6 は、v0.5.5 の TestPyPI smoke で見つかった top-level CLI help の矛盾を直す correction patch release です。**v0.5.5 は TestPyPI にのみ配布され、production PyPI には出していません。** production 配布対象は本 v0.5.6 です。
