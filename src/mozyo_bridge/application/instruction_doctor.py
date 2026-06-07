@@ -1,7 +1,8 @@
-"""Opt-in instruction doctor for repo-local LLM runtime config.
+"""Opt-in runtime-config check for repo-local LLM runtime config.
 
-`mozyo-bridge instruction doctor --target . --profile redmine-codex` is a
-read-only check that a Redmine/Codex workspace actually carries the
+`mozyo-bridge runtime-config check --target . --profile redmine-codex` (renamed
+from `instruction doctor` in Redmine #11051; the old name is a deprecated alias)
+is a read-only check that a Redmine/Codex workspace actually carries the
 repo-root runtime config the bootstrap docs require (Redmine #10814 /
 #10821 / #10854). The startup docs ask agents to place
 `<repo>/.codex/config.toml` (and, when used, `<repo>/.mcp.json`) at the
@@ -341,8 +342,12 @@ def run_instruction_doctor(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def format_instruction_doctor_text(result: dict[str, Any]) -> str:
+    # User-facing header uses the canonical command name (`runtime-config check`,
+    # Redmine #11051). The deprecated `instruction doctor` alias routes through
+    # the same formatter; its deprecation is surfaced on stderr by the CLI, so
+    # the canonical name on stdout stays correct for both invocations.
     lines = [
-        f"instruction doctor: {'ok' if result['ok'] else 'FAIL'} "
+        f"runtime-config check: {'ok' if result['ok'] else 'FAIL'} "
         f"profile={result['profile']} target={result['target']}",
     ]
     symbols = {

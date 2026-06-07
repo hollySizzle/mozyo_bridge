@@ -846,6 +846,40 @@ class DoctorInstructionTaxonomyTest(unittest.TestCase):
         self.assertIn("read-only", help_text)
         self.assertIn("dry-run", help_text)
 
+    def _run_func(self, argv: list[str]) -> tuple[int, str]:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc = args.func(args)
+        return rc, stdout.getvalue()
+
+    def test_canonical_runtime_config_text_uses_new_names(self) -> None:
+        # Review Gate #53340 finding: the canonical commands must not print the
+        # legacy `instruction doctor/install` names on stdout. The check command
+        # is exercised end-to-end; the install header is asserted on its
+        # formatter (the command body needs a workspace-defaults source).
+        from mozyo_bridge.application.instruction_install import (
+            format_instruction_install_text,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, check_out = self._run_func(["runtime-config", "check", "--target", tmp])
+            self.assertIn("runtime-config check:", check_out)
+            self.assertNotIn("instruction doctor:", check_out)
+
+        install_text = format_instruction_install_text(
+            {
+                "ok": True,
+                "profile": "redmine-codex",
+                "action": "up-to-date",
+                "target": "/repo",
+                "messages": [],
+            }
+        )
+        self.assertIn("runtime-config install:", install_text)
+        self.assertNotIn("instruction install:", install_text)
+
 
 class DoctorInstructionRunbookTest(unittest.TestCase):
     """The runbook synthesis (`build_runbook`) is pure given doctor results."""
@@ -14239,7 +14273,10 @@ class InstructionDoctorTest(unittest.TestCase):
                 ["instruction", "doctor", "--target", str(project)]
             )
             self.assertEqual(1, rc)
-            self.assertIn("instruction doctor: FAIL", out)
+            # Redmine #11051: stdout uses the canonical command name even when
+            # invoked through the deprecated `instruction doctor` alias.
+            self.assertIn("runtime-config check: FAIL", out)
+            self.assertNotIn("instruction doctor:", out)
             self.assertIn("codex_config_present", out)
 
     def test_target_defaults_to_mozyo_repo_env(self) -> None:
@@ -14955,7 +14992,8 @@ class InstructionInstallTest(unittest.TestCase):
             )
             self.assertEqual(0, code)
             self.assertTrue(config.exists())
-            self.assertIn("instruction doctor is green", out)
+            # Redmine #11051: post-write message uses the canonical command name.
+            self.assertIn("runtime-config check is green", out)
             self.assertTrue(self._doctor_green(repo))
 
     def test_generated_config_has_consistent_default_project(self) -> None:

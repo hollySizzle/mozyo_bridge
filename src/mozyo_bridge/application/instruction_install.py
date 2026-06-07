@@ -1,14 +1,15 @@
 """Generate repo-root Codex runtime config from workspace-defaults (#10930).
 
-`mozyo-bridge instruction doctor --profile redmine-codex` checks that a
-Redmine/Codex workspace declares its verified default project in
-`<repo>/.codex/config.toml`, but it is read-only: it never closes the gap
-between "the source of truth exists" and "the runtime config reflects it".
-This module is the write side. It reads the verified Redmine default project
-from `<repo>/.mozyo-bridge/workspace-defaults.yaml` (still the single source of
+`mozyo-bridge runtime-config check --profile redmine-codex` (renamed from
+`instruction doctor` in Redmine #11051) checks that a Redmine/Codex workspace
+declares its verified default project in `<repo>/.codex/config.toml`, but it is
+read-only: it never closes the gap between "the source of truth exists" and "the
+runtime config reflects it". This module is the write side. It reads the
+verified Redmine default project from
+`<repo>/.mozyo-bridge/workspace-defaults.yaml` (still the single source of
 truth) and renders / merges the `[redmine]` and
 `[mcp_servers.redmine_epic_grid]` tables into `<repo>/.codex/config.toml` so
-that `instruction doctor` turns green.
+that `runtime-config check` turns green.
 
 Design constraints (Redmine #10930):
 
@@ -302,19 +303,21 @@ def _finish(
     result["doctor_ok"] = bool(doctor["ok"])
     result["ok"] = bool(doctor["ok"])
     if result["doctor_ok"]:
-        result["messages"].append(f"wrote {rel}; instruction doctor is green.")
+        result["messages"].append(f"wrote {rel}; runtime-config check is green.")
     else:
         result["messages"].append(
-            f"wrote {rel} but instruction doctor still reports a failure; "
-            "inspect with `mozyo-bridge instruction doctor`."
+            f"wrote {rel} but runtime-config check still reports a failure; "
+            "inspect with `mozyo-bridge runtime-config check`."
         )
     return result
 
 
 def format_instruction_install_text(result: dict[str, Any]) -> str:
     head = "ok" if result["ok"] else "FAIL"
+    # Canonical command name on stdout (Redmine #11051); the deprecated
+    # `instruction install` alias warns on stderr via the CLI.
     lines = [
-        f"instruction install: {head} profile={result['profile']} "
+        f"runtime-config install: {head} profile={result['profile']} "
         f"action={result['action']} target={result['target']}",
     ]
     for message in result["messages"]:
