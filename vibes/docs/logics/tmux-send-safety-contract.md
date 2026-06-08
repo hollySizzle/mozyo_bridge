@@ -75,6 +75,19 @@ product 判断として、本 contract は次を選ぶ:
 - `--mode pending` (operator が submit を保留する経路) は default の射程外。operator が pane で Enter を押下する責任を負う独立 path として残す。
 - 本 default は universal blind Enter の許可ではない。Layer B preflight が 1 つでも fail すれば typing 前に `stage_failed` で die する (`## Queue-Enter Default Rail` の `### Deterministic Preflight Admission Control` 参照)。strong preflight は本 default の必須前提であり、preflight を抜きにして Enter を発行する rail は本 contract が定義しない。default の射程外で send したい場合は、明示的に `--mode standard` を選ぶか、send を中止する。
 
+### UX-First Configured Safety (Redmine #11301)
+
+本 tool の product value は「安全な通知 transport」そのものではなく、LLM agent 間の作業運用を日常的に回せることにある。安全性を operator の毎回の手作業・mode 選択・内部実装知識に押し付けると、導入されず、結果として安全性も運用価値も失われる。この contract は次の優先順位を採る:
+
+1. **初回設定で workspace identity と handoff safety を作る**。operator に毎回 `--mode standard` / `--target` / `--target-repo` の内部事情を判断させない。必要な設定がない場合は fail-closed するが、error は「何が危ないか」だけでなく、実行すべき setup / doctor command をそのまま示す。
+2. **設定済み workspace は default path を快適にする**。workspace identity と target pane identity が machine-checkable に一致するなら、`queue-enter` default は Enter submission まで進めるべきである。default が日常的に Enter しない設計は、transport として弱い。
+3. **曖昧な状態だけ止める**。pane id が stale、window name が receiver と不一致、foreground process が agent らしくない、workspace identity が照合できない、durable anchor が不正、などは typing 前に止める。止める理由は UX を妨げるためではなく、operator に一度だけ正しい設定をさせるためである。
+4. **unverified defaults を issue creation の根拠にしない**。`workspace-defaults.yaml` の `redmine.default_project.identifier` は session / display identity として使えるが、`verification.verified` が false の値を Redmine issue 作成先として自動採用してはいけない。
+
+この方針は `queue-enter` を無条件に緩める根拠ではない。#11299 / #11301 の smoke で、非 git workspace でも `mozyo --repo <target>` により readable session と agent windows は作れる一方、`agents list` の repo-root inference が `.git` 等の marker 不在で上位 directory に逃げ、`--target-repo` gate が `target_repo_mismatch` で fail-closed することが確認された。#11301 では `.mozyo-bridge/scaffold.json` / `.mozyo-bridge/` / workspace defaults を workspace identity marker として扱うか、または runbook に明示回避策を固定するかを検討する。
+
+望ましい最終形は、非 git でも scaffold 済み workspace なら target identity gate が通り、cross-session の explicit pane handoff でも設定済み workspace に限って default `queue-enter` が smooth に動くことである。identity gate が通らない場合は、現状どおり fail-closed し、operator に setup command または strict `--mode standard` の明示 fallback を案内する。
+
 ### Downstream Surfaces (land 済み)
 
 本 contract のピボットを反映する CLI / handoff 実装、distributed docs / rules / skill refs / preset surfaces、tests / smoke / workflow verification は別 child task で land 済み。本 contract の `## Default Delivery Promise (v0.4)` が source-of-truth であり、downstream は本文書に従う。

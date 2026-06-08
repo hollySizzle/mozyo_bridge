@@ -160,11 +160,12 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workspace-defaults-renderer.md
-    purpose: workspace-local Redmine default project 設定を single source YAML から Codex / Claude 共通 snippet へ生成する renderer の設計、schema、secret rejection、検証手順。
+    purpose: workspace-local Redmine default project 設定を single source YAML から Codex / Claude 共通 snippet へ生成する renderer の設計、schema、secret rejection、検証手順、session / workspace identity 連携。
     audit_role: workspace_defaults_renderer_logic
     related_document_refs:
       - logic-canonical-renderer
       - rule-docs-catalog-governance
+      - logic-tmux-send-safety-contract
       - skill-workflow-reference
       - spec-project-map
 
@@ -215,9 +216,10 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/tmux-send-safety-contract.md
-    purpose: tmux pane send / handoff safety contract。
+    purpose: tmux pane send / handoff safety contract、queue-enter default、cross-workspace handoff の UX-first configured safety 方針。
     audit_role: tmux_send_safety_contract_logic
     related_document_refs:
+      - logic-workspace-defaults-renderer
       - skill-safety-reference
       - logic-ack-completion-receiver-state
       - logic-autonomous-ticket-entrypoint
@@ -332,6 +334,7 @@ file_conventions:
     severity: block
     document_refs:
       - logic-tmux-send-safety-contract
+      - logic-workspace-defaults-renderer
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state
       - skill-safety-reference

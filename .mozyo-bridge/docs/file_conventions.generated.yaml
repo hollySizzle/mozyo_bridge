@@ -71,8 +71,9 @@ rules:
   - src/mozyo_bridge/infrastructure/tmux_client.py
   - src/mozyo_bridge/infrastructure/queue_reader.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/autonomous-ticket-entrypoint.md
-    と @vibes/docs/logics/ack-completion-receiver-state.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/workspace-defaults-renderer.md
+    と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @vibes/docs/logics/ack-completion-receiver-state.md と @skills/mozyo-bridge-agent/references/safety.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
