@@ -331,6 +331,19 @@ def build_parser() -> argparse.ArgumentParser:
             "hash-suffixed repo-path name. Pass an explicit name to override."
         ),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        dest="json_output",
+        help=(
+            "Bare `mozyo`: emit machine-readable JSON describing the resolved "
+            "session, current windows, and a `ready` flag (claude/codex windows "
+            "present) instead of the human table. Implies no attach so a launcher "
+            "capturing stdout is never replaced by `tmux attach`. Ignored when a "
+            "subcommand is given."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=False)
 
     status = sub.add_parser("status")

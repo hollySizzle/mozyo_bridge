@@ -689,6 +689,22 @@ class CliTest(unittest.TestCase):
         self.assertIsNone(args.command)
         self.assertTrue(args.no_attach)
 
+    def test_bare_mozyo_defaults_json_output_false(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args([])
+
+        self.assertFalse(args.json_output)
+
+    def test_bare_mozyo_accepts_json_flag_with_no_attach(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["--no-attach", "--json"])
+
+        self.assertIsNone(args.command)
+        self.assertTrue(args.no_attach)
+        self.assertTrue(args.json_output)
+
     def test_bare_mozyo_accepts_top_level_repo_override(self) -> None:
         parser = build_parser()
 
@@ -5935,6 +5951,200 @@ class CommandTest(unittest.TestCase):
 
         expected = derive_session_name(repo).name
         self.assertIn(f"attach: tmux attach -t {expected}", stdout.getvalue())
+
+    def test_cmd_mozyo_json_emits_ready_payload_for_created_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+                json_output=True,
+            )
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="0\tclaude\tclaude\n1\tcodex\tnode\n",
+                stderr="",
+            )
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=["claude:%1", "codex:%2"]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        expected = derive_session_name(repo).name
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(expected, payload["session"])
+        self.assertEqual(str(repo), payload["repo_root"])
+        self.assertEqual(str(repo), payload["cwd"])
+        self.assertEqual(["claude:%1", "codex:%2"], payload["created"])
+        self.assertTrue(payload["ready"])
+        self.assertEqual(f"tmux attach -t {expected}", payload["attach"])
+        self.assertEqual(expected, payload["attach_target"])
+        self.assertFalse(payload["attached"])
+        self.assertEqual(
+            [
+                {"index": 0, "name": "claude", "process": "claude"},
+                {"index": 1, "name": "codex", "process": "node"},
+            ],
+            payload["windows"],
+        )
+
+    def test_cmd_mozyo_json_reports_ready_when_windows_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+                json_output=True,
+            )
+            # Reused session: both agent windows already exist, so nothing is
+            # newly created, yet readiness must still be true.
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="0\tclaude\tclaude\n1\tcodex\tcodex\n2\tnotes\tzsh\n",
+                stderr="",
+            )
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.session_cwd_mismatch", return_value=[]), \
+                patch("mozyo_bridge.application.commands.legacy_basename_session_notice", return_value=None), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=[]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual([], payload["created"])
+        self.assertTrue(payload["ready"])
+        self.assertEqual(
+            {"claude", "codex", "notes"},
+            {window["name"] for window in payload["windows"]},
+        )
+
+    def test_cmd_mozyo_json_not_ready_when_codex_window_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+                json_output=True,
+            )
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="0\tclaude\tclaude\n",
+                stderr="",
+            )
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=["claude:%1"]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["ready"])
+
+    def test_cmd_mozyo_json_without_no_attach_flag_implies_no_attach(self) -> None:
+        # `--json` without an explicit `--no-attach` must still not attach and
+        # the payload must report the *effective* no-attach behavior, not the
+        # raw flag (Redmine #11313 review #54111).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=False,
+                json_output=True,
+            )
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="0\tclaude\tclaude\n1\tcodex\tnode\n",
+                stderr="",
+            )
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=["claude:%1", "codex:%2"]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["no_attach"])
+        self.assertFalse(payload["attached"])
+
+    def test_cmd_mozyo_human_output_unchanged_without_json_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = (Path(tmp) / "my-project").resolve()
+            repo.mkdir()
+            args = argparse.Namespace(
+                repo=str(repo),
+                session=None,
+                cwd=None,
+                config_path=None,
+                ready_timeout=0,
+                force=False,
+                no_attach=True,
+                json_output=False,
+            )
+            list_result = argparse.Namespace(
+                returncode=0,
+                stdout="0\tclaude\tclaude\n1\tcodex\tnode\n",
+                stderr="",
+            )
+
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=["claude:%1", "codex:%2"]), \
+                patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+                patch("mozyo_bridge.application.commands.os.execvp", side_effect=AssertionError("must not attach")), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_mozyo(args))
+
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        expected = derive_session_name(repo).name
+        output = stdout.getvalue()
+        self.assertEqual(
+            f"session={expected} created=claude:%1,codex:%2\n"
+            "INDEX\tNAME\tPROCESS\n"
+            "0\tclaude\tclaude\n1\tcodex\tnode\n"
+            f"attach: tmux attach -t {expected}\n",
+            output,
+        )
 
     def test_cmd_mozyo_dies_when_claude_window_select_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

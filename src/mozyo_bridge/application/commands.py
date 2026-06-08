@@ -658,9 +658,11 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
                 "Re-run from the matching repo root, or pass an explicit `--session NAME` "
                 "to bare `mozyo` to disambiguate."
             )
+    json_output = bool(getattr(args, "json_output", False))
+    notice = None
     if not user_session:
         notice = legacy_basename_session_notice(repo_root, session)
-        if notice:
+        if notice and not json_output:
             print(notice)
     config_path = getattr(args, "config_path", None)
     config_path_was_default = config_path is None
@@ -690,15 +692,68 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
         "#{window_index}\t#{window_name}\t#{pane_current_command}",
         check=False,
     )
+    attach_command = f"tmux attach -t {session}"
+    if json_output:
+        windows = _parse_mozyo_window_rows(result.stdout if result.returncode == 0 else "")
+        present = {window["name"] for window in windows}
+        # `--json` always returns without attaching (it never reaches the
+        # `os.execvp` below), so the effective no-attach behavior is true even
+        # when the raw `--no-attach` flag was not passed. Report the effective
+        # value here — a launcher parsing this schema cares about what actually
+        # happened, not the raw flag (Redmine #11313 review #54111).
+        no_attach_effective = bool(getattr(args, "no_attach", False)) or json_output
+        payload = {
+            "session": session,
+            "repo_root": str(repo_root),
+            "cwd": cwd,
+            "created": list(created),
+            "windows": windows,
+            "ready": AGENT_LABELS.issubset(present),
+            "attach": attach_command,
+            "attach_target": session,
+            "attached": False,
+            "no_attach": no_attach_effective,
+            "legacy_session_notice": notice,
+        }
+        import json as _json
+
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     print(f"session={session} created={','.join(created) if created else '-'}")
     print("INDEX\tNAME\tPROCESS")
     if result.returncode == 0:
         print(result.stdout, end="")
     if getattr(args, "no_attach", False):
-        print(f"attach: tmux attach -t {session}")
+        print(f"attach: {attach_command}")
         return 0
     os.execvp("tmux", ["tmux", "attach", "-t", session])
     raise AssertionError("unreachable")
+
+
+def _parse_mozyo_window_rows(table: str) -> list[dict]:
+    """Parse ``list-windows`` rows (``index<TAB>name<TAB>process``) into dicts.
+
+    Mirrors the human ``INDEX/NAME/PROCESS`` table emitted by bare ``mozyo`` so
+    the ``--json`` payload exposes the same window facts to external launchers.
+    ``index`` is an int when numeric (tmux window indices always are); a
+    missing/blank process becomes ``None`` rather than an empty string.
+    """
+    windows: list[dict] = []
+    for line in table.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        index = parts[0] if parts else ""
+        name = parts[1] if len(parts) > 1 else ""
+        process = parts[2] if len(parts) > 2 else ""
+        windows.append(
+            {
+                "index": int(index) if index.isdigit() else index,
+                "name": name,
+                "process": process or None,
+            }
+        )
+    return windows
 
 
 def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:

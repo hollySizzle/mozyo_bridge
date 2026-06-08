@@ -267,7 +267,36 @@ TaskPilot: Shell command failed: No new tmux window found for session: mozyo-gk-
 
 外部 launcher 側の推奨修正 / 運用回避策:
 
-- **success 判定を「新規 window 出現」から「期待する agent window の存在」へ変える。** `mozyo --no-attach` の決定的な stdout (`session=<name> created=...` と `INDEX / NAME / PROCESS` table) を parse し、`claude` / `codex` window が在ることを確認します。新規作成か再利用かには依存させません。
+- **推奨: `mozyo --no-attach --json` の `ready` boolean を見る。** `--json` を付けると bare `mozyo` は human table の代わりに安定した JSON を stdout に出します。`ready` は `claude` / `codex` window が存在するときに `true` で、新規作成か再利用かに依存しません (`created` が空でも `ready: true`)。`--json` は attach を行わない (stdout を取り込む launcher の process が `tmux attach` に置換されない) ため、`--no-attach` 用途に最適です。`jq` でそのまま判定できます。
+
+  ```bash
+  # ready が true なら成功。created/windows/attach も同じ payload に含まれます。
+  mozyo --repo . --no-attach --json | jq -e '.ready' >/dev/null \
+    && echo "ready" || echo "not ready"
+  ```
+
+  payload schema (安定 key):
+
+  ```json
+  {
+    "session": "mozyo-gk-0999-ningyo-tsukai",
+    "repo_root": "/abs/path/to/repo",
+    "cwd": "/abs/path/to/repo",
+    "created": ["claude:%1", "codex:%2"],
+    "windows": [
+      {"index": 0, "name": "claude", "process": "claude"},
+      {"index": 1, "name": "codex", "process": "node"}
+    ],
+    "ready": true,
+    "attach": "tmux attach -t mozyo-gk-0999-ningyo-tsukai",
+    "attach_target": "mozyo-gk-0999-ningyo-tsukai",
+    "attached": false,
+    "no_attach": true,
+    "legacy_session_notice": null
+  }
+  ```
+
+- **fallback: human stdout / tmux を parse する。** `--json` を使えない場合は、`mozyo --no-attach` の決定的な stdout (`session=<name> created=...` と `INDEX / NAME / PROCESS` table) か tmux を直接 parse し、`claude` / `codex` window が在ることを確認します。新規作成か再利用かには依存させません。
 
   ```bash
   s=$(mozyo-bridge session name --repo .)
