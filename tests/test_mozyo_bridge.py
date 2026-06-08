@@ -8651,6 +8651,230 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertIn("queue-enter", stderr)
         self.assertIn("'<unset>'", stderr)
 
+    # --- Step 10 constrained cross-session admission (Redmine #11301) ---------------
+
+    def _cross_session_codex_argv(self, target_repo, extra=None):
+        # `--to codex` is the cross-session gateway receiver; queue-enter
+        # cross-session admission requires an explicit pane and --target-repo.
+        argv = [
+            "handoff",
+            "send",
+            "--to",
+            "codex",
+            "--source",
+            "asana",
+            "--kind",
+            "reply",
+            "--task-id",
+            "T1",
+            "--comment-id",
+            "C1",
+            "--target",
+            "%2",
+            "--mode",
+            "queue-enter",
+            "--submit-delay",
+            "0",
+        ]
+        if target_repo is not None:
+            argv += ["--target-repo", str(target_repo)]
+        if extra:
+            argv += extra
+        return argv
+
+    def test_queue_enter_cross_session_admitted_with_explicit_target_and_repo(
+        self,
+    ) -> None:
+        # The constrained cross-session rail: an explicit pane in a foreign
+        # session whose cwd resolves under the asserted scaffolded workspace
+        # (`.mozyo-bridge/scaffold.json`) and passes the --target-repo gate is
+        # admitted under queue-enter — no manual --mode standard fallback.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "人形使い"
+            (workspace / ".mozyo-bridge").mkdir(parents=True)
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (workspace / "src").mkdir()
+
+            result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+                self._cross_session_codex_argv(workspace),
+                pane={
+                    "id": "%2",
+                    "location": "other:0.1",
+                    "command": "node",
+                    "cwd": str(workspace / "src"),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                current_session="agents",
+            )
+
+        self.assertEqual(0, result)
+        self.assertIn(
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=reply:to=codex]",
+            pane_text,
+        )
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_cross_session_blocked_without_target_repo(self) -> None:
+        # Cross-session without the identity gate stays fail-closed: even the
+        # gateway receiver (codex) with an explicit pane must assert
+        # --target-repo to leave the same-session rail.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._cross_session_codex_argv(None),
+            pane={
+                "id": "%2",
+                "location": "other:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+            current_session="agents",
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("target_repo=unset", stderr)
+
+    def test_queue_enter_cross_session_blocked_on_target_repo_mismatch(self) -> None:
+        # Cross-session admission at Step 10 only opens the door; the
+        # --target-repo gate still fails closed when the target pane's inferred
+        # workspace root differs from the asserted one.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            expected = Path(tmp_str) / "人形使い"
+            (expected / ".mozyo-bridge").mkdir(parents=True)
+            (expected / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            other = Path(tmp_str) / "other_repo"
+            (other / "src").mkdir(parents=True)
+            (other / "pyproject.toml").write_text("", encoding="utf-8")
+
+            result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                self._cross_session_codex_argv(expected),
+                pane={
+                    "id": "%2",
+                    "location": "other:0.1",
+                    "command": "node",
+                    "cwd": str(other / "src"),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                current_session="agents",
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_repo_mismatch", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_cross_session_non_agent_target_still_blocks(self) -> None:
+        # The admitted cross-session rail does not bypass Step 12: a foreground
+        # process that is not agent-compatible is still rejected before typing,
+        # even with a passing --target-repo identity gate.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "人形使い"
+            (workspace / ".mozyo-bridge").mkdir(parents=True)
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (workspace / "src").mkdir()
+
+            result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                self._cross_session_codex_argv(workspace),
+                pane={
+                    "id": "%2",
+                    "location": "other:0.1",
+                    "command": "vim",
+                    "cwd": str(workspace / "src"),
+                    "window_name": "codex",
+                    "pane_active": "1",
+                },
+                current_session="agents",
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_not_agent", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_cross_session_to_claude_still_routes_through_gateway(
+        self,
+    ) -> None:
+        # Cross-session admission must not let `--to claude` deliver directly
+        # into a foreign workspace's Claude pane. Step 10 admits (explicit
+        # target + --target-repo), but the cross-session Claude gate then fails
+        # closed and points back to the codex-gateway path.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "人形使い"
+            (workspace / ".mozyo-bridge").mkdir(parents=True)
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (workspace / "src").mkdir()
+
+            argv = self._cross_session_codex_argv(workspace)
+            argv[argv.index("codex")] = "claude"
+            result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                argv,
+                pane={
+                    "id": "%2",
+                    "location": "other:0.1",
+                    "command": "claude",
+                    "cwd": str(workspace / "src"),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                current_session="agents",
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("cross_session_claude", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_same_session_still_admits_on_current_rail(self) -> None:
+        # Regression: the constrained cross-session admission must not change
+        # the same-session default. A same-session codex pane is still admitted
+        # without requiring --target-repo.
+        result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
+            self._cross_session_codex_argv(None),
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+            current_session="agents",
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
     def test_queue_enter_step11_rejects_inactive_pane(self) -> None:
         # Step 11 (v0.3): the target pane must be the active split of its
         # window. An inactive split would still accept keystrokes typed via
@@ -11471,7 +11695,7 @@ class AgentDiscoveryTest(unittest.TestCase):
 
     Coverage for ``mozyo_bridge.domain.agent_discovery``: classification by
     window-name agent rail, per-session ambiguity detection, repo-root
-    inference via PROJECT_MARKERS, and the ``mozyo-bridge agents list``
+    inference via REPO_ROOT_MARKERS, and the ``mozyo-bridge agents list``
     CLI surface (text + JSON).
     """
 
@@ -11723,7 +11947,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         self.assertEqual(True, record["pane_active"])
         self.assertEqual(False, record["ambiguous"])
         # repo_root is informational only; it is None when the pane cwd
-        # cannot be walked to a PROJECT_MARKERS-bearing directory.
+        # cannot be walked to a REPO_ROOT_MARKERS-bearing directory.
         self.assertIn("repo_root", record)
 
     def test_cmd_agents_list_rejects_unknown_agent_filter(self) -> None:
@@ -11943,15 +12167,15 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
     def test_default_queue_enter_cross_session_codex_is_rejected_as_invalid_args(
         self,
     ) -> None:
-        # Regression for Redmine #10332 review #49646. Cross-session `--to
-        # codex` is the documented gateway path, but the v0.4 default
-        # `queue-enter` rail rejects every cross-session target — including
-        # `--to codex` — because its no-rollback contract is bound to the
-        # sender's tmux session. Omitting `--mode` therefore breaks the
-        # gateway send too. The CLI guidance (cross_session_claude
-        # next_action and skill workflow) must point at `--mode standard`
-        # explicitly, and this test pins the underlying queue-enter
-        # invariant so the guidance does not drift.
+        # Regression for Redmine #10332 review #49646, updated for #11301.
+        # Cross-session `--to codex` is the documented gateway path. Since
+        # #11301 the default `queue-enter` rail admits a cross-session target
+        # only under the constrained identity gate (explicit `--target` PLUS a
+        # passing `--target-repo`). This send supplies the explicit `--target`
+        # but NO `--target-repo`, so the identity gate is not satisfied and the
+        # rail still fails closed with `invalid_args` before any typing. This
+        # pins that cross-session admission is not granted without the
+        # workspace identity assertion.
         pane = {
             "id": "%9",
             "location": "other:1.0",
@@ -12000,13 +12224,16 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
             stderr,
         )
 
-    def test_cross_session_claude_outcome_guides_to_mode_standard(self) -> None:
-        # Regression for Redmine #10332 review #49646. The recovery path
-        # from a `cross_session_claude` block must steer the sender to
-        # `--to codex --mode standard` (or `--mode pending`); naming
-        # `--to codex` without `--mode` re-fails under the queue-enter
-        # default. The next_action_for / outcome narrative / die() message
-        # must all carry the explicit mode hint.
+    def test_cross_session_claude_outcome_guides_to_codex_gateway(self) -> None:
+        # Regression for Redmine #10332 review #49646, updated for #11301.
+        # The recovery path from a `cross_session_claude` block must steer the
+        # sender to the codex-gateway path with workspace identity:
+        # `--to codex --target <target_session>:codex --target-repo <root>`.
+        # Since #11301 that gateway send is admitted on the *default*
+        # queue-enter rail when --target is explicit and --target-repo passes,
+        # so the guidance must NOT present `--mode standard` as required; it is
+        # only a fallback. The next_action_for / outcome narrative / die()
+        # message must all carry the gateway + --target-repo hint.
         pane = {
             "id": "%9",
             "location": "other:1.0",
@@ -12045,16 +12272,20 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         outcome = json.loads(json_lines[-1])
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("cross_session_claude", outcome["reason"])
-        # The structured outcome's next_action must spell out the mode flag
-        # so the sender's next attempt does not re-fail under queue-enter
-        # default. The die() trailer on stderr must carry the same hint.
-        self.assertIn("--mode standard", outcome["next_action"])
+        # The structured outcome's next_action must steer to the codex gateway
+        # with the workspace identity gate so the sender's next attempt is
+        # admitted on the default queue-enter rail. The die() trailer on stderr
+        # must carry the same hint.
         self.assertIn("--to codex", outcome["next_action"])
-        self.assertIn("--mode standard", stderr)
-        # The durable record (markdown) must repeat the mode hint so
+        self.assertIn("--target-repo", outcome["next_action"])
+        self.assertIn("--to codex", stderr)
+        self.assertIn("--target-repo", stderr)
+        # `--mode standard` must read as a fallback, not a requirement.
+        self.assertIn("fallback", outcome["next_action"])
+        # The durable record (markdown) must repeat the gateway hint so
         # auditors and downstream agents see it even when the structured
         # outcome is consumed and discarded.
-        self.assertIn("--mode standard", stdout)
+        self.assertIn("--target-repo", stdout)
 
     def test_target_repo_mismatch_is_rejected(self) -> None:
         # `--target-repo` opts the sender into a repo-mismatch fail-closed
@@ -12171,7 +12402,8 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         outcome = json.loads(json_lines[-1])
         # The identity gate let it through. It dies on marker_timeout (strict
         # standard mode, no marker observed), NOT on the repo gate.
-        self.assertNotEqual("target_repo_mismatch", outcome["reason"])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
 
     def test_target_repo_mismatch_hints_setup_when_identity_unestablished(
         self,
@@ -12584,28 +12816,36 @@ class DocsAuditImpactDirtyFileTest(unittest.TestCase):
 
 
 class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
-    """Pin the #10332 cross-workspace `--mode` guidance in the skill body.
+    """Pin the cross-workspace gateway contract in the skill body.
 
-    The canonical skill workflow and its plugin mirror previously regressed
-    to the pre-correction wording (Redmine #10338 review #49720). The
+    Updated for Redmine #11301. The earlier #10332 wording said the
     `cross_session_claude` recovery path must always name `--mode standard`
-    (or `--mode pending`) because the default `queue-enter` rail rejects
-    every cross-session target. README and the runtime CLI already agree;
-    this test pins the skill side so a future rule-edit cannot silently
-    drop the mode hint again.
+    (or `--mode pending`) because the default `queue-enter` rail rejected
+    every cross-session target. Since #11301 that is no longer true: the
+    default queue-enter rail admits a cross-session `--to codex` gateway
+    send under a constrained identity gate (an explicit `--target` PLUS a
+    passing `--target-repo`). `--mode standard` / `--mode pending` are now
+    fallbacks, not a requirement. This test pins the new contract — gateway
+    target form with `--target-repo`, the constrained-admission wording, and
+    the non-git scaffold identity root — so a future rule-edit cannot
+    silently revert to the stale "always pass --mode" guidance.
     """
 
     REQUIRED_GUIDANCE_MARKERS = (
         # Cross-Workspace Handoff section heading must be present.
         "## Cross-Workspace Handoff",
-        # The gateway-path bullet must spell out the mode flag verbatim.
-        "--mode standard",
-        "--mode pending",
-        # The reason the mode flag is required must remain in the bullet.
-        "queue-enter",
-        # The window-only resolver naming convention for the gateway
-        # target must stay so callers can copy-paste it.
-        "--to codex --target <target_session>:codex",
+        # The gateway target form must stay copy-pasteable and now carries
+        # the workspace identity gate that admits the send on the default
+        # rail.
+        "--to codex --target <target_session>:codex --target-repo",
+        # The constrained cross-session admission contract (Redmine #11301).
+        "constrained identity gate",
+        "no `--mode` needed",
+        # `--mode standard` / `--mode pending` must read as a fallback, not
+        # as mandatory-because-queue-enter-rejects-all-cross-session.
+        "remain available as fallbacks",
+        # A scaffolded non-git workspace is a first-class identity root.
+        ".mozyo-bridge/scaffold.json",
     )
 
     def _skill_workflow_body(self, *parts: str) -> str:
@@ -12613,7 +12853,7 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-    def test_canonical_skill_keeps_mode_standard_gateway_guidance(self) -> None:
+    def test_canonical_skill_keeps_constrained_gateway_guidance(self) -> None:
         body = self._skill_workflow_body("skills", "mozyo-bridge-agent")
         for marker in self.REQUIRED_GUIDANCE_MARKERS:
             self.assertIn(
@@ -12621,12 +12861,12 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
                 body,
                 msg=(
                     f"skills/mozyo-bridge-agent/references/workflow.md is "
-                    f"missing #10332 marker {marker!r}; gateway guidance "
-                    f"would re-fail under default queue-enter."
+                    f"missing #11301 marker {marker!r}; cross-workspace "
+                    f"gateway guidance regressed to stale wording."
                 ),
             )
 
-    def test_plugin_mirror_keeps_mode_standard_gateway_guidance(self) -> None:
+    def test_plugin_mirror_keeps_constrained_gateway_guidance(self) -> None:
         body = self._skill_workflow_body(
             "plugins", "mozyo-bridge-agent", "skills", "mozyo-bridge-agent"
         )
@@ -12635,7 +12875,7 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
                 marker,
                 body,
                 msg=(
-                    f"plugin skill mirror is missing #10332 marker "
+                    f"plugin skill mirror is missing #11301 marker "
                     f"{marker!r}; sync_plugin_skill.sh drift or upstream "
                     f"canonical regressed."
                 ),

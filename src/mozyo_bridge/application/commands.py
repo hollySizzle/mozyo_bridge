@@ -138,7 +138,7 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     in order to name an explicit cross-workspace handoff target: session,
     window name and index, pane id and index, active flag, classified
     ``agent_kind`` (``claude`` / ``codex`` / ``unknown``), foreground process,
-    inferred ``repo_root`` (walked up via PROJECT_MARKERS from the pane's
+    inferred ``repo_root`` (walked up via REPO_ROOT_MARKERS from the pane's
     ``cwd``), the pane's ``cwd``, and an ``ambiguous`` flag when the
     ``(session, window_name)`` pair spans multiple windows in the session.
 
@@ -1120,41 +1120,70 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         raise AssertionError("unreachable")
 
     if mode == MODE_QUEUE_ENTER:
-        # Step 10 (v0.3): same-session binding. queue-enter must not deliver
-        # across tmux sessions: an explicit `--target %X` could otherwise land
-        # in a different repo's session under marker miss, and tmux-outside
-        # invocations have no sender session to compare against. Reject before
-        # typing.
+        # Step 10 (v0.3; constrained cross-session admission added in
+        # Redmine #11301): session binding. queue-enter is bound to the
+        # sender's tmux session by default — under marker miss it does not roll
+        # back, so an explicit `--target %X` in a foreign session could
+        # otherwise land in a different repo's agent, and tmux-outside
+        # invocations have no sender session to compare against.
+        #
+        # A cross-session target is admitted ONLY under the constrained rail:
+        # both sender and target sessions must be resolvable, `--target` must
+        # be an explicit pane / tmux target (not receiver auto-discovery), and
+        # `--target-repo` must be supplied so the workspace identity gate runs.
+        # When admitted, the request still flows through every downstream gate:
+        # the cross-session `--to claude` gate keeps Claude on the codex-gateway
+        # path, the `--target-repo` gate fails closed on identity mismatch, and
+        # Steps 11 / 12 bind the active pane and the foreground agent process.
+        # This lets a configured workspace skip the manual `--mode standard`
+        # fallback while ambiguous / unconfigured states stay fail-closed.
         sender_session = current_session_name()
         target_location = target_info.get("location") or ""
         target_session = (
             target_location.split(":", 1)[0] if ":" in target_location else ""
         )
-        if not sender_session or not target_session or sender_session != target_session:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
+        same_session = (
+            bool(sender_session)
+            and bool(target_session)
+            and sender_session == target_session
+        )
+        if not same_session:
+            both_sessions_known = bool(sender_session) and bool(target_session)
+            explicit_target = bool(getattr(args, "target", None))
+            has_target_repo = bool(getattr(args, "target_repo", None))
+            cross_session_admitted = (
+                both_sessions_known and explicit_target and has_target_repo
             )
-            die(
-                "--mode queue-enter requires the target pane to live in the "
-                "sender's tmux session; "
-                f"sender_session={(sender_session or '<unset>')!r} "
-                f"target_session={(target_session or '<unknown>')!r}. "
-                "Run `mozyo-bridge` from inside the receiver's tmux session, "
-                "or pass a pane id in the sender's session."
-            )
-            raise AssertionError("unreachable")
+            if not cross_session_admitted:
+                _emit_outcome(
+                    make_outcome(
+                        status="blocked",
+                        reason="invalid_args",
+                        receiver=receiver,
+                        target=target,
+                        anchor=anchor,
+                        mode=mode,
+                        kind=kind,
+                        notification_marker=None,
+                        source=source,
+                    ),
+                    record_format=record_format,
+                    command=record_command,
+                )
+                die(
+                    "--mode queue-enter requires the target pane to live in the "
+                    "sender's tmux session, or a constrained cross-session "
+                    "target (an explicit --target pane id plus --target-repo "
+                    "identity gate); "
+                    f"sender_session={(sender_session or '<unset>')!r} "
+                    f"target_session={(target_session or '<unknown>')!r} "
+                    f"explicit_target={explicit_target} "
+                    f"target_repo={'set' if has_target_repo else 'unset'}. "
+                    "Run `mozyo-bridge` from inside the receiver's tmux "
+                    "session, pass an explicit pane id together with "
+                    "--target-repo, or use `--mode standard`."
+                )
+                raise AssertionError("unreachable")
 
     # Cross-Workspace Handoff Gate (Redmine #10332).
     #
@@ -1200,12 +1229,16 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         die(
             "cross-session handoff to Claude is not allowed; "
             f"sender_session={sender_session_xw!r} target_session={target_session_xw!r}. "
-            "Route through the target session's Codex window with `--to codex "
-            "--target <target_session>:codex --mode standard` (or `--mode "
-            "pending`) and ask that Codex to perform the local Claude handoff. "
-            "`--mode` is required because the default `queue-enter` rail "
-            "rejects every cross-session target — see the Cross-Workspace "
-            "Handoff rule in the agent workflow."
+            "Naming a foreign workspace's Claude pane directly bypasses its "
+            "audit boundary. Route through the target session's Codex window "
+            "with `--to codex --target <target_session>:codex --target-repo "
+            "<target_workspace_root>` and ask that Codex to perform the local "
+            "Claude handoff. With an explicit --target and a passing "
+            "--target-repo identity gate, that gateway send is admitted on the "
+            "default queue-enter rail (Redmine #11301); `--mode standard` (or "
+            "`--mode pending`) remains an available fallback, e.g. when you "
+            "cannot assert --target-repo. See the Cross-Workspace Handoff rule "
+            "in the agent workflow."
         )
         raise AssertionError("unreachable")
 

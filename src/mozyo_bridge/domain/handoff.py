@@ -397,13 +397,14 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
             (
                 "route the handoff through the target session's Codex window: "
                 "re-run with `--to codex --target <target_session>:codex "
-                "--mode standard` (or `--mode pending`) and ask that Codex to "
-                "perform the local Claude handoff. `--mode` is required because "
-                "the default `queue-enter` rail rejects every cross-session "
-                "target — including `--to codex` — to keep its no-rollback "
-                "contract bound to the sender's session. Naming a cross-session "
-                "Claude pane directly is rejected by the Cross-Workspace "
-                "Handoff gate."
+                "--target-repo <target_workspace_root>` and ask that Codex to "
+                "perform the local Claude handoff. With an explicit --target "
+                "and a passing --target-repo identity gate, that gateway send "
+                "is admitted on the default `queue-enter` rail (Redmine "
+                "#11301); `--mode standard` (or `--mode pending`) remains an "
+                "available fallback, e.g. when you cannot assert --target-repo. "
+                "Naming a cross-session Claude pane directly is rejected by the "
+                "Cross-Workspace Handoff gate."
             ),
         )
     if reason == "target_repo_mismatch":
@@ -490,10 +491,12 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
         return (
             "Cross-Workspace Handoff gate: sender and target live in different "
             "tmux sessions, and `--to claude` was used. Route through the "
-            "target session's Codex window with `--to codex` and `--mode "
-            "standard` (or `--mode pending`); the default `queue-enter` rail "
-            "rejects every cross-session target, so the gateway path needs an "
-            "explicit `--mode`. No notification was typed."
+            "target session's Codex window with `--to codex --target "
+            "<target_session>:codex --target-repo <target_workspace_root>`; "
+            "with an explicit --target and a passing --target-repo identity "
+            "gate, that gateway send is admitted on the default `queue-enter` "
+            "rail (Redmine #11301). `--mode standard` (or `--mode pending`) "
+            "remains an available fallback. No notification was typed."
         )
     if reason == "target_repo_mismatch":
         return (
