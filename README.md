@@ -250,6 +250,37 @@ mozyo-bridge session name --repo /path/to/your-repo --json
 
 - `session name` / `session vscode-settings` (dry-run) は tmux state も Redmine も変更しません。`--target-repo` gate と `init` の同名 window fail-closed の安全境界は変更していません。
 
+### TaskPilot / 自前ランチャーの「新規 window 検出」(`No new tmux window found`)
+
+TaskPilot 等が `mozyo` 起動直後に **新規 tmux window の出現** を待ち受ける startup 検出を行うと、既存 session の再利用時に次のエラーで失敗することがあります。
+
+```text
+TaskPilot: Shell command failed: No new tmux window found for session: mozyo-gk-0999-ningyo-tsukai (ステップ 9)
+```
+
+これは mozyo-bridge の不具合ではなく、**idempotent な window model** の正しい挙動です (Redmine #11312)。
+
+- bare `mozyo` は「1 repo = 1 session, 1 agent = 1 window」を**冪等に保証**します。session に既に `claude` / `codex` window があれば、**新規 window を作らず既存を再利用**し、stdout に `created=-` (新規作成なし) と現在の window 一覧 (`INDEX / NAME / PROCESS` table) を出します。
+- したがって、2 回目以降の `mozyo` 実行 (例: `mozyo --repo <target> --no-attach` で一度作成済みの session) では新規 window が現れません。「新規 window の出現」を success 条件にしている launcher はここで取りこぼします。
+- エラー中の `(ステップ 9)` は **TaskPilot 内部の step 番号**で、mozyo-bridge handoff preflight の "Step 9" (window-name binding) とは無関係です。
+- session 名 `mozyo-gk-0999-ningyo-tsukai` は既に `mozyo-bridge session name` の導出名です。よって本件の原因は session 名 mismatch (前節) ではなく、**window の再利用**です。
+
+外部 launcher 側の推奨修正 / 運用回避策:
+
+- **success 判定を「新規 window 出現」から「期待する agent window の存在」へ変える。** `mozyo --no-attach` の決定的な stdout (`session=<name> created=...` と `INDEX / NAME / PROCESS` table) を parse し、`claude` / `codex` window が在ることを確認します。新規作成か再利用かには依存させません。
+
+  ```bash
+  s=$(mozyo-bridge session name --repo .)
+  mozyo --repo . --no-attach >/dev/null
+  # 期待する agent window が在れば成功 (新規作成かどうかは問わない)
+  tmux list-windows -t "$s" -F '#{window_name}' | grep -qx claude \
+    && tmux list-windows -t "$s" -F '#{window_name}' | grep -qx codex \
+    && echo "ready: $s"
+  ```
+
+- 既存 session を毎回まっさらにしたい場合に限り、起動前に `tmux kill-session -t "$s"` してから `mozyo` を実行すると新規 window が必ず作られます。ただし**実行中の agent も落とす**ため常用は非推奨です。
+- session 名は前節のとおり `mozyo-bridge session name --repo .` に揃えてください。
+
 ### Subtle window status colors
 
 bare `mozyo` と `mozyo-bridge init <agent>` は agent window の tmux status bar entry に**控えめな色**を付けます。`claude` は muted sage green (`colour108`)、`codex` は muted slate blue (`colour67`)、それ以外の window は user 設定の default のまま無加工です。配色は fg のみで、背景塗りや点滅は使いません。
