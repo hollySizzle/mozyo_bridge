@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 from mozyo_bridge.infrastructure.tmux_client import pane_lines
-from mozyo_bridge.shared.paths import PROJECT_MARKERS
+from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
 
 
 AGENT_KIND_CLAUDE = "claude"
@@ -59,7 +59,13 @@ class AgentRecord:
 
 
 def infer_repo_root(cwd: str) -> str | None:
-    """Walk up from ``cwd`` until a PROJECT_MARKERS-bearing directory is found.
+    """Walk up from ``cwd`` until a REPO_ROOT_MARKERS-bearing directory is found.
+
+    Recognizes both git-style project markers (``.git`` / ``.tmux.conf`` /
+    ``pyproject.toml``) and scaffolded mozyo workspace markers
+    (``.mozyo-bridge/scaffold.json``), so a non-git scaffolded workspace
+    reports its own root instead of leaking up to the home directory
+    (Redmine #11301).
 
     Returns the absolute path as a string, or ``None`` when no marker is
     reachable (filesystem root, unreadable path, etc.). The resolver is
@@ -75,7 +81,7 @@ def infer_repo_root(cwd: str) -> str | None:
     if current.is_file():
         current = current.parent
     for path in (current, *current.parents):
-        if any((path / marker).exists() for marker in PROJECT_MARKERS):
+        if any((path / marker).exists() for marker in REPO_ROOT_MARKERS):
             return str(path)
     return None
 

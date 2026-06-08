@@ -1229,13 +1229,31 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 record_format=record_format,
                 command=record_command,
             )
+            if observed_repo is None:
+                # Identity could not be established at all: the target cwd does
+                # not walk up to any git / pyproject / scaffold marker. Keep
+                # fail-closed, but hand back a concrete setup action instead of
+                # forcing the operator to reason about repo-root heuristics.
+                setup_hint = (
+                    "the target workspace has no identity marker reachable "
+                    f"from target_cwd={(target_info.get('cwd') or '<unknown>')!r}. "
+                    "For a non-git workspace, scaffold it so it carries "
+                    "`.mozyo-bridge/scaffold.json` (run `mozyo-bridge scaffold "
+                    f"apply <preset> --target {expected_resolved}`), then retry. "
+                    "Or drop `--target-repo` to skip the check."
+                )
+            else:
+                setup_hint = (
+                    f"target pane resolves to repo root {observed_repo!r}. "
+                    "Pass a target pane whose cwd resolves under the expected "
+                    "repo root, or drop `--target-repo` to skip the check."
+                )
             die(
                 "target pane is not in the expected repo; "
                 f"expected={expected_resolved!r} "
                 f"observed={(observed_repo or '<unknown>')!r} "
                 f"target_cwd={(target_info.get('cwd') or '<unknown>')!r}. "
-                "Pass a target pane whose cwd resolves under the expected "
-                "repo root, or drop `--target-repo` to skip the check."
+                + setup_hint
             )
             raise AssertionError("unreachable")
 

@@ -248,6 +248,21 @@ class PathResolutionTest(unittest.TestCase):
 
             self.assertEqual(root.resolve(), find_repo_root(nested))
 
+    def test_find_repo_root_uses_scaffolded_workspace_marker(self) -> None:
+        # A non-git scaffolded workspace (only `.mozyo-bridge/scaffold.json`,
+        # no git / pyproject / tmux marker) is a first-class identity root
+        # (Redmine #11301). The walk stops at the workspace, not the home dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "人形使い"
+            nested = workspace / "a" / "b"
+            nested.mkdir(parents=True)
+            (workspace / ".mozyo-bridge").mkdir()
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            self.assertEqual(workspace.resolve(), find_repo_root(nested))
+
     def test_resolve_repo_root_prefers_explicit_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(Path(tmp).resolve(), resolve_repo_root(tmp))
@@ -11575,6 +11590,45 @@ class AgentDiscoveryTest(unittest.TestCase):
             no_markers.mkdir(parents=True)
             self.assertIsNone(infer_repo_root(str(no_markers)))
 
+    def test_infer_repo_root_uses_scaffolded_workspace_marker(self) -> None:
+        # Redmine #11301: a non-git scaffolded workspace must report its own
+        # root from a pane cwd under it, instead of leaking up to the home
+        # directory (which fail-closes the cross-workspace --target-repo gate).
+        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "gk-0999" / "人形使い"
+            nested = workspace / "notes" / "deep"
+            nested.mkdir(parents=True)
+            (workspace / ".mozyo-bridge").mkdir()
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            self.assertEqual(
+                str(workspace.resolve()), infer_repo_root(str(nested))
+            )
+
+    def test_infer_repo_root_prefers_deeper_scaffold_over_git_ancestor(self) -> None:
+        # A scaffolded workspace nested inside a git repo is a distinct
+        # workspace identity; the deeper scaffold marker wins. Existing git /
+        # pyproject behavior for non-scaffolded trees is unchanged because the
+        # walk still returns the deepest marker-bearing ancestor.
+        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            outer = Path(tmp_str) / "outer_git"
+            (outer / ".git").mkdir(parents=True)
+            workspace = outer / "embedded_workspace"
+            nested = workspace / "src"
+            nested.mkdir(parents=True)
+            (workspace / ".mozyo-bridge").mkdir()
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            self.assertEqual(
+                str(workspace.resolve()), infer_repo_root(str(nested))
+            )
+
     def test_filter_agents_session_and_kind(self) -> None:
         from mozyo_bridge.domain.agent_discovery import (
             discover_agents,
@@ -12059,6 +12113,129 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("target_repo_mismatch", outcome["reason"])
         self.assertIn("target pane is not in the expected repo", stderr)
+
+    def test_target_repo_gate_passes_for_scaffolded_non_git_workspace(self) -> None:
+        # Redmine #11301: a non-git scaffolded workspace (only
+        # `.mozyo-bridge/scaffold.json`) is a first-class identity root, so a
+        # pane whose cwd is under it satisfies `--target-repo <workspace>`.
+        # The gate must NOT fire; the handoff dies later on marker_timeout.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "人形使い"
+            (workspace / ".mozyo-bridge").mkdir(parents=True)
+            (workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (workspace / "src").mkdir()
+
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(workspace / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, _stderr = self.run_handoff(
+                [
+                    "handoff",
+                    "send",
+                    "--to",
+                    "claude",
+                    "--source",
+                    "redmine",
+                    "--issue",
+                    "11301",
+                    "--journal",
+                    "54071",
+                    "--kind",
+                    "implementation_request",
+                    "--target",
+                    "%8",
+                    "--target-repo",
+                    str(workspace),
+                    "--mode",
+                    "standard",
+                    "--landing-timeout",
+                    "0.01",
+                    "--submit-delay",
+                    "0",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        # The identity gate let it through. It dies on marker_timeout (strict
+        # standard mode, no marker observed), NOT on the repo gate.
+        self.assertNotEqual("target_repo_mismatch", outcome["reason"])
+
+    def test_target_repo_mismatch_hints_setup_when_identity_unestablished(
+        self,
+    ) -> None:
+        # Redmine #11301 error UX: when the target cwd walks up to NO identity
+        # marker at all, stay fail-closed but return a concrete setup hint
+        # (scaffold the workspace) rather than forcing the operator to reason
+        # about repo-root heuristics.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            expected_workspace = Path(tmp_str) / "人形使い"
+            (expected_workspace / ".mozyo-bridge").mkdir(parents=True)
+            (expected_workspace / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            bare = Path(tmp_str) / "bare_no_marker"
+            bare.mkdir()
+
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(bare),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, stderr = self.run_handoff(
+                [
+                    "handoff",
+                    "send",
+                    "--to",
+                    "claude",
+                    "--source",
+                    "redmine",
+                    "--issue",
+                    "11301",
+                    "--journal",
+                    "54071",
+                    "--kind",
+                    "implementation_request",
+                    "--target",
+                    "%8",
+                    "--target-repo",
+                    str(expected_workspace),
+                    "--mode",
+                    "standard",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+
+        self.assertFalse(
+            any(call[:2] == ("send-keys", "-t") for call in sent),
+            f"unexpected send-keys: {sent}",
+        )
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_repo_mismatch", outcome["reason"])
+        # The hint names the concrete setup action, not repo-root internals.
+        self.assertIn("scaffold", stderr)
+        self.assertIn(".mozyo-bridge/scaffold.json", stderr)
 
 
 class CodexAutonomousGuardrailLaneTest(unittest.TestCase):

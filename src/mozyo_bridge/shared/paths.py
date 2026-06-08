@@ -5,6 +5,19 @@ from pathlib import Path
 
 
 PROJECT_MARKERS = (".git", ".tmux.conf", "pyproject.toml")
+# A scaffolded mozyo workspace is a first-class identity root even when it has
+# no git / pyproject / tmux marker (Redmine #11301). Google-Drive-hosted,
+# non-git workspaces created by `mozyo --repo <target>` otherwise leak their
+# inferred repo root up to the home directory, which fail-closes the
+# cross-workspace `--target-repo` gate. The scaffold manifest is the narrow
+# marker; a bare `.mozyo-bridge/` directory would be too broad because tooling
+# may create that directory without establishing workspace identity.
+WORKSPACE_MARKERS = (".mozyo-bridge/scaffold.json",)
+# Markers that establish a repo / workspace root for identity inference. The
+# walk returns the deepest ancestor bearing ANY marker, so adding workspace
+# markers can only stop the walk earlier (at a more specific root) — it never
+# overrides a deeper git / pyproject root.
+REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mozyo-bridge"
 
 
@@ -13,7 +26,7 @@ def find_repo_root(start: Path | None = None) -> Path:
     if current.is_file():
         current = current.parent
     for path in (current, *current.parents):
-        if any((path / marker).exists() for marker in PROJECT_MARKERS):
+        if any((path / marker).exists() for marker in REPO_ROOT_MARKERS):
             return path
     return current
 
