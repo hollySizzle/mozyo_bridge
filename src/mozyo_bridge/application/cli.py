@@ -735,13 +735,40 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser(
         "init",
         help=(
-            "Rename the target pane's tmux window to the agent name so it "
-            "becomes resolvable as `claude` / `codex`. Defaults to the "
-            "current pane when no target is given."
+            "Adopt the current/target pane into its workspace as a `claude` / "
+            "`codex` agent. Smart default: derive the workspace's expected tmux "
+            "session, pin it into `.vscode/settings.json`, rename a "
+            "tmux-integrated fallback session (e.g. `___________`) into the "
+            "derived name, then rename the window to the agent. Fails closed when "
+            "adoption is not provably safe (meaningful foreign session, "
+            "expected-session collision, unidentifiable workspace root). Defaults "
+            "to the current pane when no target is given."
         ),
     )
     init.add_argument("agent", choices=["claude", "codex"])
     init.add_argument("target", nargs="?")
+    init.add_argument(
+        "--window-only",
+        action="store_true",
+        default=False,
+        dest="window_only",
+        help=(
+            "Legacy low-level behavior: only rename the current/target window, "
+            "with no session rename and no `.vscode/settings.json` write. Use for "
+            "manual / debug workflows or to adopt into a meaningful (non-fallback) "
+            "session in place."
+        ),
+    )
+    init.add_argument(
+        "--no-vscode-settings",
+        action="store_true",
+        default=False,
+        dest="no_vscode_settings",
+        help=(
+            "Run the smart session/window adoption but do not write "
+            "`<workspace>/.vscode/settings.json`."
+        ),
+    )
     init.set_defaults(func=cmd_init)
 
     doctor = sub.add_parser(

@@ -5609,7 +5609,11 @@ class AgentWindowSubtleStyleTest(unittest.TestCase):
         # agent window rail. It must apply the same subtle style so panes
         # brought in via `init` look identical to panes created via
         # bare-`mozyo` in the status bar.
-        args = argparse.Namespace(agent="claude", target="%5")
+        # Exercised via the legacy `--window-only` path so the assertion stays
+        # focused on the style application (smart adoption is covered elsewhere).
+        args = argparse.Namespace(
+            agent="claude", target="%5", window_only=True, no_vscode_settings=False
+        )
         panes = [
             {"id": "%2", "location": "agents:0.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
             {"id": "%5", "location": "agents:1.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
@@ -6678,14 +6682,38 @@ class CommandTest(unittest.TestCase):
             raise AssertionError(f"unexpected tmux args: {tmux_args}")
         return side_effect
 
-    def test_cmd_init_renames_target_window_to_agent_name(self) -> None:
-        args = argparse.Namespace(agent="claude", target="%5")
+    def _stage_jp_workspace(
+        self,
+        parent: Path,
+        *,
+        identifier: str = "giken-3500-jgmlife",
+        basename: str = "2026PBL_ローカル",
+    ) -> Path:
+        # A Japanese-named workspace whose defaults declare a Redmine identifier;
+        # `.mozyo-bridge/scaffold.json` marks the root so find_repo_root stops
+        # here. derive_session_name then yields `mozyo-<identifier>`.
+        workspace = (parent / basename).resolve()
+        (workspace / ".mozyo-bridge").mkdir(parents=True)
+        (workspace / ".mozyo-bridge" / "scaffold.json").write_text("{}", encoding="utf-8")
+        (workspace / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+            "redmine:\n"
+            "  default_project:\n"
+            f"    identifier: {identifier}\n",
+            encoding="utf-8",
+        )
+        return workspace
+
+    def test_cmd_init_window_only_renames_window_in_place(self) -> None:
+        # `--window-only` keeps the legacy low-level behavior: rename the window,
+        # no session rename, no vscode write, no smart guard.
+        args = argparse.Namespace(
+            agent="claude", target="%5", window_only=True, no_vscode_settings=False
+        )
         panes = [
             {"id": "%2", "location": "agents:0.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
             {"id": "%5", "location": "agents:1.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
         ]
         rename_calls: list[tuple] = []
-
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch(
                 "mozyo_bridge.application.commands.run_tmux",
@@ -6693,6 +6721,7 @@ class CommandTest(unittest.TestCase):
             ), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:1.0"), \
             patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
             patch(
                 "mozyo_bridge.application.commands.rename_window",
                 side_effect=lambda target, name: rename_calls.append((target, name)),
@@ -6701,75 +6730,27 @@ class CommandTest(unittest.TestCase):
             self.assertEqual(0, cmd_init(args))
 
         self.assertEqual([("agents:1", "claude")], rename_calls)
+        rename_session.assert_not_called()
         self.assertIn("agents:1 -> claude", stdout.getvalue())
-
-    def test_cmd_init_refuses_when_window_name_collides_in_same_session(self) -> None:
-        # Another window already named `claude` in the same session means the
-        # resolver would die on duplicate names. init refuses up-front so the
-        # operator can rename / kill that window first.
-        args = argparse.Namespace(agent="claude", target="%5")
-        panes = [
-            {"id": "%1", "location": "agents:0.0", "command": "claude", "window_name": "claude", "cwd": "/repo"},
-            {"id": "%5", "location": "agents:2.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
-        ]
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch(
-                "mozyo_bridge.application.commands.run_tmux",
-                side_effect=self._init_run_tmux_side_effect("%5"),
-            ), \
-            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:2.0"), \
-            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.application.commands.rename_window") as rename, \
-            contextlib.redirect_stderr(io.StringIO()) as stderr:
-            with self.assertRaises(SystemExit):
-                cmd_init(args)
-
-        rename.assert_not_called()
-        self.assertIn("agents:0(%1)", stderr.getvalue())
-        self.assertIn("'claude'", stderr.getvalue())
-
-    def test_cmd_init_allows_same_agent_name_in_a_different_session(self) -> None:
-        # Cross-session `claude` windows are legitimate (one per repo). init
-        # only refuses same-session collisions.
-        args = argparse.Namespace(agent="claude", target="%5")
-        panes = [
-            {"id": "%2", "location": "other:0.0", "command": "claude", "window_name": "claude", "cwd": "/repo"},
-            {"id": "%5", "location": "agents:1.0", "command": "zsh", "window_name": "zsh", "cwd": "/repo"},
-        ]
-        rename_calls: list[tuple] = []
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch(
-                "mozyo_bridge.application.commands.run_tmux",
-                side_effect=self._init_run_tmux_side_effect("%5"),
-            ), \
-            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:1.0"), \
-            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
-            patch(
-                "mozyo_bridge.application.commands.rename_window",
-                side_effect=lambda target, name: rename_calls.append((target, name)),
-            ), \
-            contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(0, cmd_init(args))
-
-        self.assertEqual([("agents:1", "claude")], rename_calls)
+        self.assertIn("window-only", stdout.getvalue())
 
     def test_cmd_init_no_target_uses_current_pane(self) -> None:
-        args = argparse.Namespace(agent="codex", target=None)
+        args = argparse.Namespace(
+            agent="codex", target=None, window_only=True, no_vscode_settings=False
+        )
         panes = [
             {"id": "%9", "location": "agents:2.0", "command": "node", "window_name": "zsh", "cwd": "/repo"},
         ]
         rename_calls: list[tuple] = []
         with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch(
-                "mozyo_bridge.application.commands.current_pane",
-                return_value="%9",
-            ), \
+            patch("mozyo_bridge.application.commands.current_pane", return_value="%9"), \
             patch(
                 "mozyo_bridge.application.commands.run_tmux",
                 side_effect=self._init_run_tmux_side_effect("%9"),
             ), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:2.0"), \
             patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.application.commands.rename_session"), \
             patch(
                 "mozyo_bridge.application.commands.rename_window",
                 side_effect=lambda target, name: rename_calls.append((target, name)),
@@ -6778,6 +6759,309 @@ class CommandTest(unittest.TestCase):
             self.assertEqual(0, cmd_init(args))
 
         self.assertEqual([("agents:2", "codex")], rename_calls)
+
+    def test_cmd_init_adopts_fallback_session_into_workspace(self) -> None:
+        # Headline smart adoption (Redmine #11367 design #54505): a Japanese
+        # workspace in a tmux-integrated fallback session `___________` is
+        # adopted into `mozyo-giken-3500-jgmlife` — session renamed, vscode
+        # settings pinned, window renamed, style applied.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            session_calls: list[tuple] = []
+            window_calls: list[tuple] = []
+            style_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_session",
+                    side_effect=lambda old, new: session_calls.append((old, new)),
+                ), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_window",
+                    side_effect=lambda target, name: window_calls.append((target, name)),
+                ), \
+                patch(
+                    "mozyo_bridge.application.commands.apply_window_subtle_style",
+                    side_effect=lambda session, agent: style_calls.append((session, agent)),
+                ), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_init(args))
+
+            self.assertEqual([("___________", "mozyo-giken-3500-jgmlife")], session_calls)
+            self.assertEqual([("mozyo-giken-3500-jgmlife:1", "claude")], window_calls)
+            self.assertEqual([("mozyo-giken-3500-jgmlife", "claude")], style_calls)
+
+            settings = json.loads(
+                (workspace / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                "mozyo-giken-3500-jgmlife",
+                settings["tmux-integrated.sessionName"],
+            )
+
+            out = stdout.getvalue()
+            self.assertIn("adopted %5 into session 'mozyo-giken-3500-jgmlife' as claude", out)
+            self.assertIn("renamed session '___________' -> 'mozyo-giken-3500-jgmlife'", out)
+
+    def test_cmd_init_in_expected_session_pins_vscode_without_session_rename(self) -> None:
+        # When the pane is already in the expected session, smart init pins the
+        # vscode setting and renames the window but does not rename the session.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="codex", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%5", "location": "mozyo-giken-3500-jgmlife:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            window_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="mozyo-giken-3500-jgmlife:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
+                patch(
+                    "mozyo_bridge.application.commands.rename_window",
+                    side_effect=lambda target, name: window_calls.append((target, name)),
+                ), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            rename_session.assert_not_called()
+            self.assertEqual([("mozyo-giken-3500-jgmlife:1", "codex")], window_calls)
+            settings = json.loads(
+                (workspace / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("mozyo-giken-3500-jgmlife", settings["tmux-integrated.sessionName"])
+
+    def test_cmd_init_no_vscode_settings_skips_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            session_calls: list[tuple] = []
+            window_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_session",
+                    side_effect=lambda old, new: session_calls.append((old, new)),
+                ), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_window",
+                    side_effect=lambda target, name: window_calls.append((target, name)),
+                ), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            self.assertEqual([("___________", "mozyo-giken-3500-jgmlife")], session_calls)
+            self.assertEqual([("mozyo-giken-3500-jgmlife:1", "claude")], window_calls)
+            self.assertFalse((workspace / ".vscode" / "settings.json").exists())
+
+    def test_cmd_init_refuses_when_window_name_collides_in_same_session(self) -> None:
+        # Another window already named `claude` in the same session is ambiguous
+        # for the resolver. Smart init refuses before any mutation.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%1", "location": "mozyo-giken-3500-jgmlife:0.0", "command": "claude", "window_name": "claude", "cwd": str(workspace)},
+                {"id": "%5", "location": "mozyo-giken-3500-jgmlife:2.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="mozyo-giken-3500-jgmlife:2.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
+                patch("mozyo_bridge.application.commands.rename_window") as rename_window, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_init(args)
+
+            rename_window.assert_not_called()
+            rename_session.assert_not_called()
+            self.assertIn("mozyo-giken-3500-jgmlife:0(%1)", stderr.getvalue())
+            self.assertIn("'claude'", stderr.getvalue())
+
+    def test_cmd_init_allows_same_agent_name_in_a_different_session(self) -> None:
+        # Cross-session `claude` windows are legitimate (one per repo). init only
+        # refuses same-session collisions.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%2", "location": "other:0.0", "command": "claude", "window_name": "claude", "cwd": "/elsewhere"},
+                {"id": "%5", "location": "mozyo-giken-3500-jgmlife:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            window_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="mozyo-giken-3500-jgmlife:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_session"), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_window",
+                    side_effect=lambda target, name: window_calls.append((target, name)),
+                ), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            self.assertEqual([("mozyo-giken-3500-jgmlife:1", "claude")], window_calls)
+
+    def test_cmd_init_fails_closed_on_meaningful_foreign_session(self) -> None:
+        # A meaningful (non-fallback) session name different from expected is not
+        # renamed; the error preserves the explicit target in the --window-only
+        # suggestion (Redmine #11367 review #54498).
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%5", "location": "human-work:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="human-work:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
+                patch("mozyo_bridge.application.commands.rename_window") as rename_window, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_init(args)
+
+            rename_session.assert_not_called()
+            rename_window.assert_not_called()
+            message = stderr.getvalue()
+            self.assertIn("human-work", message)
+            self.assertIn("mozyo-giken-3500-jgmlife", message)
+            self.assertIn("mozyo-bridge init claude %5 --window-only", message)
+
+    def test_cmd_init_fails_closed_when_expected_session_already_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=True), \
+                patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
+                patch("mozyo_bridge.application.commands.rename_window") as rename_window, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_init(args)
+
+            rename_session.assert_not_called()
+            rename_window.assert_not_called()
+            message = stderr.getvalue()
+            self.assertIn("already exists", message)
+            self.assertIn("mozyo-giken-3500-jgmlife", message)
+
+    def test_cmd_init_fails_closed_when_workspace_root_unconfident(self) -> None:
+        # A cwd with no repo / workspace marker cannot be confidently adopted.
+        with tempfile.TemporaryDirectory() as tmp:
+            bare = (Path(tmp) / "bare").resolve()
+            bare.mkdir()
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=False
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(bare)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_session") as rename_session, \
+                patch("mozyo_bridge.application.commands.rename_window") as rename_window, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    cmd_init(args)
+
+            rename_session.assert_not_called()
+            rename_window.assert_not_called()
+            self.assertIn("workspace root", stderr.getvalue())
+
+    def test_confident_workspace_root_and_japanese_derivation(self) -> None:
+        # AC fixation: a Japanese-named workspace whose defaults declare the
+        # Redmine identifier `giken-3500-jgmlife` resolves to a confident root
+        # that derives `mozyo-giken-3500-jgmlife` (Redmine #11367).
+        from mozyo_bridge.application.commands import _confident_workspace_root
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            root = _confident_workspace_root(str(workspace))
+            self.assertEqual(workspace, root)
+            self.assertEqual("mozyo-giken-3500-jgmlife", derive_session_name(root).name)
+
+            # A marker-less cwd and an empty cwd are not confident.
+            bare = (Path(tmp) / "bare").resolve()
+            bare.mkdir()
+            self.assertIsNone(_confident_workspace_root(str(bare)))
+            self.assertIsNone(_confident_workspace_root(""))
+
+    def test_is_fallback_session_name_only_matches_all_underscore(self) -> None:
+        from mozyo_bridge.application.commands import _is_fallback_session_name
+
+        self.assertTrue(_is_fallback_session_name("___________"))
+        self.assertTrue(_is_fallback_session_name("__"))
+        self.assertFalse(_is_fallback_session_name(""))
+        self.assertFalse(_is_fallback_session_name("mozyo-giken-3500-jgmlife"))
+        self.assertFalse(_is_fallback_session_name("2026PBL_____"))
 
     def test_cmd_list_emits_window_column_in_place_of_label(self) -> None:
         panes = [

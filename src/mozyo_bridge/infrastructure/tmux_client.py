@@ -108,6 +108,21 @@ def rename_window(window_target: str, name: str) -> None:
         )
 
 
+def rename_session(old: str, new: str) -> None:
+    """Rename the tmux session ``old`` to ``new``.
+
+    Fatal when tmux rejects the request. Used by smart ``cmd_init`` to adopt a
+    low-information tmux-integrated fallback session (e.g. ``___________``) into
+    the workspace's derived session name without killing the running panes.
+    """
+    result = run_tmux("rename-session", "-t", old, new, check=False)
+    if result.returncode != 0:
+        die(
+            f"tmux rename-session failed for {old} -> {new}: "
+            f"{result.stderr.strip() or result.stdout.strip() or 'no output'}"
+        )
+
+
 def session_exists(session: str) -> bool:
     result = run_tmux("has-session", "-t", session, check=False)
     return result.returncode == 0
