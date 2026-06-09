@@ -314,13 +314,15 @@ TaskPilot: Shell command failed: No new tmux window found for session: mozyo-gk-
 
 TaskPilot の mozyo 起動メニューは、**workspace-local な `.vscode/task-menu.yaml` を長期 source-of-truth にしない**でください。workspace ごとに menu を複製すると、`mozyo-bridge init` の挙動更新 (smart adoption など) が全 workspace へ伝播せず drift します。代わりに **VS Code User settings の `taskPilot.configPath`** で User 配下の共通 `task-menu.yaml` を 1 つ参照し、全 workspace で同じ menu を使ってください。
 
-User settings (`Preferences: Open User Settings (JSON)`) に追加します。固定個人パスは書かず `${userHome}` で解決します:
+User settings (`Preferences: Open User Settings (JSON)`) に追加します。**TaskPilot は `configPath` に実際の絶対パスを要求し、`${userHome}` などの VS Code 変数を展開しません** (絶対パスでない値は workspace root と結合されるため、相対扱いになると User-level menu を読めません)。下記の `<user>` を自分の username に置き換えてください (個人名は環境ごとに異なるため、テンプレートには固定値を埋め込みません):
 
 ```jsonc
 {
-  // macOS。Linux は ${userHome}/.config/Code/User/task-menu.yaml、
-  // Windows は ${userHome}/AppData/Roaming/Code/User/task-menu.yaml。
-  "taskPilot.configPath": "${userHome}/Library/Application Support/Code/User/task-menu.yaml"
+  // <user> を自分の username に置き換える。configPath は絶対パスのみ (変数展開なし)。
+  // macOS:   /Users/<user>/Library/Application Support/Code/User/task-menu.yaml
+  // Linux:   /home/<user>/.config/Code/User/task-menu.yaml
+  // Windows: C:\\Users\\<user>\\AppData\\Roaming\\Code\\User\\task-menu.yaml
+  "taskPilot.configPath": "/Users/<user>/Library/Application Support/Code/User/task-menu.yaml"
 }
 ```
 
