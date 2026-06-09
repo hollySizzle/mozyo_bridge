@@ -310,6 +310,183 @@ TaskPilot: Shell command failed: No new tmux window found for session: mozyo-gk-
 - 既存 session を毎回まっさらにしたい場合に限り、起動前に `tmux kill-session -t "$s"` してから `mozyo` を実行すると新規 window が必ず作られます。ただし**実行中の agent も落とす**ため常用は非推奨です。
 - session 名は前節のとおり `mozyo-bridge session name --repo .` に揃えてください。
 
+### TaskPilot 起動メニューを User settings で共有する (`taskPilot.configPath` + smart init)
+
+TaskPilot の mozyo 起動メニューは、**workspace-local な `.vscode/task-menu.yaml` を長期 source-of-truth にしない**でください。workspace ごとに menu を複製すると、`mozyo-bridge init` の挙動更新 (smart adoption など) が全 workspace へ伝播せず drift します。代わりに **VS Code User settings の `taskPilot.configPath`** で User 配下の共通 `task-menu.yaml` を 1 つ参照し、全 workspace で同じ menu を使ってください。
+
+User settings (`Preferences: Open User Settings (JSON)`) に追加します。固定個人パスは書かず `${userHome}` で解決します:
+
+```jsonc
+{
+  // macOS。Linux は ${userHome}/.config/Code/User/task-menu.yaml、
+  // Windows は ${userHome}/AppData/Roaming/Code/User/task-menu.yaml。
+  "taskPilot.configPath": "${userHome}/Library/Application Support/Code/User/task-menu.yaml"
+}
+```
+
+参照先の `task-menu.yaml` (共通テンプレート)。**固定個人 repo パスを書かず**、`repo="$(pwd -P)"` で TaskPilot の shellCommand cwd から解決します:
+
+```yaml
+version: "1.0"
+
+menu:
+  - label: モジョ-Bridge
+    icon: "$(rocket)"
+    children:
+      - label: 起動[整列!]
+        icon: "$(terminal)"
+        description: TaskPilot/tmux-integrated 用。settings を同期し、期待 session に作られた新 window を claude/codex pane として初期化する
+        actions:
+          - type: shellCommand
+            command: |
+              set -eu
+              repo="$(pwd -P)"
+              session="$(mozyo-bridge session name --repo "$repo")"
+              state="/tmp/taskpilot-mozyo-${session}-claude.before"
+              tmux list-windows -a -F '#{window_id}' 2>/dev/null > "$state"
+
+          - type: vscodeCommand
+            command: tmux-integrated.newTerminal
+          - type: vscodeCommand
+            command: workbench.action.focusActiveEditorGroup
+          - type: vscodeCommand
+            command: workbench.action.newGroupRight
+          - type: vscodeCommand
+            command: workbench.action.focusRightGroup
+          - type: vscodeCommand
+            command: workbench.action.terminal.moveToEditor
+          - type: vscodeCommand
+            command: workbench.action.lockEditorGroup
+
+          - type: shellCommand
+            command: |
+              set -eu
+              repo="$(pwd -P)"
+              session="$(mozyo-bridge session name --repo "$repo")"
+              state="/tmp/taskpilot-mozyo-${session}-claude.before"
+              current="/tmp/taskpilot-mozyo-${session}-claude.current"
+              pane=""
+              i=0
+              while [ "$i" -lt 50 ]; do
+                tmux list-windows -a -F '#{window_id}|#{session_name}|#{pane_id}|#{pane_current_command}' 2>/dev/null > "$current"
+                # before に無く current に在る window_id だけを新規とみなし、候補を
+                # 期待 session か underscore fallback session (`^_+$`) の shell pane に限定する。
+                pane="$(
+                  awk -F'|' -v session="$session" '
+                    NR == FNR { seen[$1] = 1; next }
+                    !($1 in seen) && ($2 == session || $2 ~ /^_+$/) && ($4 ~ /^(zsh|bash|fish)$/) {
+                      print $3
+                      exit
+                    }
+                  ' "$state" "$current"
+                )"
+                [ -n "$pane" ] && break
+                i=$((i + 1))
+                sleep 0.1
+              done
+              if [ -z "$pane" ]; then
+                echo "tmux-integrated did not create a new window" >&2
+                echo "reopen this workspace if tmux-integrated was already attached to a fallback session." >&2
+                echo "Current tmux windows:" >&2
+                tmux list-windows -a -F '#{session_name} #{window_index} #{window_name} #{pane_id} #{pane_current_path} #{pane_current_command}' >&2 || true
+                exit 1
+              fi
+              # init の前に対象 pane を repo へ移動し、pane cwd が反映されるまで待つ。
+              tmux send-keys -t "$pane" "cd -- '$repo'" C-m
+              i=0
+              while [ "$i" -lt 50 ]; do
+                [ "$(tmux display-message -p -t "$pane" '#{pane_current_path}')" = "$repo" ] && break
+                i=$((i + 1))
+                sleep 0.1
+              done
+              # smart init: fallback session を期待 session へ rename し、vscode 設定を
+              # pin し、window を claude に rename する (`mozyo-bridge init` を参照)。
+              mozyo-bridge init claude "$pane"
+              tmux send-keys -t "$pane" "claude" C-m
+
+          - type: shellCommand
+            command: |
+              set -eu
+              repo="$(pwd -P)"
+              session="$(mozyo-bridge session name --repo "$repo")"
+              state="/tmp/taskpilot-mozyo-${session}-codex.before"
+              tmux list-windows -a -F '#{window_id}' 2>/dev/null > "$state"
+
+          - type: vscodeCommand
+            command: tmux-integrated.newTerminal
+          - type: vscodeCommand
+            command: workbench.action.focusActiveEditorGroup
+          - type: vscodeCommand
+            command: workbench.action.newGroupRight
+          - type: vscodeCommand
+            command: workbench.action.focusRightGroup
+          - type: vscodeCommand
+            command: workbench.action.terminal.moveToEditor
+          - type: vscodeCommand
+            command: workbench.action.lockEditorGroup
+
+          - type: shellCommand
+            command: |
+              set -eu
+              repo="$(pwd -P)"
+              session="$(mozyo-bridge session name --repo "$repo")"
+              state="/tmp/taskpilot-mozyo-${session}-codex.before"
+              current="/tmp/taskpilot-mozyo-${session}-codex.current"
+              pane=""
+              i=0
+              while [ "$i" -lt 50 ]; do
+                tmux list-windows -a -F '#{window_id}|#{session_name}|#{pane_id}|#{pane_current_command}' 2>/dev/null > "$current"
+                pane="$(
+                  awk -F'|' -v session="$session" '
+                    NR == FNR { seen[$1] = 1; next }
+                    !($1 in seen) && ($2 == session || $2 ~ /^_+$/) && ($4 ~ /^(zsh|bash|fish)$/) {
+                      print $3
+                      exit
+                    }
+                  ' "$state" "$current"
+                )"
+                [ -n "$pane" ] && break
+                i=$((i + 1))
+                sleep 0.1
+              done
+              if [ -z "$pane" ]; then
+                echo "tmux-integrated did not create a new window" >&2
+                echo "reopen this workspace if tmux-integrated was already attached to a fallback session." >&2
+                echo "Current tmux windows:" >&2
+                tmux list-windows -a -F '#{session_name} #{window_index} #{window_name} #{pane_id} #{pane_current_path} #{pane_current_command}' >&2 || true
+                exit 1
+              fi
+              tmux send-keys -t "$pane" "cd -- '$repo'" C-m
+              i=0
+              while [ "$i" -lt 50 ]; do
+                [ "$(tmux display-message -p -t "$pane" '#{pane_current_path}')" = "$repo" ] && break
+                i=$((i + 1))
+                sleep 0.1
+              done
+              mozyo-bridge init codex "$pane"
+              tmux send-keys -t "$pane" "codex" C-m
+
+      - label: 状態確認
+        icon: "$(info)"
+        type: shellCommand
+        command: |
+          set -eu
+          session="$(mozyo-bridge session name --repo .)"
+          echo "$session"
+          tmux list-windows -t "=$session" -F '#{window_index}\t#{window_name}\t#{pane_current_path}\t#{pane_current_command}'
+```
+
+起動 snippet の仕組み (smart init 前提):
+
+- **before/current の window_id 差分で新規 window を特定する。** `tmux-integrated.newTerminal` の前に `tmux list-windows -a -F '#{window_id}'` を snapshot し、生成後の一覧と比較して「before に無い window_id」だけを新規候補にします。**index ではなく `window_id`** を使うのは、index が再利用・並び替えされても一意だからです。
+- **全 session を横断し、候補を絞る。** 検出は `list-windows -a` (全 session) で行い、候補 pane を **期待 session (`mozyo-bridge session name`) か underscore fallback session (`^_+$`、tmux-integrated の低情報量名)** かつ **shell pane (`zsh|bash|fish`)** に限定します。これで他 workspace の window や既に agent 化済みの pane を誤検出しません。
+- **`init` の前に `cd -- <repo>` を送り、pane cwd を待つ。** smart `mozyo-bridge init` は pane の cwd から workspace root と期待 session を導出するため、init 前に対象 pane を repo へ移動し、`#{pane_current_path}` が `$repo` になるまで待ってから `mozyo-bridge init claude|codex "$pane"` を呼びます。
+- **smart `init` が session/window/settings をまとめて整える。** fallback session を期待 session へ rename し、`.vscode/settings.json` の `tmux-integrated.sessionName` を pin し、window を `claude` / `codex` に rename します (詳細は上記 `VS Code tmux-integrated の session 名` の節と `mozyo-bridge init --help`)。menu 側で別途 `session vscode-settings --write` を呼ぶ必要はありません。
+
+古い `taskPilot.globalMenu` の扱い:
+
+- 以前 **`taskPilot.globalMenu`** に mozyo 起動 entry を直接書いていた場合、その entry が残っていると新しい `configPath` menu と二重に出たり、古い起動ロジックで rollout を **shadow** することがあります。`configPath` へ移行したら、`taskPilot.globalMenu` 側の旧 mozyo entry は **削除する** か、`configPath` menu と **同一 label** にして上書き (override) させてください。両方に別 label で残すと、利用者が古い導線を踏み続けます。
+
 ### Subtle window status colors
 
 bare `mozyo` と `mozyo-bridge init <agent>` は agent window の tmux status bar entry に**控えめな色**を付けます。`claude` は muted sage green (`colour108`)、`codex` は muted slate blue (`colour67`)、それ以外の window は user 設定の default のまま無加工です。配色は fg のみで、背景塗りや点滅は使いません。
