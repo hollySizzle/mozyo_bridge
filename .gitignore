@@ -20,3 +20,10 @@ venv/
 .env.*
 !.env.example
 .pypirc
+
+# VS Code extension PoC build outputs
+experimental/**/node_modules/
+experimental/**/out/
+experimental/**/dist/
+experimental/**/*.vsix
+experimental/**/.vscode-test/

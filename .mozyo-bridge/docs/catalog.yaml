@@ -9,6 +9,7 @@ managed_types:
 coverage_roots:
   - .claude-plugin
   - .github
+  - experimental
   - src
   - tests
   - scripts
@@ -78,6 +79,18 @@ documents:
     audit_role: project_map_spec
     related_document_refs:
       - skill-project-map-reference
+
+  - id: spec-vscode-agent-pane-contract
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/vscode-agent-pane-contract.md
+    purpose: VS Code Agent Pane PoC と mozyo_bridge CLI / workspace-session identity の連携 contract。
+    audit_role: vscode_agent_pane_contract_spec
+    related_document_refs:
+      - spec-project-map
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - logic-tmux-send-safety-contract
 
   - id: manual-readme
     type: manual_spec
@@ -433,6 +446,17 @@ file_conventions:
       - spec-project-map
       - skill-workflow-reference
       - logic-turnkey-e2e-acceptance
+
+  - id: fc-vscode-agent-pane-poc
+    name: VS Code Agent Pane experimental PoC
+    patterns:
+      - experimental/vscode-agent-pane/**
+    severity: warn
+    document_refs:
+      - spec-vscode-agent-pane-contract
+      - spec-project-map
+      - logic-workspace-registry
+      - logic-tmux-send-safety-contract
 
   - id: fc-skill-source
     name: mozyo-bridge agent skill source and mirrored runtime body

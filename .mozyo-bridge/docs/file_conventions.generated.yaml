@@ -158,6 +158,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: VS Code Agent Pane experimental PoC
+  patterns:
+  - experimental/vscode-agent-pane/**
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/vscode-agent-pane-contract.md と @vibes/docs/specs/project-map.md と @vibes/docs/logics/workspace-registry.md
+    と @vibes/docs/logics/tmux-send-safety-contract.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: mozyo-bridge agent skill source and mirrored runtime body
   patterns:
   - skills/mozyo-bridge-agent/**

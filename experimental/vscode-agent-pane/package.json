@@ -1,0 +1,36 @@
+{
+  "name": "mozyo-vscode-agent-pane-poc",
+  "displayName": "mozyo Agent Pane PoC",
+  "description": "Experimental VS Code agent pane for mozyo-bridge.",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "hollySizzle",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:mozyoAgentPane.open"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mozyoAgentPane.open",
+        "title": "mozyo: Open Agent Pane PoC"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
