@@ -55,9 +55,12 @@ chat_pane通知: 正本ではなく通知のみ
   claude_code: 実装者
   codex: 監査者
   owner: 最終判断者
+  ユーザー窓口: codex
 実装者の責務: [code, schema, tests, 実装隣接docs]
-監査者の責務: [review, 設計相談回答, 規約解釈, Redmine判断記録]
+監査者の責務: [review, 設計相談回答, 規約解釈, Redmine判断記録, ticket_triage, owner承認収集]
 ```
+
+ユーザー / owner との対話窓口は Codex に集約する。owner への確認・承認収集・clarification は原則 Codex pane で行い、実装者 (Claude) の pane で owner 承認を収集しない (詳細は `### Owner Close Approval Delegation` と base の `Close Approval Separation` / `Direct Request Triage` を読む)。
 
 project が実装者 / 監査者 split を採用していない場合は、上記を採用しないでよい。ただし採用したら、本 file の境界を曖昧にしない。
 
@@ -144,6 +147,26 @@ review:
   指摘事項_分類:
     - 事実: コード・設定・docs で確認済みの不整合のみ
     - 仮説: 確認すべき事項と確認方法を併記
+design_consultation_dispute:
+  actor: 実装者または監査者
+  用途: implementation_request / review finding への異議 (上申)。既存 design_consultation の用途拡張であり、新しい gate / transport kind は作らない
+  必須:
+    - purpose: dispute
+    - dispute_target (異議対象の journal id)
+    - evidence (確認した code / docs / 事実)
+    - counterproposal
+    - owner_escalation_required: true|false
+  終端: Answer 後も合意不能なら owner 判断へ escalate
+owner_close_approval:
+  actor: codex (ユーザー窓口) または owner
+  必須:
+    - approval_source: standing_delegation | direct_owner
+    - delegation_scope: normal_development (standing_delegation の場合)
+    - carve_out_check: none | <該当理由>
+    - review_journal
+    - qa_journal / production_verification_journal (該当 gate がある場合)
+    - commit_hash
+  制約: Review Gate とは別 journal。standing_delegation は `### Owner Close Approval Delegation` の発動条件をすべて満たす場合のみ
 close:
   必須:
     - 受け入れ確認
@@ -275,6 +298,43 @@ drift が出たら `mozyo-bridge docs generate-file-conventions --repo .` で re
 - 検証 task は本 lane を直接変更しない通常開発タスクとする。
 - 検証 task では Claude が実装し、Codex は lane を実際に 1 回以上利用して repo-local guardrail を更新する。`codex_autonomous_edit` journal が破綻なく回ることを durable record として残す。
 - 結果を Redmine issue に記録する。lane policy 自身に gap が見つかれば follow-up issue を起票する。
+
+### Owner Close Approval Delegation
+
+base の `Close Approval Separation` を、窓口 = Codex として運用する。Review Gate approval 後の owner クローズ可否確認、owner_close_approval journal の記録、Close Gate までは **Codex 側で完結** させる。実装者 (Claude) は Review Gate approval を受領したら close 条件の充足状況を Progress Log に記録して待機し、owner 承認を自分の pane で収集しない。
+
+owner は通常開発タスクの close approval を Codex へ **事前委任 (standing delegation)** できる。委任の正本は本 preset であり、target project は採用可否だけを Project-Local Additions に記録する (詳細規則を workspace 側へ複製すると drift する)。
+
+```yaml
+owner_close_delegation:
+  scope: normal_development
+  発動条件 (すべて必須):
+    - review_gate: approved かつ open findings なし
+    - required_verification: green (Required Verification を満たす)
+    - commit_hash: 記録済み
+    - carve_out: 非該当 (下記一覧)
+    - residual_risk: owner 判断を要するものなし
+  記録: owner_close_approval journal に approval_source: standing_delegation を明示
+  禁止: Review Gate journal と同一 journal にまとめること
+```
+
+以下の **carve-out** に一つでも該当する issue は standing delegation の対象外であり、owner の直接承認 (`approval_source: direct_owner`) を要求する:
+
+- release / tag / publish / package distribution
+- guardrail / preset / router / skill / scaffold rule 変更
+- credential / secret / auth / permission / billing / 外部 service 設定
+- destructive operation / data 削除 / migration
+- production verification または外部副作用を伴う操作
+- legal / compliance / security-sensitive な変更
+- 仕様・scope・stakeholder 判断が未確定な issue
+- cross-project / cross-workspace ownership や session registry の正本変更
+- issue または parent に owner_approval_required 相当が明示されたもの
+
+carve-out 該当性の確認結果は owner_close_approval journal の `carve_out_check` field に残す (`none` または該当理由)。該当か判断に迷う場合は delegation を使わず owner 直接承認に escalate する。
+
+### Direct Request Triage (governed)
+
+base の `Direct Request Triage` を、窓口 = Codex / triage role = Codex として適用する。ユーザーが Claude pane に直接作業を依頼した場合、Claude は triage-pending issue を即起票し、Codex へ精査を handoff する (`--kind design_consultation` または `custom`)。Codex の精査 journal による re-parent / 分割 / tracker 変更は手戻り扱いしない。低リスク scope は Start Gate 後に着手可 (close 前に triage 完了必須)、高リスク scope (設計分岐 / 互換性 / 外部影響 / guardrail / preset / credential 接触) は triage 完了まで着手しない。default の作業入口は Codex のままであり、本経路は例外時の救済である。
 
 ### LLM 実行契約
 
@@ -443,6 +503,22 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - 未確認事項:
 - 再review要否:
 - 結論:
+
+## Gate: design_consultation (dispute)
+- purpose: dispute
+- dispute_target: journal #
+- evidence:
+- counterproposal:
+- owner_escalation_required:
+
+## Gate: owner_close_approval
+- approval_source: standing_delegation | direct_owner
+- delegation_scope: normal_development
+- carve_out_check: none | <該当理由>
+- review_journal:
+- qa_journal:
+- production_verification_journal:
+- commit_hash:
 
 ## Gate: close
 - 受け入れ確認:
