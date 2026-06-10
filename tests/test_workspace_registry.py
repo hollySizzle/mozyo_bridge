@@ -34,6 +34,7 @@ from mozyo_bridge.domain.session_naming import (
     SOURCE_WORKSPACE_DEFAULTS,
     derive_session_name,
 )
+from mozyo_bridge.shared.paths import find_repo_root
 from mozyo_bridge.workspace_registry import (
     ANCHOR_RELATIVE,
     REGISTER_CREATED,
@@ -212,6 +213,27 @@ class RegisterWorkspaceTest(WorkspaceRegistryBase):
         self.assertEqual(result.outcome, REGISTER_CREATED)
         resolved = resolve_canonical_session(self.repo, home=self.home)
         self.assertEqual(resolved.source, SOURCE_HOME_REGISTRY)
+
+    def test_subdirectory_of_registered_non_git_workspace_resolves_root(self) -> None:
+        """The anchor is a workspace-root marker (Codex review #54760).
+
+        Without it, running `mozyo-bridge session name` from a subdirectory
+        of a registered non-git workspace inferred the subdirectory as the
+        repo root and derived a different session name.
+        """
+        first = register_workspace(self.repo, home=self.home)
+        sub = self.repo / "sub" / "dir"
+        sub.mkdir(parents=True)
+        inferred_root = find_repo_root(sub)
+        self.assertEqual(inferred_root, self.repo.resolve())
+        resolved = resolve_canonical_session(inferred_root, home=self.home)
+        self.assertEqual(resolved.name, first.record.canonical_session)
+        self.assertEqual(resolved.source, SOURCE_HOME_REGISTRY)
+        # Anchor-only restore path keeps working from the subdirectory too.
+        registry_path(self.home).unlink()
+        resolved = resolve_canonical_session(find_repo_root(sub), home=self.home)
+        self.assertEqual(resolved.name, first.record.canonical_session)
+        self.assertEqual(resolved.source, SOURCE_WORKSPACE_ANCHOR)
 
     def test_register_records_scaffold_preset_when_available(self) -> None:
         manifest = self.repo / ".mozyo-bridge" / "scaffold.json"

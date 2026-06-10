@@ -29,6 +29,7 @@ identity_layers:
 - **tmux runtime state を DB に置かない。** live な window / pane / process 情報は tmux が正本。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。
 - **読み取りは read-only。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / smart `init` / `status` の session 解決) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。書き込み surface は `workspace register` だけ。
 - **anchor は path を持たない。** anchor の置き場所そのものが path であり、copy / move されても stale path を主張できない。
+- **anchor は workspace root marker である。** `shared/paths.py` の `WORKSPACE_MARKERS` に `.mozyo-bridge/workspace.json` を含め、登録済み非 git workspace の subdirectory からの root 推測が登録 root に解決されるようにする (review #54760)。`.mozyo-bridge/scaffold.json` (#11301) と同じ「workspace identity を確立する narrow marker」の扱い。
 - **特定 VS Code extension / tmux-integrated を公式 backend にしない。** 既存の `.vscode/settings.json` 連携 (#10796) は維持するが、registry の正本性はそれに依存しない。
 
 ## SQLite schema (registry v1)

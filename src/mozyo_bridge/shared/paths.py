@@ -12,7 +12,16 @@ PROJECT_MARKERS = (".git", ".tmux.conf", "pyproject.toml")
 # cross-workspace `--target-repo` gate. The scaffold manifest is the narrow
 # marker; a bare `.mozyo-bridge/` directory would be too broad because tooling
 # may create that directory without establishing workspace identity.
-WORKSPACE_MARKERS = (".mozyo-bridge/scaffold.json",)
+#
+# The workspace-registry anchor (Redmine #11429, review #54760) is equally a
+# workspace-identity root: `mozyo-bridge workspace register` writes it exactly
+# once per workspace root, and without it a registered non-git workspace's
+# subdirectories would re-derive a different session name instead of resolving
+# the registered root.
+WORKSPACE_MARKERS = (
+    ".mozyo-bridge/scaffold.json",
+    ".mozyo-bridge/workspace.json",
+)
 # Markers that establish a repo / workspace root for identity inference. The
 # walk returns the deepest ancestor bearing ANY marker, so adding workspace
 # markers can only stop the walk earlier (at a more specific root) — it never
