@@ -196,7 +196,7 @@ mozyo
 これは以下を一括で行います。
 
 - repo root を解決 (`--repo` → `MOZYO_REPO` → `.git` / `.tmux.conf` / `pyproject.toml` を遡る)
-- session 名を `mozyo-bridge session name` と同じ衝突しにくい ASCII 名に導出して、無ければ作る (`<repo>/.mozyo-bridge/workspace-defaults.yaml` の Redmine identifier 優先、無ければ `mozyo-<basename-slug>-<hash>`)。`--session NAME` を明示した場合はそれを優先 (Redmine #10796)
+- session 名を `mozyo-bridge session name` と同じ規則で解決して、無ければ作る。`mozyo-bridge workspace register` 済みの workspace では **登録済み canonical session 名** を再利用し (Redmine #11429)、未登録なら従来どおり path から導出 (`<repo>/.mozyo-bridge/workspace-defaults.yaml` の Redmine identifier 優先、無ければ `mozyo-<basename-slug>-<hash>`)。`--session NAME` を明示した場合はそれを優先 (Redmine #10796)
 - 1 つの repo-scoped session の中に `claude` window と `codex` window を ensure (window 別に分離)
 - `claude` window を default にしてから attach
 
@@ -214,13 +214,30 @@ session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 
 
 `open-here` / `tmux-ui-open` / `tmux-ui-setup` / `tmux-ui-ensure-pair` / `tmux-ui-ensure` / `tmux-ui-spawn` の pane-split 系 subcommand は廃止されました。標準導線は bare `mozyo` (1 repo = 1 session, 1 agent = 1 window) です。既存の標準 tmux pane や VS Code `tmux-integrated` pane を agent target にしたい場合は、その pane の中で `mozyo-bridge init <agent>` を実行して window 名を `<agent>` に rename してください。
 
+### Workspace registry (`mozyo-bridge workspace register`)
+
+session 名の導出入力 (workspace-defaults の identifier や path 自体) が後から変わると、path からの再導出だけでは session identity が動いてしまいます。home registry は **初回に決まった identity を正本として固定** します (Redmine #11429)。
+
+```bash
+cd /path/to/your-repo
+mozyo-bridge workspace register            # 登録 (idempotent)
+mozyo-bridge workspace list                # home registry の一覧
+mozyo-bridge workspace inspect --repo .    # registry / anchor / 導出 fallback の突き合わせ
+```
+
+- 正本は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`。workspace id / canonical path / readable name / canonical session 名 / preset version を管理します。live な tmux window / pane / process state は registry に入れません (`last_seen` のみ cache として分離保持)。
+- 登録時に **workspace-local anchor** (`<repo>/.mozyo-bridge/workspace.json`) を書きます。home registry が消えた環境 (ephemeral home / 再 install) でも、workspace 内で `workspace register` を再実行すれば anchor から同じ workspace id と canonical session 名が復元されます。
+- 登録後は `mozyo-bridge session name` / bare `mozyo` / `status` / smart `init` が **登録済み canonical session 名を優先** します。path からの導出は初回登録時と未登録 workspace の fallback に限定されます。未登録 workspace の挙動は従来と完全互換です。
+- 読み取り系 (`session name` / `list` / `inspect` / bare `mozyo` の session 解決) は registry を作らず書き換えません。書き込みは `workspace register` だけです。
+- `--name` で readable name (日本語可) を上書きできます。非 git workspace も `--repo` 明示で登録できます。
+
 ### VS Code `tmux-integrated` の session 名 (`mozyo-bridge session name`)
 
 VS Code の `tmux-integrated` 拡張 / TaskPilot menu は workspace basename から tmux session 名を導出します (典型的には `basename "$PWD" | sed ...`)。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など) `2026PBL_____` のような低情報量名に潰れ、同名の `____` session が複数 workspace で衝突すると `mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。
 
 bare `mozyo` は既にこの導出名で session を作りますが、VS Code は `mozyo` を経由せず自前で session を立てるため、VS Code 側にも同じ導出名を渡す必要があります。
 
-`mozyo-bridge session name` は repo path から **衝突しにくい ASCII session 名**を導出します。`<repo>/.mozyo-bridge/workspace-defaults.yaml` の `redmine.default_project.identifier` があればそれを優先し (`mozyo-<identifier-slug>`)、無ければ repo path の短い hash を付けた fallback (`mozyo-<basename-slug>-<hash>`) を返します。非 ASCII basename を `____` に潰すことはなく、同名 basename でも path hash で区別されます。
+`mozyo-bridge session name` は **衝突しにくい ASCII session 名**を返します。`mozyo-bridge workspace register` 済みなら登録済み canonical session 名をそのまま返し (registry → workspace anchor の順、Redmine #11429)、未登録なら repo path から導出します: `<repo>/.mozyo-bridge/workspace-defaults.yaml` の `redmine.default_project.identifier` があればそれを優先し (`mozyo-<identifier-slug>`)、無ければ repo path の短い hash を付けた fallback (`mozyo-<basename-slug>-<hash>`) を返します。非 ASCII basename を `____` に潰すことはなく、同名 basename でも path hash で区別されます。
 
 ```bash
 # 単一行出力 (shell / task script から使う)

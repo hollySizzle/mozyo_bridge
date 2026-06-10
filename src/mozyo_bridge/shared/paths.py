@@ -21,6 +21,16 @@ REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mozyo-bridge"
 
 
+def mozyo_bridge_home() -> Path:
+    """Resolve the mozyo-bridge home root (``MOZYO_BRIDGE_HOME`` or ``~/.mozyo_bridge``).
+
+    Canonical definition of the home contract (Redmine #11429); the
+    scaffold rules store and the workspace registry both resolve through
+    this single helper so the env override behaves identically everywhere.
+    """
+    return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
+
+
 def find_repo_root(start: Path | None = None) -> Path:
     current = Path(start or Path.cwd()).expanduser().resolve()
     if current.is_file():

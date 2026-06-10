@@ -41,6 +41,9 @@ from mozyo_bridge.application.commands import (
     cmd_session_name,
     cmd_session_vscode_settings,
     cmd_workspace_defaults,
+    cmd_workspace_inspect,
+    cmd_workspace_list,
+    cmd_workspace_register,
     cmd_status,
     cmd_tmux_ui_install,
     cmd_tmux_ui_status,
@@ -1166,23 +1169,26 @@ def build_parser() -> argparse.ArgumentParser:
     session = sub.add_parser(
         "session",
         help=(
-            "Derive the mozyo-bridge tmux session name for a repo "
-            "(Redmine #10796). Read-only; does not modify tmux state."
+            "Resolve the mozyo-bridge tmux session name for a repo "
+            "(Redmine #10796, #11429). Read-only; does not modify tmux state."
         ),
     )
     session_sub = session.add_subparsers(dest="session_command", required=True)
     session_name = session_sub.add_parser(
         "name",
         help=(
-            "Print the collision-safe ASCII tmux session name derived from the "
-            "repo. Prefers `redmine.default_project.identifier` in "
-            "`<repo>/.mozyo-bridge/workspace-defaults.yaml`; otherwise falls "
-            "back to a hash-suffixed repo-path name so non-ASCII or duplicate "
-            "basenames never collapse to a low-information `____`-style name. "
-            "Use it as the VS Code `tmux-integrated` session name (per "
-            "workspace) instead of a sanitized basename or a user-global fixed "
-            "value. Single-line output by default; pass `--json` for the name "
-            "plus derivation source."
+            "Print the tmux session name for the repo. Registry-first "
+            "(Redmine #11429): a canonical session name registered via "
+            "`mozyo-bridge workspace register` (home registry, else the "
+            "workspace-local anchor) wins. A never-registered workspace falls "
+            "back to path derivation: `redmine.default_project.identifier` in "
+            "`<repo>/.mozyo-bridge/workspace-defaults.yaml` when present, "
+            "otherwise a hash-suffixed repo-path name so non-ASCII or "
+            "duplicate basenames never collapse to a low-information "
+            "`____`-style name. Use it as the VS Code `tmux-integrated` "
+            "session name (per workspace) instead of a sanitized basename or "
+            "a user-global fixed value. Single-line output by default; pass "
+            "`--json` for the name plus resolution source."
         ),
     )
     add_repo_option(session_name)
@@ -1190,7 +1196,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         dest="as_json",
-        help="Emit structured JSON (name, source, identifier, repo_root) instead of the bare name.",
+        help=(
+            "Emit structured JSON (name, source, identifier, repo_root, "
+            "workspace_id) instead of the bare name."
+        ),
     )
     session_name.set_defaults(func=cmd_session_name)
 
@@ -1212,6 +1221,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply the change to `<repo>/.vscode/settings.json` (default: dry-run print only).",
     )
     session_vscode.set_defaults(func=cmd_session_vscode_settings)
+
+    workspace = sub.add_parser(
+        "workspace",
+        help=(
+            "Home-registry-first workspace identity (Redmine #11429). The "
+            "home registry (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/"
+            "registry.sqlite`) is the source of truth for workspace id, "
+            "paths, readable name, and canonical tmux session name; the "
+            "workspace-local anchor (`<repo>/.mozyo-bridge/workspace.json`) "
+            "restores the same identity if the home registry is lost. Live "
+            "tmux state is never stored here."
+        ),
+    )
+    workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
+
+    workspace_register = workspace_sub.add_parser(
+        "register",
+        help=(
+            "Register (or refresh) the workspace in the home registry and "
+            "write its local anchor. Idempotent: keeps the existing workspace "
+            "id and canonical session name; the session name is derived from "
+            "the path only on first registration. Restores identity from the "
+            "anchor when the home registry was lost. This is the only "
+            "registry write surface."
+        ),
+    )
+    add_repo_option(workspace_register)
+    workspace_register.add_argument(
+        "--name",
+        help=(
+            "Readable project name to record (may be non-ASCII). Defaults to "
+            "the previously registered name, else the directory basename."
+        ),
+    )
+    workspace_register.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the registration outcome and workspace record as JSON.",
+    )
+    workspace_register.set_defaults(func=cmd_workspace_register)
+
+    workspace_list = workspace_sub.add_parser(
+        "list",
+        help="List registered workspaces from the home registry. Read-only.",
+    )
+    workspace_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the registry rows as JSON.",
+    )
+    workspace_list.set_defaults(func=cmd_workspace_list)
+
+    workspace_inspect = workspace_sub.add_parser(
+        "inspect",
+        help=(
+            "Show how this workspace's identity resolves: registry row, "
+            "local anchor, path-derived fallback, and the effective session "
+            "name with its source. Read-only."
+        ),
+    )
+    add_repo_option(workspace_inspect)
+    workspace_inspect.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit all identity layers and the effective resolution as JSON.",
+    )
+    workspace_inspect.set_defaults(func=cmd_workspace_inspect)
 
     workspace_defaults = sub.add_parser(
         "workspace-defaults",

@@ -39,7 +39,7 @@ from mozyo_bridge.domain.handoff import (
     normalize_anchor,
 )
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
-from mozyo_bridge.domain.session_naming import derive_session_name
+from mozyo_bridge.workspace_registry import resolve_canonical_session
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
     AGENT_LABELS,
@@ -640,17 +640,20 @@ def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
 def cmd_mozyo(args: argparse.Namespace) -> int:
     """Bare ``mozyo`` entrypoint: repo-aware session with one window per agent.
 
-    Resolves the repo root, derives the session name via
-    :func:`derive_session_name` (the workspace-defaults Redmine identifier when
-    present, otherwise a collision-safe repo-path fallback — never a
-    low-information ``____``-style name), ensures a single repo-scoped session
-    containing a ``claude`` window and a ``codex`` window, and attaches unless
-    ``--no-attach`` was given. An explicit ``--session NAME`` still overrides
-    the derived name (Redmine #10796).
+    Resolves the repo root, resolves the session name via
+    :func:`resolve_canonical_session` (the registered canonical session name
+    from the home registry / workspace anchor when this workspace was
+    registered with ``mozyo-bridge workspace register`` (Redmine #11429);
+    otherwise derived from the path — the workspace-defaults Redmine
+    identifier when present, else a collision-safe repo-path fallback, never
+    a low-information ``____``-style name), ensures a single repo-scoped
+    session containing a ``claude`` window and a ``codex`` window, and
+    attaches unless ``--no-attach`` was given. An explicit ``--session NAME``
+    still overrides the resolved name (Redmine #10796).
     """
     require_tmux()
     repo_root = repo_root_from_args(args)
-    derived = derive_session_name(repo_root).name
+    derived = resolve_canonical_session(repo_root).name
     if not derived:
         die("could not derive a session name from repo root; cd into a project directory or pass a subcommand explicitly")
     user_session = getattr(args, "session", None)
@@ -814,12 +817,13 @@ def resolve_status_session(args: argparse.Namespace) -> str:
     """Pick the session ``cmd_status`` should describe.
 
     Order: explicit ``--session`` > current tmux session (when run inside
-    tmux) > the bare-``mozyo`` derived session name (see
-    :func:`derive_session_name`). The final fallback matches what bare
+    tmux) > the bare-``mozyo`` resolved session name (see
+    :func:`resolve_canonical_session`: registered canonical identity first,
+    path derivation as fallback). The final fallback matches what bare
     ``mozyo`` creates so ``status`` finds that session by name (Redmine
-    #10796). The hard-coded ``agents`` default is intentionally not used; it
-    produced misleading ``session: agents (missing)`` output under the
-    bare-``mozyo`` window model (see Asana task 1214758916882465).
+    #10796, #11429). The hard-coded ``agents`` default is intentionally not
+    used; it produced misleading ``session: agents (missing)`` output under
+    the bare-``mozyo`` window model (see Asana task 1214758916882465).
     """
     explicit = getattr(args, "session", None)
     if explicit:
@@ -828,7 +832,7 @@ def resolve_status_session(args: argparse.Namespace) -> str:
     if current:
         return current
     repo_root = repo_root_from_args(args)
-    return derive_session_name(repo_root).name
+    return resolve_canonical_session(repo_root).name
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1720,7 +1724,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"  - Or rename only this window in place: "
             f"`mozyo-bridge init {agent}{_init_target_suffix(args)} --window-only`."
         )
-    expected = derive_session_name(root)
+    expected = resolve_canonical_session(root)
     expected_name = expected.name
 
     # All fail-closed checks run before any mutation.
@@ -2179,18 +2183,19 @@ def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
 
 
 def cmd_session_name(args: argparse.Namespace) -> int:
-    """Print the derived tmux session name for the repo (Redmine #10796).
+    """Print the tmux session name for the repo (Redmine #10796, #11429).
 
-    Resolves the repo root from ``--repo`` (default cwd), derives a
-    collision-safe ASCII session name (preferring the workspace-defaults
-    Redmine identifier, otherwise a hash-suffixed repo-path fallback), and
-    prints it on a single line for shell use. ``--json`` emits the name plus
-    its derivation source. Read-only: does not touch tmux, Redmine, or disk.
+    Resolves the repo root from ``--repo`` (default cwd) and resolves the
+    session name registry-first: the canonical session name registered in the
+    home registry (or the workspace-local anchor) wins; a never-registered
+    workspace falls back to deriving a collision-safe ASCII name (preferring
+    the workspace-defaults Redmine identifier, otherwise a hash-suffixed
+    repo-path fallback). Prints it on a single line for shell use. ``--json``
+    emits the name plus its resolution source and workspace id. Read-only:
+    does not touch tmux, Redmine, or write to disk.
     """
-    from mozyo_bridge.domain.session_naming import derive_session_name
-
     repo_root = repo_root_from_args(args)
-    result = derive_session_name(repo_root)
+    result = resolve_canonical_session(repo_root)
     if getattr(args, "as_json", False):
         import json as _json
 
@@ -2199,6 +2204,7 @@ def cmd_session_name(args: argparse.Namespace) -> int:
             "source": result.source,
             "identifier": result.identifier,
             "repo_root": str(result.repo_root),
+            "workspace_id": result.workspace_id,
         }
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
@@ -2210,7 +2216,8 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
 
     Sets ``tmux-integrated.sessionName`` in ``<repo>/.vscode/settings.json`` to
-    the derived collision-safe session name, so the VS Code `tmux-integrated`
+    the resolved session name (registered canonical identity first, derived
+    collision-safe name as fallback), so the VS Code `tmux-integrated`
     extension stops sanitizing the workspace basename down to a low-information
     ``____``-style name. Only the **workspace-local** settings file is ever
     touched — user-global settings (which can carry credentials) are never
@@ -2221,12 +2228,11 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     from mozyo_bridge.domain.session_naming import (
         VSCODE_SESSION_NAME_KEY,
         VSCODE_SETTINGS_RELATIVE,
-        derive_session_name,
         merge_vscode_session_name,
     )
 
     repo_root = repo_root_from_args(args)
-    result = derive_session_name(repo_root)
+    result = resolve_canonical_session(repo_root)
     settings_path = repo_root / VSCODE_SETTINGS_RELATIVE
     existing = (
         settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
@@ -2255,6 +2261,153 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(new_text, encoding="utf-8")
     print(f'wrote "{VSCODE_SESSION_NAME_KEY}": "{result.name}" to {settings_path}')
+    return 0
+
+
+def cmd_workspace_register(args: argparse.Namespace) -> int:
+    """Register (or refresh) this workspace in the home registry (#11429).
+
+    The only write surface of the workspace registry: upserts the registry
+    row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
+    rewrites the workspace-local anchor
+    (``<repo>/.mozyo-bridge/workspace.json``). Idempotent: re-running keeps
+    the existing workspace id and canonical session name; when the home
+    registry was lost, the anchor restores the same identity. The canonical
+    session name is derived from the path only on first registration.
+    """
+    from mozyo_bridge.workspace_registry import register_workspace
+
+    repo_root = repo_root_from_args(args)
+    result = register_workspace(
+        repo_root, project_name=getattr(args, "name", None)
+    )
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "outcome": result.outcome,
+            "registry_path": str(result.registry_path),
+            "anchor_path": str(result.anchor_path),
+            "workspace": result.record.as_payload(),
+            "notes": list(result.notes),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    record = result.record
+    print(
+        f"{result.outcome}: workspace '{record.project_name}' "
+        f"({record.display_path})"
+    )
+    print(f"  workspace_id:      {record.workspace_id}")
+    print(f"  canonical_session: {record.canonical_session}")
+    if record.preset:
+        version = f" {record.preset_version}" if record.preset_version else ""
+        print(f"  preset:            {record.preset}{version}")
+    print(f"  registry:          {result.registry_path}")
+    print(f"  anchor:            {result.anchor_path}")
+    for note in result.notes:
+        print(f"  note: {note}")
+    return 0
+
+
+def cmd_workspace_list(args: argparse.Namespace) -> int:
+    """List registered workspaces from the home registry (#11429). Read-only."""
+    from mozyo_bridge.workspace_registry import list_workspaces, registry_path
+
+    records = list_workspaces()
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "registry_path": str(registry_path()),
+            "workspaces": [record.as_payload() for record in records],
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if not records:
+        print(
+            f"no workspaces registered in {registry_path()} "
+            "(run `mozyo-bridge workspace register` from a workspace root)"
+        )
+        return 0
+    print("SESSION\tNAME\tPATH\tLAST_SEEN")
+    for record in records:
+        print(
+            f"{record.canonical_session}\t{record.project_name}\t"
+            f"{record.display_path}\t{record.last_seen or '-'}"
+        )
+    return 0
+
+
+def cmd_workspace_inspect(args: argparse.Namespace) -> int:
+    """Show how this workspace's identity resolves (#11429). Read-only.
+
+    Surfaces all three identity layers side by side — home-registry row,
+    workspace-local anchor, and the path-derived fallback — plus the
+    effective resolution, so registry/anchor drift is visible before it
+    bites a handoff gate.
+    """
+    from mozyo_bridge.domain.session_naming import derive_session_name as _derive
+    from mozyo_bridge.workspace_registry import (
+        anchor_path,
+        load_workspace_by_path,
+        read_anchor,
+        registry_path,
+        resolve_canonical_session,
+    )
+
+    repo_root = repo_root_from_args(args)
+    record = load_workspace_by_path(repo_root)
+    anchor = read_anchor(repo_root)
+    derived = _derive(repo_root)
+    resolved = resolve_canonical_session(repo_root)
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "repo_root": str(resolved.repo_root),
+            "registry_path": str(registry_path()),
+            "anchor_path": str(anchor_path(resolved.repo_root)),
+            "registered": record.as_payload() if record else None,
+            "anchor": anchor,
+            "derived_fallback": {
+                "name": derived.name,
+                "source": derived.source,
+                "identifier": derived.identifier,
+            },
+            "resolved": {
+                "name": resolved.name,
+                "source": resolved.source,
+                "workspace_id": resolved.workspace_id,
+            },
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print(f"repo_root: {resolved.repo_root}")
+    print(f"resolved session: {resolved.name} (source: {resolved.source})")
+    if record:
+        print(
+            f"registry: {record.canonical_session} "
+            f"(workspace_id {record.workspace_id}, last_seen {record.last_seen or '-'})"
+        )
+    else:
+        print(f"registry: not registered in {registry_path()}")
+    if anchor:
+        print(
+            f"anchor: {anchor['canonical_session']} "
+            f"(workspace_id {anchor['workspace_id']})"
+        )
+    else:
+        print(f"anchor: none at {anchor_path(resolved.repo_root)}")
+    print(f"derived fallback: {derived.name} (source: {derived.source})")
+    if record and anchor and record.workspace_id != anchor["workspace_id"]:
+        print(
+            "warning: registry row and anchor disagree on workspace_id; "
+            "re-run `mozyo-bridge workspace register` to reconcile "
+            "(the anchor wins)."
+        )
     return 0
 
 

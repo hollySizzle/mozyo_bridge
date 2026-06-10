@@ -63,6 +63,17 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: workspace registry and identity resolution source
+  patterns:
+  - src/mozyo_bridge/workspace_registry.py
+  - src/mozyo_bridge/domain/session_naming.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/workspace-registry.md と @vibes/docs/logics/workspace-defaults-renderer.md と
+    @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: handoff notification and tmux transport source
   patterns:
   - src/mozyo_bridge/domain/handoff.py

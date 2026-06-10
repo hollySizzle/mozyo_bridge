@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 from dataclasses import dataclass
 from importlib import resources
@@ -14,6 +13,7 @@ import yaml
 
 from mozyo_bridge import __version__
 from mozyo_bridge.shared.errors import die
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 ROUTER_TEMPLATE_PRESET = "_router"
 RULE_RELATIVE_PATH = Path("rules") / "presets"
@@ -166,9 +166,9 @@ def preset_definition(preset: str) -> PresetDefinition:
         die(f"unsupported rules preset: {preset}")
 
 
-def mozyo_bridge_home() -> Path:
-    return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
-
+# NOTE: `mozyo_bridge_home()` moved to `mozyo_bridge.shared.paths` (Redmine
+# #11429) so the workspace registry shares the exact same home contract.
+# It stays importable from this module for existing callers.
 
 @dataclass(frozen=True)
 class RulesStore:

@@ -169,6 +169,17 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-workspace-registry
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workspace-registry.md
+    purpose: home-registry-first workspace identity (SQLite registry、workspace-local anchor、canonical session 解決順序、register CLI) の設計正本。
+    audit_role: workspace_registry_logic
+    related_document_refs:
+      - logic-workspace-defaults-renderer
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-bootstrap
     type: logic
     status: active
@@ -322,6 +333,17 @@ file_conventions:
       - logic-scaffold-rules
       - logic-release-helper-contract
       - logic-tmux-send-safety-contract
+
+  - id: fc-workspace-registry-source
+    name: workspace registry and identity resolution source
+    patterns:
+      - src/mozyo_bridge/workspace_registry.py
+      - src/mozyo_bridge/domain/session_naming.py
+    severity: block
+    document_refs:
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - spec-project-map
 
   - id: fc-handoff-notification-source
     name: handoff notification and tmux transport source
