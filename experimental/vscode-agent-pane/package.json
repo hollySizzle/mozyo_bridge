@@ -26,6 +26,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "dev:host": "./scripts/open-dev-host.sh",
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {

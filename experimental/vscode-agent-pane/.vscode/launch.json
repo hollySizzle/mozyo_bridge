@@ -6,7 +6,10 @@
       "type": "extensionHost",
       "request": "launch",
       "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}"
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--disable-extension",
+        "hollySizzle.taskpilot",
+        "${workspaceFolder}/../.."
       ],
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"

@@ -24,6 +24,22 @@ The extension must treat the mozyo_bridge CLI as the boundary. The contract sour
 
 - `vibes/docs/specs/vscode-agent-pane-contract.md`
 
+## Local Smoke
+
+Open an Extension Development Host with the mozyo_bridge repository as the target workspace:
+
+```sh
+npm run dev:host
+```
+
+This script installs dependencies if needed, compiles the extension, opens VS Code with this directory as the extension development path, opens the mozyo_bridge repo as the workspace, and disables TaskPilot in the development host to avoid unrelated workspace-menu errors.
+
+Then run the command in the Extension Development Host:
+
+```text
+mozyo: Open Agent Pane PoC
+```
+
 ## Expected Promotion
 
 Before closing the PoC feature, decide and execute one of:
