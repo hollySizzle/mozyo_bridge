@@ -123,6 +123,49 @@ The extension must stop before launching panes when:
 - Modifying tmux-integrated.
 - Sending handoff messages directly from the UI.
 
+## Prior Art
+
+The PoC is not exploring an unknown UI pattern. Similar terminal-hosting implementations already exist:
+
+- Claude Code Sidebar: VS Code sidebar extension that uses a webview, xterm.js, and node-pty to run a shell and send the `claude` command. Reference: https://marketplace.visualstudio.com/items?itemName=diruuu.claude-code-sidebar
+- Claude Code Crew: web UI for managing multiple Claude Code sessions across worktrees, using xterm.js and node-pty for terminal emulation and PTY management. Reference: https://github.com/to-na/claude-code-crew
+- xterm.js: mature terminal rendering library used by VS Code integrated terminal and many browser terminal tools. References: https://xtermjs.org/ and https://github.com/xtermjs/xterm.js/
+
+These examples support the feasibility of a terminal-pane PoC. They do not solve mozyo_bridge-specific requirements:
+
+- explicit workspace identity,
+- symlink / cloud drive path ambiguity,
+- Redmine-governed session routing,
+- Claude and Codex dual-pane coordination,
+- avoiding TaskPilot and tmux-integrated hidden state.
+
+## TaskPilot And tmux-integrated Lessons
+
+The dedicated Agent Pane must avoid repeating the failure mode seen in the TaskPilot / tmux-integrated workflow:
+
+- A user-level `taskPilot.configPath` can hide the workspace-local `.vscode/task-menu.yaml`.
+- A global or stale TaskPilot menu can execute commands for a different workspace.
+- tmux-integrated can display or attach a fallback shell that is not the intended Claude / Codex pane.
+- Sanitized or basename-derived tmux session names are unsafe for non-ASCII paths and duplicate workspace names.
+
+For the PoC, the UI must therefore show the target workspace, resolved workspace, expected tmux session, and each pane identity before it treats a pane as active.
+
+TaskPilot remains a useful reference for VS Code extension structure, command registration, packaging, and settings UI patterns. It must not be a runtime dependency for Agent Pane.
+
+## Next Implementation Order
+
+Proceed in this order:
+
+1. Confirm the scaffold opens in VS Code and the placeholder command works.
+2. Add webview-side xterm.js rendering without starting Claude or Codex.
+3. Add extension-host PTY creation for a simple shell command such as `pwd`.
+4. Wire resize, input, paste, and cleanup between xterm.js and the PTY.
+5. Replace the simple shell command with explicit `mozyo --repo <workspace> --no-attach --json` bootstrap and display the returned session facts.
+6. Start Claude and Codex panes only after workspace/session identity is displayed and verified.
+7. Run the smoke in Redmine #11528: Japanese input, paste, resize, scrollback, 30-minute stability, and wrong-workspace prevention.
+
+Do not start by launching `claude` and `codex` directly. The first implementation risk to retire is the PTY/webview bridge. The second is workspace identity. Agent launch comes after those two are observable.
+
 ## Follow-Up Candidates
 
 Create separate Redmine UserStories if PoC requires new CLI support:
