@@ -25,7 +25,9 @@ and exfiltrate the key. Therefore:
 Degradation states (additive ``redmine`` field on unit payloads):
 
 - ``available`` — context fetched; carries the open-issue count and the
-  most recently updated open issue (id / subject / status / updated_on).
+  most recently updated open issue (id / status / updated_on only —
+  subjects can carry personal or confidential summaries and are never
+  put on the payload).
 - ``unconfigured`` — no API key in the daemon env, or the workspace has
   no Redmine project mapping. Not an error; the other two layers stand.
 - ``unavailable`` — the workspace is configured but the fetch failed or
