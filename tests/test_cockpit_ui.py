@@ -164,6 +164,26 @@ class CockpitHttpTest(unittest.TestCase):
         self.assertEqual(403, status)
         self.assertIn("cross-origin", payload["error"])
 
+    def test_loopback_prefixed_hostile_origins_are_403(self) -> None:
+        # Review #56212: a prefix match admitted Origins whose registrable
+        # domain merely STARTS with a loopback string. Exact parsed-host
+        # comparison must reject them even with a valid token.
+        for origin in (
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            f"http://localhost.evil.example:{self.port}",
+            "https://localhost",  # scheme must be http (the served origin)
+        ):
+            with patch(
+                "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+                return_value=[pane("%1", "mozyo-demo", "claude")],
+            ):
+                status, payload = self._post(
+                    "/api/actions/jump", {"pane_id": "%1"}, origin=origin
+                )
+            self.assertEqual(403, status, origin)
+            self.assertIn("cross-origin", payload["error"])
+
     def test_action_with_loopback_origin_and_token_reaches_handler(self) -> None:
         with patch(
             "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",

@@ -271,6 +271,26 @@ def decode_otlp_protobuf(signal: str, body: bytes) -> list[OtelEvent] | None:
     return decode_otlp_json(signal, payload)
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    """Strict loopback check for a browser ``Origin`` header value.
+
+    Parsed, exact-host comparison (review #56212): a prefix match admits
+    ``http://localhost.evil.example``, because the loopback string is a
+    prefix of a hostile registrable domain. Only ``http`` with a hostname
+    exactly equal to ``127.0.0.1`` / ``localhost`` / ``::1`` (any port)
+    qualifies.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if parsed.scheme != "http":
+        return False
+    return (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+
+
 class _ReceiverHandler(BaseHTTPRequestHandler):
     server_version = "mozyo-otel"
     store: OtelEventStore  # injected via server attribute
@@ -436,11 +456,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             )
             return True
         origin = self.headers.get("Origin")
-        if origin is not None and not (
-            origin.startswith("http://127.0.0.1")
-            or origin.startswith("http://localhost")
-            or origin.startswith("http://[::1]")
-        ):
+        if origin is not None and not _is_loopback_origin(origin):
             self._respond_json(
                 403, {"error": f"cross-origin action rejected ({origin})"}
             )
