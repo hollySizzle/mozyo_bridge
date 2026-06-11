@@ -532,15 +532,22 @@ def build_server(
     # page and required on every action POST, so action intent can only
     # originate from the cockpit UI this daemon itself served.
     server.cockpit_token = secrets.token_hex(16)  # type: ignore[attr-defined]
-    # Read-only Redmine gate context (Redmine #11686). The API key comes
-    # from the daemon environment only; absent key = `unconfigured` for
-    # every unit and the cockpit's other two layers stand on their own.
+    # Read-only Redmine gate context (Redmine #11686). Both the API key
+    # AND the trusted base URL come from the daemon environment only —
+    # repo-local files can never select where the key is sent (review
+    # #56232). Either var absent = `unconfigured` for every unit, and the
+    # cockpit's other two layers stand on their own.
     import os
 
-    from mozyo_bridge.redmine_context import API_KEY_ENV, RedmineContextCache
+    from mozyo_bridge.redmine_context import (
+        API_KEY_ENV,
+        BASE_URL_ENV,
+        RedmineContextCache,
+    )
 
     server.redmine_context = RedmineContextCache(  # type: ignore[attr-defined]
-        api_key=os.environ.get(API_KEY_ENV) or None
+        api_key=os.environ.get(API_KEY_ENV) or None,
+        base_url=os.environ.get(BASE_URL_ENV) or None,
     )
     return server
 

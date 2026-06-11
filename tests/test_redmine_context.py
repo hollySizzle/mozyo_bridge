@@ -31,6 +31,7 @@ from mozyo_bridge.redmine_context import (
 )
 
 API_KEY = "test-key-not-a-real-credential"
+TRUSTED = "https://redmine.example.test"
 
 
 def write_workspace_defaults(repo: Path, *, identifier: str, url: str) -> None:
@@ -106,14 +107,14 @@ class RedmineContextCacheTest(unittest.TestCase):
         )
 
     def test_no_api_key_is_unconfigured_without_fetch(self) -> None:
-        cache = RedmineContextCache(api_key=None)
+        cache = RedmineContextCache(api_key=None, base_url=TRUSTED)
         with patch("urllib.request.urlopen") as opener:
             payload = cache.context_for_repo(str(self.repo), budget=[5])
         self.assertEqual(STATE_UNCONFIGURED, payload["state"])
         opener.assert_not_called()
 
     def test_unmapped_workspace_is_unconfigured(self) -> None:
-        cache = RedmineContextCache(api_key=API_KEY)
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
         with tempfile.TemporaryDirectory() as tmp:
             with patch("urllib.request.urlopen") as opener:
                 payload = cache.context_for_repo(tmp, budget=[5])
@@ -121,7 +122,7 @@ class RedmineContextCacheTest(unittest.TestCase):
         opener.assert_not_called()
 
     def test_available_context_carries_latest_issue_and_no_key(self) -> None:
-        cache = RedmineContextCache(api_key=API_KEY)
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
         captured: list = []
 
         def fake_urlopen(request, timeout):
@@ -132,8 +133,7 @@ class RedmineContextCacheTest(unittest.TestCase):
                     "issues": [
                         {
                             "id": 11999,
-                            "subject": "demo issue",
-                            "status": {"name": "着手中"},
+                                                        "status": {"name": "着手中"},
                             "updated_on": "2026-06-12T00:00:00Z",
                         }
                     ],
@@ -154,7 +154,7 @@ class RedmineContextCacheTest(unittest.TestCase):
         )
 
     def test_fetch_error_is_unavailable_and_cached(self) -> None:
-        cache = RedmineContextCache(api_key=API_KEY)
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
         calls: list[int] = []
 
         def failing_urlopen(request, timeout):
@@ -170,14 +170,81 @@ class RedmineContextCacheTest(unittest.TestCase):
         self.assertEqual(1, len(calls))
 
     def test_depleted_budget_yields_unavailable_without_fetch(self) -> None:
-        cache = RedmineContextCache(api_key=API_KEY)
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
         with patch("urllib.request.urlopen") as opener:
             payload = cache.context_for_repo(str(self.repo), budget=[0])
         self.assertEqual(STATE_UNAVAILABLE, payload["state"])
         opener.assert_not_called()
 
+    def test_hostile_workspace_url_never_draws_a_request(self) -> None:
+        # Review #56232 (High): a repo-local workspace-defaults file must
+        # never select where the API key is sent. A workspace declaring an
+        # attacker host gets `unconfigured` with ZERO network activity.
+        with tempfile.TemporaryDirectory() as tmp:
+            hostile = Path(tmp) / "hostile-checkout"
+            hostile.mkdir()
+            write_workspace_defaults(
+                hostile,
+                identifier="demo",
+                url="https://attacker.example/projects/demo",
+            )
+            cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
+            with patch("urllib.request.urlopen") as opener:
+                payload = cache.context_for_repo(str(hostile), budget=[5])
+        self.assertEqual(STATE_UNCONFIGURED, payload["state"])
+        opener.assert_not_called()
+
+    def test_requests_only_ever_target_the_trusted_base(self) -> None:
+        # Even on the happy path, the destination is the daemon-env base
+        # by construction — the workspace string is only compared, never
+        # used to build the request.
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
+        captured: list = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(request.full_url)
+            return issues_response({"total_count": 0, "issues": []})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            cache.context_for_repo(str(self.repo), budget=[5])
+        self.assertEqual(1, len(captured))
+        self.assertTrue(captured[0].startswith(TRUSTED + "/issues.json?"))
+
+    def test_no_trusted_base_url_is_unconfigured_without_fetch(self) -> None:
+        cache = RedmineContextCache(api_key=API_KEY, base_url=None)
+        with patch("urllib.request.urlopen") as opener:
+            payload = cache.context_for_repo(str(self.repo), budget=[5])
+        self.assertEqual(STATE_UNCONFIGURED, payload["state"])
+        opener.assert_not_called()
+
+    def test_subject_is_never_on_the_payload(self) -> None:
+        # Review #56232 (Medium): issue subjects can carry personal or
+        # confidential summaries and the v1 UI does not show them.
+        cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)
+
+        def fake_urlopen(request, timeout):
+            return issues_response(
+                {
+                    "total_count": 1,
+                    "issues": [
+                        {
+                            "id": 1,
+                            "subject": "CONFIDENTIAL-SUMMARY",
+                            "status": {"name": "着手中"},
+                            "updated_on": "2026-06-12T00:00:00Z",
+                        }
+                    ],
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            payload = cache.context_for_repo(str(self.repo), budget=[5])
+        self.assertEqual(STATE_AVAILABLE, payload["state"])
+        self.assertNotIn("subject", payload["latest_issue"])
+        self.assertNotIn("CONFIDENTIAL-SUMMARY", json.dumps(payload))
+
     def test_attach_enriches_panes_additively(self) -> None:
-        cache = RedmineContextCache(api_key=None)
+        cache = RedmineContextCache(api_key=None, base_url=TRUSTED)
         payload = {
             "stale": False,
             "panes": [
@@ -206,7 +273,7 @@ class CockpitUnitsRedmineFieldTest(unittest.TestCase):
             clean_env = {
                 k: v
                 for k, v in os.environ.items()
-                if k != "MOZYO_REDMINE_API_KEY"
+                if k not in ("MOZYO_REDMINE_API_KEY", "MOZYO_REDMINE_URL")
             }
             clean_env["MOZYO_BRIDGE_HOME"] = str(home)
             with patch.dict("os.environ", clean_env, clear=True):

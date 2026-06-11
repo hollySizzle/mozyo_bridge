@@ -29,8 +29,8 @@ endpoints:
 ## Redmine gate join (段階4: #11686 / #11687)
 
 - **Redmine は読み取りのみ** (US 制約3)。daemon は Redmine へ一切書かず、runtime heartbeat を journal に残さない。実装は `src/mozyo_bridge/redmine_context.py`。
-- 解決: workspace の `workspace-defaults.yaml` から project identifier + base URL (project url の scheme+host 導出 — runtime-config と同 pattern、distributed code に host を焼かない)。API key は **daemon env `MOZYO_REDMINE_API_KEY` のみ** (repo file 不可、payload / log / journal に出さない — test で非漏出を pin)。
-- 縮退状態 (unit payload の additive `redmine` field): `available` (open 件数 + 最新更新 open issue の id/subject/status/updated_on) / `unconfigured` (key なし or workspace 未 mapping — error ではない) / `unavailable` (fetch 失敗 or 未 fetch)。いずれも OTel / tmux 層と pane_id identity を変更しない。
+- **credential boundary (review #56232)**: API key の送信先を repo-local file が選べてはならない。**信頼 base URL は daemon env `MOZYO_REDMINE_URL` のみ** が決め、request は常にその URL だけに発行する。workspace の `workspace-defaults.yaml` は project identifier (信頼 host へ送る query param) と宣言 URL を供給し、宣言 URL の scheme+host が信頼 base と**一致しない workspace は fetch ゼロで `unconfigured`** (hostile checkout が request を一切引き出せないことを regression test で pin)。API key は **daemon env `MOZYO_REDMINE_API_KEY` のみ** (repo file 不可、request header のみに乗り payload / log / journal に出さない — test で非漏出を pin)。
+- 縮退状態 (unit payload の additive `redmine` field): `available` (open 件数 + 最新更新 open issue の id/status/updated_on — **subject は載せない**: 個人情報・機密要約を含み得て v1 UI が表示しないため、payload 不搭載を test で pin) / `unconfigured` (key・信頼 URL なし / workspace 未 mapping / host 不一致 — error ではない) / `unavailable` (fetch 失敗 or 未 fetch)。いずれも OTel / tmux 層と pane_id identity を変更しない。
 - 攻撃面・負荷の抑制: fetch は TTL cache (成功 60s / 失敗 30s) + per-call budget (既定 2 project) で、single-thread daemon が Redmine 遅延で OTLP ingestion を停めない。timeout 2s。cold cache は poll をまたいで温まる。
 - **cockpit 層限定の join**: `redmine` field は `/api/units` でのみ付与。`session list` CLI は network に依存しない (listing が Redmine 障害で遅延しない)。
 - UI: redmine 列は phase 3 と同じ DOM API / class whitelist (`rm-available` / `rm-unconfigured` / `rm-unavailable`) で描画。
