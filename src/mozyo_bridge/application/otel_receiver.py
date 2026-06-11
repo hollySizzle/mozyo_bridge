@@ -289,20 +289,56 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/healthz":
-            self._respond_json(404, {"error": "unknown path"})
+        if self.path == "/healthz":
+            store: OtelEventStore = self.server.store  # type: ignore[attr-defined]
+            self._respond_json(
+                200,
+                {
+                    "ok": True,
+                    "store": str(store.path),
+                    **store.counts(),
+                },
+            )
             return
-        store: OtelEventStore = self.server.store  # type: ignore[attr-defined]
-        self._respond_json(
-            200,
-            {
-                "ok": True,
-                "store": str(store.path),
-                **store.counts(),
-            },
-        )
+        # Cockpit Web UI (Redmine #11679): served by the same daemon, same
+        # loopback-only bind. Imported lazily so pure-receiver usage does
+        # not pay for the inventory stack.
+        if self.path == "/":
+            from mozyo_bridge.application.cockpit_ui import INDEX_HTML
+
+            body = INDEX_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/api/units":
+            from mozyo_bridge.session_inventory import take_inventory
+
+            home = getattr(self.server, "home", None)
+            snapshot = take_inventory(home=home)
+            tracker = getattr(self.server, "transitions", None)
+            # Transitions are observed only on live runtime snapshots: a
+            # stale cache could pair an outdated pane set with fresh
+            # activity and fabricate transitions.
+            if tracker is not None and not snapshot.stale:
+                tracker.observe(list(snapshot.records))
+            self._respond_json(200, snapshot.as_payload())
+            return
+        if self.path == "/api/transitions":
+            tracker = getattr(self.server, "transitions", None)
+            transitions = (
+                [t.as_payload() for t in tracker.recent()] if tracker else []
+            )
+            self._respond_json(200, {"transitions": transitions})
+            return
+        self._respond_json(404, {"error": "unknown path"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path in ("/api/actions/reveal", "/api/actions/jump"):
+            self._handle_action(self.path.rsplit("/", 1)[1])
+            return
         signal = _SIGNAL_PATHS.get(self.path)
         if signal is None:
             self._respond_json(404, {"error": "unknown path"})
@@ -352,6 +388,37 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         # OTLP/HTTP success: 200 with an (empty) Export*ServiceResponse.
         self._respond_json(200, {})
 
+    def _handle_action(self, kind: str) -> None:
+        """Cockpit user actions (Redmine #11680).
+
+        Runs only as the direct result of an explicit user click in the
+        UI (US constraint 5: the daemon never initiates focus changes).
+        Failures are explanatory JSON, never silent or destructive.
+        """
+        from mozyo_bridge.application.cockpit_ui import (
+            CockpitActionError,
+            jump_to_unit,
+            reveal_in_finder,
+        )
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._respond_json(400, {"error": "request body must be JSON"})
+            return
+        pane_id = payload.get("pane_id") if isinstance(payload, dict) else None
+        home = getattr(self.server, "home", None)
+        try:
+            if kind == "reveal":
+                result = reveal_in_finder(pane_id, home=home)
+            else:
+                result = jump_to_unit(pane_id, home=home)
+        except CockpitActionError as exc:
+            self._respond_json(409, {"error": str(exc)})
+            return
+        self._respond_json(200, result)
+
 
 def build_server(
     *,
@@ -364,9 +431,13 @@ def build_server(
 
     Raises :class:`OtelReceiverError` for any non-loopback host.
     """
+    from mozyo_bridge.domain.agent_activity import TransitionTracker
+
     store = OtelEventStore(db_path, home=home)
     server = HTTPServer((_require_loopback(host), port), _ReceiverHandler)
     server.store = store  # type: ignore[attr-defined]
+    server.home = home  # type: ignore[attr-defined]
+    server.transitions = TransitionTracker()  # type: ignore[attr-defined]
     return server
 
 

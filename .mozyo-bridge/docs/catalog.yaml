@@ -227,6 +227,17 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-cockpit-web-ui
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/cockpit-web-ui.md
+    purpose: コックピット Web UI (同一 daemon 配信、127.0.0.1 固定、構造化 action、遷移フィード、Toolbelt 登録 runbook) の設計正本。
+    audit_role: cockpit_web_ui_logic
+    related_document_refs:
+      - logic-otel-event-store
+      - logic-session-inventory
+      - spec-project-map
+
   - id: logic-executive-terminal-setup
     type: logic
     status: active
@@ -418,10 +429,12 @@ file_conventions:
     patterns:
       - src/mozyo_bridge/otel_store.py
       - src/mozyo_bridge/application/otel_receiver.py
+      - src/mozyo_bridge/application/cockpit_ui.py
       - src/mozyo_bridge/domain/agent_activity.py
     severity: block
     document_refs:
       - logic-otel-event-store
+      - logic-cockpit-web-ui
       - logic-session-inventory
       - spec-project-map
 

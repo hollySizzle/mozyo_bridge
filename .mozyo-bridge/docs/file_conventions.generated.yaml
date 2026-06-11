@@ -88,10 +88,11 @@ rules:
   patterns:
   - src/mozyo_bridge/otel_store.py
   - src/mozyo_bridge/application/otel_receiver.py
+  - src/mozyo_bridge/application/cockpit_ui.py
   - src/mozyo_bridge/domain/agent_activity.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/otel-event-store.md と @vibes/docs/logics/session-inventory.md と @vibes/docs/specs/project-map.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/otel-event-store.md と @vibes/docs/logics/cockpit-web-ui.md と @vibes/docs/logics/session-inventory.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

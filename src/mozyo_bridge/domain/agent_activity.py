@@ -130,6 +130,81 @@ def summarize_activity(
     ]
 
 
+@dataclass(frozen=True)
+class ActivityTransition:
+    """One observed state change for a pane (Redmine #11681)."""
+
+    pane_id: str
+    session: str
+    agent_kind: str
+    previous_state: str
+    state: str
+    observed_at: str
+
+    def as_payload(self) -> dict:
+        return {
+            "pane_id": self.pane_id,
+            "session": self.session,
+            "agent_kind": self.agent_kind,
+            "previous_state": self.previous_state,
+            "state": self.state,
+            "observed_at": self.observed_at,
+        }
+
+
+class TransitionTracker:
+    """In-memory activity-transition feed for the cockpit (Redmine #11681).
+
+    Deliberately modest: transitions are recorded in a bounded ring buffer
+    served to the UI for display only — no OS-level notification, no focus
+    change, no Redmine write (US constraints 3 / 5). State vocabulary stays
+    active / idle / unknown; a transition to idle means "may be waiting for
+    input", never "dead" — liveness remains the tmux layer's call. Memory
+    only by design: a daemon restart starts a fresh feed, consistent with
+    the store's best-effort posture. Structured to extend in phase 4
+    (Redmine gate context can join onto pane_id at read time).
+    """
+
+    def __init__(self, *, max_transitions: int = 100):
+        self._last_states: dict[str, tuple[str, str, str]] = {}
+        self._transitions: list[ActivityTransition] = []
+        self._max = max_transitions
+
+    def observe(self, records: list) -> list[ActivityTransition]:
+        """Record state changes from an inventory snapshot's records.
+
+        Returns the new transitions from this observation. Panes that
+        disappear from the snapshot are dropped from tracking without a
+        transition — absence is a tmux-layer fact, not an activity state.
+        """
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        new: list[ActivityTransition] = []
+        seen: dict[str, tuple[str, str, str]] = {}
+        for record in records:
+            state = (record.activity or {}).get("state") or STATE_UNKNOWN
+            seen[record.pane_id] = (state, record.session, record.agent_kind)
+            previous = self._last_states.get(record.pane_id)
+            if previous is not None and previous[0] != state:
+                new.append(
+                    ActivityTransition(
+                        pane_id=record.pane_id,
+                        session=record.session,
+                        agent_kind=record.agent_kind,
+                        previous_state=previous[0],
+                        state=state,
+                        observed_at=now,
+                    )
+                )
+        self._last_states = seen
+        if new:
+            self._transitions.extend(new)
+            self._transitions = self._transitions[-self._max:]
+        return new
+
+    def recent(self, *, limit: int = 50) -> list[ActivityTransition]:
+        return list(self._transitions[-limit:])[::-1]
+
+
 def activity_state_for(
     records: list[ActivityRecord],
     *,
