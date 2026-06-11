@@ -337,6 +337,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == "/api/units":
+            from mozyo_bridge.redmine_context import attach_redmine_context
             from mozyo_bridge.session_inventory import take_inventory
 
             home = getattr(self.server, "home", None)
@@ -347,7 +348,15 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             # activity and fabricate transitions.
             if tracker is not None and not snapshot.stale:
                 tracker.observe(list(snapshot.records))
-            self._respond_json(200, snapshot.as_payload())
+            payload = snapshot.as_payload()
+            # Third join layer (Redmine #11686): read-only gate context,
+            # attached at the cockpit layer only — `session list` itself
+            # never blocks on the network. Additive field; degradation
+            # (unconfigured / unavailable) never touches the other layers.
+            redmine_cache = getattr(self.server, "redmine_context", None)
+            if redmine_cache is not None:
+                payload = attach_redmine_context(payload, redmine_cache)
+            self._respond_json(200, payload)
             return
         if self.path == "/api/transitions":
             tracker = getattr(self.server, "transitions", None)
@@ -523,6 +532,16 @@ def build_server(
     # page and required on every action POST, so action intent can only
     # originate from the cockpit UI this daemon itself served.
     server.cockpit_token = secrets.token_hex(16)  # type: ignore[attr-defined]
+    # Read-only Redmine gate context (Redmine #11686). The API key comes
+    # from the daemon environment only; absent key = `unconfigured` for
+    # every unit and the cockpit's other two layers stand on their own.
+    import os
+
+    from mozyo_bridge.redmine_context import API_KEY_ENV, RedmineContextCache
+
+    server.redmine_context = RedmineContextCache(  # type: ignore[attr-defined]
+        api_key=os.environ.get(API_KEY_ENV) or None
+    )
     return server
 
 

@@ -430,6 +430,7 @@ file_conventions:
       - src/mozyo_bridge/otel_store.py
       - src/mozyo_bridge/application/otel_receiver.py
       - src/mozyo_bridge/application/cockpit_ui.py
+      - src/mozyo_bridge/redmine_context.py
       - src/mozyo_bridge/domain/agent_activity.py
     severity: block
     document_refs:

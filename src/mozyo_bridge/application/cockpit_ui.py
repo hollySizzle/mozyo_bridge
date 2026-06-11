@@ -187,6 +187,9 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .active  { color: #2e7d32; font-weight: 600; }
   .idle    { color: #ef6c00; font-weight: 600; }
   .unknown { color: #757575; }
+  .rm-available    { color: #1565c0; }
+  .rm-unconfigured { color: #9e9e9e; }
+  .rm-unavailable  { color: #b71c1c; }
   .stale-banner { background: #fff3e0; padding: 4px 8px; display: none; }
   button { font-size: 12px; }
   #transitions li { color: #555; }
@@ -198,16 +201,34 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 <div id="stale" class="stale-banner">tmux runtime unavailable — showing the
 last cached snapshot; activity may be outdated and actions are disabled.</div>
 <table id="units"><thead><tr>
-<th>state</th><th>agent</th><th>session</th><th>workspace</th><th>actions</th>
+<th>state</th><th>agent</th><th>session</th><th>workspace</th>
+<th>redmine</th><th>actions</th>
 </tr></thead><tbody></tbody></table>
-<p class="muted">state is OTel activity (active / idle / unknown) — unknown
-or idle never means dead; tmux liveness is the row's presence itself.
+<p class="muted">three layers: state is OTel activity (active / idle /
+unknown — never "dead"); tmux liveness is the row's presence itself;
+redmine is read-only gate context (latest open issue), degrading to
+unconfigured / unavailable without affecting the other layers.
 Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
 <h3>recent transitions</h3>
 <ul id="transitions"></ul>
 <script>
 const COCKPIT_TOKEN = "__COCKPIT_TOKEN__";
 const KNOWN_STATES = ["active", "idle", "unknown"];
+const KNOWN_RM_STATES = ["available", "unconfigured", "unavailable"];
+function redmineText(rm) {
+  if (!rm || !KNOWN_RM_STATES.includes(rm.state)) return "unknown";
+  if (rm.state !== "available") return rm.state;
+  const latest = rm.latest_issue;
+  if (!latest || !latest.id) return "available (no open issues)";
+  let text = "#" + latest.id;
+  if (latest.status) text += " " + latest.status;
+  if (typeof rm.open_total === "number") text += " (" + rm.open_total + " open)";
+  return text;
+}
+function redmineClass(rm) {
+  const state = rm && rm.state;
+  return KNOWN_RM_STATES.includes(state) ? ("rm-" + state) : "unknown";
+}
 async function act(kind, pane) {
   const res = await fetch('/api/actions/' + kind, {
     method: 'POST',
@@ -247,6 +268,7 @@ async function refresh() {
       cell(row, p.agent_kind);
       cell(row, p.session);
       cell(row, ws);
+      cell(row, redmineText(p.redmine), redmineClass(p.redmine));
       const actions = document.createElement('td');
       for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
         const button = document.createElement('button');

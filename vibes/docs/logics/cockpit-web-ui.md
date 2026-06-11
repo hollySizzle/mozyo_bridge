@@ -26,6 +26,15 @@ endpoints:
   - prompt / secrets / 個人情報を UI・log・Redmine に出さない (inventory が local に持つ情報のみ)
 ```
 
+## Redmine gate join (段階4: #11686 / #11687)
+
+- **Redmine は読み取りのみ** (US 制約3)。daemon は Redmine へ一切書かず、runtime heartbeat を journal に残さない。実装は `src/mozyo_bridge/redmine_context.py`。
+- 解決: workspace の `workspace-defaults.yaml` から project identifier + base URL (project url の scheme+host 導出 — runtime-config と同 pattern、distributed code に host を焼かない)。API key は **daemon env `MOZYO_REDMINE_API_KEY` のみ** (repo file 不可、payload / log / journal に出さない — test で非漏出を pin)。
+- 縮退状態 (unit payload の additive `redmine` field): `available` (open 件数 + 最新更新 open issue の id/subject/status/updated_on) / `unconfigured` (key なし or workspace 未 mapping — error ではない) / `unavailable` (fetch 失敗 or 未 fetch)。いずれも OTel / tmux 層と pane_id identity を変更しない。
+- 攻撃面・負荷の抑制: fetch は TTL cache (成功 60s / 失敗 30s) + per-call budget (既定 2 project) で、single-thread daemon が Redmine 遅延で OTLP ingestion を停めない。timeout 2s。cold cache は poll をまたいで温まる。
+- **cockpit 層限定の join**: `redmine` field は `/api/units` でのみ付与。`session list` CLI は network に依存しない (listing が Redmine 障害で遅延しない)。
+- UI: redmine 列は phase 3 と同じ DOM API / class whitelist (`rm-available` / `rm-unconfigured` / `rm-unavailable`) で描画。
+
 ## 遷移フィード (#11681)
 
 - `TransitionTracker` が `/api/units` の runtime snapshot 観測ごとに pane 単位の state 変化 (active / idle / unknown) を記録。bounded ring buffer (100 件) を `/api/transitions` で返す。
