@@ -24,9 +24,9 @@ sessions safely. Three design constraints from the parent UserStory
   multi-server deployment would need a ``(socket, pane_id)`` composite key.
 - **Path identity absorbs Unicode normalization differences** (Redmine
   #11625). macOS readdir yields NFD path bytes while document- or
-  agent-supplied paths are NFC, so registry lookups here compare
-  NFC-normalized strings instead of raw bytes. (The session-name *hash*
-  derivation fix itself is #11625's scope, not this module's.)
+  agent-supplied paths are NFC, so registry lookups here compare through
+  the shared ``shared.paths.normalize_path_unicode`` helper instead of raw
+  bytes — the same helper the session-name hash derivation uses.
 
 Workspace identity per pane resolves registry → anchor → derivation, the
 same layering as ``workspace_registry.resolve_canonical_session``; when the
@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,7 +51,7 @@ from typing import Iterable
 
 from mozyo_bridge.domain.agent_discovery import classify_agent_kind, infer_repo_root
 from mozyo_bridge.domain.session_naming import derive_session_name
-from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.shared.paths import mozyo_bridge_home, normalize_path_unicode
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
     SOURCE_WORKSPACE_ANCHOR,
@@ -107,11 +106,6 @@ def inventory_path(home: Path | None = None) -> Path:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _normalize_path_text(text: str) -> str:
-    """NFC-normalize a path string for identity comparison (Redmine #11625)."""
-    return unicodedata.normalize("NFC", text)
 
 
 @dataclass(frozen=True)
@@ -246,7 +240,7 @@ def _resolve_identity(
     rows are pre-indexed so a listing resolves each unique root once instead
     of re-opening SQLite per pane.
     """
-    record = registry_by_path.get(_normalize_path_text(repo_root))
+    record = registry_by_path.get(normalize_path_unicode(repo_root))
     if record is not None:
         return WorkspaceIdentity(
             workspace_id=record.workspace_id,
@@ -275,7 +269,7 @@ def _resolve_identity(
 
 def _registry_index(home: Path | None) -> dict[str, object]:
     return {
-        _normalize_path_text(record.canonical_path): record
+        normalize_path_unicode(record.canonical_path): record
         for record in list_workspaces(home=home)
     }
 
@@ -337,7 +331,7 @@ def collect_runtime_inventory(
         repo_root = infer_repo_root(cwd)
         workspace: WorkspaceIdentity | None = None
         if repo_root:
-            key = _normalize_path_text(repo_root)
+            key = normalize_path_unicode(repo_root)
             if key not in identity_cache:
                 identity_cache[key] = _resolve_identity(repo_root, registry_by_path)
             workspace = identity_cache[key]

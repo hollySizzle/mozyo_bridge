@@ -1,7 +1,26 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from pathlib import Path
+
+
+def normalize_path_unicode(text: str) -> str:
+    """Fix a path string's Unicode normal form for identity use (Redmine #11625).
+
+    The same directory can be spelled NFC (document-, Redmine-, or
+    agent-supplied paths) or NFD (macOS readdir / shell completion), and the
+    spellings differ in bytes for decomposable characters (dakuten katakana
+    etc.). Every surface that hashes or compares paths as workspace identity
+    must go through this single helper so the two spellings cannot diverge.
+
+    NFD is the fixed form — deliberately matching macOS filesystem reality —
+    so session names and anchors that were historically derived from real
+    filesystem paths keep their values. Comparisons only need both sides in
+    the same form; the hash in `domain.session_naming` is what makes the
+    concrete form choice compatibility-relevant.
+    """
+    return unicodedata.normalize("NFD", text)
 
 
 PROJECT_MARKERS = (".git", ".tmux.conf", "pyproject.toml")

@@ -85,6 +85,7 @@ from mozyo_bridge.shared.paths import (
     default_queue_path,
     default_tmux_conf,
     find_repo_root,
+    normalize_path_unicode,
     resolve_repo_root,
 )
 
@@ -1312,7 +1313,12 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
         observed_repo = infer_repo_root(target_info.get("cwd") or "")
-        if observed_repo != expected_resolved:
+        # Identity comparison goes through the shared Unicode normalization
+        # (Redmine #11625): an NFC-spelled --target-repo must match an NFD
+        # pane cwd for the same directory instead of fail-closing on bytes.
+        if observed_repo is None or normalize_path_unicode(
+            observed_repo
+        ) != normalize_path_unicode(expected_resolved):
             _emit_outcome(
                 make_outcome(
                     status="blocked",

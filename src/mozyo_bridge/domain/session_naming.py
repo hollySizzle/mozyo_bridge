@@ -39,6 +39,7 @@ from pathlib import Path
 
 import yaml
 
+from mozyo_bridge.shared.paths import normalize_path_unicode
 from mozyo_bridge.workspace_defaults import WORKSPACE_DEFAULTS_INPUT_RELATIVE
 
 # All derived names share this prefix so mozyo-bridge sessions are a clear,
@@ -93,8 +94,17 @@ def slugify(text: str) -> str:
 
 
 def _repo_path_hash(repo_root: Path) -> str:
-    """Short, stable digest of the absolute repo path for collision safety."""
-    digest = hashlib.sha256(str(repo_root).encode("utf-8")).hexdigest()
+    """Short, stable digest of the absolute repo path for collision safety.
+
+    The path string is fixed to one Unicode normal form before hashing
+    (Redmine #11625): the same directory arrives NFD from macOS readdir /
+    shell completion but NFC from documents, Redmine, or agent-supplied
+    strings, and hashing the raw bytes derived two different session names
+    for one workspace. NFD (the macOS filesystem form) is the fixed form so
+    names historically derived from real filesystem paths keep their value.
+    """
+    normalized = normalize_path_unicode(str(repo_root))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return digest[:REPO_HASH_LENGTH]
 
 

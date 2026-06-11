@@ -29,7 +29,7 @@ inventory_layers:
 - **SQLite cache を正本にしない。** runtime listing が成功するたび snapshot を全置換する。cache は読めなくても・消えても inventory 機能は失われない (次の runtime listing が再構築する)。stale cache を返すときは `stale: true` と note を必ず付け、誤誘導 (issue #11422 記載 risk) を防ぐ。
 - **registry.sqlite に runtime state を足さない。** workspace registry (#11425/#11429) の identity / cache 分離不変条件を維持するため、inventory cache は別 file `inventory.sqlite` に置く。
 - **identity key は `pane_id`** (Redmine #11628, owner 合意 2026-06-11)。tmux session group では同一 pane が複数 session に所属する。session は pane の属性 (view) であり、複数所属は `views` 配列に畳み、1 pane = 1 行とする。正準 view は workspace の resolved canonical session と一致する session を優先し、無ければ session 名 sort 順の先頭で決定的に選ぶ。単一 tmux server 前提。複数 server 対応時は `(socket, pane_id)` を複合キーとする。
-- **path 同一性は Unicode 正規化差を吸収する** (Redmine #11625)。registry の `canonical_path` と pane 由来の repo root は NFC 正規化してから比較する。macOS readdir は NFD、文書 / agent 経由の path は NFC で、raw byte 比較は同一 workspace を取り逃す。session 名 hash 導出側の正規化修正は #11625 の scope であり本 logic では扱わない。
+- **path 同一性は Unicode 正規化差を吸収する** (Redmine #11625)。registry の `canonical_path` と pane 由来の repo root は `shared/paths.py` の `normalize_path_unicode()` (NFD 固定) を通してから比較する。macOS readdir は NFD、文書 / agent 経由の path は NFC で、raw byte 比較は同一 workspace を取り逃す。session 名 hash 導出 (`domain/session_naming.py`) と handoff `--target-repo` gate も同じ helper を通る (#11625 で修正済み。NFD 固定の理由は helper docstring を正本とする)。
 - **home 消失 fallback は identity 層が担う。** home registry / inventory cache が消えても、runtime listing は各 workspace の local anchor (`.mozyo-bridge/workspace.json`) または path derivation から同じ identity を再構築する。inventory 自体の復元手順は不要 (cache は regenerable)。
 
 ## SQLite schema (inventory v1)

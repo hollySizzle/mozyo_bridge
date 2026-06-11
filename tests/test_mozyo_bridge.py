@@ -12899,6 +12899,68 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("marker_timeout", outcome["reason"])
 
+    def test_target_repo_gate_passes_across_unicode_normal_forms(self) -> None:
+        # Redmine #11625: the pane cwd arrives in macOS NFD bytes while the
+        # operator's `--target-repo` is typically NFC (copied from docs /
+        # Redmine). Same directory, different bytes — the identity gate must
+        # compare through Unicode normalization, not raw strings, so the
+        # handoff proceeds (and then dies on marker_timeout, NOT the gate).
+        import unicodedata as _ud
+
+        nfd_name = _ud.normalize("NFD", "動画ドライブ")
+        nfc_name = _ud.normalize("NFC", "動画ドライブ")
+        self.assertNotEqual(nfd_name, nfc_name)
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / nfd_name
+            (workspace / "src").mkdir(parents=True)
+            (workspace / "pyproject.toml").write_text("", encoding="utf-8")
+            nfc_spelling = str(Path(tmp_str) / nfc_name)
+
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(workspace / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, _sent, stdout, _stderr = self.run_handoff(
+                [
+                    "handoff",
+                    "send",
+                    "--to",
+                    "claude",
+                    "--source",
+                    "redmine",
+                    "--issue",
+                    "11625",
+                    "--journal",
+                    "55992",
+                    "--kind",
+                    "implementation_request",
+                    "--target",
+                    "%8",
+                    "--target-repo",
+                    nfc_spelling,
+                    "--mode",
+                    "standard",
+                    "--landing-timeout",
+                    "0.01",
+                    "--submit-delay",
+                    "0",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+
     def test_target_repo_mismatch_hints_setup_when_identity_unestablished(
         self,
     ) -> None:
@@ -15395,6 +15457,50 @@ class SessionNamingTest(unittest.TestCase):
                 result.name.startswith("mozyo-2026pbl-"),
                 msg=f"unexpected fallback name {result.name!r}",
             )
+
+    def test_nfc_and_nfd_path_spellings_derive_the_same_name(self) -> None:
+        # Redmine #11625: the same directory is spelled NFD by macOS readdir /
+        # shell completion but NFC by documents, Redmine, and agents. Hashing
+        # the raw bytes derived two session names for one workspace.
+        import unicodedata as _ud
+
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        nfd_spelling = "/ws/" + _ud.normalize("NFD", "動画ドライブ")
+        nfc_spelling = "/ws/" + _ud.normalize("NFC", "動画ドライブ")
+        self.assertNotEqual(nfd_spelling, nfc_spelling)
+
+        nfd_result = derive_session_name(nfd_spelling)
+        nfc_result = derive_session_name(nfc_spelling)
+
+        self.assertEqual(nfd_result.name, nfc_result.name)
+        self.assertEqual(self.SOURCE_REPO_FALLBACK, nfd_result.source)
+
+    def test_repo_path_hash_is_pinned_to_the_nfd_form(self) -> None:
+        # Compatibility pin: NFD is the macOS filesystem form, so session
+        # names historically derived from real filesystem paths must keep
+        # their value after the #11625 fix. The hash of any spelling must
+        # equal the hash of the NFD bytes.
+        import hashlib as _hashlib
+        import unicodedata as _ud
+
+        from mozyo_bridge.domain.session_naming import (
+            REPO_HASH_LENGTH,
+            derive_session_name,
+        )
+
+        nfc_spelling = Path("/ws/" + _ud.normalize("NFC", "動画ドライブ"))
+        resolved_nfd = _ud.normalize("NFD", str(nfc_spelling.resolve()))
+        expected_hash = _hashlib.sha256(
+            resolved_nfd.encode("utf-8")
+        ).hexdigest()[:REPO_HASH_LENGTH]
+
+        result = derive_session_name(nfc_spelling)
+
+        self.assertTrue(
+            result.name.endswith(f"-{expected_hash}"),
+            msg=f"{result.name!r} does not carry the NFD-form hash {expected_hash!r}",
+        )
 
     def test_all_non_ascii_basename_yields_hash_only_name(self) -> None:
         from mozyo_bridge.domain.session_naming import (
