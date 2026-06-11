@@ -79,6 +79,12 @@ ALLOWED_ATTRIBUTE_KEYS = frozenset(
         "process.pid",
         "host.arch",
         "os.type",
+        # Join keys injected by the mozyo session bootstrap via
+        # OTEL_RESOURCE_ATTRIBUTES (Redmine #11676). All values are
+        # tmux-safe ASCII identifiers, never paths or free-form text.
+        "mozyo.session",
+        "mozyo.agent",
+        "mozyo.workspace_id",
     }
 )
 

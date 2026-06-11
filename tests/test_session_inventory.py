@@ -360,6 +360,7 @@ class SessionListCliTest(SessionInventoryBase):
         self.assertEqual(
             sorted(record),
             [
+                "activity",
                 "agent_kind",
                 "cwd",
                 "pane_active",
@@ -374,6 +375,9 @@ class SessionListCliTest(SessionInventoryBase):
                 "workspace",
             ],
         )
+        # No telemetry in this fixture: the additive activity field reports
+        # unknown (degrade to tmux liveness), never an invented state.
+        self.assertEqual("unknown", record["activity"]["state"])
         self.assertEqual(record["session"], canonical)
         self.assertEqual(len(record["views"]), 2)
         self.assertEqual(

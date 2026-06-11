@@ -156,6 +156,12 @@ class InventoryRecord:
     agent_kind: str
     workspace: WorkspaceIdentity | None
     views: tuple[PaneView, ...]
+    # OTel activity join (Redmine #11675). Computed at query time from the
+    # otel event store, NEVER persisted in the inventory cache — the two
+    # caches stay independent and the activity is always as fresh as the
+    # store. None means "not yet attached"; the payload then reports the
+    # unknown state, which by contract degrades to tmux liveness.
+    activity: dict | None = None
 
     def as_payload(self) -> dict:
         return {
@@ -171,6 +177,8 @@ class InventoryRecord:
             "agent_kind": self.agent_kind,
             "workspace": self.workspace.as_payload() if self.workspace else None,
             "views": [view.as_payload() for view in self.views],
+            "activity": self.activity
+            or {"state": "unknown", "last_event_at": None, "source": None},
         }
 
 
@@ -463,6 +471,68 @@ def load_snapshot(
     return records, meta[0] if meta else None
 
 
+# --- OTel activity join (Redmine #11675) ----------------------------------------
+
+
+def attach_activity(
+    records: list[InventoryRecord], *, home: Path | None = None
+) -> list[InventoryRecord]:
+    """Join OTel activity onto inventory records by bootstrap hints.
+
+    Join key: an OTel source's bootstrap-injected (``mozyo.session``,
+    ``mozyo.agent``) against each pane's view sessions plus its
+    ``agent_kind`` (under the 1-agent-1-window model this pair is unique
+    per workspace session; grouped sessions are already folded). Records
+    without a matching source — and panes that share a (session, kind)
+    pair with another pane, which cannot be disambiguated honestly — get
+    the ``unknown`` state, which callers treat as "consult tmux liveness",
+    never as death. Best-effort throughout: a missing / corrupt store
+    yields unknown for everyone and never fails the listing.
+    """
+    from dataclasses import replace
+
+    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    activity_by_key: dict[tuple[str, str], dict] = {}
+    for activity in summarize_activity(OtelEventStore(home=home)):
+        hints = activity.match_hints
+        session = hints.get("session")
+        agent = hints.get("agent")
+        if isinstance(session, str) and isinstance(agent, str):
+            activity_by_key[(session, agent)] = {
+                "state": activity.state,
+                "last_event_at": activity.last_event_at,
+                "last_event_name": activity.last_event_name,
+                "source": "otel",
+            }
+
+    # A (session, agent_kind) pair claimed by more than one pane cannot be
+    # attributed honestly — leave all claimants unknown.
+    pair_counts: dict[tuple[str, str], int] = {}
+    for record in records:
+        for view in record.views:
+            pair = (view.session, record.agent_kind)
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+
+    out: list[InventoryRecord] = []
+    for record in records:
+        attached: dict | None = None
+        for view in record.views:
+            pair = (view.session, record.agent_kind)
+            if pair_counts.get(pair, 0) == 1 and pair in activity_by_key:
+                attached = activity_by_key[pair]
+                break
+        out.append(
+            replace(
+                record,
+                activity=attached
+                or {"state": "unknown", "last_event_at": None, "source": None},
+            )
+        )
+    return out
+
+
 # --- orchestration --------------------------------------------------------------
 
 
@@ -486,6 +556,7 @@ def take_inventory(
         now = _utc_now()
         records = collect_runtime_inventory(panes, home=home)
         path, notes = save_snapshot(records, home=home, now=now)
+        records = attach_activity(records, home=home)
         return InventorySnapshot(
             records=tuple(records),
             collected_at=now,
@@ -497,6 +568,7 @@ def take_inventory(
     cached = load_snapshot(home=home)
     if cached is not None:
         records, collected_at = cached
+        records = attach_activity(records, home=home)
         return InventorySnapshot(
             records=tuple(records),
             collected_at=collected_at,

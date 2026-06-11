@@ -519,6 +519,50 @@ def apply_window_subtle_style(session: str, window_name: str) -> bool:
     return True
 
 
+def otel_bootstrap_env(
+    agent: str, session: str, cwd: str | None = None
+) -> dict[str, str]:
+    """OTel env injected at agent launch (Redmine #11676).
+
+    The session bootstrap is the source of truth for telemetry env: the
+    measured CLIs carry no pid/cwd in their OTel payloads, so the join
+    keys (`mozyo.session` / `mozyo.agent` / `mozyo.workspace_id`) ride in
+    OTEL_RESOURCE_ATTRIBUTES. Every injected value is a tmux-safe ASCII
+    identifier — never a path or free-form text — so no baggage-encoding
+    ambiguity exists. `OTEL_LOG_USER_PROMPTS` is deliberately never set:
+    prompt-content recording stays OFF by contract (#11639 constraint 4).
+    Telemetry export is best-effort; a down receiver costs nothing but
+    lost events.
+    """
+    attributes = [f"mozyo.session={session}", f"mozyo.agent={agent}"]
+    if cwd:
+        try:
+            workspace_id = resolve_canonical_session(cwd).workspace_id
+        except Exception:
+            workspace_id = None
+        if workspace_id:
+            attributes.append(f"mozyo.workspace_id={workspace_id}")
+    return {
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+        "OTEL_RESOURCE_ATTRIBUTES": ",".join(attributes),
+    }
+
+
+def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
+    """The shell command tmux runs for a new agent pane, with OTel env."""
+    import shlex
+
+    env_pairs = " ".join(
+        f"{key}={shlex.quote(value)}"
+        for key, value in sorted(otel_bootstrap_env(agent, session, cwd).items())
+    )
+    return f"env {env_pairs} {AGENT_COMMANDS[agent]}"
+
+
 def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
     require_tmux()
     if agent not in AGENT_COMMANDS:
@@ -526,7 +570,7 @@ def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -
     args = ["new-session", "-d", "-s", session, "-n", agent, "-P", "-F", "#{pane_id}"]
     if cwd:
         args.extend(["-c", cwd])
-    args.append(AGENT_COMMANDS[agent])
+    args.append(_agent_launch_command(agent, session, cwd))
     result = run_tmux(*args, check=False)
     if result.returncode != 0:
         die(f"tmux new-session failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -543,7 +587,7 @@ def new_agent_window(agent: str, session: str, cwd: str | None = None) -> str:
     args = ["new-window", "-d", "-t", f"{session}:", "-n", agent, "-P", "-F", "#{pane_id}"]
     if cwd:
         args.extend(["-c", cwd])
-    args.append(AGENT_COMMANDS[agent])
+    args.append(_agent_launch_command(agent, session, cwd))
     result = run_tmux(*args, check=False)
     if result.returncode != 0:
         die(f"tmux new-window failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -2429,7 +2473,8 @@ def cmd_session_list(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(
-        "PANE\tSESSION\tWINDOW\tKIND\tPROCESS\tWORKSPACE\tREPO_ROOT\tOTHER_VIEWS"
+        "PANE\tSESSION\tWINDOW\tKIND\tACTIVITY\tPROCESS\tWORKSPACE\t"
+        "REPO_ROOT\tOTHER_VIEWS"
     )
     for record in snapshot.records:
         workspace = record.workspace
@@ -2439,6 +2484,7 @@ def cmd_session_list(args: argparse.Namespace) -> int:
         other_views = ",".join(
             view.session for view in record.views if not view.canonical
         )
+        activity = record.activity or {}
         print(
             "\t".join(
                 [
@@ -2446,6 +2492,7 @@ def cmd_session_list(args: argparse.Namespace) -> int:
                     record.session or "-",
                     record.window_name or "-",
                     record.agent_kind,
+                    activity.get("state") or "unknown",
                     record.process or "-",
                     workspace_label,
                     record.repo_root or "-",

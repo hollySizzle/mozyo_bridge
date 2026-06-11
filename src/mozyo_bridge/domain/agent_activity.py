@@ -100,6 +100,11 @@ def classify_event(
         match_hints={
             "pid": event.pid,
             "cwd": event.cwd,
+            # Bootstrap-injected join keys (Redmine #11676): the canonical
+            # join path, since measured CLIs carry no pid/cwd of their own.
+            "session": event.attrs.get("mozyo.session"),
+            "agent": event.attrs.get("mozyo.agent"),
+            "workspace_id": event.attrs.get("mozyo.workspace_id"),
         },
     )
 

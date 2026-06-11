@@ -53,6 +53,15 @@ CREATE TABLE otel_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - 判定: 最新 event が window (既定 120s) 以内 → `active`、超過 → `idle`、record なし / 時刻不明 → `unknown`。`idle` / `unknown` は死亡を意味しない (上記不変条件)。
 - CLI: `mozyo-bridge otel activity [--window N] [--json]` / `otel events --limit N` (depth 実測・debug 用) / `otel status`。
 
+## 段階2: bootstrap 注入と inventory join (#11675 / #11676 / #11677)
+
+- **env 注入の正本は session bootstrap** (`mozyo` / `mozyo-bridge init` が agent window を作る経路)。`new_agent_session_window` / `new_agent_window` は agent command を `env OTEL_... <agent>` で wrap して起動する。注入内容: OTLP endpoint (`http://127.0.0.1:4318`) / `http/json` / logs+metrics exporter / `CLAUDE_CODE_ENABLE_TELEMETRY=1` / `OTEL_RESOURCE_ATTRIBUTES`。`OTEL_LOG_USER_PROMPTS` は**決して設定しない** (prompt OFF 固定)。
+- **join key は `OTEL_RESOURCE_ATTRIBUTES` の `mozyo.session` / `mozyo.agent` / `mozyo.workspace_id`** (実測で CLI payload に pid/cwd が無いため)。値はすべて tmux-safe ASCII identifier で、path・自由文・個人情報を含めない。
+- **join 規則** (`session_inventory.attach_activity`): OTel source の (mozyo.session, mozyo.agent) を pane の view sessions × agent_kind に照合。1-agent-1-window model で一意。同一 pair を複数 pane が持つ場合 (duplicate window) は誠実に attribution 不能として全員 `unknown`。store missing / receiver down / 未注入も `unknown` → tmux 生死層へ縮退。activity は query 時に store から計算し、**inventory cache には保存しない** (cache 独立性)。
+- **出力互換**: `session list --json` の pane に `activity {state, last_event_at, last_event_name?, source}` を**追加** (既存 key 不変)。text は `ACTIVITY` 列を KIND の後に挿入。
+- **doctor** (`otel` section): receiver /healthz 疎通 (down は error でなく "lost by design" と説明し tmux 縮退へ誘導)、store 状態、**観測漏れ検出** — telemetry を一度も発していない agent pane を `unobserved_agents` として列挙 (env 未注入 / 注入前起動 / CLI 未対応)。Redmine へ runtime heartbeat は書かない。
+- 既存 startup flow 互換: env wrapper は process 連鎖 (`env` → agent) を変えるだけで、window 名 rail / preflight / `wait_for_agent_terminal_pane` の判定は不変。注入前に起動した既存 session は `unknown` のまま動き続け、`mozyo` / `init` での再起動で注入される。
+
 ## CLI ごとの event depth (実測方針)
 
 各 CLI の OTel イベントが「入力待ち判定」に足る粒度かは実装初期に実測し、結果を Redmine journal に記録する (#11674)。深度不足の CLI は tmux 沈黙検知 (段階2 以降) へ縮退する。実測は `otel events --json` で受信イベント名の種類と頻度を観察する。

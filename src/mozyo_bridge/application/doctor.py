@@ -626,6 +626,99 @@ def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
     return info
 
 
+def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
+    """OTel receiver health and observation-gap report (Redmine #11677).
+
+    Diagnosis only: the store is never treated as a source of truth and
+    nothing is written to Redmine. A down receiver is NOT an error — OTLP
+    is push-based, so it means "telemetry is being lost by design until
+    restart"; liveness questions go to the tmux layer. Agent panes whose
+    (session, agent) pair has never produced a store source are surfaced
+    as observation gaps (env not injected / pre-injection launch /
+    unsupported CLI), which is exactly the new blind-spot class the owner
+    decision (#11639 constraint 3) requires doctor to expose.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    store = OtelEventStore()
+    section: dict[str, Any] = {
+        "status": "ok",
+        "store_path": str(store.path),
+        "store_exists": store.path.exists(),
+        "notes": [],
+    }
+    section.update(store.counts())
+
+    healthz = "http://127.0.0.1:4318/healthz"
+    try:
+        with urllib.request.urlopen(healthz, timeout=2) as response:
+            _json.loads(response.read().decode("utf-8"))
+        section["receiver_reachable"] = True
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        section["receiver_reachable"] = False
+        section["receiver_error"] = str(exc)
+        section["notes"].append(
+            "receiver not reachable: telemetry sent now is lost BY DESIGN "
+            "(best-effort store, not an error). Start it with "
+            "`mozyo-bridge otel serve`; use `agents list` / `session list` "
+            "for liveness in the meantime."
+        )
+
+    # Observation gaps: agent panes with no telemetry source ever.
+    observed_pairs = set()
+    for activity in summarize_activity(store):
+        hints = activity.match_hints
+        if isinstance(hints.get("session"), str) and isinstance(
+            hints.get("agent"), str
+        ):
+            observed_pairs.add((hints["session"], hints["agent"]))
+    gaps: list[dict[str, str]] = []
+    try:
+        from mozyo_bridge.domain.agent_discovery import (
+            discover_agents,
+            fold_agents_by_pane,
+        )
+        from mozyo_bridge.infrastructure.tmux_client import try_pane_lines
+
+        panes = try_pane_lines()
+        if panes is None:
+            section["notes"].append(
+                "tmux unavailable: observation-gap check skipped"
+            )
+        else:
+            for record in fold_agents_by_pane(discover_agents(panes)):
+                if record.agent_kind == "unknown":
+                    continue
+                pairs = {
+                    (view.session, record.agent_kind) for view in record.views
+                }
+                if not pairs & observed_pairs:
+                    gaps.append(
+                        {
+                            "pane_id": record.pane_id,
+                            "session": record.session,
+                            "agent": record.agent_kind,
+                        }
+                    )
+    except Exception as exc:  # diagnosis must never take doctor down
+        section["notes"].append(f"observation-gap check failed: {exc}")
+    section["unobserved_agents"] = gaps
+    if gaps:
+        section["notes"].append(
+            f"{len(gaps)} agent pane(s) have never emitted telemetry "
+            "(OTel env not injected, launched before injection, or the "
+            "CLI does not emit). Restart them via `mozyo` / `mozyo-bridge "
+            "init <agent>` to inject; until then their activity is "
+            "`unknown` and falls back to tmux liveness."
+        )
+    return section
+
+
 def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
     tmux_section = doctor_tmux_section(args)
     # Attach the governed-preset tmux-ui artifact state to the existing
@@ -642,6 +735,7 @@ def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "scaffold": doctor_scaffold_section(args),
         "claude_nagger": doctor_claude_nagger_section(args),
         "tmux": tmux_section,
+        "otel": doctor_otel_section(args),
     }
     ok = True
     for section in sections.values():
@@ -832,6 +926,23 @@ def format_doctor_text(result: dict[str, Any]) -> str:
                 )
     for action in tmux.get("next_action", []):
         lines.append(f"  -> {action}")
+
+    otel = sections.get("otel", {})
+    if otel:
+        reachable = otel.get("receiver_reachable")
+        lines.append(
+            f"otel: {otel.get('status', 'unknown')} "
+            f"receiver={'reachable' if reachable else 'down (lost by design)'} "
+            f"events={otel.get('total', 0)} store={otel.get('store_path', '-')}"
+        )
+        for gap in otel.get("unobserved_agents", []):
+            lines.append(
+                f"  unobserved: {gap['agent']} pane={gap['pane_id']} "
+                f"session={gap['session']} (no telemetry ever; env not "
+                "injected or pre-injection launch)"
+            )
+        for note in otel.get("notes", []):
+            lines.append(f"  note: {note}")
 
     lines.append("")
     lines.append("result: " + ("ok" if result["ok"] else "needs attention"))

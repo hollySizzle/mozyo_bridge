@@ -280,7 +280,16 @@ class AgentActivityTest(unittest.TestCase):
     def test_recent_event_is_active(self) -> None:
         record = classify_event(self._event(age_seconds=5))
         self.assertEqual(STATE_ACTIVE, record.state)
-        self.assertEqual({"pid": "4242", "cwd": "/repo"}, record.match_hints)
+        self.assertEqual(
+            {
+                "pid": "4242",
+                "cwd": "/repo",
+                "session": None,
+                "agent": None,
+                "workspace_id": None,
+            },
+            record.match_hints,
+        )
 
     def test_silence_is_idle_never_dead(self) -> None:
         record = classify_event(self._event(age_seconds=600))
@@ -466,6 +475,196 @@ class PackagingMetadataTest(unittest.TestCase):
             # Every extras entry must look like a PEP 508 requirement,
             # not orphaned project metadata.
             self.assertRegex(requirement, r"^[A-Za-z0-9_.-]+[><=~!]")
+
+
+class BootstrapInjectionTest(unittest.TestCase):
+    """Redmine #11676: OTel env rides on the agent launch command."""
+
+    def test_bootstrap_env_carries_join_keys_and_never_prompt_logging(self) -> None:
+        from mozyo_bridge.application.commands import otel_bootstrap_env
+
+        env = otel_bootstrap_env("claude", "mozyo-demo", cwd=None)
+        self.assertEqual("http/json", env["OTEL_EXPORTER_OTLP_PROTOCOL"])
+        self.assertEqual(
+            "http://127.0.0.1:4318", env["OTEL_EXPORTER_OTLP_ENDPOINT"]
+        )
+        self.assertEqual("1", env["CLAUDE_CODE_ENABLE_TELEMETRY"])
+        self.assertEqual(
+            "mozyo.session=mozyo-demo,mozyo.agent=claude",
+            env["OTEL_RESOURCE_ATTRIBUTES"],
+        )
+        # Prompt-content recording stays OFF by contract: the variable
+        # must never even be set.
+        self.assertNotIn("OTEL_LOG_USER_PROMPTS", env)
+
+    def test_bootstrap_env_includes_workspace_id_when_registered(self) -> None:
+        from mozyo_bridge.application.commands import otel_bootstrap_env
+        from mozyo_bridge.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            with patch.dict(
+                "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ):
+                registered = register_workspace(repo, home=home)
+                env = otel_bootstrap_env("codex", "mozyo-x", cwd=str(repo))
+        self.assertIn(
+            f"mozyo.workspace_id={registered.record.workspace_id}",
+            env["OTEL_RESOURCE_ATTRIBUTES"],
+        )
+
+    def test_new_agent_window_launches_with_env_wrapper(self) -> None:
+        from mozyo_bridge.application.commands import new_agent_window
+
+        captured: list[tuple] = []
+
+        def fake_run_tmux(*args, check: bool = True):
+            captured.append(args)
+            return argparse.Namespace(returncode=0, stdout="%5\n", stderr="")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch(
+                "mozyo_bridge.application.commands.run_tmux",
+                side_effect=fake_run_tmux,
+            ):
+            pane = new_agent_window("claude", "mozyo-demo")
+        self.assertEqual("%5", pane)
+        command = captured[0][-1]
+        self.assertTrue(command.startswith("env "), command)
+        self.assertIn("OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318", command)
+        self.assertIn("mozyo.session=mozyo-demo,mozyo.agent=claude", command)
+        self.assertTrue(command.endswith(" claude"), command)
+        self.assertNotIn("OTEL_LOG_USER_PROMPTS", command)
+
+
+class InventoryActivityJoinTest(unittest.TestCase):
+    """Redmine #11675: activity joins by bootstrap hints onto pane_id rows."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "home"
+        env_patch = patch.dict(
+            "os.environ", {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def _store_event(self, *, session: str, agent: str) -> None:
+        from mozyo_bridge.otel_store import OtelEvent, OtelEventStore
+
+        store = OtelEventStore(home=self.home)
+        try:
+            store.insert_events(
+                [
+                    OtelEvent(
+                        signal="logs",
+                        event_name="claude_code.api_request",
+                        service_name="claude-code",
+                        session_id="cli-sess",
+                        attrs={
+                            "mozyo.session": session,
+                            "mozyo.agent": agent,
+                        },
+                    )
+                ]
+            )
+        finally:
+            store.close()
+
+    def _pane(self, pane_id: str, session: str, agent: str) -> dict:
+        return {
+            "id": pane_id,
+            "location": f"{session}:1.0",
+            "command": agent,
+            "cwd": "",
+            "window_name": agent,
+            "pane_active": "1",
+        }
+
+    def test_matching_source_attaches_and_missing_is_unknown(self) -> None:
+        from mozyo_bridge.session_inventory import take_inventory
+
+        self._store_event(session="mozyo-demo", agent="claude")
+        snapshot = take_inventory(
+            home=self.home,
+            panes=[
+                self._pane("%1", "mozyo-demo", "claude"),
+                self._pane("%2", "mozyo-demo", "codex"),
+            ],
+        )
+        payload = {r.pane_id: r.as_payload() for r in snapshot.records}
+        self.assertEqual("active", payload["%1"]["activity"]["state"])
+        self.assertEqual("otel", payload["%1"]["activity"]["source"])
+        self.assertEqual("unknown", payload["%2"]["activity"]["state"])
+        self.assertIsNone(payload["%2"]["activity"]["source"])
+
+    def test_ambiguous_session_kind_pair_stays_unknown(self) -> None:
+        # Two claude panes in one session cannot be attributed honestly.
+        from mozyo_bridge.session_inventory import take_inventory
+
+        self._store_event(session="mozyo-demo", agent="claude")
+        snapshot = take_inventory(
+            home=self.home,
+            panes=[
+                self._pane("%1", "mozyo-demo", "claude"),
+                self._pane("%9", "mozyo-demo", "claude"),
+            ],
+        )
+        for record in snapshot.records:
+            self.assertEqual("unknown", (record.activity or {}).get("state"))
+
+    def test_grouped_views_still_fold_and_join_via_any_view(self) -> None:
+        from mozyo_bridge.session_inventory import take_inventory
+
+        self._store_event(session="mozyo-demo", agent="claude")
+        snapshot = take_inventory(
+            home=self.home,
+            panes=[
+                self._pane("%1", "alias-view", "claude"),
+                self._pane("%1", "mozyo-demo", "claude"),
+            ],
+        )
+        self.assertEqual(1, len(snapshot.records))
+        self.assertEqual(
+            "active", (snapshot.records[0].activity or {}).get("state")
+        )
+
+
+class DoctorOtelSectionTest(unittest.TestCase):
+    def test_receiver_down_is_by_design_and_gaps_are_listed(self) -> None:
+        from mozyo_bridge.application.doctor import doctor_otel_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            panes = [
+                {
+                    "id": "%1",
+                    "location": "mozyo-demo:1.0",
+                    "command": "claude",
+                    "cwd": "",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+            ]
+            with patch.dict(
+                "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch(
+                "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+                return_value=panes,
+            ):
+                section = doctor_otel_section(argparse.Namespace())
+        self.assertEqual("ok", section["status"])
+        self.assertFalse(section["receiver_reachable"])
+        self.assertTrue(
+            any("BY DESIGN" in note for note in section["notes"])
+        )
+        self.assertEqual(
+            [{"pane_id": "%1", "session": "mozyo-demo", "agent": "claude"}],
+            section["unobserved_agents"],
+        )
 
 
 class OtelCliTest(unittest.TestCase):
