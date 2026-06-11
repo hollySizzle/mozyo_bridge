@@ -2235,6 +2235,162 @@ def cmd_session_name(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_otel_serve(args: argparse.Namespace) -> int:
+    """Run the OTLP/HTTP receiver in the foreground (Redmine #11672).
+
+    Localhost-only, single-threaded (= the SQLite single-writer), OTLP
+    JSON natively and protobuf via the optional `mozyo-bridge[otel]`
+    extra. Best-effort by contract: events sent while the receiver is
+    down are lost; the store is a cache, not a source of truth.
+    """
+    from mozyo_bridge.application.otel_receiver import serve
+
+    serve(
+        host=getattr(args, "host", None) or "127.0.0.1",
+        port=int(getattr(args, "port", None) or 4318),
+        db_path=Path(args.db).expanduser() if getattr(args, "db", None) else None,
+    )
+    return 0
+
+
+def cmd_otel_status(args: argparse.Namespace) -> int:
+    """Show store counts and receiver reachability. Read-only."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    store = OtelEventStore(
+        Path(args.db).expanduser() if getattr(args, "db", None) else None
+    )
+    host = getattr(args, "host", None) or "127.0.0.1"
+    port = int(getattr(args, "port", None) or 4318)
+    receiver: dict = {"url": f"http://{host}:{port}/healthz"}
+    try:
+        with urllib.request.urlopen(receiver["url"], timeout=2) as response:
+            receiver["reachable"] = True
+            receiver["health"] = _json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        receiver["reachable"] = False
+        receiver["error"] = str(exc)
+    payload = {
+        "store_path": str(store.path),
+        "store_exists": store.path.exists(),
+        **store.counts(),
+        "receiver": receiver,
+    }
+    if getattr(args, "as_json", False):
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(f"store: {payload['store_path']} (exists: {payload['store_exists']})")
+    print(f"events: {payload['total']} {payload['events_by_signal']}")
+    print(f"last_write: {payload['last_write'] or '-'}")
+    if receiver["reachable"]:
+        print(f"receiver: reachable at {receiver['url']}")
+    else:
+        print(
+            f"receiver: NOT reachable at {receiver['url']} "
+            "(start with `mozyo-bridge otel serve`; telemetry sent while "
+            "it is down is lost by design)"
+        )
+    return 0
+
+
+def cmd_otel_events(args: argparse.Namespace) -> int:
+    """Tail recent normalized events. Read-only; debugging / depth measurement."""
+    import json as _json
+
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    store = OtelEventStore(
+        Path(args.db).expanduser() if getattr(args, "db", None) else None
+    )
+    events = store.recent_events(limit=int(getattr(args, "limit", None) or 50))
+    if getattr(args, "as_json", False):
+        print(
+            _json.dumps(
+                [event.as_payload() for event in events],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    print("RECEIVED\tSIGNAL\tEVENT\tSERVICE\tSESSION\tPID\tCWD")
+    for event in events:
+        print(
+            "\t".join(
+                [
+                    event.received_at or "-",
+                    event.signal,
+                    event.event_name,
+                    event.service_name or "-",
+                    (event.session_id or "-")[:12],
+                    event.pid or "-",
+                    event.cwd or "-",
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_otel_activity(args: argparse.Namespace) -> int:
+    """Per-source activity/idle judgement (Redmine #11673). Read-only.
+
+    `idle` and `unknown` are NOT death: OTel silence cannot distinguish
+    waiting from dead, so callers degrade to the tmux liveness layer
+    (`agents list` / `session list`).
+    """
+    import json as _json
+
+    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    store = OtelEventStore(
+        Path(args.db).expanduser() if getattr(args, "db", None) else None
+    )
+    records = summarize_activity(
+        store,
+        active_window_seconds=int(getattr(args, "window", None) or 120),
+    )
+    if getattr(args, "as_json", False):
+        print(
+            _json.dumps(
+                [record.as_payload() for record in records],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not records:
+        print(
+            "no telemetry sources observed (env not injected, receiver "
+            "down, or store empty) — this means UNKNOWN, not dead; check "
+            "`mozyo-bridge agents list` for liveness"
+        )
+        return 0
+    print("STATE\tLAST_EVENT_AT\tSECONDS\tEVENT\tSERVICE\tSESSION\tPID\tCWD")
+    for record in records:
+        seconds = record.seconds_since_event
+        print(
+            "\t".join(
+                [
+                    record.state,
+                    record.last_event_at or "-",
+                    f"{seconds:.0f}" if seconds is not None else "-",
+                    record.last_event_name or "-",
+                    record.service_name or "-",
+                    (record.session_id or "-")[:12],
+                    record.match_hints.get("pid") or "-",
+                    record.match_hints.get("cwd") or "-",
+                ]
+            )
+        )
+    return 0
+
+
 def cmd_session_list(args: argparse.Namespace) -> int:
     """Cross-workspace session inventory (Redmine #11422).
 

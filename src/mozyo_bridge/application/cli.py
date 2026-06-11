@@ -38,6 +38,10 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_canonical,
     cmd_scaffold_diff,
     cmd_scaffold_status,
+    cmd_otel_activity,
+    cmd_otel_events,
+    cmd_otel_serve,
+    cmd_otel_status,
     cmd_session_list,
     cmd_session_name,
     cmd_session_vscode_settings,
@@ -1172,6 +1176,103 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     docs_impact.set_defaults(func=cmd_docs_audit_impact)
+
+    otel = sub.add_parser(
+        "otel",
+        help=(
+            "OTel event store (Redmine #11639 / #11672): a self-built, "
+            "localhost-only OTLP/HTTP receiver persists agent telemetry "
+            "(usage / event kinds only, never prompt bodies) into "
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/otel-events.sqlite`. "
+            "Best-effort: events sent while the receiver is down are lost; "
+            "the store is a cache, never the source of truth. Liveness "
+            "stays with `agents list` / `session list`; workflow state "
+            "stays with Redmine."
+        ),
+    )
+    otel_sub = otel.add_subparsers(dest="otel_command", required=True)
+
+    def add_otel_db_option(parser_obj: argparse.ArgumentParser) -> None:
+        parser_obj.add_argument(
+            "--db",
+            help=(
+                "Event store path override. Default: "
+                "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/otel-events.sqlite`."
+            ),
+        )
+
+    otel_serve = otel_sub.add_parser(
+        "serve",
+        help=(
+            "Run the OTLP/HTTP receiver in the foreground (single-threaded "
+            "= SQLite single-writer; binds 127.0.0.1 only). JSON encoding "
+            "is built-in; protobuf needs `pip install 'mozyo-bridge[otel]'` "
+            "or set OTEL_EXPORTER_OTLP_PROTOCOL=http/json on the agent. "
+            "launchd wiring is a follow-up task; this process is designed "
+            "to be launchd-managed (foreground, clean shutdown)."
+        ),
+    )
+    otel_serve.add_argument("--host", help="Bind address (default 127.0.0.1).")
+    otel_serve.add_argument(
+        "--port", help="Port (default 4318, the OTLP/HTTP standard)."
+    )
+    add_otel_db_option(otel_serve)
+    otel_serve.set_defaults(func=cmd_otel_serve)
+
+    otel_status = otel_sub.add_parser(
+        "status",
+        help=(
+            "Store counts plus receiver /healthz reachability. Read-only. "
+            "An unreachable receiver means telemetry is being lost "
+            "(by design) until it is restarted."
+        ),
+    )
+    otel_status.add_argument("--host", help="Receiver host (default 127.0.0.1).")
+    otel_status.add_argument("--port", help="Receiver port (default 4318).")
+    add_otel_db_option(otel_status)
+    otel_status.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the status as JSON.",
+    )
+    otel_status.set_defaults(func=cmd_otel_status)
+
+    otel_events = otel_sub.add_parser(
+        "events",
+        help=(
+            "Tail recent normalized events. Read-only; for debugging and "
+            "for measuring per-CLI event depth."
+        ),
+    )
+    otel_events.add_argument(
+        "--limit", help="Max events to show (default 50)."
+    )
+    add_otel_db_option(otel_events)
+    otel_events.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the events as JSON.",
+    )
+    otel_events.set_defaults(func=cmd_otel_events)
+
+    otel_activity = otel_sub.add_parser(
+        "activity",
+        help=(
+            "Per-source activity / idle judgement (Redmine #11673). "
+            "`idle` / `unknown` never mean dead — OTel silence cannot "
+            "distinguish waiting from dead; consult `agents list` for "
+            "liveness. Sources are (service, session); the pane_id join "
+            "is phase 2 (`match_hints` carries pid / cwd for it)."
+        ),
+    )
+    otel_activity.add_argument(
+        "--window",
+        help="Active window in seconds (default 120).",
+    )
+    add_otel_db_option(otel_activity)
+    otel_activity.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit activity records as JSON.",
+    )
+    otel_activity.set_defaults(func=cmd_otel_activity)
 
     session = sub.add_parser(
         "session",

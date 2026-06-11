@@ -245,6 +245,22 @@ mozyo-bridge session list --json    # 機械可読 snapshot (schema_version / so
 - 同一 pane が tmux session group で複数 session に属する場合も **1 行に畳まれます** (同一性キーは `pane_id`、Redmine #11628)。所属 session は `views` 配列で保持し、workspace の canonical session と一致する view を正準として表示します。
 - 低レベルの pane 列挙が必要な場合は従来どおり `mozyo-bridge agents list` を使ってください。
 
+### OTel イベントストア (`mozyo-bridge otel`)
+
+エージェント CLI (Claude Code 等) が発行する OpenTelemetry を localhost で受けて SQLite に貯め、「ユニットが動いているか」を判定します (Redmine #11639 段階1)。
+
+```bash
+mozyo-bridge otel serve                 # OTLP/HTTP 受け口 (127.0.0.1:4318) を foreground 起動
+mozyo-bridge otel status [--json]       # ストア件数 + 受け口疎通
+mozyo-bridge otel activity [--json]     # source ごとの active / idle 判定
+mozyo-bridge otel events --json         # 受信イベントの tail (debug / 深度実測)
+```
+
+- **best-effort** です。受け口停止中のイベントは失われ、ストアは正本になりません。`idle` / `unknown` は死亡を意味せず、生死は `agents list` / `session list` (tmux 層) で確認します。
+- **プロンプト本文は保存しません**。usage / イベント種別 / 最小 metadata のみ allowlist で保存し、本文系 key は deny 優先で落とします。
+- agent 側設定例 (Claude Code): `CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_LOGS_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/json OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`。protobuf を受けたい場合は `pip install 'mozyo-bridge[otel]'`。
+- launchd 常駐化・session 起動時の env 注入・doctor 連携は後続段階で提供します。詳細設計は `vibes/docs/logics/otel-event-store.md`。
+
 ### VS Code `tmux-integrated` の session 名 (`mozyo-bridge session name`)
 
 VS Code の `tmux-integrated` 拡張 / TaskPilot menu は workspace basename から tmux session 名を導出します (典型的には `basename "$PWD" | sed ...`)。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など) `2026PBL_____` のような低情報量名に潰れ、同名の `____` session が複数 workspace で衝突すると `mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。

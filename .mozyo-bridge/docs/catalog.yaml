@@ -216,6 +216,17 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-otel-event-store
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/otel-event-store.md
+    purpose: OTel イベントストア段階1 (自前 OTLP/HTTP 受け口、SQLite single-writer cache、prompt 本文非保存 allowlist、activity/idle 判定、三層 join における best-effort 位置づけ) の設計正本。
+    audit_role: otel_event_store_logic
+    related_document_refs:
+      - logic-session-inventory
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-executive-terminal-setup
     type: logic
     status: active
@@ -400,6 +411,18 @@ file_conventions:
     document_refs:
       - logic-session-inventory
       - logic-workspace-registry
+      - spec-project-map
+
+  - id: fc-otel-event-store-source
+    name: otel event store, receiver, and activity model source
+    patterns:
+      - src/mozyo_bridge/otel_store.py
+      - src/mozyo_bridge/application/otel_receiver.py
+      - src/mozyo_bridge/domain/agent_activity.py
+    severity: block
+    document_refs:
+      - logic-otel-event-store
+      - logic-session-inventory
       - spec-project-map
 
   - id: fc-handoff-notification-source
