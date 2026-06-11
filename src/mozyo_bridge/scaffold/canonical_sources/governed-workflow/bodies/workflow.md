@@ -99,6 +99,12 @@ us_level_audit:
     - gate 語彙・必須 field・Close Approval Separation・Review Quality Hierarchy は base のまま継承する
   単独issue (親USなし):
     - US に属さない単独の通常開発 issue は、その issue 自身を audit 単位として base どおり Review Request / Review / owner close approval を適用する
+  issue_status運用:
+    - 実装者は配下 issue の着手時に status を「着手中」相当へ移す。journal だけ残して status を「未着手」のまま進めない
+    - task_close必須 (replayable journal / commit hash record / 親US引き継ぎ) を満たしたら、実装者は配下 issue を closed 相当へ移してよい。US audit 完了を待つ必要はない
+    - US audit が配下 issue に gap を見つけたら該当 issue を reopen する
+    - US 自身の status は us_close必須 (US-level audit + owner close approval) を満たすまで closed にしない
+    - journal と issue status を矛盾させない。journal 上「完了」と記録した issue を「未着手」status のまま放置しない
 ```
 
 過去の Task-level review_request / review journal は有効な歴史記録であり、遡及して読み替えない。本 model は適用後の新規作業に適用する。
