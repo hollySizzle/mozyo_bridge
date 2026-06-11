@@ -163,7 +163,19 @@ def jump_to_unit(pane_id: str, *, home: Path | None = None) -> dict:
 # CDN, nothing fetched off-host — consistent with the loopback-only and
 # no-exfiltration posture. Kept intentionally small; it is an indicator
 # surface, not an app platform.
-INDEX_HTML = """<!doctype html>
+#
+# Two safety properties are load-bearing (review #56197):
+#
+# - Rendering uses DOM APIs (`textContent` / `createElement`) only —
+#   never `innerHTML` — so workspace / session / path strings, which are
+#   operator- or checkout-controlled local input, cannot inject HTML/JS
+#   into the UI origin.
+# - Every action request carries the per-process cockpit token (injected
+#   into the ``__COCKPIT_TOKEN__`` placeholder when the page is served)
+#   in a custom header, which the action endpoints require. A custom
+#   header also forces a CORS preflight, so a cross-site simple request
+#   can never express action intent.
+INDEX_HTML_TEMPLATE = """<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
@@ -194,14 +206,27 @@ Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
 <h3>recent transitions</h3>
 <ul id="transitions"></ul>
 <script>
+const COCKPIT_TOKEN = "__COCKPIT_TOKEN__";
+const KNOWN_STATES = ["active", "idle", "unknown"];
 async function act(kind, pane) {
   const res = await fetch('/api/actions/' + kind, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
+    },
     body: JSON.stringify({pane_id: pane})
   });
   const body = await res.json();
   if (!res.ok) alert(body.error || 'action failed');
+}
+// DOM construction only: every payload string lands via textContent, so
+// workspace / session names with HTML metacharacters render as text.
+function cell(row, text, cls) {
+  const el = document.createElement('td');
+  if (cls) el.className = cls;
+  el.textContent = text;
+  row.appendChild(el);
 }
 async function refresh() {
   try {
@@ -209,25 +234,39 @@ async function refresh() {
     const data = await res.json();
     document.getElementById('stale').style.display =
       data.stale ? 'block' : 'none';
-    const rows = (data.panes || [])
-      .filter(p => p.agent_kind !== 'unknown')
-      .map(p => {
-        const st = (p.activity && p.activity.state) || 'unknown';
-        const ws = (p.workspace && (p.workspace.project_name ||
-                    p.workspace.canonical_session)) || '-';
-        const dis = data.stale ? 'disabled' : '';
-        return `<tr><td class="${st}">${st}</td>` +
-          `<td>${p.agent_kind}</td><td>${p.session}</td><td>${ws}</td>` +
-          `<td><button ${dis} onclick="act('jump','${p.pane_id}')">jump</button> ` +
-          `<button ${dis} onclick="act('reveal','${p.pane_id}')">Finder</button>` +
-          `</td></tr>`;
-      });
-    document.querySelector('#units tbody').innerHTML = rows.join('');
+    const tbody = document.querySelector('#units tbody');
+    tbody.replaceChildren();
+    for (const p of (data.panes || [])) {
+      if (p.agent_kind === 'unknown') continue;
+      const row = document.createElement('tr');
+      const raw = (p.activity && p.activity.state) || 'unknown';
+      const st = KNOWN_STATES.includes(raw) ? raw : 'unknown';
+      const ws = (p.workspace && (p.workspace.project_name ||
+                  p.workspace.canonical_session)) || '-';
+      cell(row, st, st);
+      cell(row, p.agent_kind);
+      cell(row, p.session);
+      cell(row, ws);
+      const actions = document.createElement('td');
+      for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
+        const button = document.createElement('button');
+        button.textContent = label;
+        button.disabled = !!data.stale;
+        button.addEventListener('click', () => act(kind, p.pane_id));
+        actions.appendChild(button);
+      }
+      row.appendChild(actions);
+      tbody.appendChild(row);
+    }
     const tr = await (await fetch('/api/transitions')).json();
-    document.getElementById('transitions').innerHTML =
-      (tr.transitions || []).map(t =>
-        `<li>${t.observed_at} ${t.agent_kind}@${t.session}: ` +
-        `${t.previous_state} → ${t.state}</li>`).join('');
+    const list = document.getElementById('transitions');
+    list.replaceChildren();
+    for (const t of (tr.transitions || [])) {
+      const item = document.createElement('li');
+      item.textContent = t.observed_at + ' ' + t.agent_kind + '@' +
+        t.session + ': ' + t.previous_state + ' \\u2192 ' + t.state;
+      list.appendChild(item);
+    }
   } catch (e) { /* daemon restarting; next poll recovers */ }
 }
 refresh();

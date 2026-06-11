@@ -69,11 +69,24 @@ class CockpitHttpTest(unittest.TestCase):
         ) as response:
             return response.status, response.read()
 
-    def _post(self, path: str, payload: dict):
+    def _post(
+        self,
+        path: str,
+        payload: dict,
+        *,
+        with_token: bool = True,
+        content_type: str = "application/json",
+        origin: str | None = None,
+    ):
+        headers = {"Content-Type": content_type}
+        if with_token:
+            headers["X-Mozyo-Cockpit-Token"] = self.server.cockpit_token
+        if origin is not None:
+            headers["Origin"] = origin
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -91,6 +104,79 @@ class CockpitHttpTest(unittest.TestCase):
         # Self-contained: no external asset loads (loopback / no-exfil).
         self.assertNotIn("http://", text.replace("http://127.0.0.1", ""))
         self.assertNotIn("https://", text)
+        # The per-process action token is embedded for the action header.
+        self.assertIn(self.server.cockpit_token, text)
+
+    def test_rendering_never_uses_innerhtml(self) -> None:
+        # Review #56197 finding 2: payload strings (workspace / session /
+        # path names) are local but untrusted input; the page must build
+        # DOM via textContent / createElement so HTML metacharacters in
+        # them render as text instead of executing. Pin the approach.
+        from mozyo_bridge.application.cockpit_ui import INDEX_HTML_TEMPLATE
+
+        self.assertNotIn("innerHTML", INDEX_HTML_TEMPLATE)
+        self.assertNotIn("outerHTML", INDEX_HTML_TEMPLATE)
+        self.assertNotIn("insertAdjacentHTML", INDEX_HTML_TEMPLATE)
+        self.assertNotIn("document.write", INDEX_HTML_TEMPLATE)
+        self.assertIn("textContent", INDEX_HTML_TEMPLATE)
+        self.assertIn("createElement", INDEX_HTML_TEMPLATE)
+
+    def test_cross_site_simple_request_never_reaches_action_handler(self) -> None:
+        # Review #56197 finding 1 reproduction: a browser simple request
+        # (text/plain, foreign Origin, no preflight) must be rejected at
+        # the intent gate (415), NOT answered by the action handler (409).
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=[pane("%1", "mozyo-demo", "claude")],
+        ):
+            status, payload = self._post(
+                "/api/actions/jump",
+                {"pane_id": "%1"},
+                with_token=False,
+                content_type="text/plain",
+                origin="https://example.invalid",
+            )
+        self.assertEqual(415, status)
+        self.assertNotIn("inventory", payload["error"])
+        self.assertIn("application/json", payload["error"])
+
+    def test_action_without_token_is_403(self) -> None:
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=[pane("%1", "mozyo-demo", "claude")],
+        ):
+            status, payload = self._post(
+                "/api/actions/jump", {"pane_id": "%1"}, with_token=False
+            )
+        self.assertEqual(403, status)
+        self.assertIn("token", payload["error"])
+
+    def test_action_with_foreign_origin_is_403_even_with_token(self) -> None:
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=[pane("%1", "mozyo-demo", "claude")],
+        ):
+            status, payload = self._post(
+                "/api/actions/jump",
+                {"pane_id": "%1"},
+                origin="https://example.invalid",
+            )
+        self.assertEqual(403, status)
+        self.assertIn("cross-origin", payload["error"])
+
+    def test_action_with_loopback_origin_and_token_reaches_handler(self) -> None:
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=[pane("%1", "mozyo-demo", "claude")],
+        ):
+            status, payload = self._post(
+                "/api/actions/jump",
+                {"pane_id": "%404"},
+                origin=f"http://127.0.0.1:{self.port}",
+            )
+        # Past the intent gate; fails on the (intended) stale-pane check.
+        self.assertEqual(409, status)
+        self.assertIn("no longer in the runtime inventory", payload["error"])
 
     def test_units_endpoint_returns_inventory_payload(self) -> None:
         panes = [pane("%1", "mozyo-demo", "claude")]

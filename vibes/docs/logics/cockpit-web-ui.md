@@ -17,6 +17,8 @@ endpoints:
   "POST /api/actions/jump": attach client を `tmux switch-client -c <client> -t <session>:<window>` で移動
 不変条件:
   - 自動前面化なし (US 制約5)。action は UI の明示 click (POST) でのみ実行。通知は UI 内表示に限定し OS 通知・focus 変更をしない
+  - **action intent 検証 (review #56197)**: 「明示 click のみ」は security boundary。action endpoint は (1) `Content-Type: application/json` 以外を 415 で拒否、(2) per-process cockpit token (配信 page に埋込、custom header `X-Mozyo-Cockpit-Token` で送付。custom header は CORS preflight を強制し、server は CORS header を一切返さない) 不一致を 403 で拒否、(3) 非 loopback `Origin` を 403 で拒否する。cross-site simple request は action handler に到達しない (regression test で pin)
+  - **HTML rendering 安全 (review #56197)**: workspace / session / path 名は local だが untrusted 入力。UI の DOM 構築は `textContent` / `createElement` のみで、`innerHTML` / `outerHTML` / `insertAdjacentHTML` / `document.write` を使わない (regression test で pin)
   - Redmine へ runtime heartbeat を書かない (US 制約3)
   - 構造化 command のみ (`subprocess` 引数リスト)。shell 文字列連結なし — 空白・日本語 path が inject できない
   - stale 安全: action 前に runtime inventory で pane を再解決。消滅 pane / session / tmux 不在は 409 JSON + refresh 誘導で安全失敗。stale snapshot 中は UI が action を無効化

@@ -304,9 +304,12 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         # loopback-only bind. Imported lazily so pure-receiver usage does
         # not pay for the inventory stack.
         if self.path == "/":
-            from mozyo_bridge.application.cockpit_ui import INDEX_HTML
+            from mozyo_bridge.application.cockpit_ui import INDEX_HTML_TEMPLATE
 
-            body = INDEX_HTML.encode("utf-8")
+            token = getattr(self.server, "cockpit_token", "")
+            body = INDEX_HTML_TEMPLATE.replace(
+                "__COCKPIT_TOKEN__", token
+            ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -388,12 +391,70 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         # OTLP/HTTP success: 200 with an (empty) Export*ServiceResponse.
         self._respond_json(200, {})
 
+    def _action_intent_rejected(self) -> bool:
+        """Reject any action request that cannot prove same-origin UI intent.
+
+        Review #56197 finding 1: a cross-site *simple* request (text/plain
+        body, no preflight) must never reach the action handlers, because
+        "actions run only from an explicit UI click" (#56164 / US
+        constraint 5) is a security boundary, not just a UX statement.
+        Three independent gates, each sufficient to stop the simple-request
+        shape:
+
+        - Content-Type must be ``application/json`` (simple requests are
+          limited to form/text types);
+        - the per-process cockpit token must ride in the custom
+          ``X-Mozyo-Cockpit-Token`` header (custom headers force a CORS
+          preflight, which this server never approves — it sends no CORS
+          response headers at all);
+        - when a browser supplies an ``Origin``, it must be this loopback
+          origin.
+        """
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0]
+        if content_type.strip().lower() != "application/json":
+            self._respond_json(
+                415,
+                {
+                    "error": (
+                        "actions accept application/json from the cockpit "
+                        "UI only"
+                    )
+                },
+            )
+            return True
+        expected = getattr(self.server, "cockpit_token", None)
+        supplied = self.headers.get("X-Mozyo-Cockpit-Token")
+        if not expected or supplied != expected:
+            self._respond_json(
+                403,
+                {
+                    "error": (
+                        "missing or invalid cockpit token; actions can "
+                        "only be invoked from the served cockpit page"
+                    )
+                },
+            )
+            return True
+        origin = self.headers.get("Origin")
+        if origin is not None and not (
+            origin.startswith("http://127.0.0.1")
+            or origin.startswith("http://localhost")
+            or origin.startswith("http://[::1]")
+        ):
+            self._respond_json(
+                403, {"error": f"cross-origin action rejected ({origin})"}
+            )
+            return True
+        return False
+
     def _handle_action(self, kind: str) -> None:
         """Cockpit user actions (Redmine #11680).
 
         Runs only as the direct result of an explicit user click in the
-        UI (US constraint 5: the daemon never initiates focus changes).
-        Failures are explanatory JSON, never silent or destructive.
+        UI (US constraint 5: the daemon never initiates focus changes);
+        :meth:`_action_intent_rejected` enforces that the request actually
+        originates from the served page. Failures are explanatory JSON,
+        never silent or destructive.
         """
         from mozyo_bridge.application.cockpit_ui import (
             CockpitActionError,
@@ -401,6 +462,8 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             reveal_in_finder,
         )
 
+        if self._action_intent_rejected():
+            return
         length = int(self.headers.get("Content-Length") or 0)
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -431,6 +494,8 @@ def build_server(
 
     Raises :class:`OtelReceiverError` for any non-loopback host.
     """
+    import secrets
+
     from mozyo_bridge.domain.agent_activity import TransitionTracker
 
     store = OtelEventStore(db_path, home=home)
@@ -438,6 +503,10 @@ def build_server(
     server.store = store  # type: ignore[attr-defined]
     server.home = home  # type: ignore[attr-defined]
     server.transitions = TransitionTracker()  # type: ignore[attr-defined]
+    # Per-process action token (review #56197): embedded into the served
+    # page and required on every action POST, so action intent can only
+    # originate from the cockpit UI this daemon itself served.
+    server.cockpit_token = secrets.token_hex(16)  # type: ignore[attr-defined]
     return server
 
 
