@@ -494,18 +494,37 @@ def attach_activity(
     from mozyo_bridge.domain.agent_activity import summarize_activity
     from mozyo_bridge.otel_store import OtelEventStore
 
+    # Multiple OTel sources can legitimately share one join key: the agent
+    # CLI mints a new session.id on every restart while the tmux pane (and
+    # therefore the bootstrap hints) stays the same. The newest event wins
+    # deterministically — review #56160 caught the last-write-wins indexing
+    # letting a stale pre-restart source override the live one.
     activity_by_key: dict[tuple[str, str], dict] = {}
+    freshness: dict[tuple[str, str], float] = {}
     for activity in summarize_activity(OtelEventStore(home=home)):
         hints = activity.match_hints
         session = hints.get("session")
         agent = hints.get("agent")
-        if isinstance(session, str) and isinstance(agent, str):
-            activity_by_key[(session, agent)] = {
-                "state": activity.state,
-                "last_event_at": activity.last_event_at,
-                "last_event_name": activity.last_event_name,
-                "source": "otel",
-            }
+        if not (isinstance(session, str) and isinstance(agent, str)):
+            continue
+        key = (session, agent)
+        # seconds_since_event is computed uniformly for every record;
+        # smaller = newer. A record with no parseable timestamp can never
+        # displace one that has one.
+        age = (
+            activity.seconds_since_event
+            if activity.seconds_since_event is not None
+            else float("inf")
+        )
+        if key in freshness and age >= freshness[key]:
+            continue
+        freshness[key] = age
+        activity_by_key[key] = {
+            "state": activity.state,
+            "last_event_at": activity.last_event_at,
+            "last_event_name": activity.last_event_name,
+            "source": "otel",
+        }
 
     # A (session, agent_kind) pair claimed by more than one pane cannot be
     # attributed honestly — leave all claimants unknown.

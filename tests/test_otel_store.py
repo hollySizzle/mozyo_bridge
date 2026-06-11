@@ -601,6 +601,57 @@ class InventoryActivityJoinTest(unittest.TestCase):
         self.assertEqual("unknown", payload["%2"]["activity"]["state"])
         self.assertIsNone(payload["%2"]["activity"]["source"])
 
+    def test_newest_source_wins_when_cli_session_restarts(self) -> None:
+        # Review #56160 (High): a restarted agent CLI mints a new
+        # session.id but keeps the same bootstrap hints, so two OTel
+        # sources share one (mozyo.session, mozyo.agent) key. The stale
+        # pre-restart source must never override the live one.
+        from datetime import datetime, timedelta, timezone
+
+        from mozyo_bridge.otel_store import OtelEvent, OtelEventStore
+        from mozyo_bridge.session_inventory import take_inventory
+
+        now = datetime.now(timezone.utc)
+        store = OtelEventStore(home=self.home)
+        try:
+            store.insert_events(
+                [
+                    OtelEvent(
+                        signal="logs",
+                        event_name="old-idle",
+                        service_name="claude-code",
+                        session_id="cli-old",
+                        received_at=(now - timedelta(minutes=10)).isoformat(
+                            timespec="seconds"
+                        ),
+                        attrs={
+                            "mozyo.session": "mozyo-demo",
+                            "mozyo.agent": "claude",
+                        },
+                    ),
+                    OtelEvent(
+                        signal="logs",
+                        event_name="new-active",
+                        service_name="claude-code",
+                        session_id="cli-new",
+                        received_at=now.isoformat(timespec="seconds"),
+                        attrs={
+                            "mozyo.session": "mozyo-demo",
+                            "mozyo.agent": "claude",
+                        },
+                    ),
+                ]
+            )
+        finally:
+            store.close()
+        snapshot = take_inventory(
+            home=self.home,
+            panes=[self._pane("%1", "mozyo-demo", "claude")],
+        )
+        activity = snapshot.records[0].activity or {}
+        self.assertEqual("active", activity.get("state"))
+        self.assertEqual("new-active", activity.get("last_event_name"))
+
     def test_ambiguous_session_kind_pair_stays_unknown(self) -> None:
         # Two claude panes in one session cannot be attributed honestly.
         from mozyo_bridge.session_inventory import take_inventory
