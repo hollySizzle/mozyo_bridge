@@ -21,11 +21,6 @@ authors = [
     { name = "takahorishizuru" },
 ]
 
-[project.optional-dependencies]
-# OTLP/HTTP protobuf decoding for the otel receiver (Redmine #11672).
-# The receiver works without this extra when agents are configured with
-# OTEL_EXPORTER_OTLP_PROTOCOL=http/json.
-otel = ["opentelemetry-proto>=1.25"]
 keywords = ["tmux", "codex", "claude", "redmine", "cli"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -39,6 +34,12 @@ classifiers = [
     "Topic :: Software Development",
     "Topic :: Terminals",
 ]
+
+[project.optional-dependencies]
+# OTLP/HTTP protobuf decoding for the otel receiver (Redmine #11672).
+# The receiver works without this extra when agents are configured with
+# OTEL_EXPORTER_OTLP_PROTOCOL=http/json.
+otel = ["opentelemetry-proto>=1.25"]
 
 [project.scripts]
 mozyo-bridge = "mozyo_bridge.application.cli:main"

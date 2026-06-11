@@ -1212,7 +1212,14 @@ def build_parser() -> argparse.ArgumentParser:
             "to be launchd-managed (foreground, clean shutdown)."
         ),
     )
-    otel_serve.add_argument("--host", help="Bind address (default 127.0.0.1).")
+    otel_serve.add_argument(
+        "--host",
+        help=(
+            "Bind address. Loopback only (127.0.0.1 / localhost / ::1); "
+            "any other value is rejected — the receiver is localhost-only "
+            "by contract. Default 127.0.0.1."
+        ),
+    )
     otel_serve.add_argument(
         "--port", help="Port (default 4318, the OTLP/HTTP standard)."
     )

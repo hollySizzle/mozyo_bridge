@@ -46,6 +46,29 @@ DEFAULT_OTEL_HOST = "127.0.0.1"
 # (`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`).
 DEFAULT_OTEL_PORT = 4318
 
+# The receiver is localhost-only by contract (#11639 / review #56128):
+# telemetry never leaves the machine and nothing remote can write into
+# the store. A non-loopback bind would need a separate owner decision
+# and security model, so it is rejected at the library layer rather
+# than merely not-offered by the CLI.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class OtelReceiverError(RuntimeError):
+    """User-actionable receiver configuration error."""
+
+
+def _require_loopback(host: str) -> str:
+    candidate = (host or DEFAULT_OTEL_HOST).strip()
+    if candidate.lower() in _LOOPBACK_HOSTS or candidate.startswith("127."):
+        return candidate
+    raise OtelReceiverError(
+        f"refusing to bind the OTel receiver to {candidate!r}: the receiver "
+        "is localhost-only by contract (telemetry must not leave the "
+        "machine, and nothing remote may write into the store). Use "
+        "127.0.0.1 / localhost / ::1."
+    )
+
 _SIGNAL_PATHS = {
     "/v1/logs": "logs",
     "/v1/metrics": "metrics",
@@ -337,9 +360,12 @@ def build_server(
     db_path: Path | None = None,
     home: Path | None = None,
 ) -> HTTPServer:
-    """Construct (and bind) the receiver without entering the serve loop."""
+    """Construct (and bind) the receiver without entering the serve loop.
+
+    Raises :class:`OtelReceiverError` for any non-loopback host.
+    """
     store = OtelEventStore(db_path, home=home)
-    server = HTTPServer((host, port), _ReceiverHandler)
+    server = HTTPServer((_require_loopback(host), port), _ReceiverHandler)
     server.store = store  # type: ignore[attr-defined]
     return server
 

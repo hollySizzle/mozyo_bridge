@@ -2243,13 +2243,18 @@ def cmd_otel_serve(args: argparse.Namespace) -> int:
     extra. Best-effort by contract: events sent while the receiver is
     down are lost; the store is a cache, not a source of truth.
     """
-    from mozyo_bridge.application.otel_receiver import serve
+    from mozyo_bridge.application.otel_receiver import OtelReceiverError, serve
 
-    serve(
-        host=getattr(args, "host", None) or "127.0.0.1",
-        port=int(getattr(args, "port", None) or 4318),
-        db_path=Path(args.db).expanduser() if getattr(args, "db", None) else None,
-    )
+    try:
+        serve(
+            host=getattr(args, "host", None) or "127.0.0.1",
+            port=int(getattr(args, "port", None) or 4318),
+            db_path=(
+                Path(args.db).expanduser() if getattr(args, "db", None) else None
+            ),
+        )
+    except OtelReceiverError as exc:
+        die(str(exc))
     return 0
 
 

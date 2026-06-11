@@ -399,6 +399,75 @@ class ReceiverEndToEndTest(unittest.TestCase):
         self.assertEqual(404, status)
 
 
+class ReceiverLoopbackGateTest(unittest.TestCase):
+    def test_non_loopback_bind_is_rejected(self) -> None:
+        # Review #56128 finding 2: the receiver is localhost-only by
+        # contract; a wildcard bind must be refused at the library layer.
+        from mozyo_bridge.application.otel_receiver import (
+            OtelReceiverError,
+            build_server,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for host in ("0.0.0.0", "::", "192.168.1.10", "example.test"):
+                with self.assertRaises(OtelReceiverError, msg=host):
+                    build_server(
+                        host=host, port=0, db_path=Path(tmp) / "db.sqlite"
+                    )
+
+    def test_loopback_spellings_are_accepted(self) -> None:
+        from mozyo_bridge.application.otel_receiver import build_server
+
+        # 127.0.0.2 passes the validator but is not bindable on default
+        # macOS, so only actually bind the universally configured ones.
+        with tempfile.TemporaryDirectory() as tmp:
+            for host in ("127.0.0.1", "localhost"):
+                server = build_server(
+                    host=host, port=0, db_path=Path(tmp) / "db.sqlite"
+                )
+                server.server_close()
+
+    def test_cli_serve_dies_on_non_loopback_host(self) -> None:
+        from mozyo_bridge.application.commands import cmd_otel_serve
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    cmd_otel_serve(
+                        argparse.Namespace(
+                            host="0.0.0.0",
+                            port="0",
+                            db=str(Path(tmp) / "db.sqlite"),
+                        )
+                    )
+            self.assertIn("localhost-only", stderr.getvalue())
+
+
+class PackagingMetadataTest(unittest.TestCase):
+    def test_optional_dependencies_carry_only_dependency_extras(self) -> None:
+        # Review #56128 finding 1: a TOML table-placement mistake moved
+        # `keywords` / `classifiers` under [project.optional-dependencies],
+        # breaking wheel builds. Pin the table memberships.
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            import tomli as tomllib
+
+        pyproject = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        project = pyproject["project"]
+        self.assertIn("keywords", project)
+        self.assertIn("classifiers", project)
+        extras = project["optional-dependencies"]
+        self.assertEqual(["otel"], sorted(extras))
+        for requirement in extras["otel"]:
+            # Every extras entry must look like a PEP 508 requirement,
+            # not orphaned project metadata.
+            self.assertRegex(requirement, r"^[A-Za-z0-9_.-]+[><=~!]")
+
+
 class OtelCliTest(unittest.TestCase):
     def test_status_and_activity_json(self) -> None:
         from mozyo_bridge.application.commands import (
