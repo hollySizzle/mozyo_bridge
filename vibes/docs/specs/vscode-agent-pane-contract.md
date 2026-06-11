@@ -14,6 +14,8 @@ During PoC, the extension lives at:
 
 This location is temporary. Redmine #11523 tracks promotion to a submodule or independent repository after PoC validation. The Python package must not include this directory.
 
+Startup procedure, success criteria, and failure diagnostics for the PoC (isolated dev host vs F5 debug launch, missing `mozyo` command, `TaskPilot config error` vs workspace-less host, E2E smoke) are documented in `experimental/vscode-agent-pane/README.md`. This contract document stays limited to the CLI boundary.
+
 ## Required CLI Surfaces
 
 These CLI surfaces are still required even if the VS Code integration later uses MCP or Agent APIs. They are the local source for workspace/session facts and the fallback path when the VS Code agent surface cannot host a full terminal UI.
