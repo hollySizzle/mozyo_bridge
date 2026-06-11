@@ -51,6 +51,14 @@ Expected smoke result:
 
 If `mozyo` does not appear in the Command Palette, the active window is not the isolated Extension Development Host. Re-run `npm run dev:host` and switch to the new window it opens.
 
+Run the automated VS Code smoke test with:
+
+```sh
+npm run test:e2e
+```
+
+The test uses `@vscode/test-electron` with VS Code `1.123.2`, a short temporary profile path, and an explicit removal of `ELECTRON_RUN_AS_NODE`. It verifies that the development extension loads and that `mozyoAgentPane.open` activates without throwing.
+
 ## Expected Promotion
 
 Before closing the PoC feature, decide and execute one of:
