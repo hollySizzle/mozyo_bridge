@@ -2440,6 +2440,59 @@ def cmd_otel_activity(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_otel_launchd(args: argparse.Namespace) -> int:
+    """launchd residency management for the receiver (Redmine #11690).
+
+    Minimal face: install / uninstall / status / restart. The plist
+    carries no environment block (no secrets possible by construction),
+    keeps the loopback default bind, and restart is the documented
+    upgrade step. macOS only.
+    """
+    import json as _json
+    import sys as _sys
+
+    from mozyo_bridge.application import otel_launchd
+
+    if _sys.platform != "darwin" and getattr(args, "launchd_command", "") != "status":
+        die("launchd management is macOS-only")
+    action = getattr(args, "launchd_command", None)
+    if action == "install":
+        port = getattr(args, "port", None)
+        result = otel_launchd.install(port=int(port) if port else None)
+        print(f"installed: {result['plist']}")
+        print(f"  command: {' '.join(result['command'])}")
+        print(
+            "  note: the plist carries no environment variables; the "
+            "cockpit's Redmine layer stays `unconfigured` under launchd "
+            "until a secure key-delivery follow-up lands."
+        )
+        return 0
+    if action == "uninstall":
+        result = otel_launchd.uninstall()
+        print(
+            f"uninstalled: {result['plist']} "
+            f"(plist removed: {result['removed']})"
+        )
+        return 0
+    if action == "restart":
+        otel_launchd.restart()
+        print(f"restarted: {otel_launchd.LAUNCHD_LABEL}")
+        return 0
+    payload = otel_launchd.status()
+    if getattr(args, "as_json", False):
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(f"label: {payload['label']}")
+    print(f"plist: {payload['plist']} (exists: {payload['plist_exists']})")
+    print(f"loaded: {payload['loaded']} pid: {payload['pid'] or '-'}")
+    print(f"log: {payload['log']}")
+    print(
+        "receiver health is `mozyo-bridge otel status`; this surface only "
+        "answers whether launchd is wired."
+    )
+    return 0
+
+
 def cmd_session_list(args: argparse.Namespace) -> int:
     """Cross-workspace session inventory (Redmine #11422).
 

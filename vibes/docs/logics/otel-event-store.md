@@ -62,6 +62,20 @@ CREATE TABLE otel_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - **doctor** (`otel` section): receiver /healthz 疎通 (down は error でなく "lost by design" と説明し tmux 縮退へ誘導)、store 状態、**観測漏れ検出** — telemetry を一度も発していない agent pane を `unobserved_agents` として列挙 (env 未注入 / 注入前起動 / CLI 未対応)。Redmine へ runtime heartbeat は書かない。
 - 既存 startup flow 互換: env wrapper は process 連鎖 (`env` → agent) を変えるだけで、window 名 rail / preflight / `wait_for_agent_terminal_pane` の判定は不変。注入前に起動した既存 session は `unknown` のまま動き続け、`mozyo` / `init` での再起動で注入される。
 
+## launchd 常駐 (段階横断: #11690)
+
+- `mozyo-bridge otel launchd install / uninstall / status / restart` (macOS のみ)。最小管理面であり汎用 daemon manager にしない: start/stop は `RunAtLoad` + `KeepAlive` + `bootout` が担う。実装は `src/mozyo_bridge/application/otel_launchd.py`。
+- plist: `~/Library/LaunchAgents/biz.asile.mozyo-bridge.otel.plist`。**EnvironmentVariables block を一切持たない** (secret が plist に乗る経路を構造的に排除 — test で pin)。`--host` を渡さないため receiver の loopback 既定 bind が適用。log は `~/Library/Logs/mozyo-bridge/otel-receiver.log`。
+- 帰結 (明示): launchd 配下の receiver は env を持たないため、cockpit の **Redmine layer は `unconfigured`** になる。安全な key 受け渡し (keychain 等) は follow-up 設計事項。他 2 層 (OTel activity / tmux) は影響なし。
+- `launchctl` は構造化 argv のみ (bootstrap / bootout / kickstart / print)。uninstall は自 label の plist だけを削除。
+- launchd 状態 (`launchd status`) は配線の有無のみを答え、receiver health は従来どおり `otel status` / doctor が正本 (重複させない)。
+- **upgrade / restart runbook**:
+  1. `pipx upgrade mozyo-bridge` (または再 install)
+  2. `mozyo-bridge otel launchd restart` — kickstart -k で旧 process を kill し新 binary で再起動。受け口停止中のイベントは best-effort lost (仕様)
+  3. `mozyo-bridge otel status` で受け口疎通 / store を確認
+  - plist の ProgramArguments は install 時の `which mozyo-bridge` 絶対 path を焼くため、**実行 path が変わる upgrade (pipx 再作成等) の後は `launchd install` を再実行**してから restart する
+- 非常駐時の縮退: agent 不在 = receiver 停止と同じ (events lost by design / activity unknown / tmux 縮退)。既存 CLI / inventory / cockpit の動作は段階 1–3 の test で pin 済み。
+
 ## CLI ごとの event depth (実測方針)
 
 各 CLI の OTel イベントが「入力待ち判定」に足る粒度かは実装初期に実測し、結果を Redmine journal に記録する (#11674)。深度不足の CLI は tmux 沈黙検知 (段階2 以降) へ縮退する。実測は `otel events --json` で受信イベント名の種類と頻度を観察する。

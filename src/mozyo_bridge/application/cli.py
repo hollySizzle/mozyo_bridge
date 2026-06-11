@@ -40,6 +40,7 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_status,
     cmd_otel_activity,
     cmd_otel_events,
+    cmd_otel_launchd,
     cmd_otel_serve,
     cmd_otel_status,
     cmd_session_list,
@@ -1280,6 +1281,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit activity records as JSON.",
     )
     otel_activity.set_defaults(func=cmd_otel_activity)
+
+    otel_launchd = otel_sub.add_parser(
+        "launchd",
+        help=(
+            "macOS launchd residency for the receiver (Redmine #11690): "
+            "install / uninstall / status / restart. The LaunchAgent plist "
+            "carries no environment variables (no secrets possible), keeps "
+            "the loopback-only default bind, and `restart` is the upgrade "
+            "step after `pipx upgrade mozyo-bridge`. Receiver health stays "
+            "with `otel status`."
+        ),
+    )
+    otel_launchd_sub = otel_launchd.add_subparsers(
+        dest="launchd_command", required=True
+    )
+    launchd_install = otel_launchd_sub.add_parser(
+        "install",
+        help=(
+            "Write ~/Library/LaunchAgents/"
+            "biz.asile.mozyo-bridge.otel.plist and bootstrap it "
+            "(RunAtLoad + KeepAlive). Idempotent; re-running re-bootstraps."
+        ),
+    )
+    launchd_install.add_argument(
+        "--port",
+        help="Receiver port override written into the plist (default 4318).",
+    )
+    launchd_install.set_defaults(func=cmd_otel_launchd)
+    launchd_uninstall = otel_launchd_sub.add_parser(
+        "uninstall",
+        help="Boot the agent out and remove exactly our plist file.",
+    )
+    launchd_uninstall.set_defaults(func=cmd_otel_launchd)
+    launchd_status = otel_launchd_sub.add_parser(
+        "status",
+        help=(
+            "launchd-side wiring state (plist presence, loaded, pid). "
+            "Additive to `otel status`, which owns receiver health."
+        ),
+    )
+    launchd_status.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the status as JSON.",
+    )
+    launchd_status.set_defaults(func=cmd_otel_launchd)
+    launchd_restart = otel_launchd_sub.add_parser(
+        "restart",
+        help=(
+            "Kickstart (kill + relaunch) the loaded agent — the documented "
+            "upgrade step after updating the package."
+        ),
+    )
+    launchd_restart.set_defaults(func=cmd_otel_launchd)
 
     session = sub.add_parser(
         "session",
