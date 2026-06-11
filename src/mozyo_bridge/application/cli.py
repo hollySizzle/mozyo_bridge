@@ -38,6 +38,7 @@ from mozyo_bridge.application.commands import (
     cmd_scaffold_canonical,
     cmd_scaffold_diff,
     cmd_scaffold_status,
+    cmd_session_list,
     cmd_session_name,
     cmd_session_vscode_settings,
     cmd_workspace_defaults,
@@ -1170,7 +1171,9 @@ def build_parser() -> argparse.ArgumentParser:
         "session",
         help=(
             "Resolve the mozyo-bridge tmux session name for a repo "
-            "(Redmine #10796, #11429). Read-only; does not modify tmux state."
+            "(Redmine #10796, #11429) and inventory running sessions across "
+            "workspaces (Redmine #11422). Read-only towards tmux; `list` "
+            "refreshes the home inventory cache."
         ),
     )
     session_sub = session.add_subparsers(dest="session_command", required=True)
@@ -1202,6 +1205,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     session_name.set_defaults(func=cmd_session_name)
+
+    session_list = session_sub.add_parser(
+        "list",
+        help=(
+            "Cross-workspace session inventory (Redmine #11422). One row per "
+            "tmux pane, folded by pane_id: grouped tmux sessions count as "
+            "views of one agent, not extra rows (Redmine #11628). Each pane "
+            "carries its workspace identity (registry → anchor → derivation, "
+            "Unicode-normalization-safe path matching). The live tmux runtime "
+            "is the source of truth; each run refreshes the SQLite cache in "
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite`, and "
+            "when tmux is unavailable the cached snapshot is served, marked "
+            "stale. Generic inventory for operators and external UIs; not a "
+            "backend for a specific VS Code extension."
+        ),
+    )
+    session_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help=(
+            "Emit the structured snapshot (schema_version, source, stale, "
+            "collected_at, panes with workspace identity and views) instead "
+            "of the table."
+        ),
+    )
+    session_list.set_defaults(func=cmd_session_list)
 
     session_vscode = session_sub.add_parser(
         "vscode-settings",

@@ -231,6 +231,20 @@ mozyo-bridge workspace inspect --repo .    # registry / anchor / 導出 fallback
 - 読み取り系 (`session name` / `list` / `inspect` / bare `mozyo` の session 解決) は registry を作らず書き換えません。書き込みは `workspace register` だけです。
 - `--name` で readable name (日本語可) を上書きできます。非 git workspace も `--repo` 明示で登録できます。
 
+### Workspace 横断 session inventory (`mozyo-bridge session list`)
+
+複数 workspace で起動中の mozyo session / agent pane を一覧します (Redmine #11422)。operator の俯瞰と外部 UI の発見用で、特定 VS Code extension の専用 backend ではありません。
+
+```bash
+mozyo-bridge session list           # 1 pane = 1 行のテーブル
+mozyo-bridge session list --json    # 機械可読 snapshot (schema_version / source / stale / panes[])
+```
+
+- **正本は tmux runtime** です。実行のたびに live な session / window / pane / process / cwd を収集し、各 pane の repo root を workspace identity (registry → anchor → 導出、Unicode 正規化差を吸収) に解決します。
+- 収集結果は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite` に **cache として** 保存されます。tmux が使えない環境では最後の snapshot を `stale` 明示付きで返します。cache が消えても次の実行で再構築されるため復元手順は不要です。
+- 同一 pane が tmux session group で複数 session に属する場合も **1 行に畳まれます** (同一性キーは `pane_id`、Redmine #11628)。所属 session は `views` 配列で保持し、workspace の canonical session と一致する view を正準として表示します。
+- 低レベルの pane 列挙が必要な場合は従来どおり `mozyo-bridge agents list` を使ってください。
+
 ### VS Code `tmux-integrated` の session 名 (`mozyo-bridge session name`)
 
 VS Code の `tmux-integrated` 拡張 / TaskPilot menu は workspace basename から tmux session 名を導出します (典型的には `basename "$PWD" | sed ...`)。basename が日本語など非 ASCII を含むと (`2026PBL_ローカル` など) `2026PBL_____` のような低情報量名に潰れ、同名の `____` session が複数 workspace で衝突すると `mozyo-bridge agents list` / `--target-repo` handoff gate が repo identity を復元できなくなります。

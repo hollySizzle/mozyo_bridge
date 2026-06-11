@@ -204,6 +204,18 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-session-inventory
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/session-inventory.md
+    purpose: workspace 横断 session inventory (runtime-first 収集、pane_id 同一性キーと grouped view 畳み込み、SQLite durable cache、Unicode 正規化吸収、home 消失 fallback) の設計正本。
+    audit_role: session_inventory_logic
+    related_document_refs:
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-bootstrap
     type: logic
     status: active
@@ -367,6 +379,16 @@ file_conventions:
     document_refs:
       - logic-workspace-registry
       - logic-workspace-defaults-renderer
+      - spec-project-map
+
+  - id: fc-session-inventory-source
+    name: cross-workspace session inventory source
+    patterns:
+      - src/mozyo_bridge/session_inventory.py
+    severity: block
+    document_refs:
+      - logic-session-inventory
+      - logic-workspace-registry
       - spec-project-map
 
   - id: fc-handoff-notification-source

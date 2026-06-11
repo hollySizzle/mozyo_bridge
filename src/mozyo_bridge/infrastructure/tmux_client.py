@@ -41,17 +41,37 @@ def source_tmux_conf(path: str | None = None, *, optional: bool = False) -> bool
     return True
 
 
-def pane_lines() -> list[dict[str, str]]:
+def try_pane_lines() -> list[dict[str, str]] | None:
+    """Non-fatal variant of :func:`pane_lines` for degradable surfaces.
+
+    Returns ``None`` when tmux is missing or has no server, so callers with
+    an offline fallback (the session inventory cache, Redmine #11422) can
+    degrade instead of dying.
+    """
     fmt = (
         "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
         "#{pane_current_command}\t#{pane_current_path}\t"
         "#{window_name}\t#{pane_active}"
     )
-    result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
+    try:
+        result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
+    except OSError:
+        return None
     if result.returncode != 0:
-        die(f"tmux list-panes failed: {result.stderr.strip() or 'no tmux server'}")
+        return None
+    return _parse_pane_lines(result.stdout)
+
+
+def pane_lines() -> list[dict[str, str]]:
+    panes = try_pane_lines()
+    if panes is None:
+        die("tmux list-panes failed: tmux missing or no tmux server")
+    return panes
+
+
+def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         parts = (line.split("\t", 5) + [""] * 6)[:6]
         pane_id, location, command, cwd, window_name, pane_active = parts
         panes.append(

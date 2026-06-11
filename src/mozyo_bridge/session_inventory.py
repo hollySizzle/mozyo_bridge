@@ -1,0 +1,610 @@
+"""Cross-workspace session inventory (Redmine #11422).
+
+``mozyo-bridge session list`` enumerates every running mozyo session / agent
+pane across workspaces so operators and external UIs can discover existing
+sessions safely. Three design constraints from the parent UserStory
+(Redmine #11421) shape this module:
+
+- **SQLite is a durable cache / index, never the source of truth.** Live
+  tmux session / window / pane / process state is collected from the tmux
+  runtime on every listing; the snapshot in
+  ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite`` only serves the
+  degraded path (tmux unavailable) and is clearly marked ``stale`` there.
+  The cache lives in its own database file — the workspace registry
+  (``registry.sqlite``, Redmine #11429) is an identity source of truth whose
+  contract forbids runtime tmux state, and this module must not weaken that
+  separation. Losing ``inventory.sqlite`` loses nothing but the offline
+  fallback; the next runtime listing rebuilds it.
+- **Identity is keyed by ``pane_id``** (Redmine #11628, owner agreement
+  2026-06-11). In tmux session groups the same pane belongs to several
+  sessions, so a per-(session, pane) row would double-count agents. Each
+  inventory record is one pane; its memberships are folded into ``views``,
+  and the canonical view is the one whose session matches the workspace's
+  resolved canonical session name. This assumes a single tmux server; a
+  multi-server deployment would need a ``(socket, pane_id)`` composite key.
+- **Path identity absorbs Unicode normalization differences** (Redmine
+  #11625). macOS readdir yields NFD path bytes while document- or
+  agent-supplied paths are NFC, so registry lookups here compare
+  NFC-normalized strings instead of raw bytes. (The session-name *hash*
+  derivation fix itself is #11625's scope, not this module's.)
+
+Workspace identity per pane resolves registry → anchor → derivation, the
+same layering as ``workspace_registry.resolve_canonical_session``; when the
+home registry / inventory cache is lost, the runtime listing rebuilds the
+same identities from each workspace's local anchor (or path derivation), so
+an ephemeral home directory degrades gracefully instead of losing the
+inventory.
+
+This is a generic inventory surface for any external consumer; it is
+deliberately not a backend for a specific VS Code extension or
+tmux-integrated launcher.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+from mozyo_bridge.domain.agent_discovery import classify_agent_kind, infer_repo_root
+from mozyo_bridge.domain.session_naming import derive_session_name
+from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.workspace_registry import (
+    SOURCE_HOME_REGISTRY,
+    SOURCE_WORKSPACE_ANCHOR,
+    list_workspaces,
+    read_anchor,
+)
+
+INVENTORY_FILENAME = "inventory.sqlite"
+INVENTORY_SCHEMA_VERSION = 1
+
+# How the snapshot handed to the caller was produced.
+SOURCE_RUNTIME = "runtime"
+SOURCE_CACHE = "cache"
+
+_PANES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS panes (
+    pane_id TEXT PRIMARY KEY,
+    session TEXT NOT NULL,
+    window_index TEXT NOT NULL,
+    window_name TEXT NOT NULL,
+    pane_index TEXT NOT NULL,
+    pane_active INTEGER NOT NULL,
+    process TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    repo_root TEXT,
+    agent_kind TEXT NOT NULL,
+    workspace_id TEXT,
+    canonical_session TEXT,
+    project_name TEXT,
+    identity_source TEXT,
+    views_json TEXT NOT NULL
+)
+"""
+
+_META_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS inventory_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+_PANE_COLUMNS = (
+    "pane_id, session, window_index, window_name, pane_index, pane_active, "
+    "process, cwd, repo_root, agent_kind, workspace_id, canonical_session, "
+    "project_name, identity_source, views_json"
+)
+
+
+def inventory_path(home: Path | None = None) -> Path:
+    return (home or mozyo_bridge_home()) / INVENTORY_FILENAME
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_path_text(text: str) -> str:
+    """NFC-normalize a path string for identity comparison (Redmine #11625)."""
+    return unicodedata.normalize("NFC", text)
+
+
+@dataclass(frozen=True)
+class PaneView:
+    """One (session, window, pane-index) membership of a pane.
+
+    Grouped tmux sessions expose the same pane through several sessions;
+    each membership is a view. ``canonical`` marks the view whose session
+    matches the workspace's resolved canonical session name.
+    """
+
+    session: str
+    window_index: str
+    window_name: str
+    pane_index: str
+    pane_active: bool
+    canonical: bool
+
+    def as_payload(self) -> dict:
+        return {
+            "session": self.session,
+            "window_index": self.window_index,
+            "window_name": self.window_name,
+            "pane_index": self.pane_index,
+            "pane_active": self.pane_active,
+            "canonical": self.canonical,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceIdentity:
+    """The workspace identity a pane's repo root resolves to.
+
+    ``source`` is ``home-registry`` / ``workspace-anchor`` or one of the
+    derivation markers from ``domain.session_naming`` — the same layering
+    (and the same fallback story) as the workspace registry: when the home
+    registry is gone, anchors and derivation still reproduce the identity.
+    """
+
+    workspace_id: str | None
+    canonical_session: str
+    project_name: str | None
+    source: str
+
+    def as_payload(self) -> dict:
+        return {
+            "workspace_id": self.workspace_id,
+            "canonical_session": self.canonical_session,
+            "project_name": self.project_name,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
+class InventoryRecord:
+    """One agent pane in the inventory, keyed by ``pane_id`` (Redmine #11628).
+
+    The top-level session / window / pane fields describe the canonical
+    view; every membership (including the canonical one) is in ``views``.
+    """
+
+    pane_id: str
+    session: str
+    window_index: str
+    window_name: str
+    pane_index: str
+    pane_active: bool
+    process: str
+    cwd: str
+    repo_root: str | None
+    agent_kind: str
+    workspace: WorkspaceIdentity | None
+    views: tuple[PaneView, ...]
+
+    def as_payload(self) -> dict:
+        return {
+            "pane_id": self.pane_id,
+            "session": self.session,
+            "window_index": self.window_index,
+            "window_name": self.window_name,
+            "pane_index": self.pane_index,
+            "pane_active": self.pane_active,
+            "process": self.process,
+            "cwd": self.cwd,
+            "repo_root": self.repo_root,
+            "agent_kind": self.agent_kind,
+            "workspace": self.workspace.as_payload() if self.workspace else None,
+            "views": [view.as_payload() for view in self.views],
+        }
+
+
+@dataclass(frozen=True)
+class InventorySnapshot:
+    """The inventory handed to the CLI: records plus provenance.
+
+    ``source`` is :data:`SOURCE_RUNTIME` when collected live from tmux, or
+    :data:`SOURCE_CACHE` when degraded to the SQLite snapshot; ``stale`` is
+    true exactly on the cache branch. ``notes`` carries non-fatal
+    degradations (cache unwritable, cache recreated, ...).
+    """
+
+    records: tuple[InventoryRecord, ...]
+    collected_at: str | None
+    source: str
+    stale: bool
+    inventory_path: Path
+    notes: tuple[str, ...] = ()
+
+    def as_payload(self) -> dict:
+        return {
+            "schema_version": INVENTORY_SCHEMA_VERSION,
+            "collected_at": self.collected_at,
+            "source": self.source,
+            "stale": self.stale,
+            "inventory_path": str(self.inventory_path),
+            "notes": list(self.notes),
+            "panes": [record.as_payload() for record in self.records],
+        }
+
+
+# --- workspace identity resolution -------------------------------------------
+
+
+def _resolve_identity(
+    repo_root: str, registry_by_path: dict[str, object]
+) -> WorkspaceIdentity:
+    """Resolve a pane's repo root to its workspace identity.
+
+    Same registry → anchor → derivation layering as
+    ``resolve_canonical_session``, with two inventory-specific differences:
+    the registry lookup is NFC-normalized (Redmine #11625) and the registry
+    rows are pre-indexed so a listing resolves each unique root once instead
+    of re-opening SQLite per pane.
+    """
+    record = registry_by_path.get(_normalize_path_text(repo_root))
+    if record is not None:
+        return WorkspaceIdentity(
+            workspace_id=record.workspace_id,
+            canonical_session=record.canonical_session,
+            project_name=record.project_name,
+            source=SOURCE_HOME_REGISTRY,
+        )
+    root = Path(repo_root)
+    anchor = read_anchor(root)
+    if anchor is not None:
+        name = anchor.get("project_name")
+        return WorkspaceIdentity(
+            workspace_id=anchor["workspace_id"],
+            canonical_session=anchor["canonical_session"],
+            project_name=name if isinstance(name, str) and name.strip() else None,
+            source=SOURCE_WORKSPACE_ANCHOR,
+        )
+    derived = derive_session_name(root)
+    return WorkspaceIdentity(
+        workspace_id=None,
+        canonical_session=derived.name,
+        project_name=None,
+        source=derived.source,
+    )
+
+
+def _registry_index(home: Path | None) -> dict[str, object]:
+    return {
+        _normalize_path_text(record.canonical_path): record
+        for record in list_workspaces(home=home)
+    }
+
+
+# --- runtime collection -------------------------------------------------------
+
+
+def _parse_location(location: str) -> tuple[str, str, str]:
+    session, _, rest = location.partition(":")
+    window_index, _, pane_index = rest.partition(".")
+    return session, window_index, pane_index
+
+
+def _fold_agent_kind(views: Iterable[PaneView]) -> str:
+    """Classify the pane from its views' window names.
+
+    Windows are shared across grouped sessions so the names normally agree;
+    when they somehow disagree on two different agent kinds, the pane is
+    ``unknown`` rather than arbitrarily one of them.
+    """
+    kinds = {
+        kind
+        for kind in (classify_agent_kind(view.window_name) for view in views)
+        if kind != "unknown"
+    }
+    return kinds.pop() if len(kinds) == 1 else "unknown"
+
+
+def collect_runtime_inventory(
+    panes: Iterable[dict[str, str]],
+    *,
+    home: Path | None = None,
+) -> list[InventoryRecord]:
+    """Build inventory records from raw tmux pane lines.
+
+    Folds multiple (session, window) memberships of the same ``pane_id``
+    into one record (Redmine #11628): the canonical view is the one whose
+    session equals the workspace's resolved canonical session name, else
+    the first view by session sort order, so the choice is deterministic.
+    """
+    grouped: dict[str, list[dict[str, str]]] = {}
+    order: list[str] = []
+    for pane in panes:
+        pane_id = pane.get("id") or ""
+        if not pane_id:
+            continue
+        if pane_id not in grouped:
+            grouped[pane_id] = []
+            order.append(pane_id)
+        grouped[pane_id].append(pane)
+
+    registry_by_path = _registry_index(home)
+    identity_cache: dict[str, WorkspaceIdentity] = {}
+    records: list[InventoryRecord] = []
+    for pane_id in order:
+        raw_views = grouped[pane_id]
+        first = raw_views[0]
+        cwd = first.get("cwd") or ""
+        repo_root = infer_repo_root(cwd)
+        workspace: WorkspaceIdentity | None = None
+        if repo_root:
+            key = _normalize_path_text(repo_root)
+            if key not in identity_cache:
+                identity_cache[key] = _resolve_identity(repo_root, registry_by_path)
+            workspace = identity_cache[key]
+
+        views_raw: list[tuple[str, str, str, str, bool]] = []
+        for pane in raw_views:
+            session, window_index, pane_index = _parse_location(
+                pane.get("location") or ""
+            )
+            views_raw.append(
+                (
+                    session,
+                    window_index,
+                    pane.get("window_name") or "",
+                    pane_index,
+                    pane.get("pane_active") == "1",
+                )
+            )
+        views_raw.sort(key=lambda view: (view[0], view[1], view[3]))
+        canonical_index = 0
+        if workspace is not None:
+            for index, view in enumerate(views_raw):
+                if view[0] == workspace.canonical_session:
+                    canonical_index = index
+                    break
+        views = tuple(
+            PaneView(
+                session=view[0],
+                window_index=view[1],
+                window_name=view[2],
+                pane_index=view[3],
+                pane_active=view[4],
+                canonical=(index == canonical_index),
+            )
+            for index, view in enumerate(views_raw)
+        )
+        canonical = views[canonical_index]
+        records.append(
+            InventoryRecord(
+                pane_id=pane_id,
+                session=canonical.session,
+                window_index=canonical.window_index,
+                window_name=canonical.window_name,
+                pane_index=canonical.pane_index,
+                pane_active=canonical.pane_active,
+                process=first.get("command") or "",
+                cwd=cwd,
+                repo_root=repo_root,
+                agent_kind=_fold_agent_kind(views),
+                workspace=workspace,
+                views=views,
+            )
+        )
+    return records
+
+
+# --- durable cache (SQLite) ----------------------------------------------------
+
+
+def _record_to_row(record: InventoryRecord) -> tuple:
+    return (
+        record.pane_id,
+        record.session,
+        record.window_index,
+        record.window_name,
+        record.pane_index,
+        1 if record.pane_active else 0,
+        record.process,
+        record.cwd,
+        record.repo_root,
+        record.agent_kind,
+        record.workspace.workspace_id if record.workspace else None,
+        record.workspace.canonical_session if record.workspace else None,
+        record.workspace.project_name if record.workspace else None,
+        record.workspace.source if record.workspace else None,
+        json.dumps(
+            [view.as_payload() for view in record.views], ensure_ascii=False
+        ),
+    )
+
+
+def _row_to_record(row: tuple) -> InventoryRecord:
+    views = tuple(
+        PaneView(
+            session=view.get("session", ""),
+            window_index=view.get("window_index", ""),
+            window_name=view.get("window_name", ""),
+            pane_index=view.get("pane_index", ""),
+            pane_active=bool(view.get("pane_active")),
+            canonical=bool(view.get("canonical")),
+        )
+        for view in json.loads(row[14])
+        if isinstance(view, dict)
+    )
+    workspace = None
+    if row[11] is not None:
+        workspace = WorkspaceIdentity(
+            workspace_id=row[10],
+            canonical_session=row[11],
+            project_name=row[12],
+            source=row[13] or "",
+        )
+    return InventoryRecord(
+        pane_id=row[0],
+        session=row[1],
+        window_index=row[2],
+        window_name=row[3],
+        pane_index=row[4],
+        pane_active=bool(row[5]),
+        process=row[6],
+        cwd=row[7],
+        repo_root=row[8],
+        agent_kind=row[9],
+        workspace=workspace,
+        views=views,
+    )
+
+
+def save_snapshot(
+    records: Iterable[InventoryRecord],
+    *,
+    home: Path | None = None,
+    now: str | None = None,
+) -> tuple[Path, list[str]]:
+    """Replace the cached snapshot with ``records``. Best-effort by contract.
+
+    The inventory file is a regenerable cache, so unlike the workspace
+    registry a corrupt file is moved out of the way (recreated) instead of
+    dying — but a cache written by a *newer* schema is left untouched so a
+    downgraded CLI never destroys it. All degradations are returned as
+    notes, never raised: failing to persist the cache must not fail the
+    runtime listing it was derived from.
+    """
+    path = inventory_path(home)
+    notes: list[str] = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in ("open", "recreate"):
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (0, INVENTORY_SCHEMA_VERSION):
+                    notes.append(
+                        f"inventory cache {path} has schema version {version}; "
+                        "left untouched (snapshot not persisted)"
+                    )
+                    return path, notes
+                with conn:
+                    if version == 0:
+                        conn.execute(_PANES_TABLE_SQL)
+                        conn.execute(_META_TABLE_SQL)
+                        conn.execute(
+                            f"PRAGMA user_version = {INVENTORY_SCHEMA_VERSION}"
+                        )
+                    conn.execute("DELETE FROM panes")
+                    conn.executemany(
+                        f"INSERT INTO panes ({_PANE_COLUMNS}) "
+                        f"VALUES ({', '.join('?' * 15)})",
+                        [_record_to_row(record) for record in records],
+                    )
+                    conn.execute(
+                        "INSERT INTO inventory_meta (key, value) "
+                        "VALUES ('collected_at', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (now or _utc_now(),),
+                    )
+                return path, notes
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            if attempt == "open":
+                notes.append(
+                    f"inventory cache {path} was unreadable ({exc}); recreated"
+                )
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    notes.append(
+                        f"could not remove corrupt inventory cache: {unlink_exc}"
+                    )
+                    return path, notes
+            else:
+                notes.append(f"inventory cache not persisted: {exc}")
+    return path, notes
+
+
+def load_snapshot(
+    *, home: Path | None = None
+) -> tuple[list[InventoryRecord], str | None] | None:
+    """Read the cached snapshot. Returns ``None`` when no usable cache exists.
+
+    Missing / corrupt / unknown-version caches all degrade to ``None`` —
+    the cache is never authoritative, so there is nothing to repair here.
+    """
+    path = inventory_path(home)
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != INVENTORY_SCHEMA_VERSION:
+                return None
+            rows = conn.execute(
+                f"SELECT {_PANE_COLUMNS} FROM panes ORDER BY pane_id"
+            ).fetchall()
+            meta = conn.execute(
+                "SELECT value FROM inventory_meta WHERE key = 'collected_at'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return None
+    try:
+        records = [_row_to_record(row) for row in rows]
+    except (ValueError, KeyError):
+        return None
+    return records, meta[0] if meta else None
+
+
+# --- orchestration --------------------------------------------------------------
+
+
+def take_inventory(
+    *,
+    home: Path | None = None,
+    panes: Iterable[dict[str, str]] | None = None,
+) -> InventorySnapshot:
+    """Collect the live inventory, refreshing the cache; degrade to cache.
+
+    ``panes=None`` means "ask the tmux runtime". When tmux is unavailable
+    (no binary, no server) the cached snapshot is returned with
+    ``stale=True``; when there is no cache either, an empty stale snapshot
+    is returned — the caller decides how loudly to surface that.
+    """
+    if panes is None:
+        from mozyo_bridge.infrastructure.tmux_client import try_pane_lines
+
+        panes = try_pane_lines()
+    if panes is not None:
+        now = _utc_now()
+        records = collect_runtime_inventory(panes, home=home)
+        path, notes = save_snapshot(records, home=home, now=now)
+        return InventorySnapshot(
+            records=tuple(records),
+            collected_at=now,
+            source=SOURCE_RUNTIME,
+            stale=False,
+            inventory_path=path,
+            notes=tuple(notes),
+        )
+    cached = load_snapshot(home=home)
+    if cached is not None:
+        records, collected_at = cached
+        return InventorySnapshot(
+            records=tuple(records),
+            collected_at=collected_at,
+            source=SOURCE_CACHE,
+            stale=True,
+            inventory_path=inventory_path(home),
+            notes=("tmux unavailable; serving the last cached snapshot",),
+        )
+    return InventorySnapshot(
+        records=(),
+        collected_at=None,
+        source=SOURCE_CACHE,
+        stale=True,
+        inventory_path=inventory_path(home),
+        notes=("tmux unavailable and no cached snapshot exists",),
+    )
