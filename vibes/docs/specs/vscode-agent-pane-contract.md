@@ -12,7 +12,7 @@ During PoC, the extension lives at:
 
 - `experimental/vscode-agent-pane/`
 
-This location is temporary. Redmine #11523 tracks promotion to a submodule or independent repository after PoC validation. The Python package must not include this directory.
+This location is temporary. Redmine #11523 tracks the management-boundary decision. The decided promotion path (monorepo subproject at `packages/vscode-agent-pane/` first, submodule / independent repository later when escalation conditions are met) and the migration plan are recorded in `vibes/docs/specs/vscode-agent-pane-promotion-plan.md`. The Python package must not include this directory.
 
 Startup procedure, success criteria, and failure diagnostics for the PoC (isolated dev host vs F5 debug launch, missing `mozyo` command, `TaskPilot config error` vs workspace-less host, E2E smoke) are documented in `experimental/vscode-agent-pane/README.md`. This contract document stays limited to the CLI boundary.
 

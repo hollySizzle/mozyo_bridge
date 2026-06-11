@@ -2,7 +2,7 @@
 
 Experimental workspace for a mozyo-bridge VS Code extension that can host agent panes.
 
-This directory is intentionally inside the mozyo_bridge repository for the PoC phase only. It must not become the permanent release unit. Redmine #11523 tracks promotion to a submodule or independent repository after the PoC proves useful.
+This directory is intentionally inside the mozyo_bridge repository for the PoC phase only. It must not become the permanent release unit. Redmine #11523 tracks the promotion; the decided path is `vibes/docs/specs/vscode-agent-pane-promotion-plan.md` (monorepo subproject first, submodule / independent repository when escalation conditions are met).
 
 ## Scope
 
@@ -102,9 +102,8 @@ It verifies that the development extension is present, that `mozyoAgentPane.open
 
 ## Expected Promotion
 
-Before closing the PoC feature, decide and execute one of:
+The management boundary is decided (Redmine #11531): this PoC is promoted to an official monorepo subproject at `packages/vscode-agent-pane/` first; a submodule or independent repository comes later only when the escalation conditions are met. The promotion path, migration steps, and escalation conditions are recorded in:
 
-- move this PoC to a dedicated repository and add it as a submodule, or
-- move it to an independent repository and keep only contract docs here.
+- `vibes/docs/specs/vscode-agent-pane-promotion-plan.md`
 
-Do not leave this directory as an untracked permanent product surface.
+Do not leave this directory as an untracked permanent product surface. Migration execution is tracked by Redmine #11532 and verified by #11533.

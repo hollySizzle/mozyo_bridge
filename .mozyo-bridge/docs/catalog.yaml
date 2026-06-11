@@ -88,9 +88,20 @@ documents:
     audit_role: vscode_agent_pane_contract_spec
     related_document_refs:
       - spec-project-map
+      - spec-vscode-agent-pane-promotion-plan
       - logic-workspace-registry
       - logic-workspace-defaults-renderer
       - logic-tmux-send-safety-contract
+
+  - id: spec-vscode-agent-pane-promotion-plan
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/vscode-agent-pane-promotion-plan.md
+    purpose: VS Code Agent Pane の管理境界 (monorepo subproject 採用)、experimental からの昇格 migration plan、submodule / 独立 repo 昇格条件の正本。
+    audit_role: vscode_agent_pane_promotion_plan_spec
+    related_document_refs:
+      - spec-vscode-agent-pane-contract
+      - spec-project-map
 
   - id: manual-readme
     type: manual_spec
@@ -454,6 +465,7 @@ file_conventions:
     severity: warn
     document_refs:
       - spec-vscode-agent-pane-contract
+      - spec-vscode-agent-pane-promotion-plan
       - spec-project-map
       - logic-workspace-registry
       - logic-tmux-send-safety-contract
