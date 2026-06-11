@@ -549,6 +549,67 @@ class PaneResolverTest(unittest.TestCase):
             patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertEqual("%9", resolve_target("codex"))
 
+    def test_resolve_target_normalizes_location_form_to_pane_id(self) -> None:
+        # Redmine #11666: a `session:window` location used to be returned
+        # verbatim, so pane_info()'s pane-id match never succeeded and every
+        # location target died with `pane disappeared after resolve`.
+        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch(
+                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                return_value="%9",
+            ) as resolver:
+            self.assertEqual("%9", resolve_target("repo:codex"))
+        resolver.assert_called_once_with("repo:codex")
+
+    def test_resolve_target_passes_pane_id_through_unchanged(self) -> None:
+        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch(
+                "mozyo_bridge.domain.pane_resolver.resolve_pane_id"
+            ) as resolver:
+            self.assertEqual("%9", resolve_target("%9"))
+        resolver.assert_not_called()
+
+    def test_pane_info_finds_pane_for_location_target(self) -> None:
+        # End-to-end through pane_info: the normalized id must match the
+        # pane_lines() entry, where the raw location string never did.
+        from mozyo_bridge.domain.pane_resolver import pane_info
+
+        panes = [
+            {
+                "id": "%9",
+                "location": "repo:2.0",
+                "command": "codex",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+            },
+        ]
+        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch(
+                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                return_value="%9",
+            ), \
+            patch(
+                "mozyo_bridge.domain.pane_resolver.pane_lines",
+                return_value=panes,
+            ):
+            self.assertEqual("%9", pane_info("repo:codex")["id"])
+
+    def test_resolve_pane_id_resolves_location_and_rejects_invalid(self) -> None:
+        from mozyo_bridge.infrastructure.tmux_client import resolve_pane_id
+
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            return_value=argparse.Namespace(returncode=0, stdout="%42\n", stderr=""),
+        ):
+            self.assertEqual("%42", resolve_pane_id("repo:codex"))
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            return_value=argparse.Namespace(returncode=1, stdout="", stderr="no such window"),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                resolve_pane_id("repo:nope")
+
     def test_resolve_target_rejects_non_agent_string(self) -> None:
         # Custom strings used to fall through to the `@agent_name` label
         # lookup; under the window-only model they fail closed at resolve
@@ -13084,6 +13145,67 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         outcome = json.loads(json_lines[-1])
         # The identity gate let it through. It dies on marker_timeout (strict
         # standard mode, no marker observed), NOT on the repo gate.
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+
+    def test_location_form_target_resolves_instead_of_pane_disappeared(self) -> None:
+        # Redmine #11666: `--target '<session>:codex'` — the exact form the
+        # cross-session guidance tells operators to use — used to die with
+        # `pane disappeared after resolve` even though the pane existed.
+        # With location→pane-id normalization it must reach the same
+        # endpoint as a pane-id target (marker_timeout in standard mode),
+        # not the resolver death.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            workspace = Path(tmp_str) / "other-repo"
+            (workspace / "src").mkdir(parents=True)
+            (workspace / "pyproject.toml").write_text("", encoding="utf-8")
+
+            pane = {
+                "id": "%9",
+                "location": "other:1.0",
+                "command": "codex",
+                "cwd": str(workspace / "src"),
+                "window_name": "codex",
+                "pane_active": "1",
+            }
+            with patch(
+                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                return_value="%9",
+            ):
+                _exc, _sent, stdout, _stderr = self.run_handoff(
+                    [
+                        "handoff",
+                        "send",
+                        "--to",
+                        "codex",
+                        "--source",
+                        "redmine",
+                        "--issue",
+                        "11666",
+                        "--journal",
+                        "56072",
+                        "--kind",
+                        "implementation_request",
+                        "--target",
+                        "other:codex",
+                        "--target-repo",
+                        str(workspace),
+                        "--mode",
+                        "standard",
+                        "--landing-timeout",
+                        "0.01",
+                        "--submit-delay",
+                        "0",
+                    ],
+                    pane=pane,
+                    sender_session="local",
+                )
+
+        json_lines = [
+            line for line in stdout.splitlines() if line.strip().startswith("{")
+        ]
+        self.assertTrue(json_lines, f"no JSON outcome: {stdout!r}")
+        outcome = json.loads(json_lines[-1])
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("marker_timeout", outcome["reason"])
 

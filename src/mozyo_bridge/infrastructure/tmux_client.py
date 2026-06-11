@@ -98,6 +98,24 @@ def validate_target(target: str) -> None:
         die(f"invalid tmux target: {target}")
 
 
+def resolve_pane_id(target: str) -> str:
+    """Resolve any tmux target (location or pane id) to its pane id (`%n`).
+
+    A location target like ``session:window`` or ``session:window.pane``
+    resolves to the pane tmux itself would address — for a window target,
+    that window's active pane. Fatal when tmux rejects the target, so
+    callers keep the same fail-closed behavior as :func:`validate_target`
+    (Redmine #11666).
+    """
+    result = run_tmux("display-message", "-t", target, "-p", "#{pane_id}", check=False)
+    if result.returncode != 0:
+        die(f"invalid tmux target: {target}")
+    pane_id = result.stdout.strip()
+    if not pane_id.startswith("%"):
+        die(f"invalid tmux target: {target}")
+    return pane_id
+
+
 def pane_location(pane_id: str) -> str:
     result = run_tmux("display-message", "-t", pane_id, "-p", "#{session_name}:#{window_index}.#{pane_index}")
     return result.stdout.strip()

@@ -7,7 +7,12 @@ import re
 import time
 from pathlib import Path
 
-from mozyo_bridge.infrastructure.tmux_client import pane_lines, run_tmux, validate_target
+from mozyo_bridge.infrastructure.tmux_client import (
+    pane_lines,
+    resolve_pane_id,
+    run_tmux,
+    validate_target,
+)
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import READ_MARK_PREFIX
 
@@ -127,9 +132,21 @@ def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | Non
 
 
 def resolve_target(target: str) -> str:
+    """Resolve a CLI ``--target`` to a tmux pane id (`%n`).
+
+    Every branch returns a pane id: downstream consumers (notably
+    :func:`pane_info`) match the result against ``pane_lines()`` ids, so a
+    location form like ``session:window`` must be normalized here instead of
+    being passed through — passing the raw location made every location
+    target die with ``pane disappeared after resolve`` (Redmine #11666).
+    A window-level location resolves to that window's active pane, matching
+    tmux's own addressing and the queue-enter rail's active-split preflight.
+    """
     if is_tmux_target(target):
         validate_target(target)
-        return target
+        if target.startswith("%"):
+            return target
+        return resolve_pane_id(target)
     if target not in AGENT_LABELS:
         die(
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
