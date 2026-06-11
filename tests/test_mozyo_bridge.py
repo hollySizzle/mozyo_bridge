@@ -13846,6 +13846,13 @@ class GovernedWorkflowCanonicalTest(unittest.TestCase):
         "短い命令は file edit 許可ではない",
         "Repo-Local Guardrail Autonomous Lane",
         "codex_autonomous_edit",
+        # US-level audit model (Redmine #11599) — the standard review /
+        # audit / close-approval unit is the UserStory; per-task Codex
+        # review is the exception, not the default.
+        "US-Level Audit Model",
+        "標準適用単位は UserStory",
+        "Task / Test / Bug ごとの Codex review_request は不要",
+        "task_close",
         # Docs catalog governance contract.
         "catalog 駆動の docs 解決",
         ".mozyo-bridge/docs/catalog.yaml",

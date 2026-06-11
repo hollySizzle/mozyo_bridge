@@ -27,7 +27,7 @@ docs catalog tooling (validator / resolver / generator / impact checker) は **m
 governed preset は次の三本柱で動く。
 
 1. **正本性** — 作業状態の durable record は Redmine issue / journal。durable record が無い・曖昧・矛盾している場合は実装着手しない。
-2. **gate 分離** — Start / Progress / Design Consultation / Design Consultation Answer / Implementation Done / Review Request / Review / QA Verification / Production Verification / Close を独立 journal として残す。Implementation Done は completion ではない。Review Gate approval も Close ではない。base Redmine の `Close Approval Separation` を継承し、Close には owner close approval を別 journal として要求する。
+2. **gate 分離** — Start / Progress / Design Consultation / Design Consultation Answer / Implementation Done / Review Request / Review / QA Verification / Production Verification / Close を独立 journal として残す。Implementation Done は completion ではない。Review Gate approval も Close ではない。base Redmine の `Close Approval Separation` を継承し、Close には owner close approval を別 journal として要求する。Review Request / Review / owner close approval の標準適用単位は UserStory である (詳細は `### US-Level Audit Model`)。
 3. **catalog 駆動の docs 解決** — 変更対象 path から、その path に紐づく guardrail / spec / convention を catalog 経由で解決し、本文を読んでから実装・監査する。generated 物を正本にしない。
 
 ## Agent Execution Contract
@@ -58,11 +58,50 @@ chat_pane通知: 正本ではなく通知のみ
   ユーザー窓口: codex
 実装者の責務: [code, schema, tests, 実装隣接docs]
 監査者の責務: [review, 設計相談回答, 規約解釈, Redmine判断記録, ticket_triage, owner承認収集]
+標準粒度:
+  実装: UserStory (配下 Task / Test / Bug を含めて実装者が一括遂行)
+  監査: UserStory (US close 前の横断 audit)
+  close承認: owner (US 単位)
 ```
 
 ユーザー / owner との対話窓口は Codex に集約する。owner への確認・承認収集・clarification は原則 Codex pane で行い、実装者 (Claude) の pane で owner 承認を収集しない (詳細は `### Owner Close Approval Delegation` と base の `Close Approval Separation` / `Direct Request Triage` を読む)。
 
 project が実装者 / 監査者 split を採用していない場合は、上記を採用しないでよい。ただし採用したら、本 file の境界を曖昧にしない。
+
+### US-Level Audit Model
+
+通常開発の標準単位を次のように定める。実装者 = UserStory implementer、監査者 = UserStory auditor、owner = close approver。
+
+- **実装者 (claude_code)** は UserStory 配下の Task / Test / Bug を完了可能な粒度でまとめて実行し、各 issue に実装・検証・残リスクを journal として記録する。
+- **監査者 (codex)** は US 完了時に、配下 issue 全体、対象 commit 群、docs、tests、journal、未解決事項、close 条件を横断して監査する (UserStory 単位の横断 audit)。
+- **owner** は監査者の audit approval とは別に owner close approval を出す。`Close Approval Separation` は本 model でも維持される。Codex audit は close approval ではない。
+
+```yaml
+us_level_audit:
+  標準運用:
+    - Task / Test / Bug ごとの Codex review_request は不要
+    - 実装者は配下 issue ごとに implementation_done 相当の記録 (変更・検証・残リスク) を残す
+    - US の implementation_done / review_request (US-level audit request) で配下 issue の結果をまとめて監査者へ渡す
+    - 監査者は US close 前に配下 issue / journal / diff / docs を横断 audit する
+  gate名:
+    - review_request / review の gate 名と transport kind は維持する。US issue 上に記録された review_request が US-level audit request である
+    - 新しい gate 名 / transport kind (us_audit_request 等) は作らない
+  task_level例外 (Task-level review または design consultation を要求・許可する条件):
+    - guardrail / workflow / preset / router / skill / scaffold rule 変更
+    - release / tag / publish / packaging / CI 変更
+    - credential / secret / auth / permission / billing / 外部 service 設定
+    - destructive operation / data 削除 / migration
+    - architecture 変更、互換性 (既存 URL / API / data) に影響する変更
+    - 実装者が判断に迷う場合 (design consultation へ)
+    - owner または監査者が mid-review を明示要求した場合
+  base_preset_override:
+    - base preset の Gate Lifecycle / Completion が「通常開発 task」ごとに要求する Review Request / Review / owner close approval は、US 配下の Task / Test / Bug については本 preset が適用単位を UserStory へ再定義する (明示 override)
+    - gate 語彙・必須 field・Close Approval Separation・Review Quality Hierarchy は base のまま継承する
+  単独issue (親USなし):
+    - US に属さない単独の通常開発 issue は、その issue 自身を audit 単位として base どおり Review Request / Review / owner close approval を適用する
+```
+
+過去の Task-level review_request / review journal は有効な歴史記録であり、遡及して読み替えない。本 model は適用後の新規作業に適用する。
 
 ### パス別編集権限
 
@@ -130,20 +169,24 @@ start:
   必須: [issue, parent_issue, 目的, 受け入れ条件, 参照docs, 未確認事項]
 implementation_done:
   actor: 実装者
+  粒度: Task / Test / Bug / US のいずれにも記録できる。Task-level の記録は Codex review を伴わず、US audit の input になる
   必須: [変更ファイル, 実装意図, 前提, 未確認事項, 検証結果, docs更新, commit_or_diff]
 review_request:
   actor: 実装者
+  標準粒度: UserStory (US-level audit request)。Task-level は us_level_audit.task_level例外 に該当する場合のみ
   必須:
-    - implementation_done_journal
-    - commit_or_diff
+    - implementation_done_journal (US-level では配下 issue の implementation_done journal 一覧)
+    - commit_or_diff (US-level では対象 commit 群)
     - 変更ファイル
+    - 配下issue一覧と各状態 (US-level のみ。残リスク・未完 scope を含む)
     - review観点
     - 未確認事項
     - 受信agent
     - 受領方法
 review:
   actor: 監査者
-  必須: [対象commit_or_diff, resolved_docs, 照合規約, 指摘事項, 未確認事項, 再review要否, 結論]
+  標準粒度: UserStory。対象 commit だけでなく配下 Task / Test / Bug の issue / journal / docs / residual risk を横断して読む
+  必須: [対象commit_or_diff, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 未確認事項, 再review要否, 結論]
   指摘事項_分類:
     - 事実: コード・設定・docs で確認済みの不整合のみ
     - 仮説: 確認すべき事項と確認方法を併記
@@ -168,14 +211,20 @@ owner_close_approval:
     - commit_hash
   制約: Review Gate とは別 journal。standing_delegation は `### Owner Close Approval Delegation` の発動条件をすべて満たす場合のみ
 close:
-  必須:
+  us_close必須 (UserStory および親USを持たない単独issue):
     - 受け入れ確認
     - 指摘対応
     - 残留リスク
-    - review結果
+    - review結果 (US では US-level audit)
     - owner_close_approval (Review Gate とは別 journal)
     - commit_hash_record
     - close判断
+  task_close必須 (US 配下の Task / Test / Bug):
+    - implementation_done journal (検証結果・残リスクを含む)
+    - commit_hash_record (commit を伴う場合)
+    - 未完 scope / 残リスクの親US引き継ぎ記録
+    - per-issue Codex review: 不要 (us_level_audit.task_level例外 に該当する場合を除く)
+    - 制約: US audit が journal から replay できない task close は invalid。US audit で gap が見つかれば reopen する
 codex_direct_edit:
   actor: codex
   有効条件:
@@ -301,7 +350,7 @@ drift が出たら `mozyo-bridge docs generate-file-conventions --repo .` で re
 
 ### Owner Close Approval Delegation
 
-base の `Close Approval Separation` を、窓口 = Codex として運用する。Review Gate approval 後の owner クローズ可否確認、owner_close_approval journal の記録、Close Gate までは **Codex 側で完結** させる。実装者 (Claude) は Review Gate approval を受領したら close 条件の充足状況を Progress Log に記録して待機し、owner 承認を自分の pane で収集しない。
+base の `Close Approval Separation` を、窓口 = Codex として運用する。適用単位は `### US-Level Audit Model` に従い UserStory (または単独 issue) である。Review Gate approval (US では US-level audit approval) 後の owner クローズ可否確認、owner_close_approval journal の記録、Close Gate までは **Codex 側で完結** させる。実装者 (Claude) は Review Gate approval を受領したら close 条件の充足状況を Progress Log に記録して待機し、owner 承認を自分の pane で収集しない。
 
 owner は通常開発タスクの close approval を Codex へ **事前委任 (standing delegation)** できる。委任の正本は本 preset であり、target project は採用可否だけを Project-Local Additions に記録する (詳細規則を workspace 側へ複製すると drift する)。
 
@@ -371,7 +420,7 @@ if ($agentがcodex()) then (yes)
   endif
 endif
 if ($gate有効("review_request")) then (yes)
-  $codex_reviewを実行()
+  $codex_us_auditを実行(対象commit群, 配下issue, journals, docs, residual_risk)
   $review_gateを記録()
   $claude_codeへ通知()
 else (no)
@@ -382,17 +431,33 @@ else (no)
   endif
 endif
 if ($agentがclaude_code() && $役割が実装者()) then (yes)
-  $scopeを守って実装()
-  $implementation_doneを記録()
-  $review_requestを記録()
-  $codexへreview通知()
+  while ($US配下に未完のTask/Test/Bugがある())
+    $scopeを守って実装()
+    $issueごとにimplementation_doneを記録()
+    if ($task_level例外に該当()) then (yes)
+      $task_level_review_requestまたはdesign_consultationを記録()
+      $codexへ通知()
+    endif
+  endwhile
+  $USのimplementation_doneを記録()
+  $US_audit_requestを記録(review_request gate)
+  $codexへaudit通知()
 endif
 if ($close要求()) then (yes)
-  if ($review_gateあり() && $owner_close_approvalあり() && $commit_hash_recordあり()) then (yes)
-    $close_gateを記録()
+  if ($対象がUS配下のTask/Test/Bug()) then (yes)
+    if ($implementation_done_journalあり() && $残リスク引き継ぎあり()) then (yes)
+      $task_closeを記録()
+    else (no)
+      $close_blockedを記録("US auditがreplayできない")
+      stop
+    endif
   else (no)
-    $close_blockedを記録()
-    stop
+    if ($review_gateあり() && $owner_close_approvalあり() && $commit_hash_recordあり()) then (yes)
+      $close_gateを記録()
+    else (no)
+      $close_blockedを記録()
+      stop
+    endif
   endif
 endif
 stop
@@ -409,12 +474,18 @@ stop
   - id: review_without_review_request
     条件: [agent:codex, review_request_gate:missing]
     action: 監査不能を記録
-  - id: close_after_implementation_done_only
-    条件: [implementation_done:present, review_gate:missing]
-    action: close禁止
+  - id: us_close_after_implementation_done_only
+    条件: [issue:user_story_or_standalone, implementation_done:present, review_gate:missing]
+    action: close禁止 (US-level audit が先)
   - id: close_without_owner_approval
-    条件: [review_gate:present, owner_close_approval:missing]
+    条件: [issue:user_story_or_standalone, review_gate:present, owner_close_approval:missing]
     action: close禁止
+  - id: task_close_without_replayable_journal
+    条件: [issue:task_under_us, implementation_done_journal:missing_or_検証記録なし]
+    action: close禁止 (US audit が replay できない)
+  - id: us_close_with_unaudited_children
+    条件: [issue:user_story, 配下issue:open_or_unrecorded, review_gate:recorded]
+    action: close禁止 (audit 対象が確定していない)
   - id: notify_without_redmine_gate
     条件: [handoff_or_review_notification:requested, journal_gate:missing]
     action: gate作成または作成依頼を先に行う
@@ -486,16 +557,20 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - reason:
 - follow_up_review:
 
-## Gate: review_request
-- implementation_done_journal:
-- commit_or_diff:
+## Gate: review_request (US-level audit request; Task-level は例外時のみ)
+- 対象US: #<us_id>
+- 配下issue状態: (#<id> 状態 / implementation_done journal / 残リスク を issue ごとに列挙)
+- implementation_done_journal: (US 自身の summary journal)
+- commit_or_diff: (対象 commit 群)
 - changed_paths:
 - review_focus:
+- 未確認事項:
 - receiver: Codex
 - receive_method: mozyo-bridge journal <id>
 
-## Gate: review
-- target_commit_or_diff:
+## Gate: review (US-level audit)
+- target_commit_or_diff: (対象 commit 群)
+- 配下issue確認結果: (#<id> ごとの journal / 検証 / close 妥当性)
 - resolved_docs:
 - 照合規約:
 - 指摘事項 [事実]:
@@ -503,6 +578,12 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - 未確認事項:
 - 再review要否:
 - 結論:
+
+## Gate: task_close (US 配下の Task / Test / Bug)
+- implementation_done_journal:
+- commit_hash: (commit を伴う場合)
+- 親USへの引き継ぎ: (未完 scope / 残リスク / なし)
+- task_level例外該当: none | <該当理由と対応journal>
 
 ## Gate: design_consultation (dispute)
 - purpose: dispute
@@ -532,7 +613,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 
 ## Completion
 
-Implementation Done は完了ではない。Redmine に Review Gate、指摘対応、owner close approval journal (Review Gate とは別)、commit hash record、Close Gate が記録されるまで完了扱いしない。
+Implementation Done は完了ではない。US 配下の Task / Test / Bug は implementation_done journal (検証・残リスクを含む) と必要な commit hash record があれば close できるが、それは US の完了ではない。UserStory は Redmine に US-level audit の Review Gate、指摘対応、owner close approval journal (Review Gate とは別)、commit hash record、Close Gate が記録されるまで完了扱いしない。親USを持たない単独 issue は base どおり issue 自身を audit 単位として同じ条件を満たす。
 
 ## Repo-Local Rules Maintenance (governed mode)
 
