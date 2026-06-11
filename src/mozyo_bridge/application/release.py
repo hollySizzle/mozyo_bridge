@@ -381,9 +381,23 @@ def cmd_release_check_drift(args: argparse.Namespace) -> int:
     blockers: list[str] = []
 
     _print_section("scaffold canonical --check")
+    # The canonical check must run the *target tree's* package: staged
+    # release copies (and dev checkouts under an interpreter without the
+    # package installed) are not importable as `mozyo_bridge` from the
+    # subprocess's default sys.path, so prepend the target `src` layout.
+    canonical_env = os.environ.copy()
+    target_src = repo_root / "src"
+    if (target_src / "mozyo_bridge" / "__init__.py").is_file():
+        existing_pythonpath = canonical_env.get("PYTHONPATH")
+        canonical_env["PYTHONPATH"] = (
+            str(target_src)
+            if not existing_pythonpath
+            else f"{target_src}{os.pathsep}{existing_pythonpath}"
+        )
     canonical = _run(
         [sys.executable, "-m", "mozyo_bridge", "scaffold", "canonical", "--check", "--repo", str(repo_root)],
         cwd=repo_root,
+        env=canonical_env,
     )
     if canonical.stdout:
         print(canonical.stdout, end="" if canonical.stdout.endswith("\n") else "\n")
