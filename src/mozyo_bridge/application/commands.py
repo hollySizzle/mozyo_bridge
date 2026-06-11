@@ -140,28 +140,40 @@ def cmd_list(_: argparse.Namespace) -> int:
 
 
 def cmd_agents_list(args: argparse.Namespace) -> int:
-    """Cross-session agent discovery surface (Redmine #10332).
+    """Cross-session agent discovery surface (Redmine #10332, #11628).
 
-    Emits one row per tmux pane carrying the structured fields a sender needs
-    in order to name an explicit cross-workspace handoff target: session,
-    window name and index, pane id and index, active flag, classified
-    ``agent_kind`` (``claude`` / ``codex`` / ``unknown``), foreground process,
-    inferred ``repo_root`` (walked up via REPO_ROOT_MARKERS from the pane's
-    ``cwd``), the pane's ``cwd``, and an ``ambiguous`` flag when the
-    ``(session, window_name)`` pair spans multiple windows in the session.
+    Emits one row per ``pane_id`` — the agent identity key (Redmine #11628):
+    a pane that belongs to several grouped tmux sessions is ONE agent whose
+    memberships are folded into ``views``; the top-level session / window
+    fields describe the canonical view (the session matching the workspace's
+    canonical session name, resolved registry → anchor → derivation). Each
+    row carries the structured fields a sender needs to name an explicit
+    cross-workspace handoff target: session, window name and index, pane id
+    and index, active flag, classified ``agent_kind`` (``claude`` /
+    ``codex`` / ``unknown``), foreground process, inferred ``repo_root``
+    (walked up via REPO_ROOT_MARKERS from the pane's ``cwd``), the pane's
+    ``cwd``, and an ``ambiguous`` flag when any view's ``(session,
+    window_name)`` pair spans multiple windows in its session. ``--session``
+    matches the canonical session or any grouped view.
 
     Read-only. Does not change tmux state, does not interact with
     Asana / Redmine, and is intentionally separate from the legacy ``list`` /
     ``status`` surfaces so existing scripts that scrape those outputs keep
-    working.
+    working. Single tmux server assumed; a multi-server deployment would
+    key on ``(socket, pane_id)``.
     """
+    from mozyo_bridge.domain.agent_discovery import fold_agents_by_pane
+
     require_tmux()
     agent_filter = getattr(args, "agent", None)
     if agent_filter is not None and agent_filter not in AGENT_KINDS:
         die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
     session_filter = getattr(args, "session", None)
     records = filter_agents(
-        discover_agents(),
+        fold_agents_by_pane(
+            discover_agents(),
+            resolve_canonical=lambda root: resolve_canonical_session(root).name,
+        ),
         session=session_filter,
         agent_kind=agent_filter,
     )
@@ -172,9 +184,13 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     print(
-        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS"
+        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\t"
+        "AMBIGUOUS\tOTHER_VIEWS"
     )
     for record in records:
+        other_views = ",".join(
+            view.session for view in record.views if not view.canonical
+        )
         print(
             "\t".join(
                 [
@@ -188,6 +204,7 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
                     record.repo_root or "-",
                     record.cwd or "-",
                     "1" if record.ambiguous else "0",
+                    other_views or "-",
                 ]
             )
         )

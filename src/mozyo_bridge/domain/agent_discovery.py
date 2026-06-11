@@ -1,9 +1,19 @@
-"""Cross-workspace agent discovery surface (Redmine #10332).
+"""Cross-workspace agent discovery surface (Redmine #10332, #11628).
 
 Read-only discovery of every tmux pane structured by ``session`` /
 ``window_index`` / ``window_name`` / ``pane_id`` / ``process`` / ``cwd`` /
 ``repo_root`` / ``agent_kind``. Used by ``mozyo-bridge agents list`` and as
 the building block for cross-workspace handoff targeting.
+
+Agent identity is keyed by ``pane_id`` (Redmine #11628, owner agreement
+2026-06-11): in tmux session groups the same pane belongs to several
+sessions, so a per-(session, pane) row double-counts agents. The raw
+:func:`discover_agents` enumeration still yields one record per tmux pane
+*line* (one per session membership); :func:`fold_agents_by_pane` collapses
+those memberships into one record per pane whose ``views`` carry every
+membership and whose top-level session / window fields describe the
+canonical view. This assumes a single tmux server — a multi-server
+deployment would need a ``(socket, pane_id)`` composite key.
 
 The legacy ``find_agent_window`` resolver in ``pane_resolver`` only addresses
 **same-session** routing; it intentionally fails closed on cross-session
@@ -14,9 +24,9 @@ the cross-workspace handoff gate accepts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from mozyo_bridge.infrastructure.tmux_client import pane_lines
 from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
@@ -29,7 +39,42 @@ AGENT_KINDS = frozenset({AGENT_KIND_CLAUDE, AGENT_KIND_CODEX, AGENT_KIND_UNKNOWN
 
 
 @dataclass(frozen=True)
+class PaneView:
+    """One (session, window, pane-index) membership of a pane.
+
+    Grouped tmux sessions expose the same pane through several sessions;
+    each membership is a view. ``canonical`` marks the view whose session
+    matches the workspace's resolved canonical session name.
+    """
+
+    session: str
+    window_index: str
+    window_name: str
+    pane_index: str
+    pane_active: bool
+    canonical: bool
+
+    def as_payload(self) -> dict:
+        return {
+            "session": self.session,
+            "window_index": self.window_index,
+            "window_name": self.window_name,
+            "pane_index": self.pane_index,
+            "pane_active": self.pane_active,
+            "canonical": self.canonical,
+        }
+
+
+@dataclass(frozen=True)
 class AgentRecord:
+    """One discovered pane; after folding, one agent identity.
+
+    ``views`` is empty on the raw per-line records from
+    :func:`discover_agents` and populated by :func:`fold_agents_by_pane`,
+    where the top-level session / window / pane fields describe the
+    canonical view and ``views`` carries every membership.
+    """
+
     pane_id: str
     session: str
     window_index: str
@@ -41,6 +86,7 @@ class AgentRecord:
     repo_root: str | None
     agent_kind: str
     ambiguous: bool
+    views: tuple[PaneView, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -55,6 +101,7 @@ class AgentRecord:
             "repo_root": self.repo_root,
             "agent_kind": self.agent_kind,
             "ambiguous": self.ambiguous,
+            "views": [view.as_payload() for view in self.views],
         }
 
 
@@ -143,16 +190,115 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
     return records
 
 
+def fold_agent_kind(window_names: Iterable[str]) -> str:
+    """Classify a pane from the window names of all its views.
+
+    Windows are shared across grouped sessions so the names normally agree;
+    when they somehow disagree on two different agent kinds, the pane is
+    ``unknown`` rather than arbitrarily one of them.
+    """
+    kinds = {
+        kind
+        for kind in (classify_agent_kind(name) for name in window_names)
+        if kind != AGENT_KIND_UNKNOWN
+    }
+    return kinds.pop() if len(kinds) == 1 else AGENT_KIND_UNKNOWN
+
+
+def fold_agents_by_pane(
+    records: Iterable[AgentRecord],
+    *,
+    resolve_canonical: Callable[[str], str | None] | None = None,
+) -> list[AgentRecord]:
+    """Collapse per-line records into one record per ``pane_id`` (#11628).
+
+    Each grouped-session membership becomes a :class:`PaneView`; the
+    canonical view is the one whose session equals
+    ``resolve_canonical(repo_root)`` (the workspace's canonical session
+    name), else the first view by (session, window, pane) sort order so the
+    choice stays deterministic. The folded record's ``ambiguous`` is the OR
+    of its views' flags, and ``agent_kind`` is folded across all views'
+    window names. Records without a ``pane_id`` cannot carry a stable
+    identity and are dropped. ``resolve_canonical`` is invoked once per
+    distinct ``repo_root``.
+    """
+    grouped: dict[str, list[AgentRecord]] = {}
+    order: list[str] = []
+    for record in records:
+        if not record.pane_id:
+            continue
+        if record.pane_id not in grouped:
+            grouped[record.pane_id] = []
+            order.append(record.pane_id)
+        grouped[record.pane_id].append(record)
+
+    canonical_cache: dict[str, str | None] = {}
+
+    def canonical_session_for(repo_root: str | None) -> str | None:
+        if resolve_canonical is None or not repo_root:
+            return None
+        if repo_root not in canonical_cache:
+            canonical_cache[repo_root] = resolve_canonical(repo_root)
+        return canonical_cache[repo_root]
+
+    folded: list[AgentRecord] = []
+    for pane_id in order:
+        members = sorted(
+            grouped[pane_id],
+            key=lambda r: (r.session, r.window_index, r.pane_index),
+        )
+        first = grouped[pane_id][0]
+        canonical_name = canonical_session_for(first.repo_root)
+        canonical_index = 0
+        if canonical_name is not None:
+            for index, member in enumerate(members):
+                if member.session == canonical_name:
+                    canonical_index = index
+                    break
+        views = tuple(
+            PaneView(
+                session=member.session,
+                window_index=member.window_index,
+                window_name=member.window_name,
+                pane_index=member.pane_index,
+                pane_active=member.pane_active,
+                canonical=(index == canonical_index),
+            )
+            for index, member in enumerate(members)
+        )
+        canonical = members[canonical_index]
+        folded.append(
+            replace(
+                canonical,
+                agent_kind=fold_agent_kind(
+                    member.window_name for member in members
+                ),
+                ambiguous=any(member.ambiguous for member in members),
+                views=views,
+            )
+        )
+    return folded
+
+
 def filter_agents(
     records: Iterable[AgentRecord],
     *,
     session: str | None = None,
     agent_kind: str | None = None,
 ) -> list[AgentRecord]:
+    """Filter records by session membership and/or agent kind.
+
+    The session filter matches the canonical session OR any grouped view's
+    session (a folded pane is a member of every session it appears in);
+    unfolded records carry no views, so this stays an exact-name match for
+    them.
+    """
     out: list[AgentRecord] = []
     for record in records:
-        if session is not None and record.session != session:
-            continue
+        if session is not None:
+            in_views = any(view.session == session for view in record.views)
+            if record.session != session and not in_views:
+                continue
         if agent_kind is not None and record.agent_kind != agent_kind:
             continue
         out.append(record)

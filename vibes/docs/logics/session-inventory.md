@@ -64,7 +64,7 @@ CREATE TABLE inventory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 - `mozyo-bridge session list [--json]` — 既存 `session` サブコマンド体系 (issue #11422 指定) に追加。runtime 収集成功時は cache を更新して `source: runtime` / `stale: false`。tmux 不在時は cache から `source: cache` / `stale: true` (text 出力では stderr に stale 警告)。cache も無ければ空の stale snapshot を返す (exit 0)。
 - JSON payload: `schema_version` / `collected_at` / `source` / `stale` / `inventory_path` / `notes` / `panes[]`。pane は `pane_id` / 正準 view の `session`・`window_*`・`pane_*` / `process` / `cwd` / `repo_root` / `agent_kind` / `workspace{workspace_id, canonical_session, project_name, source}` / `views[]`。
-- `agents list` (#10332) は低レベル pane discovery としてそのまま残す。`agents list` の同一性キー変更・grouped 畳み込みは #11628 の scope であり、本 logic は新 surface 側で folded 出力を最初から提供する (新 surface のため後方互換制約なし)。
+- `agents list` (#10332) も #11628 で同じ identity model に統一済み: 1 行 = 1 `pane_id`、grouped 所属は `views` 配列、text 出力は末尾 `OTHER_VIEWS` 列。**folding の実装は `domain/agent_discovery.fold_agents_by_pane()` を両 surface で共有**し、`session list` は workspace identity 層 (registry → anchor → derivation) をその上に重ねる。`agents list --json` の既存 field は正準 view の値として意味を維持し、`views` が追加 (grouped pane の重複行は廃止 = #11628 が修正した bug)。`--session` filter は正準 / grouped どちらの所属でも match する。
 
 ## 検証
 

@@ -189,8 +189,9 @@ class CollectRuntimeInventoryTest(SessionInventoryBase):
         registered = register_workspace(repo, home=self.home)
         nfc_root = unicodedata.normalize("NFC", str(repo.resolve()))
         self.assertNotEqual(nfc_root, str(repo.resolve()))
-        with patch.object(
-            session_inventory, "infer_repo_root", return_value=nfc_root
+        with patch(
+            "mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            return_value=nfc_root,
         ):
             records = collect_runtime_inventory(
                 [pane("%1", "s:1.0", cwd=nfc_root)], home=self.home

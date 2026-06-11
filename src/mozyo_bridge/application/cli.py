@@ -380,16 +380,22 @@ def build_parser() -> argparse.ArgumentParser:
     agents_list = agents_sub.add_parser(
         "list",
         help=(
-            "Enumerate every tmux pane with structured discovery fields. "
-            "Does not modify tmux state; safe to call from any session. "
-            "Distinct from `mozyo-bridge list` (raw single-session pane "
-            "table) and `mozyo-bridge status` (current session diagnostics)."
+            "Enumerate agents with structured discovery fields, one row per "
+            "pane_id (Redmine #11628): a pane shared by grouped tmux "
+            "sessions is one agent whose memberships are folded into "
+            "`views`; the top-level session is the canonical view (the "
+            "workspace's canonical session name when one matches). Single "
+            "tmux server assumed. Does not modify tmux state; safe to call "
+            "from any session. Distinct from `mozyo-bridge list` (raw "
+            "single-session pane table) and `mozyo-bridge status` (current "
+            "session diagnostics)."
         ),
     )
     agents_list.add_argument(
         "--session",
         help=(
-            "Filter to panes whose tmux session matches this name exactly. "
+            "Filter to agents that are members of this tmux session (exact "
+            "name; matches the canonical session or any grouped view). "
             "Omit to enumerate every visible session."
         ),
     )

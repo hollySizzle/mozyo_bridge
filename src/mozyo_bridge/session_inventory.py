@@ -49,7 +49,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from mozyo_bridge.domain.agent_discovery import classify_agent_kind, infer_repo_root
+from mozyo_bridge.domain.agent_discovery import (
+    PaneView,
+    discover_agents,
+    fold_agents_by_pane,
+)
 from mozyo_bridge.domain.session_naming import derive_session_name
 from mozyo_bridge.shared.paths import mozyo_bridge_home, normalize_path_unicode
 from mozyo_bridge.workspace_registry import (
@@ -106,33 +110,6 @@ def inventory_path(home: Path | None = None) -> Path:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-@dataclass(frozen=True)
-class PaneView:
-    """One (session, window, pane-index) membership of a pane.
-
-    Grouped tmux sessions expose the same pane through several sessions;
-    each membership is a view. ``canonical`` marks the view whose session
-    matches the workspace's resolved canonical session name.
-    """
-
-    session: str
-    window_index: str
-    window_name: str
-    pane_index: str
-    pane_active: bool
-    canonical: bool
-
-    def as_payload(self) -> dict:
-        return {
-            "session": self.session,
-            "window_index": self.window_index,
-            "window_name": self.window_name,
-            "pane_index": self.pane_index,
-            "pane_active": self.pane_active,
-            "canonical": self.canonical,
-        }
 
 
 @dataclass(frozen=True)
@@ -277,27 +254,6 @@ def _registry_index(home: Path | None) -> dict[str, object]:
 # --- runtime collection -------------------------------------------------------
 
 
-def _parse_location(location: str) -> tuple[str, str, str]:
-    session, _, rest = location.partition(":")
-    window_index, _, pane_index = rest.partition(".")
-    return session, window_index, pane_index
-
-
-def _fold_agent_kind(views: Iterable[PaneView]) -> str:
-    """Classify the pane from its views' window names.
-
-    Windows are shared across grouped sessions so the names normally agree;
-    when they somehow disagree on two different agent kinds, the pane is
-    ``unknown`` rather than arbitrarily one of them.
-    """
-    kinds = {
-        kind
-        for kind in (classify_agent_kind(view.window_name) for view in views)
-        if kind != "unknown"
-    }
-    return kinds.pop() if len(kinds) == 1 else "unknown"
-
-
 def collect_runtime_inventory(
     panes: Iterable[dict[str, str]],
     *,
@@ -305,87 +261,42 @@ def collect_runtime_inventory(
 ) -> list[InventoryRecord]:
     """Build inventory records from raw tmux pane lines.
 
-    Folds multiple (session, window) memberships of the same ``pane_id``
-    into one record (Redmine #11628): the canonical view is the one whose
-    session equals the workspace's resolved canonical session name, else
-    the first view by session sort order, so the choice is deterministic.
+    Discovery and pane_id folding are shared with ``agents list``
+    (``domain.agent_discovery.fold_agents_by_pane``, Redmine #11628) so the
+    two surfaces cannot drift; this function adds the workspace identity
+    layer on top, resolving each distinct repo root once through the
+    registry → anchor → derivation chain (Unicode-normalized, #11625).
     """
-    grouped: dict[str, list[dict[str, str]]] = {}
-    order: list[str] = []
-    for pane in panes:
-        pane_id = pane.get("id") or ""
-        if not pane_id:
-            continue
-        if pane_id not in grouped:
-            grouped[pane_id] = []
-            order.append(pane_id)
-        grouped[pane_id].append(pane)
-
     registry_by_path = _registry_index(home)
     identity_cache: dict[str, WorkspaceIdentity] = {}
-    records: list[InventoryRecord] = []
-    for pane_id in order:
-        raw_views = grouped[pane_id]
-        first = raw_views[0]
-        cwd = first.get("cwd") or ""
-        repo_root = infer_repo_root(cwd)
-        workspace: WorkspaceIdentity | None = None
-        if repo_root:
-            key = normalize_path_unicode(repo_root)
-            if key not in identity_cache:
-                identity_cache[key] = _resolve_identity(repo_root, registry_by_path)
-            workspace = identity_cache[key]
 
-        views_raw: list[tuple[str, str, str, str, bool]] = []
-        for pane in raw_views:
-            session, window_index, pane_index = _parse_location(
-                pane.get("location") or ""
-            )
-            views_raw.append(
-                (
-                    session,
-                    window_index,
-                    pane.get("window_name") or "",
-                    pane_index,
-                    pane.get("pane_active") == "1",
-                )
-            )
-        views_raw.sort(key=lambda view: (view[0], view[1], view[3]))
-        canonical_index = 0
-        if workspace is not None:
-            for index, view in enumerate(views_raw):
-                if view[0] == workspace.canonical_session:
-                    canonical_index = index
-                    break
-        views = tuple(
-            PaneView(
-                session=view[0],
-                window_index=view[1],
-                window_name=view[2],
-                pane_index=view[3],
-                pane_active=view[4],
-                canonical=(index == canonical_index),
-            )
-            for index, view in enumerate(views_raw)
+    def identity_for(repo_root: str) -> WorkspaceIdentity:
+        key = normalize_path_unicode(repo_root)
+        if key not in identity_cache:
+            identity_cache[key] = _resolve_identity(repo_root, registry_by_path)
+        return identity_cache[key]
+
+    folded = fold_agents_by_pane(
+        discover_agents(list(panes)),
+        resolve_canonical=lambda root: identity_for(root).canonical_session,
+    )
+    return [
+        InventoryRecord(
+            pane_id=agent.pane_id,
+            session=agent.session,
+            window_index=agent.window_index,
+            window_name=agent.window_name,
+            pane_index=agent.pane_index,
+            pane_active=agent.pane_active,
+            process=agent.process,
+            cwd=agent.cwd,
+            repo_root=agent.repo_root,
+            agent_kind=agent.agent_kind,
+            workspace=identity_for(agent.repo_root) if agent.repo_root else None,
+            views=agent.views,
         )
-        canonical = views[canonical_index]
-        records.append(
-            InventoryRecord(
-                pane_id=pane_id,
-                session=canonical.session,
-                window_index=canonical.window_index,
-                window_name=canonical.window_name,
-                pane_index=canonical.pane_index,
-                pane_active=canonical.pane_active,
-                process=first.get("command") or "",
-                cwd=cwd,
-                repo_root=repo_root,
-                agent_kind=_fold_agent_kind(views),
-                workspace=workspace,
-                views=views,
-            )
-        )
-    return records
+        for agent in folded
+    ]
 
 
 # --- durable cache (SQLite) ----------------------------------------------------

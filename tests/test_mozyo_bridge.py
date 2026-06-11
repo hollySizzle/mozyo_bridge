@@ -12405,7 +12405,8 @@ class AgentDiscoveryTest(unittest.TestCase):
             self.assertEqual(0, cmd_agents_list(args))
         output = stdout.getvalue()
         self.assertIn(
-            "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS",
+            "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\t"
+            "AMBIGUOUS\tOTHER_VIEWS",
             output,
         )
         self.assertIn("sess_a\tclaude\t0\t%1\t1\tclaude\tclaude", output)
@@ -12443,6 +12444,193 @@ class AgentDiscoveryTest(unittest.TestCase):
         # repo_root is informational only; it is None when the pane cwd
         # cannot be walked to a REPO_ROOT_MARKERS-bearing directory.
         self.assertIn("repo_root", record)
+
+    def test_fold_agents_by_pane_collapses_grouped_sessions(self) -> None:
+        # Redmine #11628: the same pane in two grouped sessions is ONE agent.
+        # The canonical view is the one matching the resolver's canonical
+        # session name; the other membership lands in `views`.
+        from mozyo_bridge.domain.agent_discovery import (
+            discover_agents,
+            fold_agents_by_pane,
+        )
+
+        resolved_roots: list[str] = []
+
+        def resolver(root: str) -> str:
+            resolved_roots.append(root)
+            return "mozyo-giken-1750-labor"
+
+        with patch(
+            "mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            return_value="/repo",
+        ):
+            records = discover_agents(
+                panes=[
+                    {
+                        "id": "%851",
+                        "location": "1750-codex-view:1.0",
+                        "command": "claude",
+                        "cwd": "/repo",
+                        "window_name": "claude",
+                        "pane_active": "1",
+                    },
+                    {
+                        "id": "%851",
+                        "location": "mozyo-giken-1750-labor:2.0",
+                        "command": "claude",
+                        "cwd": "/repo",
+                        "window_name": "claude",
+                        "pane_active": "0",
+                    },
+                ]
+            )
+        folded = fold_agents_by_pane(records, resolve_canonical=resolver)
+
+        self.assertEqual(1, len(folded))
+        agent = folded[0]
+        self.assertEqual("%851", agent.pane_id)
+        self.assertEqual("mozyo-giken-1750-labor", agent.session)
+        self.assertEqual("claude", agent.agent_kind)
+        self.assertEqual(2, len(agent.views))
+        flags = {view.session: view.canonical for view in agent.views}
+        self.assertTrue(flags["mozyo-giken-1750-labor"])
+        self.assertFalse(flags["1750-codex-view"])
+        # The resolver runs once per distinct repo root, not per view.
+        self.assertEqual(["/repo"], resolved_roots)
+
+    def test_fold_agents_by_pane_without_resolver_is_deterministic(self) -> None:
+        from mozyo_bridge.domain.agent_discovery import (
+            discover_agents,
+            fold_agents_by_pane,
+        )
+
+        records = discover_agents(
+            panes=[
+                {
+                    "id": "%7",
+                    "location": "zzz-view:1.0",
+                    "command": "claude",
+                    "cwd": "",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%7",
+                    "location": "aaa-view:1.0",
+                    "command": "claude",
+                    "cwd": "",
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "",
+                    "location": "ghost:1.0",
+                    "command": "zsh",
+                    "cwd": "",
+                    "window_name": "zsh",
+                    "pane_active": "1",
+                },
+            ]
+        )
+        folded = fold_agents_by_pane(records)
+
+        # The empty-pane_id line cannot carry a stable identity and is
+        # dropped; the canonical view falls back to session sort order.
+        self.assertEqual(1, len(folded))
+        self.assertEqual("aaa-view", folded[0].session)
+
+    def test_filter_agents_session_matches_grouped_view(self) -> None:
+        # A folded pane is a member of every session it appears in, so the
+        # --session filter must match alias views, not only the canonical one.
+        from mozyo_bridge.domain.agent_discovery import (
+            discover_agents,
+            fold_agents_by_pane,
+            filter_agents,
+        )
+
+        records = fold_agents_by_pane(
+            discover_agents(
+                panes=[
+                    {
+                        "id": "%7",
+                        "location": "alias-view:1.0",
+                        "command": "claude",
+                        "cwd": "",
+                        "window_name": "claude",
+                        "pane_active": "1",
+                    },
+                    {
+                        "id": "%7",
+                        "location": "canonical-session:1.0",
+                        "command": "claude",
+                        "cwd": "",
+                        "window_name": "claude",
+                        "pane_active": "1",
+                    },
+                ]
+            ),
+            resolve_canonical=None,
+        )
+        self.assertEqual(
+            ["%7"],
+            [r.pane_id for r in filter_agents(records, session="alias-view")],
+        )
+        self.assertEqual(
+            [],
+            [r.pane_id for r in filter_agents(records, session="absent")],
+        )
+
+    def test_cmd_agents_list_json_folds_grouped_sessions(self) -> None:
+        # End-to-end #11628: `agents list --json` emits ONE record for a
+        # grouped pane, with both memberships in `views` and the canonical
+        # session (the workspace's derived session name) at the top level.
+        from mozyo_bridge.application.commands import cmd_agents_list
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            home = Path(tmp_str) / "home"
+            repo = Path(tmp_str) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            canonical = derive_session_name(repo).name
+            panes = [
+                {
+                    "id": "%851",
+                    "location": "grouped-view:1.0",
+                    "command": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+                {
+                    "id": "%851",
+                    "location": f"{canonical}:2.0",
+                    "command": "claude",
+                    "cwd": str(repo),
+                    "window_name": "claude",
+                    "pane_active": "1",
+                },
+            ]
+            args = argparse.Namespace(session=None, agent=None, as_json=True)
+            with patch.dict(
+                "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+            ), patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.domain.agent_discovery.pane_lines",
+                    return_value=panes,
+                ), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(0, cmd_agents_list(args))
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(1, len(payload))
+        record = payload[0]
+        self.assertEqual("%851", record["pane_id"])
+        self.assertEqual(canonical, record["session"])
+        self.assertEqual(2, len(record["views"]))
+        canonical_flags = {
+            view["session"]: view["canonical"] for view in record["views"]
+        }
+        self.assertTrue(canonical_flags[canonical])
+        self.assertFalse(canonical_flags["grouped-view"])
 
     def test_cmd_agents_list_rejects_unknown_agent_filter(self) -> None:
         from mozyo_bridge.application.commands import cmd_agents_list

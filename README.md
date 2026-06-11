@@ -747,11 +747,13 @@ mozyo-bridge agents list --session other-repo
 mozyo-bridge agents list --agent claude --json
 ```
 
-- `--session NAME` で session 名を完全一致 filter できます。
+- **1 行 = 1 `pane_id`** です (Redmine #11628)。tmux session group で同一 pane が複数 session に所属していても agent としては 1 行に畳まれ、所属 session は `views` 配列 (canonical flag 付き) で保持されます。先頭の `session` 列は正準 view (workspace の canonical session 名と一致する所属を優先、無ければ session 名 sort 順で決定的に選択) です。単一 tmux server 前提で、複数 server 対応時は `(socket, pane_id)` 複合キーへ拡張します。
+- `--session NAME` で session 名を完全一致 filter できます。畳まれた agent は所属するどの session 名でも match します (正準 view / grouped view の両方)。
 - `--agent claude|codex|unknown` で window-name agent rail に基づく分類で filter できます。`unknown` は agent window でない pane を意味します。
-- `--json` で JSON output が出ます (`session`, `window_index`, `window_name`, `pane_id`, `pane_index`, `pane_active`, `agent_kind`, `process`, `cwd`, `repo_root`, `ambiguous`)。
+- `--json` で JSON output が出ます (`session`, `window_index`, `window_name`, `pane_id`, `pane_index`, `pane_active`, `agent_kind`, `process`, `cwd`, `repo_root`, `ambiguous`, `views`)。既存 field の意味は従来どおり (値は正準 view のもの) で、`views` が追加です。
+- text 出力も同様に畳まれ、末尾に `OTHER_VIEWS` 列 (正準以外の所属 session、無ければ `-`) が付きます。
 - `repo_root` は pane の `cwd` から `.git` / `.tmux.conf` / `pyproject.toml` を遡って推定します。markers が見つからない場合は `null` です。情報用 field で、ここを根拠に handoff を拒否したい場合は下記の `--target-repo` を使ってください。
-- `ambiguous=true` は同一 session 内で同じ window name が複数 window に存在する状態です (resolver 既存 fail-closed と同じ条件)。
+- `ambiguous=true` はいずれかの所属 session 内で同じ window name が複数 window に存在する状態です (resolver 既存 fail-closed と同じ条件)。
 
 ### Cross-Workspace Handoff Gate
 
