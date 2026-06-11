@@ -216,6 +216,17 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-executive-terminal-setup
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/executive-terminal-setup.md
+    purpose: 役員 iTerm2 + tmux 環境の再現可能なセットアップ runbook (tmux-ui 配線、extended-keys / Shift+Enter 事実関係、iTerm2 key preset、QoL 機能の確認表)。
+    audit_role: executive_terminal_setup_logic
+    related_document_refs:
+      - logic-bootstrap
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-bootstrap
     type: logic
     status: active
