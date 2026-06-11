@@ -33,12 +33,23 @@ npm run dev:host
 ```
 
 This script installs dependencies if needed, compiles the extension, opens VS Code with this directory as the extension development path, opens the mozyo_bridge repo as the workspace, and disables TaskPilot in the development host to avoid unrelated workspace-menu errors.
+It starts a separate VS Code app instance with isolated temporary `--user-data-dir` and `--extensions-dir`, so the PoC host does not inherit the normal VS Code profile, TaskPilot, tmux-integrated, or broken auth state. The script also removes `ELECTRON_RUN_AS_NODE` when launching VS Code, which is required when the command is run from a VS Code extension-host environment.
 
 Then run the command in the Extension Development Host:
 
 ```text
 mozyo: Open Agent Pane PoC
 ```
+
+Expected smoke result:
+
+- the window title contains `Extension Development Host`
+- the workspace is `mozyo_bridge`
+- the `mozyo Agent Pane PoC` webview opens
+- `Session identity` is `ok`
+- `Doctor` is `ok`
+
+If `mozyo` does not appear in the Command Palette, the active window is not the isolated Extension Development Host. Re-run `npm run dev:host` and switch to the new window it opens.
 
 ## Expected Promotion
 
