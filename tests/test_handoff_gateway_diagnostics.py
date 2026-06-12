@@ -172,6 +172,47 @@ class CrossSessionClaudeHintIntegrationTest(unittest.TestCase):
         self.assertIn("cross-session handoff to Claude is not allowed", stderr)
         self.assertIn("no Codex-classified pane", stderr)
 
+    def test_diagnostics_tmux_failure_does_not_break_claude_block(self) -> None:
+        # Regression for the Redmine #11778 CI failure: the best-effort gateway
+        # hint calls pane_lines(), which raises SystemExit (via die()) when no
+        # tmux server is reachable (e.g. CI). That must NOT pre-empt the
+        # cross_session_claude boundary message — diagnostics catch SystemExit.
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.application.cli import build_parser
+
+        args = build_parser().parse_args(
+            [
+                "handoff", "send", "--to", "claude",
+                "--source", "redmine", "--issue", "10332", "--journal", "49623",
+                "--kind", "implementation_request",
+                "--target", "%9", "--mode", "standard",
+            ]
+        )
+
+        def boom(*_a, **_k):
+            raise SystemExit("error: tmux list-panes failed: tmux missing")
+
+        with patch.object(commands, "require_tmux"), \
+            patch.object(commands, "capture_pane", return_value=""), \
+            patch.object(commands, "run_tmux", return_value=argparse.Namespace(returncode=0, stdout="", stderr="")), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch.object(commands, "current_session_name", return_value="local"), \
+            patch.object(
+                commands,
+                "pane_info",
+                return_value=_pane("%9", "other", "claude"),
+            ), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", side_effect=boom), \
+            contextlib.redirect_stdout(io.StringIO()) as out, \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                args.func(args)
+        # The terminal output is the boundary message, not the tmux error.
+        self.assertIn("cross-session handoff to Claude is not allowed", err.getvalue())
+        json_lines = [l for l in out.getvalue().splitlines() if l.strip().startswith("{")]
+        self.assertTrue(json_lines)
+        self.assertEqual("cross_session_claude", json.loads(json_lines[-1])["reason"])
+
 
 class ExplicitPaneTargetPredicateTest(unittest.TestCase):
     def test_pane_id_is_explicit(self) -> None:
@@ -250,6 +291,7 @@ class AutoTargetRepoTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch.object(commands, "current_session_name", return_value=sender_session), \
             patch.object(commands, "pane_info", return_value=pane), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             try:

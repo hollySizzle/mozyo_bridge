@@ -1303,7 +1303,11 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                     _sess, "codex", _cands
                 )
                 print(_diag, file=sys.stderr)
-        except Exception:
+        except (Exception, SystemExit):
+            # Diagnostics are strictly best-effort. `pane_lines()` calls
+            # `die()` (SystemExit) when tmux is absent, so catch SystemExit too
+            # — a diagnostics failure must never replace the original
+            # `target_unavailable` outcome (Redmine #11778).
             pass
         raise
 
@@ -1542,7 +1546,11 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
                 )
             ]
             gateway_hint = cross_session_gateway_hint(target_session_xw, _cands)
-        except Exception:
+        except (Exception, SystemExit):
+            # Best-effort: `pane_lines()` calls `die()` (SystemExit) when tmux
+            # is absent. Catch SystemExit too so the diagnostics path can never
+            # pre-empt the `cross_session_claude` boundary message that must be
+            # the command's terminal output (Redmine #11778).
             gateway_hint = ""
         die(
             "cross-session handoff to Claude is not allowed; "
