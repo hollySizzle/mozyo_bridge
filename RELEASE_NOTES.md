@@ -6,7 +6,39 @@
 
 ## Unreleased
 
-次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。
+次の release に向けて準備中の変更です。version bump や tag 付与は別 release task で扱います。この期間の主題は **workspace 横断の session 基盤** と、その上に建てた **ユニット状態コックピット** です。「複数 workspace で今どの agent が動いていて、どこで止まっているか」を発見・観測・ジャンプできるところまでを、既存の best-effort / runtime-first 原則を崩さずに積み上げました。
+
+### workspace 横断 session inventory
+
+- `mozyo-bridge session list [--json]` を追加しました。複数 workspace で起動している mozyo session / agent pane を一覧化し、operator や外部 UI が既存 session を安全に発見できます。live tmux runtime を正本に毎回収集し、`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite` を durable cache として使います。SQLite を唯一の真実にはせず、tmux が見えないときだけ cache を `stale: true` 明示で返します。(#11421 / #11422)
+- inventory の同一性キーを `pane_id` に統一し、`agents list` も同じ model に揃えました。tmux session group で 1 つの pane が複数 session に所属しても、agent としては 1 行に畳み、所属 session は `views` 配列で保持します。コックピット上で台数を数え間違えたり二重通知したりする事故を防ぎます。(#11628)
+- session 名導出の Unicode 正規化差(NFC / NFD)バグを修正しました。macOS の readdir は NFD、文書・Redmine・agent 経由のパスは NFC で、同じ日本語ディレクトリから別々の session 名が導出され同一 workspace に複数 session が生まれていました。path identity を NFD に固定する共有 helper を入れ、session 名 hash・handoff の `--target-repo` gate・inventory の registry 照合をすべて同じ正規化に通します。(#11625)
+- 上記基盤は home-registry-first の workspace identity(registry → anchor → 導出)を踏襲しており、home / registry が消えても workspace-local anchor から identity を復元できます。受け入れ検証として、初回作成・再利用・home 消失復元・JSON schema・日本語/長い/non-git path・stale cache の各ケースを確認しました。(#11423)
+
+### ユニット状態コックピット(OTel イベントストア + 三層 join)
+
+「今 Claude / Codex のどちらで止まっているか」を見えるようにし、当該ユニットへワンアクションで跳ぶための中核機能です。Redmine=誰の番か / OTel ストア=動いているか / tmux=生きているか、の三層を join して表示します。(#11639)
+
+- **OTel イベントストア(段階1)**: agent CLI が直接発行する OpenTelemetry を localhost で受ける自前 OTLP/HTTP 受け口と、SQLite single-writer のイベントストアを追加しました。公式 Collector は立てず、既存の Python/pipx 資産の延長に収めています。受動・帯域外のため、壊れても「データが来ない」に留まり agent 本体に波及しません。プロンプト本文は保存せず、usage / イベント種別 / 最小 metadata のみを allowlist で保存します(本文系 key は deny 優先で落とす)。Claude Code の実測でイベント深度が入力待ち判定に足ることを確認しました。
+- **inventory への activity 統合(段階2)**: session bootstrap で agent 起動時に OTel endpoint と join 用属性(`mozyo.session` / `mozyo.agent` / `mozyo.workspace_id`)を注入し、`session list` の各 unit に activity(active / idle / unknown)を additive に join しました。OTel の沈黙は「待機」と「死亡」を区別できないため、idle / unknown は死亡を意味せず tmux 生死確認へ縮退します。`doctor` に受け口 health と「telemetry を一度も発していない agent(観測漏れ)」検出を追加しました。
+- **コックピット Web UI(段階3)**: 同じ daemon が `http://127.0.0.1:4318/` に unit 一覧 UI を配信します(127.0.0.1 のみ。iTerm2 Toolbelt webview / 任意ブラウザで同一 UI)。各 unit の状態表示・状態遷移フィード・Reveal in Finder・ジャンプ(attach client への `tmux switch-client`)を提供します。action は明示クリックでのみ実行し(自動前面化なし)、Content-Type / per-process token / loopback Origin の三重ゲートでブラウザ経由の意図しない実行を防ぎ、UI は DOM API のみで描画して workspace 名由来の HTML/JS 注入を塞いでいます。Toolbelt 登録手順は runbook 化しました。
+- **Redmine gate 表示(段階4)**: daemon の環境変数で信頼 Redmine base URL と API key を渡すと、各 unit にその workspace の最新更新 open issue(gate / workflow 文脈)を読み取り専用で表示します。送信先は環境変数の URL だけに固定し、repo 側の設定ファイルが送信先を変えることはできません(host 不一致は fetch せず `unconfigured`)。Redmine への書き込みは一切せず、ランタイムのハートビートを journal に残しません。
+- **launchd 常駐**: `mozyo-bridge otel launchd install / status / restart / uninstall`(macOS)で受け口を常駐できます。plist には環境変数を一切書かないため secret が乗りません。upgrade 後の restart 手順を runbook 化しています。
+
+### managed desired-state event log の設計と PoC
+
+mozyo-bridge 管理下の session / workspace について「mozyo が何を作ろうとしたか(desired state)」を replay 可能な event log として正本化し、「今 生きているか(observed liveness)」は live tmux 正本のまま維持する、という 4 層モデルを設計 doc 化しました。registry=identity / event log=desired / live tmux=liveness・handoff / inventory=projection の境界を明文化し、managed marker は registry anchor 一次 + tmux user option 二次(session 名 prefix は権限境界にしない)としています。設計に続いて、marker 分類と desired-state append の最小 PoC を実装しました(liveness / handoff には一切触れない)。(#11695 / #11698)
+
+### Claude design consultation の運用ルール化
+
+owner / Codex の設計議論を実装担当へ「Design Consultation」として投げ、実装側から反証・懸念・最小 task 分割を返す進め方を、再現可能な project-local rule として整備しました。毎回必須にはせず、正本境界・責務境界・security/credential/handoff・後戻りコストが高い場面だけ発火する high-signal gate として位置づけています。(#11702)
+
+### operator QoL(tmux UI パック)
+
+- 複数 iTerm2 window が全部「tmux」表示で見分けられない問題に対し、`agent-ui.conf` に OS window title(session 名ベース)を追加しました。あわせて `<prefix> f` で現在 pane の作業ディレクトリを Finder で開く keybinding と、tmux の `extended-keys` 透過(Claude Code の Shift+Enter 改行を tmux 越しに効かせる)を追加しています。役員環境向けの再現可能な端末セットアップ runbook も整備しました。(#11638)
+- handoff の `--target 'session:window名'` 形式が、対象 pane が存在していても常に失敗していたバグを修正しました。location 形式を pane id へ正規化するようにし、cross-session gateway の案内どおりの指定が実際に通るようになりました。(#11666)
+
+これらはいずれも docs / 機能の追加であり、本 Unreleased 期間で version bump / tag / publish は行っていません。
 
 ## v0.6.0 - 2026-06-07
 
