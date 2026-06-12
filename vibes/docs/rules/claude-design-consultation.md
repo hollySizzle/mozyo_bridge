@@ -50,7 +50,8 @@ mozyo-bridge handoff send --to claude --source redmine --issue <id> --journal <c
 ## Redmine gate lifecycle との整合
 
 - 本 rule は base の `Design Consultation Gate` / `Design Consultation Answer Gate` の **適用タイミング指針** であり、gate の意味・順序・必須 field を変えない。
-- Consultation Answer は通常 issue / US の close 条件ではない。high-signal な設計確認であり、その結論を受けて owner / Codex が Start / Implementation Request gate を切る。
+- **Design Consultation は全 issue / US の必須 close 条件ではない** (= 毎回発火させる gate ではない)。ただし **発火した場合は、その `Design Consultation Answer` と採用/却下の disposition を Review / Close Gate で照合する**。これは base の `Review Quality Hierarchy` (review 観点に Design Consultation Answer 整合を含む)、`Completion` (requested work を design consultation answer に照合)、`Close Gate Checklist` (owner / design role 判断の選択肢・採用案・却下案・理由が journal に残っていること) を継承するものであり、発火済み consultation の回答・採用判断を close 時に無視してよいという意味ではない。
+- 高 signal な設計確認の結論を受けて、owner / Codex が Start / Implementation Request gate を切る。
 - Consultation で出た方向転換 (re-parent / 分割 / scope 変更) は手戻り扱いしない (base の `Direct Request Triage (governed)` と同思想)。
 
 ## 禁止 / scope 外
