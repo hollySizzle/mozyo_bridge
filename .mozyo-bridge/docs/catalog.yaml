@@ -59,6 +59,17 @@ documents:
       - logic-release-helper-contract
       - skill-release-reference
 
+  - id: rule-claude-design-consultation
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/claude-design-consultation.md
+    purpose: Claude design consultation を high-signal gate として発火させる project-local 運用ルール (発火/非発火条件、相談 payload 要素、gate lifecycle 整合)。毎回必須にしない。
+    audit_role: claude_design_consultation_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: rule-codex-autonomous-guardrail-lane
     type: rule
     status: active
