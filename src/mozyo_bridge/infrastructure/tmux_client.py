@@ -161,6 +161,34 @@ def rename_session(old: str, new: str) -> None:
         )
 
 
+def set_user_option(target: str, option: str, value: str) -> bool:
+    """Set a tmux user option (``@name``) on ``target``. Non-fatal.
+
+    Used by the managed-marker PoC (Redmine #11699): a tmux user option is
+    the *secondary* managed signal (the registry anchor is primary). Returns
+    True on success, False when tmux rejects it — the caller degrades rather
+    than dies, because a missing marker just means ``unmanaged``.
+    """
+    result = run_tmux("set-option", "-t", target, option, value, check=False)
+    return result.returncode == 0
+
+
+def get_user_option(target: str, option: str) -> str | None:
+    """Read a tmux user option (``@name``) from ``target``. Non-fatal.
+
+    Returns the value, or ``None`` when the option is unset or tmux rejects
+    the target. ``show-options -v`` prints just the value; an unset option
+    yields an empty stdout, which is also reported as ``None``.
+    """
+    result = run_tmux(
+        "show-options", "-t", target, "-v", option, check=False
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def session_exists(session: str) -> bool:
     result = run_tmux("has-session", "-t", session, check=False)
     return result.returncode == 0

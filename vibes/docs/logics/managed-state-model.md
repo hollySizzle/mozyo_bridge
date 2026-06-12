@@ -110,14 +110,14 @@ managed 判定の優先順位:
 - session name prefix を managed 判定の権限境界にする (#10796 と矛盾)。
 - #11639 の既存 cockpit / OTel / launchd へ後付け混入 — audit 単位肥大化のため本 US で分離。
 
-## PoC 提案 (別 child task)
+## PoC 実装状況 (#11698)
 
-設計確定後、最小 PoC を別 child Task として切る (本 #11697 では実装しない):
+設計確定後の最小 PoC を実装した (liveness / handoff 不触が不変条件):
 
-1. **marker PoC**: tmux user option (`@mozyo_managed`) の set/読取と、registry anchor 一次判定との突合。liveness には触れない。
-2. **desired-state append PoC**: 1 つの mozyo コマンド境界 (例: bare `mozyo` の session 作成) で managed_events に 1 record append し、projection には影響させない。
+1. **marker PoC (#11699)**: `domain/managed_marker.py` — `classify_managed(repo_root, tmux_marker)` が registry anchor 一次 → tmux user option (`@mozyo_managed`) 二次 → `unmanaged/runtime-only` の順で判定。name prefix は引数にすら持たない (権限境界にしない、#10796)。tmux helper は `infrastructure/tmux_client.set_user_option` / `get_user_option` (非致死)。
+2. **desired-state append PoC (#11700)**: `managed_events.py` — append-only `managed-events.sqlite` v1。`record_managed_event()` が command boundary 用の best-effort append surface (失敗は None、command を壊さない)。pane_id identity / `socket` 拡張点 / 書込時 NFD 正規化 / single-writer。
 
-いずれも **liveness / handoff には一切触れない**ことを PoC の不変条件とする。
+PoC は既存 surface に projection-first 反転を加えていない (managed_events は read 経路を liveness/handoff に一切持たない — guard test で pin)。本格的な command-boundary 配線 (bare `mozyo` 等への append 埋め込み) と inventory への managed/unmanaged 区分表示は、PoC 評価後の後続段階。
 
 ## owner 判断事項 (#56318 から継続)
 

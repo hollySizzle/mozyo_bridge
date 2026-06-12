@@ -436,6 +436,17 @@ file_conventions:
       - logic-workspace-registry
       - spec-project-map
 
+  - id: fc-managed-state-source
+    name: managed marker and desired-state event log source (PoC)
+    patterns:
+      - src/mozyo_bridge/managed_events.py
+      - src/mozyo_bridge/domain/managed_marker.py
+    severity: block
+    document_refs:
+      - logic-managed-state-model
+      - logic-workspace-registry
+      - spec-project-map
+
   - id: fc-otel-event-store-source
     name: otel event store, receiver, and activity model source
     patterns:

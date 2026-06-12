@@ -84,6 +84,17 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: managed marker and desired-state event log source (PoC)
+  patterns:
+  - src/mozyo_bridge/managed_events.py
+  - src/mozyo_bridge/domain/managed_marker.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/workspace-registry.md と @vibes/docs/specs/project-map.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: otel event store, receiver, and activity model source
   patterns:
   - src/mozyo_bridge/otel_store.py
