@@ -204,6 +204,18 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-managed-state-model
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/managed-state-model.md
+    purpose: managed desired-state event log と 4 層正本境界 (registry=identity / event log=desired / live tmux=liveness・handoff / inventory=projection) + 多層 marker 方針の設計正本。
+    audit_role: managed_state_model_logic
+    related_document_refs:
+      - logic-session-inventory
+      - logic-workspace-registry
+      - logic-otel-event-store
+      - spec-project-map
+
   - id: logic-session-inventory
     type: logic
     status: active

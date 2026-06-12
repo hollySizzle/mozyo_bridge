@@ -2,6 +2,8 @@
 
 Redmine #11421 / #11422。workspace 横断で起動中の mozyo session / agent pane を operator・外部 UI が安全に発見するための inventory の設計正本。実装は `src/mozyo_bridge/session_inventory.py`、CLI は `mozyo-bridge session list [--json]`。
 
+> 正本境界 (registry=identity / live tmux=liveness・handoff / inventory=projection / event log=desired-state) の集約は `managed-state-model.md` (#11695)。本 doc の inventory は projection 層であり単独正本ではない。
+
 ## 目的
 
 - 複数 workspace で起動している mozyo session と作業 path を一覧化する。
