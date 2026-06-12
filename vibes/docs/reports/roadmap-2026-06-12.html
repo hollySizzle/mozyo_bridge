@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mozyo-bridge ロードマップ 2026-06-12</title>
+<!--
+  standalone roadmap report (Redmine #11719 / #11720).
+  外部 CDN / 外部画像 / 外部 JS / script なし。inline CSS のみ。
+  事実は RELEASE_NOTES.md の Unreleased 節と整合させている (#11711)。
+-->
+<style>
+  :root {
+    --ink: #1a1a1a; --muted: #666; --line: #e0e0e0;
+    --done: #2e7d32; --current: #1565c0; --next: #ef6c00;
+    --later: #6a1b9a; --risk: #b71c1c; --bg-soft: #fafafa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.7 -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic",
+      Meiryo, sans-serif;
+    color: var(--ink); margin: 0; background: #fff;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  header { border-bottom: 2px solid var(--ink); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); font-size: .9rem; }
+  h2 {
+    font-size: 1.2rem; margin: 2rem 0 .75rem; padding-left: .6rem;
+    border-left: 5px solid var(--line);
+  }
+  h2.done { border-left-color: var(--done); }
+  h2.current { border-left-color: var(--current); }
+  h2.next { border-left-color: var(--next); }
+  h2.later { border-left-color: var(--later); }
+  h2.risk { border-left-color: var(--risk); }
+  .tag {
+    display: inline-block; font-size: .72rem; font-weight: 700;
+    padding: .05rem .45rem; border-radius: 3px; color: #fff;
+    vertical-align: middle; margin-left: .4rem;
+  }
+  .tag.done { background: var(--done); }
+  .tag.current { background: var(--current); }
+  .tag.next { background: var(--next); }
+  .tag.later { background: var(--later); }
+  .tag.risk { background: var(--risk); }
+  .item { margin: .9rem 0; padding-left: .25rem; }
+  .item .name { font-weight: 600; }
+  .item .why { color: var(--muted); font-size: .9rem; }
+  .refs { color: var(--muted); font-size: .8rem; font-family: ui-monospace, monospace; }
+  .legend {
+    background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px;
+    padding: .75rem 1rem; font-size: .85rem; color: var(--muted); margin: 1rem 0 1.5rem;
+  }
+  ul { margin: .4rem 0 .4rem 1.2rem; padding: 0; }
+  li { margin: .3rem 0; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .8rem; }
+  .pill { font-size: .75rem; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 999px; padding: .05rem .5rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>mozyo-bridge ロードマップ</h1>
+  <div class="sub">作成日 2026-06-12 ・ 対象: workspace 横断 session 基盤 〜 ユニット状態コックピット 〜 managed state 設計</div>
+</header>
+
+<p>
+  この期間の主題は <strong>workspace 横断の session 基盤</strong> と、その上に建てた
+  <strong>ユニット状態コックピット</strong> です。「複数 workspace で今どの agent が動いていて、
+  どこで止まっているか」を発見・観測・ジャンプできるところまでを、既存の best-effort /
+  runtime-first 原則を崩さずに積み上げました。本レポートは
+  <span class="pill">RELEASE_NOTES.md の Unreleased 節</span> と事実を整合させています。
+</p>
+
+<div class="legend">
+  <strong>凡例</strong>:
+  <span class="tag done">Completed</span> 完了・受け入れ検証済み ・
+  <span class="tag current">Current</span> 直近実装/設計確定 ・
+  <span class="tag next">Next</span> 次にやること ・
+  <span class="tag later">Later</span> 後続・将来 ・
+  <span class="tag risk">Risks</span> 残リスク・判断待ち。
+  カッコ内は Redmine issue 番号です。
+</div>
+
+<h2 class="done">Completed <span class="tag done">完了</span></h2>
+
+<div class="item">
+  <div class="name">home-registry-first の workspace identity</div>
+  <div class="why">workspace identity を path からの毎回導出ではなく、home registry を正本とする登録モデルへ移行。home / registry が消えても workspace-local anchor から identity を復元できる。</div>
+  <div class="refs">Redmine #11429</div>
+</div>
+
+<div class="item">
+  <div class="name">workspace 横断 session inventory（<code>mozyo-bridge session list</code>）</div>
+  <div class="why">複数 workspace で起動している mozyo session / agent pane を一覧化し、operator や外部 UI が既存 session を安全に発見できる。live tmux runtime を正本に毎回収集し、<code>inventory.sqlite</code> は durable cache（tmux 不可視時のみ <code>stale</code> 明示で返す）。SQLite を唯一の真実にはしない。</div>
+  <div class="refs">Redmine #11421 / #11422 / #11423</div>
+</div>
+
+<div class="item">
+  <div class="name">pane_id 同一性キーへの統一</div>
+  <div class="why">tmux session group で 1 pane が複数 session に所属しても agent としては 1 行に畳み、所属 session は <code>views</code> 配列で保持。<code>agents list</code> も同じ model に揃え、台数の数え間違い・二重通知を防ぐ。</div>
+  <div class="refs">Redmine #11628</div>
+</div>
+
+<div class="item">
+  <div class="name">Unicode 正規化（NFC / NFD）の session 名分岐バグ修正</div>
+  <div class="why">macOS readdir は NFD、文書・Redmine・agent 経由のパスは NFC で、同じ日本語ディレクトリから別々の session 名が導出されていた。path identity を NFD に固定する共有 helper を入れ、session 名 hash・handoff の <code>--target-repo</code> gate・inventory の registry 照合をすべて同じ正規化に通す。</div>
+  <div class="refs">Redmine #11625</div>
+</div>
+
+<div class="item">
+  <div class="name">リリースノート（Unreleased）整理</div>
+  <div class="why">直近の基盤・コックピット・managed state・design consultation 運用化を、人間が流れとして読める粒度で <code>RELEASE_NOTES.md</code> に整理（docs-only、version bump / publish なし）。</div>
+  <div class="refs">Redmine #11711</div>
+</div>
+
+<h2 class="current">Current <span class="tag current">直近実装 / 設計確定</span></h2>
+
+<div class="item">
+  <div class="name">ユニット状態コックピット（OTel イベントストア + 三層 join）</div>
+  <div class="why">Redmine=誰の番か / OTel ストア=動いているか / tmux=生きているか、の三層を join して表示する中核機能。4 段階で実装済み：
+  </div>
+  <ul>
+    <li><strong>段階1 OTel イベントストア</strong>: agent CLI が直接発行する OpenTelemetry を localhost で受ける自前 OTLP/HTTP 受け口と SQLite single-writer ストア。公式 Collector は立てない。受動・帯域外で agent 本体に波及しない。プロンプト本文は保存せず usage / イベント種別のみ allowlist 保存（本文系 key は deny 優先）。</li>
+    <li><strong>段階2 inventory への activity 統合</strong>: session bootstrap で OTel endpoint と join 属性（<code>mozyo.session</code> / <code>mozyo.agent</code> / <code>mozyo.workspace_id</code>）を注入し、<code>session list</code> に activity（active / idle / unknown）を additive 表示。沈黙は死亡ではなく tmux 縮退。<code>doctor</code> に受け口 health と観測漏れ検出を追加。</li>
+    <li><strong>段階3 コックピット Web UI</strong>: 同じ daemon が <code>http://127.0.0.1:4318/</code> に unit 一覧 UI を配信（127.0.0.1 のみ）。状態表示・遷移フィード・Reveal in Finder・ジャンプ（<code>tmux switch-client</code>）。action は明示クリックのみ、Content-Type / per-process token / loopback Origin の三重ゲート、UI は DOM API のみで描画。</li>
+    <li><strong>段階4 Redmine gate 表示</strong>: 環境変数で渡した信頼 Redmine base URL と API key で、各 unit の最新更新 open issue を読み取り専用表示。送信先は環境変数 URL に固定（repo 側設定で送信先を変えられない）。Redmine へ書き込まず、ハートビートを残さない。</li>
+    <li><strong>launchd 常駐</strong>: <code>otel launchd install / status / restart / uninstall</code>（macOS）。plist に環境変数を書かないため secret が乗らない。</li>
+  </ul>
+  <div class="refs">Redmine #11639</div>
+</div>
+
+<div class="item">
+  <div class="name">operator QoL（tmux UI パック）</div>
+  <div class="why">iTerm2 の OS window title（session 名ベース）、<code>&lt;prefix&gt; f</code> での Finder ジャンプ、tmux <code>extended-keys</code> 透過（Shift+Enter 改行）、役員向け端末セットアップ runbook。あわせて handoff の <code>--target 'session:window名'</code> 形式が常に失敗していたバグを修正。</div>
+  <div class="refs">Redmine #11638 / #11666</div>
+</div>
+
+<div class="item">
+  <div class="name">managed desired-state event log の設計確定</div>
+  <div class="why">「mozyo が何を作ろうとしたか（desired state）」は replay 可能な event log として正本化してよく、「今 生きているか（observed liveness）」は live tmux 正本のまま、という 4 層モデルを設計 doc 化。registry=identity / event log=desired / live tmux=liveness・handoff / inventory=projection の境界を明文化。managed marker は registry anchor 一次 + tmux user option 二次（session 名 prefix は権限境界にしない）。</div>
+  <div class="refs">Redmine #11695</div>
+</div>
+
+<div class="item">
+  <div class="name">managed marker / desired-state append PoC</div>
+  <div class="why">marker 分類（anchor 一次 / tmux option 二次 / unmanaged 共存）と、append-only <code>managed-events.sqlite</code> v1（pane_id identity key、socket 拡張点、書込時 NFD 正規化、single-writer、best-effort append）の最小 PoC。liveness / handoff には一切触れない（guard test で import 不在を pin）。</div>
+  <div class="refs">Redmine #11698</div>
+</div>
+
+<div class="item">
+  <div class="name">Claude design consultation の運用ルール化</div>
+  <div class="why">owner / Codex の設計議論を実装担当へ Design Consultation として投げ、実装側から反証・懸念・最小 task 分割を返す進め方を、再現可能な project-local rule に整備。毎回必須にはせず、正本境界・責務境界・security/credential/handoff・後戻りコストが高い場面だけ発火する high-signal gate。発火した場合は Answer / disposition を Review / Close で照合する。</div>
+  <div class="refs">Redmine #11702</div>
+</div>
+
+<h2 class="next">Next <span class="tag next">次にやること</span></h2>
+
+<ul>
+  <li><strong>managed event log の command-boundary 配線</strong>: PoC の append surface を実際の mozyo コマンド境界（bare <code>mozyo</code> の session 作成等）に埋め込む。liveness には触れない。（#11698 後続）</li>
+  <li><strong>inventory への managed / unmanaged 区分表示</strong>: marker 不在の session/pane を <code>unmanaged / runtime-only</code> として共存表示する（owner 採用方針）。（#11698 後続）</li>
+  <li><strong>operator 実機確認</strong>: Toolbelt webview 登録 / ブラウザでの三層表示 / 実 API key での Redmine <code>available</code> 表示 / launchd install・restart・uninstall の実走 / <code>-CC</code> window の title 反映。</li>
+</ul>
+
+<h2 class="later">Later <span class="tag later">後続・将来</span></h2>
+
+<ul>
+  <li><strong>launchd 配下への安全な API key 受け渡し</strong>: plist に secret を載せないため、launchd 常駐時は cockpit の Redmine 層が <code>unconfigured</code> になる。keychain 等の安全な受け渡しを別途設計する。</li>
+  <li><strong>Codex / Gemini の OTel event depth 実測</strong>: Codex は config.toml opt-in、Gemini は未 install のため、env/config 注入とあわせて後続実測。それまでは tmux 縮退で安全側。</li>
+  <li><strong>Redmine gate 深度の抽出</strong>: 現状は最新 open issue の status 文脈まで。gate 見出し抽出など深い文脈が必要なら per-issue journal fetch のコスト判断を伴う後続。</li>
+  <li><strong>managed-state model の本実装</strong>: PoC 評価を経た desired-state event log の本格運用（projection への反映含む）。</li>
+</ul>
+
+<h2 class="risk">Risks / 判断待ち <span class="tag risk">残リスク</span></h2>
+
+<ul>
+  <li><strong>正本境界の維持</strong>: liveness / handoff target 解決 / preflight は live tmux 正本のまま固定する不変条件。event log / projection を先に信じる方向へ反転させると、消滅 pane への誤送信や stale 表示の事故に戻る（#11666 / #11625 で締めた境界）。後続実装でこの境界を崩さないこと。</li>
+  <li><strong>Linux での NFC-byte 既存 session 名</strong>: NFD 固定により、Linux 等で NFC-byte パスから既に導出済みの session 名が 1 回だけ変わり得る。<code>workspace register</code> で恒久化して緩和。（#11625 残リスク）</li>
+  <li><strong>外部 tmux 直接操作の扱い</strong>: marker 不在の session を「unmanaged 共存」とする方針を採用済み。完全排除はしない。</li>
+  <li><strong>owner 判断待ち</strong>: 各 US の owner close approval（packaging 変更を含む US は direct owner approval が必要）。本レポートは進捗整理であり、close 判断や release 操作は別 gate。</li>
+  <li><strong>配布反映</strong>: 上記機能の pipx 配布 CLI への反映は次回 release / 再 install で行う（本期間で version bump / tag / publish はしていない）。</li>
+</ul>
+
+<footer>
+  本レポートは Redmine #11719 / #11720 の成果物です。standalone HTML（外部 CDN / 外部画像 / 外部 JS なし、inline CSS のみ）。
+  事実関係は <code>RELEASE_NOTES.md</code> の Unreleased 節および各 Redmine issue の journal を正本とします。
+  release version 決定 / tag / publish は本レポートの scope 外です。
+</footer>
+
+</div>
+</body>
+</html>
