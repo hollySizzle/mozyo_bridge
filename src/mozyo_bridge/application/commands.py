@@ -812,7 +812,20 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
         "#{window_index}\t#{window_name}\t#{pane_current_command}",
         check=False,
     )
-    attach_command = f"tmux attach -t {session}"
+    # iTerm2 control mode (Redmine #11729): `--cc` swaps the plain
+    # `tmux attach` for `tmux -CC attach` so iTerm2 drives tmux windows as
+    # native windows/panes. It only changes the *attach* form — session
+    # derivation, the legacy-collision guard, env injection, and the
+    # claude/codex window ensure above are all unchanged. `--no-attach` and
+    # `--json` still win (ensure only, never exec); the printed / JSON attach
+    # command just reflects the `-CC` variant so a launcher copies the right
+    # command.
+    control_mode = bool(getattr(args, "cc", False))
+    attach_command = (
+        f"tmux -CC attach -t {session}"
+        if control_mode
+        else f"tmux attach -t {session}"
+    )
     if json_output:
         windows = _parse_mozyo_window_rows(result.stdout if result.returncode == 0 else "")
         present = {window["name"] for window in windows}
@@ -832,6 +845,7 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
             "attach": attach_command,
             "attach_target": session,
             "attached": False,
+            "control_mode": control_mode,
             "no_attach": no_attach_effective,
             "legacy_session_notice": notice,
         }
@@ -846,6 +860,8 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     if getattr(args, "no_attach", False):
         print(f"attach: {attach_command}")
         return 0
+    if control_mode:
+        os.execvp("tmux", ["tmux", "-CC", "attach", "-t", session])
     os.execvp("tmux", ["tmux", "attach", "-t", session])
     raise AssertionError("unreachable")
 

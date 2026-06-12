@@ -750,6 +750,17 @@ class CliTest(unittest.TestCase):
         self.assertIsNone(args.command)
         self.assertTrue(args.no_attach)
 
+    def test_bare_mozyo_defaults_cc_false(self) -> None:
+        args = build_parser().parse_args([])
+
+        self.assertFalse(args.cc)
+
+    def test_bare_mozyo_accepts_cc_flag(self) -> None:
+        args = build_parser().parse_args(["--cc"])
+
+        self.assertIsNone(args.command)
+        self.assertTrue(args.cc)
+
     def test_bare_mozyo_defaults_json_output_false(self) -> None:
         parser = build_parser()
 
@@ -6064,6 +6075,86 @@ class CommandTest(unittest.TestCase):
             ],
             payload["windows"],
         )
+
+    def _run_cmd_mozyo_capturing_execvp(self, *, cc, no_attach=False, json_output=False):
+        """Run cmd_mozyo with tmux mocked; capture os.execvp argv (or None)."""
+        tmp_ctx = tempfile.TemporaryDirectory()
+        tmp = tmp_ctx.__enter__()
+        self.addCleanup(tmp_ctx.__exit__, None, None, None)
+        repo = (Path(tmp) / "my-project").resolve()
+        repo.mkdir()
+        ns = dict(
+            repo=str(repo),
+            session=None,
+            cwd=None,
+            config_path=None,
+            ready_timeout=0,
+            force=False,
+            no_attach=no_attach,
+            cc=cc,
+        )
+        if json_output:
+            ns["json_output"] = True
+        args = argparse.Namespace(**ns)
+        list_result = argparse.Namespace(
+            returncode=0, stdout="0\tclaude\tclaude\n1\tcodex\tnode\n", stderr=""
+        )
+        calls: list[list[str]] = []
+
+        def rec_execvp(_file, argv):
+            calls.append(list(argv))
+            raise RuntimeError("attached")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+            patch("mozyo_bridge.application.commands.ensure_repo_session_windows", return_value=["claude:%1", "codex:%2"]), \
+            patch("mozyo_bridge.application.commands.run_tmux", return_value=list_result), \
+            patch("mozyo_bridge.application.commands.os.execvp", side_effect=rec_execvp), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout:
+            if no_attach or json_output:
+                rc = cmd_mozyo(args)
+                self.assertEqual(0, rc)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "attached"):
+                    cmd_mozyo(args)
+        from mozyo_bridge.domain.session_naming import derive_session_name
+
+        return derive_session_name(repo).name, calls, stdout.getvalue()
+
+    def test_cmd_mozyo_default_attach_uses_plain_tmux_attach(self) -> None:
+        session, calls, _out = self._run_cmd_mozyo_capturing_execvp(cc=False)
+        self.assertEqual([["tmux", "attach", "-t", session]], calls)
+
+    def test_cmd_mozyo_cc_attaches_via_control_mode(self) -> None:
+        session, calls, _out = self._run_cmd_mozyo_capturing_execvp(cc=True)
+        # `-CC` is a tmux global option and must precede the `attach` command.
+        self.assertEqual([["tmux", "-CC", "attach", "-t", session]], calls)
+
+    def test_cmd_mozyo_cc_no_attach_prints_control_mode_hint_without_exec(self) -> None:
+        session, calls, out = self._run_cmd_mozyo_capturing_execvp(
+            cc=True, no_attach=True
+        )
+        self.assertEqual([], calls)  # --no-attach wins: never exec
+        self.assertIn(f"attach: tmux -CC attach -t {session}", out)
+
+    def test_cmd_mozyo_cc_json_reports_control_mode_without_attaching(self) -> None:
+        session, calls, out = self._run_cmd_mozyo_capturing_execvp(
+            cc=True, json_output=True
+        )
+        self.assertEqual([], calls)  # --json never attaches
+        payload = json.loads(out)
+        self.assertTrue(payload["control_mode"])
+        self.assertEqual(f"tmux -CC attach -t {session}", payload["attach"])
+        self.assertFalse(payload["attached"])
+        self.assertTrue(payload["no_attach"])
+
+    def test_cmd_mozyo_default_json_reports_control_mode_false(self) -> None:
+        session, _calls, out = self._run_cmd_mozyo_capturing_execvp(
+            cc=False, json_output=True
+        )
+        payload = json.loads(out)
+        self.assertFalse(payload["control_mode"])
+        self.assertEqual(f"tmux attach -t {session}", payload["attach"])
 
     def test_cmd_mozyo_json_reports_ready_when_windows_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

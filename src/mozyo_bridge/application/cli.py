@@ -322,6 +322,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bare `mozyo`: ensure the repo session and agent windows but do not attach. Ignored when a subcommand is given.",
     )
     parser.add_argument(
+        "--cc",
+        action="store_true",
+        default=False,
+        dest="cc",
+        help=(
+            "Bare `mozyo`: attach via iTerm2 control mode (`tmux -CC attach`) "
+            "instead of a plain `tmux attach`, so iTerm2 manages tmux windows "
+            "as native windows/panes. Ensure behavior is unchanged. "
+            "`--no-attach` and `--json` both win: they ensure only and never "
+            "exec, so the printed/JSON attach command just reflects the `-CC` "
+            "variant. Ignored when a subcommand is given."
+        ),
+    )
+    parser.add_argument(
         "--repo",
         default=None,
         help=(

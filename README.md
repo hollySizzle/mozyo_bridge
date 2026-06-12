@@ -208,6 +208,14 @@ attach せずに session / window だけ用意したい場合:
 mozyo --no-attach
 ```
 
+iTerm2 control mode で attach したい場合 (iTerm2 が tmux window/pane を native 管理):
+
+```bash
+mozyo --cc        # ensure 後 `tmux -CC attach -t <session>` を exec
+```
+
+`--cc` は ensure 系挙動 (session 導出 / window 構成 / env 注入 / workspace identity) を変えず、attach 形だけを `tmux -CC attach` に置き換えます。`--no-attach` と `--json` は `--cc` より優先し、どちらも attach せず ensure のみで、表示 / JSON の attach コマンドが `-CC` 版を指すだけになります (`--json` payload に `control_mode` を追加)。control mode での OS window title 反映は iTerm2 側挙動に依存し実機確認が必要です (Redmine #11729)。
+
 session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に session 名を分離する場合は `mozyo --session NAME` で session 名を上書きするか、bare `mozyo --repo /path/to/another` で別 repo root を指定してください。
 
 **移行メモ**: 以前の bare `mozyo` は session 名を repo basename にしていました。導出名へ移行したため、古い basename session が残っている repo では bare `mozyo` 実行時に notice を出します。古い session に入りたい場合は `mozyo --session <旧basename>` (または `tmux attach -t <旧basename>`)、空になったら `tmux kill-session -t <旧basename>` で片付けてください。`--target-repo` gate と `init` の同名 window fail-closed は従来どおりです。

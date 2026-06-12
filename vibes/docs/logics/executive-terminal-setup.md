@@ -47,6 +47,15 @@ Redmine #11638 / #11670。役員 2 名の iTerm2 + tmux (mozyo workspace) 環境
   - **`tmux -CC` (iTerm2 control mode) の注意**: control mode では iTerm2 が window を native 管理するため、title 反映は iTerm2 側挙動に依存する。反映可否は実機で確認し、結果を該当 Redmine issue に記録する (headless 検証不能、#11671)。
 - **Finder ジャンプ**: `<prefix>` `f` で現在 pane の作業 directory を Finder で開く。default の `find-window` を上書きしているため、window 検索が必要な場合は `<prefix>` `:` から `find-window` を使う。
 
+## iTerm2 control mode 起動 (`mozyo --cc`, #11729)
+
+- `mozyo --cc` は通常の `mozyo` と同じく repo session / `claude`・`codex` window を ensure したうえで、attach を `tmux attach` ではなく `tmux -CC attach -t <session>` に置き換える。iTerm2 が tmux window/pane を native window/pane として管理する。
+- これまで必要だった `mozyo --no-attach` + 手組みの `tmux -CC attach -t <導出名>` が不要になる。owner 運用の `mozyo` 一発に乗る。
+- ensure 系挙動 (session 導出 / legacy collision guard / env 注入 / workspace identity / window 構成) は通常 `mozyo` と不変。`--cc` は attach 形だけを変える。
+- **フラグの優先順位**: `--no-attach` と `--json` は `--cc` より優先する。どちらかが付くと exec せず ensure のみで、表示 / JSON の attach コマンドが `-CC` 版を指すだけになる (silent attach はしない)。`--json` の payload には `control_mode` (bool) と `attach` (`tmux -CC attach -t <session>`) が含まれ、launcher が control-mode 起動コマンドをそのまま採れる。
+- **title 反映は実機確認が必要**: control mode では iTerm2 が window を native 管理するため、`set-titles` による OS window title 反映は iTerm2 側挙動に依存する (上記 QoL の注意と同じ)。`mozyo --cc` 実装後の title 反映可否は headless 検証不能なため、実機で観測し結果を #11729 / #11638 に記録する。
+- iTerm2 launcher プロファイル (人形使い `iterm2-iac/`, #11729 journal #56427) の Command を `--cc` 変種へ切り替えるのは operator 側作業。
+
 ## 確認表
 
 | 確認項目 | コマンド / 操作 | 期待値 |
@@ -58,6 +67,8 @@ Redmine #11638 / #11670。役員 2 名の iTerm2 + tmux (mozyo workspace) 環境
 | Shift+Enter | Claude Code 入力中に Shift+Enter | 送信されず改行される |
 | 単語削除 | iTerm2 で Option+Backspace | 直前の単語が消える |
 | Finder | `<prefix>` `f` | pane cwd が Finder で開く |
+| control mode 起動 | `mozyo --cc --no-attach` | `attach: tmux -CC attach -t <session>` が表示される |
+| control mode title | `mozyo --cc` で attach 後、iTerm2 window title | 実機観測し #11729 に記録 (iTerm2 依存) |
 
 ## 禁止事項
 
