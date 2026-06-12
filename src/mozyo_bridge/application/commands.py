@@ -868,6 +868,180 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     raise AssertionError("unreachable")
 
 
+def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
+    """Resolve the active workspaces to summon into the cockpit (Redmine #11788).
+
+    Explicit ``--repo`` columns win (deterministic order). Otherwise the active
+    mozyo workspaces are discovered from the live session inventory — one column
+    per distinct workspace that currently carries a codex/claude agent pane.
+    """
+    from mozyo_bridge.domain.cockpit_layout import CockpitWorkspace
+
+    repos = getattr(args, "layout_repos", None)
+    out: list = []
+    if repos:
+        for repo in repos:
+            resolved = str(Path(repo).expanduser().resolve())
+            canon = resolve_canonical_session(resolved)
+            wsid = getattr(canon, "workspace_id", None) or canon.name
+            out.append(
+                CockpitWorkspace(
+                    workspace_id=wsid, label=canon.name, repo_root=resolved
+                )
+            )
+        return out
+
+    from mozyo_bridge.session_inventory import take_inventory
+
+    snapshot = take_inventory()
+    by_ws: dict[str, object] = {}
+    for rec in snapshot.records:
+        if rec.agent_kind not in (AGENT_KIND_CODEX, AGENT_KIND_CLAUDE):
+            continue
+        wsid = (
+            (rec.workspace.workspace_id if rec.workspace else None)
+            or rec.repo_root
+            or rec.session
+        )
+        if wsid not in by_ws:
+            by_ws[wsid] = CockpitWorkspace(
+                workspace_id=wsid, label=rec.session, repo_root=rec.repo_root
+            )
+    return list(by_ws.values())
+
+
+def execute_cockpit_plan(plan, run) -> dict:
+    """Run a :class:`CockpitPlan`'s tmux commands, resolving logical tokens.
+
+    ``run`` is a ``run_tmux``-style callable. Each command's logical pane tokens
+    (``@colN_role``) are substituted with the real ``%pane`` id captured from an
+    earlier ``-P -F '#{pane_id}'`` command. Returns the token -> pane id map.
+
+    Fail-fast (Redmine #11788 review): a tmux step that exits non-zero, or a
+    capturing step that does not return a ``%pane`` id, is fatal. Continuing
+    would run later steps against an empty / wrong target and present a broken
+    half-built layout as if it succeeded, so the layout — whose source of truth
+    is tmux state — must abort instead.
+    """
+    ids: dict[str, str] = {}
+    for cmd in plan.commands:
+        argv = [ids.get(token, token) for token in cmd.argv]
+        result = run(*argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip() or (
+                getattr(result, "stdout", "") or ""
+            ).strip()
+            die(
+                f"cockpit layout step failed ({cmd.purpose}): "
+                f"`tmux {' '.join(argv)}` -> {detail or 'nonzero exit'}"
+            )
+        if cmd.captures:
+            pane_id = (getattr(result, "stdout", "") or "").strip()
+            if not pane_id.startswith("%"):
+                die(
+                    f"cockpit layout step did not return a pane id "
+                    f"({cmd.purpose}): got {pane_id!r}"
+                )
+            ids[cmd.captures] = pane_id
+    return ids
+
+
+def cmd_layout_apply(args: argparse.Namespace) -> int:
+    """`mozyo layout apply cockpit` — build/focus the cockpit layout (#11788).
+
+    Active workspaces become horizontal columns; within each column the agents
+    are a vertical split (Codex top, Claude bottom) at `--ratio`. tmux state is
+    the layout's source of truth; `--cc` only swaps the attach for control mode.
+    `--json` / `--dry-run` emit the planned tmux commands without touching tmux.
+    """
+    import shlex as _shlex
+
+    from mozyo_bridge.domain.cockpit_layout import (
+        COCKPIT_SESSION_DEFAULT,
+        build_cockpit_plan,
+    )
+
+    preset = getattr(args, "preset", "cockpit")
+    if preset != "cockpit":
+        die(f"unsupported layout preset: {preset!r}")
+    session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
+    codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
+
+    workspaces = _resolve_cockpit_workspaces(args)
+    if not workspaces:
+        die(
+            "no active workspace to summon into the cockpit. Pass explicit "
+            "`--repo <root>` columns, or start at least one mozyo session "
+            "(`mozyo`) so the inventory has a codex/claude pane to discover."
+        )
+
+    def launch(role: str, ws) -> str:
+        return _agent_launch_command(role, session, ws.repo_root)
+
+    plan = build_cockpit_plan(
+        workspaces, codex_ratio=codex_ratio, session=session, launch=launch
+    )
+
+    json_output = bool(getattr(args, "json_output", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    control_mode = bool(getattr(args, "cc", False))
+    no_attach = bool(getattr(args, "no_attach", False))
+    attach_command = (
+        f"tmux -CC attach -t {session}"
+        if control_mode
+        else f"tmux attach -t {session}"
+    )
+
+    if json_output:
+        import json as _json
+
+        payload = plan.as_dict()
+        payload["attach"] = attach_command
+        payload["control_mode"] = control_mode
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if dry_run:
+        print(
+            f"cockpit plan: session={session} columns={plan.columns} "
+            f"codex={plan.codex_ratio}% claude={plan.claude_ratio}%"
+        )
+        for cmd in plan.commands:
+            rendered = " ".join(_shlex.quote(token) for token in cmd.argv)
+            print(f"  tmux {rendered}")
+        print(f"attach: {attach_command}")
+        return 0
+
+    require_tmux()
+    # Reuse over duplication (Redmine #11788): when the cockpit session already
+    # exists, focus/attach it instead of rebuilding a second copy of the panes.
+    if session_exists(session):
+        print(
+            f"cockpit session {session!r} already exists; attaching without "
+            "rebuild (reuse over duplicate panes)"
+        )
+    else:
+        try:
+            execute_cockpit_plan(plan, run_tmux)
+        except SystemExit:
+            # A layout step failed mid-build (Redmine #11788 review). Tear down
+            # the partial cockpit session best-effort so a retry rebuilds
+            # cleanly instead of the reuse path adopting a broken half layout.
+            run_tmux("kill-session", "-t", session, check=False)
+            raise
+        print(
+            f"cockpit built: session={session} columns={plan.columns} "
+            f"codex={plan.codex_ratio}% claude={plan.claude_ratio}%"
+        )
+    if no_attach:
+        print(f"attach: {attach_command}")
+        return 0
+    if control_mode:
+        os.execvp("tmux", ["tmux", "-CC", "attach", "-t", session])
+    os.execvp("tmux", ["tmux", "attach", "-t", session])
+    raise AssertionError("unreachable")
+
+
 def _parse_mozyo_window_rows(table: str) -> list[dict]:
     """Parse ``list-windows`` rows (``index<TAB>name<TAB>process``) into dicts.
 

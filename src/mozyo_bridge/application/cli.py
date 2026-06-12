@@ -16,6 +16,7 @@ from mozyo_bridge.application.commands import (
     cmd_instruction_doctor,
     cmd_instruction_install,
     cmd_keys,
+    cmd_layout_apply,
     cmd_list,
     cmd_message,
     cmd_mozyo,
@@ -383,6 +384,82 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=cmd_status)
 
     sub.add_parser("list").set_defaults(func=cmd_list)
+
+    layout = sub.add_parser(
+        "layout",
+        help=(
+            "Cockpit layout presets (Redmine #11788): arrange active "
+            "workspaces as horizontal columns with a Codex-top / Claude-bottom "
+            "vertical split per workspace. tmux state is the layout's source of "
+            "truth; `--cc` only changes how it is attached."
+        ),
+    )
+    layout_sub = layout.add_subparsers(dest="layout_command", required=True)
+    layout_apply = layout_sub.add_parser(
+        "apply",
+        help="Build (or focus) a cockpit layout for the active workspaces.",
+    )
+    layout_apply.add_argument(
+        "preset",
+        choices=["cockpit"],
+        help="Layout preset. Currently only `cockpit`.",
+    )
+    layout_apply.add_argument(
+        "--ratio",
+        dest="codex_ratio",
+        type=int,
+        default=70,
+        help=(
+            "Codex pane height percentage per column (Claude takes the rest). "
+            "Default 70 (Codex 70%% / Claude 30%%); clamped to 10..90."
+        ),
+    )
+    layout_apply.add_argument(
+        "--session",
+        dest="cockpit_session",
+        default=None,
+        help="Cockpit tmux session name. Defaults to `mozyo-cockpit`.",
+    )
+    layout_apply.add_argument(
+        "--repo",
+        dest="layout_repos",
+        action="append",
+        default=None,
+        help=(
+            "Explicit workspace repo root to summon as a column (repeatable). "
+            "When omitted, active mozyo workspaces are discovered from the live "
+            "session inventory."
+        ),
+    )
+    layout_apply.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Print the planned tmux commands without running them.",
+    )
+    layout_apply.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=False,
+        help="Emit the plan as JSON (implies no tmux execution and no attach).",
+    )
+    layout_apply.add_argument(
+        "--cc",
+        dest="cc",
+        action="store_true",
+        default=False,
+        help="Attach the built cockpit via iTerm2 control mode (`tmux -CC`).",
+    )
+    layout_apply.add_argument(
+        "--no-attach",
+        dest="no_attach",
+        action="store_true",
+        default=False,
+        help="Build the cockpit but do not attach.",
+    )
+    layout_apply.set_defaults(func=cmd_layout_apply)
 
     agents = sub.add_parser(
         "agents",

@@ -216,6 +216,37 @@ mozyo --cc        # ensure 後 `tmux -CC attach -t <session>` を exec
 
 `--cc` は ensure 系挙動 (session 導出 / window 構成 / env 注入 / workspace identity) を変えず、attach 形だけを `tmux -CC attach` に置き換えます。`--no-attach` と `--json` は `--cc` より優先し、どちらも attach せず ensure のみで、表示 / JSON の attach コマンドが `-CC` 版を指すだけになります (`--json` payload に `control_mode` を追加)。control mode での OS window title 反映は iTerm2 側挙動に依存し実機確認が必要です (Redmine #11729)。
 
+### Cockpit layout (`mozyo layout apply cockpit`)
+
+複数 workspace を横並びの列にし、各列の中で Codex を上・Claude を下に縦分割した cockpit ビューを組みます (Redmine #11788)。既定比率は Codex 70% / Claude 30%。
+
+```bash
+mozyo layout apply cockpit                 # active workspace を列に並べて attach
+mozyo layout apply cockpit --ratio 60      # Codex 60% / Claude 40%
+mozyo layout apply cockpit --repo /a --repo /b   # 列にする workspace を明示
+mozyo layout apply cockpit --dry-run       # 生成する tmux コマンドを表示 (実行しない)
+mozyo layout apply cockpit --json          # plan を JSON で出力 (実行・attach しない)
+mozyo layout apply cockpit --cc            # 構築後 iTerm2 control mode で attach
+```
+
+```text
+workspace A          workspace B
++---------------+    +---------------+
+| Codex   70%   |    | Codex   70%   |
++---------------+    +---------------+
+| Claude  30%   |    | Claude  30%   |
++---------------+    +---------------+
+```
+
+責務分担:
+
+- **tmux state が layout の正本**です。cockpit は `mozyo-cockpit` session に列 (workspace) × 縦分割 (Codex/Claude) の pane を組み、各 pane の title に `workspace · role [· anchor]` を記録します。
+- **`--cc` は表示面**で、組み上がった tmux layout を iTerm2 control mode で見るための attach option です。`-CC` 自体は layout semantics を持ちません (#11729 と同じ責務)。
+- **active workspace のみ**を召喚します。`--repo` 明示が無ければ live session inventory から codex/claude pane を持つ workspace を列にします。全 unit 常時表示は非目標 (fleet overview は別)。
+- **reuse 優先**: 既に `mozyo-cockpit` session があれば重複 pane を作らず、その session に focus / attach します。`--session NAME` で別名にできます。
+- `--dry-run` / `--json` は tmux を一切触らず plan を出すので、実機 tmux / iTerm2 が無くても layout コマンド生成を確認できます。
+- 既存の bare `mozyo` / `mozyo --cc` / `--json` / `--no-attach` 契約は不変です。
+
 session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に session 名を分離する場合は `mozyo --session NAME` で session 名を上書きするか、bare `mozyo --repo /path/to/another` で別 repo root を指定してください。
 
 **移行メモ**: 以前の bare `mozyo` は session 名を repo basename にしていました。導出名へ移行したため、古い basename session が残っている repo では bare `mozyo` 実行時に notice を出します。古い session に入りたい場合は `mozyo --session <旧basename>` (または `tmux attach -t <旧basename>`)、空になったら `tmux kill-session -t <旧basename>` で片付けてください。`--target-repo` gate と `init` の同名 window fail-closed は従来どおりです。
