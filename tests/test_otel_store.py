@@ -524,7 +524,17 @@ class BootstrapInjectionTest(unittest.TestCase):
             captured.append(args)
             return argparse.Namespace(returncode=0, stdout="%5\n", stderr="")
 
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
+        # new_agent_window now records a best-effort desired-state event
+        # (Redmine #11726). Pin MOZYO_BRIDGE_HOME to a temp dir so that
+        # append lands in a throwaway managed-events.sqlite and never
+        # pollutes the operator's real home DB.
+        with tempfile.TemporaryDirectory() as tmp, \
+            patch.dict(
+                "os.environ",
+                {"MOZYO_BRIDGE_HOME": str(Path(tmp) / "home")},
+                clear=False,
+            ), \
+            patch("mozyo_bridge.application.commands.require_tmux"), \
             patch(
                 "mozyo_bridge.application.commands.run_tmux",
                 side_effect=fake_run_tmux,

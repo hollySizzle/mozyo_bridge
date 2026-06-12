@@ -563,6 +563,52 @@ def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
     return f"env {env_pairs} {AGENT_COMMANDS[agent]}"
 
 
+def _record_managed_pane_created(
+    agent: str, session: str, pane_id: str, cwd: str | None
+) -> None:
+    """Append a desired-state ``created`` event at the pane-creation boundary.
+
+    Redmine #11726: this is the one mozyo command boundary that *creates*
+    a managed pane, so it is where the desired-state event log records the
+    intent (what mozyo built, in which session, for which agent). Strictly
+    best-effort — any failure is swallowed (``record_managed_event``
+    returns None) so the desired-state log can never break session
+    creation, exactly like the OTel/telemetry posture. It records intent
+    only; it does not read or write liveness, handoff target resolution,
+    or preflight, which stay live-tmux-authoritative (#11698 invariant).
+    The pane also gets the secondary ``@mozyo_managed`` runtime marker, so
+    a running managed pane is classifiable even before registry
+    registration.
+    """
+    try:
+        from mozyo_bridge.domain.managed_marker import mark_target
+        from mozyo_bridge.managed_events import (
+            KIND_CREATED,
+            record_managed_event,
+        )
+
+        workspace_id = None
+        if cwd:
+            workspace_id = resolve_canonical_session(cwd).workspace_id
+        # repo_root is NFD-normalized inside record_managed_event (#11625).
+        record_managed_event(
+            command="mozyo",
+            event_kind=KIND_CREATED,
+            pane_id=pane_id,
+            mozyo_session=session,
+            workspace_id=workspace_id,
+            repo_root=cwd,
+            intent={"agent": agent, "window": agent},
+        )
+        # Secondary runtime marker; primary managed signal is the registry
+        # anchor. Non-fatal — a marker failure must not fail creation.
+        mark_target(pane_id)
+    except Exception:
+        # Whole boundary is best-effort: desired-state recording must never
+        # break the session/pane the operator asked mozyo to create.
+        pass
+
+
 def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
     require_tmux()
     if agent not in AGENT_COMMANDS:
@@ -577,6 +623,7 @@ def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -
     pane_id = result.stdout.strip()
     if not pane_id:
         die("tmux new-session did not return a pane id")
+    _record_managed_pane_created(agent, session, pane_id, cwd)
     return pane_id
 
 
@@ -594,6 +641,7 @@ def new_agent_window(agent: str, session: str, cwd: str | None = None) -> str:
     pane_id = result.stdout.strip()
     if not pane_id:
         die("tmux new-window did not return a pane id")
+    _record_managed_pane_created(agent, session, pane_id, cwd)
     return pane_id
 
 
