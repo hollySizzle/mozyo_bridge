@@ -153,6 +153,12 @@
 </div>
 
 <div class="item">
+  <div class="name">managed desired-state event の command-boundary 配線</div>
+  <div class="why">PoC の append surface を、mozyo が managed pane を作る唯一の境界（<code>new_agent_session_window</code> / <code>new_agent_window</code> の pane_id 確定直後）に最小配線。<code>created</code> event を best-effort append（pane_id=identity / session=attribute / repo_root=NFD 正規化）し、二次 marker を付与。helper 全体を try/except で囲み、append・marker 失敗が pane 生成を壊さない。liveness / handoff target 解決 / preflight / tmux discovery は live tmux 正本のまま（runtime 正本 module に event log/marker の read path を入れないことを guard test で pin）。古典学派寄りに observable contract（外から呼んで event が残る・失敗時も pane_id を返す・正本境界を侵さない）を検証。US-level Codex audit 承認後 <code>main</code> に merge 済みで US はクローズ。<code>RELEASE_NOTES.md</code> への明記は下記 Next の release preparation 時に行う。<span class="pill">クローズ済み</span></div>
+  <div class="refs">Redmine #11726 / #11727 / #11728</div>
+</div>
+
+<div class="item">
   <div class="name">Claude design consultation の運用ルール化</div>
   <div class="why">owner / Codex の設計議論を実装担当へ Design Consultation として投げ、実装側から反証・懸念・最小 task 分割を返す進め方を、再現可能な project-local rule に整備。毎回必須にはせず、正本境界・責務境界・security/credential/handoff・後戻りコストが高い場面だけ発火する high-signal gate。発火した場合は Answer / disposition を Review / Close で照合する。</div>
   <div class="refs">Redmine #11702</div>
@@ -161,9 +167,9 @@
 <h2 class="next">Next <span class="tag next">次にやること</span></h2>
 
 <ul>
-  <li><strong>managed event log の command-boundary 配線</strong>: PoC の append surface を実際の mozyo コマンド境界（bare <code>mozyo</code> の session 作成等）に埋め込む。liveness には触れない。（#11698 後続）</li>
-  <li><strong>inventory への managed / unmanaged 区分表示</strong>: marker 不在の session/pane を <code>unmanaged / runtime-only</code> として共存表示する（owner 採用方針）。（#11698 後続）</li>
-  <li><strong>operator 実機確認</strong>: Toolbelt webview 登録 / ブラウザでの三層表示 / 実 API key での Redmine <code>available</code> 表示 / launchd install・restart・uninstall の実走 / <code>-CC</code> window の title 反映。</li>
+  <li><strong>inventory / cockpit への managed / unmanaged 区分表示（additive）</strong>: marker 不在の session/pane を <code>unmanaged / runtime-only</code> として共存表示する（owner 採用方針）。desired-state event log を read 側に持ち込まず、表示は live tmux + registry/marker から additive に導く。（#11698 / #11726 後続）</li>
+  <li><strong>release preparation / release gate 確認</strong>: 本 Unreleased 期間の変更（session 基盤 / コックピット / managed-state 設計・PoC・command-boundary 配線 / design consultation 運用化）を release 単位として束ね、version 決定・<code>RELEASE_NOTES.md</code> の Unreleased → 確定節への昇格・tag/publish gate を owner 承認のもとで切る。本 issue では release / tag / publish はしない。</li>
+  <li><strong>operator 実機確認</strong>: Toolbelt webview 登録 / ブラウザでの三層表示 / 実 API key での Redmine <code>available</code> 表示 / launchd install・restart・uninstall の実走 / <code>-CC</code> window の title 反映 / 実機で managed pane 作成時に <code>created</code> event が append される（best-effort）ことの確認。</li>
 </ul>
 
 <h2 class="later">Later <span class="tag later">後続・将来</span></h2>
@@ -177,11 +183,18 @@
 
 <h2 class="risk">Risks / 判断待ち <span class="tag risk">残リスク</span></h2>
 
+<p class="sub" style="margin:.2rem 0 .8rem;">解消・緩和済みと、release 判断に向けて残る項目を分けて整理しています。</p>
+
+<p style="margin:.4rem 0 .2rem;font-weight:600;">緩和済み / 締めた境界</p>
 <ul>
-  <li><strong>正本境界の維持</strong>: liveness / handoff target 解決 / preflight は live tmux 正本のまま固定する不変条件。event log / projection を先に信じる方向へ反転させると、消滅 pane への誤送信や stale 表示の事故に戻る（#11666 / #11625 で締めた境界）。後続実装でこの境界を崩さないこと。</li>
+  <li><strong>正本境界の維持（command-boundary 配線後も保持）</strong>: liveness / handoff target 解決 / preflight / tmux discovery は live tmux 正本のまま固定する不変条件。#11726 の command-boundary 配線は append（desired-state 記録）のみで runtime 正本に read path を足しておらず、runtime 正本 module が event log/marker を import しないことを guard test で pin 済み。後続実装でもこの境界を崩さないこと。（#11666 / #11625 / #11726）</li>
+  <li><strong>外部 tmux 直接操作の扱い</strong>: marker 不在の session を「unmanaged 共存」とする方針を採用済み。完全排除はしない。（#11698 owner 採用）</li>
+</ul>
+
+<p style="margin:.8rem 0 .2rem;font-weight:600;">残存 / 判断待ち</p>
+<ul>
   <li><strong>Linux での NFC-byte 既存 session 名</strong>: NFD 固定により、Linux 等で NFC-byte パスから既に導出済みの session 名が 1 回だけ変わり得る。<code>workspace register</code> で恒久化して緩和。（#11625 残リスク）</li>
-  <li><strong>外部 tmux 直接操作の扱い</strong>: marker 不在の session を「unmanaged 共存」とする方針を採用済み。完全排除はしない。</li>
-  <li><strong>owner 判断待ち</strong>: 各 US の owner close approval（packaging 変更を含む US は direct owner approval が必要）。本レポートは進捗整理であり、close 判断や release 操作は別 gate。</li>
+  <li><strong>release gate / owner close approval（判断待ち）</strong>: 各 US の owner close approval（packaging 変更を含む US は direct owner approval が必要）と、Unreleased 期間を 1 release として束ねる version 決定。本レポートは進捗整理であり、close 判断・version 決定・release 操作は別 gate。</li>
   <li><strong>配布反映</strong>: 上記機能の pipx 配布 CLI への反映は次回 release / 再 install で行う（本期間で version bump / tag / publish はしていない）。</li>
 </ul>
 
