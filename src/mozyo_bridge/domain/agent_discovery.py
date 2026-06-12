@@ -303,3 +303,24 @@ def filter_agents(
             continue
         out.append(record)
     return out
+
+
+def codex_gateway_candidates(
+    target_session: str,
+    panes: Iterable[dict[str, str]] | None = None,
+) -> list[AgentRecord]:
+    """Codex-classified panes in ``target_session`` for gateway diagnostics.
+
+    Read-only diagnostic helper (Redmine #11776). Composes the existing
+    discovery pipeline — :func:`discover_agents` -> :func:`fold_agents_by_pane`
+    -> :func:`filter_agents` (``agent_kind=codex``) — so a blocked
+    cross-session handoff can name the safe Codex gateway pane(s) with the
+    concrete ``pane_id`` / ``window_name`` / ``cwd`` / ``repo_root`` an operator
+    needs to build a working ``--to codex --target <pane> --target-repo <root>``
+    command. It performs no send and widens no admission gate; callers pass the
+    already-fetched ``panes`` snapshot so this never reaches tmux on its own.
+    """
+    if not target_session:
+        return []
+    folded = fold_agents_by_pane(discover_agents(panes))
+    return filter_agents(folded, session=target_session, agent_kind=AGENT_KIND_CODEX)

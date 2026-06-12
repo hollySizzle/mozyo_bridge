@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal, Optional, Sequence
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -419,6 +419,95 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
     return "sender", "inspect handoff failure and decide the next step"
 
 
+def _gateway_candidate_lines(candidates: "Iterable[Any]") -> list[str]:
+    """Format Codex gateway candidate panes as ``- pane window cwd repo_root``.
+
+    Each candidate is a mapping (e.g. ``AgentRecord.to_dict()``) carrying
+    ``pane_id`` / ``window_name`` / ``cwd`` / ``repo_root``. Pure/string-only.
+    """
+    lines: list[str] = []
+    for cand in candidates:
+        get = cand.get
+        lines.append(
+            f"  - {get('pane_id') or '<?>'}  "
+            f"window={get('window_name') or '<?>'}  "
+            f"cwd={get('cwd') or '<?>'}  "
+            f"repo_root={get('repo_root') or '<unresolved>'}"
+        )
+    return lines
+
+
+def cross_session_gateway_hint(
+    target_session: str, candidates: "Sequence[Any]"
+) -> str:
+    """Operator hint appended to a blocked ``cross_session_claude`` outcome.
+
+    Diagnostics only (Redmine #11776): names the safe Codex gateway pane(s) in
+    ``target_session`` and a copyable explicit-pane command shape, so the
+    operator does not have to hand-discover the Codex pane and its repo root.
+    Does not change the safety boundary — cross-session ``--to claude`` stays
+    blocked; this only points at the gateway route. Pure/string-only.
+    """
+    if candidates:
+        first = candidates[0]
+        pane = first.get("pane_id") or "<codex_pane>"
+        repo = first.get("repo_root") or "<target_workspace_root>"
+        return "\n".join(
+            [
+                f"Gateway route: target session '{target_session}' has these "
+                "Codex gateway candidate pane(s):",
+                *_gateway_candidate_lines(candidates),
+                "Re-send through that Codex window using an explicit pane id and "
+                "its repo_root (keep your --source/--anchor/--kind/--summary):",
+                f"  mozyo-bridge handoff send --to codex --target {pane} "
+                f"--target-repo {repo} ...",
+            ]
+        )
+    return (
+        f"Gateway route: no Codex-classified pane found in target session "
+        f"'{target_session}'. The cross-session gateway needs a pane whose tmux "
+        "window is named 'codex' (agent_kind=codex). Start that workspace's "
+        "Codex window with `mozyo` there, or run `mozyo-bridge agents list` to "
+        "inspect classification, then re-send with `--to codex --target "
+        "<codex_pane> --target-repo <target_workspace_root>`."
+    )
+
+
+def target_unavailable_codex_diagnostic(
+    target_session: str, requested_window: str, candidates: "Sequence[Any]"
+) -> str:
+    """Diagnose a ``<session>:<window>`` ``target_unavailable`` (Redmine #11776).
+
+    Distinguishes exact tmux window-name resolution from inventory agent_kind
+    classification: a pane can be ``agent_kind=codex`` yet not resolve as
+    ``:codex`` when its tmux window carries a different name. ``candidates`` are
+    the ``agent_kind=codex`` panes in ``target_session``. Pure/string-only.
+    """
+    head = (
+        f"diagnostic: '{target_session}:{requested_window}' did not resolve to a "
+        f"live tmux window named '{requested_window}'. A tmux location target "
+        "matches the window *name* exactly, which is independent of inventory "
+        "agent_kind classification."
+    )
+    if candidates:
+        return "\n".join(
+            [
+                head,
+                f"Inventory classifies these pane(s) as Codex in "
+                f"'{target_session}':",
+                *_gateway_candidate_lines(candidates),
+                "Target one by explicit pane id (with --target-repo <repo_root>) "
+                "instead of the ':codex' window form.",
+            ]
+        )
+    return (
+        head
+        + f" No pane in '{target_session}' is classified agent_kind=codex either; "
+        "run `mozyo` there to start its Codex window, or `mozyo-bridge agents "
+        "list` to check classification."
+    )
+
+
 RECORD_FORMAT_TEXT = "text"
 RECORD_FORMAT_JSON = "json"
 RECORD_FORMAT_BOTH = "both"
@@ -671,8 +760,10 @@ __all__: Iterable[str] = (
     "build_delivery_record",
     "build_marker",
     "build_notification_body",
+    "cross_session_gateway_hint",
     "make_outcome",
     "next_action_for",
     "normalize_anchor",
     "project_last_input",
+    "target_unavailable_codex_diagnostic",
 )

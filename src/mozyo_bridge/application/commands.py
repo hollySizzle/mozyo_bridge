@@ -1256,6 +1256,37 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             record_format=record_format,
             command=record_command,
         )
+        # Diagnostics only (Redmine #11776): when a `<session>:codex` gateway
+        # location fails to resolve, distinguish exact tmux window-name
+        # resolution from inventory agent_kind classification and list the
+        # session's Codex-like candidate panes. Best-effort and additive — the
+        # original resolver failure (already printed) and the blocked outcome
+        # are unchanged.
+        try:
+            if (
+                ":" in target_arg
+                and not target_arg.startswith("%")
+                and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
+            ):
+                from mozyo_bridge.domain import pane_resolver as _pr
+                from mozyo_bridge.domain.agent_discovery import (
+                    codex_gateway_candidates,
+                )
+                from mozyo_bridge.domain.handoff import (
+                    target_unavailable_codex_diagnostic,
+                )
+
+                _sess = target_arg.split(":", 1)[0]
+                _cands = [
+                    rec.to_dict()
+                    for rec in codex_gateway_candidates(_sess, _pr.pane_lines())
+                ]
+                _diag = target_unavailable_codex_diagnostic(
+                    _sess, "codex", _cands
+                )
+                print(_diag, file=sys.stderr)
+        except Exception:
+            pass
         raise
 
     target = target_info["id"]
@@ -1402,6 +1433,27 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             record_format=record_format,
             command=record_command,
         )
+        # Diagnostics only (Redmine #11776): point the operator at the safe
+        # Codex gateway route with concrete candidate pane(s). Best-effort —
+        # any discovery failure falls back to the boundary message unchanged,
+        # and the cross-session `--to claude` block itself is untouched.
+        gateway_hint = ""
+        try:
+            from mozyo_bridge.domain import pane_resolver as _pr
+            from mozyo_bridge.domain.agent_discovery import (
+                codex_gateway_candidates,
+            )
+            from mozyo_bridge.domain.handoff import cross_session_gateway_hint
+
+            _cands = [
+                rec.to_dict()
+                for rec in codex_gateway_candidates(
+                    target_session_xw, _pr.pane_lines()
+                )
+            ]
+            gateway_hint = cross_session_gateway_hint(target_session_xw, _cands)
+        except Exception:
+            gateway_hint = ""
         die(
             "cross-session handoff to Claude is not allowed; "
             f"sender_session={sender_session_xw!r} target_session={target_session_xw!r}. "
@@ -1415,6 +1467,7 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             "`--mode pending`) remains an available fallback, e.g. when you "
             "cannot assert --target-repo. See the Cross-Workspace Handoff rule "
             "in the agent workflow."
+            + (f"\n\n{gateway_hint}" if gateway_hint else "")
         )
         raise AssertionError("unreachable")
 
