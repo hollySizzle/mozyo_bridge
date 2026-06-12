@@ -9,7 +9,9 @@
       "Bash(mozyo-bridge --help)",
       "Bash(env)",
       "mcp__redmine_epic_grid__get_issue_detail_tool",
-      "Bash(mozyo-bridge doctor *)"
+      "Bash(mozyo-bridge doctor *)",
+      "Bash(mozyo-bridge rules *)",
+      "mcp__redmine_epic_grid__list_epics_tool"
     ]
   }
 }
