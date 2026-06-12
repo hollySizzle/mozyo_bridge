@@ -140,6 +140,12 @@ class RuntimeBoundaryNotReroutedTest(unittest.TestCase):
     def test_handoff_preflight_still_uses_live_pane_info(self) -> None:
         # A light regression: the resolver path still goes through
         # pane_lines (live tmux), not any event-log lookup.
+        #
+        # pane_info() -> resolve_target() first runs validate_target(), a
+        # real-tmux pane-existence precheck. Stub it so the test is hermetic
+        # (CI has no live "%5" pane); we are only removing the live-tmux call,
+        # not substituting an event-log source — the assertion below still
+        # proves pane_info reads the patched pane_lines() snapshot.
         from mozyo_bridge.domain import pane_resolver
 
         panes = [
@@ -153,6 +159,8 @@ class RuntimeBoundaryNotReroutedTest(unittest.TestCase):
             }
         ]
         with patch(
+            "mozyo_bridge.domain.pane_resolver.validate_target"
+        ), patch(
             "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
         ):
             info = pane_resolver.pane_info("%5")
