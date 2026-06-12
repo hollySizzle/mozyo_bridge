@@ -419,6 +419,26 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
     return "sender", "inspect handoff failure and decide the next step"
 
 
+AUTO_TARGET_REPO = "auto"
+"""Sentinel `--target-repo` value that resolves identity from the target pane.
+
+Redmine #11778: `--target-repo auto` derives the cross-workspace identity gate
+from an explicitly-named `%pane`'s own cwd instead of forcing the operator to
+hand-run `tmux display-message -p -t %pane '#{pane_current_path}'`.
+"""
+
+
+def is_explicit_pane_target(target_arg: "Optional[str]") -> bool:
+    """True only for an explicit tmux pane-id target (``%n``).
+
+    Used to gate `--target-repo auto` (Redmine #11778): auto identity
+    resolution is admitted ONLY when the operator named an exact pane, never
+    for a receiver label, a ``session:window`` location, or implicit
+    receiver-window discovery. Pure/string-only.
+    """
+    return bool(target_arg) and target_arg.startswith("%")
+
+
 def _gateway_candidate_lines(candidates: "Iterable[Any]") -> list[str]:
     """Format Codex gateway candidate panes as ``- pane window cwd repo_root``.
 
@@ -757,10 +777,12 @@ __all__: Iterable[str] = (
     "SOURCES",
     "SOURCE_ASANA",
     "SOURCE_REDMINE",
+    "AUTO_TARGET_REPO",
     "build_delivery_record",
     "build_marker",
     "build_notification_body",
     "cross_session_gateway_hint",
+    "is_explicit_pane_target",
     "make_outcome",
     "next_action_for",
     "normalize_anchor",

@@ -677,7 +677,12 @@ def build_parser() -> argparse.ArgumentParser:
                 "pane's cwd must resolve to this repo root, otherwise the "
                 "handoff is rejected with `target_repo_mismatch`. Use when "
                 "the sender wants to assert which workspace the target lives "
-                "in before delivery. Drop the flag to skip the repo gate."
+                "in before delivery. Drop the flag to skip the repo gate. "
+                "Pass `auto` (Redmine #11778) to infer the root from an "
+                "explicit `%%pane` target's own cwd instead of running "
+                "`tmux display-message ... pane_current_path` by hand; "
+                "`auto` requires an explicit `%%pane` target and stays "
+                "fail-closed when no workspace/repo marker is reachable."
             ),
         )
         parser_.add_argument(

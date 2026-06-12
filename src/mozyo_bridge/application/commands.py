@@ -20,6 +20,7 @@ from mozyo_bridge.domain.agent_discovery import (
     infer_repo_root,
 )
 from mozyo_bridge.domain.handoff import (
+    AUTO_TARGET_REPO,
     AnchorError,
     KIND_LABELS,
     MODE_PENDING,
@@ -35,6 +36,7 @@ from mozyo_bridge.domain.handoff import (
     build_delivery_record,
     build_marker,
     build_notification_body,
+    is_explicit_pane_target,
     make_outcome,
     normalize_anchor,
 )
@@ -1306,6 +1308,78 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         raise
 
     target = target_info["id"]
+
+    # `--target-repo auto` (Redmine #11778): resolve the cross-workspace
+    # identity gate from the explicitly-named pane's own cwd so the operator
+    # does not hand-run `tmux display-message -p -t %pane '#{pane_current_path}'`
+    # before a safe gateway send. Strictly limited to an explicit `%pane`
+    # target — never a receiver label, a `session:window` location, or implicit
+    # discovery — and fail-closed when the pane cwd has no inferable
+    # workspace/repo root. The resolved root then flows through the SAME
+    # cross-session admission and `target_repo_mismatch` gates below as a
+    # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
+    # no reachable marker is rejected here, and `--to claude` cross-session is
+    # still blocked downstream regardless).
+    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
+        raw_target = getattr(args, "target", None)
+        if not is_explicit_pane_target(raw_target):
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "`--target-repo auto` requires an explicit `%pane` target; "
+                f"target={(raw_target or '<receiver-window>')!r} is not a "
+                "`%pane` id. Auto never widens to receiver-label, "
+                "`session:window`, or discovery targets — name the exact pane, "
+                "or pass an explicit `--target-repo <root>`."
+            )
+            raise AssertionError("unreachable")
+        auto_cwd = target_info.get("cwd") or ""
+        auto_root = infer_repo_root(auto_cwd)
+        if not auto_root:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_repo_mismatch",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "`--target-repo auto` could not infer a workspace/repo root "
+                f"from target_cwd={(auto_cwd or '<unknown>')!r}; identity "
+                "unestablished, fail-closed. Scaffold the target workspace so "
+                "it carries a `.mozyo-bridge/scaffold.json` / git marker, or "
+                "pass an explicit `--target-repo <root>`."
+            )
+            raise AssertionError("unreachable")
+        # Diagnostics: record the resolved cwd and inferred root so the auto
+        # decision is auditable, then hand the concrete root to the gates below.
+        print(
+            f"--target-repo auto resolved: target_pane={target} "
+            f"target_cwd={auto_cwd!r} -> repo_root={auto_root!r}",
+            file=sys.stderr,
+        )
+        args.target_repo = auto_root
 
     if mode == MODE_QUEUE_ENTER and target_info.get("window_name") != receiver:
         # Step 9 (v0.2). Under the relaxed queue-enter rail, marker miss does

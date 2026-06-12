@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.domain.agent_discovery import codex_gateway_candidates
 from mozyo_bridge.domain.handoff import (
     cross_session_gateway_hint,
+    is_explicit_pane_target,
     target_unavailable_codex_diagnostic,
 )
 
@@ -168,6 +171,153 @@ class CrossSessionClaudeHintIntegrationTest(unittest.TestCase):
         _stdout, stderr = self._run_send(panes)
         self.assertIn("cross-session handoff to Claude is not allowed", stderr)
         self.assertIn("no Codex-classified pane", stderr)
+
+
+class ExplicitPaneTargetPredicateTest(unittest.TestCase):
+    def test_pane_id_is_explicit(self) -> None:
+        self.assertTrue(is_explicit_pane_target("%884"))
+
+    def test_label_location_and_empty_are_not_explicit(self) -> None:
+        self.assertFalse(is_explicit_pane_target("codex"))
+        self.assertFalse(is_explicit_pane_target("sess:codex"))
+        self.assertFalse(is_explicit_pane_target(""))
+        self.assertFalse(is_explicit_pane_target(None))
+
+
+class AutoTargetRepoTest(unittest.TestCase):
+    """`--target-repo auto` (Redmine #11778): explicit-pane-only identity helper."""
+
+    def _git_repo(self) -> str:
+        ctx = tempfile.TemporaryDirectory()
+        tmp = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        repo = (Path(tmp) / "ws").resolve()
+        (repo / ".git").mkdir(parents=True)
+        return str(repo)
+
+    def _bare_dir(self) -> str:
+        ctx = tempfile.TemporaryDirectory()
+        tmp = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        d = (Path(tmp) / "no-marker").resolve()
+        d.mkdir(parents=True)
+        return str(d)
+
+    def _run(
+        self,
+        *,
+        target,
+        cwd,
+        receiver="codex",
+        sender_session="mysess",
+        pane_session="mysess",
+        window_name=None,
+        command=None,
+        pane_active="1",
+        target_repo="auto",
+    ):
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.application.cli import build_parser
+
+        window_name = window_name or receiver
+        command = command or receiver
+        pane = {
+            "id": "%884",
+            "location": f"{pane_session}:1.0",
+            "command": command,
+            "cwd": cwd,
+            "window_name": window_name,
+            "pane_active": pane_active,
+        }
+        argv = [
+            "handoff", "send", "--to", receiver,
+            "--source", "redmine", "--issue", "11775", "--journal", "56743",
+            "--kind", "review_request",
+            "--landing-timeout", "0.01", "--submit-delay", "0",
+        ]
+        if target is not None:
+            argv += ["--target", target]
+        if target_repo is not None:
+            argv += ["--target-repo", target_repo]
+        args = build_parser().parse_args(argv)
+
+        def fake_run_tmux(*a, check: bool = True):
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(commands, "require_tmux"), \
+            patch.object(commands, "capture_pane", return_value=""), \
+            patch.object(commands, "run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch.object(commands, "current_session_name", return_value=sender_session), \
+            patch.object(commands, "pane_info", return_value=pane), \
+            contextlib.redirect_stdout(io.StringIO()) as out, \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                args.func(args)
+            except SystemExit:
+                pass
+        outcome = None
+        for line in out.getvalue().splitlines():
+            if line.strip().startswith("{"):
+                try:
+                    outcome = json.loads(line)
+                except ValueError:
+                    pass
+        return outcome, out.getvalue(), err.getvalue()
+
+    def test_auto_resolves_root_from_explicit_pane_and_sends(self) -> None:
+        repo = self._git_repo()
+        outcome, _out, err = self._run(target="%884", cwd=repo)
+        # Auto resolved the identity gate; the send was not rejected by auto
+        # nor by the repo-mismatch gate.
+        self.assertIn("--target-repo auto resolved", err)
+        self.assertIn("repo_root=", err)
+        self.assertIsNotNone(outcome)
+        self.assertNotIn(outcome["reason"], {"invalid_args", "target_repo_mismatch"})
+        self.assertEqual("sent", outcome["status"])
+
+    def test_auto_resolves_for_cross_session_codex_gateway(self) -> None:
+        # The headline #11775 win: cross-session `--to codex` + explicit pane +
+        # auto is admitted without a hand-passed --target-repo.
+        repo = self._git_repo()
+        outcome, _out, err = self._run(
+            target="%884", cwd=repo, pane_session="other", sender_session="mysess"
+        )
+        self.assertIn("--target-repo auto resolved", err)
+        self.assertEqual("sent", outcome["status"])
+
+    def test_auto_rejects_non_explicit_location_target(self) -> None:
+        repo = self._git_repo()
+        outcome, _out, err = self._run(target="mysess:codex", cwd=repo)
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("requires an explicit `%pane` target", err)
+
+    def test_auto_rejects_implicit_receiver_target(self) -> None:
+        repo = self._git_repo()
+        outcome, _out, err = self._run(target=None, cwd=repo)
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("requires an explicit `%pane` target", err)
+
+    def test_auto_fails_closed_when_cwd_has_no_marker(self) -> None:
+        outcome, _out, err = self._run(target="%884", cwd=self._bare_dir())
+        self.assertEqual("target_repo_mismatch", outcome["reason"])
+        self.assertIn("could not infer a workspace/repo root", err)
+
+    def test_auto_does_not_bypass_cross_session_claude_block(self) -> None:
+        # Even with a resolvable pane root, cross-session `--to claude` stays
+        # blocked — auto only resolves identity, it never opens the direct route.
+        repo = self._git_repo()
+        outcome, _out, err = self._run(
+            target="%883",
+            cwd=repo,
+            receiver="claude",
+            command="claude",
+            window_name="claude",
+            pane_session="other",
+            sender_session="mysess",
+        )
+        self.assertEqual("cross_session_claude", outcome["reason"])
+        self.assertIn("cross-session handoff to Claude is not allowed", err)
 
 
 if __name__ == "__main__":
