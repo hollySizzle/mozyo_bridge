@@ -154,7 +154,7 @@
 
 <div class="item">
   <div class="name">managed desired-state event の command-boundary 配線</div>
-  <div class="why">PoC の append surface を、mozyo が managed pane を作る唯一の境界（<code>new_agent_session_window</code> / <code>new_agent_window</code> の pane_id 確定直後）に最小配線。<code>created</code> event を best-effort append（pane_id=identity / session=attribute / repo_root=NFD 正規化）し、二次 marker を付与。helper 全体を try/except で囲み、append・marker 失敗が pane 生成を壊さない。liveness / handoff target 解決 / preflight / tmux discovery は live tmux 正本のまま（runtime 正本 module に event log/marker の read path を入れないことを guard test で pin）。古典学派寄りに observable contract（外から呼んで event が残る・失敗時も pane_id を返す・正本境界を侵さない）を検証。US-level Codex audit 承認後 <code>main</code> に merge 済みで US はクローズ。<code>RELEASE_NOTES.md</code> への明記は下記 Next の release preparation 時に行う。<span class="pill">クローズ済み</span></div>
+  <div class="why">PoC の append surface を、mozyo が managed pane を作る唯一の境界（<code>new_agent_session_window</code> / <code>new_agent_window</code> の pane_id 確定直後）に最小配線。<code>created</code> event を best-effort append（pane_id=identity / session=attribute / repo_root=NFD 正規化）し、二次 marker を付与。helper 全体を try/except で囲み、append・marker 失敗が pane 生成を壊さない。liveness / handoff target 解決 / preflight / tmux discovery は live tmux 正本のまま（runtime 正本 module に event log/marker の read path を入れないことを guard test で pin）。古典学派寄りに observable contract（外から呼んで event が残る・失敗時も pane_id を返す・正本境界を侵さない）を検証。US-level Codex audit 承認後 <code>main</code> に merge 済みで US はクローズ。<code>RELEASE_NOTES.md</code> の Unreleased にも反映済み（#11742 release preparation）。<span class="pill">クローズ済み</span></div>
   <div class="refs">Redmine #11726 / #11727 / #11728</div>
 </div>
 
