@@ -640,6 +640,47 @@ def otel_bootstrap_env(
     }
 
 
+# Redmine #11857: opt-in permission mode for managed Claude panes.
+# Operators kept forgetting to Shift+Tab cockpit / sublane Claude panes
+# into auto mode, which stalled multi-sublane dogfooding. Exporting
+# MOZYO_CLAUDE_PERMISSION_MODE=<mode> appends `--permission-mode <mode>`
+# to the Claude launch command at every managed-pane chokepoint (cockpit,
+# layout, sublane, standalone agent windows). Unset / blank keeps the
+# historical bare `claude` launch, so existing behavior never changes
+# silently, and the flag is Claude-only — Codex launches are untouched.
+# A CLI `--permission-mode` flag overrides settings.json's
+# permissions.defaultMode for that one session only; it neither reads nor
+# writes any user / project settings file, so it cannot conflict with
+# local on-disk settings.
+CLAUDE_PERMISSION_MODE_ENV = "MOZYO_CLAUDE_PERMISSION_MODE"
+# Choices confirmed from local `claude --help` (#11857).
+CLAUDE_PERMISSION_MODES = frozenset(
+    {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
+)
+
+
+def _claude_permission_mode_flag(agent: str) -> str:
+    """`--permission-mode <mode>` suffix for managed Claude panes, or ``""``.
+
+    Opt-in via MOZYO_CLAUDE_PERMISSION_MODE and scoped to the Claude agent
+    only. An unset / blank value yields no flag (unchanged launch). An
+    unrecognized value is a hard error so a typo cannot silently fall back
+    to a default-permission pane the operator did not intend.
+    """
+    if agent != "claude":
+        return ""
+    mode = os.environ.get(CLAUDE_PERMISSION_MODE_ENV, "").strip()
+    if not mode:
+        return ""
+    if mode not in CLAUDE_PERMISSION_MODES:
+        die(
+            f"{CLAUDE_PERMISSION_MODE_ENV}={mode!r} is not a valid Claude "
+            f"permission mode (choices: "
+            f"{', '.join(sorted(CLAUDE_PERMISSION_MODES))})"
+        )
+    return f" --permission-mode {mode}"
+
+
 def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
     """The shell command tmux runs for a new agent pane, with OTel env."""
     import shlex
@@ -648,7 +689,10 @@ def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
         f"{key}={shlex.quote(value)}"
         for key, value in sorted(otel_bootstrap_env(agent, session, cwd).items())
     )
-    return f"env {env_pairs} {AGENT_COMMANDS[agent]}"
+    return (
+        f"env {env_pairs} {AGENT_COMMANDS[agent]}"
+        f"{_claude_permission_mode_flag(agent)}"
+    )
 
 
 def _record_managed_pane_created(

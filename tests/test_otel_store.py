@@ -549,6 +549,66 @@ class BootstrapInjectionTest(unittest.TestCase):
         self.assertNotIn("OTEL_LOG_USER_PROMPTS", command)
 
 
+class ClaudePermissionModeLaunchTest(unittest.TestCase):
+    """Redmine #11857: opt-in `--permission-mode` for managed Claude panes.
+
+    The launch command is built once in ``_agent_launch_command`` and
+    fans out to every pane chokepoint (cockpit / layout / sublane /
+    standalone window), so asserting on that builder covers all of them.
+    """
+
+    def _command(self, agent: str, env: dict[str, str]) -> str:
+        from mozyo_bridge.application.commands import _agent_launch_command
+
+        with patch.dict("os.environ", env, clear=False):
+            return _agent_launch_command(agent, "mozyo-demo", cwd=None)
+
+    def test_unset_keeps_bare_claude_launch(self) -> None:
+        # Unset (the historical default) appends no flag: existing
+        # behavior must never change silently.
+        env = {"MOZYO_CLAUDE_PERMISSION_MODE": ""}
+        command = self._command("claude", env)
+        self.assertTrue(command.endswith(" claude"), command)
+        self.assertNotIn("--permission-mode", command)
+
+    def test_auto_mode_appended_for_claude(self) -> None:
+        env = {"MOZYO_CLAUDE_PERMISSION_MODE": "auto"}
+        command = self._command("claude", env)
+        self.assertTrue(
+            command.endswith(" claude --permission-mode auto"), command
+        )
+
+    def test_blank_whitespace_value_is_treated_as_unset(self) -> None:
+        env = {"MOZYO_CLAUDE_PERMISSION_MODE": "  "}
+        command = self._command("claude", env)
+        self.assertTrue(command.endswith(" claude"), command)
+        self.assertNotIn("--permission-mode", command)
+
+    def test_codex_pane_is_never_affected(self) -> None:
+        # The flag is Claude-only; Codex launches stay untouched even when
+        # the operator has the env var exported in their shell.
+        env = {"MOZYO_CLAUDE_PERMISSION_MODE": "auto"}
+        command = self._command("codex", env)
+        self.assertTrue(command.endswith(" codex"), command)
+        self.assertNotIn("--permission-mode", command)
+
+    def test_other_valid_modes_are_accepted(self) -> None:
+        for mode in ("acceptEdits", "bypassPermissions", "default", "dontAsk", "plan"):
+            with self.subTest(mode=mode):
+                env = {"MOZYO_CLAUDE_PERMISSION_MODE": mode}
+                command = self._command("claude", env)
+                self.assertTrue(
+                    command.endswith(f" claude --permission-mode {mode}"), command
+                )
+
+    def test_invalid_mode_is_a_hard_error(self) -> None:
+        # A typo must fail loudly rather than silently launch a
+        # default-permission pane the operator did not intend.
+        env = {"MOZYO_CLAUDE_PERMISSION_MODE": "autopilot"}
+        with self.assertRaises(SystemExit):
+            self._command("claude", env)
+
+
 class InventoryActivityJoinTest(unittest.TestCase):
     """Redmine #11675: activity joins by bootstrap hints onto pane_id rows."""
 
