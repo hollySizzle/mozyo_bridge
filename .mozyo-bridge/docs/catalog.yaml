@@ -295,7 +295,20 @@ documents:
     audit_role: executive_terminal_setup_logic
     related_document_refs:
       - logic-bootstrap
+      - logic-copy-route-runbook
       - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-copy-route-runbook
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/copy-route-runbook.md
+    purpose: Claude / Codex / tmux のコピー経路 runbook (/copy・/export・capture-pane -J・ドラッグの使い分けと限界、TUI 焼き込み改行の不可逆性、mozyo-bridge 側 copy helper 不採用の判断)。
+    audit_role: copy_route_runbook_logic
+    related_document_refs:
+      - logic-executive-terminal-setup
+      - logic-tmux-send-safety-contract
+      - rule-public-private-boundary
       - spec-project-map
 
   - id: logic-bootstrap
