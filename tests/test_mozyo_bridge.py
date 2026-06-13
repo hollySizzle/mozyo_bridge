@@ -9280,15 +9280,17 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual("invalid_args", outcome["reason"])
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
 
-    def test_queue_enter_rejects_ambiguous_role_signal_fail_closed(self) -> None:
-        # Pane option says claude but the window says codex: even though the
-        # option role matches the receiver, the signal conflict is ambiguous and
-        # must fail closed rather than press Enter.
+    def test_queue_enter_allows_cockpit_pane_despite_layout_window_name(self) -> None:
+        # Redmine #11822 audit regression (journal #57116): the live cockpit was
+        # observed with a Claude-role pane (`@mozyo_agent_role=claude`) in a
+        # window named `codex` (tmux layout / auto-naming). The explicit marker
+        # is authoritative, so a `--to claude` queue-enter send must be ALLOWED
+        # (no `--force`) — the layout window name is not a conflicting signal.
         result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff", "send", "--to", "claude", "--source", "asana",
-                "--kind", "implementation_request", "--task-id", "T1",
-                "--comment-id", "C1", "--target", "%2", "--mode", "queue-enter",
+                "--kind", "reply", "--task-id", "T1", "--comment-id", "C1",
+                "--target", "%2", "--mode", "queue-enter", "--submit-delay", "0",
             ],
             pane={
                 "id": "%2",
@@ -9299,13 +9301,12 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
                 "pane_active": "1",
                 "agent_role": "claude",
             },
-            allow_exit=True,
         )
-        self.assertIsInstance(result, SystemExit)
-        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        self.assertEqual(0, result)
         outcome = self._outcome_from_stdout(stdout)
-        self.assertEqual("blocked", outcome["status"])
-        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
 
     # --- v0.3 deterministic preflight (Step 10 / 11 / 12) -------------------------
 

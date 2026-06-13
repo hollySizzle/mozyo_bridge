@@ -69,11 +69,15 @@ class ResolveAgentRoleTest(unittest.TestCase):
         self.assertEqual(CONFIDENCE_STRONG, r.confidence)
         self.assertFalse(r.ambiguous)
 
-    def test_pane_option_wins_over_window_but_conflict_is_ambiguous(self) -> None:
+    def test_pane_option_is_authoritative_over_layout_window_name(self) -> None:
+        # #57116: a cockpit/managed pane's explicit role marker wins over a
+        # layout/auto-named window (here `codex`); it must stay strong &
+        # non-ambiguous so the pane remains reachable, not fail-closed.
         r = resolve_agent_role(pane_option_role="claude", window_name="codex")
         self.assertEqual(AGENT_KIND_CLAUDE, r.role)
         self.assertEqual(ROLE_SOURCE_PANE_OPTION, r.role_source)
-        self.assertTrue(r.ambiguous)  # fail-closed for automatic targeting
+        self.assertEqual(CONFIDENCE_STRONG, r.confidence)
+        self.assertFalse(r.ambiguous)
 
     def test_pane_option_agreeing_with_window_is_not_ambiguous(self) -> None:
         r = resolve_agent_role(pane_option_role="claude", window_name="claude")
@@ -126,12 +130,17 @@ class DiscoverAgentsRoleTest(unittest.TestCase):
         self.assertEqual(ROLE_SOURCE_INFERRED, recs[0].role_source)
         self.assertEqual(CONFIDENCE_WEAK, recs[0].confidence)
 
-    def test_role_signal_conflict_is_flagged_ambiguous(self) -> None:
+    def test_pane_option_overrides_layout_window_name_not_ambiguous(self) -> None:
+        # #57116 regression: a cockpit Claude pane whose window is observed as
+        # `codex` (tmux layout / auto-naming) is classified claude, strong, and
+        # NOT ambiguous — the explicit marker is authoritative.
         recs = discover_agents([
-            _pane("%1", "repo:0.0", window_name="codex", agent_role="claude"),
+            _pane("%1", "mozyo-cockpit:0.0", window_name="codex", agent_role="claude"),
         ])
-        self.assertTrue(recs[0].ambiguous)
         self.assertEqual(AGENT_KIND_CLAUDE, recs[0].agent_kind)
+        self.assertEqual(ROLE_SOURCE_PANE_OPTION, recs[0].role_source)
+        self.assertEqual(CONFIDENCE_STRONG, recs[0].confidence)
+        self.assertFalse(recs[0].ambiguous)
 
 
 class FindAgentWindowRoleTest(unittest.TestCase):
@@ -184,11 +193,28 @@ class FindAgentWindowRoleTest(unittest.TestCase):
         with self._patch(panes):
             self.assertIsNone(find_agent_window("claude", "repo"))
 
-    def test_ambiguous_role_pane_is_not_targeted(self) -> None:
+    def test_cockpit_pane_with_layout_window_name_still_resolves(self) -> None:
+        # #57116 regression: the live cockpit was observed with a Claude-role
+        # pane (`@mozyo_agent_role=claude`) in a window named `codex`. The
+        # explicit marker is authoritative, so `--to claude` must resolve this
+        # pane (the release-blocker) rather than fail-closed on the layout name.
         from mozyo_bridge.domain.pane_resolver import find_agent_window
 
         panes = [
-            _pane("%1", "repo:0.0", window_name="codex", agent_role="claude"),
+            _pane("%9", "mozyo-cockpit:0.2", window_name="codex", agent_role="claude"),
+        ]
+        with self._patch(panes):
+            pane = find_agent_window("claude", "mozyo-cockpit")
+        self.assertIsNotNone(pane)
+        self.assertEqual("%9", pane["id"])
+
+    def test_window_name_codex_without_option_does_not_resolve_to_claude(self) -> None:
+        # A normal pane (no marker) in a `codex` window is codex, not claude —
+        # the window-name rail is unchanged when no pane option is present.
+        from mozyo_bridge.domain.pane_resolver import find_agent_window
+
+        panes = [
+            _pane("%1", "repo:0.0", window_name="codex", command="node"),
         ]
         with self._patch(panes):
             self.assertIsNone(find_agent_window("claude", "repo"))

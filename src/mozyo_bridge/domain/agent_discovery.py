@@ -211,12 +211,17 @@ def resolve_agent_role(
     2. ``window_name == claude|codex`` -> ``window_name`` / strong (legacy rail)
     3. foreground process basename ``claude`` / ``codex`` -> ``inferred`` / weak
 
-    When BOTH the pane option and the window name name an agent role and they
-    disagree, the result is ``ambiguous`` (fail-closed); the pane option is
-    reported as the role (it is the more explicit, intentional marker) but
-    callers must not auto-target an ambiguous pane. Live tmux state remains the
-    liveness / preflight source of truth (#11698) — this resolver decides
-    *identity*, never liveness.
+    The pane option is **authoritative when present** (Redmine #11822 audit,
+    journal #57116): a pane carrying ``@mozyo_agent_role`` is a cockpit / managed
+    pane, where the window name is a *layout / view* attribute — tmux auto-naming
+    or existing cockpit state can leave a Claude-role pane in a window observed
+    as ``codex``. Treating that layout name as a conflicting role signal would
+    flag the pane ambiguous and make it unreachable, re-creating the very
+    window/pane mismatch this US removes. So an explicit marker resolves
+    strong / non-ambiguous regardless of the window name; the window name is only
+    a role signal when no pane option is set (the normal-``mozyo`` rail, where
+    panes carry no option). Live tmux state remains the liveness / preflight
+    source of truth (#11698) — this resolver decides *identity*, never liveness.
     """
     option_role = _normalize_role(pane_option_role)
     window_role = _normalize_role(window_name)
@@ -228,14 +233,12 @@ def resolve_agent_role(
     )
 
     if option_role != AGENT_KIND_UNKNOWN:
-        ambiguous = (
-            window_role != AGENT_KIND_UNKNOWN and window_role != option_role
-        )
+        # Explicit marker wins; the window name is layout, not a rival signal.
         return RoleResolution(
             role=option_role,
             role_source=ROLE_SOURCE_PANE_OPTION,
             confidence=CONFIDENCE_STRONG,
-            ambiguous=ambiguous,
+            ambiguous=False,
             evidence=evidence,
         )
     if window_role != AGENT_KIND_UNKNOWN:
@@ -295,10 +298,11 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
         window_ambiguous = bool(window_name) and len(ambig_windows) > 1
         cwd = pane.get("cwd") or ""
         # Role identity comes from the resolver, not the window name alone, so a
-        # cockpit pane (role on `@mozyo_agent_role`, window `cockpit`) classifies
-        # like a normal-`mozyo` pane (role on the window name). The pane's own
-        # duplicate-window ambiguity is OR'd with the resolver's role-signal
-        # conflict — either one means "do not auto-target without disambiguation".
+        # cockpit pane (role on `@mozyo_agent_role`, window `cockpit` / a layout
+        # name) classifies like a normal-`mozyo` pane (role on the window name).
+        # The pane's duplicate-window ambiguity is OR'd with the resolver's own
+        # `ambiguous` so either one means "do not auto-target". (The resolver no
+        # longer derives ambiguity from a layout window name — see #57116.)
         resolution = resolve_agent_role(
             pane_option_role=pane.get("agent_role"),
             window_name=window_name,
