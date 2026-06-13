@@ -13955,6 +13955,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Handoff Lifecycle",
         "## Cross-Workspace Handoff",
         "## Sublane Coordinator Callback",
+        "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -14004,6 +14005,14 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "send a concise callback to the coordinator lane",
         "owner close approval requested",
         "The sublane's Codex owns the cross-lane callback",
+        # Named cockpit groups — grouping vs identity separation
+        # (Redmine #11853). A multi-cockpit layout must not become an
+        # implicit cross-group send shortcut, and the cross-group rail
+        # must route through the target group's Codex gateway.
+        "A **cockpit group is a named tmux session**",
+        "not the routing or identity source of truth",
+        "route it through the **target group's Codex** pane",
+        "Multiple cockpit sessions do not create a cross-session Claude shortcut",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
