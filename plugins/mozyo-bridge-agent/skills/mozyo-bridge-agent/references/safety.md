@@ -55,6 +55,8 @@ Writing the durable result is necessary but not always sufficient for a handoff.
 
 The return notification should be short and should point back to the durable record. Do not use the return notification as a substitute for the Redmine journal (default for `mozyo_bridge`), Asana comment (for Asana-preset repos), repository change, or other named source of truth.
 
+In a coordinator / sublane operating model (a main Codex coordinator lane dispatching work into implementation sublanes), this return boundary widens into a standing rule: when a sublane reaches any handoff-worthy state — blocked, implementation_done, review_request, review result, commit recorded, or owner close approval requested — it sends a concise callback to the coordinator lane's Codex with the durable anchor, so the work does not appear stalled from the coordinator cockpit. The callback crosses a lane boundary, so it goes Codex-to-Codex (never straight to another lane's Claude) even inside one physical cockpit session, and it stays a pointer to the Redmine journal, not a copy of it. The full procedure lives in `references/workflow.md` under `## Sublane Coordinator Callback`.
+
 ## Release Safety
 
 - Prefer GitHub Actions OIDC Trusted Publishing.

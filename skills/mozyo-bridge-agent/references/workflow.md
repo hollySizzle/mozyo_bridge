@@ -103,6 +103,39 @@ Operators routinely name a handoff target by natural language rather than a tmux
 - **Discovery is not a durable record.** `agents targets` output, like `status` / `doctor` / scrollback, is an operator/debug aid. The durable source of truth for the handoff request stays on Redmine / Asana; the resolved pane send is only the pointer.
 - **Keep operator-specific identity out of distributed defaults.** When documenting or scripting this flow, do not bake a private path, host, session nickname, or operator-specific lane policy into the OSS skill / preset defaults. The procedure is the portable part; concrete workspace identifiers belong in the operator's own runtime, not in the distributed body.
 
+## Sublane Coordinator Callback
+
+Some operating models run a **coordinator lane** (a main Codex lane that owns project management, audit, release, and lightweight verification) alongside one or more **sublanes** (implementation lanes, each with its own Codex gateway and Claude implementer). Work is dispatched from the coordinator into a sublane through the target lane's Codex gateway (see `## Natural-Name Target Handoff`), after which the durable Redmine / Asana state advances *inside* the sublane. Unless the sublane reports back, the coordinator cannot see that progress: the work looks stalled from the coordinator cockpit even though the durable record has already moved forward — for example to review-approved or owner-close-approval-waiting (Redmine #11850 j#57274, surfaced while running #11812).
+
+A sublane must send a concise callback to the coordinator lane whenever it reaches a handoff-worthy state, so the coordinator knows to read the advanced durable record. The callback is a pointer, not the work log: the Redmine journal (or Asana comment) stays the source of truth. This is the multi-lane specialization of `## Handoff Lifecycle` step 5 (the receiver notifies the originator after recording the result) and of `references/safety.md` `## Result Notification Boundary`; it does not replace either.
+
+### States that require a coordinator callback
+
+Send a callback when the sublane reaches any of these states. Each one already lands as its own durable gate / journal first; the callback only points at it:
+
+- **blocked / needs clarification** — the sublane cannot proceed without a decision or unblocking input.
+- **implementation_done** — implementation finished and recorded (recorded is not completion).
+- **review_request** — a US-level audit request (or a task-level review request under the preset exceptions) is posted.
+- **review result** — review approved, or findings recorded that need the originator's attention.
+- **commit recorded** — an audit-owned commit landed and its hash is recorded in the durable record.
+- **owner close approval requested** — the work is waiting on owner close approval.
+
+These are the transitions where another lane must act or update its view. Routine intra-lane progress (an in-flight implementation step) does not need a callback; the trigger is reaching a state the coordinator is waiting on.
+
+### Callback procedure
+
+1. **Record the durable state first.** The gate journal (Start / Implementation Done / Review Request / Review / Owner Close Approval / Close, or a Progress Log for a blocked state) must exist on the Redmine issue before the callback is sent. The callback never substitutes for the journal.
+2. **The sublane's Codex owns the cross-lane callback.** Within the sublane, the Claude implementer surfaces its state into the durable record and notifies its own lane Codex (same-lane addressing). The sublane's Codex — the lane's coordinator-facing actor — then carries the callback across the lane boundary. A single-actor sublane performs both roles, but the callback is still addressed to the coordinator's Codex, never to another lane's Claude.
+3. **Resolve the coordinator lane's Codex pane** through compact target discovery (`## Natural-Name Target Handoff`). The coordinator's user-facing actor is its Codex, so the callback addresses that Codex pane. Because this crosses a lane boundary, it obeys the same rule as dispatch — route through the target (here, coordinator) lane's Codex even when both lanes share one physical cockpit session (Redmine #11812 routing correction).
+4. **Send a short, anchored notification.** Use `mozyo-bridge handoff send --to codex --target <coordinator_codex_%pane> --target-repo auto` (or an explicit repo root) with the durable anchor in the body: the issue id, the gate journal id, the state reached, and — when relevant — the commit hash. Keep it to the minimal state + pointer; retry plans, attempted commands, and detailed findings live in the durable record, not the callback chat.
+5. **Do not poll the coordinator pane afterward.** Delivery is only a pointer; the coordinator reads the durable anchor and decides the next action (audit, owner-approval collection, close, or further routing). The sublane resumes from its own durable record.
+
+### Boundaries this procedure does not relax
+
+- **Redmine / Asana stays the source of truth.** The callback pane message is only a pointer. A coordinator receiving a callback reads the named journal / comment — not pane scrollback, `status`, or `doctor` — before acting.
+- **Cross-lane routing through Codex is preserved.** The callback addresses the coordinator lane's Codex, consistent with `## Natural-Name Target Handoff`. A shared physical cockpit session does not authorize a direct sublane-Claude-to-coordinator-Claude send; cross-lane still means Codex-to-Codex.
+- **Keep operator-specific identity out of distributed defaults.** The procedure is portable; concrete coordinator pane ids, session nicknames, host paths, and lane policy belong in the operator's own runtime, not in the OSS skill / preset body.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

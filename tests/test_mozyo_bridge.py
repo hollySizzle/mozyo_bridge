@@ -13954,6 +13954,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Ticket System Conventions",
         "## Handoff Lifecycle",
         "## Cross-Workspace Handoff",
+        "## Sublane Coordinator Callback",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -13996,6 +13997,13 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # of truth, pane is a pointer.
         "the durable source of truth",
         "pane notification is still only the pointer",
+        # Sublane coordinator callback (Redmine #11852). A sublane must
+        # report handoff-worthy states back to the coordinator lane's
+        # Codex with a durable anchor, cross-lane Codex-to-Codex, so the
+        # work does not look stalled from the coordinator cockpit.
+        "send a concise callback to the coordinator lane",
+        "owner close approval requested",
+        "The sublane's Codex owns the cross-lane callback",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
