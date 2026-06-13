@@ -1057,6 +1057,35 @@ class DoctorInstructionRunbookTest(unittest.TestCase):
         )
         self.assertIn("plugin", primary_claude["command"])
 
+    def test_cli_step_surfaces_stale_source_drift_note(self) -> None:
+        """Redmine #11855: a stale-installed-CLI warning in the cli section
+        surfaces the repo-local invocation in the CLI readiness step."""
+        from mozyo_bridge.application.doctor_instruction import (
+            STATUS_ACTION,
+            build_runbook,
+        )
+
+        doctor_result = self._doctor_result()
+        doctor_result["sections"]["cli"] = {
+            "status": "warning",
+            "version": "9.9.9",
+            "executable": "/x/mozyo-bridge",
+            "source_drift": {
+                "relation": "version-differs",
+                "repo_local_invocation": "PYTHONPATH=src python3 -m mozyo_bridge",
+            },
+            "next_action": ["use repo-local CLI"],
+        }
+        steps = build_runbook(doctor_result, {"ok": True}, "/repo", "redmine-codex")
+        cli_step = next(s for s in steps if s["id"] == "cli")
+        self.assertEqual(STATUS_ACTION, cli_step["status"])
+        self.assertTrue(
+            any(
+                "PYTHONPATH=src python3 -m mozyo_bridge" in note
+                for note in cli_step["notes"]
+            )
+        )
+
     def test_scaffold_drift_is_review_before_restore(self) -> None:
         from mozyo_bridge.application.doctor_instruction import build_runbook
 
@@ -7512,6 +7541,104 @@ class DoctorEnvironmentTest(unittest.TestCase):
         for cmd in ("doctor", "rules", "scaffold"):
             self.assertIn(cmd, section["subcommands"])
         self.assertTrue(section["package_path"].endswith("mozyo_bridge"))
+        # No target supplied → no stale-source drift check (backward compatible).
+        self.assertNotIn("source_drift", section)
+
+    def _write_fake_source_checkout(self, root: Path, *, version: str) -> Path:
+        """Lay down a checkout-shaped src/mozyo_bridge/__init__.py for drift tests."""
+        pkg = root / "src" / "mozyo_bridge"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            f'"""stub."""\n__version__ = "{version}"\n', encoding="utf-8"
+        )
+        return pkg
+
+    def test_cli_section_quiet_when_no_repo_local_source(self) -> None:
+        """Redmine #11855: post-release normal usage (no checkout) must stay quiet.
+
+        A target with no src/mozyo_bridge is the normal released-CLI case;
+        there is nothing to be stale against, so doctor neither warns nor
+        attaches a drift record.
+        """
+        from mozyo_bridge.application.doctor import doctor_cli_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            section = doctor_cli_section(Path(tmp))
+        self.assertEqual("ok", section["status"])
+        self.assertNotIn("source_drift", section)
+        self.assertEqual([], section["next_action"])
+
+    def test_cli_section_flags_stale_installed_cli_vs_repo_local_source(self) -> None:
+        """Inside a checkout whose source version differs from the running
+        install, doctor warns and points at the repo-local invocation."""
+        from mozyo_bridge.application.doctor import doctor_cli_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Pick a version guaranteed to differ from the running __version__.
+            self._write_fake_source_checkout(root, version=__version__ + ".dev999")
+            section = doctor_cli_section(root)
+
+        self.assertEqual("warning", section["status"])
+        drift = section["source_drift"]
+        self.assertEqual("version-differs", drift["relation"])
+        self.assertEqual(__version__ + ".dev999", drift["source_version"])
+        self.assertEqual(__version__, drift["running_version"])
+        self.assertEqual(
+            "PYTHONPATH=src python3 -m mozyo_bridge", drift["repo_local_invocation"]
+        )
+        self.assertTrue(section["next_action"])
+        self.assertIn(
+            "PYTHONPATH=src python3 -m mozyo_bridge", section["next_action"][0]
+        )
+
+    def test_repo_local_source_drift_none_when_running_is_the_source(self) -> None:
+        """An editable install / PYTHONPATH=src run *is* the source → no drift."""
+        from mozyo_bridge.application.doctor import repo_local_source_drift
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = self._write_fake_source_checkout(root, version="1.2.3")
+            # running package path equals the checkout's source package.
+            self.assertIsNone(
+                repo_local_source_drift(root, pkg, "1.2.3")
+            )
+
+    def test_repo_local_source_drift_same_version_is_not_a_warning(self) -> None:
+        """Paths differ but versions match: surfaced for visibility, not a warning."""
+        from mozyo_bridge.application.doctor import (
+            doctor_cli_section,
+            repo_local_source_drift,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fake_source_checkout(root, version=__version__)
+            running_elsewhere = Path("/opt/site-packages/mozyo_bridge")
+            drift = repo_local_source_drift(root, running_elsewhere, __version__)
+            self.assertIsNotNone(drift)
+            self.assertEqual("same-version", drift["relation"])
+
+            # Through the section, same-version attaches the record but stays ok
+            # (the real running install path is not the temp checkout source).
+            section = doctor_cli_section(root)
+            self.assertEqual("ok", section["status"])
+            self.assertEqual("same-version", section["source_drift"]["relation"])
+            self.assertEqual([], section["next_action"])
+
+    def test_repo_local_source_drift_unknown_version_warns(self) -> None:
+        """Source present but __version__ unparseable → unknown relation warns."""
+        from mozyo_bridge.application.doctor import doctor_cli_section
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "src" / "mozyo_bridge"
+            pkg.mkdir(parents=True)
+            (pkg / "__init__.py").write_text('"""no version here."""\n', encoding="utf-8")
+            section = doctor_cli_section(root)
+
+        self.assertEqual("warning", section["status"])
+        self.assertEqual("unknown", section["source_drift"]["relation"])
 
     def test_rules_section_reports_missing_when_not_installed(self) -> None:
         from mozyo_bridge.application.doctor import doctor_rules_section

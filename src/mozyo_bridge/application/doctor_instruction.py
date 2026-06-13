@@ -139,18 +139,28 @@ def build_runbook(
     steps: list[dict[str, Any]] = []
 
     # 1. CLI / rules readiness anchor — the runbook starts from the doctor run.
+    cli_notes = [
+        f"mozyo-bridge {cli.get('version', '?')} "
+        f"({cli.get('executable') or 'not on PATH'})",
+        "Diagnose first: mozyo-bridge doctor --target " + target + " --json",
+    ]
+    cli_drift = cli.get("source_drift")
+    if cli_drift and cli.get("status") != STATUS_OK:
+        # Stale installed CLI vs repo-local source (Redmine #11855): inside a
+        # checkout, point the operator at the repo-local invocation so a
+        # sublane does not silently run an older install missing newer
+        # subcommands.
+        cli_notes.append(
+            "Stale installed CLI vs repo-local source: during active "
+            f"development run `{cli_drift['repo_local_invocation']} <args>` "
+            "instead of the installed mozyo-bridge."
+        )
     steps.append(
         _step(
             "cli",
             "CLI readiness",
             STATUS_OK if cli.get("status") == "ok" else STATUS_ACTION,
-            notes=[
-                f"mozyo-bridge {cli.get('version', '?')} "
-                f"({cli.get('executable') or 'not on PATH'})",
-                "Diagnose first: mozyo-bridge doctor --target "
-                + target
-                + " --json",
-            ],
+            notes=cli_notes,
         )
     )
 

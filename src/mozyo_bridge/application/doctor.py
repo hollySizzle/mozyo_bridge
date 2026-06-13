@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,10 +106,87 @@ def doctor_home(args: argparse.Namespace) -> Path | None:
     return None
 
 
-def doctor_cli_section() -> dict[str, Any]:
+# Portable repo-local invocation an end user should switch to during active
+# development / sublane dogfooding. Deliberately path-agnostic: no private
+# checkout path, no operator-specific home — just the in-repo source entry that
+# every checkout exposes. Concrete paths belong in the operator's runtime, not
+# this distributed diagnostic.
+REPO_LOCAL_INVOCATION = "PYTHONPATH=src python3 -m mozyo_bridge"
+
+_SOURCE_VERSION_RE = re.compile(r"""__version__\s*=\s*["']([^"']+)["']""")
+
+
+def _read_source_version(init_path: Path) -> str | None:
+    """Parse ``__version__`` from a repo-local ``mozyo_bridge/__init__.py``.
+
+    Returns None when the file cannot be read or carries no recognizable
+    ``__version__`` assignment. Reading is text-only; the source is never
+    imported (importing it would shadow the running package).
+    """
+    try:
+        text = init_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _SOURCE_VERSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def repo_local_source_drift(
+    target: Path, running_package_path: Path, running_version: str
+) -> dict[str, Any] | None:
+    """Detect a stale installed CLI relative to the repo-local source.
+
+    During active development / sublane dogfooding inside a ``mozyo_bridge``
+    checkout, running the *installed* ``mozyo-bridge`` can shadow newer source
+    under ``src/`` — the install may lack the latest subcommands (the observed
+    case: a freshly added ``agents targets`` missing from the stale install,
+    Redmine #11855 / #11850 j#57328). This compares the running CLI's package
+    against the checkout's ``src/mozyo_bridge`` and reports drift.
+
+    Returns None — i.e. nothing to warn about — when either:
+
+    - the target has no repo-local source (``src/mozyo_bridge/__init__.py``
+      absent). This is the normal post-release case: the installed CLI is the
+      whole story and there is nothing to be stale against, so doctor stays
+      quiet outside a checkout. This is the line that keeps post-release
+      *normal usage* from being confused with active *dogfooding* usage.
+    - the running CLI already *is* the repo-local source (editable install or
+      ``PYTHONPATH=src``), so there is no drift to flag.
+
+    Otherwise returns a record describing the drift. ``relation`` is
+    ``version-differs`` (strong signal: the installed and source versions
+    disagree), ``unknown`` (source present but its version could not be read),
+    or ``same-version`` (paths differ but versions match — surfaced for
+    visibility but not a warning, since the installed CLI's public surface
+    should match at an equal version).
+    """
+    source_pkg = (target / "src" / "mozyo_bridge").resolve()
+    init_path = source_pkg / "__init__.py"
+    if not init_path.is_file():
+        return None
+    if running_package_path.resolve() == source_pkg:
+        return None
+    source_version = _read_source_version(init_path)
+    if source_version is None:
+        relation = "unknown"
+    elif source_version == running_version:
+        relation = "same-version"
+    else:
+        relation = "version-differs"
+    return {
+        "source_package": str(source_pkg),
+        "source_version": source_version or "",
+        "running_version": running_version,
+        "running_package": str(running_package_path),
+        "relation": relation,
+        "repo_local_invocation": REPO_LOCAL_INVOCATION,
+    }
+
+
+def doctor_cli_section(target: Path | None = None) -> dict[str, Any]:
     package_path = Path(mozyo_bridge.__file__).resolve().parent
     executable = shutil.which("mozyo-bridge")
-    return {
+    section: dict[str, Any] = {
         "status": "ok",
         "version": __version__,
         "executable": executable or "",
@@ -117,6 +195,20 @@ def doctor_cli_section() -> dict[str, Any]:
         "subcommands": list(EXPECTED_SUBCOMMANDS),
         "next_action": [],
     }
+    if target is not None:
+        drift = repo_local_source_drift(target, package_path, __version__)
+        if drift is not None:
+            section["source_drift"] = drift
+            if drift["relation"] in ("version-differs", "unknown"):
+                section["status"] = "warning"
+                section["next_action"].append(
+                    "running mozyo-bridge is the installed CLI "
+                    f"(version {__version__}) but this checkout has repo-local "
+                    f"source (src/mozyo_bridge {drift['source_version'] or 'version unknown'}); "
+                    "during active development run the repo-local CLI instead: "
+                    f"{drift['repo_local_invocation']} <args>"
+                )
+    return section
 
 
 def doctor_rules_section(home: Path | None) -> dict[str, Any]:
@@ -728,7 +820,7 @@ def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
     # `.mozyo-bridge/tmux/agent-ui.conf` snippet landed on the target.
     tmux_section["artifact"] = doctor_tmux_ui_artifact_info(doctor_target(args))
     sections: dict[str, dict[str, Any]] = {
-        "cli": doctor_cli_section(),
+        "cli": doctor_cli_section(doctor_target(args)),
         "rules": doctor_rules_section(doctor_home(args)),
         "codex_skill": doctor_codex_skill_section(),
         "claude_skill": doctor_claude_skill_section(args),
@@ -774,6 +866,15 @@ def format_doctor_text(result: dict[str, Any]) -> str:
             lines.append(f"  executable: {cli['executable']}")
         if cli.get("subcommands"):
             lines.append(f"  subcommands: {', '.join(cli['subcommands'])}")
+        drift = cli.get("source_drift")
+        if drift:
+            lines.append(
+                f"  source_drift: {drift['relation']} "
+                f"repo_local_source={drift['source_package']} "
+                f"source_version={drift['source_version'] or '-'}"
+            )
+        for action in cli.get("next_action", []):
+            lines.append(f"  -> {action}")
     else:
         lines.append(f"cli: {cli_status}")
 
