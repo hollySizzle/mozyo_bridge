@@ -344,7 +344,7 @@ journal の欠如』で定義し、四状態に分類し、stall check と再通
 
 - cockpit append width rebalance。
 - dogfooding 中の stale installed CLI。
-- Redmine task 作成時の subject / description separation。
+- Redmine task 作成時の subject / description separation (#11856)。
 - Claude pane launch permission mode。
 - main unit Claude role boundary。
 
@@ -385,6 +385,34 @@ permission mode を opt-in で渡せるようにした。
 - env var はその shell / cockpit session のスコープであり、durable な
   governance state ではない。permission mode を恒久 policy として扱わず、
   実行境界は Redmine gate と durable record 側に置く。
+
+## Redmine task subject / description separation (#11856)
+
+PoC 運用中、`create_task_tool` に Markdown 長文を渡した際に subject が body の
+先頭見出し (`## 背景`) になり、後続で手修正が必要になる friction が観測された
+(#11850 j#57294)。subject は body から導出されるべきものではなく、明示の一行
+要約である。
+
+これを再発しにくくする運用ルールを distributed skill 本体
+(`skills/mozyo-bridge-agent/references/workflow.md` の
+`## Ticket System Conventions` > `### Issue Subject / Description Separation`)
+に置いた。要点は次である。
+
+- **explicit-subject-on-create**: `create_*` (Redmine `create_task_tool` /
+  `create_user_story_tool` 等、Asana task 作成) を呼ぶときは、body と独立した
+  簡潔な一行 subject を必ず明示で渡す。Markdown 見出し / body 先頭行 / 切り詰め
+  断片を subject にしない。
+- **description 分離**: 目的 / 対象 path / 受入条件 / 参照は description に置き、
+  subject に流し込まない。
+- **即時修正**: 誤 subject (見出し断片 / 切り詰め断片) が land したら、その
+  session 内で `update_issue_subject_tool` (Asana は task 名更新) で簡潔な要約に
+  直し、durable record (journal / comment) に修正を記録する。後続の手 cleanup に
+  残さない。
+
+この規約は creation-time の discipline を足すだけで、gate 語彙 / hierarchy /
+必須 field を変えない (それらは central preset 側の正本のまま)。operator 固有の
+subject 文体 / 命名テンプレートは runbook 側 (`public-private-boundary.md`) に置き、
+distributed body には焼かない。
 
 ## Revision Principle
 

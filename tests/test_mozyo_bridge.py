@@ -4312,6 +4312,37 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # Claude pane.
         self.assertIn("never a Claude pane", section)
 
+    def test_issue_subject_description_separation_section_present(self) -> None:
+        """Redmine #11856: the shared skill reference must carry the
+        creation-time subject / description separation convention so agents
+        pass an explicit concise subject instead of letting a long Markdown
+        body produce a subject like `## 背景` (the #11850 j#57294 observation).
+        It must also carry the immediate-correction rule for a malformed
+        subject and stay anchored to the durable record."""
+        section_start = self.workflow.index(
+            "### Issue Subject / Description Separation"
+        )
+        section_end = self.workflow.index("\n## Local Documentation", section_start)
+        section = self.workflow[section_start:section_end]
+        # Anchored to the durable record and the concrete observed failure.
+        self.assertIn("#11856", section)
+        self.assertIn("## 背景", section)
+        # The two acceptance-criteria halves: explicit subject on create, and
+        # an immediate-correction rule for a bad subject.
+        self.assertIn("explicit-subject-on-create", section)
+        self.assertIn("Immediate-correction rule", section)
+        # Concrete creation-time discipline: always pass an explicit subject and
+        # never let the body derive it.
+        self.assertIn("Always pass an explicit `subject`", section)
+        self.assertIn("Never let the description body produce the subject", section)
+        # The correction names the actual repair tool and lands on the durable
+        # record.
+        self.assertIn("update_issue_subject_tool", section)
+        # Must not claim to change gate vocabulary / hierarchy / required fields.
+        self.assertIn("does not change any gate vocabulary", section)
+        # Portable rule vs operator's private subject style.
+        self.assertIn("public-private-boundary.md", section)
+
 
 class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
     """Regression rails for Asana 1214760806178471: the scaffold presets must
