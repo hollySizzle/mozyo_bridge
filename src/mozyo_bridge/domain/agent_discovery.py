@@ -110,6 +110,13 @@ class AgentRecord:
     ambiguous: bool
     role_source: str = ROLE_SOURCE_UNKNOWN
     confidence: str = CONFIDENCE_NONE
+    # Checkout-local lane facts (Redmine #11820), read from the pane's
+    # `@mozyo_lane_id` / `@mozyo_lane_label` options when present (cockpit panes
+    # carry them; normal-`mozyo` panes leave them empty -> the `default` lane).
+    # Carried here so compact target discovery (#11811) can distinguish
+    # same-workspace / different-lane panes without parsing titles.
+    lane_id: str = ""
+    lane_label: str | None = None
     views: tuple[PaneView, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
@@ -127,6 +134,8 @@ class AgentRecord:
             "ambiguous": self.ambiguous,
             "role_source": self.role_source,
             "confidence": self.confidence,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
             "views": [view.as_payload() for view in self.views],
         }
 
@@ -334,6 +343,8 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 ambiguous=window_ambiguous or resolution.ambiguous,
                 role_source=resolution.role_source,
                 confidence=resolution.confidence,
+                lane_id=pane.get("lane_id") or "",
+                lane_label=(pane.get("lane_label") or "").strip() or None,
             )
         )
     return records
@@ -493,3 +504,132 @@ def codex_gateway_candidates(
         return []
     folded = fold_agents_by_pane(discover_agents(panes))
     return filter_agents(folded, session=target_session, agent_kind=AGENT_KIND_CODEX)
+
+
+# --- Compact target discovery (Redmine #11811) --------------------------------
+
+# Sanitized host placeholder. Host-aware display (local vs remote SSH) is
+# #11817 scope; until then every candidate reports a generic `local` origin so
+# no private hostname leaks into compact output or any durable record.
+HOST_LOCAL = "local"
+
+
+@dataclass(frozen=True)
+class TargetCandidate:
+    """One handoff target the LLM/operator can choose, with disambiguators.
+
+    A compact, privacy-aware projection of a folded :class:`AgentRecord` plus
+    resolved workspace identity and checkout lane (Redmine #11811). It exposes
+    exactly the fields needed to pick an explicit ``pane_id`` without parsing
+    pane titles, and reuses the #11822 role resolver's ``role_source`` /
+    ``confidence`` / ``ambiguous`` so an unsafe or ambiguous target is visible
+    rather than silently selected. ``repo_short`` is the checkout basename for
+    compact text; the absolute ``repo_root`` / ``cwd`` ride in JSON only (the
+    same exposure ``agents list`` already allows).
+    """
+
+    pane_id: str
+    role: str
+    role_source: str
+    confidence: str
+    ambiguous: bool
+    session: str
+    window_name: str
+    window_index: str
+    pane_index: str
+    active: bool
+    workspace_id: str | None
+    workspace_label: str | None
+    lane_id: str
+    lane_label: str | None
+    repo_short: str | None
+    repo_root: str | None
+    cwd: str
+    host: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pane_id": self.pane_id,
+            "role": self.role,
+            "role_source": self.role_source,
+            "confidence": self.confidence,
+            "ambiguous": self.ambiguous,
+            "session": self.session,
+            "window_name": self.window_name,
+            "window_index": self.window_index,
+            "pane_index": self.pane_index,
+            "active": self.active,
+            "workspace_id": self.workspace_id,
+            "workspace_label": self.workspace_label,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
+            "repo_short": self.repo_short,
+            "repo_root": self.repo_root,
+            "cwd": self.cwd,
+            "host": self.host,
+        }
+
+
+def _normalize_lane_display(value: str | None) -> str:
+    """Empty / missing lane -> the backward-compatible ``default`` lane (#11820)."""
+    return (value or "").strip() or "default"
+
+
+def build_target_candidates(
+    records: Iterable[AgentRecord],
+    *,
+    resolve_workspace: Callable[[str], tuple[str | None, str | None]] | None = None,
+    host: str = HOST_LOCAL,
+) -> list[TargetCandidate]:
+    """Project folded agent records into compact target candidates (#11811).
+
+    ``records`` are already folded by ``pane_id`` (one row per agent). Only
+    classified agents (``claude`` / ``codex``) are emitted — an ``unknown`` pane
+    is not a handoff target. ``resolve_workspace(repo_root)`` returns
+    ``(workspace_id, workspace_label)`` for the checkout (registry → anchor →
+    derivation, same chain as the inventory); it is invoked once per distinct
+    repo root. The lane is read from the pane's ``@mozyo_lane_id`` option
+    (``default`` when absent). This is pure: no tmux, no registry I/O of its own.
+
+    Listing is deliberately non-selecting — same-role candidates stay
+    distinguishable by workspace / lane / pane_id and the caller must choose an
+    explicit pane, so a natural name can never auto-cross a safety boundary.
+    """
+    workspace_cache: dict[str, tuple[str | None, str | None]] = {}
+
+    def workspace_for(repo_root: str | None) -> tuple[str | None, str | None]:
+        if resolve_workspace is None or not repo_root:
+            return (None, None)
+        if repo_root not in workspace_cache:
+            workspace_cache[repo_root] = resolve_workspace(repo_root)
+        return workspace_cache[repo_root]
+
+    candidates: list[TargetCandidate] = []
+    for record in records:
+        if record.agent_kind == AGENT_KIND_UNKNOWN:
+            continue
+        workspace_id, workspace_label = workspace_for(record.repo_root)
+        repo_short = Path(record.repo_root).name if record.repo_root else None
+        candidates.append(
+            TargetCandidate(
+                pane_id=record.pane_id,
+                role=record.agent_kind,
+                role_source=record.role_source,
+                confidence=record.confidence,
+                ambiguous=record.ambiguous,
+                session=record.session,
+                window_name=record.window_name,
+                window_index=record.window_index,
+                pane_index=record.pane_index,
+                active=record.pane_active,
+                workspace_id=workspace_id,
+                workspace_label=workspace_label,
+                lane_id=_normalize_lane_display(record.lane_id),
+                lane_label=record.lane_label,
+                repo_short=repo_short,
+                repo_root=record.repo_root,
+                cwd=record.cwd,
+                host=host,
+            )
+        )
+    return candidates

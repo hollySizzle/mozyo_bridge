@@ -16,6 +16,7 @@ from mozyo_bridge.domain.agent_discovery import (
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     CONFIDENCE_STRONG,
+    build_target_candidates,
     discover_agents,
     filter_agents,
     infer_repo_root,
@@ -211,6 +212,87 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
                     record.cwd or "-",
                     "1" if record.ambiguous else "0",
                     other_views or "-",
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_agents_targets(args: argparse.Namespace) -> int:
+    """Compact handoff-target discovery for LLM / operator use (Redmine #11811).
+
+    Read-only. Prints the classified agent panes as candidate handoff targets
+    with just the fields needed to pick an explicit ``pane_id`` without parsing
+    titles: role + resolver provenance (``role_source`` / ``confidence`` /
+    ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
+    repo identifier, liveness, and location. Builds on the same
+    ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
+    the two never drift, and resolves workspace identity through the registry →
+    anchor → derivation chain. Compact text hides absolute paths (basename
+    only); ``--json`` carries ``repo_root`` / ``cwd`` (the exposure ``agents
+    list`` already allows). Listing is non-selecting: same-role candidates stay
+    distinguishable by workspace / lane / pane and the caller must name the
+    explicit pane, so a natural name never auto-crosses a safety boundary. Live
+    tmux remains the liveness source (``active``); registry / anchor are
+    identity hints only.
+    """
+    from mozyo_bridge.domain.agent_discovery import fold_agents_by_pane
+
+    require_tmux()
+    agent_filter = getattr(args, "agent", None)
+    if agent_filter is not None and agent_filter not in AGENT_KINDS:
+        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    session_filter = getattr(args, "session", None)
+
+    canonical_cache: dict[str, object] = {}
+
+    def _canonical(repo_root: str):
+        if repo_root not in canonical_cache:
+            canonical_cache[repo_root] = resolve_canonical_session(repo_root)
+        return canonical_cache[repo_root]
+
+    records = filter_agents(
+        fold_agents_by_pane(
+            discover_agents(),
+            resolve_canonical=lambda root: _canonical(root).name,
+        ),
+        session=session_filter,
+        agent_kind=agent_filter,
+    )
+
+    def resolve_workspace(repo_root: str):
+        canon = _canonical(repo_root)
+        return (getattr(canon, "workspace_id", None), getattr(canon, "name", None))
+
+    candidates = build_target_candidates(records, resolve_workspace=resolve_workspace)
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = [candidate.to_dict() for candidate in candidates]
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print(
+        "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
+        "SESSION\tWINDOW"
+    )
+    for c in candidates:
+        lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
+        print(
+            "\t".join(
+                [
+                    c.pane_id or "-",
+                    c.role,
+                    c.role_source,
+                    c.confidence,
+                    "1" if c.ambiguous else "0",
+                    c.workspace_label or c.workspace_id or "-",
+                    lane,
+                    c.repo_short or "-",
+                    "1" if c.active else "0",
+                    c.session or "-",
+                    c.window_name or "-",
                 ]
             )
         )

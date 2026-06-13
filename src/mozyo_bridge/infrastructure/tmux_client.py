@@ -52,11 +52,13 @@ def try_pane_lines() -> list[dict[str, str]] | None:
         "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
         "#{pane_current_command}\t#{pane_current_path}\t"
         "#{window_name}\t#{pane_active}\t"
-        # Machine-readable mozyo pane options (Redmine #11803 / #11820 / #11822).
-        # Cockpit panes live under window `cockpit` and carry their agent role /
-        # workspace / lane on these user options instead of the window name, so
-        # the role resolver can classify them. Empty for panes that lack them.
-        "#{@mozyo_agent_role}\t#{@mozyo_workspace_id}\t#{@mozyo_lane_id}"
+        # Machine-readable mozyo pane options (Redmine #11803 / #11820 / #11822 /
+        # #11811). Cockpit panes live under window `cockpit` and carry their
+        # agent role / workspace / lane on these user options instead of the
+        # window name, so the role resolver can classify them and compact target
+        # discovery can disambiguate without title parsing. Empty when unset.
+        "#{@mozyo_agent_role}\t#{@mozyo_workspace_id}\t#{@mozyo_lane_id}\t"
+        "#{@mozyo_lane_label}"
     )
     try:
         result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -77,10 +79,10 @@ def pane_lines() -> list[dict[str, str]]:
 def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
     for line in stdout.splitlines():
-        # 9 tab-separated fields; the trailing mozyo option fields are empty for
+        # 10 tab-separated fields; the trailing mozyo option fields are empty for
         # panes that do not carry them (older tmux output / pre-option panes).
         # Splitting with maxsplit keeps any stray tab inside the last field.
-        parts = (line.split("\t", 8) + [""] * 9)[:9]
+        parts = (line.split("\t", 9) + [""] * 10)[:10]
         (
             pane_id,
             location,
@@ -91,6 +93,7 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
             agent_role,
             workspace_id,
             lane_id,
+            lane_label,
         ) = parts
         panes.append(
             {
@@ -103,6 +106,7 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
                 "agent_role": agent_role,
                 "workspace_id": workspace_id,
                 "lane_id": lane_id,
+                "lane_label": lane_label,
             }
         )
     return panes

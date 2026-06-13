@@ -6,6 +6,7 @@ import sys
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
     cmd_agents_list,
+    cmd_agents_targets,
     cmd_config,
     cmd_doctor,
     cmd_doctor_instruction,
@@ -576,6 +577,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON output instead of the tab-separated table.",
     )
     agents_list.set_defaults(func=cmd_agents_list)
+
+    agents_targets = agents_sub.add_parser(
+        "targets",
+        help=(
+            "Compact handoff-target discovery for LLM / operator use (Redmine "
+            "#11811). Lists classified agent panes (claude / codex) as candidate "
+            "targets with role + resolver provenance (role_source / confidence / "
+            "ambiguous), workspace id + label, checkout lane, a short repo "
+            "identifier, liveness, and location — enough to choose an explicit "
+            "pane_id without parsing titles. Read-only. Listing is non-selecting: "
+            "same-role candidates stay distinguishable by workspace / lane / pane, "
+            "so a natural name never auto-crosses a safety boundary. Compact text "
+            "hides absolute paths; --json adds repo_root / cwd."
+        ),
+    )
+    agents_targets.add_argument(
+        "--session",
+        help=(
+            "Filter to candidates that are members of this tmux session (exact "
+            "name; matches the canonical session or any grouped view)."
+        ),
+    )
+    agents_targets.add_argument(
+        "--agent",
+        choices=sorted(AGENT_KINDS),
+        help="Filter by classified agent kind (claude / codex).",
+    )
+    agents_targets.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON candidates instead of the compact table.",
+    )
+    agents_targets.set_defaults(func=cmd_agents_targets)
 
     config = sub.add_parser("tmux-ui-config")
     add_repo_option(config)
