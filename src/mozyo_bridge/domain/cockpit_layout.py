@@ -215,6 +215,27 @@ def normalize_ratio(codex_ratio: int) -> int:
     return max(10, min(90, int(codex_ratio)))
 
 
+def even_column_share(total_columns: int) -> int:
+    """Percent width of one column when ``total_columns`` share the window evenly.
+
+    Used to size an appended full-height column (Redmine #11854). A bare
+    ``split-window -h -f`` gives the new full-height column ~50% of the *whole*
+    window on every append, so each append halves the existing columns and the
+    last-added lane balloons while older lanes starve (#11850 j#57317). Sizing
+    the split to ``-l {even_column_share(N)}%`` instead makes the new column take
+    only its fair ``1/N`` of the window; with ``-f`` the percentage is of the
+    full window width, so tmux scales the existing (already-equal) columns into
+    the remaining space and every column stays equal — while each column keeps
+    its vertical Codex/Claude split (which ``select-layout even-horizontal``
+    would have flattened, see :func:`build_cockpit_append_plan`).
+
+    Clamped to a splittable 1..99 so a degenerate ``total_columns`` can never
+    emit a 0% or 100% split that tmux would reject.
+    """
+    n = max(2, int(total_columns))
+    return max(1, min(99, round(100 / n)))
+
+
 def normalize_lane(value: Optional[str]) -> str:
     """Empty / missing lane id -> the backward-compatible ``default`` lane."""
     text = (value or "").strip()
@@ -466,7 +487,18 @@ def build_cockpit_append_plan(
     # height — a true new column — and we deliberately do NOT re-run
     # `even-horizontal`, so each existing workspace keeps its Codex-top /
     # Claude-bottom pair intact.
-    codex_argv = ["split-window", "-h", "-f", "-t", anchor_pane]
+    #
+    # Size the split to the new column's fair `1/N` share of the window
+    # (Redmine #11854). Without `-l`, the full-height split takes ~50% of the
+    # whole window each time, so the newest lane balloons and the existing lanes
+    # starve (#11850 j#57317). With `-f` the `-l N%` is a percentage of the full
+    # window width, so tmux scales the existing (equal) columns into the rest and
+    # every column stays equal — re-equalizing widths without an `even-horizontal`
+    # that would flatten the vertical splits.
+    even_share = even_column_share(column_index + 1)
+    codex_argv = [
+        "split-window", "-h", "-f", "-l", f"{even_share}%", "-t", anchor_pane,
+    ]
     if workspace.repo_root:
         codex_argv += ["-c", workspace.repo_root]
     codex_argv += ["-P", "-F", "#{pane_id}"]

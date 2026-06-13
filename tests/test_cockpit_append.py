@@ -42,14 +42,42 @@ class AppendPlannerTest(unittest.TestCase):
         plan = self._plan()
         first = plan.commands[0]
         # Full-height horizontal split (`-h -f`) so the new column does not
-        # carve up the anchor's cell (Redmine #11807).
-        self.assertEqual(("split-window", "-h", "-f", "-t", "%7"), first.argv[:5])
+        # carve up the anchor's cell (Redmine #11807), sized to the new column's
+        # fair share so widths re-equalize (Redmine #11854). column_index=1 ->
+        # 2 columns total -> 50% each.
+        self.assertEqual(
+            ("split-window", "-h", "-f", "-l", "50%", "-t", "%7"), first.argv[:7]
+        )
         self.assertEqual("@col1_codex", first.captures)
         self.assertEqual(1, plan.columns)
         # then a vertical split for the new column's claude pane.
         self.assertTrue(
             any(c.argv[:2] == ("split-window", "-v") for c in plan.commands)
         )
+
+    def test_new_column_sized_to_fair_share_re_equalizes_widths(self) -> None:
+        # Redmine #11854: a bare `split-window -h -f` grabs ~50% of the whole
+        # window on every append, so the newest lane balloons and existing lanes
+        # starve. Sizing the full-height split to 1/N of the window instead keeps
+        # all N columns equal. column_index = number of existing columns, so the
+        # new total is column_index + 1.
+        for existing, expected_pct in [(1, "50%"), (2, "33%"), (3, "25%"), (4, "20%")]:
+            plan = build_cockpit_append_plan(
+                CockpitWorkspace("wsN", "sessN", "/repoN"),
+                anchor_pane="%7",
+                column_index=existing,
+            )
+            split = plan.commands[0]
+            self.assertEqual("split-window", split.argv[0])
+            self.assertIn("-f", split.argv)  # full-height: a true new column
+            # the split carries an explicit `-l <pct>%` fair share.
+            self.assertIn("-l", split.argv)
+            pct = split.argv[split.argv.index("-l") + 1]
+            self.assertEqual(
+                expected_pct, pct,
+                f"{existing} existing columns -> new column should take "
+                f"{expected_pct} of the window, got {pct}",
+            )
 
     def test_append_does_not_flatten_existing_columns(self) -> None:
         # Regression for Redmine #11807: `select-layout even-horizontal` would
@@ -83,6 +111,29 @@ class AppendPlannerTest(unittest.TestCase):
             build_cockpit_append_plan(
                 CockpitWorkspace("w", "s", "/r"), anchor_pane="", column_index=1
             )
+
+
+class EvenColumnShareTest(unittest.TestCase):
+    """Fair-share column width for append re-equalization (Redmine #11854)."""
+
+    def test_share_is_one_over_n_percent(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import even_column_share
+
+        self.assertEqual(50, even_column_share(2))
+        self.assertEqual(33, even_column_share(3))
+        self.assertEqual(25, even_column_share(4))
+        self.assertEqual(20, even_column_share(5))
+        self.assertEqual(17, even_column_share(6))
+
+    def test_degenerate_counts_clamp_to_a_splittable_percentage(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import even_column_share
+
+        # 0 / 1 columns can't yield a 0% or 100% split tmux would reject; clamp
+        # to a sane 2-column (50%) floor and keep 1..99.
+        self.assertEqual(50, even_column_share(1))
+        self.assertEqual(50, even_column_share(0))
+        self.assertGreaterEqual(even_column_share(200), 1)
+        self.assertLessEqual(even_column_share(200), 99)
 
 
 class FocusPlannerTest(unittest.TestCase):
@@ -224,8 +275,9 @@ class CockpitDecisionTest(unittest.TestCase):
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
         out, _r, _e = self._run(self._args(), columns=cols)
         self.assertIn("action=append", out)
-        # appends a full-height column split from the existing codex pane.
-        self.assertIn("tmux split-window -h -f -t %1", out)
+        # appends a full-height column split from the existing codex pane, sized
+        # to the new column's fair share (1 existing -> 2 total -> 50%, #11854).
+        self.assertIn("tmux split-window -h -f -l 50% -t %1", out)
 
     def test_append_anchors_on_geometry_rightmost_not_list_order(self) -> None:
         # Redmine #11849: the rightmost column (%right, pane_left 40) is listed
@@ -238,7 +290,8 @@ class CockpitDecisionTest(unittest.TestCase):
         ]
         out, _r, _e = self._run(self._args(), columns=cols, ws_id="wsNew")
         self.assertIn("action=append", out)
-        self.assertIn("tmux split-window -h -f -t %right", out)
+        # 2 existing columns -> 3 total -> the new column takes 33% (#11854).
+        self.assertIn("tmux split-window -h -f -l 33% -t %right", out)
         self.assertNotIn("-t %left", out)
 
     def test_dry_run_focus_when_workspace_present(self) -> None:
@@ -442,7 +495,7 @@ class CockpitDecisionTest(unittest.TestCase):
             self._args(), columns=cols, ws_id="wsX", lane=self._lane("lane-abc", "feat")
         )
         self.assertIn("action=append", out)
-        self.assertIn("tmux split-window -h -f -t %5", out)
+        self.assertIn("tmux split-window -h -f -l 50% -t %5", out)
 
     def test_legacy_pane_without_lane_is_focusable_by_default_lane(self) -> None:
         # Backward compat: a pane stamped before #11820 carries no lane id; a
