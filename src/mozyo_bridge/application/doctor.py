@@ -153,12 +153,19 @@ def repo_local_source_drift(
     - the running CLI already *is* the repo-local source (editable install or
       ``PYTHONPATH=src``), so there is no drift to flag.
 
-    Otherwise returns a record describing the drift. ``relation`` is
-    ``version-differs`` (strong signal: the installed and source versions
-    disagree), ``unknown`` (source present but its version could not be read),
-    or ``same-version`` (paths differ but versions match — surfaced for
-    visibility but not a warning, since the installed CLI's public surface
-    should match at an equal version).
+    Otherwise returns a record describing the drift. The discriminator for a
+    warning is *checkout presence + running package ≠ repo-local source*, not
+    version equality: during active dogfooding the package version is not
+    bumped until release, so the installed CLI and the checkout can share the
+    same ``__version__`` (e.g. ``0.7.0``) while differing by commits — the
+    originating case (a stale install missing ``agents targets``) cannot be
+    detected from the version string alone (Redmine #11855 review j#57416).
+    Every non-None record therefore warrants the repo-local-invocation
+    guidance. ``relation`` is kept as informative context:
+    ``version-differs`` (installed and source versions disagree),
+    ``same-version`` (paths differ but versions match — still a warning, since
+    equal versions do not guarantee equal commits during dogfooding), or
+    ``unknown`` (source present but its version could not be read).
     """
     source_pkg = (target / "src" / "mozyo_bridge").resolve()
     init_path = source_pkg / "__init__.py"
@@ -198,16 +205,28 @@ def doctor_cli_section(target: Path | None = None) -> dict[str, Any]:
     if target is not None:
         drift = repo_local_source_drift(target, package_path, __version__)
         if drift is not None:
-            section["source_drift"] = drift
-            if drift["relation"] in ("version-differs", "unknown"):
-                section["status"] = "warning"
-                section["next_action"].append(
-                    "running mozyo-bridge is the installed CLI "
-                    f"(version {__version__}) but this checkout has repo-local "
-                    f"source (src/mozyo_bridge {drift['source_version'] or 'version unknown'}); "
-                    "during active development run the repo-local CLI instead: "
-                    f"{drift['repo_local_invocation']} <args>"
+            # Any drift inside a checkout warrants the warning: the running CLI
+            # is not the repo-local source, so it may lag the checkout's
+            # commits regardless of whether the version string matches
+            # (Redmine #11855 review j#57416).
+            section["status"] = "warning"
+            source_label = drift["source_version"] or "version unknown"
+            message = (
+                "running mozyo-bridge is the installed CLI "
+                f"(version {__version__}) but this checkout has repo-local "
+                f"source (src/mozyo_bridge {source_label}); during active "
+                "development run the repo-local CLI instead: "
+                f"{drift['repo_local_invocation']} <args>"
+            )
+            if drift["relation"] == "same-version":
+                # The originating case: equal version, different commits. Spell
+                # it out so an equal-version match is not mistaken for parity.
+                message += (
+                    " (same version string does not guarantee the same commits "
+                    "during dogfooding; the install can lack newer subcommands)"
                 )
+            section["source_drift"] = drift
+            section["next_action"].append(message)
     return section
 
 

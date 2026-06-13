@@ -7604,8 +7604,16 @@ class DoctorEnvironmentTest(unittest.TestCase):
                 repo_local_source_drift(root, pkg, "1.2.3")
             )
 
-    def test_repo_local_source_drift_same_version_is_not_a_warning(self) -> None:
-        """Paths differ but versions match: surfaced for visibility, not a warning."""
+    def test_repo_local_source_drift_same_version_still_warns(self) -> None:
+        """Redmine #11855 review j#57416: equal version, different commits.
+
+        During active dogfooding the package version is not bumped until
+        release, so an installed CLI and the checkout source can share
+        __version__ yet differ by commits (the originating `agents targets`
+        case). A same-version drift inside a checkout must therefore still
+        warn and point at the repo-local invocation — version equality does
+        not clear it.
+        """
         from mozyo_bridge.application.doctor import (
             doctor_cli_section,
             repo_local_source_drift,
@@ -7619,12 +7627,16 @@ class DoctorEnvironmentTest(unittest.TestCase):
             self.assertIsNotNone(drift)
             self.assertEqual("same-version", drift["relation"])
 
-            # Through the section, same-version attaches the record but stays ok
-            # (the real running install path is not the temp checkout source).
+            # The real running install path is not the temp checkout source,
+            # so the section warns even though versions are equal.
             section = doctor_cli_section(root)
-            self.assertEqual("ok", section["status"])
+            self.assertEqual("warning", section["status"])
             self.assertEqual("same-version", section["source_drift"]["relation"])
-            self.assertEqual([], section["next_action"])
+            self.assertTrue(section["next_action"])
+            action = section["next_action"][0]
+            self.assertIn("PYTHONPATH=src python3 -m mozyo_bridge", action)
+            # The message explains that equal versions do not imply equal commits.
+            self.assertIn("same version string does not guarantee", action)
 
     def test_repo_local_source_drift_unknown_version_warns(self) -> None:
         """Source present but __version__ unparseable → unknown relation warns."""
