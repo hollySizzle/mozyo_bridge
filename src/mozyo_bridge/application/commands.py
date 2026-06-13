@@ -1163,13 +1163,21 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
 def _read_cockpit_columns(session: str):
     """Read the cockpit window's panes with their workspace+lane identity (#11803, #11820).
 
-    Returns a list of ``{pane_id, workspace_id, role, lane_id}`` (one per pane
-    carrying the `@mozyo_workspace_id` user option), or ``None`` when the cockpit
-    window does not exist. Identity is read from the tmux user options, not the
-    title. ``lane_id`` is absent (empty) on pre-#11820 panes and normalizes to
-    the ``default`` lane at comparison time.
+    Returns a list of ``{pane_id, workspace_id, role, lane_id, pane_left,
+    pane_width}`` (one per pane carrying the `@mozyo_workspace_id` user option),
+    or ``None`` when the cockpit window does not exist. Identity is read from the
+    tmux user options, not the title. ``lane_id`` is absent (empty) on pre-#11820
+    panes and normalizes to the ``default`` lane at comparison time. The
+    ``pane_left`` / ``pane_width`` geometry (Redmine #11849) lets append pick the
+    visually rightmost column instead of trusting list-panes order.
     """
     from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    def _as_int(value: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     # Read-only and tolerant: a missing tmux binary / server, or a missing
     # cockpit window, all degrade to "no cockpit" (None) rather than raising —
@@ -1180,7 +1188,8 @@ def _read_cockpit_columns(session: str):
             "-t",
             f"{session}:{COCKPIT_WINDOW}",
             "-F",
-            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}\t#{@mozyo_lane_id}",
+            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
+            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}",
             check=False,
         )
     except (Exception, SystemExit):
@@ -1197,9 +1206,32 @@ def _read_cockpit_columns(session: str):
                     "workspace_id": parts[1],
                     "role": parts[2],
                     "lane_id": parts[3] if len(parts) >= 4 else "",
+                    "pane_left": _as_int(parts[4]) if len(parts) >= 5 else 0,
+                    "pane_width": _as_int(parts[5]) if len(parts) >= 6 else 0,
                 }
             )
     return columns
+
+
+def _rightmost_codex_anchor(codex_columns) -> str | None:
+    """The codex pane id of the visually rightmost cockpit column (#11849).
+
+    `tmux list-panes` enumeration order is NOT layout order, so anchoring an
+    append on the last-listed codex pane can split a middle column and crush the
+    layout. Pick by geometry instead: the largest ``pane_left``, tie-broken by
+    the right edge (``pane_left + pane_width``) then ``pane_id`` so it stays
+    deterministic even when geometry is missing (defaults to 0 → a stable
+    pane-id ordering).
+    """
+    if not codex_columns:
+        return None
+
+    def _key(col):
+        left = col.get("pane_left") or 0
+        width = col.get("pane_width") or 0
+        return (left, left + width, col.get("pane_id") or "")
+
+    return max(codex_columns, key=_key).get("pane_id")
 
 
 def _cockpit_session_present(session: str) -> bool:
@@ -1395,7 +1427,10 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         plan = build_cockpit_focus_plan(same["pane_id"], session=session)
     else:
         action = "append"
-        anchor = existing_codex[-1]["pane_id"] if existing_codex else None
+        # Anchor on the visually rightmost column by geometry, not list-panes
+        # order (Redmine #11849): a middle-column anchor would let the
+        # full-height split crush an existing column's width.
+        anchor = _rightmost_codex_anchor(existing_codex)
         if anchor:
             plan = build_cockpit_append_plan(
                 workspace,

@@ -100,10 +100,14 @@ class ReadCockpitColumnsTest(unittest.TestCase):
     def test_parses_pane_identity_options(self) -> None:
         from mozyo_bridge.application import commands
 
-        # Mixed feed: pre-#11820 panes carry only 3 fields (no lane), newer
-        # panes carry the 4th `@mozyo_lane_id` column. Both parse; a missing
-        # lane id reads as "" and normalizes to `default` at comparison time.
-        out = "%1\twsA\tcodex\twkt-1\n%2\twsA\tclaude\twkt-1\n%3\twsB\tcodex\n"
+        # Mixed feed: newer panes carry lane id + geometry (#11820, #11849),
+        # pre-#11820 panes carry only 3 fields. Both parse; missing fields read
+        # as "" / 0 without IndexError.
+        out = (
+            "%1\twsA\tcodex\twkt-1\t41\t39\n"
+            "%2\twsA\tclaude\twkt-1\t41\t13\n"
+            "%3\twsB\tcodex\n"
+        )
         with patch.object(
             commands, "run_tmux",
             return_value=argparse.Namespace(returncode=0, stdout=out, stderr=""),
@@ -111,11 +115,16 @@ class ReadCockpitColumnsTest(unittest.TestCase):
             cols = commands._read_cockpit_columns("mozyo-cockpit")
         self.assertEqual(3, len(cols))
         self.assertEqual(
-            {"pane_id": "%1", "workspace_id": "wsA", "role": "codex", "lane_id": "wkt-1"},
+            {
+                "pane_id": "%1", "workspace_id": "wsA", "role": "codex",
+                "lane_id": "wkt-1", "pane_left": 41, "pane_width": 39,
+            },
             cols[0],
         )
-        # Legacy 3-field pane -> lane_id defaults to "" (no IndexError).
+        # Legacy 3-field pane -> lane_id "" and geometry defaults to 0.
         self.assertEqual("", cols[2]["lane_id"])
+        self.assertEqual(0, cols[2]["pane_left"])
+        self.assertEqual(0, cols[2]["pane_width"])
 
     def test_missing_session_returns_none(self) -> None:
         from mozyo_bridge.application import commands
@@ -125,6 +134,44 @@ class ReadCockpitColumnsTest(unittest.TestCase):
             return_value=argparse.Namespace(returncode=1, stdout="", stderr="no session"),
         ):
             self.assertIsNone(commands._read_cockpit_columns("mozyo-cockpit"))
+
+
+class RightmostAnchorTest(unittest.TestCase):
+    def test_picks_max_pane_left_not_list_order(self) -> None:
+        # Redmine #11849: list order != layout order. The rightmost column
+        # (largest pane_left) must be the anchor even when it is listed first.
+        from mozyo_bridge.application.commands import _rightmost_codex_anchor
+
+        codex = [
+            {"pane_id": "%rightmost", "pane_left": 80, "pane_width": 40},
+            {"pane_id": "%left", "pane_left": 0, "pane_width": 40},
+            {"pane_id": "%middle", "pane_left": 40, "pane_width": 40},
+        ]
+        self.assertEqual("%rightmost", _rightmost_codex_anchor(codex))
+
+    def test_tie_breaks_deterministically_on_right_edge_then_id(self) -> None:
+        from mozyo_bridge.application.commands import _rightmost_codex_anchor
+
+        # equal pane_left -> wider (further right edge) wins.
+        codex = [
+            {"pane_id": "%a", "pane_left": 40, "pane_width": 10},
+            {"pane_id": "%b", "pane_left": 40, "pane_width": 30},
+        ]
+        self.assertEqual("%b", _rightmost_codex_anchor(codex))
+
+    def test_missing_geometry_falls_back_to_stable_id_order(self) -> None:
+        from mozyo_bridge.application.commands import _rightmost_codex_anchor
+
+        # all geometry absent (pre-#11849 panes) -> deterministic by pane id.
+        codex = [
+            {"pane_id": "%1"}, {"pane_id": "%3"}, {"pane_id": "%2"},
+        ]
+        self.assertEqual("%3", _rightmost_codex_anchor(codex))
+
+    def test_empty_is_none(self) -> None:
+        from mozyo_bridge.application.commands import _rightmost_codex_anchor
+
+        self.assertIsNone(_rightmost_codex_anchor([]))
 
 
 class CockpitDecisionTest(unittest.TestCase):
@@ -179,6 +226,20 @@ class CockpitDecisionTest(unittest.TestCase):
         self.assertIn("action=append", out)
         # appends a full-height column split from the existing codex pane.
         self.assertIn("tmux split-window -h -f -t %1", out)
+
+    def test_append_anchors_on_geometry_rightmost_not_list_order(self) -> None:
+        # Redmine #11849: the rightmost column (%right, pane_left 40) is listed
+        # FIRST; append must still split from it, not from the last-listed pane.
+        cols = [
+            {"pane_id": "%right", "workspace_id": "wsB", "role": "codex",
+             "lane_id": "default", "pane_left": 40, "pane_width": 40},
+            {"pane_id": "%left", "workspace_id": "wsA", "role": "codex",
+             "lane_id": "default", "pane_left": 0, "pane_width": 40},
+        ]
+        out, _r, _e = self._run(self._args(), columns=cols, ws_id="wsNew")
+        self.assertIn("action=append", out)
+        self.assertIn("tmux split-window -h -f -t %right", out)
+        self.assertNotIn("-t %left", out)
 
     def test_dry_run_focus_when_workspace_present(self) -> None:
         cols = [{"pane_id": "%5", "workspace_id": "wsX", "role": "codex"}]
