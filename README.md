@@ -244,8 +244,30 @@ workspace A          workspace B
 - **`--cc` は表示面**で、組み上がった tmux layout を iTerm2 control mode で見るための attach option です。`-CC` 自体は layout semantics を持ちません (#11729 と同じ責務)。
 - **active workspace のみ**を召喚します。`--repo` 明示が無ければ live session inventory から codex/claude pane を持つ workspace を列にします。全 unit 常時表示は非目標 (fleet overview は別)。
 - **reuse 優先**: 既に `mozyo-cockpit` session があれば重複 pane を作らず、その session に focus / attach します。`--session NAME` で別名にできます。
-- `--dry-run` / `--json` は tmux を一切触らず plan を出すので、実機 tmux / iTerm2 が無くても layout コマンド生成を確認できます。
+- `--dry-run` / `--json` は tmux を mutate せず plan を出します (`--repo` 明示が無いときは active workspace 判定のため inventory を read-only で読みます)。unit test では実機 tmux / iTerm2 なしに layout コマンド生成を検証できます。
 - 既存の bare `mozyo` / `mozyo --cc` / `--json` / `--no-attach` 契約は不変です。
+
+### 日常入口: `mozyo cockpit` (project を cockpit に追加 / focus)
+
+各 project に `cd` して `mozyo cockpit` を叩くだけで、その workspace を共有 cockpit (`mozyo-cockpit`) に追加できます (Redmine #11803)。専用 launcher は不要で、`mozyo --cc` の意味は変わりません。
+
+```bash
+cd /path/to/project-A && mozyo cockpit   # cockpit が無ければ作成 + iTerm2 control mode で attach
+cd /path/to/project-B && mozyo cockpit   # 既存 cockpit に project-B の列を追加 (新規 iTerm window は増やさない)
+cd /path/to/project-A && mozyo cockpit   # 既に居る workspace は再追加せず、その列に focus
+mozyo cockpit --dry-run    # 実行する tmux コマンドと action (create/append/focus) を表示
+mozyo cockpit --json       # plan + action を JSON 出力 (tmux を mutate しない / read-only)
+```
+
+挙動:
+
+- **create**: `mozyo-cockpit` が無ければ、現在の workspace を 1 列目として作成し `tmux -CC attach` します。`--no-attach` で attach を抑制できます。
+- **append**: 既存 cockpit があり、その workspace がまだ無ければ、**新規 iTerm window を増やさず**横 column として追加します (control mode の既存 window にライブ反映)。
+- **focus**: 同一 workspace が既に cockpit 内にあれば、重複 column を作らずその pane に focus します。
+- workspace identity は pane title 文字列ではなく **tmux user option** (`@mozyo_workspace_id` / `@mozyo_agent_role`) に記録するため、append/focus の重複判定が title 表記に依存しません。
+- layout step が失敗したら fail-closed します。create 失敗時は partial session を kill-session で後始末します。append 失敗時は、他 workspace の pane が同居するため cockpit session 自体は kill せず、その append で作成した新規 pane だけを kill-pane で後始末します (orphan pane を残しません)。
+- `--dry-run` / `--json` は **read-only / non-mutating** です。create/append/focus 判定のため cockpit state を読みますが tmux を mutate せず、stale / 未識別の cockpit でも abort しません (append が anchor を取れない場合は `blocked` として理由を表示します)。
+- `--cc` 起動 (#11729) と `mozyo layout apply cockpit` (#11788) の上に載る薄い入口で、それらの契約は不変です。
 
 session 名が同じでも repo root の下に pane が 1 つも無い場合 (= 別 project の session が同名で居る場合) は、誤 attach を避けるためにエラーで止まります。明示的に session 名を分離する場合は `mozyo --session NAME` で session 名を上書きするか、bare `mozyo --repo /path/to/another` で別 repo root を指定してください。
 

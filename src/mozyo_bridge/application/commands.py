@@ -910,7 +910,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
     return list(by_ws.values())
 
 
-def execute_cockpit_plan(plan, run) -> dict:
+def execute_cockpit_plan(plan, run, *, cleanup_captured: bool = False) -> dict:
     """Run a :class:`CockpitPlan`'s tmux commands, resolving logical tokens.
 
     ``run`` is a ``run_tmux``-style callable. Each command's logical pane tokens
@@ -922,8 +922,21 @@ def execute_cockpit_plan(plan, run) -> dict:
     would run later steps against an empty / wrong target and present a broken
     half-built layout as if it succeeded, so the layout — whose source of truth
     is tmux state — must abort instead.
+
+    ``cleanup_captured`` (Redmine #11803 review): when appending into an
+    existing shared cockpit the session must not be killed, so a mid-append
+    failure would otherwise orphan the new panes already created. With this
+    flag, every pane captured so far is ``kill-pane``'d (best-effort) before
+    aborting, leaving the shared cockpit's other columns intact.
     """
     ids: dict[str, str] = {}
+
+    def _abort(message: str):
+        if cleanup_captured:
+            for pane_id in ids.values():
+                run("kill-pane", "-t", pane_id, check=False)
+        die(message)
+
     for cmd in plan.commands:
         argv = [ids.get(token, token) for token in cmd.argv]
         result = run(*argv, check=False)
@@ -931,14 +944,14 @@ def execute_cockpit_plan(plan, run) -> dict:
             detail = (getattr(result, "stderr", "") or "").strip() or (
                 getattr(result, "stdout", "") or ""
             ).strip()
-            die(
+            _abort(
                 f"cockpit layout step failed ({cmd.purpose}): "
                 f"`tmux {' '.join(argv)}` -> {detail or 'nonzero exit'}"
             )
         if cmd.captures:
             pane_id = (getattr(result, "stdout", "") or "").strip()
             if not pane_id.startswith("%"):
-                die(
+                _abort(
                     f"cockpit layout step did not return a pane id "
                     f"({cmd.purpose}): got {pane_id!r}"
                 )
@@ -1040,6 +1053,212 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
         os.execvp("tmux", ["tmux", "-CC", "attach", "-t", session])
     os.execvp("tmux", ["tmux", "attach", "-t", session])
     raise AssertionError("unreachable")
+
+
+def _read_cockpit_columns(session: str):
+    """Read the cockpit window's panes with their workspace identity (#11803).
+
+    Returns a list of ``{pane_id, workspace_id, role}`` (one per pane carrying
+    the `@mozyo_workspace_id` user option), or ``None`` when the cockpit window
+    does not exist. Identity is read from the tmux user options, not the title.
+    """
+    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    # Read-only and tolerant: a missing tmux binary / server, or a missing
+    # cockpit window, all degrade to "no cockpit" (None) rather than raising —
+    # so `--dry-run` / `--json` stay non-mutating and never abort (#11803 review).
+    try:
+        result = run_tmux(
+            "list-panes",
+            "-t",
+            f"{session}:{COCKPIT_WINDOW}",
+            "-F",
+            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}",
+            check=False,
+        )
+    except (Exception, SystemExit):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    columns = []
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0]:
+            columns.append(
+                {"pane_id": parts[0], "workspace_id": parts[1], "role": parts[2]}
+            )
+    return columns
+
+
+def _cockpit_session_present(session: str) -> bool:
+    """Tolerant `has-session` for the cockpit (#11803 review).
+
+    Distinguishes "session absent" from "session present but cockpit window
+    missing", so a real-run create never `new-session`s against (and the
+    cleanup never kills) a pre-existing session. Tolerant: any tmux error
+    degrades to ``False``.
+    """
+    try:
+        return bool(session_exists(session))
+    except (Exception, SystemExit):
+        return False
+
+
+def cmd_cockpit(args: argparse.Namespace) -> int:
+    """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
+
+    Daily entry: `cd <project> && mozyo cockpit` adds the current workspace as a
+    column to the shared `mozyo-cockpit` (creating it on first use), focuses it
+    if already present, and never spawns a duplicate iTerm window for an
+    existing cockpit. `mozyo --cc` is unchanged (#11729). `--dry-run` / `--json`
+    are read-only and non-mutating: they read live cockpit state to report the
+    action but run no tmux mutation and never abort on a stale cockpit.
+    """
+    import json as _json
+    import shlex as _shlex
+
+    from mozyo_bridge.domain.cockpit_layout import (
+        COCKPIT_SESSION_DEFAULT,
+        CockpitWorkspace,
+        build_cockpit_append_plan,
+        build_cockpit_focus_plan,
+        build_cockpit_plan,
+    )
+
+    session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
+    codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
+    json_output = bool(getattr(args, "json_output", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    inspect_only = dry_run or json_output
+    no_attach = bool(getattr(args, "no_attach", False))
+
+    repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
+    repo_root = str(Path(repo).expanduser().resolve())
+    canon = resolve_canonical_session(repo_root)
+    workspace = CockpitWorkspace(
+        workspace_id=getattr(canon, "workspace_id", None) or canon.name,
+        label=canon.name,
+        repo_root=repo_root,
+    )
+
+    def launch(role: str, ws) -> str:
+        return _agent_launch_command(role, session, ws.repo_root)
+
+    # Read-only state read drives the create/append/focus decision. `--dry-run`
+    # / `--json` only read (never mutate) — `_read_cockpit_columns` /
+    # `_cockpit_session_present` are tolerant so a missing/stale cockpit
+    # degrades gracefully instead of aborting.
+    if not inspect_only:
+        require_tmux()
+    columns = _read_cockpit_columns(session)
+    session_present = _cockpit_session_present(session)
+
+    existing_codex = [c for c in (columns or []) if c.get("role") == "codex"]
+    same = next(
+        (c for c in existing_codex if c.get("workspace_id") == workspace.workspace_id),
+        None,
+    )
+
+    # `plan is None` marks a blocked action (stale cockpit) — fail-closed on a
+    # real run, reported (not aborted) under --dry-run / --json.
+    plan = None
+    blocked_reason = None
+    if columns is None and session_present:
+        # The `mozyo-cockpit` session exists but has no usable cockpit window.
+        # Treating this as "create" would run `new-session` against an existing
+        # session (failing) and the cleanup could then kill that pre-existing
+        # session — so fail closed with a recovery action instead (#11803 review).
+        action = "create"
+        blocked_reason = (
+            f"session {session!r} already exists but has no cockpit window to "
+            f"add a column to. Rebuild it with `mozyo layout apply cockpit`, or "
+            f"remove it (`tmux kill-session -t {session}`) and re-run "
+            "`mozyo cockpit`."
+        )
+    elif columns is None:
+        action = "create"
+        plan = build_cockpit_plan(
+            [workspace], codex_ratio=codex_ratio, session=session, launch=launch
+        )
+    elif same is not None:
+        action = "focus"
+        plan = build_cockpit_focus_plan(same["pane_id"], session=session)
+    else:
+        action = "append"
+        anchor = existing_codex[-1]["pane_id"] if existing_codex else None
+        if anchor:
+            plan = build_cockpit_append_plan(
+                workspace,
+                anchor_pane=anchor,
+                column_index=len(existing_codex),
+                codex_ratio=codex_ratio,
+                session=session,
+                launch=launch,
+            )
+        else:
+            blocked_reason = (
+                f"cockpit session {session!r} exists but carries no "
+                "mozyo-identified codex column to append beside; rebuild it "
+                "with `mozyo layout apply cockpit` or remove the stale session."
+            )
+
+    if json_output:
+        payload = plan.as_dict() if plan is not None else {}
+        payload["action"] = action
+        payload["workspace_id"] = workspace.workspace_id
+        payload["session"] = session
+        payload["blocked"] = blocked_reason
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if dry_run:
+        print(
+            f"cockpit plan: action={action} session={session} "
+            f"workspace={workspace.workspace_id} ({workspace.label})"
+        )
+        if plan is None:
+            print(f"  (blocked: {blocked_reason})")
+        else:
+            for cmd in plan.commands:
+                print("  tmux " + " ".join(_shlex.quote(token) for token in cmd.argv))
+        return 0
+
+    if blocked_reason:
+        die(blocked_reason)
+
+    if action == "create":
+        # cleanup_captured kills only the panes THIS attempt created (closing
+        # the freshly-created session) — never a blanket `kill-session` that
+        # could destroy a pre-existing `mozyo-cockpit` we did not create. If
+        # `new-session` itself fails, nothing was captured and nothing is
+        # killed, so an existing session is left intact (#11803 review).
+        execute_cockpit_plan(plan, run_tmux, cleanup_captured=True)
+        print(f"cockpit created: session={session} workspace={workspace.label}")
+        if no_attach:
+            print(f"attach: tmux -CC attach -t {session}")
+            return 0
+        os.execvp("tmux", ["tmux", "-CC", "attach", "-t", session])
+        raise AssertionError("unreachable")
+
+    if action == "focus":
+        # Existing cockpit already shows this workspace — select it, never a
+        # duplicate column, and never a second attach/iTerm window.
+        execute_cockpit_plan(plan, run_tmux)
+        print(
+            f"workspace {workspace.label!r} already in cockpit {session!r}; "
+            f"focused pane {same['pane_id']}"
+        )
+        return 0
+
+    # append: add a column to the live cockpit without a new iTerm window. On a
+    # mid-append failure the newly-created panes are cleaned up
+    # (cleanup_captured) so a failed append never orphans panes in the shared
+    # cockpit; the other workspaces' columns are left untouched (#11803 review).
+    execute_cockpit_plan(plan, run_tmux, cleanup_captured=True)
+    print(
+        f"appended {workspace.label!r} as a new column to cockpit {session!r}; "
+        "switch to your cockpit window to see it (no new iTerm window opened)"
+    )
+    return 0
 
 
 def _parse_mozyo_window_rows(table: str) -> list[dict]:

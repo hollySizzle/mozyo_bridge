@@ -13,6 +13,7 @@ from mozyo_bridge.application.commands import (
     cmd_handoff_send,
     cmd_id,
     cmd_init,
+    cmd_cockpit,
     cmd_instruction_doctor,
     cmd_instruction_install,
     cmd_keys,
@@ -460,6 +461,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build the cockpit but do not attach.",
     )
     layout_apply.set_defaults(func=cmd_layout_apply)
+
+    cockpit = sub.add_parser(
+        "cockpit",
+        help=(
+            "Add the current project/workspace to the shared cockpit and view "
+            "it in iTerm2 control mode (Redmine #11803). `cd <project> && mozyo "
+            "cockpit` appends a column to `mozyo-cockpit` (creating it on first "
+            "use), focuses the column if the workspace is already present, and "
+            "never opens a duplicate iTerm window for an existing cockpit. "
+            "`mozyo --cc` is unchanged."
+        ),
+    )
+    cockpit.add_argument(
+        "action",
+        nargs="?",
+        choices=["append"],
+        default=None,
+        help=(
+            "Optional explicit sub-action. `append` is the same append/focus "
+            "behavior as bare `mozyo cockpit`; both auto-decide create / append "
+            "/ focus from the live cockpit state."
+        ),
+    )
+    cockpit.add_argument(
+        "--repo",
+        default=None,
+        help="Workspace repo root to add. Defaults to the current directory.",
+    )
+    cockpit.add_argument(
+        "--ratio",
+        dest="codex_ratio",
+        type=int,
+        default=70,
+        help="Codex pane height percentage for the column (default 70).",
+    )
+    cockpit.add_argument(
+        "--session",
+        dest="cockpit_session",
+        default=None,
+        help="Cockpit tmux session name. Defaults to `mozyo-cockpit`.",
+    )
+    cockpit.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Print the planned action and tmux commands without running them.",
+    )
+    cockpit.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=False,
+        help="Emit the planned action + commands as JSON (no tmux execution).",
+    )
+    cockpit.add_argument(
+        "--no-attach",
+        dest="no_attach",
+        action="store_true",
+        default=False,
+        help="On first-time create, build the cockpit but do not attach.",
+    )
+    cockpit.set_defaults(func=cmd_cockpit)
 
     agents = sub.add_parser(
         "agents",

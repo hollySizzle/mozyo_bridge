@@ -36,6 +36,14 @@ ROLE_CODEX = "codex"
 ROLE_CLAUDE = "claude"
 ROLES = (ROLE_CODEX, ROLE_CLAUDE)
 
+# Machine-readable identity stamped on every cockpit pane as tmux user options
+# (Redmine #11803): the pane title is human-facing, but duplicate detection /
+# focus / append must read identity reliably, so the workspace id and agent
+# role go on `@mozyo_workspace_id` / `@mozyo_agent_role` user options instead of
+# parsing the title string.
+WORKSPACE_OPTION = "@mozyo_workspace_id"
+ROLE_OPTION = "@mozyo_agent_role"
+
 
 @dataclass(frozen=True)
 class CockpitWorkspace:
@@ -125,6 +133,30 @@ class CockpitPlan:
 def _pane_title(label: str, role: str, anchor: Optional[str]) -> str:
     base = f"{label} · {role}"
     return f"{base} · {anchor}" if anchor else base
+
+
+def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
+    """Title (human-facing) + workspace/role tmux user options (machine-readable)."""
+    return [
+        CockpitCommand(
+            argv=("select-pane", "-t", pane.token, "-T", pane.title),
+            captures=None,
+            purpose=f"title {pane.workspace_id} {pane.role}",
+        ),
+        CockpitCommand(
+            argv=(
+                "set-option", "-p", "-t", pane.token,
+                WORKSPACE_OPTION, pane.workspace_id,
+            ),
+            captures=None,
+            purpose=f"mark workspace {pane.workspace_id} ({pane.role})",
+        ),
+        CockpitCommand(
+            argv=("set-option", "-p", "-t", pane.token, ROLE_OPTION, pane.role),
+            captures=None,
+            purpose=f"mark role {pane.role} ({pane.workspace_id})",
+        ),
+    ]
 
 
 def normalize_ratio(codex_ratio: int) -> int:
@@ -243,17 +275,9 @@ def build_cockpit_plan(
             )
         )
 
-    # --- Pane titles: record workspace id + agent role for the operator. ---
+    # --- Pane identity: human title + machine-readable workspace/role options. ---
     for pane in panes:
-        commands.append(
-            CockpitCommand(
-                argv=(
-                    "select-pane", "-t", pane.token, "-T", pane.title,
-                ),
-                captures=None,
-                purpose=f"title {pane.workspace_id} {pane.role}",
-            )
-        )
+        commands.extend(_pane_identity_commands(pane))
 
     return CockpitPlan(
         session=session,
@@ -263,4 +287,134 @@ def build_cockpit_plan(
         columns=len(workspaces),
         panes=tuple(panes),
         commands=tuple(commands),
+    )
+
+
+def build_cockpit_append_plan(
+    workspace: CockpitWorkspace,
+    *,
+    anchor_pane: str,
+    column_index: int,
+    codex_ratio: int = DEFAULT_CODEX_RATIO,
+    session: str = COCKPIT_SESSION_DEFAULT,
+    launch: Optional[Callable[[str, CockpitWorkspace], Optional[str]]] = None,
+) -> CockpitPlan:
+    """Plan appending ONE new column to an existing cockpit (Redmine #11803).
+
+    ``anchor_pane`` is the real ``%pane`` id of the rightmost existing column's
+    Codex pane; the new column is split to its right and widths re-equalized.
+    ``column_index`` is the 0-based position of the new column (used only for
+    the logical token names so they cannot collide with existing panes). Pure.
+    """
+    if not anchor_pane:
+        raise ValueError("append needs the anchor pane id of an existing column")
+
+    codex_ratio = normalize_ratio(codex_ratio)
+    claude_ratio = 100 - codex_ratio
+    target = f"{session}:{COCKPIT_WINDOW}"
+    codex_token = f"@col{column_index}_codex"
+    claude_token = f"@col{column_index}_claude"
+    commands: list[CockpitCommand] = []
+
+    def _launch(role: str) -> Optional[str]:
+        return launch(role, workspace) if launch is not None else None
+
+    # New column: split the rightmost existing column's Codex pane.
+    codex_argv = ["split-window", "-h", "-t", anchor_pane]
+    if workspace.repo_root:
+        codex_argv += ["-c", workspace.repo_root]
+    codex_argv += ["-P", "-F", "#{pane_id}"]
+    cmd = _launch(ROLE_CODEX)
+    if cmd:
+        codex_argv.append(cmd)
+    commands.append(
+        CockpitCommand(
+            argv=tuple(codex_argv),
+            captures=codex_token,
+            purpose=f"append column {column_index} codex ({workspace.label})",
+        )
+    )
+    commands.append(
+        CockpitCommand(
+            argv=("select-layout", "-t", target, "even-horizontal"),
+            captures=None,
+            purpose="re-equalize column widths after append",
+        )
+    )
+    claude_argv = [
+        "split-window", "-v", "-t", codex_token, "-l", f"{claude_ratio}%",
+    ]
+    if workspace.repo_root:
+        claude_argv += ["-c", workspace.repo_root]
+    claude_argv += ["-P", "-F", "#{pane_id}"]
+    cmd = _launch(ROLE_CLAUDE)
+    if cmd:
+        claude_argv.append(cmd)
+    commands.append(
+        CockpitCommand(
+            argv=tuple(claude_argv),
+            captures=claude_token,
+            purpose=f"append column {column_index} claude ({workspace.label})",
+        )
+    )
+
+    panes = (
+        CockpitPane(
+            token=codex_token, column=column_index, role=ROLE_CODEX,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
+            height_pct=codex_ratio, anchor=workspace.codex_anchor,
+        ),
+        CockpitPane(
+            token=claude_token, column=column_index, role=ROLE_CLAUDE,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
+            height_pct=claude_ratio, anchor=workspace.claude_anchor,
+        ),
+    )
+    for pane in panes:
+        commands.extend(_pane_identity_commands(pane))
+
+    return CockpitPlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        codex_ratio=codex_ratio,
+        claude_ratio=claude_ratio,
+        columns=1,
+        panes=panes,
+        commands=tuple(commands),
+    )
+
+
+def build_cockpit_focus_plan(
+    target_pane: str, *, session: str = COCKPIT_SESSION_DEFAULT
+) -> CockpitPlan:
+    """Plan focusing an already-present cockpit pane (Redmine #11803).
+
+    No panes are created — a duplicate workspace is selected, not re-appended.
+    """
+    if not target_pane:
+        raise ValueError("focus needs the target pane id")
+    commands = (
+        CockpitCommand(
+            argv=("select-window", "-t", f"{session}:{COCKPIT_WINDOW}"),
+            captures=None,
+            purpose="focus cockpit window",
+        ),
+        CockpitCommand(
+            argv=("select-pane", "-t", target_pane),
+            captures=None,
+            purpose=f"focus existing pane {target_pane}",
+        ),
+    )
+    return CockpitPlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        codex_ratio=0,
+        claude_ratio=0,
+        columns=0,
+        panes=(),
+        commands=commands,
     )
