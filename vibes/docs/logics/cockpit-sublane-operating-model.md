@@ -414,6 +414,26 @@ PoC 運用中、`create_task_tool` に Markdown 長文を渡した際に subject
 subject 文体 / 命名テンプレートは runbook 側 (`public-private-boundary.md`) に置き、
 distributed body には焼かない。
 
+### MCP tool boundary finding (#11885)
+
+`create_task_tool` に `subject` 引数を足す要求 (#11885) を調査した結果、`subject`
+未対応は **外部接続 MCP server `redmine_epic_grid` 側の schema 非対称**であり、
+`mozyo_bridge` repo 内の実装ではないと確定した。現セッションの tool schema は次:
+
+- explicit `subject` あり: `create_epic_tool` / `create_feature_tool` /
+  `create_user_story_tool` / `create_inquiry_tool`。
+- `subject` 無し (`description` の先頭内容から subject 導出): `create_task_tool` /
+  `create_bug_tool` / `create_test_tool`。#11884 の `## 背景` subject はこの導出が原因。
+
+したがって #11885 受入条件のうち「`create_task_tool` で subject を明示指定できる」は
+本 repo では満たせない。正しい実装先は外部 `redmine_epic_grid` MCP server で、
+上記 3 leaf creator に `subject` field を追加し container 系 creator と対称化する
+upstream 変更である。本 repo 側の対応は、leaf creator 向けの運用 mitigation を
+distributed skill (`skills/mozyo-bridge-agent/references/workflow.md` の
+`### Issue Subject / Description Separation`) に明記することに留める: description 先頭行を
+heading marker 無しの一行 plain-text summary にし、生成後に subject を検証して
+誤ったら `update_issue_subject_tool` で即修正する。
+
 ## Revision Principle
 
 この文書は、観測された workflow risk と現時点の operating judgment を記録
