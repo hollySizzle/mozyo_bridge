@@ -239,6 +239,20 @@ documents:
       - logic-otel-event-store
       - spec-project-map
 
+  - id: logic-cockpit-sublane-operating-model
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/cockpit-sublane-operating-model.md
+    purpose: cockpit multi-lane PoC から得た coordinator / sublane / Codex gateway / Claude worker / Redmine durable-state の運用哲学と責務分界。
+    audit_role: cockpit_sublane_operating_model_logic
+    related_document_refs:
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - logic-managed-state-model
+      - logic-session-inventory
+      - logic-tmux-send-safety-contract
+      - skill-workflow-reference
+
   - id: logic-session-inventory
     type: logic
     status: active
