@@ -38,18 +38,30 @@ class AppendPlannerTest(unittest.TestCase):
             launch=lambda role, ws: f"{role}-cmd",
         )
 
-    def test_appends_one_column_split_from_anchor(self) -> None:
+    def test_appends_one_full_height_column_from_anchor(self) -> None:
         plan = self._plan()
         first = plan.commands[0]
-        self.assertEqual(("split-window", "-h", "-t", "%7"), first.argv[:4])
+        # Full-height horizontal split (`-h -f`) so the new column does not
+        # carve up the anchor's cell (Redmine #11807).
+        self.assertEqual(("split-window", "-h", "-f", "-t", "%7"), first.argv[:5])
         self.assertEqual("@col1_codex", first.captures)
         self.assertEqual(1, plan.columns)
-        # widths re-equalized, then a vertical split for claude.
-        ops = [c.argv[0] for c in plan.commands]
-        self.assertIn("select-layout", ops)
+        # then a vertical split for the new column's claude pane.
         self.assertTrue(
             any(c.argv[:2] == ("split-window", "-v") for c in plan.commands)
         )
+
+    def test_append_does_not_flatten_existing_columns(self) -> None:
+        # Regression for Redmine #11807: `select-layout even-horizontal` would
+        # split every existing workspace's Codex/Claude pair into left/right,
+        # so the append plan must NOT emit it.
+        plan = self._plan()
+        ops = [c.argv[0] for c in plan.commands]
+        self.assertNotIn("select-layout", ops)
+        # the new column is the only thing created; existing panes (only the
+        # anchor codex id is referenced) are never re-split or re-laid-out.
+        referenced = {tok for c in plan.commands for tok in c.argv if tok.startswith("%")}
+        self.assertEqual({"%7"}, referenced)  # only the anchor, nothing else existing
 
     def test_records_machine_readable_identity_options(self) -> None:
         plan = self._plan()
@@ -154,8 +166,8 @@ class CockpitDecisionTest(unittest.TestCase):
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
         out, _r, _e = self._run(self._args(), columns=cols)
         self.assertIn("action=append", out)
-        # appends by splitting the existing codex pane.
-        self.assertIn("tmux split-window -h -t %1", out)
+        # appends a full-height column split from the existing codex pane.
+        self.assertIn("tmux split-window -h -f -t %1", out)
 
     def test_dry_run_focus_when_workspace_present(self) -> None:
         cols = [{"pane_id": "%5", "workspace_id": "wsX", "role": "codex"}]

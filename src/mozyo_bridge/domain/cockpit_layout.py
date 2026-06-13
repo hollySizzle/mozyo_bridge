@@ -311,7 +311,6 @@ def build_cockpit_append_plan(
 
     codex_ratio = normalize_ratio(codex_ratio)
     claude_ratio = 100 - codex_ratio
-    target = f"{session}:{COCKPIT_WINDOW}"
     codex_token = f"@col{column_index}_codex"
     claude_token = f"@col{column_index}_claude"
     commands: list[CockpitCommand] = []
@@ -319,8 +318,15 @@ def build_cockpit_append_plan(
     def _launch(role: str) -> Optional[str]:
         return launch(role, workspace) if launch is not None else None
 
-    # New column: split the rightmost existing column's Codex pane.
-    codex_argv = ["split-window", "-h", "-t", anchor_pane]
+    # New column: a FULL-HEIGHT horizontal split (`-h -f`) to the right of the
+    # existing layout (Redmine #11807). A plain `-h` would split only the
+    # anchor Codex pane's cell, and a follow-up `select-layout even-horizontal`
+    # would flatten every existing column's vertical Codex/Claude split into
+    # separate left/right panes. `-f` makes the split span the whole window
+    # height — a true new column — and we deliberately do NOT re-run
+    # `even-horizontal`, so each existing workspace keeps its Codex-top /
+    # Claude-bottom pair intact.
+    codex_argv = ["split-window", "-h", "-f", "-t", anchor_pane]
     if workspace.repo_root:
         codex_argv += ["-c", workspace.repo_root]
     codex_argv += ["-P", "-F", "#{pane_id}"]
@@ -332,13 +338,6 @@ def build_cockpit_append_plan(
             argv=tuple(codex_argv),
             captures=codex_token,
             purpose=f"append column {column_index} codex ({workspace.label})",
-        )
-    )
-    commands.append(
-        CockpitCommand(
-            argv=("select-layout", "-t", target, "even-horizontal"),
-            captures=None,
-            purpose="re-equalize column widths after append",
         )
     )
     claude_argv = [
