@@ -7,6 +7,11 @@ import re
 import time
 from pathlib import Path
 
+from mozyo_bridge.domain.agent_discovery import (
+    CONFIDENCE_STRONG,
+    ROLE_SOURCE_PANE_OPTION,
+    resolve_agent_role,
+)
 from mozyo_bridge.infrastructure.tmux_client import (
     pane_lines,
     resolve_pane_id,
@@ -84,38 +89,78 @@ def current_session_name() -> str | None:
     return result.stdout.strip() or None
 
 
-def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
-    """Return the (active) pane of the agent-named window in ``session``.
+def _active_or_first(panes: list[dict[str, str]]) -> dict[str, str]:
+    """The active pane among ``panes``, else the first (split-window tie-break)."""
+    for pane in panes:
+        if pane.get("pane_active") == "1":
+            return pane
+    return panes[0]
 
-    Sole runtime resolver for agent identity under the window-only model. A
-    tmux window whose ``window_name`` equals ``agent`` is the authoritative
-    target; the previous ``@agent_name`` user-option fallback has been retired
-    (Asana task 1214759644692283). Returns ``None`` when no window in
-    ``session`` matches. Hard-errors when more than one window in ``session``
-    is named ``agent`` — tmux tolerates duplicates silently, so resolver
-    safety has to fail closed.
+
+def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
+    """Resolve the pane in ``session`` whose *resolved role* is ``agent``.
+
+    Runtime resolver for agent identity under the unified role model (Redmine
+    #11822). A pane's role is decided by :func:`resolve_agent_role` over its
+    runtime facts, so this matches both the normal-``mozyo`` rail (role on the
+    ``<agent>``-named window) and a cockpit pane (role on the
+    ``@mozyo_agent_role`` option, window named ``cockpit``). Only *strong*,
+    non-ambiguous matches count — a weak process hint or a pane/window signal
+    conflict never auto-targets. Returns ``None`` when nothing in ``session``
+    resolves to ``agent``.
+
+    Fails closed on more than one distinct logical target. A window-named match
+    collapses its split panes to one target (the active pane); cockpit packs
+    several agents into one window, so each pane-option match is its own
+    target. Two ``<agent>`` windows, or several cockpit ``agent`` panes for the
+    same session, therefore die rather than pick one silently — tmux tolerates
+    the duplication, so resolver safety has to fail closed.
     """
-    windows: dict[str, list[dict[str, str]]] = {}
+    window_groups: dict[str, list[dict[str, str]]] = {}
+    option_panes: list[dict[str, str]] = []
     for pane in pane_lines():
         location = pane.get("location") or ""
         if location.split(":", 1)[0] != session:
             continue
-        if pane.get("window_name") != agent:
+        resolution = resolve_agent_role(
+            pane_option_role=pane.get("agent_role"),
+            window_name=pane.get("window_name"),
+            process=pane.get("command"),
+        )
+        if (
+            resolution.role != agent
+            or resolution.confidence != CONFIDENCE_STRONG
+            or resolution.ambiguous
+        ):
             continue
-        window_index = location.split(":", 1)[1].split(".", 1)[0] if ":" in location else ""
-        windows.setdefault(window_index, []).append(pane)
-    if not windows:
+        if resolution.role_source == ROLE_SOURCE_PANE_OPTION:
+            option_panes.append(pane)
+        else:
+            window_index = (
+                location.split(":", 1)[1].split(".", 1)[0] if ":" in location else ""
+            )
+            window_groups.setdefault(window_index, []).append(pane)
+
+    targets: list[dict[str, str]] = [
+        _active_or_first(panes) for panes in window_groups.values()
+    ]
+    seen_ids = {target.get("id") for target in targets}
+    for pane in option_panes:
+        if pane.get("id") not in seen_ids:
+            targets.append(pane)
+            seen_ids.add(pane.get("id"))
+
+    if not targets:
         return None
-    if len(windows) > 1:
-        labels = ", ".join(f"{session}:{idx}" for idx in sorted(windows.keys()))
-        die(f"multiple windows named '{agent}' found in session '{session}': {labels}")
-    only = next(iter(windows.values()))
-    if len(only) == 1:
-        return only[0]
-    for pane in only:
-        if pane.get("pane_active") == "1":
-            return pane
-    return only[0]
+    if len(targets) > 1:
+        labels = ", ".join(
+            sorted(target.get("id") or target.get("location") or "?" for target in targets)
+        )
+        die(
+            f"multiple '{agent}' panes found in session '{session}': {labels}. "
+            "Name the exact pane with `--target %pane`."
+        )
+    return targets[0]
 
 
 def resolve_agent_label(agent: str, session: str | None) -> dict[str, str] | None:

@@ -51,7 +51,12 @@ def try_pane_lines() -> list[dict[str, str]] | None:
     fmt = (
         "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t"
         "#{pane_current_command}\t#{pane_current_path}\t"
-        "#{window_name}\t#{pane_active}"
+        "#{window_name}\t#{pane_active}\t"
+        # Machine-readable mozyo pane options (Redmine #11803 / #11820 / #11822).
+        # Cockpit panes live under window `cockpit` and carry their agent role /
+        # workspace / lane on these user options instead of the window name, so
+        # the role resolver can classify them. Empty for panes that lack them.
+        "#{@mozyo_agent_role}\t#{@mozyo_workspace_id}\t#{@mozyo_lane_id}"
     )
     try:
         result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -72,8 +77,21 @@ def pane_lines() -> list[dict[str, str]]:
 def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
     for line in stdout.splitlines():
-        parts = (line.split("\t", 5) + [""] * 6)[:6]
-        pane_id, location, command, cwd, window_name, pane_active = parts
+        # 9 tab-separated fields; the trailing mozyo option fields are empty for
+        # panes that do not carry them (older tmux output / pre-option panes).
+        # Splitting with maxsplit keeps any stray tab inside the last field.
+        parts = (line.split("\t", 8) + [""] * 9)[:9]
+        (
+            pane_id,
+            location,
+            command,
+            cwd,
+            window_name,
+            pane_active,
+            agent_role,
+            workspace_id,
+            lane_id,
+        ) = parts
         panes.append(
             {
                 "id": pane_id,
@@ -82,6 +100,9 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
                 "cwd": cwd,
                 "window_name": window_name,
                 "pane_active": pane_active,
+                "agent_role": agent_role,
+                "workspace_id": workspace_id,
+                "lane_id": lane_id,
             }
         )
     return panes

@@ -351,7 +351,7 @@ class SessionListCliTest(SessionInventoryBase):
             )
         self.assertEqual(code, 0)
         payload = json.loads(out)
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["source"], "runtime")
         self.assertFalse(payload["stale"])
         self.assertEqual(payload["inventory_path"], str(inventory_path()))
@@ -362,12 +362,14 @@ class SessionListCliTest(SessionInventoryBase):
             [
                 "activity",
                 "agent_kind",
+                "confidence",
                 "cwd",
                 "pane_active",
                 "pane_id",
                 "pane_index",
                 "process",
                 "repo_root",
+                "role_source",
                 "session",
                 "views",
                 "window_index",

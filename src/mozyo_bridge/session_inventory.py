@@ -50,7 +50,9 @@ from pathlib import Path
 from typing import Iterable
 
 from mozyo_bridge.domain.agent_discovery import (
+    CONFIDENCE_NONE,
     PaneView,
+    ROLE_SOURCE_UNKNOWN,
     discover_agents,
     fold_agents_by_pane,
 )
@@ -64,7 +66,11 @@ from mozyo_bridge.workspace_registry import (
 )
 
 INVENTORY_FILENAME = "inventory.sqlite"
-INVENTORY_SCHEMA_VERSION = 1
+# v2 (Redmine #11822): adds role_source / confidence columns. The cache is a
+# regenerable index, so an older v1 cache is dropped and rebuilt at v2 on the
+# next write rather than migrated in place; a newer-than-current cache is left
+# untouched so a downgraded CLI never destroys it.
+INVENTORY_SCHEMA_VERSION = 2
 
 # How the snapshot handed to the caller was produced.
 SOURCE_RUNTIME = "runtime"
@@ -86,7 +92,9 @@ CREATE TABLE IF NOT EXISTS panes (
     canonical_session TEXT,
     project_name TEXT,
     identity_source TEXT,
-    views_json TEXT NOT NULL
+    views_json TEXT NOT NULL,
+    role_source TEXT,
+    confidence TEXT
 )
 """
 
@@ -100,8 +108,9 @@ CREATE TABLE IF NOT EXISTS inventory_meta (
 _PANE_COLUMNS = (
     "pane_id, session, window_index, window_name, pane_index, pane_active, "
     "process, cwd, repo_root, agent_kind, workspace_id, canonical_session, "
-    "project_name, identity_source, views_json"
+    "project_name, identity_source, views_json, role_source, confidence"
 )
+_PANE_COLUMN_COUNT = 17
 
 
 def inventory_path(home: Path | None = None) -> Path:
@@ -154,8 +163,13 @@ class InventoryRecord:
     cwd: str
     repo_root: str | None
     agent_kind: str
-    workspace: WorkspaceIdentity | None
-    views: tuple[PaneView, ...]
+    # Role resolver provenance (Redmine #11822): which signal classified the
+    # agent kind and how strong it was. Defaults keep legacy construction
+    # working and make a cache miss / older payload degrade to "unknown/none".
+    role_source: str = ROLE_SOURCE_UNKNOWN
+    confidence: str = CONFIDENCE_NONE
+    workspace: WorkspaceIdentity | None = None
+    views: tuple[PaneView, ...] = ()
     # OTel activity join (Redmine #11675). Computed at query time from the
     # otel event store, NEVER persisted in the inventory cache — the two
     # caches stay independent and the activity is always as fresh as the
@@ -175,6 +189,8 @@ class InventoryRecord:
             "cwd": self.cwd,
             "repo_root": self.repo_root,
             "agent_kind": self.agent_kind,
+            "role_source": self.role_source,
+            "confidence": self.confidence,
             "workspace": self.workspace.as_payload() if self.workspace else None,
             "views": [view.as_payload() for view in self.views],
             "activity": self.activity
@@ -300,6 +316,8 @@ def collect_runtime_inventory(
             cwd=agent.cwd,
             repo_root=agent.repo_root,
             agent_kind=agent.agent_kind,
+            role_source=agent.role_source,
+            confidence=agent.confidence,
             workspace=identity_for(agent.repo_root) if agent.repo_root else None,
             views=agent.views,
         )
@@ -329,6 +347,8 @@ def _record_to_row(record: InventoryRecord) -> tuple:
         json.dumps(
             [view.as_payload() for view in record.views], ensure_ascii=False
         ),
+        record.role_source,
+        record.confidence,
     )
 
 
@@ -364,6 +384,8 @@ def _row_to_record(row: tuple) -> InventoryRecord:
         cwd=row[7],
         repo_root=row[8],
         agent_kind=row[9],
+        role_source=row[15] or ROLE_SOURCE_UNKNOWN,
+        confidence=row[16] or CONFIDENCE_NONE,
         workspace=workspace,
         views=views,
     )
@@ -392,14 +414,18 @@ def save_snapshot(
             conn = sqlite3.connect(path)
             try:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, INVENTORY_SCHEMA_VERSION):
+                if version > INVENTORY_SCHEMA_VERSION:
                     notes.append(
                         f"inventory cache {path} has schema version {version}; "
                         "left untouched (snapshot not persisted)"
                     )
                     return path, notes
                 with conn:
-                    if version == 0:
+                    if version != INVENTORY_SCHEMA_VERSION:
+                        # Fresh (0) or an older known version: the cache is a
+                        # regenerable index, so rebuild the table at the current
+                        # schema rather than ALTER-migrate in place.
+                        conn.execute("DROP TABLE IF EXISTS panes")
                         conn.execute(_PANES_TABLE_SQL)
                         conn.execute(_META_TABLE_SQL)
                         conn.execute(
@@ -408,7 +434,7 @@ def save_snapshot(
                     conn.execute("DELETE FROM panes")
                     conn.executemany(
                         f"INSERT INTO panes ({_PANE_COLUMNS}) "
-                        f"VALUES ({', '.join('?' * 15)})",
+                        f"VALUES ({', '.join('?' * _PANE_COLUMN_COUNT)})",
                         [_record_to_row(record) for record in records],
                     )
                     conn.execute(

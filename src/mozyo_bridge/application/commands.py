@@ -15,9 +15,11 @@ from mozyo_bridge.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
+    CONFIDENCE_STRONG,
     discover_agents,
     filter_agents,
     infer_repo_root,
+    resolve_agent_role,
 )
 from mozyo_bridge.domain.handoff import (
     AUTO_TARGET_REPO,
@@ -186,8 +188,8 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     print(
-        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\t"
-        "AMBIGUOUS\tOTHER_VIEWS"
+        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tROLE_SOURCE\tCONFIDENCE\t"
+        "PROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS\tOTHER_VIEWS"
     )
     for record in records:
         other_views = ",".join(
@@ -202,6 +204,8 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
                     record.pane_id or "-",
                     "1" if record.pane_active else "0",
                     record.agent_kind,
+                    record.role_source,
+                    record.confidence,
                     record.process or "-",
                     record.repo_root or "-",
                     record.cwd or "-",
@@ -1905,18 +1909,31 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         )
         args.target_repo = auto_root
 
-    if mode == MODE_QUEUE_ENTER and target_info.get("window_name") != receiver:
-        # Step 9 (v0.2). Under the relaxed queue-enter rail, marker miss does
-        # NOT roll back, so an explicit `--target %X` that lands in a different
-        # agent's window would silently press Enter into the wrong receiver's
-        # pane. The agent gate (`ensure_agent_target`) only verifies the pane
-        # is running *some* agent process (claude / codex / node) and does not
-        # bind the pane to the intended receiver. The window-name resolver
-        # already enforces `window_name == receiver` when no `--target` is
-        # supplied; this guard restores the same invariant for explicit pane
-        # targets under queue-enter, matching the contract's "Allowed Targets"
-        # enumeration of "Claude/Codex agent panes for the intended receiver".
+    target_role = resolve_agent_role(
+        pane_option_role=target_info.get("agent_role"),
+        window_name=target_info.get("window_name"),
+        process=target_info.get("command"),
+    )
+    role_binds_receiver = (
+        target_role.role == receiver
+        and target_role.confidence == CONFIDENCE_STRONG
+        and not target_role.ambiguous
+    )
+    if mode == MODE_QUEUE_ENTER and not role_binds_receiver:
+        # Step 9 (v0.2; role-aware since Redmine #11822). Under the relaxed
+        # queue-enter rail, marker miss does NOT roll back, so an explicit
+        # `--target %X` that resolves to a different agent would silently press
+        # Enter into the wrong receiver's pane. The agent gate
+        # (`ensure_agent_target`) only verifies the pane is running *some* agent
+        # process (claude / codex / node) and does not bind the pane to the
+        # intended receiver. This guard binds the explicit target to the
+        # receiver via the role resolver: a strong, non-ambiguous role ==
+        # receiver from either the `@mozyo_agent_role` pane option (cockpit) or
+        # the `<agent>` window name (normal `mozyo`). A cockpit pane no longer
+        # needs `--force`; a weak / ambiguous / mismatched signal stays
+        # fail-closed, matching the contract's "Allowed Targets".
         observed_window = target_info.get("window_name") or "<unknown>"
+        observed_role = target_info.get("agent_role") or "<none>"
         _emit_outcome(
             make_outcome(
                 status="blocked",
@@ -1933,10 +1950,13 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             command=record_command,
         )
         die(
-            "--mode queue-enter requires the explicit --target pane to live in "
-            f"the receiver's window; --to={receiver!r} but pane {target} is in "
-            f"window {observed_window!r}. Drop --target to use window-name "
-            "resolution, or pass a pane in the receiver's window."
+            "--mode queue-enter requires the explicit --target pane to resolve "
+            f"to the receiver; --to={receiver!r} but pane {target} resolved to "
+            f"role={target_role.role!r} (source={target_role.role_source}, "
+            f"confidence={target_role.confidence}, ambiguous={target_role.ambiguous}; "
+            f"window={observed_window!r}, @mozyo_agent_role={observed_role!r}). "
+            "Drop --target to use role resolution, or pass a pane that resolves "
+            "to the receiver."
         )
         raise AssertionError("unreachable")
 

@@ -9226,6 +9226,87 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual("target_not_agent", outcome["reason"])
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
 
+    def test_queue_enter_allows_cockpit_pane_via_role_option(self) -> None:
+        # Redmine #11822: a cockpit pane lives in window `cockpit` but carries
+        # its role on `@mozyo_agent_role`. The role-aware receiver binding must
+        # accept it under queue-enter WITHOUT `--force` (the prior window-name
+        # gate forced `--mode standard --force`).
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff", "send", "--to", "claude", "--source", "asana",
+                "--kind", "reply", "--task-id", "T1", "--comment-id", "C1",
+                "--target", "%2", "--mode", "queue-enter", "--submit-delay", "0",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "cockpit",
+                "pane_active": "1",
+                "agent_role": "claude",
+            },
+        )
+        self.assertEqual(0, result)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+
+    def test_queue_enter_rejects_cockpit_pane_with_mismatched_role_option(self) -> None:
+        # Cockpit pane explicitly marked `codex` must not accept a `--to claude`
+        # queue-enter send: role resolves to codex, fail-closed.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff", "send", "--to", "claude", "--source", "asana",
+                "--kind", "implementation_request", "--task-id", "T1",
+                "--comment-id", "C1", "--target", "%2", "--mode", "queue-enter",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:1.0",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "cockpit",
+                "pane_active": "1",
+                "agent_role": "codex",
+            },
+            allow_exit=True,
+        )
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+
+    def test_queue_enter_rejects_ambiguous_role_signal_fail_closed(self) -> None:
+        # Pane option says claude but the window says codex: even though the
+        # option role matches the receiver, the signal conflict is ambiguous and
+        # must fail closed rather than press Enter.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff", "send", "--to", "claude", "--source", "asana",
+                "--kind", "implementation_request", "--task-id", "T1",
+                "--comment-id", "C1", "--target", "%2", "--mode", "queue-enter",
+            ],
+            pane={
+                "id": "%2",
+                "location": "agents:1.0",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "codex",
+                "pane_active": "1",
+                "agent_role": "claude",
+            },
+            allow_exit=True,
+        )
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+
     # --- v0.3 deterministic preflight (Step 10 / 11 / 12) -------------------------
 
     def _queue_enter_argv(self, *, kind: str = "implementation_request") -> list[str]:
@@ -12557,11 +12638,14 @@ class AgentDiscoveryTest(unittest.TestCase):
             self.assertEqual(0, cmd_agents_list(args))
         output = stdout.getvalue()
         self.assertIn(
-            "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tPROCESS\tREPO_ROOT\tCWD\t"
-            "AMBIGUOUS\tOTHER_VIEWS",
+            "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tROLE_SOURCE\tCONFIDENCE\t"
+            "PROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS\tOTHER_VIEWS",
             output,
         )
-        self.assertIn("sess_a\tclaude\t0\t%1\t1\tclaude\tclaude", output)
+        # window-name rail: role classified from the `claude` window, strong.
+        self.assertIn(
+            "sess_a\tclaude\t0\t%1\t1\tclaude\twindow_name\tstrong\tclaude", output
+        )
 
     def test_cmd_agents_list_json_output_carries_all_fields(self) -> None:
         from mozyo_bridge.application.commands import cmd_agents_list

@@ -37,6 +37,28 @@ AGENT_KIND_CODEX = "codex"
 AGENT_KIND_UNKNOWN = "unknown"
 AGENT_KINDS = frozenset({AGENT_KIND_CLAUDE, AGENT_KIND_CODEX, AGENT_KIND_UNKNOWN})
 
+# Role identity model (Redmine #11822). Agent role is not the window name nor a
+# single pane option — it is the *output of a resolver* over the pane's runtime
+# facts, so cockpit panes (role on `@mozyo_agent_role`, window named `cockpit`)
+# and normal-`mozyo` panes (role on the window name) classify uniformly. The
+# resolver always exposes which signal won (``role_source``) and how strong it
+# is (``confidence``) so a mis-route can be traced and automatic targeting can
+# fail closed on weak / ambiguous signals.
+ROLE_SOURCE_PANE_OPTION = "pane_option"
+ROLE_SOURCE_WINDOW_NAME = "window_name"
+ROLE_SOURCE_INFERRED = "inferred"
+ROLE_SOURCE_UNKNOWN = "unknown"
+
+CONFIDENCE_STRONG = "strong"
+CONFIDENCE_WEAK = "weak"
+CONFIDENCE_NONE = "none"
+
+# Foreground process basenames that *weakly* hint a role. `node` / versioned
+# native binaries are receiver-agnostic (both CLIs are node-based), so they are
+# deliberately NOT here — a weak hint must still name the role to be usable, and
+# automatic handoff never targets on a weak hint regardless.
+_PROCESS_ROLE_HINTS = {AGENT_KIND_CLAUDE: AGENT_KIND_CLAUDE, AGENT_KIND_CODEX: AGENT_KIND_CODEX}
+
 
 @dataclass(frozen=True)
 class PaneView:
@@ -86,6 +108,8 @@ class AgentRecord:
     repo_root: str | None
     agent_kind: str
     ambiguous: bool
+    role_source: str = ROLE_SOURCE_UNKNOWN
+    confidence: str = CONFIDENCE_NONE
     views: tuple[PaneView, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
@@ -101,6 +125,8 @@ class AgentRecord:
             "repo_root": self.repo_root,
             "agent_kind": self.agent_kind,
             "ambiguous": self.ambiguous,
+            "role_source": self.role_source,
+            "confidence": self.confidence,
             "views": [view.as_payload() for view in self.views],
         }
 
@@ -141,6 +167,102 @@ def classify_agent_kind(window_name: str) -> str:
     return AGENT_KIND_UNKNOWN
 
 
+@dataclass(frozen=True)
+class RoleResolution:
+    """The resolved agent role for a pane plus the signal that decided it.
+
+    ``role`` is ``claude`` / ``codex`` / ``unknown``. ``role_source`` names the
+    winning signal (``pane_option`` / ``window_name`` / ``inferred`` /
+    ``unknown``) and ``confidence`` grades it (``strong`` / ``weak`` /
+    ``none``). ``ambiguous`` is set when two signals name *different* roles
+    (e.g. ``@mozyo_agent_role=claude`` in a ``codex`` window) — a state callers
+    must treat as fail-closed for automatic targeting. ``evidence`` carries the
+    minimal raw facts for debugging.
+    """
+
+    role: str
+    role_source: str
+    confidence: str
+    ambiguous: bool
+    evidence: tuple[str, ...] = ()
+
+
+def _normalize_role(value: str | None) -> str:
+    """Map a raw role-ish string to a known agent kind, else ``unknown``."""
+    text = (value or "").strip()
+    if text == AGENT_KIND_CLAUDE:
+        return AGENT_KIND_CLAUDE
+    if text == AGENT_KIND_CODEX:
+        return AGENT_KIND_CODEX
+    return AGENT_KIND_UNKNOWN
+
+
+def resolve_agent_role(
+    *,
+    pane_option_role: str | None = None,
+    window_name: str | None = None,
+    process: str | None = None,
+) -> RoleResolution:
+    """Resolve a pane's agent role from its runtime facts (pure, Redmine #11822).
+
+    Signal priority:
+
+    1. explicit pane option ``@mozyo_agent_role`` -> ``pane_option`` / strong
+    2. ``window_name == claude|codex`` -> ``window_name`` / strong (legacy rail)
+    3. foreground process basename ``claude`` / ``codex`` -> ``inferred`` / weak
+
+    When BOTH the pane option and the window name name an agent role and they
+    disagree, the result is ``ambiguous`` (fail-closed); the pane option is
+    reported as the role (it is the more explicit, intentional marker) but
+    callers must not auto-target an ambiguous pane. Live tmux state remains the
+    liveness / preflight source of truth (#11698) — this resolver decides
+    *identity*, never liveness.
+    """
+    option_role = _normalize_role(pane_option_role)
+    window_role = _normalize_role(window_name)
+    process_role = _PROCESS_ROLE_HINTS.get((process or "").strip(), AGENT_KIND_UNKNOWN)
+    evidence = (
+        f"option={(pane_option_role or '').strip() or '-'}",
+        f"window={(window_name or '').strip() or '-'}",
+        f"process={(process or '').strip() or '-'}",
+    )
+
+    if option_role != AGENT_KIND_UNKNOWN:
+        ambiguous = (
+            window_role != AGENT_KIND_UNKNOWN and window_role != option_role
+        )
+        return RoleResolution(
+            role=option_role,
+            role_source=ROLE_SOURCE_PANE_OPTION,
+            confidence=CONFIDENCE_STRONG,
+            ambiguous=ambiguous,
+            evidence=evidence,
+        )
+    if window_role != AGENT_KIND_UNKNOWN:
+        return RoleResolution(
+            role=window_role,
+            role_source=ROLE_SOURCE_WINDOW_NAME,
+            confidence=CONFIDENCE_STRONG,
+            ambiguous=False,
+            evidence=evidence,
+        )
+    if process_role != AGENT_KIND_UNKNOWN:
+        return RoleResolution(
+            role=process_role,
+            role_source=ROLE_SOURCE_INFERRED,
+            confidence=CONFIDENCE_WEAK,
+            ambiguous=False,
+            evidence=evidence,
+        )
+    return RoleResolution(
+        role=AGENT_KIND_UNKNOWN,
+        role_source=ROLE_SOURCE_UNKNOWN,
+        confidence=CONFIDENCE_NONE,
+        ambiguous=False,
+        evidence=evidence,
+    )
+
+
 def _parse_location(location: str) -> tuple[str, str, str]:
     session, _, rest = location.partition(":")
     window_index, _, pane_index = rest.partition(".")
@@ -170,8 +292,29 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
     for pane, session, window_index, pane_index in parsed:
         window_name = pane.get("window_name") or ""
         ambig_windows = window_indexes.get((session, window_name), set())
-        ambiguous = bool(window_name) and len(ambig_windows) > 1
+        window_ambiguous = bool(window_name) and len(ambig_windows) > 1
         cwd = pane.get("cwd") or ""
+        # Role identity comes from the resolver, not the window name alone, so a
+        # cockpit pane (role on `@mozyo_agent_role`, window `cockpit`) classifies
+        # like a normal-`mozyo` pane (role on the window name). The pane's own
+        # duplicate-window ambiguity is OR'd with the resolver's role-signal
+        # conflict — either one means "do not auto-target without disambiguation".
+        resolution = resolve_agent_role(
+            pane_option_role=pane.get("agent_role"),
+            window_name=window_name,
+            process=pane.get("command"),
+        )
+        # Only a STRONG signal sets the authoritative `agent_kind` (and thus
+        # what `agents list` / handoff target on). A weak process hint is still
+        # surfaced via `role_source` / `confidence` for debugging and #11811
+        # discovery, but never promotes an `unknown` pane to a real agent kind —
+        # that preserves the pre-#11822 window-name classification exactly while
+        # adding the pane-option rail.
+        agent_kind = (
+            resolution.role
+            if resolution.confidence == CONFIDENCE_STRONG
+            else AGENT_KIND_UNKNOWN
+        )
         records.append(
             AgentRecord(
                 pane_id=pane.get("id") or "",
@@ -183,8 +326,10 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 process=pane.get("command") or "",
                 cwd=cwd,
                 repo_root=infer_repo_root(cwd),
-                agent_kind=classify_agent_kind(window_name),
-                ambiguous=ambiguous,
+                agent_kind=agent_kind,
+                ambiguous=window_ambiguous or resolution.ambiguous,
+                role_source=resolution.role_source,
+                confidence=resolution.confidence,
             )
         )
     return records
@@ -203,6 +348,18 @@ def fold_agent_kind(window_names: Iterable[str]) -> str:
         if kind != AGENT_KIND_UNKNOWN
     }
     return kinds.pop() if len(kinds) == 1 else AGENT_KIND_UNKNOWN
+
+
+def _fold_resolved_kind(kinds: Iterable[str]) -> str:
+    """Fold already-resolved agent kinds across a pane's grouped views.
+
+    Views of one pane share window name and pane options so their resolved
+    kinds normally agree; a genuine disagreement folds to ``unknown`` rather
+    than arbitrarily picking one (same fail-closed spirit as
+    :func:`fold_agent_kind`).
+    """
+    distinct = {kind for kind in kinds if kind != AGENT_KIND_UNKNOWN}
+    return distinct.pop() if len(distinct) == 1 else AGENT_KIND_UNKNOWN
 
 
 def fold_agents_by_pane(
@@ -267,13 +424,21 @@ def fold_agents_by_pane(
             for index, member in enumerate(members)
         )
         canonical = members[canonical_index]
+        folded_kind = _fold_resolved_kind(member.agent_kind for member in members)
+        # Keep the canonical view's resolver provenance when the fold agrees with
+        # it; a cross-view disagreement (folded to unknown) resets provenance so
+        # the record never claims a strong source for an unknown role.
+        if folded_kind == canonical.agent_kind:
+            role_source, confidence = canonical.role_source, canonical.confidence
+        else:
+            role_source, confidence = ROLE_SOURCE_UNKNOWN, CONFIDENCE_NONE
         folded.append(
             replace(
                 canonical,
-                agent_kind=fold_agent_kind(
-                    member.window_name for member in members
-                ),
+                agent_kind=folded_kind,
                 ambiguous=any(member.ambiguous for member in members),
+                role_source=role_source,
+                confidence=confidence,
                 views=views,
             )
         )
