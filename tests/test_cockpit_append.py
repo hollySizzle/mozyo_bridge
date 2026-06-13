@@ -100,14 +100,22 @@ class ReadCockpitColumnsTest(unittest.TestCase):
     def test_parses_pane_identity_options(self) -> None:
         from mozyo_bridge.application import commands
 
-        out = "%1\twsA\tcodex\n%2\twsA\tclaude\n%3\twsB\tcodex\n"
+        # Mixed feed: pre-#11820 panes carry only 3 fields (no lane), newer
+        # panes carry the 4th `@mozyo_lane_id` column. Both parse; a missing
+        # lane id reads as "" and normalizes to `default` at comparison time.
+        out = "%1\twsA\tcodex\twkt-1\n%2\twsA\tclaude\twkt-1\n%3\twsB\tcodex\n"
         with patch.object(
             commands, "run_tmux",
             return_value=argparse.Namespace(returncode=0, stdout=out, stderr=""),
         ):
             cols = commands._read_cockpit_columns("mozyo-cockpit")
         self.assertEqual(3, len(cols))
-        self.assertEqual({"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}, cols[0])
+        self.assertEqual(
+            {"pane_id": "%1", "workspace_id": "wsA", "role": "codex", "lane_id": "wkt-1"},
+            cols[0],
+        )
+        # Legacy 3-field pane -> lane_id defaults to "" (no IndexError).
+        self.assertEqual("", cols[2]["lane_id"])
 
     def test_missing_session_returns_none(self) -> None:
         from mozyo_bridge.application import commands
@@ -129,24 +137,27 @@ class CockpitDecisionTest(unittest.TestCase):
         return argparse.Namespace(**base)
 
     @contextlib.contextmanager
-    def _patched(self, *, columns, ws_id="wsX", session_present=False):
+    def _patched(self, *, columns, ws_id="wsX", session_present=False, lane=None):
         from mozyo_bridge.application import commands
+        from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
 
         canon = argparse.Namespace(name="sessX", workspace_id=ws_id)
+        lane = lane if lane is not None else LaneIdentity(DEFAULT_LANE, None)
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_agent_launch_command", side_effect=lambda r, s, c: f"{r}-cmd"), \
             patch.object(commands, "require_tmux"), \
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
+            patch.object(commands, "_resolve_workspace_lane", return_value=lane), \
             patch.object(commands, "session_exists", return_value=session_present), \
             patch.object(commands, "run_tmux") as run_tmux, \
             patch.object(commands.os, "execvp", side_effect=RuntimeError("attach")) as execvp:
             yield run_tmux, execvp
 
-    def _run(self, args, columns, ws_id="wsX", session_present=False):
+    def _run(self, args, columns, ws_id="wsX", session_present=False, lane=None):
         from mozyo_bridge.application.commands import cmd_cockpit
 
         with self._patched(
-            columns=columns, ws_id=ws_id, session_present=session_present
+            columns=columns, ws_id=ws_id, session_present=session_present, lane=lane
         ) as (run_tmux, execvp):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 try:
@@ -342,6 +353,216 @@ class CockpitDecisionTest(unittest.TestCase):
         self.assertEqual(0, rc)
         execvp.assert_not_called()
         self.assertIn("already in cockpit", out.getvalue())
+
+    # --- Lane-aware duplicate detection (Redmine #11820). ---
+    def _lane(self, lane_id, label=None):
+        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+
+        return LaneIdentity(lane_id, label)
+
+    def test_same_workspace_same_lane_focuses(self) -> None:
+        cols = [
+            {"pane_id": "%5", "workspace_id": "wsX", "role": "codex", "lane_id": "lane-abc"}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX", lane=self._lane("lane-abc", "feat")
+        )
+        self.assertIn("action=focus", out)
+        self.assertIn("tmux select-pane -t %5", out)
+        self.assertIn("lane=lane-abc", out)
+
+    def test_same_workspace_different_lane_appends_a_new_column(self) -> None:
+        # Same workspace_id but a different checkout lane (e.g. a git worktree)
+        # must NOT focus the existing column — it appends beside it.
+        cols = [
+            {"pane_id": "%5", "workspace_id": "wsX", "role": "codex", "lane_id": "default"}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX", lane=self._lane("lane-abc", "feat")
+        )
+        self.assertIn("action=append", out)
+        self.assertIn("tmux split-window -h -f -t %5", out)
+
+    def test_legacy_pane_without_lane_is_focusable_by_default_lane(self) -> None:
+        # Backward compat: a pane stamped before #11820 carries no lane id; a
+        # primary (default-lane) checkout of the same workspace still focuses it
+        # instead of appending a duplicate column.
+        cols = [
+            {"pane_id": "%5", "workspace_id": "wsX", "role": "codex", "lane_id": ""}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX", lane=self._lane("default", None)
+        )
+        self.assertIn("action=focus", out)
+
+    def test_json_exposes_lane_fields(self) -> None:
+        cols = [
+            {"pane_id": "%5", "workspace_id": "wsX", "role": "codex", "lane_id": "lane-abc"}
+        ]
+        out, _r, _e = self._run(
+            self._args(dry_run=False, json_output=True),
+            columns=cols,
+            ws_id="wsX",
+            lane=self._lane("lane-abc", "feature/x"),
+        )
+        payload = json.loads(out)
+        self.assertEqual("focus", payload["action"])
+        self.assertEqual("lane-abc", payload["lane_id"])
+        self.assertEqual("feature/x", payload["lane_label"])
+
+
+class PlannerLaneStampingTest(unittest.TestCase):
+    """Lane id / label ride on tmux pane options (Redmine #11820)."""
+
+    def test_lane_id_and_label_stamped_when_present(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import build_cockpit_plan
+
+        ws = CockpitWorkspace(
+            "wsX", "alpha", "/a", lane_id="lane-abc", lane_label="feature/x"
+        )
+        plan = build_cockpit_plan([ws])
+        lane_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_lane_id" in c.argv
+        ]
+        label_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_lane_label" in c.argv
+        ]
+        # one lane id + one lane label per pane (codex + claude).
+        self.assertEqual(2, len(lane_opts))
+        self.assertEqual(2, len(label_opts))
+        self.assertTrue(all("lane-abc" in c.argv for c in lane_opts))
+        self.assertTrue(all("feature/x" in c.argv for c in label_opts))
+        # workspace id is unchanged and still stamped (additive, not replaced).
+        ws_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_workspace_id" in c.argv
+        ]
+        self.assertEqual(2, len(ws_opts))
+        self.assertTrue(all("wsX" in c.argv for c in ws_opts))
+
+    def test_default_lane_stamped_and_no_label_when_absent(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import build_cockpit_plan
+
+        plan = build_cockpit_plan([CockpitWorkspace("wsX", "alpha", "/a")])
+        lane_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_lane_id" in c.argv
+        ]
+        label_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_lane_label" in c.argv
+        ]
+        self.assertEqual(2, len(lane_opts))
+        self.assertTrue(all("default" in c.argv for c in lane_opts))
+        # no label option when there is no label.
+        self.assertEqual([], label_opts)
+
+    def test_append_plan_stamps_lane(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import build_cockpit_append_plan
+
+        ws = CockpitWorkspace(
+            "wsB", "sessB", "/repoB", lane_id="lane-xyz", lane_label="wt"
+        )
+        plan = build_cockpit_append_plan(ws, anchor_pane="%7", column_index=1)
+        lane_opts = [
+            c for c in plan.commands
+            if c.argv[0] == "set-option" and "@mozyo_lane_id" in c.argv
+        ]
+        self.assertEqual(2, len(lane_opts))
+        self.assertTrue(all("lane-xyz" in c.argv for c in lane_opts))
+
+
+class LaneIdentityTest(unittest.TestCase):
+    """Pure lane derivation (Redmine #11820)."""
+
+    def test_primary_checkout_is_default_lane(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import (
+            DEFAULT_LANE,
+            resolve_lane_identity,
+        )
+
+        # main worktree: git_dir == git_common_dir, path == canonical.
+        lane = resolve_lane_identity(
+            repo_root="/work/repo",
+            canonical_path="/work/repo",
+            git_dir="/work/repo/.git",
+            git_common_dir="/work/repo/.git",
+            branch="main",
+        )
+        self.assertEqual(DEFAULT_LANE, lane.lane_id)
+        self.assertEqual("main", lane.lane_label)
+
+    def test_non_git_workspace_is_default_lane(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import (
+            DEFAULT_LANE,
+            resolve_lane_identity,
+        )
+
+        lane = resolve_lane_identity(repo_root="/work/plain")
+        self.assertEqual(DEFAULT_LANE, lane.lane_id)
+        self.assertIsNone(lane.lane_label)
+
+    def test_linked_worktree_is_distinct_lane(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+
+        lane = resolve_lane_identity(
+            repo_root="/work/repo-feature",
+            canonical_path="/work/repo",
+            git_dir="/work/repo/.git/worktrees/repo-feature",
+            git_common_dir="/work/repo/.git",
+            branch="feature/x",
+        )
+        self.assertTrue(lane.lane_id.startswith("lane-"))
+        self.assertEqual("feature/x", lane.lane_label)
+
+    def test_relocated_clone_sharing_workspace_id_is_distinct_lane(self) -> None:
+        # A clone copied the tracked workspace.json (same workspace_id) but lives
+        # at a different path with its own .git (git_dir == git_common_dir).
+        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+
+        lane = resolve_lane_identity(
+            repo_root="/work/repo-clone",
+            canonical_path="/work/repo",
+            git_dir="/work/repo-clone/.git",
+            git_common_dir="/work/repo-clone/.git",
+            branch="main",
+        )
+        self.assertTrue(lane.lane_id.startswith("lane-"))
+
+    def test_lane_id_is_deterministic_and_carries_no_raw_path(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+
+        kwargs = dict(
+            repo_root="/work/repo-feature",
+            canonical_path="/work/repo",
+            git_dir="/work/repo/.git/worktrees/repo-feature",
+            git_common_dir="/work/repo/.git",
+        )
+        a = resolve_lane_identity(**kwargs)
+        b = resolve_lane_identity(**kwargs)
+        self.assertEqual(a.lane_id, b.lane_id)  # deterministic
+        # privacy-safe: the durable lane id never embeds the absolute path.
+        self.assertNotIn("/work", a.lane_id)
+        self.assertNotIn("repo-feature", a.lane_id)
+
+    def test_distinct_checkouts_get_distinct_lane_ids(self) -> None:
+        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+
+        a = resolve_lane_identity(
+            repo_root="/work/wt-a",
+            canonical_path="/work/repo",
+            git_dir="/work/repo/.git/worktrees/wt-a",
+            git_common_dir="/work/repo/.git",
+        )
+        b = resolve_lane_identity(
+            repo_root="/work/wt-b",
+            canonical_path="/work/repo",
+            git_dir="/work/repo/.git/worktrees/wt-b",
+            git_common_dir="/work/repo/.git",
+        )
+        self.assertNotEqual(a.lane_id, b.lane_id)
 
 
 if __name__ == "__main__":

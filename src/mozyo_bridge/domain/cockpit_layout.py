@@ -44,6 +44,23 @@ ROLES = (ROLE_CODEX, ROLE_CLAUDE)
 WORKSPACE_OPTION = "@mozyo_workspace_id"
 ROLE_OPTION = "@mozyo_agent_role"
 
+# Additive lane / checkout identity (Redmine #11820). The same `workspace_id`
+# can appear in several checkouts (git worktree / clone / devcontainer) when a
+# tracked `.mozyo-bridge/workspace.json` is duplicated; the lane id distinguishes
+# them so the cockpit treats same-workspace-different-lane as a separate column
+# instead of a focus target. It NEVER redefines `workspace_id` — it rides on its
+# own `@mozyo_lane_id` user option, with an optional human-facing
+# `@mozyo_lane_label`.
+LANE_OPTION = "@mozyo_lane_id"
+LANE_LABEL_OPTION = "@mozyo_lane_label"
+
+# A checkout that is not a distinct lane — the primary worktree, the registered
+# canonical checkout, or a non-git workspace — belongs to the "default" lane.
+# Pre-#11820 cockpit panes carry no `@mozyo_lane_id` and normalize to this same
+# value, so an upgraded cockpit keeps focusing them rather than appending a
+# duplicate column.
+DEFAULT_LANE = "default"
+
 
 @dataclass(frozen=True)
 class CockpitWorkspace:
@@ -56,6 +73,11 @@ class CockpitWorkspace:
     # recorded in the pane title so the operator can see whose turn it is.
     codex_anchor: Optional[str] = None
     claude_anchor: Optional[str] = None
+    # Checkout-local lane identity (Redmine #11820). Defaults keep every
+    # existing construction (and non-lane environments) on the backward-compatible
+    # "default" lane.
+    lane_id: str = DEFAULT_LANE
+    lane_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +93,8 @@ class CockpitPane:
     title: str
     height_pct: int
     anchor: Optional[str]
+    lane_id: str = DEFAULT_LANE
+    lane_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +147,8 @@ class CockpitPlan:
                     "title": p.title,
                     "height_pct": p.height_pct,
                     "anchor": p.anchor,
+                    "lane_id": p.lane_id,
+                    "lane_label": p.lane_label,
                 }
                 for p in self.panes
             ],
@@ -136,8 +162,13 @@ def _pane_title(label: str, role: str, anchor: Optional[str]) -> str:
 
 
 def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
-    """Title (human-facing) + workspace/role tmux user options (machine-readable)."""
-    return [
+    """Title (human-facing) + workspace/role/lane tmux user options (machine-readable).
+
+    The lane id always lands (normalized to ``default``) so duplicate detection
+    can read ``workspace_id + lane_id`` off every cockpit pane; the human-facing
+    lane label is only stamped when present.
+    """
+    commands = [
         CockpitCommand(
             argv=("select-pane", "-t", pane.token, "-T", pane.title),
             captures=None,
@@ -156,12 +187,117 @@ def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
             captures=None,
             purpose=f"mark role {pane.role} ({pane.workspace_id})",
         ),
+        CockpitCommand(
+            argv=(
+                "set-option", "-p", "-t", pane.token,
+                LANE_OPTION, normalize_lane(pane.lane_id),
+            ),
+            captures=None,
+            purpose=f"mark lane {normalize_lane(pane.lane_id)} ({pane.workspace_id})",
+        ),
     ]
+    if pane.lane_label:
+        commands.append(
+            CockpitCommand(
+                argv=(
+                    "set-option", "-p", "-t", pane.token,
+                    LANE_LABEL_OPTION, pane.lane_label,
+                ),
+                captures=None,
+                purpose=f"label lane {pane.lane_label} ({pane.workspace_id})",
+            )
+        )
+    return commands
 
 
 def normalize_ratio(codex_ratio: int) -> int:
     """Clamp the Codex share to a sane, splittable 10..90 range."""
     return max(10, min(90, int(codex_ratio)))
+
+
+def normalize_lane(value: Optional[str]) -> str:
+    """Empty / missing lane id -> the backward-compatible ``default`` lane."""
+    text = (value or "").strip()
+    return text or DEFAULT_LANE
+
+
+@dataclass(frozen=True)
+class LaneIdentity:
+    """A checkout-local lane identity (Redmine #11820).
+
+    ``lane_id`` distinguishes multiple checkouts (git worktree / clone /
+    relocated copy) of the *same* ``workspace_id`` so the cockpit treats them as
+    separate columns. It is additive — it never redefines ``workspace_id``. The
+    primary checkout maps to :data:`DEFAULT_LANE`; a distinct checkout maps to a
+    deterministic, privacy-safe ``lane-<hash>`` derived from git facts (never a
+    raw absolute path). ``lane_label`` is a human-facing hint (branch name or
+    checkout basename), display-only.
+    """
+
+    lane_id: str
+    lane_label: Optional[str]
+
+
+def _norm_path(path: Optional[str]) -> Optional[str]:
+    """Trailing-slash-insensitive comparison key (display-only normalization)."""
+    if not path:
+        return path
+    stripped = path.rstrip("/")
+    return stripped or "/"
+
+
+def _basename(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _lane_hash(seed: str) -> str:
+    """Deterministic, privacy-safe lane id: a truncated digest, never a path."""
+    import hashlib
+
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"lane-{digest[:12]}"
+
+
+def resolve_lane_identity(
+    *,
+    repo_root: str,
+    canonical_path: Optional[str] = None,
+    git_dir: Optional[str] = None,
+    git_common_dir: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> LaneIdentity:
+    """Derive the lane identity for a checkout from observed facts (pure).
+
+    A checkout is a *distinct* lane when either:
+
+    - it is a linked git worktree — ``git_dir`` differs from ``git_common_dir``
+      (the main worktree has them equal, a linked worktree points its git dir at
+      ``.../.git/worktrees/<name>`` while the common dir stays the source), or
+    - it is a relocated checkout — its ``repo_root`` differs from the workspace's
+      registered ``canonical_path`` (a clone / copy that shares the same
+      ``workspace_id`` via a duplicated ``.mozyo-bridge/workspace.json``).
+
+    Otherwise it is the primary checkout and maps to :data:`DEFAULT_LANE`. The
+    lane id is hashed from ``git_dir`` (unique per worktree and per clone) or, if
+    absent, the checkout path — so durable / displayed surfaces carry a stable
+    token, never a raw absolute path.
+    """
+    git_dir_n = _norm_path(git_dir)
+    common_n = _norm_path(git_common_dir)
+    branch_label = (branch or "").strip() or None
+
+    is_linked_worktree = bool(git_dir_n and common_n and git_dir_n != common_n)
+    repo_n = _norm_path(repo_root)
+    canon_n = _norm_path(canonical_path)
+    is_relocated = bool(canon_n and repo_n and repo_n != canon_n)
+
+    if is_linked_worktree or is_relocated:
+        seed = git_dir_n or repo_n or repo_root
+        label = branch_label or _basename(repo_root) or None
+        return LaneIdentity(lane_id=_lane_hash(seed), lane_label=label)
+    return LaneIdentity(lane_id=DEFAULT_LANE, lane_label=branch_label)
 
 
 def build_cockpit_plan(
@@ -228,6 +364,8 @@ def build_cockpit_plan(
                 title=_pane_title(ws.label, ROLE_CODEX, ws.codex_anchor),
                 height_pct=codex_ratio,
                 anchor=ws.codex_anchor,
+                lane_id=ws.lane_id,
+                lane_label=ws.lane_label,
             )
         )
         prev_codex_token = codex_token
@@ -272,6 +410,8 @@ def build_cockpit_plan(
                 title=_pane_title(ws.label, ROLE_CLAUDE, ws.claude_anchor),
                 height_pct=claude_ratio,
                 anchor=ws.claude_anchor,
+                lane_id=ws.lane_id,
+                lane_label=ws.lane_label,
             )
         )
 
@@ -364,6 +504,7 @@ def build_cockpit_append_plan(
             repo_root=workspace.repo_root,
             title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
             height_pct=codex_ratio, anchor=workspace.codex_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
         ),
         CockpitPane(
             token=claude_token, column=column_index, role=ROLE_CLAUDE,
@@ -371,6 +512,7 @@ def build_cockpit_append_plan(
             repo_root=workspace.repo_root,
             title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
             height_pct=claude_ratio, anchor=workspace.claude_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
         ),
     )
     for pane in panes:

@@ -884,9 +884,14 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
             resolved = str(Path(repo).expanduser().resolve())
             canon = resolve_canonical_session(resolved)
             wsid = getattr(canon, "workspace_id", None) or canon.name
+            lane = _resolve_workspace_lane(resolved, getattr(canon, "workspace_id", None))
             out.append(
                 CockpitWorkspace(
-                    workspace_id=wsid, label=canon.name, repo_root=resolved
+                    workspace_id=wsid,
+                    label=canon.name,
+                    repo_root=resolved,
+                    lane_id=lane.lane_id,
+                    lane_label=lane.lane_label,
                 )
             )
         return out
@@ -904,8 +909,16 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
             or rec.session
         )
         if wsid not in by_ws:
+            lane = _resolve_workspace_lane(
+                rec.repo_root or "",
+                rec.workspace.workspace_id if rec.workspace else None,
+            )
             by_ws[wsid] = CockpitWorkspace(
-                workspace_id=wsid, label=rec.session, repo_root=rec.repo_root
+                workspace_id=wsid,
+                label=rec.session,
+                repo_root=rec.repo_root,
+                lane_id=lane.lane_id,
+                lane_label=lane.lane_label,
             )
     return list(by_ws.values())
 
@@ -1056,11 +1069,13 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
 
 
 def _read_cockpit_columns(session: str):
-    """Read the cockpit window's panes with their workspace identity (#11803).
+    """Read the cockpit window's panes with their workspace+lane identity (#11803, #11820).
 
-    Returns a list of ``{pane_id, workspace_id, role}`` (one per pane carrying
-    the `@mozyo_workspace_id` user option), or ``None`` when the cockpit window
-    does not exist. Identity is read from the tmux user options, not the title.
+    Returns a list of ``{pane_id, workspace_id, role, lane_id}`` (one per pane
+    carrying the `@mozyo_workspace_id` user option), or ``None`` when the cockpit
+    window does not exist. Identity is read from the tmux user options, not the
+    title. ``lane_id`` is absent (empty) on pre-#11820 panes and normalizes to
+    the ``default`` lane at comparison time.
     """
     from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
 
@@ -1073,7 +1088,7 @@ def _read_cockpit_columns(session: str):
             "-t",
             f"{session}:{COCKPIT_WINDOW}",
             "-F",
-            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}",
+            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}\t#{@mozyo_lane_id}",
             check=False,
         )
     except (Exception, SystemExit):
@@ -1085,7 +1100,12 @@ def _read_cockpit_columns(session: str):
         parts = line.split("\t")
         if len(parts) >= 3 and parts[0]:
             columns.append(
-                {"pane_id": parts[0], "workspace_id": parts[1], "role": parts[2]}
+                {
+                    "pane_id": parts[0],
+                    "workspace_id": parts[1],
+                    "role": parts[2],
+                    "lane_id": parts[3] if len(parts) >= 4 else "",
+                }
             )
     return columns
 
@@ -1102,6 +1122,89 @@ def _cockpit_session_present(session: str) -> bool:
         return bool(session_exists(session))
     except (Exception, SystemExit):
         return False
+
+
+def _probe_checkout_facts(repo_root: str) -> dict:
+    """Best-effort git checkout facts for lane identity (Redmine #11820).
+
+    Tolerant: a non-git workspace, a missing path, a missing git binary, or any
+    git error yields empty facts so :func:`resolve_lane_identity` falls back to
+    the backward-compatible ``default`` lane. Never raises.
+    """
+    import subprocess
+
+    facts = {"git_dir": None, "git_common_dir": None, "branch": None}
+    try:
+        if not os.path.isdir(repo_root):
+            return facts
+    except OSError:
+        return facts
+
+    def _git(*git_args):
+        try:
+            result = subprocess.run(
+                ["git", "-C", repo_root, *git_args],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return (result.stdout or "").strip() or None
+
+    def _abs(path):
+        if not path:
+            return None
+        return os.path.realpath(
+            path if os.path.isabs(path) else os.path.join(repo_root, path)
+        )
+
+    facts["git_dir"] = _abs(_git("rev-parse", "--git-dir"))
+    facts["git_common_dir"] = _abs(_git("rev-parse", "--git-common-dir"))
+    facts["branch"] = _git("branch", "--show-current") or _git(
+        "rev-parse", "--short", "HEAD"
+    )
+    return facts
+
+
+def _registered_canonical_path(workspace_id):
+    """Registered canonical checkout path for ``workspace_id`` (tolerant).
+
+    Used to flag a *relocated* checkout (a clone/copy that shares the workspace
+    id via a duplicated anchor) as a distinct lane. Any registry error / absent
+    record yields ``None`` so derivation degrades to the ``default`` lane.
+    """
+    if not workspace_id:
+        return None
+    try:
+        from mozyo_bridge.workspace_registry import load_workspace_by_id
+
+        record = load_workspace_by_id(workspace_id)
+    except Exception:
+        return None
+    return getattr(record, "canonical_path", None) if record is not None else None
+
+
+def _resolve_workspace_lane(repo_root: str, workspace_id):
+    """Derive the lane identity for ``repo_root`` (Redmine #11820).
+
+    Ties the tolerant git probe + registered canonical path to the pure
+    :func:`resolve_lane_identity`. Returns the backward-compatible ``default``
+    lane for the primary checkout / a non-git workspace.
+    """
+    from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+
+    facts = _probe_checkout_facts(repo_root)
+    return resolve_lane_identity(
+        repo_root=repo_root,
+        canonical_path=_registered_canonical_path(workspace_id),
+        git_dir=facts.get("git_dir"),
+        git_common_dir=facts.get("git_common_dir"),
+        branch=facts.get("branch"),
+    )
 
 
 def cmd_cockpit(args: argparse.Namespace) -> int:
@@ -1123,6 +1226,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         build_cockpit_append_plan,
         build_cockpit_focus_plan,
         build_cockpit_plan,
+        normalize_lane,
     )
 
     session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
@@ -1135,10 +1239,13 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
     repo_root = str(Path(repo).expanduser().resolve())
     canon = resolve_canonical_session(repo_root)
+    lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
     workspace = CockpitWorkspace(
         workspace_id=getattr(canon, "workspace_id", None) or canon.name,
         label=canon.name,
         repo_root=repo_root,
+        lane_id=lane.lane_id,
+        lane_label=lane.lane_label,
     )
 
     def launch(role: str, ws) -> str:
@@ -1153,9 +1260,20 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     columns = _read_cockpit_columns(session)
     session_present = _cockpit_session_present(session)
 
+    # Duplicate detection compares `workspace_id + lane_id` (Redmine #11820):
+    # same workspace + same lane focuses the existing column; same workspace +
+    # different lane (a worktree / clone / relocated checkout) falls through to
+    # append as its own column. A pre-#11820 pane carries no lane id and
+    # normalizes to `default`, matching the `default` lane of a primary checkout.
     existing_codex = [c for c in (columns or []) if c.get("role") == "codex"]
+    target_lane = normalize_lane(workspace.lane_id)
     same = next(
-        (c for c in existing_codex if c.get("workspace_id") == workspace.workspace_id),
+        (
+            c
+            for c in existing_codex
+            if c.get("workspace_id") == workspace.workspace_id
+            and normalize_lane(c.get("lane_id")) == target_lane
+        ),
         None,
     )
 
@@ -1206,6 +1324,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         payload = plan.as_dict() if plan is not None else {}
         payload["action"] = action
         payload["workspace_id"] = workspace.workspace_id
+        payload["lane_id"] = normalize_lane(workspace.lane_id)
+        payload["lane_label"] = workspace.lane_label
         payload["session"] = session
         payload["blocked"] = blocked_reason
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1213,7 +1333,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     if dry_run:
         print(
             f"cockpit plan: action={action} session={session} "
-            f"workspace={workspace.workspace_id} ({workspace.label})"
+            f"workspace={workspace.workspace_id} ({workspace.label}) "
+            f"lane={normalize_lane(workspace.lane_id)}"
         )
         if plan is None:
             print(f"  (blocked: {blocked_reason})")
