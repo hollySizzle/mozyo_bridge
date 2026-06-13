@@ -161,6 +161,54 @@ A single operator can run more than one local cockpit at once — for example on
 - **Multiple cockpit sessions do not create a cross-session Claude shortcut.** Splitting work into several named cockpit groups does not authorize `--to claude` across sessions; that remains rejected at the CLI (`blocked` / `cross_session_claude`). Naming a group only makes the gateway target easier to find; it does not move the boundary.
 - **Keep private cockpit composition out of OSS defaults.** Which concrete project families share a cockpit, the session nicknames, the host/window layout, and any operator-specific grouping policy are private operating policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a named cockpit session is the group unit and grouping is not identity*; concrete cockpit composition belongs in the operator's own runtime / private runbook, not in the distributed skill or preset defaults.
 
+## Coordinator Stop And Next-Action Standard
+
+A coordinator lane (the main Codex lane that owns audit, owner-facing decisions, release, and sublane orchestration) is *correctly* conservative: it gates close on owner approval and refuses to bypass guardrails. But conservatism without a structured stop becomes a throughput sink — when the coordinator pauses for an owner decision and says nothing about what comes next, every sublane that depends on it idles too, and the cockpit looks blocked even where progress is possible (Redmine #11860, from the #11850 multi-lane PoC). The fix is not to make the coordinator less careful; it is to make every stop carry a next-action proposal so the owner can act in one step and unrelated work keeps moving.
+
+This standard is the coordinator-side complement of `## Sublane Coordinator Callback` (which governs how sublanes report *into* the coordinator). It governs how the coordinator presents a stop *back out* to the owner and the other lanes.
+
+### What a coordinator stop is
+
+A coordinator stop is any point where the coordinator lane has finished what it can do unattended and is waiting: an owner judgment, a close approval, a review conclusion the owner must ratify, or the selection of the next piece of work. It is a normal, expected state — not a failure. The standard is about how that state is *recorded and presented*, not about avoiding it.
+
+### Durable record first, pane pointer second
+
+- The stop is recorded as a Redmine journal on the relevant issue (a Progress Log, or the gate journal the stop is waiting on — for example a Review Request awaiting owner close approval). The journal is the source of truth; the pane notification to the owner is only a pointer to it, exactly as in `## Handoff Lifecycle` and `## Sublane Coordinator Callback`.
+- Do not encode the stop reason or the next-action menu *only* in pane scrollback. An owner or another lane reconstructing the situation reads the durable journal, not `status` / `doctor` / scrollback.
+
+### Separate what the coordinator may do autonomously from what needs owner approval
+
+Before stopping, the coordinator classifies the pending next actions into two buckets and only stops on the second:
+
+- **Autonomous range** — actions the coordinator may take from the source of truth without owner approval: reading and summarizing durable records, posting review findings, routing an already-approved implementation to a sublane, recording an audit conclusion, dispatching a queued backlog task into a free sublane, or any Repo-Local Guardrail Autonomous Lane edit the preset already permits. If an autonomous action is available, the coordinator takes it rather than stopping.
+- **Owner-approval range** — actions gated on an owner decision per the central preset's `Close Approval Separation` and the carve-out list in `### Owner Close Approval Delegation` (close approval, release / publish, credential / auth changes, destructive operations, scope / stakeholder calls, and the other carve-outs). The coordinator stops and asks here; it does not self-authorize a carve-out action even under standing delegation.
+
+A stop is justified only when the *only* remaining next actions are in the owner-approval range. If an autonomous action remains, the stop is premature.
+
+### Every stop presents a next-action proposal
+
+When the coordinator does stop, the durable journal (and the pane pointer to it) carries a short, three-part proposal so the owner can decide in one step:
+
+1. **Why it is stopping** — the specific gate or decision being waited on, anchored to the journal id (for example "US #NNNN review approved; waiting on owner close approval per Close Approval Separation").
+2. **What happens on approval** — the concrete action the coordinator will take the moment the owner approves (for example "on approval: record owner_close_approval journal and move US #NNNN to closed"). State it as the next command-level step, not a vague "proceed".
+3. **What can proceed without approval** — whether there is alternative, non-gated work the coordinator or a sublane can pick up *now* so the lanes do not idle (for example "meanwhile: sublane #MMMM implementation can continue; backlog task #PPPP is dispatchable"). If genuinely nothing can proceed without the owner, say so explicitly rather than leaving it implied.
+
+Keep the proposal short and anchored. Retry plans, command transcripts, and detailed analysis live in the durable record, not the pane pointer.
+
+### Keep the lanes from idling on the stop
+
+The coordinator stop must not silently freeze every sublane:
+
+- **Hand gated work back to the queue, not to a held pane.** When the coordinator is blocked on an owner decision for one unit of work, it returns to the next-action queue / backlog and dispatches any ready, non-gated task into a free sublane instead of holding the whole cockpit on the gated item. The gated item stays parked on its durable journal until the owner acts; it does not block unrelated lanes.
+- **A sublane waiting only on the coordinator gets an explicit pointer.** If a sublane's next step depends on the coordinator's gated decision, record that dependency on the sublane's issue (a Progress Log noting "waiting on coordinator decision at #NNNN j#JJJJ") so the sublane is parked on a durable anchor rather than appearing stalled with no explanation. The sublane resumes from that anchor once the coordinator's decision journal lands.
+- **The owner decision, once made, is itself a durable journal** (the owner_close_approval journal, or the answer to a Design Consultation), and the coordinator resumes from it. The pane exchange that prompted the decision is not the record.
+
+### Boundaries this standard does not relax
+
+- **A next-action proposal is not self-authorization.** Presenting "on approval I will close US #NNNN" does not let the coordinator close it without the separate owner close approval journal. The proposal makes the owner's one-step decision easy; it does not move the Close Approval Separation boundary or any carve-out.
+- **The coordinator does not collect owner approval in a sublane's Claude pane.** Owner-facing decisions stay in the coordinator lane's Codex (see `### Owner Close Approval Delegation` in the central preset). The standard changes how the stop is *presented*, not who owns the owner-facing exchange.
+- **Keep operator-specific policy out of OSS defaults.** Concrete next-action menus, throughput targets, which backlog a given operator drains first, and any private prioritization rule are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that every coordinator stop records a durable reason plus a three-part next-action proposal and returns ready work to the queue*; the operator's concrete queue and priorities belong in their own runbook, not in the distributed skill or preset body.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

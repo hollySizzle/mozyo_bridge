@@ -13956,6 +13956,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Cross-Workspace Handoff",
         "## Sublane Coordinator Callback",
         "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
+        "## Coordinator Stop And Next-Action Standard",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -14013,6 +14014,14 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "not the routing or identity source of truth",
         "route it through the **target group's Codex** pane",
         "Multiple cockpit sessions do not create a cross-session Claude shortcut",
+        # Coordinator stop and next-action standard (Redmine #11860). Every
+        # coordinator stop records a durable reason plus a three-part
+        # next-action proposal and returns ready work to the queue, without
+        # relaxing Close Approval Separation or self-authorizing a carve-out.
+        "make every stop carry a next-action proposal",
+        "A stop is justified only when the *only* remaining next actions are in the owner-approval range",
+        "A next-action proposal is not self-authorization",
+        "Hand gated work back to the queue, not to a held pane",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",

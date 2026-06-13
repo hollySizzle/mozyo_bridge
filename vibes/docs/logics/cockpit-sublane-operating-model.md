@@ -165,6 +165,46 @@ sublane は handoff-worthy な state transition を Redmine と短い pane point
 これにより、sublane では完了しているのに cockpit coordinator view では停止
 して見える状態を避ける。
 
+## Coordinator の停止点と次アクション提示
+
+coordinator lane が慎重であること自体は正しい。close を owner approval で
+gate し、guardrail を bypass しないのは設計どおりである。問題は、停止時に
+次アクションを提示しないと、その coordinator に依存する sublane も idle し、
+cockpit 全体が詰まって見えることである (Redmine #11860, #11850 PoC 由来)。
+
+解決は「coordinator を雑にする」ことではなく、「停止を構造化する」ことで
+ある。観測された portable な判断は次である。
+
+- **停止は失敗ではなく正常状態。** owner 判断待ち / close 待ち / review 結論
+  待ち / 次作業選定待ちは想定内の停止である。標準化するのは停止の有無では
+  なく、停止の記録と提示の仕方である。
+- **durable record が先、pane pointer が後。** 停止理由と次アクション候補は
+  Redmine journal に残し、pane 通知はその pointer にとどめる。停止理由を
+  scrollback だけに置かない。
+- **自律可能範囲と owner 承認範囲を分ける。** durable record から取れる
+  action (要約、review finding 記録、承認済み実装の sublane への routing、
+  backlog task の空き sublane への dispatch、autonomous lane 編集) は停止せず
+  実行する。停止するのは残る next action が owner 承認範囲 (`Close Approval
+  Separation` と carve-out) だけになったときに限る。
+- **停止時は三点を短く提示する。** (1) なぜ止まるか (待っている gate を
+  journal id 付きで)、(2) owner が承認したら何をするか (承認直後の具体
+  step)、(3) 承認なしに進められる代替作業があるか (空き sublane / backlog)。
+  無ければ「無い」と明示する。
+- **gate された作業は queue に戻す。** 一単位が owner 判断待ちでも、ready な
+  非 gate task は next-action queue / backlog から空き sublane へ dispatch し、
+  cockpit 全体を gated item で止めない。coordinator 待ちの sublane には、
+  依存先 journal anchor を sublane issue に記録して park させる。
+
+提示は提案であって自己承認ではない。「承認されたら close する」と書いても、
+別 journal の owner close approval なしに close してよいことにはならない。
+owner-facing なやり取りは coordinator lane に残し、sublane の Claude pane で
+owner 承認を回収しない。
+
+具体的な next-action menu、throughput 目標、どの backlog を先に消化するか
+等は operator runtime policy であり OSS default に混ぜない (public-private
+boundary)。portable な部分は「停止ごとに durable な理由 + 三点提示を残し、
+ready な作業を queue に戻す」ことである。
+
 ## Ticket 化するもの
 
 この PoC では、運用上の friction を意図的に child issue 化する。finding が
