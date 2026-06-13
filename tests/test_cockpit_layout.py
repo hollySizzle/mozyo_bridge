@@ -296,5 +296,108 @@ class LayoutCliTest(unittest.TestCase):
                     cmd_layout_apply(self._args(layout_repos=None))
 
 
+class ResolveWorkspacesLaneTest(unittest.TestCase):
+    """`_resolve_cockpit_workspaces` live-inventory path keys on workspace+lane.
+
+    Regression for the #11820 US-audit Major finding (journal #57044): keying
+    the inventory dedupe by `workspace_id` alone collapsed a same-workspace /
+    different-lane pair (e.g. main worktree + linked worktree) into one column,
+    contradicting the append-as-separate-column contract.
+    """
+
+    def _rec(self, *, agent_kind, workspace_id, repo_root, session):
+        from mozyo_bridge.session_inventory import InventoryRecord, WorkspaceIdentity
+
+        return InventoryRecord(
+            pane_id=f"%{abs(hash((repo_root, agent_kind))) % 1000}",
+            session=session,
+            window_index="0",
+            window_name=agent_kind,
+            pane_index="0",
+            pane_active=True,
+            process=agent_kind,
+            cwd=repo_root,
+            repo_root=repo_root,
+            agent_kind=agent_kind,
+            workspace=WorkspaceIdentity(
+                workspace_id=workspace_id,
+                canonical_session=session,
+                project_name=None,
+                source="test",
+            ),
+            views=(),
+        )
+
+    def test_same_workspace_different_lane_makes_two_columns(self) -> None:
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.domain.agent_discovery import (
+            AGENT_KIND_CLAUDE,
+            AGENT_KIND_CODEX,
+        )
+        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+
+        # Two checkouts of the SAME workspace_id at different paths/lanes; each
+        # carries a codex + claude pane (4 records total).
+        records = [
+            self._rec(agent_kind=AGENT_KIND_CODEX, workspace_id="ws-same",
+                      repo_root="/repo/main", session="main-session"),
+            self._rec(agent_kind=AGENT_KIND_CLAUDE, workspace_id="ws-same",
+                      repo_root="/repo/main", session="main-session"),
+            self._rec(agent_kind=AGENT_KIND_CODEX, workspace_id="ws-same",
+                      repo_root="/repo/wt", session="wt-session"),
+            self._rec(agent_kind=AGENT_KIND_CLAUDE, workspace_id="ws-same",
+                      repo_root="/repo/wt", session="wt-session"),
+        ]
+        snapshot = argparse.Namespace(records=tuple(records))
+
+        lane_by_repo = {
+            "/repo/main": LaneIdentity("default", None),
+            "/repo/wt": LaneIdentity("lane-worktree", "feature"),
+        }
+
+        with patch("mozyo_bridge.session_inventory.take_inventory", return_value=snapshot), \
+            patch.object(
+                commands, "_resolve_workspace_lane",
+                side_effect=lambda repo_root, ws: lane_by_repo[repo_root],
+            ):
+            workspaces = commands._resolve_cockpit_workspaces(
+                argparse.Namespace(layout_repos=None)
+            )
+
+        self.assertEqual(2, len(workspaces))
+        lanes = sorted(w.lane_id for w in workspaces)
+        self.assertEqual(["default", "lane-worktree"], lanes)
+        # both columns are the same workspace, distinguished only by lane.
+        self.assertEqual({"ws-same"}, {w.workspace_id for w in workspaces})
+
+    def test_same_workspace_same_lane_dedupes_to_one_column(self) -> None:
+        # codex + claude panes of one checkout collapse to a single column.
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.domain.agent_discovery import (
+            AGENT_KIND_CLAUDE,
+            AGENT_KIND_CODEX,
+        )
+        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+
+        records = [
+            self._rec(agent_kind=AGENT_KIND_CODEX, workspace_id="ws-1",
+                      repo_root="/repo/main", session="s"),
+            self._rec(agent_kind=AGENT_KIND_CLAUDE, workspace_id="ws-1",
+                      repo_root="/repo/main", session="s"),
+        ]
+        snapshot = argparse.Namespace(records=tuple(records))
+
+        with patch("mozyo_bridge.session_inventory.take_inventory", return_value=snapshot), \
+            patch.object(
+                commands, "_resolve_workspace_lane",
+                return_value=LaneIdentity("default", None),
+            ):
+            workspaces = commands._resolve_cockpit_workspaces(
+                argparse.Namespace(layout_repos=None)
+            )
+
+        self.assertEqual(1, len(workspaces))
+
+
 if __name__ == "__main__":
     unittest.main()

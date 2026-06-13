@@ -875,7 +875,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
     mozyo workspaces are discovered from the live session inventory — one column
     per distinct workspace that currently carries a codex/claude agent pane.
     """
-    from mozyo_bridge.domain.cockpit_layout import CockpitWorkspace
+    from mozyo_bridge.domain.cockpit_layout import CockpitWorkspace, normalize_lane
 
     repos = getattr(args, "layout_repos", None)
     out: list = []
@@ -899,7 +899,12 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
     from mozyo_bridge.session_inventory import take_inventory
 
     snapshot = take_inventory()
-    by_ws: dict[str, object] = {}
+    # One column per distinct workspace+lane (Redmine #11820). Keying by
+    # `workspace_id` alone would collapse same-workspace-different-lane checkouts
+    # (e.g. a main worktree and a linked worktree) into a single column, which
+    # contradicts the append-as-separate-column contract this US adds — so the
+    # dedupe key carries the normalized lane id too.
+    by_lane: dict[tuple, object] = {}
     for rec in snapshot.records:
         if rec.agent_kind not in (AGENT_KIND_CODEX, AGENT_KIND_CLAUDE):
             continue
@@ -908,19 +913,20 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
             or rec.repo_root
             or rec.session
         )
-        if wsid not in by_ws:
-            lane = _resolve_workspace_lane(
-                rec.repo_root or "",
-                rec.workspace.workspace_id if rec.workspace else None,
-            )
-            by_ws[wsid] = CockpitWorkspace(
+        lane = _resolve_workspace_lane(
+            rec.repo_root or "",
+            rec.workspace.workspace_id if rec.workspace else None,
+        )
+        key = (wsid, normalize_lane(lane.lane_id))
+        if key not in by_lane:
+            by_lane[key] = CockpitWorkspace(
                 workspace_id=wsid,
                 label=rec.session,
                 repo_root=rec.repo_root,
                 lane_id=lane.lane_id,
                 lane_label=lane.lane_label,
             )
-    return list(by_ws.values())
+    return list(by_lane.values())
 
 
 def execute_cockpit_plan(plan, run, *, cleanup_captured: bool = False) -> dict:
