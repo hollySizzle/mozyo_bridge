@@ -1,200 +1,197 @@
-# Cockpit Sublane Operating Model
+# Cockpit サブレーン運用モデル
 
 ## Purpose
 
-This document records the operating philosophy that emerged from the
-multi-lane cockpit PoC around Redmine #11850. It is a repo-local logic
-document, not a private operating manual.
+この文書は Redmine #11850 の multi-lane cockpit PoC から出てきた運用哲学を
+記録する。これは repo-local な logic 文書であり、private な社内運用規約
+そのものではない。
 
-The goal is to keep the portable mozyo-bridge primitives clear while still
-capturing the real workflow pressure that created them.
+目的は、mozyo-bridge の portable primitive を濁さずに、実運用で発生した
+圧力と判断を後から検証できる形で残すことである。
 
-## Observed Context
+## 観測された前提
 
-The cockpit can now host multiple checkouts of the same workspace as distinct
-lanes. In the active PoC:
+cockpit は、同じ workspace の複数 checkout を別 lane として扱えるように
+なった。現在の PoC では、次の形で運用している。
 
-- The main `mozyo_bridge` lane is the coordinator lane.
-- Additional worktrees are appended as sublanes.
-- Each lane has a Codex pane and a Claude pane.
-- Redmine journals are the durable source of truth.
-- Pane messages are only pointers to durable anchors.
+- main `mozyo_bridge` lane は coordinator lane である。
+- 追加 worktree は sublane として append する。
+- 各 lane には Codex pane と Claude pane がある。
+- Redmine journal が durable source of truth である。
+- pane message は durable anchor への pointer にすぎない。
 
-This model became useful because several problems appeared only during actual
-dogfooding:
+このモデルが必要になったのは、実際に dogfooding して初めて見える問題が
+複数あったためである。
 
-- same workspace / multiple checkout identity needs `lane_id`;
-- cockpit and normal `mozyo` sessions need a role resolver rather than
-  window-name-only identity;
-- sublane completion can look stalled if the result does not return to the
-  coordinator lane;
-- append geometry can become uneven even when identity is correct;
-- installed CLI commands can lag behind repo-local source during active
-  development;
-- multiple related projects need a way to stay visually close without becoming
-  one routing identity.
+- same workspace / multiple checkout identity には `lane_id` が必要である。
+- cockpit と通常の `mozyo` session は、window name だけではなく role
+  resolver で扱う必要がある。
+- sublane 側で作業が完了しても、結果が coordinator lane に戻らなければ
+  cockpit 上では停止して見える。
+- identity が正しくても append 後の表示幅が偏ることがある。
+- 開発中は installed CLI が repo-local source より遅れることがある。
+- 関連する複数 project は近くに見える必要があるが、routing identity まで
+  混ぜてはいけない。
 
-## Core Separation
+## 中核の分離
 
-The cockpit model separates four concerns that must not be collapsed:
+cockpit model では、次の 4 つを混同してはいけない。
 
-- **Identity**: durable workspace / lane / role / pane facts.
-- **Routing**: which agent is allowed to receive and act on a handoff.
-- **Display**: how panes, windows, tabs, and iTerm/tmux views are arranged.
-- **Governance**: which Redmine gate authorizes action and close.
+- **Identity**: workspace / lane / role / pane の durable な事実。
+- **Routing**: どの agent が handoff を受け取り、行動してよいか。
+- **Display**: pane、window、tab、iTerm/tmux view の見せ方。
+- **Governance**: どの Redmine gate が実行や close を承認しているか。
 
-Window layout can help humans see related work, but it is not a routing
-source of truth. A pane being visible next to another pane does not authorize a
-direct send across a lane or project boundary.
+window layout は人間が関連作業を見やすくするためには有用だが、routing の
+source of truth ではない。隣に pane が見えていることは、lane 境界や
+project 境界を越えた direct send の承認にはならない。
 
-## Lane Roles
+## Lane の役割
 
 ### Main Coordinator Lane
 
-The main Codex pane is the coordinator, auditor, and owner-facing window.
-It owns:
+main Codex pane は coordinator、auditor、owner-facing window である。主に
+次を扱う。
 
-- owner questions and close approval collection;
-- Redmine gate interpretation;
-- review conclusions;
-- release / push / CI coordination;
-- sublane creation and retirement;
-- capture of PoC findings into Redmine or repo-local docs.
+- owner への質問と close approval の回収。
+- Redmine gate の解釈。
+- review conclusion。
+- release / push / CI の coordination。
+- sublane の作成と退役。
+- PoC findings の Redmine または repo-local docs への記録。
 
-The main Codex lane should be conservative with direct edits. It may use the
-repo-local guardrail autonomous lane where the project rules allow it, but
-ordinary implementation and distributed workflow surfaces still follow the
-project's role boundary.
+main Codex lane は direct edit に慎重であるべきである。project rule が許す
+repo-local guardrail autonomous lane は使ってよいが、通常の実装や配布対象の
+workflow surface は project の role boundary に従う。
 
 ### Sublane Codex
 
-The sublane Codex pane is the gateway for its lane. It should:
+sublane Codex pane はその lane の gateway である。主に次を行う。
 
-- read the durable Redmine anchor first;
-- validate that the request belongs to its lane;
-- decide whether local Claude should implement;
-- route to local Claude with a durable journal anchor;
-- report blocked / review-ready / owner-action-needed states back toward the
-  coordinator lane.
+- まず durable Redmine anchor を読む。
+- request が自 lane に属することを確認する。
+- local Claude に実装させるべきか判断する。
+- durable journal anchor 付きで local Claude へ route する。
+- blocked / review-ready / owner-action-needed の状態を coordinator lane へ
+  返す。
 
-The sublane Codex is not a second owner-facing coordinator unless the project
-explicitly promotes it to that role.
+sublane Codex は、project が明示的に昇格させない限り、第二の owner-facing
+coordinator ではない。
 
 ### Sublane Claude
 
-The sublane Claude pane is the implementation worker. It should:
+sublane Claude pane は implementation worker である。主に次を行う。
 
-- implement from Redmine journals, not from pane scrollback alone;
-- record implementation_done and review_request gates;
-- keep verification and residual risk replayable;
-- avoid collecting owner close approval.
+- pane scrollback だけではなく Redmine journal から実装する。
+- implementation_done と review_request gate を記録する。
+- verification と residual risk を再現可能に残す。
+- owner close approval を回収しない。
 
 ### Main Claude
 
-The main Claude pane is useful, but it should not become a parallel
-coordinator.
+main Claude pane は有用だが、parallel coordinator にしてはいけない。
 
-Safe uses include:
+安全な使い方は次である。
 
-- scratch analysis;
-- long-output or journal summarization;
-- candidate extraction;
-- draft wording;
-- non-authoritative comparison of options;
-- implementation only after the work is moved into a proper Redmine-gated lane.
+- scratch analysis。
+- 長い出力や journal の要約。
+- candidate extraction。
+- draft wording。
+- option の非権威的な比較。
+- work が適切な Redmine-gated lane に移された後の implementation。
 
-Avoid using main Claude for:
+main Claude に任せるべきではないものは次である。
 
-- owner questions;
-- close approval collection;
-- Review Gate conclusions;
-- durable routing decisions;
-- silent edits to protected workflow, skill, source, or test surfaces.
+- owner questions。
+- close approval collection。
+- Review Gate conclusions。
+- durable routing decisions。
+- protected workflow、skill、source、test surface への silent edit。
 
-Claude output in the main lane is input, not evidence. The coordinator Codex
-must still check source files, Redmine journals, and command output before
-turning it into a decision.
+main lane の Claude output は input であり、evidence ではない。coordinator
+Codex は、それを decision に変換する前に source file、Redmine journal、
+command output を確認しなければならない。
 
 ## Cross-Lane Routing Rule
 
-A lane boundary is a governance boundary even when panes share one physical
-tmux session.
+複数 pane が同じ物理 tmux session にいても、lane boundary は governance
+boundary である。
 
-If a request crosses from one lane to another, route it to the target lane's
-Codex pane first. That Codex reads the durable anchor and then routes to its
-local Claude if implementation is appropriate.
+request が lane を越える場合は、まず target lane の Codex pane に route
+する。その Codex が durable anchor を読み、implementation が適切であれば
+local Claude へ route する。
 
-Direct Claude delivery is reserved for same-lane addressing. This preserves
-the same principle as the cross-session Claude direct-send prohibition.
+Claude への direct delivery は same-lane addressing に限定する。これは
+cross-session Claude direct-send prohibition と同じ原則を守るためである。
 
 ## Cockpit Groups
 
-Related projects may need to be viewed together. The portable rule is:
+関連 project は同時に見える必要がある。portable rule は次である。
 
-- use named cockpit sessions as cockpit groups;
-- keep `workspace_id` / `lane_id` / role / pane identity inside the group;
-- treat iTerm windows, tabs, or tmux windows as display grouping only;
-- use Codex gateway handoff for cross-project consultation.
+- named cockpit session を cockpit group として使う。
+- group 内でも `workspace_id` / `lane_id` / role / pane identity は維持する。
+- iTerm window、tab、tmux window は display grouping としてのみ扱う。
+- cross-project consultation には Codex gateway handoff を使う。
 
-Do not put unrelated project policy into the OSS default. Private cockpit
-composition belongs in private operating policy, not in portable
-mozyo-bridge defaults.
+無関係な project policy を OSS default に入れてはいけない。private cockpit
+composition は private operating policy の領域であり、portable mozyo-bridge
+default に混ぜない。
 
 ## Dogfooding Version Boundary
 
-During active development, the installed `mozyo-bridge` CLI can lag behind the
-repo-local source. When the workflow depends on just-landed commands, use the
-repo-local invocation:
+開発中は installed `mozyo-bridge` CLI が repo-local source より遅れることが
+ある。workflow が landed 直後の command に依存する場合は、repo-local
+invocation を使う。
 
 ```bash
 PYTHONPATH=src python3 -m mozyo_bridge ...
 ```
 
-This is a dogfooding rule, not a public install contract. Public docs should
-continue to describe installed commands after release.
+これは dogfooding rule であり、public install contract ではない。public docs
+では release 後の installed command を説明する。
 
-## Reporting Back To Coordinator
+## Coordinator への報告
 
-Sublanes must report handoff-worthy state transitions back to the coordinator
-lane through Redmine and a short pane pointer. Examples:
+sublane は handoff-worthy な state transition を Redmine と短い pane pointer
+で coordinator lane へ返す。例は次である。
 
-- blocked / needs clarification;
-- implementation_done;
-- review_request;
-- review result;
-- commit recorded;
-- owner close approval requested.
+- blocked / needs clarification。
+- implementation_done。
+- review_request。
+- review result。
+- commit recorded。
+- owner close approval requested。
 
-This prevents work from being complete in a sublane while appearing stalled in
-the cockpit coordinator view.
+これにより、sublane では完了しているのに cockpit coordinator view では停止
+して見える状態を避ける。
 
-## What To Ticket
+## Ticket 化するもの
 
-The PoC intentionally turns operational friction into child issues. Ticket a
-finding when it is concrete, likely to recur, or independently fixable.
+この PoC では、運用上の friction を意図的に child issue 化する。finding が
+具体的で、再発しやすく、独立して修正可能なら ticket にする。
 
-Examples already observed:
+すでに観測された例は次である。
 
-- cockpit append width rebalance;
-- stale installed CLI during dogfooding;
-- subject / description separation when creating Redmine tasks;
-- Claude pane launch permission mode;
-- main unit Claude role boundary.
+- cockpit append width rebalance。
+- dogfooding 中の stale installed CLI。
+- Redmine task 作成時の subject / description separation。
+- Claude pane launch permission mode。
+- main unit Claude role boundary。
 
-Keep #11850 as the integration record. Do not let it become an unstructured
-dump for problems that need their own fix path.
+#11850 は integration record として保つ。独立した fix path が必要な問題を、
+構造のない dump として #11850 に積まない。
 
 ## Revision Principle
 
-This document describes observed workflow risk and current operating judgment.
-It is not a permanent claim about any model's quality.
+この文書は、観測された workflow risk と現時点の operating judgment を記録
+するものである。特定 model の品質に関する恒久的な主張ではない。
 
-Claude and Codex behavior will change over time. Revisit this document when
-the tools change, but preserve the core separation unless there is evidence
-that a safer simpler model exists:
+Claude と Codex の挙動は時間とともに変わる。tool が変わったらこの文書も
+見直す。ただし、より安全で単純な model が存在する証拠がない限り、次の
+core separation は維持する。
 
-- durable state in Redmine;
-- identity at workspace / lane / pane level;
-- routing through Codex gateways across boundaries;
-- implementation in bounded lanes;
-- owner-facing decisions in the coordinator lane.
+- durable state は Redmine に置く。
+- identity は workspace / lane / pane level で扱う。
+- boundary を越える routing は Codex gateway を通す。
+- implementation は bounded lane で行う。
+- owner-facing decision は coordinator lane で行う。
