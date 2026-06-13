@@ -243,6 +243,52 @@ The coordinator's grasp of the outstanding owner queue must not degrade as panes
 - **The durable record stays the source of truth.** The enumerated queue and every callback are anchored on Redmine journals; the coordinator reads those journals, not pane scrollback, before acting on any waiting item.
 - **Keep operator-specific policy out of OSS defaults.** The concrete Redmine filter / saved query / status mapping an operator uses to enumerate the waiting set, and any private prioritization of that queue, are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that owner-approval-waiting always aggregates to the single coordinator Codex and is enumerable from the durable record independent of pane count*; the concrete query belongs in the operator's own runbook, not in the distributed skill or preset body.
 
+## Stall And No-Progress Detection Standard
+
+`## Sublane Coordinator Callback` defines how a sublane reports *into* the coordinator when it reaches a handoff-worthy state. But a callback is a best-effort pointer, and in a growing cockpit it can simply fail to arrive: the sublane's Codex never recorded a routing callback, the durable record advanced but nothing pointed at it, or the send itself failed target resolution. When that happens the coordinator sees only silence and currently has to poll Redmine, worktrees, and panes by hand to decide whether a lane is genuinely blocked, still working, or already done (Redmine #11880, from the #11854 sublane PoC). This standard makes that detection mechanical and durable-record-anchored, so a missing callback degrades gracefully instead of stalling the whole cockpit.
+
+This is the failure-mode complement of `## Sublane Coordinator Callback`: that section covers the happy path (the sublane points at its advanced state); this one covers what the coordinator does when the pointer is missing or late. It does not relax `## Coordinator Stop And Next-Action Standard` or `## Owner Approval Aggregation` — a detected stall still resolves through the same durable journals and the same single owner-facing aggregation point.
+
+### A stall candidate is defined from the durable record, not the pane
+
+A **stall candidate is a unit of work whose handoff was delivered but whose expected next durable journal has not appeared** within the operator's tolerance window. "Delivered" means a durable dispatch journal — a Start / implementation_request, or a coordinator routing journal — exists on the issue (the request is recorded before it is sent, per `## Handoff Lifecycle`). "Expected next journal has not appeared" means the absence of the gate / Progress Log journal that dispatch was waiting on. Both halves are read from the Redmine issue, not from pane scrollback.
+
+Pane silence, an empty `status` / `doctor`, and a clean worktree are *corroborating* signals at most; none of them is the trigger. A lane can be alive and working with nothing yet typed back, and a lane can be finished with only the callback missing — so neither silence nor a clean tree distinguishes the cases. The trigger is "delivered dispatch journal + missing expected durable journal", which is reconstructable from the issue alone and survives a retired or hidden pane.
+
+### Classify which next state the coordinator is waiting on
+
+When a unit is a stall candidate, the coordinator does not collapse it to a single "stalled" label. It classifies, from the durable record, which state the issue is actually in — the four states the PoC surfaced (#11880 j#57539):
+
+- **`no_progress_after_handoff`** — delivery succeeded but no newer durable journal exists at all. The lane may be genuinely blocked, mid-implementation, or never started; the coordinator's next read is the sublane's own issue / Progress Log, not its pane.
+- **`progress_without_callback`** — a newer durable journal *does* exist (for example implementation_done or review_request) but no coordinator callback / ack pointed at it. Work is *not* stopped; only the pointer is missing. The coordinator picks up the advanced state directly.
+- **`callback_delivery_failed`** — the sublane *tried* to call back but the send failed (target resolution, a window-binding preflight rejection, or a stale-CLI rejection — see below). A durable record of the attempt should exist; the coordinator reads it and re-resolves the target.
+- **`callback_not_attempted`** — durable progress exists but neither a callback nor a receive-method journal was recorded. This is a process gap on the sublane side, not a coordinator blind spot; the coordinator records it and nudges.
+
+The coordinator distinguishes these by reading the issue's last journal and asking which gate it was waiting on — **blocked, no-progress, still-working, or implementation_done**. The discriminator is the durable gate sequence, never the pane.
+
+### Record detection and re-notification as durable journals
+
+A stall check and any re-notification are themselves durable events, not ephemeral pane actions:
+
+- When the coordinator concludes a unit is a stall candidate and re-notifies or escalates, **it records that fact on the issue** — a Progress Log noting the stall classification, what was missing, and the re-notification target — exactly as #11854 j#57526 recorded a stall check and nudge. A silent re-poke that leaves no journal is invisible to the next coordinator and is not allowed.
+- When the resolution is `progress_without_callback`, the coordinator records that it picked the state up directly and resumes; it does not re-dispatch work the durable record already shows as done.
+- The re-notification pane send remains a pointer; the stall classification and the retry plan live in the journal, not the callback chat.
+
+### Stale CLI is a distinct stall mode during a handoff or callback
+
+A routing callback can be missing not because a lane is idle but because the lane's *tooling* is broken: the target-lane Codex was alive and reasoning, but its dispatch / callback was blocked by a stale installed CLI (for example an installed `mozyo-bridge` that predates `agents targets` and rejects it as an invalid choice), so no routing callback journal was ever recorded (#11880 j#57555). The coordinator treats this as a `callback_delivery_failed` sub-case and does not misread it as "no progress":
+
+- During a stall check, if the durable record shows the lane reached a routing / preflight step and then went silent, suspect a tooling failure (stale CLI, window-binding preflight) before concluding the lane is idle.
+- For active dogfooding handoff paths — where the repo's own CLI is under development and the installed CLI may lag the source — prefer the repo-local CLI (`PYTHONPATH=src python3 -m mozyo_bridge ...`) over the plain installed `mozyo-bridge` until release / install catches up, so a dispatch or callback is not silently blocked by a version that predates a needed subcommand.
+- A coordinator intervention that unblocks a stale-CLI stall (for example re-sending from the repo-local CLI with an explicit target) is itself recorded on the issue as a durable Progress Log, and is understood as a temporary dogfooding intervention, not a replacement for the target-lane Codex gateway model.
+
+### Boundaries this standard does not relax
+
+- **The durable record stays the source of truth.** A stall candidate, its classification, and its resolution are all derived from and recorded on Redmine journals; pane scrollback / `status` / `doctor` / worktree state are corroborating aids, never the trigger or the record. A missing callback never demotes the durable record.
+- **Detection is not re-dispatch of completed work.** Before re-notifying, the coordinator reads the issue to separate `progress_without_callback` (pick up the done state) from `no_progress_after_handoff` (genuinely waiting); it does not blindly resend work the durable record shows as already advanced.
+- **It does not bypass the stop / aggregation standards.** A detected stall resolves through the same `## Coordinator Stop And Next-Action Standard` next-action proposal and, for owner-waiting states, the same single aggregation point in `## Owner Approval Aggregation`. Stall detection finds the state; it does not self-authorize a close, a carve-out, or an owner decision.
+- **Keep operator-specific policy out of OSS defaults.** The concrete tolerance window (how long is "too long"), the Redmine saved query / filter used to enumerate stall candidates, and any private re-notification cadence or escalation order are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a stall candidate is defined as "delivered dispatch journal + missing expected durable journal", is classified into the four durable states, and that every stall check and re-notification is itself recorded on the issue*; the operator's concrete timeout and query belong in their own runbook, not in the distributed skill or preset body.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

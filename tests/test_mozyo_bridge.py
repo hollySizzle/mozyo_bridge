@@ -14097,6 +14097,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
         "## Coordinator Stop And Next-Action Standard",
         "## Owner Approval Aggregation",
+        "## Stall And No-Progress Detection Standard",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -14171,6 +14172,18 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "owner-action-needed",
         "the owner-approval-waiting set is a property of the durable record, enumerable from the durable record, not by scanning panes",
         "Aggregation is not self-authorization",
+        # Stall and no-progress detection (Redmine #11880). The coordinator
+        # defines a stall candidate from the durable record, classifies it into
+        # four states, treats a stale CLI as a distinct callback-delivery
+        # failure, and records every stall check and re-notification.
+        "A **stall candidate is a unit of work whose handoff was delivered but whose expected next durable journal has not appeared**",
+        "`no_progress_after_handoff`",
+        "`progress_without_callback`",
+        "`callback_delivery_failed`",
+        "`callback_not_attempted`",
+        "Stale CLI is a distinct stall mode during a handoff or callback",
+        "it records that fact on the issue",
+        "Detection is not re-dispatch of completed work",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",

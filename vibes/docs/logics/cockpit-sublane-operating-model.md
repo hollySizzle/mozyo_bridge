@@ -245,6 +245,71 @@ default に混ぜない。portable な部分は「owner 承認待ちは単一 co
 Codex に集約し、pane 数に依存せず durable record から列挙できる」ことで
 ある。
 
+## stall / no-progress 検出 (#11880)
+
+sublane callback (#11852) は happy path、つまり sublane が進んだ durable state
+を pointer で返す経路を定義する。だが callback は best-effort な pointer で
+あり、cockpit が育つと単に届かないことがある。sublane Codex が routing
+callback を記録しなかった、durable record は進んだが誰も pointer を残さな
+かった、send 自体が target 解決に失敗した、などである。届かないと coordinator
+は沈黙だけを見て、その lane が blocked か still-working か done かを手で
+Redmine / worktree / pane を polling して判定することになる (Redmine #11880,
+#11854 PoC 由来)。#11880 はこの検出を durable-record anchored に機械化する。
+
+観測された portable な判断は次である。
+
+- **stall candidate は durable record から定義する。** stall candidate は
+  「handoff が delivered で、期待される次の durable journal が tolerance
+  window 内に現れない」work unit である。delivered は dispatch journal
+  (Start / implementation_request / coordinator routing journal) が issue 上に
+  存在すること。未到来は、その dispatch が待っていた gate / Progress Log
+  journal の不在。どちらも Redmine issue から読み、pane scrollback から
+  読まない。pane 沈黙 / 空の `status` `doctor` / clean worktree は corroborating
+  signal どまりで trigger ではない。lane は何も返さず作業中のこともあり、
+  done で callback だけ欠けることもあるので、沈黙では区別できない。trigger は
+  「delivered dispatch journal + 期待 durable journal の欠如」であり、issue
+  だけから再構成でき、pane 退役後も残る。
+- **どの次状態を待っているか分類する。** 単一の「stalled」に潰さず、durable
+  record から四状態に分類する (#11880 j#57539)。
+  - `no_progress_after_handoff`: delivery 成功だが新しい durable journal が皆無。
+  - `progress_without_callback`: 新しい durable journal はあるが coordinator
+    callback / ack が無い。作業は止まっておらず pointer だけ欠落。
+  - `callback_delivery_failed`: callback を試みたが send が失敗 (target 解決 /
+    window-binding preflight / stale-CLI rejection)。試行の durable record を読む。
+  - `callback_not_attempted`: durable progress はあるが callback も receive-method
+    journal も無い。sublane 側の process gap。
+  分類は issue の最後の journal を読み「blocked / no-progress / still-working /
+  implementation_done のどれを待っていたか」で決め、pane では決めない。
+- **stall check と再通知は durable journal に残す。** stall candidate と判断し
+  再通知 / escalation したら、その事実 (分類・欠落内容・再通知先) を issue に
+  Progress Log として記録する (#11854 j#57526 と同型)。journal を残さない
+  silent re-poke は次 coordinator から不可視であり禁止。`progress_without_callback`
+  の解決は「既に進んでいた state を直接拾った」と記録し、done な work を
+  re-dispatch しない。
+- **stale CLI は handoff/callback 中の独立した stall mode。** lane が idle では
+  なく tooling が壊れていて callback が欠けることがある。target-lane Codex は
+  生きて reasoning しているが、stale installed CLI (例: `agents targets` を
+  知らない古い `mozyo-bridge`) に dispatch / callback が blocked され、routing
+  callback journal が記録されなかった (#11880 j#57555)。これを
+  `callback_delivery_failed` の sub-case として扱い「no progress」と誤読しない。
+  active dogfooding handoff path では installed CLI が source に lag しうるため、
+  release / install が追いつくまで repo-local CLI (`PYTHONPATH=src python3 -m
+  mozyo_bridge ...`) を優先する。stale-CLI stall を解いた coordinator
+  intervention は issue に durable Progress Log として残し、target-lane Codex
+  gateway model の置換ではなく一時的な dogfooding intervention と理解する。
+
+これは停止点標準 (#11860) や owner 承認集約 (#11867) を緩めない。検出された
+stall も同じ durable journal、同じ next-action 提示、同じ単一 owner-facing
+集約点で解決する。stall 検出は state を見つけるだけで、close / carve-out /
+owner 判断を self-authorize しない。
+
+具体的な tolerance window (どれだけで「遅い」か)、stall candidate を列挙する
+Redmine saved query / filter、private な再通知 cadence / escalation 順は
+operator runtime policy であり OSS default に混ぜない (public-private boundary)。
+portable な部分は「stall candidate を『delivered dispatch journal + 期待 durable
+journal の欠如』で定義し、四状態に分類し、stall check と再通知を必ず issue に
+記録する」ことである。
+
 ## Ticket 化するもの
 
 この PoC では、運用上の friction を意図的に child issue 化する。finding が
