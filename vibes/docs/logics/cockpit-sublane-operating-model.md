@@ -205,6 +205,46 @@ owner 承認を回収しない。
 boundary)。portable な部分は「停止ごとに durable な理由 + 三点提示を残し、
 ready な作業を queue に戻す」ことである。
 
+## owner 承認待ちの集約
+
+停止点標準 (#11860) と sublane callback (#11852) の交差で残っていた前提を
+#11867 で明示した。owner 承認待ちは、それが発生した sublane 内で完結させて
+はならず、必ず単一の owner-facing 点 = main coordinator Codex に集約する。
+#11855 / #11860 では review approved / owner-close-waiting が Redmine には
+記録されていたが、coordinator に集約されないと cockpit 上では停止して
+見えた。pane が増えても「いま owner を待っている issue はどれか」を pane
+ごとに探し回らせない、というのが要点である。
+
+観測された portable な判断は次である。
+
+- **owner 承認を回収する actor は一つ。** main coordinator lane の Codex
+  だけが owner 承認を回収する。sublane の Codex / Claude は待機状態を
+  durable record に記録して callback するだけで、自 pane で owner 判断を
+  solicit / collect / ratify しない。これは `Result Notification Boundary`
+  と central preset の `Owner Close Approval Delegation` を集約方向に適用
+  したものである。
+- **owner-approval-waiting の二状態を明示する。** owner close approval
+  waiting (Review Gate / US audit 後、`Close Approval Separation` 待ち) と、
+  owner-action-needed (scope / stakeholder 判断、carve-out、owner-only
+  unblock、owner が答える Design Consultation など、close approval より
+  広い owner 判断)。後者を「blocked」に潰さず別状態として扱う。
+- **承認待ち集合は pane 非依存で列挙する。** owner-approval-waiting 集合は
+  durable record の属性であり、pane scrollback / `status` / `doctor` を
+  pane ごとに走査して作らない。Redmine 上の gate journal / status を query
+  して再構成する。待機は pane ではなく issue に乗っているので、pane が
+  非表示でも sublane が退役しても集合から落ちない。callback は集合そのもの
+  ではなく pointer であり、coordinator は受け取った callback から queue を
+  組み立てるのではなく durable record から導出する。
+- **集約は自己承認ではない。** coordinator に集約しても、別 journal の owner
+  決定なしに owner の代わりに承認してよいことにはならない。standing
+  delegation 下でも carve-out を self-authorize しない。
+
+owner の承認待ち列挙に使う具体的な Redmine filter / saved query / status
+mapping と、その列の優先順位付けは operator runtime policy であり OSS
+default に混ぜない。portable な部分は「owner 承認待ちは単一 coordinator
+Codex に集約し、pane 数に依存せず durable record から列挙できる」ことで
+ある。
+
 ## Ticket 化するもの
 
 この PoC では、運用上の friction を意図的に child issue 化する。finding が

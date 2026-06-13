@@ -209,6 +209,40 @@ The coordinator stop must not silently freeze every sublane:
 - **The coordinator does not collect owner approval in a sublane's Claude pane.** Owner-facing decisions stay in the coordinator lane's Codex (see `### Owner Close Approval Delegation` in the central preset). The standard changes how the stop is *presented*, not who owns the owner-facing exchange.
 - **Keep operator-specific policy out of OSS defaults.** Concrete next-action menus, throughput targets, which backlog a given operator drains first, and any private prioritization rule are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that every coordinator stop records a durable reason plus a three-part next-action proposal and returns ready work to the queue*; the operator's concrete queue and priorities belong in their own runbook, not in the distributed skill or preset body.
 
+## Owner Approval Aggregation
+
+`## Sublane Coordinator Callback` lists "owner close approval requested" as one of several callback states, and `## Coordinator Stop And Next-Action Standard` governs how the coordinator presents a stop. This section pins the specialization that the two leave implicit: **owner-approval-waiting is the one state class that must always converge on a single owner-facing point — the main coordinator Codex — never resolved inside the sublane that produced it** (Redmine #11867, from the #11855 / #11860 multi-lane PoC, where review-approved / owner-close-waiting was recorded in Redmine but, not aggregated to the coordinator, looked stopped on the cockpit). As the cockpit grows more sublanes, "what is currently waiting on the owner?" must not become a per-pane hunt.
+
+### The single owner-facing aggregation point is the main coordinator Codex
+
+There is exactly one actor that collects owner approval: the main coordinator lane's Codex. Every owner-approval-waiting state, wherever it arises, is callbacked to that Codex so the owner sees one consolidated queue rather than a decision scattered across sublane panes.
+
+- **A sublane never resolves owner approval inside its own lane.** The sublane Codex and the sublane Claude record the waiting state on the durable record and call it back; they do not solicit, collect, or ratify the owner decision in their own panes. This is the same boundary as `references/safety.md` `## Result Notification Boundary` and the central preset's `### Owner Close Approval Delegation` — the coordinator owns the owner-facing exchange — applied to the aggregation direction.
+- **The coordinator is where the owner acts once.** Because all owner-approval-waiting states converge there, the owner ratifies (or defers) from one place, and the resulting `owner_close_approval` journal (or Design Consultation answer, or other owner decision journal) lands as the durable record the originating lane resumes from.
+
+### States that must callback as owner-approval-waiting
+
+Beyond the generic callback list, these two are the owner-approval class and always aggregate to the coordinator Codex:
+
+- **owner close approval waiting** — a UserStory or standalone issue has passed its Review Gate / US-level audit and is parked on `Close Approval Separation`, waiting on the owner's close approval before the Close Gate.
+- **owner-action-needed** — any other point where the sublane has run out of autonomous range and the only remaining next action needs an owner judgment the sublane may not self-make: a scope / stakeholder call, a carve-out action under `### Owner Close Approval Delegation`, an owner-only unblock, or a Design Consultation the owner (not Codex) must answer. This is broader than close approval and is named explicitly so it is not silently collapsed into "blocked".
+
+Each lands as its own durable gate / Progress Log journal first; the callback is only the pointer to it, exactly as in `## Sublane Coordinator Callback`.
+
+### Enumerating the approval-waiting set is pane-count-independent
+
+The coordinator's grasp of the outstanding owner queue must not degrade as panes multiply. The portable invariant: **the owner-approval-waiting set is a property of the durable record, enumerable from the durable record, not by scanning panes.**
+
+- The authoritative list of "issues currently waiting on the owner" is reconstructed by querying Redmine for the owner-approval-waiting gate journals / status the lanes recorded — not by walking each pane's scrollback, `status`, or `doctor`. A pane that is not currently visible, or a sublane that has since been retired, does not drop its waiting issue out of the queue, because the wait lives on the issue, not the pane.
+- This is why the callback in the section above is a *pointer*, not the queue: the coordinator does not rebuild the queue from the callbacks it happened to receive; it derives the queue from the durable record and uses callbacks only to know when to refresh its view. The two stay consistent because both anchor on the same gate journals.
+- Pane count, cockpit group layout, and which sublanes are open are display facts; the approval-waiting queue is a governance fact. Keeping them separate is the same `Identity / Routing / Display / Governance` separation as the cockpit operating model.
+
+### Boundaries this standard does not relax
+
+- **Aggregation is not self-authorization.** Converging owner-approval-waiting states on the coordinator does not let the coordinator approve them on the owner's behalf; it still records the separate owner decision journal per `Close Approval Separation` and never self-authorizes a carve-out under standing delegation.
+- **The durable record stays the source of truth.** The enumerated queue and every callback are anchored on Redmine journals; the coordinator reads those journals, not pane scrollback, before acting on any waiting item.
+- **Keep operator-specific policy out of OSS defaults.** The concrete Redmine filter / saved query / status mapping an operator uses to enumerate the waiting set, and any private prioritization of that queue, are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that owner-approval-waiting always aggregates to the single coordinator Codex and is enumerable from the durable record independent of pane count*; the concrete query belongs in the operator's own runbook, not in the distributed skill or preset body.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

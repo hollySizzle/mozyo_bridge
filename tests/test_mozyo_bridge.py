@@ -14096,6 +14096,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Sublane Coordinator Callback",
         "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
         "## Coordinator Stop And Next-Action Standard",
+        "## Owner Approval Aggregation",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -14161,6 +14162,15 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "A stop is justified only when the *only* remaining next actions are in the owner-approval range",
         "A next-action proposal is not self-authorization",
         "Hand gated work back to the queue, not to a held pane",
+        # Owner approval aggregation (Redmine #11867). Owner-approval-waiting
+        # always converges on the single main coordinator Codex, is never
+        # resolved inside the sublane, and the waiting queue is enumerable
+        # from the durable record independent of pane count.
+        "The single owner-facing aggregation point is the main coordinator Codex",
+        "A sublane never resolves owner approval inside its own lane",
+        "owner-action-needed",
+        "the owner-approval-waiting set is a property of the durable record, enumerable from the durable record, not by scanning panes",
+        "Aggregation is not self-authorization",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
