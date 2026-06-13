@@ -82,6 +82,18 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: rule-public-private-boundary
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/public-private-boundary.md
+    purpose: OSS mozyo-bridge と private consumer / presentation plane の責務分界、private 情報混入防止、ticket routing の project-local guardrail。
+    audit_role: public_private_boundary_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - rule-codex-autonomous-guardrail-lane
+      - rule-release-distribution
+      - spec-project-map
+
   - id: spec-project-map
     type: spec
     status: active
@@ -594,6 +606,7 @@ file_conventions:
     severity: warn
     document_refs:
       - rule-project-agent-workflow
+      - rule-public-private-boundary
       - spec-project-map
       - skill-workflow-reference
 
@@ -607,6 +620,7 @@ file_conventions:
     document_refs:
       - rule-codex-autonomous-guardrail-lane
       - rule-project-agent-workflow
+      - rule-public-private-boundary
       - skill-workflow-reference
 
   - id: fc-agent-workflow-docs

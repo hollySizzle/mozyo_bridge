@@ -220,8 +220,8 @@ rules:
   patterns:
   - vibes/docs/**
   severity: warn
-  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/specs/project-map.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -232,8 +232,8 @@ rules:
   - vibes/docs/logics/**
   - vibes/docs/specs/**
   severity: warn
-  message: 'このファイルを変更する場合は､ @vibes/docs/rules/codex-autonomous-guardrail-lane.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/codex-autonomous-guardrail-lane.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/rules/public-private-boundary.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
