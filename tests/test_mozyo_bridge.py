@@ -4254,6 +4254,64 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # boundary defined elsewhere.
         self.assertIn("does not waive the implementer / auditor boundary", section)
 
+    def test_main_unit_claude_safe_use_section_present(self) -> None:
+        """Redmine #11858: the shared skill reference must carry the main-unit
+        Claude safe-use boundary so a main coordinator unit that places a
+        Claude pane beside the coordinator Codex knows what it may offload to
+        save Codex context and what stays owner-facing. The boundary is the
+        portable workflow risk, not an operator's private offload list."""
+        section_start = self.workflow.index("## Main-Unit Claude Safe-Use Boundary")
+        section_end = self.workflow.index(
+            "\n## Claude / Codex Role Boundary", section_start
+        )
+        section = self.workflow[section_start:section_end]
+        # Anchored to the durable record and framed as observed risk, not a
+        # fixed judgement about any model.
+        self.assertIn("#11858", section)
+        self.assertIn(
+            "observed workflow risk, not a fixed judgement about any model",
+            section,
+        )
+        # Output is input/draft, never evidence the coordinator can act on
+        # without confirming against the source of truth.
+        self.assertIn("draft / input, never evidence", section)
+        # The two explicit buckets the acceptance criteria require.
+        self.assertIn("### Allowed uses (safe Codex-context savings)", section)
+        self.assertIn("### Prohibited uses (stay with the coordinator Codex)", section)
+        # Concrete Codex-context-saving safe tasks.
+        self.assertIn("Summarizing long Redmine journals", section)
+        self.assertIn("Extracting candidates", section)
+        # Owner-facing / gate actions that must NOT be delegated.
+        self.assertIn("owner close approval", section)
+        self.assertIn("Review Gate", section)
+        self.assertIn("durable routing decisions", section)
+        # The difference from a sublane Claude must be explicit.
+        self.assertIn("### Difference from a sublane Claude", section)
+        # Portable vs private operator preference separation.
+        self.assertIn("public-private-boundary.md", section)
+
+    def test_main_unit_claude_safe_use_does_not_grant_owner_or_gate_authority(
+        self,
+    ) -> None:
+        """The main-unit Claude section saves coordinator context but must not
+        read as moving any owner-facing / gate boundary onto the Claude pane.
+        A future edit that softened the prohibition into an allowance would be
+        caught here."""
+        section_start = self.workflow.index("## Main-Unit Claude Safe-Use Boundary")
+        section_end = self.workflow.index(
+            "\n## Claude / Codex Role Boundary", section_start
+        )
+        section = self.workflow[section_start:section_end]
+        # The assistant framing and the non-relaxation clause must both stand.
+        self.assertIn("assistant, not a parallel coordinator", section)
+        self.assertIn(
+            "Owner-facing and gate decisions stay with the coordinator Codex",
+            section,
+        )
+        # It must defer owner approval to the single aggregation point, not the
+        # Claude pane.
+        self.assertIn("never a Claude pane", section)
+
 
 class ScaffoldPresetHandoffPrimitiveDocsTest(unittest.TestCase):
     """Regression rails for Asana 1214760806178471: the scaffold presets must

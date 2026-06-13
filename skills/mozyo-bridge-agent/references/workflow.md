@@ -289,6 +289,54 @@ A routing callback can be missing not because a lane is idle but because the lan
 - **It does not bypass the stop / aggregation standards.** A detected stall resolves through the same `## Coordinator Stop And Next-Action Standard` next-action proposal and, for owner-waiting states, the same single aggregation point in `## Owner Approval Aggregation`. Stall detection finds the state; it does not self-authorize a close, a carve-out, or an owner decision.
 - **Keep operator-specific policy out of OSS defaults.** The concrete tolerance window (how long is "too long"), the Redmine saved query / filter used to enumerate stall candidates, and any private re-notification cadence or escalation order are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a stall candidate is defined as "delivered dispatch journal + missing expected durable journal", is classified into the four durable states, and that every stall check and re-notification is itself recorded on the issue*; the operator's concrete timeout and query belong in their own runbook, not in the distributed skill or preset body.
 
+## Main-Unit Claude Safe-Use Boundary
+
+`## Sublane Coordinator Callback` and `## Coordinator Stop And Next-Action Standard` assume the main coordinator lane is a Codex pane. Some cockpit layouts also place a **Claude pane in the main coordinator unit itself**, idle in auto mode beside the coordinator Codex. It is tempting to spend that pane on coordinator work to save the coordinator Codex's context. This section bounds that use so the main-unit Claude saves context without blurring the coordinator's owner-facing / gate-deciding role (Redmine #11858, from the #11850 multi-lane PoC).
+
+The boundary is drawn from **observed workflow risk, not a fixed judgement about any model's capability**. Claude and Codex both change over time; revisit this section when the tooling changes. What it protects is structural: the main unit is the closest pane to the owner-facing / audit / routing source of truth, so an actor there that silently makes a gate or owner decision collapses the separation the whole multi-lane model depends on.
+
+### The main-unit Claude is an assistant, not a parallel coordinator
+
+The main-unit Claude pane is a non-authoritative helper for the coordinator. Its output is **draft / input, never evidence**: the coordinator Codex must confirm it against source files, the Redmine record, and command output before turning it into any decision. Treat a main-unit Claude result the way you treat pane scrollback — a pointer to check, not a durable fact.
+
+### Allowed uses (safe Codex-context savings)
+
+These are concrete tasks the coordinator may hand to the main-unit Claude to spend its context budget instead of the coordinator's, because none of them produces an authoritative decision:
+
+- Summarizing long Redmine journals, diffs, logs, or command transcripts into a shorter brief the coordinator then verifies.
+- Extracting candidates — for example a first-pass list of stall candidates, changed paths, or affected issues — for the coordinator to confirm against the durable record.
+- Scratch analysis and read-only investigation that leaves no durable edit.
+- Drafting wording (journal text, a proposed next-action menu, a doc paragraph) that the coordinator reviews and owns before it lands.
+- Non-authoritative comparison of options for the coordinator to weigh.
+- Normal implementation **after** the work has been moved into a properly Redmine-gated lane (its own sublane or worktree), following the standard implement → record → review flow. That is no longer "main-unit assistant" use; it is ordinary implementer use in a bounded lane.
+
+### Prohibited uses (stay with the coordinator Codex)
+
+The main-unit Claude must not perform any owner-facing or gate-deciding action. These stay with the coordinator Codex regardless of how the request is phrased into the Claude pane:
+
+- Asking the owner questions, or soliciting / collecting / ratifying owner close approval (see `## Owner Approval Aggregation` — owner approval converges on the single coordinator Codex, never a Claude pane).
+- Concluding a Review Gate / US-level audit, or recording a review verdict.
+- Making durable routing decisions — choosing which lane a request goes to, dispatching a handoff across a lane boundary, or deciding a sublane is done.
+- Interpreting a Redmine gate as satisfied, advancing a gate, or closing an issue.
+- Silent edits to protected workflow / skill / source / test surfaces (the surfaces listed in `## Policy / Skill Authoring Boundary`), or any edit outside an explicitly gated lane.
+
+A request typed into the main-unit Claude pane does not change this. As in `## Claude / Codex Role Boundary`, an imperative phrase ("やって", "go ahead") expresses intent, not authority to cross the boundary.
+
+### Difference from a sublane Claude
+
+A sublane Claude and the main-unit Claude are both non-owner-facing, but they differ in authority:
+
+- A **sublane Claude** is a bounded implementation worker. Inside its lane it produces real diffs, records implementation_done / review_request journals, and runs verification — durable implementation outputs, just not owner-facing ones. Its lane has its own Redmine gating and its own Codex gateway.
+- The **main-unit Claude** has no implementation lane of its own. It sits next to the coordinator, so its safe range is narrower: assistant-only (summaries, extraction, drafts, scratch) until work is explicitly moved into a gated lane. Letting it implement in place would put unreviewed edits next to the audit / owner-facing source of truth, which is exactly the risk this section guards against.
+
+In short: a sublane Claude implements under its lane's gate; the main-unit Claude assists the coordinator and only implements once work has left the main unit for a gated lane.
+
+### Boundaries this section does not relax
+
+- **Assistant output is input, not evidence.** Nothing the main-unit Claude produces is durable until the coordinator Codex confirms it against the source of truth and records it.
+- **Owner-facing and gate decisions stay with the coordinator Codex.** This section saves coordinator context; it does not move the `Close Approval Separation`, `## Owner Approval Aggregation`, or `## Policy / Skill Authoring Boundary` boundaries.
+- **Keep operator-specific policy out of OSS defaults.** Whether a given operator runs a Claude pane in the main unit at all, which concrete tasks they routinely offload to it, and any private prioritization are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a main-unit Claude is an assistant whose output is input-not-evidence, may take the listed safe tasks, and must not take owner-facing or gate decisions or implement outside a gated lane*; the operator's concrete offload list belongs in their own runbook, not in the distributed skill or preset body.
+
 ## Claude / Codex Role Boundary
 
 - Claude owns implementation for normal development tasks.

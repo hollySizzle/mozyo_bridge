@@ -89,28 +89,53 @@ sublane Claude pane は implementation worker である。主に次を行う。
 
 ### Main Claude
 
-main Claude pane は有用だが、parallel coordinator にしてはいけない。
+main Claude pane は有用だが、parallel coordinator にしてはいけない
+(Redmine #11858)。これは特定 model の能力評価ではなく、観測された workflow
+risk に基づく境界である。main unit は owner-facing / audit / routing の source
+of truth に最も近い pane であり、ここで gate / owner 判断を silent に行う actor
+が混ざると、multi-lane model 全体が依存している分離が崩れる。
 
-安全な使い方は次である。
-
-- scratch analysis。
-- 長い出力や journal の要約。
-- candidate extraction。
-- draft wording。
-- option の非権威的な比較。
-- work が適切な Redmine-gated lane に移された後の implementation。
-
-main Claude に任せるべきではないものは次である。
-
-- owner questions。
-- close approval collection。
-- Review Gate conclusions。
-- durable routing decisions。
-- protected workflow、skill、source、test surface への silent edit。
-
-main lane の Claude output は input であり、evidence ではない。coordinator
+main lane の Claude output は input であって evidence ではない。coordinator
 Codex は、それを decision に変換する前に source file、Redmine journal、
-command output を確認しなければならない。
+command output で確認しなければならない。pane scrollback と同じく「確認すべき
+pointer」であり durable な事実ではない。
+
+安全な使い方 (coordinator Codex の context を節約できる concrete task) は次で
+ある。いずれも authoritative な決定を生まないものに限る。
+
+- 長い Redmine journal / diff / log / command 出力の要約 (coordinator が後で
+  検証する)。
+- candidate 抽出 (stall candidate の一次列挙、changed paths、影響 issue など)
+  を、coordinator が durable record と突き合わせる前段として作る。
+- scratch analysis と read-only 調査 (durable edit を残さない)。
+- draft wording (journal 文面、next-action menu 案、doc 段落)。coordinator が
+  review して own してから land させる。
+- option の非権威的な比較。
+- work が適切な Redmine-gated lane (専用 sublane / worktree) に移された後の
+  implementation。これは「main unit assistant」用途ではなく、bounded lane で
+  の通常の implementer 用途であり、標準の implement → record → review flow に
+  従う。
+
+main Claude に任せるべきではないもの (coordinator Codex が保持する) は次で
+ある。request が Claude pane に直接打ち込まれても変わらない。
+
+- owner questions、owner close approval の solicit / collect / ratify
+  (owner 承認は単一 coordinator Codex に集約する。`owner 承認待ちの集約`
+  参照)。
+- Review Gate / US audit conclusion、review verdict の記録。
+- durable routing decision (どの lane に渡すか、lane 境界を越える handoff の
+  dispatch、sublane done の判断)。
+- Redmine gate を満たしたと解釈する、gate を進める、issue を close する。
+- protected workflow / skill / source / test surface への silent edit、または
+  gated lane 外の編集。
+
+sublane Claude との違い: sublane Claude は自 lane の gate 下で実 diff を出し、
+implementation_done / review_request を記録する bounded implementation worker
+である (上の `### Sublane Claude`)。main Claude は自前の implementation lane を
+持たず、work が gated lane へ明示的に移るまで assistant-only (要約 / 抽出 /
+draft / scratch) にとどまる。in place で実装させると、unreviewed edit が audit /
+owner-facing source of truth の隣に並び、本節が守ろうとする risk そのものに
+なる。
 
 ## Cross-Lane Routing Rule
 
