@@ -3474,6 +3474,21 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("window-layout-changed", text, msg=str(conf))
             self.assertIn("pane-border-status", text, msg=str(conf))
             self.assertIn("window_panes", text, msg=str(conf))
+            # The hook is registered at a stable reserved array index so a
+            # re-source replaces it in place instead of appending a
+            # duplicate (the non-idempotent `set-hook -ga` bug, #11958
+            # j#58616). The fix lives in the actual directives, so check
+            # those rather than the prose comment (which names `-ga` while
+            # explaining why it is avoided).
+            hook_directives = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip().startswith("set-hook") and not line.lstrip().startswith("#")
+            ]
+            self.assertTrue(hook_directives, msg=f"{conf} has no set-hook directive")
+            for directive in hook_directives:
+                self.assertIn("window-layout-changed[9000]", directive, msg=str(conf))
+                self.assertNotIn("-ga", directive, msg=f"{conf} re-introduced non-idempotent -ga")
             # Same label vocabulary as the window marker; quiet when healthy.
             for label in ("OWNER", "REVIEW", "BLOCKED", "STALLED", "DONE", "RETIRE", "UNKNOWN"):
                 self.assertIn(label, text, msg=f"{conf} missing {label}")
@@ -3613,6 +3628,90 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual(
                 "24",
                 tmux("display-message", "-p", "-t", "cp:cockpit", "#{pane_height}").stdout.strip(),
+            )
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket, "kill-server"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+    def test_governed_tmux_snippet_layout_hook_is_idempotent_under_tmux(self) -> None:
+        """Re-sourcing the snippet does not pile up duplicate layout hooks (#11958).
+
+        Regression test for the j#58616 Major finding: `set-hook -ga`
+        appends a fresh `window-layout-changed` entry on every source, so
+        a reusable snippet that operators re-source (config reloads,
+        repeated `source-file`) would accumulate duplicates. The fix
+        registers the hook at a stable reserved array index, so sourcing
+        the file twice leaves exactly one mozyo entry while an unrelated
+        operator hook at another index survives. Skipped when tmux is not
+        on PATH (the static check above keeps CI green).
+        """
+        import shutil as _shutil
+        import subprocess
+
+        if _shutil.which("tmux") is None:
+            self.skipTest("tmux binary not on PATH")
+
+        snippet = Path(__file__).resolve().parents[1] / ".mozyo-bridge/tmux/agent-ui.conf"
+        self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
+
+        socket = f"mozyo-hook-{os.getpid()}"
+        env = os.environ.copy()
+        env.pop("TMUX", None)
+        env.pop("TMUX_PANE", None)
+
+        def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["tmux", "-L", socket, *argv],
+                capture_output=True,
+                text=True,
+                check=check,
+                env=env,
+            )
+
+        subprocess.run(
+            ["tmux", "-L", socket, "kill-server"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        try:
+            tmux("-f", "/dev/null", "new-session", "-d", "-s", "hk", "-n", "cockpit", "sleep 60")
+            # An operator already has their own layout hook at the default
+            # index; it must survive our (re-)source untouched.
+            tmux("set-hook", "-ga", "window-layout-changed", "display-message 'operator hook'")
+
+            # Source the snippet twice to simulate a config reload.
+            tmux("source-file", str(snippet))
+            tmux("source-file", str(snippet))
+
+            entries = [
+                line.strip()
+                for line in tmux("show-hooks", "-gw").stdout.splitlines()
+                if line.strip().startswith("window-layout-changed[")
+            ]
+            # Exactly one mozyo entry (no duplicate from the second source)
+            # plus the preserved operator entry.
+            mozyo_entries = [e for e in entries if "pane-border-status" in e]
+            operator_entries = [e for e in entries if "operator hook" in e]
+            self.assertEqual(1, len(mozyo_entries), msg=f"duplicate mozyo hooks: {entries}")
+            self.assertIn("window-layout-changed[9000]", mozyo_entries[0], msg=mozyo_entries[0])
+            self.assertEqual(1, len(operator_entries), msg=f"operator hook lost/dup: {entries}")
+
+            # The hook still functions after the dedup: border row on with
+            # >1 pane, off again at one.
+            tmux("split-window", "-t", "hk:cockpit", "-d", "-v", "sleep 60")
+            self.assertEqual(
+                "top",
+                tmux("show-options", "-wqv", "-t", "hk:cockpit", "pane-border-status").stdout.strip(),
+            )
+            tmux("kill-pane", "-t", "hk:cockpit.1")
+            self.assertEqual(
+                "off",
+                tmux("show-options", "-wqv", "-t", "hk:cockpit", "pane-border-status").stdout.strip(),
             )
         finally:
             subprocess.run(
