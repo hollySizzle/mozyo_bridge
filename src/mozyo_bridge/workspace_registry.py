@@ -28,8 +28,13 @@ durable identity instead of a per-call computation:
 
 Reads are strictly read-only: resolving a session name never creates the
 registry, never writes ``last_seen``, and never touches the anchor. All
-writes happen only in :func:`register_workspace` (CLI: ``mozyo-bridge
-workspace register``).
+writes go through :func:`register_workspace`, which has two callers: the
+explicit ``mozyo-bridge workspace register`` CLI (manual, idempotent) and
+smart ``mozyo-bridge init`` (Redmine #11427), which registers an
+unregistered workspace as part of a guarded adoption — after its
+fail-closed preflight checks and before any tmux/vscode mutation. The
+session resolution step inside ``init`` is itself read-only; the
+registration is a separate, explicit write.
 """
 
 from __future__ import annotations

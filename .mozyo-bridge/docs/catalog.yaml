@@ -189,7 +189,21 @@ documents:
     audit_role: scaffold_rules_logic
     related_document_refs:
       - logic-bootstrap
+      - logic-scaffold-distribution-minimization
       - rule-docs-catalog-governance
+      - spec-project-map
+
+  - id: logic-scaffold-distribution-minimization
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/scaffold-distribution-minimization.md
+    purpose: scaffold 配布物の 4 分類 (durable anchor / thin router / optional governance / generated-bootstrap)、home registry + thin anchor 中心の最小化目標像、配布責務再評価、移行/後方互換境界、private 分離の方針正本。
+    audit_role: scaffold_distribution_minimization_logic
+    related_document_refs:
+      - logic-scaffold-rules
+      - logic-workspace-registry
+      - logic-bootstrap
+      - rule-public-private-boundary
       - spec-project-map
 
   - id: logic-canonical-renderer

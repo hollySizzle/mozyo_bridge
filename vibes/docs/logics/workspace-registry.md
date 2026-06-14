@@ -27,7 +27,7 @@ identity_layers:
 設計上の不変条件:
 
 - **tmux runtime state を DB に置かない。** live な window / pane / process 情報は tmux が正本。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。
-- **読み取りは read-only。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / smart `init` / `status` の session 解決) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。書き込み surface は `workspace register` だけ。
+- **読み取りは read-only / 書き込みは `register_workspace()` 経由。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / `status` / smart `init` の session 解決ステップ) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。registry / anchor への書き込みは `register_workspace()` のみが行い、呼び出し元は (1) 明示的な `workspace register` CLI (手動・idempotent) と (2) smart `init` (#11427) の guarded adoption (fail-closed preflight の後・tmux/vscode mutation の前に、未登録 workspace を登録) の 2 つ。`init` の session 解決自体は read-only で、登録は別の明示的 write step。
 - **anchor は path を持たない。** anchor の置き場所そのものが path であり、copy / move されても stale path を主張できない。
 - **anchor は workspace root marker である。** `shared/paths.py` の `WORKSPACE_MARKERS` に `.mozyo-bridge/workspace.json` を含め、登録済み非 git workspace の subdirectory からの root 推測が登録 root に解決されるようにする (review #54760)。`.mozyo-bridge/scaffold.json` (#11301) と同じ「workspace identity を確立する narrow marker」の扱い。
 - **特定 VS Code extension / tmux-integrated を公式 backend にしない。** 既存の `.vscode/settings.json` 連携 (#10796) は維持するが、registry の正本性はそれに依存しない。
@@ -80,10 +80,12 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 
 ## CLI surface
 
-- `mozyo-bridge workspace register [--repo PATH] [--name NAME] [--json]` — 唯一の書き込み。idempotent。
+- `mozyo-bridge workspace register [--repo PATH] [--name NAME] [--json]` — 明示的・手動の書き込み。idempotent。registry / anchor への書き込み関数 `register_workspace()` を呼ぶ。
 - `mozyo-bridge workspace list [--json]` — read-only。
 - `mozyo-bridge workspace inspect [--repo PATH] [--json]` — registry row / anchor / derived fallback / 効いている解決を並べて表示。drift の可視化用。
-- 既存 consumer (`session name`, bare `mozyo`, `status`, smart `init`, `session vscode-settings`) は `resolve_canonical_session()` 経由。未登録 workspace では従来の導出と byte 一致で後方互換。
+- read-only consumer (`session name`, bare `mozyo`, `status`, `session vscode-settings`) は `resolve_canonical_session()` 経由で、書き込みを伴わない。
+- smart `init` (#11427) は解決自体は `resolve_canonical_session()` 経由 (read-only) だが、未登録 workspace のときは guarded adoption の一部として `register_workspace()` を呼んで登録する (`workspace register` と同じ write 関数)。これは `workspace register` 以外の唯一の write 呼び出し元。
+- 未登録 workspace の解決は従来の導出と byte 一致で後方互換。
 
 ## 検証
 

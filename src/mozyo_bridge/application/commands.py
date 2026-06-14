@@ -4399,7 +4399,9 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
 def cmd_workspace_register(args: argparse.Namespace) -> int:
     """Register (or refresh) this workspace in the home registry (#11429).
 
-    The only write surface of the workspace registry: upserts the registry
+    The explicit, manual write surface of the workspace registry (smart
+    ``init`` also registers via the same :func:`register_workspace` API since
+    Redmine #11427): upserts the registry
     row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
     rewrites the workspace-local anchor
     (``<repo>/.mozyo-bridge/workspace.json``). Idempotent: re-running keeps
