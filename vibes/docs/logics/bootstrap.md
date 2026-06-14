@@ -34,7 +34,8 @@ In scope:
 - governed scaffold catalog setup (`catalog.yaml.example` -> `catalog.yaml`) and
   `mozyo-bridge docs ...` verification for projects that opt into
   `redmine-governed` or `redmine-rails-governed`.
-- workspace-local Redmine default project startup (`.mozyo-bridge/workspace-defaults.yaml`
+- workspace-local Redmine default project startup (`.mozyo-bridge/project-defaults.yaml`,
+  legacy `workspace-defaults.yaml` still reads
   -> `.mozyo-bridge/redmine-defaults.md`) and optional LLM/MCP runtime config
   placement guidance.
 - bootstrap verification (`mozyo-bridge doctor`, `--target`, `--json`).
@@ -431,8 +432,10 @@ If it is missing, ask the operator for:
 - Redmine project URL.
 - Optional parent project label.
 
-Then create or update `.mozyo-bridge/workspace-defaults.yaml` with those
-workspace-specific values and render the generated snippet:
+Then create or update `.mozyo-bridge/project-defaults.yaml` (the legacy
+`workspace-defaults.yaml` name still reads as a fallback, Redmine #11920 /
+#11921; new files use the new name) with those workspace-specific values and
+render the generated snippet:
 
 ```bash
 mozyo-bridge workspace-defaults
@@ -440,7 +443,7 @@ mozyo-bridge workspace-defaults --check
 ```
 
 Do not store Redmine API keys, OAuth tokens, cookies, passwords, or other
-credentials in `.mozyo-bridge/workspace-defaults.yaml`, generated snippets,
+credentials in `.mozyo-bridge/project-defaults.yaml`, generated snippets,
 `.codex/config.toml`, `.mcp.json`, ticket journals, or chat output. Authentication
 belongs in user-level tool config or secret stores.
 
@@ -463,7 +466,7 @@ http_headers = { X-Default-Project = "<project-identifier>" }
 ```
 
 This file is a startup checkpoint and example, not a generated output kind. Do
-not point `workspace-defaults.yaml` at `.codex/config.toml` unless a future
+not point `project-defaults.yaml` at `.codex/config.toml` unless a future
 typed `codex_toml` renderer exists and validates TOML, suffixes, and secret
 rejection. If `.codex/config.toml` is created or updated, restart or reload
 Codex before verification.
@@ -632,7 +635,7 @@ The symptoms below are the ones an LLM is most likely to observe while executing
   - run bare `mozyo` from the repo root: `cd /path/to/repo && mozyo`. This creates `claude` and `codex` windows in a repo-scoped tmux session.
   - for an existing pane (VS Code tmux terminal, hand-managed tmux pane), run `mozyo-bridge init <agent>` from inside that pane to rename its window.
 - VS Code `tmux-integrated` collapses a non-ASCII workspace basename to a low-information session name (for example `2026PBL_ローカル` → `2026PBL_____`), and same-named `____` sessions across workspaces break `agents list` / `--target-repo` repo-identity recovery (Redmine #10796):
-  - bare `mozyo` already derives a collision-safe ASCII session name (prefers `redmine.default_project.identifier` from `.mozyo-bridge/workspace-defaults.yaml`, else `mozyo-<basename-slug>-<hash>`). Inspect it with `mozyo-bridge session name --repo <repo>`. An explicit `mozyo --session NAME` still overrides.
+  - bare `mozyo` already derives a collision-safe ASCII session name (prefers `redmine.default_project.identifier` from `.mozyo-bridge/project-defaults.yaml`, legacy `workspace-defaults.yaml` still reads, else `mozyo-<basename-slug>-<hash>`). Inspect it with `mozyo-bridge session name --repo <repo>`. An explicit `mozyo --session NAME` still overrides.
   - VS Code starts its own session (not via `mozyo`), so pin the same name **per workspace**: run `mozyo-bridge session vscode-settings --repo . --write` to set `"tmux-integrated.sessionName"` in `<repo>/.vscode/settings.json` (workspace-local only; user-global settings are never touched; JSONC files are refused, not clobbered). For a custom task menu, replace `basename "$PWD" | sed ...` with `mozyo-bridge session name --repo .`.
   - do **not** set a user-global fixed `tmux-integrated.sessionName`; it collapses every workspace onto one session and risks cross-repo misdelivery.
   - migration: if a legacy basename-named session lingers, bare `mozyo` prints a notice; attach it with `mozyo --session <old>` or remove it once empty with `tmux kill-session -t <old>`.
@@ -675,7 +678,8 @@ reports and their fixes:
   - cause: the workspace has no repo-root Redmine default project config. The
     docs require this file at `<repo>/.codex/config.toml`, not in a home config.
   - fix (preferred, when a verified source of truth exists): if
-    `<repo>/.mozyo-bridge/workspace-defaults.yaml` already carries a **verified**
+    `<repo>/.mozyo-bridge/project-defaults.yaml` (legacy `workspace-defaults.yaml`
+    still reads) already carries a **verified**
     Redmine default project (`mozyo-bridge workspace-defaults --check` clean),
     generate the config from it with `mozyo-bridge runtime-config install --profile
     redmine-codex --target . --write` (dry-run first without `--write`). This
@@ -684,7 +688,7 @@ reports and their fixes:
   - fix (no source of truth yet): an agent must **ask the operator before
     creating it** — the default project is a workspace-specific fact, not
     something to guess. Once the operator confirms the project identity, populate
-    `<repo>/.mozyo-bridge/workspace-defaults.yaml` (then `runtime-config install`),
+    `<repo>/.mozyo-bridge/project-defaults.yaml` (then `runtime-config install`),
     or hand-create the file with `[redmine]` `default_project` /
     `default_project_name` / `default_project_url` and the
     `[mcp_servers.redmine_epic_grid]` `url` + `http_headers.X-Default-Project`.
@@ -714,7 +718,7 @@ reports and their fixes:
     `X-Default-Project` header to match an operator-confirmed
     `[redmine].default_project`, or removing an obviously misplaced credential.
     Running `mozyo-bridge runtime-config install --write` against a **verified**
-    workspace-defaults is in this category: it only projects an
+    project-defaults is in this category: it only projects an
     already-established, verified fact into the runtime config.
   - operator confirmation required: choosing or changing the default project
     identity itself, creating `<repo>/.codex/config.toml` from scratch, or
@@ -722,16 +726,18 @@ reports and their fixes:
     doctor` itself never writes; these are actions an agent takes only after the
     check reports a failure and the operator has confirmed intent.
 
-### `runtime-config install` FAQ (workspace-defaults → runtime config)
+### `runtime-config install` FAQ (project-defaults → runtime config)
 
 `mozyo-bridge runtime-config install --profile redmine-codex --target .` is the
 write side that `runtime-config check` lacks. It projects the verified Redmine
-default project from `<repo>/.mozyo-bridge/workspace-defaults.yaml` (the single
-source of truth) into the repo-root `<repo>/.codex/config.toml`, so the flow is
-`workspace-defaults.yaml` → `workspace-defaults --check` clean →
+default project from `<repo>/.mozyo-bridge/project-defaults.yaml` (the single
+source of truth; legacy `workspace-defaults.yaml` still reads as a fallback)
+into the repo-root `<repo>/.codex/config.toml`, so the flow is
+`project-defaults.yaml` → `workspace-defaults --check` clean →
 `runtime-config install --write` → `runtime-config check` green.
 
-- source of truth: stays `workspace-defaults.yaml`; install never invents
+- source of truth: stays `project-defaults.yaml` (legacy `workspace-defaults.yaml`
+  still reads); install never invents
   values and only writes `<repo>/.codex/config.toml` (the `[redmine]` and
   `[mcp_servers.redmine_epic_grid]` tables). Home config is never read/written.
 - safety: default is a dry-run (`--write` applies); no credentials are

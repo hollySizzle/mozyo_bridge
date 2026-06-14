@@ -6,7 +6,7 @@ Redmine default project の解決規約は Codex / Claude / local docs / verific
 
 本 logic は次を実現する。
 
-1. **正本は workspace-local YAML 1 枚** (`<workspace>/.mozyo-bridge/workspace-defaults.yaml`)。distributed code は contract と renderer だけを持つ。
+1. **正本は workspace-local YAML 1 枚** (`<workspace>/.mozyo-bridge/project-defaults.yaml`、旧名 `workspace-defaults.yaml` も read-only fallback で読む)。distributed code は contract と renderer だけを持つ。
 2. **生成出力は workspace-local generated artifact** (default: `.mozyo-bridge/redmine-defaults.md`)。Codex / Claude session 入口から reference される。
 3. **`--check` で drift gate**。`mozyo-bridge workspace-defaults --check` が CI / pre-commit / release で機械的に走る。
 4. **secret rejection by construction**。credential-shape key / value は load 時に die する。renderer 経由で secret が出力されることはない。
@@ -19,8 +19,7 @@ Naming note: 入力 YAML は実態として project-level defaults である。R
 両名が存在する状態は `workspace-defaults` / `runtime-config install` で fail
 closed する。generated snippet の source 参照は実際に読んだファイル名を表示する。
 rename 方針と runtime contract の正本は
-`workspace-anchor-project-defaults-migration.md`。以下本文の `workspace-defaults.yaml`
-表記は新名 `project-defaults.yaml` に読み替える (compat window 中は旧名でも動く)。
+`workspace-anchor-project-defaults-migration.md`。
 
 ## Source-of-Truth Layering
 
@@ -33,13 +32,13 @@ distributed (mozyo_bridge package)
                 │ load_workspace_defaults / render
                 │
 workspace-local (target workspace の git repo に commit する)
-├── .mozyo-bridge/workspace-defaults.yaml        # 正本 (project-specific values)
+├── .mozyo-bridge/project-defaults.yaml          # 正本 (旧名 workspace-defaults.yaml も fallback)
 └── .mozyo-bridge/redmine-defaults.md            # generated (do not hand-edit)
 ```
 
 distributed code には特定 project の identifier を書かない。customer / project 固有値 (Redmine slug、project name、URL の末尾 etc.) は workspace-local YAML、もしくは test fixture (`WorkspaceDefaultsRendererTest`) のみで使う。distributed 側 (`src/**`、`skills/**`、`plugins/**`、`vibes/docs/**`、`.mozyo-bridge/redmine-defaults.md`) に acceptance fixture の identifier が流出していないことを `test_distributed_source_does_not_carry_cloud_drive_identifier` が pin する。
 
-## Schema (`.mozyo-bridge/workspace-defaults.yaml`)
+## Schema (`.mozyo-bridge/project-defaults.yaml`, 旧名 `workspace-defaults.yaml`)
 
 ```yaml
 schema_version: 1
@@ -104,7 +103,7 @@ mozyo-bridge workspace-defaults [--repo <root>]            # 全 output を rend
 mozyo-bridge workspace-defaults --check [--repo <root>]    # drift check (exit 1 on drift)
 ```
 
-- `--repo` 省略時は cwd。default で `<repo>/.mozyo-bridge/workspace-defaults.yaml` を読む。
+- `--repo` 省略時は cwd。default で `<repo>/.mozyo-bridge/project-defaults.yaml` (旧名 `workspace-defaults.yaml` も fallback) を読む。
 - `--check` は generated output を rerender し on-disk と比較。差異があれば exit 1、stderr に出力 path + 復旧 command (`mozyo-bridge workspace-defaults` no `--check`, from the repo root) を verbatim で出す。#10345 / #10663 correction の precedent に従う。
 - input YAML が無い場合は die し、schema doc (本 file) を参照する hint を出す。
 
@@ -121,8 +120,8 @@ Startup sequence:
 1. `<repo>/.mozyo-bridge/redmine-defaults.md` があれば読む。verified default が
    ある場合でも、明示 `project_id` が user / ticket / MCP call にあればそれを
    優先する。
-2. generated snippet が無い場合は `<repo>/.mozyo-bridge/workspace-defaults.yaml`
-   の有無を確認する。YAML があれば `mozyo-bridge workspace-defaults` と
+2. generated snippet が無い場合は `<repo>/.mozyo-bridge/project-defaults.yaml`
+   (旧名 `workspace-defaults.yaml` も fallback) の有無を確認する。YAML があれば `mozyo-bridge workspace-defaults` と
    `--check` で snippet を生成・検証する。
 3. YAML も無い場合は、project identifier / display name / URL / optional parent
    label を operator に確認する。Redmine project を推測で作成しない。
@@ -189,7 +188,7 @@ acceptance criteria は次を要求する。
 
 `tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest` で次を pin する。
 
-- **round-trip**: 本 workspace (`mozyo_bridge`) 自身の `.mozyo-bridge/workspace-defaults.yaml` が `.mozyo-bridge/redmine-defaults.md` と byte-equal に再現される。
+- **round-trip**: 本 workspace (`mozyo_bridge`) 自身の入力 YAML (現状はまだ旧名 `.mozyo-bridge/workspace-defaults.yaml`、新名は `project-defaults.yaml`) が `.mozyo-bridge/redmine-defaults.md` と byte-equal に再現される。generated snippet の source 参照は実際に読んだファイル名を反映するため、旧名のままでも drift しない。
 - **CLI**: clean / drift / missing-output / 復旧 path。stderr に runnable recovery command が出る。
 - **schema 違反**: missing input / required field 欠落 / 不正 schema_version / non-http url / `..` を含む output target。
 - **secret rejection**: top-level credential key / nested credential key / 値の credential 代入形。
@@ -201,8 +200,8 @@ acceptance criteria は次を要求する。
 - **Skill workflow (`skills/mozyo-bridge-agent/references/workflow.md`)**: Ticket System Conventions の Redmine 系 entrypoint で、`<repo>/.mozyo-bridge/redmine-defaults.md` を読んで default project を解決する旨を 1 段落で言及する。distributed skill には project-specific identifier を書かない。
 - **scaffold preset の `agent-workflow.md`**: 今回 workspace defaults renderer に新規 binding は追加しない。preset workflow は引き続き Redmine issue / journal を主軸とし、default project 解決は workspace-local snippet に委ねる。
 - **release helper**: `mozyo-bridge release check drift` (#10688) は canonical + plugin mirror を bundling する。`workspace-defaults --check` は worktree (workspace-local) を対象とするため、release helper 経由ではなく **CI unittest 経由** で gating する (`WorkspaceDefaultsRendererTest::test_committed_repo_renders_byte_equal`)。drift があれば毎 push / PR で fail する。
-- **docs catalog**: 新 logic doc (`logic-workspace-defaults-renderer`) と新 file pattern (`.mozyo-bridge/workspace-defaults.yaml` / `.mozyo-bridge/redmine-defaults.md`) を catalog に登録する。fc-governance-artifacts に追加する。
-- **Codex runtime config install (`mozyo-bridge runtime-config install`, Redmine #10930 / #11051)**: `redmine.default_project` の verified 値を repo-root `<repo>/.codex/config.toml` の `[redmine]` / `[mcp_servers.redmine_epic_grid]` に projection する write 側経路。正本は本 YAML のまま (install は値を発明しない)。`verification.is_complete` が false の default は install を拒否し(`mozyo-bridge runtime-config check` が守る不変条件と整合)、credential は生成しない。MCP RPC URL は `default_project.url` の host から導出するため distributed source に project 固有 host を焼かない。既存 config は無関係 table を保持して merge し、conflict は `--force` 無しで fail、`.mcp.json` は引き続き deferral。`workspace-defaults.yaml` → `workspace-defaults --check` → `runtime-config install --write` → `runtime-config check` green が一連の流れ。旧名 `instruction install` / `instruction doctor` は #11051 で rename され、1 minor cycle の deprecated alias (stderr warn、`--json` stdout 不変) として残る。
+- **docs catalog**: 新 logic doc (`logic-workspace-defaults-renderer`) と file pattern (新名 `.mozyo-bridge/project-defaults.yaml` / 旧名 `.mozyo-bridge/workspace-defaults.yaml` / `.mozyo-bridge/redmine-defaults.md`) を catalog に登録する。fc-governance-artifacts に追加する。
+- **Codex runtime config install (`mozyo-bridge runtime-config install`, Redmine #10930 / #11051)**: `redmine.default_project` の verified 値を repo-root `<repo>/.codex/config.toml` の `[redmine]` / `[mcp_servers.redmine_epic_grid]` に projection する write 側経路。正本は本 YAML のまま (install は値を発明しない)。`verification.is_complete` が false の default は install を拒否し(`mozyo-bridge runtime-config check` が守る不変条件と整合)、credential は生成しない。MCP RPC URL は `default_project.url` の host から導出するため distributed source に project 固有 host を焼かない。既存 config は無関係 table を保持して merge し、conflict は `--force` 無しで fail、`.mcp.json` は引き続き deferral。`project-defaults.yaml` (旧名 `workspace-defaults.yaml` も fallback) → `workspace-defaults --check` → `runtime-config install --write` → `runtime-config check` green が一連の流れ。旧名 `instruction install` / `instruction doctor` は #11051 で rename され、1 minor cycle の deprecated alias (stderr warn、`--json` stdout 不変) として残る。
 - **tmux session naming (Redmine #10796)**: `redmine.default_project.identifier` を **tmux session 名導出の優先入力**として消費する (`mozyo-<identifier-slug>`)。consumer は `mozyo-bridge session name` (導出値の表示)、`mozyo-bridge session vscode-settings` (workspace-local `.vscode/settings.json` への `tmux-integrated.sessionName` 反映)、および bare `mozyo` / `mozyo-bridge status` (session 解決の既定値) で、全て同じ `derive_session_name` を通る。これは display / grouping identity であり issue 作成判断ではないため、`verification.verified` flag では gate しない (unverified でも identifier があれば使う)。reader (`src/mozyo_bridge/domain/session_naming.py`) は identifier のみを best-effort で読む非 die path で、`load_workspace_defaults` の schema / secret gate は通さない (render command 側の責務)。identifier が無い / 非 ASCII で slug が空になる場合は repo path hash を付けた collision-safe fallback (`mozyo-<basename-slug>-<hash>`) に落ちる。bare `mozyo` の `--session` override / 誤 attach guard / `--target-repo` gate / `init` 同名 window fail-closed の安全境界は変更しない。
 - **cross-workspace handoff identity (Redmine #11299 / #11301)**: 本 YAML の `redmine.default_project.identifier` は readable session / workspace display identity として有用だが、target pane safety gate は別責務である。#11299 smoke では、非 git workspace でも `mozyo --repo <target>` が `mozyo-<identifier-slug>` session と agent windows を作れる一方、`agents list` の `repo_root` inference は `.git` / `pyproject.toml` 等の marker 不在で上位 directory に逃げ、`handoff send --target-repo <target>` が `target_repo_mismatch` で止まることを確認した。#11301 では `.mozyo-bridge/scaffold.json` / `.mozyo-bridge/` / workspace defaults を workspace identity marker として扱うかを検討する。UX 方針は「初回設定で identity を確立し、設定済み workspace では default handoff を快適にし、曖昧な状態だけ fail-closed して具体的な setup command を示す」ことであり、詳細 contract は `vibes/docs/logics/tmux-send-safety-contract.md` を正本とする。
 

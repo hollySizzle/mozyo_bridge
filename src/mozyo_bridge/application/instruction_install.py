@@ -1,4 +1,4 @@
-"""Generate repo-root Codex runtime config from workspace-defaults (#10930).
+"""Generate repo-root Codex runtime config from project-defaults (#10930).
 
 `mozyo-bridge runtime-config check --profile redmine-codex` (renamed from
 `instruction doctor` in Redmine #11051) checks that a Redmine/Codex workspace
@@ -6,22 +6,24 @@ declares its verified default project in `<repo>/.codex/config.toml`, but it is
 read-only: it never closes the gap between "the source of truth exists" and "the
 runtime config reflects it". This module is the write side. It reads the
 verified Redmine default project from
-`<repo>/.mozyo-bridge/workspace-defaults.yaml` (still the single source of
-truth) and renders / merges the `[redmine]` and
+`<repo>/.mozyo-bridge/project-defaults.yaml` (the single source of truth; the
+legacy `workspace-defaults.yaml` name is still read as a fallback, Redmine
+#11920 / #11921) and renders / merges the `[redmine]` and
 `[mcp_servers.redmine_epic_grid]` tables into `<repo>/.codex/config.toml` so
 that `runtime-config check` turns green.
 
 Design constraints (Redmine #10930):
 
-- The single source of truth stays `workspace-defaults.yaml`. This command
-  only projects it into the Codex runtime config; it never invents values.
+- The single source of truth stays `project-defaults.yaml` (legacy
+  `workspace-defaults.yaml` still reads). This command only projects it into the
+  Codex runtime config; it never invents values.
 - Only the repo-root `<repo>/.codex/config.toml` is written. Home config is
   never read or written.
 - Default is a dry-run; an actual write requires `--write`.
 - Only a **verified** default project is installed. An incomplete verification
   record fails, mirroring the renderer's "treat as a suggestion only" posture —
   generating runtime config from an unverified default is the anti-goal.
-- No credentials are generated. The workspace-defaults loader already rejects
+- No credentials are generated. The project-defaults loader already rejects
   credential-shape values, so the projected fields are non-secret.
 - An existing config is preserved: when the managed tables are absent they are
   appended (other content is left byte-for-byte intact). When they already
@@ -48,7 +50,7 @@ from mozyo_bridge.workspace_defaults import (
 )
 
 # The Redmine MCP RPC endpoint path. Combined with the host derived from the
-# workspace-defaults project URL so no project-specific host is hard-coded in
+# project-defaults project URL so no project-specific host is hard-coded in
 # distributed source — the host comes from the workspace-local YAML.
 _MCP_RPC_PATH = "/mcp/rpc"
 
@@ -214,7 +216,7 @@ def run_instruction_install(args: argparse.Namespace) -> dict[str, Any]:
 
     if not config_path.exists():
         result["action"] = "create"
-        result["messages"].append(f"{rel} is missing; would create it from workspace-defaults.")
+        result["messages"].append(f"{rel} is missing; would create it from project-defaults.")
         new_text = blocks
         return _finish(result, config_path, new_text, write, rel)
 
@@ -239,7 +241,7 @@ def run_instruction_install(args: argparse.Namespace) -> dict[str, Any]:
     if not missing and not conflicts:
         result["ok"] = True
         result["action"] = "up-to-date"
-        result["messages"].append(f"{rel} already matches workspace-defaults; nothing to do.")
+        result["messages"].append(f"{rel} already matches project-defaults; nothing to do.")
         return result
 
     if not _has_managed_table(parsed):
@@ -258,12 +260,12 @@ def run_instruction_install(args: argparse.Namespace) -> dict[str, Any]:
         result["action"] = "conflict"
         detail = []
         for key, vals in conflicts.items():
-            detail.append(f"{key}: existing {vals['current']!r} != workspace-defaults {vals['desired']!r}")
+            detail.append(f"{key}: existing {vals['current']!r} != project-defaults {vals['desired']!r}")
         for key in missing:
             detail.append(f"{key}: missing")
         result["messages"].append(
             f"{rel} already has a Redmine/MCP block that disagrees with "
-            "workspace-defaults. Refusing to edit it in place. Resolve manually, "
+            "project-defaults. Refusing to edit it in place. Resolve manually, "
             "or re-run with --force to regenerate the managed tables "
             "(other tables are preserved). Details: " + "; ".join(detail)
         )
@@ -273,7 +275,7 @@ def run_instruction_install(args: argparse.Namespace) -> dict[str, Any]:
     result["action"] = "force-replace"
     result["messages"].append(
         f"--force: would replace the [redmine] and [mcp_servers.redmine_epic_grid] "
-        f"tables in {rel} from workspace-defaults (other tables preserved)."
+        f"tables in {rel} from project-defaults (other tables preserved)."
     )
     stripped = _strip_managed_tables(existing)
     return _finish(result, config_path, _append_blocks(stripped, blocks), write, rel)
