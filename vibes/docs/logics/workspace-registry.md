@@ -24,6 +24,11 @@ identity_layers:
 解決順序: home_registry -> workspace_anchor -> path_derivation
 ```
 
+Naming note: `workspace.json` は実態として workspace identity recovery anchor である。
+rename 方針は `workspace-anchor-project-defaults-migration.md` を正本とする。runtime
+実装が入るまでは現行 path を維持し、docs-only decision を code の事実として
+先取りしない。
+
 設計上の不変条件:
 
 - **tmux runtime state を DB に置かない。** live な window / pane / process 情報は tmux が正本。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。

@@ -224,6 +224,7 @@ documents:
     purpose: workspace-local Redmine default project 設定を single source YAML から Codex / Claude 共通 snippet へ生成する renderer の設計、schema、secret rejection、検証手順、session / workspace identity 連携。
     audit_role: workspace_defaults_renderer_logic
     related_document_refs:
+      - logic-workspace-anchor-project-defaults-migration
       - logic-canonical-renderer
       - rule-docs-catalog-governance
       - logic-tmux-send-safety-contract
@@ -237,8 +238,23 @@ documents:
     purpose: home-registry-first workspace identity (SQLite registry、workspace-local anchor、canonical session 解決順序、register CLI) の設計正本。
     audit_role: workspace_registry_logic
     related_document_refs:
+      - logic-workspace-anchor-project-defaults-migration
       - logic-workspace-defaults-renderer
       - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-workspace-anchor-project-defaults-migration
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workspace-anchor-project-defaults-migration.md
+    purpose: ".mozyo-bridge/workspace.json を workspace identity recovery anchor、.mozyo-bridge/workspace-defaults.yaml を project-level defaults として rename する判断と互換 migration 方針の設計正本。"
+    audit_role: workspace_anchor_project_defaults_migration_logic
+    related_document_refs:
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - rule-public-private-boundary
       - spec-project-map
 
   - id: logic-managed-state-model
@@ -282,6 +298,7 @@ documents:
       - logic-unit-presentation-state-db
       - logic-session-inventory
       - logic-workspace-registry
+      - logic-workspace-anchor-project-defaults-migration
       - rule-public-private-boundary
       - spec-project-map
 

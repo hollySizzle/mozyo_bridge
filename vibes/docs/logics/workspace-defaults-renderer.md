@@ -13,6 +13,11 @@ Redmine default project の解決規約は Codex / Claude / local docs / verific
 
 `mozyo-bridge scaffold canonical` (Redmine #10345 / #10426) や `sync_plugin_skill.sh` (Redmine #10663) と同じ思想だが、対象が **distributed** ではなく **per-workspace** である点が異なる。
 
+Naming note: `workspace-defaults.yaml` は実態として project-level defaults である。
+rename 方針は `workspace-anchor-project-defaults-migration.md` を正本とする。runtime
+実装が入るまでは現行 path を維持し、docs-only decision を code の事実として
+先取りしない。
+
 ## Source-of-Truth Layering
 
 ```

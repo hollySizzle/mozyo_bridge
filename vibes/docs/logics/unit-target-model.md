@@ -297,6 +297,9 @@ rename は互換 migration が必要である。旧 file read fallback、新規 
 warning、scaffold / docs / tests 更新を設計してから行う。file を増やさず rename を
 基本方針とする。
 
+rename の判断と compatibility story は `workspace-anchor-project-defaults-migration.md`
+を正本とする。
+
 ## Anti-patterns
 
 - `window_name == role` を primary identity に戻す。
