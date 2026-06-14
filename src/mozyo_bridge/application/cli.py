@@ -473,13 +473,15 @@ def build_parser() -> argparse.ArgumentParser:
             "cockpit` appends a column to `mozyo-cockpit` (creating it on first "
             "use), focuses the column if the workspace is already present, and "
             "never opens a duplicate iTerm window for an existing cockpit. "
+            "`mozyo cockpit reset` / `rebuild` (Redmine #11814) safely tear down "
+            "a stale / broken cockpit instead of a manual `tmux kill-session`. "
             "`mozyo --cc` is unchanged."
         ),
     )
     cockpit.add_argument(
         "action",
         nargs="?",
-        choices=["append", "adopt"],
+        choices=["append", "adopt", "reset", "rebuild"],
         default=None,
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
@@ -487,8 +489,13 @@ def build_parser() -> argparse.ArgumentParser:
             "/ focus from the live cockpit state. `adopt` reports a co-existing "
             "normal `mozyo` session for this workspace+lane as an adopt candidate "
             "and, with `--confirm` (Redmine #11898, Phase 2), atomically moves "
-            "its live codex/claude panes into the cockpit as a column. Without "
-            "`--confirm` adopt is detect-only / preview and moves no panes; "
+            "its live codex/claude panes into the cockpit as a column. `reset` "
+            "and `rebuild` (Redmine #11814) safely tear down a stale / broken "
+            "cockpit: `reset` kills the mozyo-identified cockpit session, "
+            "`rebuild` then recreates a fresh one for the current workspace. Both "
+            "act only on a session proven mozyo-managed by its identity markers "
+            "(never by name) and only with `--confirm`. Without `--confirm` every "
+            "sub-action is detect-only / preview and mutates nothing; "
             "`--dry-run` / `--json` always preview without mutating."
         ),
     )
@@ -537,10 +544,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "For `cockpit adopt` only (Redmine #11898, Phase 2): explicitly "
-            "confirm moving the co-existing normal session's live codex/claude "
-            "panes into the cockpit. Required to mutate; without it adopt is "
-            "detect-only / preview. `--dry-run` / `--json` still only preview."
+            "Explicitly confirm a destructive cockpit sub-action. For `adopt` "
+            "(Redmine #11898) it moves the co-existing normal session's live "
+            "codex/claude panes into the cockpit; for `reset` / `rebuild` "
+            "(Redmine #11814) it kills (and, for rebuild, recreates) the "
+            "mozyo-identified cockpit session. Required to mutate; without it "
+            "these sub-actions are detect-only / preview. `--dry-run` / `--json` "
+            "still only preview."
         ),
     )
     cockpit.set_defaults(func=cmd_cockpit)

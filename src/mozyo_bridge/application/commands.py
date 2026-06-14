@@ -1179,6 +1179,26 @@ def execute_cockpit_adopt_plan(plan, run) -> dict:
     return {"stamp_warnings": stamp_warnings}
 
 
+def execute_cockpit_reset_plan(plan, run) -> None:
+    """Run a :class:`CockpitResetPlan`'s ``kill-session`` (#11814), fail-fast.
+
+    ``run`` is a ``run_tmux``-style callable. The plan is built only after the
+    target was graded mozyo-managed, so this just executes the destructive
+    teardown and aborts (``die``) on a non-zero tmux exit rather than reporting a
+    half-killed session as success.
+    """
+    for cmd in plan.commands:
+        result = run(*cmd.argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip() or (
+                getattr(result, "stdout", "") or ""
+            ).strip()
+            die(
+                f"cockpit reset step failed ({cmd.purpose}): "
+                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}"
+            )
+
+
 def cmd_layout_apply(args: argparse.Namespace) -> int:
     """`mozyo layout apply cockpit` — build/focus the cockpit layout (#11788).
 
@@ -1791,6 +1811,188 @@ def _handle_cockpit_adopt(
     return 0
 
 
+def _assess_cockpit_reset(session, *, columns, session_present):
+    """Grade the cockpit session for `mozyo cockpit reset` / `rebuild` (#11814).
+
+    Thin application wrapper over the pure :func:`assess_cockpit_reset`: it reads
+    the *extra* runtime facts the grade needs (attached clients + the session's
+    window list) and hands them, with the already-read ``columns`` /
+    ``session_present``, to the domain grader. Read-only and tolerant — the
+    client / window reads degrade to empty on any tmux error, never raising, so a
+    bare `cockpit reset` preview cannot break.
+    """
+    from mozyo_bridge.domain.cockpit_layout import assess_cockpit_reset
+
+    clients = _session_attached_clients(session) if session_present else ()
+    windows = tuple(list_session_windows(session)) if session_present else ()
+    return assess_cockpit_reset(
+        session=session,
+        session_present=session_present,
+        columns=columns,
+        attached_clients=clients,
+        windows=windows,
+    )
+
+
+def _print_cockpit_reset_inventory(target):
+    """Print the session / window / pane inventory a reset/rebuild would act on."""
+    print(f"  attached clients: {', '.join(target.attached_clients) or 'none'}")
+    print(f"  windows: {', '.join(target.windows) or 'none'}")
+    for pane in target.managed_panes:
+        print(
+            f"  pane {pane.pane_id}: workspace={pane.workspace_id} "
+            f"role={pane.role or '-'} lane={pane.lane_id} (mozyo-managed)"
+        )
+    for pane in target.unmanaged_panes:
+        print(
+            f"  pane {pane.pane_id}: role={pane.role or '-'} (NOT mozyo-managed)"
+        )
+
+
+def _handle_cockpit_reset(
+    args, workspace, session, *, columns, session_present, rebuild, launch,
+    codex_ratio,
+):
+    """Route `mozyo cockpit reset` / `rebuild` — preview vs confirm-gated teardown (#11814).
+
+    Safety contract (US #11814): the default path and `--dry-run` / `--json` are
+    non-mutating previews; only an explicit `--confirm` (and not `--dry-run` /
+    `--json`) runs the destructive `kill-session`, and only against a cockpit
+    graded mozyo-managed by identity markers — never by session name. ``reset``
+    tears the cockpit down; ``rebuild`` is ``reset`` composed with the normal
+    create flow (a fresh cockpit seeded with the current workspace), so a broken
+    cockpit can be restored in one command. ``rebuild`` against an absent cockpit
+    is a plain create (nothing to kill). A fail-closed grade (foreign / unmanaged
+    / attached-client) blocks both with a recovery instruction and moves nothing.
+    """
+    import json as _json
+    import shlex as _shlex
+
+    from mozyo_bridge.domain.cockpit_layout import (
+        build_cockpit_plan,
+        build_cockpit_reset_plan,
+        normalize_lane,
+    )
+
+    action = "rebuild" if rebuild else "reset"
+    confirm = bool(getattr(args, "confirm", False))
+    json_output = bool(getattr(args, "json_output", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    no_attach = bool(getattr(args, "no_attach", False))
+    lane_id = normalize_lane(workspace.lane_id)
+
+    target = _assess_cockpit_reset(
+        session, columns=columns, session_present=session_present
+    )
+    reset_plan = (
+        build_cockpit_reset_plan(session) if target.mozyo_identified else None
+    )
+    # rebuild always recreates a fresh cockpit from the current workspace; reset
+    # never creates. The create plan is the same one bare `mozyo cockpit` builds.
+    create_plan = (
+        build_cockpit_plan(
+            [workspace], codex_ratio=codex_ratio, session=session, launch=launch
+        )
+        if rebuild
+        else None
+    )
+
+    # A fail-closed identity / client gate (not the benign "absent" no-op).
+    blocked = (
+        None if (target.resettable or target.absent) else target.blocked_reason
+    )
+    # Will the confirmed run mutate? A managed+detached cockpit is killed; an
+    # absent cockpit is only (re)built by `rebuild`.
+    would_kill = target.resettable
+    would_create = bool(rebuild and (target.resettable or target.absent))
+    would_execute = bool(confirm and not dry_run and (would_kill or would_create))
+
+    if json_output:
+        payload = {
+            "command": f"cockpit {action}",
+            "action": action,
+            # This invocation never runs tmux (json is a preview surface).
+            "executes": False,
+            "would_execute": would_execute,
+            "confirm": confirm,
+            "session": session,
+            "workspace_id": workspace.workspace_id,
+            "lane_id": lane_id,
+            "lane_label": workspace.lane_label,
+            "blocked": blocked,
+            "target": target.as_dict(),
+            "reset_plan": reset_plan.as_dict() if reset_plan is not None else None,
+            "rebuild_plan": (
+                create_plan.as_dict() if create_plan is not None else None
+            ),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    # Preview: bare command (no `--confirm`) or `--dry-run`. No mutation.
+    if dry_run or not confirm:
+        print(
+            f"cockpit {action} (preview; no tmux changes): session={session} "
+            f"status={target.status} workspace={workspace.workspace_id} "
+            f"({workspace.label}) lane={lane_id}"
+        )
+        if target.session_present:
+            _print_cockpit_reset_inventory(target)
+        if blocked:
+            print(f"  cannot {action}: {blocked}")
+        elif would_kill or would_create:
+            if reset_plan is not None and would_kill:
+                print(f"  reset plan — kill the mozyo cockpit session {session!r}:")
+                for cmd in reset_plan.commands:
+                    print(
+                        "    tmux "
+                        + " ".join(_shlex.quote(tok) for tok in cmd.argv)
+                    )
+            if create_plan is not None:
+                verb = "rebuild" if would_kill else "create"
+                print(f"  {verb} plan — fresh cockpit for {workspace.label!r}:")
+                for cmd in create_plan.commands:
+                    print(
+                        "    tmux "
+                        + " ".join(_shlex.quote(tok) for tok in cmd.argv)
+                    )
+            print(f"  run `mozyo cockpit {action} --confirm` to execute.")
+        else:
+            # reset with nothing to tear down (absent cockpit).
+            print(f"  nothing to {action}: {target.blocked_reason}")
+        return 0
+
+    # Confirm-gated execution: the only path that mutates tmux.
+    if blocked:
+        die(blocked)
+    if not (would_kill or would_create):
+        # `reset --confirm` on an absent cockpit: benign no-op, not an error.
+        print(
+            f"cockpit reset: no cockpit session {session!r} exists — nothing to do."
+        )
+        return 0
+
+    require_tmux()
+    if would_kill and reset_plan is not None:
+        print(
+            f"cockpit {action}: tearing down mozyo cockpit session {session!r} "
+            f"({len(target.managed_panes)} managed pane(s))"
+        )
+        execute_cockpit_reset_plan(reset_plan, run_tmux)
+        print(f"  reset: cockpit session {session!r} killed.")
+    if not rebuild:
+        return 0
+
+    print(f"  rebuilding a fresh cockpit for {workspace.label!r}...")
+    execute_cockpit_plan(create_plan, run_tmux, cleanup_captured=True)
+    print(f"cockpit rebuilt: session={session} workspace={workspace.label}")
+    if no_attach:
+        print(f"attach: tmux -CC attach -t {session}")
+        return 0
+    os.execvp("tmux", ["tmux", "-CC", "attach", "-t", session])
+    raise AssertionError("unreachable")
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -1822,6 +2024,11 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     # moves NO panes (explicit transfer is Phase 2 / #11898). Like `--dry-run` /
     # `--json` it is read-only, so it never gates on tmux being mutable.
     adopt_mode = getattr(args, "action", None) == "adopt"
+    # `mozyo cockpit reset` / `rebuild` (Redmine #11814) are their own
+    # confirm-gated sub-actions: like adopt, the default path is a non-mutating
+    # preview, so they do not gate on tmux being mutable up front.
+    reset_action = getattr(args, "action", None)
+    reset_mode = reset_action in ("reset", "rebuild")
     inspect_only = dry_run or json_output
     no_attach = bool(getattr(args, "no_attach", False))
 
@@ -1844,7 +2051,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     # / `--json` only read (never mutate) — `_read_cockpit_columns` /
     # `_cockpit_session_present` are tolerant so a missing/stale cockpit
     # degrades gracefully instead of aborting.
-    if not inspect_only and not adopt_mode:
+    if not inspect_only and not adopt_mode and not reset_mode:
         require_tmux()
     columns = _read_cockpit_columns(session)
     session_present = _cockpit_session_present(session)
@@ -1882,6 +2089,22 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             session_present=session_present,
             already_in_cockpit=same is not None,
             existing_codex=existing_codex,
+        )
+
+    # `mozyo cockpit reset` / `rebuild` (Redmine #11814) is a confirm-gated,
+    # mozyo-identity-gated teardown of a stale/broken cockpit; it never spawns the
+    # normal append/focus column and never silently adopts. Like adopt it short-
+    # circuits to its own handler.
+    if reset_mode:
+        return _handle_cockpit_reset(
+            args,
+            workspace,
+            session,
+            columns=columns,
+            session_present=session_present,
+            rebuild=(reset_action == "rebuild"),
+            launch=launch,
+            codex_ratio=codex_ratio,
         )
 
     # Adopt advisory rides the normal create/append flow as a NON-mutating notice

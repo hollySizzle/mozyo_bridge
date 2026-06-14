@@ -26,7 +26,7 @@ unit-tested without a live tmux server.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 COCKPIT_SESSION_DEFAULT = "mozyo-cockpit"
 COCKPIT_WINDOW = "cockpit"
@@ -974,4 +974,234 @@ def build_cockpit_focus_plan(
         columns=0,
         panes=(),
         commands=commands,
+    )
+
+
+# --- Cockpit reset / rebuild (Redmine #11814) ---------------------------------
+#
+# A stale or broken `mozyo-cockpit` session (the #11807 append-flatten regression
+# left one that could not self-heal; the operator fell back to a manual
+# `tmux kill-session`) needs a safe, first-class teardown UX so nobody reaches for
+# raw `tmux kill-session` again. The hard rule (US #11814 safety boundary) is that
+# the destructive `kill-session` only runs against a cockpit that is *proven* to be
+# mozyo-managed — never decided by session name alone. Identity is read off the
+# same machine-readable markers append/adopt already stamp (`@mozyo_workspace_id`
+# on the cockpit-window panes); a same-named session that carries no such marker,
+# or a session with no `cockpit` window at all, fails closed and is left untouched.
+# This module stays pure: :func:`assess_cockpit_reset` grades a runtime snapshot
+# and :func:`build_cockpit_reset_plan` emits the (single) kill command; the
+# application layer reads tmux, previews, and — only with explicit confirm —
+# executes. `reset` never adopts and never silently rebuilds; `rebuild` is reset
+# composed with the normal create flow, decided in the application layer.
+
+COCKPIT_RESET_ABSENT = "absent"  # no cockpit session at all — nothing to reset
+COCKPIT_RESET_FOREIGN = "foreign"  # session present but no `cockpit` window — unconfirmable
+COCKPIT_RESET_UNMANAGED = "unmanaged"  # cockpit window present but no mozyo-identified pane
+COCKPIT_RESET_MANAGED = "managed"  # mozyo-identified cockpit — safe to reset
+
+
+@dataclass(frozen=True)
+class CockpitPaneIdentity:
+    """One cockpit-window pane projected for the reset preview (#11814).
+
+    ``managed`` is the load-bearing field: a pane is mozyo-managed only when it
+    carries a non-empty ``@mozyo_workspace_id`` marker. The reset gate keys off
+    the presence of *any* managed pane, never the session name — a stray shell
+    pane an operator split into the cockpit window is reported (``managed`` False)
+    but does not by itself make the session resettable or block it.
+    """
+
+    pane_id: str
+    workspace_id: str
+    role: str
+    lane_id: str
+    managed: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "pane_id": self.pane_id,
+            "workspace_id": self.workspace_id,
+            "role": self.role,
+            "lane_id": self.lane_id,
+            "managed": self.managed,
+        }
+
+
+@dataclass(frozen=True)
+class CockpitResetTarget:
+    """The graded reset target — what a reset/rebuild may (or may not) tear down (#11814).
+
+    ``status`` is one of the ``COCKPIT_RESET_*`` grades. Only :data:`COCKPIT_RESET_MANAGED`
+    with no attached client is :pyattr:`resettable`; every other state
+    (``foreign`` / ``unmanaged`` / an attached managed cockpit) carries a
+    ``blocked_reason`` and is left untouched (fail-closed). ``absent`` is a benign
+    no-op (nothing to reset), not a block. ``windows`` / ``managed_panes`` /
+    ``unmanaged_panes`` / ``attached_clients`` are the inventory the preview shows
+    so the operator sees exactly what a confirmed kill would destroy.
+    """
+
+    session: str
+    status: str
+    session_present: bool
+    has_cockpit_window: bool
+    windows: tuple[str, ...]
+    managed_panes: tuple[CockpitPaneIdentity, ...]
+    unmanaged_panes: tuple[CockpitPaneIdentity, ...]
+    attached_clients: tuple[str, ...]
+    blocked_reason: Optional[str]
+
+    @property
+    def mozyo_identified(self) -> bool:
+        """The session is a proven mozyo-managed cockpit (a kill plan is buildable)."""
+        return self.status == COCKPIT_RESET_MANAGED
+
+    @property
+    def resettable(self) -> bool:
+        """Safe to run the destructive teardown: mozyo-identified and not attached."""
+        return self.status == COCKPIT_RESET_MANAGED and not self.attached_clients
+
+    @property
+    def absent(self) -> bool:
+        return self.status == COCKPIT_RESET_ABSENT
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "status": self.status,
+            "session_present": self.session_present,
+            "has_cockpit_window": self.has_cockpit_window,
+            "mozyo_identified": self.mozyo_identified,
+            "resettable": self.resettable,
+            "windows": list(self.windows),
+            "managed_panes": [p.as_dict() for p in self.managed_panes],
+            "unmanaged_panes": [p.as_dict() for p in self.unmanaged_panes],
+            "attached_clients": list(self.attached_clients),
+            "blocked_reason": self.blocked_reason,
+        }
+
+
+def assess_cockpit_reset(
+    *,
+    session: str,
+    session_present: bool,
+    columns: Optional[Sequence[Mapping[str, object]]],
+    attached_clients: Sequence[str] = (),
+    windows: Sequence[str] = (),
+) -> CockpitResetTarget:
+    """Grade a cockpit session for reset/rebuild from a runtime snapshot (#11814, pure).
+
+    ``columns`` is the cockpit window's pane list (each a mapping with
+    ``pane_id`` / ``workspace_id`` / ``role`` / ``lane_id`` — the shape
+    :func:`mozyo_bridge.application.commands._read_cockpit_columns` returns), or
+    ``None`` when the ``cockpit`` window does not exist. Grading is fail-closed:
+
+    - ``columns is None``: the session either does not exist (:data:`COCKPIT_RESET_ABSENT`,
+      a benign no-op) or exists without a cockpit window (:data:`COCKPIT_RESET_FOREIGN`)
+      — in the latter case ownership cannot be confirmed from a window/marker, so the
+      same-named session is left untouched rather than killed by name.
+    - a cockpit window with **no** marker-carrying pane is :data:`COCKPIT_RESET_UNMANAGED`
+      and left untouched.
+    - a cockpit window with at least one ``@mozyo_workspace_id`` pane is
+      :data:`COCKPIT_RESET_MANAGED`; it is resettable only when no client is attached
+      (moving the rug out from a live client is fail-closed — detach first).
+    """
+    clients = tuple(c for c in attached_clients if c)
+    wins = tuple(w for w in windows if w)
+
+    if columns is None:
+        if session_present:
+            reason = (
+                f"session {session!r} exists but has no `cockpit` window, so it "
+                f"cannot be confirmed as the mozyo-managed cockpit. Refusing to "
+                f"kill a session by name alone (fail-closed). Inspect it with "
+                f"`tmux list-windows -t {session}` and, only if you are sure it is "
+                f"stale, remove it manually with `tmux kill-session -t {session}`."
+            )
+            return CockpitResetTarget(
+                session, COCKPIT_RESET_FOREIGN, True, False, wins, (), (), clients, reason
+            )
+        reason = f"no cockpit session {session!r} exists — nothing to reset."
+        return CockpitResetTarget(
+            session, COCKPIT_RESET_ABSENT, False, False, wins, (), (), clients, reason
+        )
+
+    managed: list[CockpitPaneIdentity] = []
+    unmanaged: list[CockpitPaneIdentity] = []
+    for col in columns:
+        workspace_id = str(col.get("workspace_id") or "")
+        ident = CockpitPaneIdentity(
+            pane_id=str(col.get("pane_id") or ""),
+            workspace_id=workspace_id,
+            role=str(col.get("role") or ""),
+            lane_id=normalize_lane(col.get("lane_id")),  # type: ignore[arg-type]
+            managed=bool(workspace_id),
+        )
+        (managed if ident.managed else unmanaged).append(ident)
+
+    if not managed:
+        reason = (
+            f"session {session!r} has a `cockpit` window but no pane carries the "
+            f"mozyo identity marker (`@mozyo_workspace_id`), so it is not a "
+            f"mozyo-managed cockpit. Refusing to reset it (fail-closed); inspect "
+            f"it manually if you believe it is stale."
+        )
+        return CockpitResetTarget(
+            session, COCKPIT_RESET_UNMANAGED, True, True, wins,
+            (), tuple(unmanaged), clients, reason,
+        )
+
+    blocked: Optional[str] = None
+    if clients:
+        blocked = (
+            f"cockpit session {session!r} has attached client(s) "
+            f"({', '.join(clients)}); detach it first (close the iTerm2 -CC "
+            f"window, or `tmux detach -s {session}`) so reset never tears it down "
+            f"under a live client (fail-closed)."
+        )
+    return CockpitResetTarget(
+        session, COCKPIT_RESET_MANAGED, True, True, wins,
+        tuple(managed), tuple(unmanaged), clients, blocked,
+    )
+
+
+@dataclass(frozen=True)
+class CockpitResetPlan:
+    """The destructive teardown plan for a mozyo-managed cockpit (#11814).
+
+    A single ``kill-session`` against the proven-managed cockpit session. Built
+    only after :func:`assess_cockpit_reset` grades the target
+    :data:`COCKPIT_RESET_MANAGED`, so the plan can never name a session whose
+    ownership was not confirmed from a marker-carrying cockpit pane.
+    """
+
+    session: str
+    commands: tuple[CockpitCommand, ...]
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "commands": [c.as_dict() for c in self.commands],
+        }
+
+
+def build_cockpit_reset_plan(
+    session: str = COCKPIT_SESSION_DEFAULT,
+) -> CockpitResetPlan:
+    """Plan the teardown of the mozyo cockpit ``session`` (#11814, pure).
+
+    Emits the single ``kill-session`` the confirm-gated executor runs. The caller
+    must have graded the target :data:`COCKPIT_RESET_MANAGED` first; this builder
+    does not re-check identity (it has no runtime to read).
+    """
+    if not session:
+        raise ValueError("cockpit reset needs the cockpit session name")
+    return CockpitResetPlan(
+        session=session,
+        commands=(
+            CockpitCommand(
+                argv=("kill-session", "-t", session),
+                captures=None,
+                purpose=f"reset cockpit session {session}",
+            ),
+        ),
     )
