@@ -3440,6 +3440,188 @@ class ScaffoldRulesTest(unittest.TestCase):
                 env=env,
             )
 
+    def test_governed_tmux_snippet_declares_pane_level_attention_marker(self) -> None:
+        """Every distributed agent-ui.conf projects attention at pane level (#11958).
+
+        Static checks (no tmux needed, so CI stays green) that all three
+        copies render the same `@mozyo_attention_*` projection on the
+        tmux-native pane border for cockpit multi-pane visibility:
+
+        * `pane-border-format` carries the label-bearing marker (so the
+          signal survives without colour, as #11957 requires) and reuses
+          the same uppercase state labels as the window marker;
+        * a `window-layout-changed` hook toggles `pane-border-status` so
+          single-pane windows keep their full height (the restraint cue);
+        * the colour-only border styles are deliberately NOT bound to
+          attention, so the active/inactive focus cue is left intact.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        confs = [
+            repo_root
+            / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
+            repo_root
+            / "src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
+            repo_root / ".mozyo-bridge/tmux/agent-ui.conf",
+        ]
+        for conf in confs:
+            text = conf.read_text(encoding="utf-8")
+            # The pane border carries the projection, keyed off the same
+            # per-pane user options the window marker reads.
+            self.assertIn("pane-border-format", text, msg=str(conf))
+            self.assertIn("@mozyo_attention_state", text, msg=str(conf))
+            self.assertIn("@mozyo_attention_severity", text, msg=str(conf))
+            # The hook gates the border row by pane count (restraint).
+            self.assertIn("window-layout-changed", text, msg=str(conf))
+            self.assertIn("pane-border-status", text, msg=str(conf))
+            self.assertIn("window_panes", text, msg=str(conf))
+            # Same label vocabulary as the window marker; quiet when healthy.
+            for label in ("OWNER", "REVIEW", "BLOCKED", "STALLED", "DONE", "RETIRE", "UNKNOWN"):
+                self.assertIn(label, text, msg=f"{conf} missing {label}")
+            self.assertNotIn("HEALTHY", text, msg=str(conf))
+            # Border colour stays the focus cue: attention must not be wired
+            # into the (colour-only) active/inactive border styles. They may
+            # be named in the explanatory comment, but never actually set.
+            directives = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip().startswith("set") and not line.lstrip().startswith("#")
+            ]
+            for directive in directives:
+                self.assertNotIn("pane-active-border-style", directive, msg=str(conf))
+                self.assertNotIn("pane-border-style", directive, msg=str(conf))
+
+    def test_governed_tmux_snippet_renders_pane_marker_under_tmux(self) -> None:
+        """Under real tmux the pane border reflects per-pane `@mozyo_attention_*`.
+
+        Sources the snippet into a window, splits it into two panes, and
+        checks that each pane's border renders its own derived state: a
+        quiet `index:command` border for unset/healthy panes, a colourful
+        `[LABEL]` suffix otherwise, and a fail-safe `[UNKNOWN]` for an
+        unrecognised state. Also checks the restraint contract — the
+        border status row only appears once a window has more than one
+        pane and disappears again when it drops back to one, so ordinary
+        single-pane agent windows keep their full height. Skipped when
+        tmux is not on PATH (the static checks above keep CI green).
+        """
+        import shutil as _shutil
+        import subprocess
+
+        if _shutil.which("tmux") is None:
+            self.skipTest("tmux binary not on PATH")
+
+        snippet = Path(__file__).resolve().parents[1] / ".mozyo-bridge/tmux/agent-ui.conf"
+        self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
+
+        socket = f"mozyo-pane-{os.getpid()}"
+        env = os.environ.copy()
+        env.pop("TMUX", None)
+        env.pop("TMUX_PANE", None)
+
+        def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["tmux", "-L", socket, *argv],
+                capture_output=True,
+                text=True,
+                check=check,
+                env=env,
+            )
+
+        subprocess.run(
+            ["tmux", "-L", socket, "kill-server"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        try:
+            tmux(
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "cp",
+                "-n",
+                "cockpit",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 60",
+            )
+            tmux("source-file", str(snippet))
+
+            # Single pane: the layout hook keeps the border row off, so the
+            # pane keeps the full window height (restraint for ordinary
+            # single-pane agent windows).
+            self.assertEqual(
+                "24",
+                tmux("display-message", "-p", "-t", "cp:cockpit", "#{pane_height}").stdout.strip(),
+            )
+
+            tmux("split-window", "-t", "cp:cockpit", "-d", "-v", "sleep 60")
+
+            # Two panes -> the hook enables the border status row.
+            self.assertEqual(
+                "top",
+                tmux("show-options", "-wqv", "-t", "cp:cockpit", "pane-border-status").stdout.strip(),
+            )
+
+            fmt = tmux("show-options", "-gqv", "pane-border-format").stdout.strip()
+            self.assertTrue(fmt, msg="pane-border-format was empty after source-file")
+
+            def render(pane: str) -> str:
+                return tmux("display-message", "-p", "-t", pane, fmt).stdout.strip()
+
+            def set_attention(pane: str, state: str, severity: str = "normal") -> None:
+                tmux("set-option", "-p", "-t", pane, "@mozyo_attention_state", state)
+                tmux("set-option", "-p", "-t", pane, "@mozyo_attention_severity", severity)
+
+            # Unset pane -> quiet identity border, no label.
+            self.assertNotIn("[", render("cp:cockpit.0"))
+            self.assertIn("0:", render("cp:cockpit.0"))
+
+            # An inactive pane carrying a blocked/critical state surfaces a
+            # red [BLOCKED] label so its stopped state is visible even
+            # though it is not the active pane.
+            set_attention("cp:cockpit.1", "blocked", "critical")
+            blocked = render("cp:cockpit.1")
+            self.assertIn("[BLOCKED]", blocked, msg=blocked)
+            self.assertIn("colour203", blocked, msg=blocked)
+
+            # owner_waiting/warning -> amber [OWNER]; per-pane, independent
+            # of the other pane.
+            set_attention("cp:cockpit.0", "owner_waiting", "warning")
+            owner = render("cp:cockpit.0")
+            self.assertIn("[OWNER]", owner, msg=owner)
+            self.assertIn("colour179", owner, msg=owner)
+
+            # Unrecognised state fails safe to UNKNOWN, never healthy-looking.
+            set_attention("cp:cockpit.0", "weird", "normal")
+            self.assertIn("[UNKNOWN]", render("cp:cockpit.0"))
+
+            # healthy -> marker suppressed so healthy panes stay quiet.
+            set_attention("cp:cockpit.0", "healthy", "normal")
+            self.assertNotIn("[", render("cp:cockpit.0"))
+
+            # Drop back to one pane: the hook turns the border row off again
+            # and the surviving pane reclaims the full height.
+            tmux("kill-pane", "-t", "cp:cockpit.1")
+            self.assertEqual(
+                "off",
+                tmux("show-options", "-wqv", "-t", "cp:cockpit", "pane-border-status").stdout.strip(),
+            )
+            self.assertEqual(
+                "24",
+                tmux("display-message", "-p", "-t", "cp:cockpit", "#{pane_height}").stdout.strip(),
+            )
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket, "kill-server"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
     def test_governed_scaffold_skip_flags_omit_artifacts_and_manifest_entries(self) -> None:
         """`--skip-tmux-ui` / `--skip-nagger` opt-outs drop the category.
 
