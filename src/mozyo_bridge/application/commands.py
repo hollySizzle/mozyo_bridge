@@ -45,7 +45,10 @@ from mozyo_bridge.domain.handoff import (
     normalize_anchor,
 )
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
-from mozyo_bridge.workspace_registry import resolve_canonical_session
+from mozyo_bridge.workspace_registry import (
+    SOURCE_HOME_REGISTRY,
+    resolve_canonical_session,
+)
 from mozyo_bridge.domain.pane_resolver import (
     AGENT_COMMANDS,
     AGENT_LABELS,
@@ -3427,8 +3430,31 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"`mozyo-bridge init {agent}{_init_target_suffix(args)} --window-only`."
             )
 
-    # --- Mutations: vscode settings -> session rename -> window rename -> style.
     notes: list[str] = []
+
+    # --- Registry-aware identity (Redmine #11427) -----------------------------
+    # Make the workspace identity durable before any tmux/vscode mutation, but
+    # only after every abortable preflight check above — so a registry write
+    # never precedes a detectable conflict, and a tmux mutation never precedes a
+    # successful registration. A workspace already resolved from the home
+    # registry keeps its identity untouched (no re-derivation); one resolved via
+    # path derivation or an anchor-only state is registered now, converting the
+    # path fallback into a durable registration. ``register_workspace`` is
+    # idempotent and reuses the anchor identity, so the canonical session name is
+    # byte-identical to what ``resolve_canonical_session`` returned above.
+    workspace_id = expected.workspace_id
+    if expected.source != SOURCE_HOME_REGISTRY:
+        from mozyo_bridge.workspace_registry import register_workspace
+
+        registration = register_workspace(root)
+        expected_name = registration.record.canonical_session
+        workspace_id = registration.record.workspace_id
+        notes.append(
+            f"registered workspace '{registration.record.project_name}' "
+            f"({registration.outcome}; session '{expected_name}')"
+        )
+
+    # --- Mutations: vscode settings -> session rename -> window rename -> style.
     if not getattr(args, "no_vscode_settings", False):
         settings_path, written, warning = _write_vscode_session_name(root, expected_name)
         if warning:
@@ -3450,10 +3476,47 @@ def cmd_init(args: argparse.Namespace) -> int:
     # status-bar tint so adopted panes look identical to `mozyo`-created ones.
     apply_window_subtle_style(final_session, agent)
 
+    # Stabilize role binding with the same pane-option markers cockpit panes
+    # carry (Redmine #11427 / #11822): an explicit `@mozyo_agent_role` makes the
+    # resolver report this pane as `pane_option` / strong, so the role survives a
+    # later window rename instead of depending only on the window name. The
+    # paired `@mozyo_workspace_id` ties the pane to the workspace just made
+    # durable above. Both are best-effort (`check=False`): a failed marker write
+    # must not undo the completed adoption.
+    _bind_agent_pane_markers(target, agent, workspace_id, notes)
+
     print(f"adopted {target} into session '{final_session}' as {agent}")
     for note in notes:
         print(f"  - {note}")
     return 0
+
+
+def _bind_agent_pane_markers(
+    target: str, agent: str, workspace_id: str | None, notes: list[str]
+) -> None:
+    """Stamp `@mozyo_agent_role` (+ `@mozyo_workspace_id`) on an adopted pane.
+
+    Reuses the cockpit identity options (`domain.cockpit_layout`) so a normal
+    `init`-adopted pane carries the same machine-readable role/workspace markers
+    a cockpit pane does, which is what makes `agents`/`session list` report it as
+    a `pane_option` / strong role rather than inferring the role from the window
+    name alone. Best-effort: a non-zero tmux exit is noted but never aborts the
+    already-completed adoption.
+    """
+    from mozyo_bridge.domain.cockpit_layout import ROLE_OPTION, WORKSPACE_OPTION
+
+    role_result = run_tmux("set-option", "-p", "-t", target, ROLE_OPTION, agent, check=False)
+    if role_result.returncode == 0:
+        notes.append(f"bound role marker {ROLE_OPTION}={agent} on {target}")
+    else:
+        notes.append(
+            f"warning: could not set {ROLE_OPTION} on {target} "
+            f"(role still resolves from the window name)"
+        )
+    if workspace_id:
+        run_tmux(
+            "set-option", "-p", "-t", target, WORKSPACE_OPTION, workspace_id, check=False
+        )
 
 
 def cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:

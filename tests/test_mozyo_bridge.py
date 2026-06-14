@@ -7176,12 +7176,15 @@ class CommandTest(unittest.TestCase):
         *,
         rename_observer: list | None = None,
         style_observer: list | None = None,
+        option_observer: list | None = None,
     ):
         # display-message resolves the pane reference to its canonical id.
         # rename-window is the rename mutation init makes.
         # set-window-option is the subtle window-status-style applied to the
         # newly-renamed agent window so the tmux status bar entry for that
         # window is colored without changing the window name.
+        # set-option -p stamps the pane identity markers (@mozyo_agent_role /
+        # @mozyo_workspace_id) that stabilize role binding (Redmine #11427).
         def side_effect(*tmux_args, **_):
             if tmux_args[:1] == ("display-message",):
                 return argparse.Namespace(returncode=0, stdout=f"{target_pane_id}\n", stderr="")
@@ -7192,6 +7195,10 @@ class CommandTest(unittest.TestCase):
             if tmux_args[:1] == ("set-window-option",):
                 if style_observer is not None:
                     style_observer.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:1] == ("set-option",):
+                if option_observer is not None:
+                    option_observer.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux args: {tmux_args}")
         return side_effect
@@ -7216,6 +7223,21 @@ class CommandTest(unittest.TestCase):
             encoding="utf-8",
         )
         return workspace
+
+    def _isolate_home(self, tmp: str) -> Path:
+        """Point MOZYO_BRIDGE_HOME at a temp dir for the duration of the test.
+
+        Smart `init` now registers the workspace (Redmine #11427), which writes
+        the home registry. Without this, registration would pollute the real
+        ``~/.mozyo_bridge/registry.sqlite`` with throwaway temp-workspace rows.
+        """
+        home = Path(tmp) / "mozyo-home"
+        patcher = patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return home
 
     def test_cmd_init_window_only_renames_window_in_place(self) -> None:
         # `--window-only` keeps the legacy low-level behavior: rename the window,
@@ -7281,6 +7303,7 @@ class CommandTest(unittest.TestCase):
         # settings pinned, window renamed, style applied.
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._stage_jp_workspace(Path(tmp))
+            self._isolate_home(tmp)
             args = argparse.Namespace(
                 agent="claude", target="%5", window_only=False, no_vscode_settings=False
             )
@@ -7334,6 +7357,7 @@ class CommandTest(unittest.TestCase):
         # vscode setting and renames the window but does not rename the session.
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._stage_jp_workspace(Path(tmp))
+            self._isolate_home(tmp)
             args = argparse.Namespace(
                 agent="codex", target="%5", window_only=False, no_vscode_settings=False
             )
@@ -7367,6 +7391,7 @@ class CommandTest(unittest.TestCase):
     def test_cmd_init_no_vscode_settings_skips_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._stage_jp_workspace(Path(tmp))
+            self._isolate_home(tmp)
             args = argparse.Namespace(
                 agent="claude", target="%5", window_only=False, no_vscode_settings=True
             )
@@ -7434,6 +7459,7 @@ class CommandTest(unittest.TestCase):
         # refuses same-session collisions.
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._stage_jp_workspace(Path(tmp))
+            self._isolate_home(tmp)
             args = argparse.Namespace(
                 agent="claude", target="%5", window_only=False, no_vscode_settings=True
             )
@@ -7459,6 +7485,197 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(0, cmd_init(args))
 
             self.assertEqual([("mozyo-giken-3500-jgmlife:1", "claude")], window_calls)
+
+    def test_cmd_init_registers_unregistered_workspace(self) -> None:
+        # Redmine #11427: smart init converts an unregistered workspace into a
+        # durable registration — a home-registry row and a local anchor — and
+        # adopts the registered canonical session.
+        from mozyo_bridge.workspace_registry import (
+            load_workspace_by_path,
+            read_anchor,
+            registry_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            home = self._isolate_home(tmp)
+            self.assertFalse(registry_path(home).exists())
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.rename_session"), \
+                patch("mozyo_bridge.application.commands.rename_window"), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            record = load_workspace_by_path(workspace, home=home)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.canonical_session, "mozyo-giken-3500-jgmlife")
+            anchor = read_anchor(workspace)
+            self.assertIsNotNone(anchor)
+            self.assertEqual(anchor["workspace_id"], record.workspace_id)
+
+    def test_cmd_init_reuses_registered_canonical_session_not_path_derivation(self) -> None:
+        # A registered workspace keeps its canonical session even when the
+        # derivation input later changes: smart init must read the registry,
+        # not re-derive from the (now different) workspace-defaults identifier.
+        from mozyo_bridge.workspace_registry import (
+            load_workspace_by_path,
+            register_workspace,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            home = self._isolate_home(tmp)
+            registered = register_workspace(workspace, home=home)
+            canonical = registered.record.canonical_session
+            # Mutate the derivation input so a re-derive WOULD yield a new name.
+            (workspace / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+                "redmine:\n  default_project:\n    identifier: giken-9999-changed\n",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                agent="codex", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%5", "location": f"{canonical}:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            window_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value=f"{canonical}:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch(
+                    "mozyo_bridge.application.commands.rename_session"
+                ) as rename_session, \
+                patch(
+                    "mozyo_bridge.application.commands.rename_window",
+                    side_effect=lambda target, name: window_calls.append((target, name)),
+                ), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            rename_session.assert_not_called()
+            self.assertEqual([(f"{canonical}:1", "codex")], window_calls)
+            record = load_workspace_by_path(workspace, home=home)
+            self.assertEqual(record.canonical_session, canonical)
+            self.assertEqual(record.workspace_id, registered.record.workspace_id)
+
+    def test_cmd_init_window_only_does_not_register(self) -> None:
+        # `--window-only` stays a low-level escape hatch: no registry row, no
+        # anchor (Redmine #11427).
+        from mozyo_bridge.workspace_registry import anchor_path, registry_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            home = self._isolate_home(tmp)
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=True, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%5", "location": "agents:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="agents:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.rename_window"), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            self.assertFalse(registry_path(home).exists())
+            self.assertFalse(anchor_path(workspace).exists())
+
+    def test_cmd_init_does_not_register_when_conflict_detected(self) -> None:
+        # Fail-closed ordering: a detectable same-session window conflict aborts
+        # BEFORE any registry write, so no durable identity is left behind.
+        from mozyo_bridge.workspace_registry import registry_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            home = self._isolate_home(tmp)
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%3", "location": "___________:2.0", "command": "claude", "window_name": "claude", "cwd": str(workspace)},
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect("%5"),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    cmd_init(args)
+
+            self.assertFalse(registry_path(home).exists())
+
+    def test_cmd_init_binds_agent_role_pane_marker(self) -> None:
+        # Redmine #11427 / #11822: smart init stamps @mozyo_agent_role (+ the
+        # registered @mozyo_workspace_id) on the adopted pane so the resolver
+        # reports a strong pane_option role rather than inferring from the window
+        # name alone.
+        from mozyo_bridge.workspace_registry import load_workspace_by_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._stage_jp_workspace(Path(tmp))
+            home = self._isolate_home(tmp)
+            args = argparse.Namespace(
+                agent="claude", target="%5", window_only=False, no_vscode_settings=True
+            )
+            panes = [
+                {"id": "%5", "location": "___________:1.0", "command": "zsh", "window_name": "zsh", "cwd": str(workspace)},
+            ]
+            option_calls: list[tuple] = []
+            with patch("mozyo_bridge.application.commands.require_tmux"), \
+                patch(
+                    "mozyo_bridge.application.commands.run_tmux",
+                    side_effect=self._init_run_tmux_side_effect(
+                        "%5", option_observer=option_calls
+                    ),
+                ), \
+                patch("mozyo_bridge.application.commands.pane_location", return_value="___________:1.0"), \
+                patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+                patch("mozyo_bridge.application.commands.session_exists", return_value=False), \
+                patch("mozyo_bridge.application.commands.rename_session"), \
+                patch("mozyo_bridge.application.commands.rename_window"), \
+                patch("mozyo_bridge.application.commands.apply_window_subtle_style"), \
+                contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, cmd_init(args))
+
+            self.assertIn(
+                ("set-option", "-p", "-t", "%5", "@mozyo_agent_role", "claude"),
+                option_calls,
+            )
+            record = load_workspace_by_path(workspace, home=home)
+            self.assertIn(
+                ("set-option", "-p", "-t", "%5", "@mozyo_workspace_id", record.workspace_id),
+                option_calls,
+            )
 
     def test_cmd_init_fails_closed_on_meaningful_foreign_session(self) -> None:
         # A meaningful (non-fallback) session name different from expected is not
