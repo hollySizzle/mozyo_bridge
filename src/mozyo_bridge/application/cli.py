@@ -5,6 +5,7 @@ import sys
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.commands import (
+    cmd_agents_attention_project,
     cmd_agents_list,
     cmd_agents_targets,
     cmd_config,
@@ -640,6 +641,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON candidates instead of the compact table.",
     )
     agents_targets.set_defaults(func=cmd_agents_targets)
+
+    agents_attention = agents_sub.add_parser(
+        "attention-project",
+        help=(
+            "Project derived attention state onto tmux pane user options as a "
+            "re-derivable cache (Redmine #11954): @mozyo_attention_state / "
+            "_severity / _reason / _updated_at. The cache is never the source of "
+            "truth and is never used for routing / handoff preflight. Safe by "
+            "default: previews the set-option plan without mutating tmux; pass "
+            "--apply to write. Reuses the conservative #11952 derivation (no "
+            "fabricated owner/review signals yet)."
+        ),
+    )
+    agents_attention.add_argument(
+        "--session",
+        help="Filter to candidates that are members of this tmux session.",
+    )
+    agents_attention.add_argument(
+        "--agent",
+        choices=sorted(AGENT_KINDS),
+        help="Filter by classified agent kind (claude / codex).",
+    )
+    agents_attention.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the tmux user options (default previews the plan only).",
+    )
+    agents_attention.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Force preview even with --apply (preview is already the default).",
+    )
+    agents_attention.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the derived attention records and set-option plan as JSON.",
+    )
+    agents_attention.set_defaults(func=cmd_agents_attention_project)
 
     config = sub.add_parser("tmux-ui-config")
     add_repo_option(config)

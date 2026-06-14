@@ -288,38 +288,17 @@ def _attention_for_candidate(candidate, observed_at: str):
     return derive_attention(inputs)
 
 
-def cmd_agents_targets(args: argparse.Namespace) -> int:
-    """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
+def _agents_target_candidates(args: argparse.Namespace) -> list:
+    """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Read-only. Prints the classified agent panes as candidate handoff targets
-    with just the fields needed to pick an explicit ``pane_id`` without parsing
-    titles: role + resolver provenance (``role_source`` / ``confidence`` /
-    ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
-    repo identifier, current branch, liveness, location, and the projection
-    ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
-    and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
-    original column order and appends ``VIEW_KIND`` / ``BRANCH`` and the additive
-    ``ATTENTION`` / ``REASON`` columns (#11952); ``--json`` renders the nested
-    canonical ``TargetRecord`` projection (host / runtime / identity / repo /
-    view) plus an additive ``attention`` record — a projection, never a saved
-    file. Attention is a conservative read-only projection (#11951 read model):
-    no durable attention source is wired yet, so a cleanly-identified target
-    derives ``healthy`` (reason ``no_attention_source``) and an ambiguous /
-    unreadable one derives ``unknown`` — never a fabricated owner/review signal,
-    and never used for routing. Builds on the same
-    ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
-    the two never drift, and resolves workspace identity through the registry →
-    anchor → derivation chain. Compact text hides absolute paths (basename
-    only); ``--json`` carries ``repo_root`` / ``cwd`` (the exposure ``agents
-    list`` already allows). Listing is non-selecting: same-role candidates stay
-    distinguishable by workspace / lane / pane and the caller must name the
-    explicit pane, so a natural name never auto-crosses a safety boundary. Live
-    tmux remains the liveness source (``active``); registry / anchor are
-    identity hints only.
+    Used by ``agents targets`` and the attention projection (#11954) so the two
+    read the same classified candidates (identity / lane / workspace / branch)
+    and never drift. Read-only: ``discover_agents`` → ``fold_agents_by_pane`` with
+    registry-resolved workspace identity and a tolerant branch probe; validates
+    ``--agent`` and applies ``--session`` / ``--agent`` filters.
     """
     from mozyo_bridge.domain.agent_discovery import fold_agents_by_pane
 
-    require_tmux()
     agent_filter = getattr(args, "agent", None)
     if agent_filter is not None and agent_filter not in AGENT_KINDS:
         die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
@@ -355,11 +334,139 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
             branch_cache[repo_root] = _probe_checkout_facts(repo_root).get("branch")
         return branch_cache[repo_root]
 
-    candidates = build_target_candidates(
+    return build_target_candidates(
         records,
         resolve_workspace=resolve_workspace,
         resolve_branch=resolve_branch,
     )
+
+
+def cmd_agents_attention_project(args: argparse.Namespace) -> int:
+    """Project derived attention onto tmux pane user options (Redmine #11954).
+
+    Writes a re-derivable **projection cache** of the #11951 ``AttentionRecord``
+    (derived conservatively, #11952) onto each discovered target's tmux pane user
+    options: ``@mozyo_attention_state`` / ``@mozyo_attention_severity`` /
+    ``@mozyo_attention_reason`` / ``@mozyo_attention_updated_at``.
+
+    Boundaries:
+
+    - **Projection cache only.** The source of truth stays the durable state /
+      the ``derive_attention`` read model; these user options are a cache that
+      can be deleted and re-derived. They are never consulted for routing /
+      handoff preflight / target resolution.
+    - **Safe by default.** Default is a preview (no tmux mutation) that prints
+      the exact ``set-option`` plan per pane; ``--apply`` performs the writes
+      best-effort (a failed option write never aborts the run, like other
+      best-effort projections). ``--dry-run`` forces preview and wins over
+      ``--apply``.
+    - **No color / ``agent-ui.conf`` / iTerm changes** here — this task only
+      writes the machine-readable user options; rendering them is a later task.
+    """
+    from mozyo_bridge.application.attention_projection import (
+        build_attention_option_plan,
+    )
+
+    require_tmux()
+    candidates = _agents_target_candidates(args)
+
+    from datetime import datetime, timezone
+
+    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Safe default: preview unless --apply is given; --dry-run always wins.
+    apply = bool(getattr(args, "apply", False)) and not bool(
+        getattr(args, "dry_run", False)
+    )
+
+    # Apply (when requested) happens here once, before any output branch, so
+    # `--json --apply` and text `--apply` perform identical writes and both
+    # report the true outcome — the JSON branch must never claim ``applied`` while
+    # mutating nothing (Redmine #11954 review #58539). Preview never writes.
+    # ``applied_ok`` is True/False per target only when a write was attempted, and
+    # None in preview.
+    plans = []
+    for c in candidates:
+        record = _attention_for_candidate(c, observed_at)
+        commands_plan = build_attention_option_plan(c.pane_id, record)
+        applied_ok: bool | None = None
+        if apply:
+            applied_ok = True
+            for argv in commands_plan:
+                if run_tmux(*argv, check=False).returncode != 0:
+                    # Best-effort: a failed option write is recorded, not raised
+                    # (projection-cache posture); the run still finishes.
+                    applied_ok = False
+        plans.append((c, record, commands_plan, applied_ok))
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = [
+            {
+                "pane_id": c.pane_id,
+                "attention": record.as_payload(),
+                "applied": apply,
+                "applied_ok": applied_ok,
+                "plan": [list(argv) for argv in commands_plan],
+            }
+            for c, record, commands_plan, applied_ok in plans
+        ]
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if not plans:
+        print("no agent targets discovered; nothing to project")
+        return 0
+
+    for c, record, commands_plan, applied_ok in plans:
+        label = (
+            f"{c.pane_id or '-'} {record.attention_state}/{record.severity} "
+            f"({record.reason_code})"
+        )
+        if not apply:
+            print(f"(dry-run) {label}")
+            for argv in commands_plan:
+                print("  tmux " + " ".join(argv))
+            continue
+        print(
+            f"projected {label}"
+            if applied_ok
+            else f"warning: partial projection {label}"
+        )
+    return 0
+
+
+def cmd_agents_targets(args: argparse.Namespace) -> int:
+    """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
+
+    Read-only. Prints the classified agent panes as candidate handoff targets
+    with just the fields needed to pick an explicit ``pane_id`` without parsing
+    titles: role + resolver provenance (``role_source`` / ``confidence`` /
+    ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
+    repo identifier, current branch, liveness, location, and the projection
+    ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
+    and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
+    original column order and appends ``VIEW_KIND`` / ``BRANCH`` and the additive
+    ``ATTENTION`` / ``REASON`` columns (#11952); ``--json`` renders the nested
+    canonical ``TargetRecord`` projection (host / runtime / identity / repo /
+    view) plus an additive ``attention`` record — a projection, never a saved
+    file. Attention is a conservative read-only projection (#11951 read model):
+    no durable attention source is wired yet, so a cleanly-identified target
+    derives ``healthy`` (reason ``no_attention_source``) and an ambiguous /
+    unreadable one derives ``unknown`` — never a fabricated owner/review signal,
+    and never used for routing. Builds on the same
+    ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
+    the two never drift, and resolves workspace identity through the registry →
+    anchor → derivation chain. Compact text hides absolute paths (basename
+    only); ``--json`` carries ``repo_root`` / ``cwd`` (the exposure ``agents
+    list`` already allows). Listing is non-selecting: same-role candidates stay
+    distinguishable by workspace / lane / pane and the caller must name the
+    explicit pane, so a natural name never auto-crosses a safety boundary. Live
+    tmux remains the liveness source (``active``); registry / anchor are
+    identity hints only.
+    """
+    require_tmux()
+    candidates = _agents_target_candidates(args)
 
     # Single observation timestamp for this read; the pure attention read model
     # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
