@@ -276,6 +276,18 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-event-timeline-source
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/event-timeline-source.md
+    purpose: consumer 向け event timeline source (events tail / query --json) の設計正本。OTel runtime store からの安定 envelope projection、三層 source layering (runtime/delivery/anchor) と trust 境界、path/secret redaction、DB を唯一正本にしない runtime/durable 境界、localhost API/stream と delivery feed の design consultation 送り。
+    audit_role: event_timeline_source_logic
+    related_document_refs:
+      - logic-otel-event-store
+      - logic-cockpit-web-ui
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-cockpit-web-ui
     type: logic
     status: active
@@ -509,8 +521,20 @@ file_conventions:
     severity: block
     document_refs:
       - logic-otel-event-store
+      - logic-event-timeline-source
       - logic-cockpit-web-ui
       - logic-session-inventory
+      - spec-project-map
+
+  - id: fc-event-timeline-source
+    name: consumer event timeline projection source
+    patterns:
+      - src/mozyo_bridge/domain/event_timeline.py
+    severity: block
+    document_refs:
+      - logic-event-timeline-source
+      - logic-otel-event-store
+      - rule-public-private-boundary
       - spec-project-map
 
   - id: fc-handoff-notification-source

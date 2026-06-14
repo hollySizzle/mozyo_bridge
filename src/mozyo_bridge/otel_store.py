@@ -327,6 +327,39 @@ class OtelEventStore:
         )
         return [self._row_to_event(row) for row in rows]
 
+    def query_events(
+        self,
+        *,
+        since: str | None = None,
+        source: str | None = None,
+        limit: int = 200,
+    ) -> list[tuple[int, OtelEvent]]:
+        """Filtered timeline query: returns ``(row_id, event)`` newest-first.
+
+        Read-only. ``since`` filters on the receiver clock
+        (``received_at >= since``, UTC ISO); ``source`` matches
+        ``service_name`` exactly. The row id is returned so the event
+        timeline projection can hand consumers a stable cursor / dedup key
+        (Redmine #11813). Filtering happens in SQL so a long history does
+        not have to be materialized.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if since:
+            clauses.append("received_at >= ?")
+            params.append(since)
+        if source:
+            clauses.append("service_name = ?")
+            params.append(source)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._read_rows(
+            f"SELECT id, {_EVENT_COLUMNS} FROM otel_events{where} "
+            "ORDER BY id DESC LIMIT ?",
+            tuple(params),
+        )
+        return [(row[0], self._row_to_event(row[1:])) for row in rows]
+
     def latest_per_source(self) -> list[OtelEvent]:
         """Most recent event per (service_name, session_id) source."""
         rows = self._read_rows(

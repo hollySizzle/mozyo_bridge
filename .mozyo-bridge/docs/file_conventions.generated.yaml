@@ -104,7 +104,17 @@ rules:
   - src/mozyo_bridge/redmine_context.py
   - src/mozyo_bridge/domain/agent_activity.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/otel-event-store.md と @vibes/docs/logics/cockpit-web-ui.md と @vibes/docs/logics/session-inventory.md
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/otel-event-store.md と @vibes/docs/logics/event-timeline-source.md と @vibes/docs/logics/cockpit-web-ui.md
+    と @vibes/docs/logics/session-inventory.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: consumer event timeline projection source
+  patterns:
+  - src/mozyo_bridge/domain/event_timeline.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/event-timeline-source.md と @vibes/docs/logics/otel-event-store.md と @vibes/docs/rules/public-private-boundary.md
     と @vibes/docs/specs/project-map.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください

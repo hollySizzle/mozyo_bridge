@@ -10,6 +10,8 @@ from mozyo_bridge.application.commands import (
     cmd_config,
     cmd_doctor,
     cmd_doctor_instruction,
+    cmd_events_query,
+    cmd_events_tail,
     cmd_handoff_reply,
     cmd_handoff_send,
     cmd_id,
@@ -1411,6 +1413,79 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     docs_impact.set_defaults(func=cmd_docs_audit_impact)
+
+    events = sub.add_parser(
+        "events",
+        help=(
+            "Consumer event timeline source (Redmine #11813): a stable, "
+            "redacted, source-layer-tagged projection over the OTel runtime "
+            "store for display consumers (cockpit / private GUI / iTerm "
+            "WebViewer). Distinct from `otel events`, which exposes the raw "
+            "OTLP shape for debugging — this face decouples consumers from "
+            "the OTel internal schema. Read-only and best-effort: the store "
+            "is a cache, never the source of truth (gate state stays with "
+            "Redmine, liveness with `agents list` / `session list`). JSON "
+            "carries identifiers, event kinds and numeric usage only — never "
+            "prompt bodies or full filesystem paths."
+        ),
+    )
+    events_sub = events.add_subparsers(dest="events_command", required=True)
+
+    def add_events_db_option(parser_obj: argparse.ArgumentParser) -> None:
+        parser_obj.add_argument(
+            "--db",
+            help=(
+                "Event store path override. Default: "
+                "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/otel-events.sqlite`."
+            ),
+        )
+
+    events_tail = events_sub.add_parser(
+        "tail",
+        help=(
+            "Tail the most recent timeline events (default 50), newest "
+            "first. Use `--json` for the stable TimelineEvent envelope that "
+            "display consumers code against."
+        ),
+    )
+    events_tail.add_argument(
+        "--limit", help="Max events to show (default 50)."
+    )
+    add_events_db_option(events_tail)
+    events_tail.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the timeline as the JSON TimelineEvent envelope.",
+    )
+    events_tail.set_defaults(func=cmd_events_tail)
+
+    events_query = events_sub.add_parser(
+        "query",
+        help=(
+            "Filtered timeline query. `--since` keeps events at or after a "
+            "UTC ISO timestamp (the receiver clock); `--source` matches the "
+            "emitting service exactly. Same redacted envelope as `tail`."
+        ),
+    )
+    events_query.add_argument(
+        "--since",
+        help=(
+            "Keep events whose observed_at is >= this UTC ISO timestamp "
+            "(e.g. 2026-06-14T00:00:00+00:00)."
+        ),
+    )
+    events_query.add_argument(
+        "--source",
+        help="Keep only events from this service_name (exact match).",
+    )
+    events_query.add_argument(
+        "--limit", help="Max events to show (default 200)."
+    )
+    add_events_db_option(events_query)
+    events_query.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the timeline as the JSON TimelineEvent envelope.",
+    )
+    events_query.set_defaults(func=cmd_events_query)
 
     otel = sub.add_parser(
         "otel",

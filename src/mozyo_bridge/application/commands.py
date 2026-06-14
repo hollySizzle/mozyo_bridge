@@ -3327,6 +3327,86 @@ def cmd_otel_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _events_store(args: argparse.Namespace):
+    from mozyo_bridge.otel_store import OtelEventStore
+
+    return OtelEventStore(
+        Path(args.db).expanduser() if getattr(args, "db", None) else None
+    )
+
+
+def _render_timeline(events, *, as_json: bool) -> int:
+    """Shared text/JSON renderer for the consumer event timeline (#11813)."""
+    import json as _json
+
+    if as_json:
+        print(
+            _json.dumps(
+                [event.as_payload() for event in events],
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    print("OBSERVED\tLAYER\tCATEGORY\tEVENT\tSERVICE\tSESSION\tWORKSPACE\tTOKENS")
+    for event in events:
+        agent = event.agent or {}
+        tokens = event.usage.get("total_tokens")
+        print(
+            "\t".join(
+                [
+                    event.observed_at or "-",
+                    event.source_layer,
+                    event.category,
+                    event.event_name,
+                    (agent.get("service") or "-"),
+                    (agent.get("session") or "-")[:12],
+                    event.workspace_hint or "-",
+                    str(tokens) if tokens is not None else "-",
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_events_tail(args: argparse.Namespace) -> int:
+    """Tail the consumer event timeline (Redmine #11813). Read-only.
+
+    A stable, redacted, source-layer-tagged projection over the OTel
+    runtime store for display consumers (cockpit / private GUI / iTerm
+    WebViewer). Distinct from `otel events`, which exposes the raw OTLP
+    shape for debugging. The store is a best-effort cache, never the source
+    of truth; gate state stays with Redmine and liveness with the tmux
+    layer.
+    """
+    from mozyo_bridge.domain.event_timeline import project_rows
+
+    store = _events_store(args)
+    rows = store.query_events(limit=int(getattr(args, "limit", None) or 50))
+    events = project_rows(rows)
+    return _render_timeline(events, as_json=getattr(args, "as_json", False))
+
+
+def cmd_events_query(args: argparse.Namespace) -> int:
+    """Filtered consumer event timeline query (Redmine #11813). Read-only.
+
+    `--since` filters on the receiver clock (`observed_at >= ISO`);
+    `--source` matches the emitting service exactly. Same redacted,
+    source-layer-tagged envelope as `events tail`.
+    """
+    from mozyo_bridge.domain.event_timeline import project_rows
+
+    store = _events_store(args)
+    rows = store.query_events(
+        since=getattr(args, "since", None) or None,
+        source=getattr(args, "source", None) or None,
+        limit=int(getattr(args, "limit", None) or 200),
+    )
+    events = project_rows(rows)
+    return _render_timeline(events, as_json=getattr(args, "as_json", False))
+
+
 def cmd_otel_activity(args: argparse.Namespace) -> int:
     """Per-source activity/idle judgement (Redmine #11673). Read-only.
 
