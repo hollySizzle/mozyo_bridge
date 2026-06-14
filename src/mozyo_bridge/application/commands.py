@@ -226,6 +226,68 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     return 0
 
 
+# Reason code for the conservative pre-wiring attention projection (#11952):
+# no durable attention source (Redmine gate / owner / review / managed event) is
+# connected yet, so a cleanly-identified target derives `healthy` with this
+# reason rather than a fabricated owner/review signal.
+_ATTENTION_NO_SOURCE_REASON = "no_attention_source"
+
+
+def _attention_for_candidate(candidate, observed_at: str):
+    """Derive a conservative :class:`AttentionRecord` for one target (#11952).
+
+    First read-only exposure of the #11951 attention read model. No durable
+    attention source is wired yet, so this never fabricates an
+    owner/review/blocked/stalled signal: it only distinguishes a cleanly
+    identified target (``healthy``, reason ``no_attention_source``) from one
+    whose identity itself is ambiguous / unreadable (``unknown``). Later
+    extraction tasks feed real durable / observed signals into the same pure
+    :func:`derive_attention`; this stays an additive projection and is never used
+    for routing / target selection.
+    """
+    from mozyo_bridge.domain.agent_discovery import (
+        CONFIDENCE_NONE,
+        ROLE_SOURCE_UNKNOWN,
+    )
+    from mozyo_bridge.domain.attention import (
+        ROLE_CLAUDE,
+        ROLE_CODEX,
+        ROLE_OTHER,
+        AttentionInputs,
+        derive_attention,
+    )
+
+    role = candidate.role if candidate.role in (ROLE_CLAUDE, ROLE_CODEX) else ROLE_OTHER
+    identity_readable = (
+        role in (ROLE_CLAUDE, ROLE_CODEX)
+        and candidate.confidence != CONFIDENCE_NONE
+        and candidate.role_source != ROLE_SOURCE_UNKNOWN
+    )
+    contradictory = bool(candidate.ambiguous)
+    host = candidate.host or "local"
+    workspace_id = candidate.workspace_id or ""
+    lane_id = candidate.lane_id or "default"
+    pane_id = candidate.pane_id
+    inputs = AttentionInputs(
+        unit_id=f"unit:{host}:{workspace_id}:{lane_id}",
+        observed_at=observed_at,
+        host_id=host,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        role=role,
+        target_key=f"tmux:{host}:{pane_id}" if pane_id else None,
+        source_refs=(f"tmux:{pane_id}",) if pane_id else (),
+        source_readable=identity_readable,
+        contradictory=contradictory,
+        reason_code=(
+            _ATTENTION_NO_SOURCE_REASON
+            if identity_readable and not contradictory
+            else None
+        ),
+    )
+    return derive_attention(inputs)
+
+
 def cmd_agents_targets(args: argparse.Namespace) -> int:
     """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
 
@@ -236,9 +298,15 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     repo identifier, current branch, liveness, location, and the projection
     ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
     and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
-    original column order and appends ``VIEW_KIND`` / ``BRANCH``; ``--json``
-    renders the nested canonical ``TargetRecord`` projection (host / runtime /
-    identity / repo / view) — a projection, never a saved file. Builds on the same
+    original column order and appends ``VIEW_KIND`` / ``BRANCH`` and the additive
+    ``ATTENTION`` / ``REASON`` columns (#11952); ``--json`` renders the nested
+    canonical ``TargetRecord`` projection (host / runtime / identity / repo /
+    view) plus an additive ``attention`` record — a projection, never a saved
+    file. Attention is a conservative read-only projection (#11951 read model):
+    no durable attention source is wired yet, so a cleanly-identified target
+    derives ``healthy`` (reason ``no_attention_source``) and an ambiguous /
+    unreadable one derives ``unknown`` — never a fabricated owner/review signal,
+    and never used for routing. Builds on the same
     ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
     the two never drift, and resolves workspace identity through the registry →
     anchor → derivation chain. Compact text hides absolute paths (basename
@@ -293,22 +361,37 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
         resolve_branch=resolve_branch,
     )
 
+    # Single observation timestamp for this read; the pure attention read model
+    # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
+    # here once. Attention is an additive projection (#11952): JSON gains an
+    # `attention` key per target, text appends ATTENTION / REASON columns.
+    from datetime import datetime, timezone
+
+    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
     if getattr(args, "as_json", False):
         import json as _json
 
-        payload = [candidate.to_dict() for candidate in candidates]
+        payload = [
+            {
+                **candidate.to_dict(),
+                "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
+            }
+            for candidate in candidates
+        ]
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
-    # Compatibility-preserving text projection (#11907): the original column run
-    # (PANE..WINDOW) keeps its order so existing parsers stay valid; VIEW_KIND /
-    # BRANCH are appended so normal local and cockpit read with one vocabulary.
+    # Compatibility-preserving text projection (#11907, #11952): the original
+    # column run (PANE..WINDOW) keeps its order so existing parsers stay valid;
+    # VIEW_KIND / BRANCH (#11907) and ATTENTION / REASON (#11952) are appended.
     print(
         "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH"
+        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON"
     )
     for c in candidates:
         lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
+        attention = _attention_for_candidate(c, observed_at)
         print(
             "\t".join(
                 [
@@ -325,6 +408,8 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     c.window_name or "-",
                     c.view_kind,
                     c.branch or "-",
+                    attention.attention_state,
+                    attention.reason_code,
                 ]
             )
         )

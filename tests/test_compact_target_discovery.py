@@ -274,5 +274,136 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         self.assertNotIn("%9\t", out)
 
 
+class AgentsTargetsAttentionTest(unittest.TestCase):
+    """Additive attention projection in `agents targets` (Redmine #11952).
+
+    Pins that attention is additive (existing text columns / JSON keys stay),
+    that the conservative pre-wiring default is `healthy` (reason
+    `no_attention_source`) / `unknown` — never a fabricated owner/review signal —
+    and the non-routing boundary.
+    """
+
+    def _run(self, panes, *, as_json=False):
+        from mozyo_bridge.application import commands
+
+        canon = argparse.Namespace(name="mozyo-bridge", workspace_id="wsA")
+        args = argparse.Namespace(session=None, agent=None, as_json=as_json)
+        with patch.object(commands, "require_tmux"), \
+            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root",
+                  return_value="/work/repo"), \
+            patch.object(commands, "resolve_canonical_session", return_value=canon), \
+            patch.object(commands, "_probe_checkout_facts",
+                         return_value={"branch": "main"}), \
+            contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = commands.cmd_agents_targets(args)
+        return rc, out.getvalue()
+
+    def test_text_appends_attention_columns_with_healthy_default(self) -> None:
+        rc, out = self._run([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="claude"),
+        ])
+        self.assertEqual(0, rc)
+        # Header keeps the prior columns and appends ATTENTION / REASON.
+        self.assertIn("\tVIEW_KIND\tBRANCH\tATTENTION\tREASON", out)
+        # A cleanly-identified pane with no wired source derives healthy.
+        self.assertIn("\thealthy\tno_attention_source", out)
+
+    def test_json_adds_additive_attention_record(self) -> None:
+        rc, out = self._run([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="claude"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        c = json.loads(out)[0]
+        # Existing nested TargetRecord keys remain stable (additive only).
+        self.assertEqual("claude", c["identity"]["role"])
+        self.assertEqual("%9", c["runtime"]["pane_id"])
+        # New additive attention record.
+        att = c["attention"]
+        self.assertEqual("healthy", att["attention_state"])
+        self.assertEqual("no_attention_source", att["reason_code"])
+        self.assertEqual("tmux:local:%9", att["target_key"])
+        self.assertEqual("unit:local:wsA:default", att["unit_id"])
+        self.assertIn("severity", att)
+        self.assertIn("observed_at", att)
+
+    def test_json_attention_never_fabricates_owner_or_review(self) -> None:
+        # Conservative: with no durable source connected, no target may show an
+        # owner/review/blocked/stalled state.
+        rc, out = self._run([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="claude"),
+            _pane("%10", "mozyo-cockpit:0.3", window_name="codex",
+                  agent_role="codex"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        states = {c["attention"]["attention_state"] for c in json.loads(out)}
+        self.assertTrue(states <= {"healthy", "unknown"}, states)
+
+
+class AttentionForCandidateHelperTest(unittest.TestCase):
+    """Conservative extraction mapping for one target (Redmine #11952)."""
+
+    def _candidate(self, **over):
+        from mozyo_bridge.domain.agent_discovery import TargetCandidate
+
+        base = dict(
+            pane_id="%9",
+            role="claude",
+            role_source="pane_option",
+            confidence="strong",
+            ambiguous=False,
+            session="mozyo-cockpit",
+            window_name="codex",
+            window_index="0",
+            pane_index="1",
+            active=True,
+            workspace_id="wsA",
+            workspace_label="mozyo-bridge",
+            lane_id="default",
+            lane_label=None,
+            repo_short="repo",
+            repo_root="/work/repo",
+            cwd="/work/repo",
+            host="local",
+            view_kind="cockpit_pane",
+            branch="main",
+        )
+        base.update(over)
+        return TargetCandidate(**base)
+
+    def _attention(self, candidate):
+        from mozyo_bridge.application.commands import _attention_for_candidate
+
+        return _attention_for_candidate(candidate, "2026-06-15T00:00:00Z")
+
+    def test_clean_candidate_is_healthy_no_source(self) -> None:
+        rec = self._attention(self._candidate())
+        self.assertEqual("healthy", rec.attention_state)
+        self.assertEqual("no_attention_source", rec.reason_code)
+        self.assertEqual("tmux:local:%9", rec.target_key)
+
+    def test_ambiguous_candidate_is_unknown(self) -> None:
+        rec = self._attention(self._candidate(ambiguous=True))
+        self.assertEqual("unknown", rec.attention_state)
+        self.assertEqual("contradictory_sources", rec.reason_code)
+
+    def test_weak_identity_is_unknown_not_healthy(self) -> None:
+        rec = self._attention(
+            self._candidate(role_source="unknown", confidence="none")
+        )
+        self.assertEqual("unknown", rec.attention_state)
+        self.assertEqual("source_unreadable", rec.reason_code)
+
+    def test_helper_never_emits_active_attention_signal(self) -> None:
+        # No durable source: the only possible derived states are healthy/unknown.
+        for over in ({}, {"ambiguous": True}, {"confidence": "none",
+                                               "role_source": "unknown"}):
+            rec = self._attention(self._candidate(**over))
+            self.assertIn(rec.attention_state, {"healthy", "unknown"})
+
+
 if __name__ == "__main__":
     unittest.main()
