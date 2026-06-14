@@ -209,6 +209,29 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
         self.assertEqual("wsX", obs[0].workspace_id)
         self.assertEqual("codex", obs[0].role)
 
+    def test_unregistered_workspace_uses_canonical_session_not_raw_path(self) -> None:
+        # Redmine #11897 review j#57857 (major): an unregistered workspace has
+        # `workspace_id=None`; the projection must fall back to the privacy-safe
+        # `canonical_session` (matching `cmd_cockpit`'s `canon.name`), never the
+        # raw repo_root — else detection silently fails and a raw path leaks.
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.session_inventory import WorkspaceIdentity
+
+        rec = self._record(
+            repo_root="/workspace/project-alpha",
+            workspace=WorkspaceIdentity(
+                workspace_id=None,
+                canonical_session="mozyo-project-alpha-abcdef",
+                project_name=None,
+                source="derivation",
+            ),
+        )
+        with self._inventory([rec]):
+            obs = commands._coexisting_normal_observations("mozyo-cockpit")
+        self.assertEqual(1, len(obs))
+        self.assertEqual("mozyo-project-alpha-abcdef", obs[0].workspace_id)
+        self.assertNotIn("/workspace", obs[0].workspace_id)
+
     def test_drops_cockpit_pane_by_role_source(self) -> None:
         # Cockpit panes carry the role on `@mozyo_agent_role`
         # (role_source=pane_option); they are not a normal-session adopt source.

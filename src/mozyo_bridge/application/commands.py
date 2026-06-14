@@ -1406,8 +1406,18 @@ def _coexisting_normal_observations(cockpit_session: str):
             continue
         if rec.role_source != ROLE_SOURCE_WINDOW_NAME:
             continue
+        # Mirror the target's identity fallback EXACTLY (Redmine #11897 review
+        # j#57857): `cmd_cockpit` uses `canon.workspace_id or canon.name`, where
+        # `canon.name` is the registry→anchor→derivation canonical session. The
+        # inventory resolves identity through the *same* chain, so an unregistered
+        # workspace (no registry row / anchor) has `workspace_id=None` but a
+        # matching `canonical_session`. Falling back to the raw `repo_root` here
+        # instead would never match that `canon.name` (detection silently fails)
+        # and would also leak an absolute path as the match key. Prefer the
+        # privacy-safe `canonical_session`; repo_root/session are last-resort only.
         workspace_id = (
             (rec.workspace.workspace_id if rec.workspace else None)
+            or (rec.workspace.canonical_session if rec.workspace else None)
             or rec.repo_root
             or rec.session
         )
