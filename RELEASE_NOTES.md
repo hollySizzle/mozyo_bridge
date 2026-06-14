@@ -6,7 +6,47 @@
 
 ## Unreleased
 
-次の release に向けた変更をここに追記します。
+次の release 候補 — Version #218 `v0.7.1 cockpit dogfooding stabilization`。
+
+この期間の主題は、v0.7.0 で建てた **workspace 横断 session 基盤 / ユニット状態コックピット** を実運用(dogfooding)で **安定化**することです。registry-aware な identity 解決の完成、cockpit サブレーン運用の primitive 強化と運用 runbook の整備、scaffold 配布物の最小化方針の固定が中心です。いずれも additive / 後方互換で、既存 CLI の JSON / text 出力互換は壊していません。version 決定 / tag / publish はこのメモでは行わず、別 gate と owner 承認のもとで実施します。
+
+### registry-aware identity の完成
+
+- `doctor` を registry / anchor / runtime の整合性診断へ拡張しました。home registry の有無・schema・readability、workspace 登録状態、anchor との不一致、`last_seen` と tmux runtime の関係を read-only で診断します。(#11426)
+- smart `init` を registry-aware にしました。未登録 workspace は guarded adoption の中で登録し、既登録 workspace は registry の canonical session を再利用し、`@mozyo_agent_role` pane option で role bind を安定化します。fail-closed 順序(preflight 後・tmux/vscode mutation 前に登録)を維持します。(#11427)
+
+### unit target model / TargetRecord projection
+
+- unit target model を設計 doc 化し、design gate を明確化しました。(#11906)
+- `agents targets` を TargetRecord canonical projection へ拡張しました。(#11907)
+- handoff の explicit-pane preflight を同じ TargetRecord projection 経由に統一しました。(#11908)
+- unit presentation state の DB 境界を doc 化しました。(#11909)
+
+### workspace anchor / project-defaults rename 互換
+
+- workspace anchor の project-defaults rename について migration を doc 化しました。(#11910)
+- rename の後方互換を実装し、現行 path を壊さずに移行できるようにしました。(#11921)
+- active docs / install text で `project-defaults.yaml` を primary 名として明記しました。(#11921)
+
+### 配布物最小化 / worktree 境界 / 運用 runbook の方針固定
+
+- scaffold 配布物を 4 分類し、home registry + thin anchor 中心の最小化目標像・移行/後方互換境界を方針正本化しました。(#11428)
+- git worktree lifecycle を mozyo-bridge core ではなく skill / runbook / operator recipe で扱う責務境界を固定しました(core は identity / discovery / safety primitive に限定)。(#11889)
+- 他プロジェクトでも再現できる portable な sublane / worktree 運用 runbook を整備しました。(#11929)
+- local-only catalog overlay(`catalog.local.yaml`)の governance を配布しました。(#11922)
+
+### cockpit 運用 docs
+
+- cross-project cockpit smoke runbook を整備しました。(#11911)
+- local / remote cockpit host 境界を doc 化しました。(#11817)
+
+### リリース準備メモ(release gate 用)
+
+本 Unreleased 期間を Version #218 `v0.7.1 cockpit dogfooding stabilization` の release 候補として整理します。version 決定 / tag / publish はこのメモでは行わず、別 gate と owner 承認のもとで実施します。
+
+- **変更概要**: registry-aware identity の完成(#11426 / #11427)、unit target model / TargetRecord projection(#11906 / #11907 / #11908 / #11909)、workspace anchor / project-defaults rename 互換(#11910 / #11921)、配布物最小化・worktree 境界・portable runbook の方針固定(#11428 / #11889 / #11929 / #11922)、cockpit 運用 docs(#11911 / #11817)。いずれも additive で、破壊的 CLI rename を含みません。
+- **version 候補の考え方**: v0.7.0 cockpit ラインの stabilization + additive であり、破壊的変更を含まないため、Version 名(#218 `v0.7.1`)どおり `0.7.0` からの **patch(0.7.1)** が妥当な目安です。最終的な version 決定は owner 判断とします。
+- **release gate の実行手順**: 実際の検証・配布手順は `skills/mozyo-bridge-agent/references/release.md` の Standard Verification / Release Flow / Release Artifact Guardrails / Distribution Gates / Trusted Publishing を正本とします。version bump は standalone commit とし、`main` push → GitHub Actions `Test` 成功確認 → TestPyPI → `pipx` install 検証 → owner 判断で production PyPI、の順で進めます。本メモはこの gate の入口を明確化するもので、本 issue では gate を実行しません。
 
 ## v0.7.0 - 2026-06-12
 
