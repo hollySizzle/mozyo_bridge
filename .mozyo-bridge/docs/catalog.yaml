@@ -357,6 +357,21 @@ documents:
     related_document_refs:
       - logic-cockpit-sublane-operating-model
       - logic-scaffold-distribution-minimization
+      - logic-sublane-worktree-operating-runbook
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-sublane-worktree-operating-runbook
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/sublane-worktree-operating-runbook.md
+    purpose: sublane / worktree 運用を他プロジェクトで再現する時系列順 portable runbook (prereq / mapping / lane 作成 / gateway dispatch / sublane 実装境界 / coordinator callback・owner approval 集約 / review・merge・push・CI・retirement / known friction)。規約本文は既存正本へリンクする sequenced spine。
+    audit_role: sublane_worktree_operating_runbook_logic
+    related_document_refs:
+      - logic-cockpit-sublane-operating-model
+      - logic-worktree-lifecycle-boundary
+      - logic-workspace-registry
+      - skill-workflow-reference
       - rule-public-private-boundary
       - spec-project-map
 
