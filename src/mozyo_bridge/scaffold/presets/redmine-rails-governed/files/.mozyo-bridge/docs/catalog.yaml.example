@@ -5,6 +5,17 @@
 # All `documents[].canonical_path` entries must resolve to real files in
 # the repo; the validator (`mozyo-bridge docs validate`) will reject
 # dangling canonical paths.
+#
+# Local-only overlay (optional): a git-ignored
+# `.mozyo-bridge/docs/catalog.local.yaml` may sit next to this file to
+# carry checkout-local docs/rules whose paths must stay out of this
+# public, tracked catalog. `mozyo-bridge docs resolve` /
+# `docs audit-impact` merge the overlay when present (pass `--no-local`
+# for the public-only view); `docs validate` /
+# `docs generate-file-conventions` never read it, so the generated
+# public artifacts never carry overlay entries. The overlay adds new
+# ids only and is rejected if it carries secret-shaped values. See the
+# docs_catalog_governance rule for the full boundary.
 
 schema_version: 1
 managed_types:

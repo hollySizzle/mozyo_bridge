@@ -72,6 +72,8 @@ categories:
 | `.mozyo-bridge/rules/docs_catalog_governance.yaml` | scaffold (governed) | C | governed opt-in。catalog 運用 project のみ必要 |
 | `.mozyo-bridge/docs/catalog.yaml` | operator (`.example` から複製) | C (operator-owned) | active-doc map。operator 正本。scaffold は `.example` のみ配り本体に触れない |
 | `.mozyo-bridge/docs/catalog.yaml.example` | scaffold (governed) | C / skeleton | governed opt-in の skeleton。framework-neutral を維持 |
+| `.mozyo-bridge/docs/.gitignore` | scaffold (governed) | C | governed opt-in。local-only overlay (`catalog.local.yaml`) を git-ignore する catalog skeleton 付随ファイル |
+| `.mozyo-bridge/docs/catalog.local.yaml` (overlay) | operator (local-only) | C (operator-owned) | optional。checkout-local docs を catalog 解決へ足す git-ignored overlay。配布物ではなく operator が必要な checkout だけに置く ([[rule-public-private-boundary]]) |
 | `.mozyo-bridge/docs/file_conventions.generated.yaml` | `docs generate-file-conventions` | D | 生成物。正本にしない。catalog から再生成 |
 | `.mozyo-bridge/tmux/agent-ui.conf` | scaffold (governed) | C | governed opt-in の tmux UI snippet。host wiring は別途 opt-in |
 | `.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example` | scaffold (governed) | C | governed opt-in の nagger skeleton。`config.yaml` 本体は operator が複製するまで無効 |

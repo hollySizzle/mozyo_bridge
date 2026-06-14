@@ -1,0 +1,6 @@
+# Local-only docs catalog overlay. The public `catalog.yaml` stays free
+# of private paths; this git-ignored overlay carries checkout-local docs
+# that `mozyo-bridge docs resolve` / `docs audit-impact` merge when
+# present. Never commit it. See `docs_catalog_governance.yaml` for the
+# full public/private boundary.
+catalog.local.yaml

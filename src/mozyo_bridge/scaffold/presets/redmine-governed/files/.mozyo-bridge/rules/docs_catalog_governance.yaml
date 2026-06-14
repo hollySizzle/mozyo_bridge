@@ -114,10 +114,35 @@ tooling:
   - audit-doc-impact の成功だけを docs 本文確認の代替にしない。
   - file_conventions に過剰な docs を紐づけ、agent が実際に読めないノイズを増やさない。
   - canonical_path に存在しないファイルを active 状態で残さない。
+  - local overlay の値 (private path 等) を public tracked file / ticket journal へ転記しない。
+  - local overlay を public catalog / generated file conventions に取り込まない。
+
+ローカルオーバーレイ:
+  要約: >
+    `.mozyo-bridge/docs/catalog.local.yaml` は checkout-local な docs / rules を
+    catalog 解決へ足すための optional な local-only overlay。public catalog に
+    private path を書かずに、その checkout だけで local docs を resolver から
+    発見できるようにするための仕組み。
+  境界:
+    - overlay file は git-ignored の local-only artifact として扱い、tracked にしない。
+    - public `catalog.yaml` と generated file_conventions は overlay を一切含まない。
+    - overlay は新規 id の additive merge のみ。public id との衝突は reject する。
+  解決:
+    - "`mozyo-bridge docs resolve` / `mozyo-bridge docs audit-impact` は overlay が存在する時だけ public catalog に additive merge して解決する。"
+    - public-only view (fresh clone / CI / PyPI consumer 相当) が必要な場合は `--no-local` を付ける。
+    - "`mozyo-bridge docs validate` / `mozyo-bridge docs generate-file-conventions` は overlay を一切読まない (separation guard)。generated 物に overlay data は混入しない。"
+    - overlay 構造を検証する場合は `mozyo-bridge docs validate --include-local` を使う (overlay 不在では no-op)。
+  ガード:
+    - secret-shaped value (credential-named key / 既知 token prefix / PEM block) は fail-closed で拒否する。報告は location のみで、値は出力しない。
+  配布:
+    - fresh clone / CI / PyPI consumer は overlay 不在でも全 docs command が正常に動く。
+    - governed scaffold は overlay を git-ignore する `.mozyo-bridge/docs/.gitignore` を同梱する。
 
 関連ファイル:
   catalog: .mozyo-bridge/docs/catalog.yaml
   catalog_example: .mozyo-bridge/docs/catalog.yaml.example
+  overlay: .mozyo-bridge/docs/catalog.local.yaml
+  overlay_gitignore: .mozyo-bridge/docs/.gitignore
   validator: mozyo-bridge docs validate
   generator: mozyo-bridge docs generate-file-conventions
   resolver: mozyo-bridge docs resolve

@@ -1922,6 +1922,73 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertIn("tracked files:", output)
             self.assertNotIn("router files:", output)
 
+    def test_governed_scaffold_distributes_local_overlay_governance(self) -> None:
+        """Governed presets must ship the local-only overlay boundary.
+
+        The package primitive (`catalog.local.yaml` overlay) is useless to
+        consumers unless the governed scaffold tells them the overlay is a
+        git-ignored local-only artifact and keeps it out of the public
+        catalog / generated conventions. Assert the distribution surfaces —
+        a `.mozyo-bridge/docs/.gitignore`, the catalog skeleton comment, and
+        the docs_catalog_governance rule — for both governed presets, and
+        that the overlay file itself is never a tracked, shipped artifact.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    # The overlay is git-ignored by a shipped, tracked
+                    # `.mozyo-bridge/docs/.gitignore`.
+                    docs_gitignore = project / ".mozyo-bridge/docs/.gitignore"
+                    self.assertTrue(docs_gitignore.exists())
+                    gitignore_text = docs_gitignore.read_text(encoding="utf-8")
+                    self.assertIn("catalog.local.yaml", gitignore_text)
+
+                    state = scaffold_state(project)
+                    assert state is not None
+                    tracked = set(state["files"].keys())
+                    self.assertIn(".mozyo-bridge/docs/.gitignore", tracked)
+                    # The overlay body itself is operator-owned local-only
+                    # state; the scaffold never ships or tracks it.
+                    self.assertNotIn(
+                        ".mozyo-bridge/docs/catalog.local.yaml", tracked
+                    )
+                    self.assertFalse(
+                        (project / ".mozyo-bridge/docs/catalog.local.yaml").exists()
+                    )
+
+                    # The catalog skeleton documents the overlay boundary.
+                    example = (
+                        project / ".mozyo-bridge/docs/catalog.yaml.example"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn("catalog.local.yaml", example)
+                    self.assertIn("--no-local", example)
+
+                    # The governance rule records the public/private
+                    # separation and the secret-shaped fail-closed guard.
+                    governance = (
+                        project / ".mozyo-bridge/rules/docs_catalog_governance.yaml"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn("catalog.local.yaml", governance)
+                    self.assertIn("separation guard", governance)
+                    self.assertIn("fail-closed", governance)
+
     def test_docs_validate_coverage_roots_precedence(self) -> None:
         """coverage_roots: CLI overrides catalog overrides default.
 

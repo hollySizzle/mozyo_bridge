@@ -12,11 +12,14 @@
     ".claude-nagger/mcp_conventions.yaml.example": {
       "sha256": "75d559e0fcdf0e4828ac9c02e70dacef250538eb685d40409118b77d2f8383e3"
     },
+    ".mozyo-bridge/docs/.gitignore": {
+      "sha256": "38edde4e2283c39daf25d10207a7899b6e8b4d8a9d98d15dc39ec1046c28210b"
+    },
     ".mozyo-bridge/docs/catalog.yaml.example": {
-      "sha256": "37b5bb52d7bd3cb9563594d3581f34344726978dcf751a617bd8119b366be627"
+      "sha256": "fb9f27225bcd112e4149b387c4df0036ad31cf7b39c7b2d79fda9b6c4674edaf"
     },
     ".mozyo-bridge/rules/docs_catalog_governance.yaml": {
-      "sha256": "bff203f1b11dc46888b584cddaa48968302f2ef2bccae96c91b8abd4d3c9eb9d"
+      "sha256": "824e48bc8aca095e2221fc1402bb4deb9b497219bfba600343c5fff57318b3b6"
     },
     ".mozyo-bridge/rules/llm_rule_authoring.md": {
       "sha256": "02b22f058d41dd5bbeca0faeb2eba289623a0bfebf5d784cf5f099ff8e2cafde"
@@ -25,17 +28,17 @@
       "sha256": "028bdeffc815964030e341ec587d0c140a3b48bd625917e02a6fe143781c4506"
     },
     "AGENTS.md": {
-      "sha256": "fcaa64b6b6ba90c199a8d90ae2666d501b3de9c08645289d22e234570ec00e41"
+      "sha256": "eb6e5929ee158799f126ff1e1c288e885318d2c0d917f65c79ce9ffc845f3e74"
     },
     "CLAUDE.md": {
       "sha256": "3a2cd3ee11ea5bef470987bf8e10c9e55633920e0bb030271d5f4007e10cf381"
     }
   },
-  "generated_by": "mozyo-bridge 0.6.2",
+  "generated_by": "mozyo-bridge 0.7.0",
   "mode": "repo-local",
   "preset": "redmine-governed",
   "preset_hash": "698ca3920a9a8bb2d3ceff244c471a14bfe23dd6ada7e2776b49ec813bc91f00",
-  "preset_version": "2026.06.11.2",
+  "preset_version": "2026.06.14.1",
   "rule_path": ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
   "schema_version": 2
 }

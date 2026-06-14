@@ -185,6 +185,7 @@ Responsibilities:
   - `.mozyo-bridge/rules/llm_rule_authoring.md`
   - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
   - `.mozyo-bridge/docs/catalog.yaml.example`
+  - `.mozyo-bridge/docs/.gitignore`
   - `.mozyo-bridge/tmux/agent-ui.conf`
   - `.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example`
   - `.claude-nagger/.gitignore`
@@ -218,6 +219,7 @@ Responsibilities:
   - `.mozyo-bridge/rules/llm_rule_authoring.md`
   - `.mozyo-bridge/rules/docs_catalog_governance.yaml`
   - `.mozyo-bridge/docs/catalog.yaml.example`
+  - `.mozyo-bridge/docs/.gitignore`
   - `.mozyo-bridge/tmux/agent-ui.conf`
   - `.claude-nagger/{config,command_conventions,mcp_conventions}.yaml.example`
   - `.claude-nagger/.gitignore`

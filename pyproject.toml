@@ -69,6 +69,7 @@ mozyo_bridge = [
     "scaffold/presets/*/files/.mozyo-bridge/**/*",
     "scaffold/presets/*/files/.mozyo-bridge/rules/*",
     "scaffold/presets/*/files/.mozyo-bridge/docs/*",
+    "scaffold/presets/*/files/.mozyo-bridge/docs/.gitignore",
     "scaffold/presets/*/files/.mozyo-bridge/tmux/*",
     "scaffold/presets/*/files/.claude-nagger/**/*",
     "scaffold/presets/*/files/.claude-nagger/*",
