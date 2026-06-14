@@ -99,6 +99,20 @@ class AssessCockpitResetTest(unittest.TestCase):
         self.assertIsNone(target.blocked_reason)
         self.assertEqual(2, len(target.managed_panes))
 
+    def test_managed_fails_closed_when_client_state_unknown(self) -> None:
+        # The client read failed (could not be queried). An *unknown* client
+        # state must fail closed for a destructive teardown — never treated as
+        # "no client attached" (#11814 review j#57928).
+        target = assess_cockpit_reset(
+            session="mozyo-cockpit", session_present=True,
+            columns=_managed_columns(), attached_clients=(),
+            attached_clients_known=False,
+        )
+        self.assertEqual(COCKPIT_RESET_MANAGED, target.status)
+        self.assertTrue(target.mozyo_identified)  # identity confirmed...
+        self.assertFalse(target.resettable)  # ...but unknown client state blocks
+        self.assertIn("unknown", target.blocked_reason)
+
     def test_managed_fails_closed_when_client_attached(self) -> None:
         target = assess_cockpit_reset(
             session="mozyo-cockpit", session_present=True,
@@ -190,6 +204,41 @@ class ExecuteResetPlanTest(unittest.TestCase):
             self._execute(run)
 
 
+class SessionAttachedClientsResultTest(unittest.TestCase):
+    """`_session_attached_clients_result` separates "no client" from "unreadable"."""
+
+    def _call(self, run):
+        from mozyo_bridge.application import commands
+
+        with patch.object(commands, "run_tmux", side_effect=run):
+            return commands._session_attached_clients_result("mozyo-cockpit")
+
+    def test_success_empty_is_known(self) -> None:
+        clients, known = self._call(lambda *a, **k: FakeResult(0, stdout=""))
+        self.assertEqual((), clients)
+        self.assertTrue(known)
+
+    def test_success_with_clients_is_known(self) -> None:
+        clients, known = self._call(
+            lambda *a, **k: FakeResult(0, stdout="/dev/ttys003\n/dev/ttys004\n")
+        )
+        self.assertEqual(("/dev/ttys003", "/dev/ttys004"), clients)
+        self.assertTrue(known)
+
+    def test_nonzero_is_unknown(self) -> None:
+        clients, known = self._call(lambda *a, **k: FakeResult(1, stderr="boom"))
+        self.assertEqual((), clients)
+        self.assertFalse(known)
+
+    def test_exception_is_unknown(self) -> None:
+        def boom(*a, **k):
+            raise RuntimeError("no server")
+
+        clients, known = self._call(boom)
+        self.assertEqual((), clients)
+        self.assertFalse(known)
+
+
 class CockpitResetCommandTest(unittest.TestCase):
     """`mozyo cockpit reset` / `rebuild` — preview vs confirm-gated teardown (#11814)."""
 
@@ -203,8 +252,8 @@ class CockpitResetCommandTest(unittest.TestCase):
         return argparse.Namespace(**base)
 
     @contextlib.contextmanager
-    def _patched(self, *, columns, attached=(), windows=("cockpit",),
-                 session_present=True, run=None):
+    def _patched(self, *, columns, attached=(), clients_known=True,
+                 windows=("cockpit",), session_present=True, run=None):
         from mozyo_bridge.application import commands
         from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
 
@@ -217,7 +266,8 @@ class CockpitResetCommandTest(unittest.TestCase):
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
             patch.object(commands, "_cockpit_session_present",
                          return_value=session_present), \
-            patch.object(commands, "_session_attached_clients", return_value=attached), \
+            patch.object(commands, "_session_attached_clients_result",
+                         return_value=(attached, clients_known)), \
             patch.object(commands, "list_session_windows", return_value=list(windows)), \
             patch.object(commands, "_agent_launch_command", return_value="launch"), \
             patch.object(commands, "run_tmux", side_effect=run), \
@@ -267,6 +317,26 @@ class CockpitResetCommandTest(unittest.TestCase):
         )
         self.assertEqual(2, rc)
         self.assertNotIn("kill-session", [c[0] for c in run.calls if c])
+
+    def test_confirm_fails_closed_when_client_state_unreadable(self) -> None:
+        # tmux list-clients could not be read -> unknown client state -> the
+        # destructive confirm path must NOT kill-session (#11814 review j#57928).
+        rc, out, _rt, run, _ev = self._run(
+            self._args(confirm=True), columns=_managed_columns(),
+            attached=(), clients_known=False,
+        )
+        self.assertEqual(2, rc)  # die()
+        self.assertNotIn("kill-session", [c[0] for c in run.calls if c])
+
+    def test_rebuild_confirm_fails_closed_when_client_state_unreadable(self) -> None:
+        rc, out, _rt, run, execvp = self._run(
+            self._args(action="rebuild", confirm=True),
+            columns=_managed_columns(), attached=(), clients_known=False,
+        )
+        self.assertEqual(2, rc)
+        self.assertNotIn("kill-session", [c[0] for c in run.calls if c])
+        self.assertNotIn("new-session", [c[0] for c in run.calls if c])
+        execvp.assert_not_called()
 
     # --- confirmed teardown of a proven-managed cockpit ----------------------
 

@@ -1383,29 +1383,46 @@ def _cockpit_session_present(session: str) -> bool:
         return False
 
 
+def _session_attached_clients_result(session: str) -> tuple[tuple[str, ...], bool]:
+    """``(clients, known)`` for ``session`` — distinguishes "no client" from "could not read".
+
+    ``known`` is ``False`` when the tmux ``list-clients`` read failed (exception
+    or non-zero exit), so a caller can fail closed on an *unknown* client state
+    instead of mistaking it for "no client attached". The destructive cockpit
+    reset/rebuild gate needs that distinction (Redmine #11814 review j#57928);
+    adopt's tolerant :func:`_session_attached_clients` keeps the old "any error ->
+    no client" shape, which is safe there because a failed read on a source
+    session that may not even exist means there is no live client to protect.
+    """
+    if not session:
+        return (), True
+    try:
+        result = run_tmux(
+            "list-clients", "-t", session, "-F", "#{client_tty}", check=False
+        )
+    except (Exception, SystemExit):
+        return (), False
+    if getattr(result, "returncode", 1) != 0:
+        return (), False
+    clients = tuple(
+        line.strip()
+        for line in (getattr(result, "stdout", "") or "").splitlines()
+        if line.strip()
+    )
+    return clients, True
+
+
 def _session_attached_clients(session: str) -> tuple[str, ...]:
     """tty names of clients attached to ``session`` (Redmine #11898, tolerant).
 
     Adopt fails closed when the source normal session has an attached client:
     moving its panes out from under a live client is disruptive (the client may
     be left blank or the session torn down beneath it). Any tmux error degrades
-    to ``()`` — there is no client to protect when tmux can't be queried.
+    to ``()`` — there is no client to protect when tmux can't be queried. When the
+    success/failure distinction matters (destructive reset/rebuild), use
+    :func:`_session_attached_clients_result` instead.
     """
-    if not session:
-        return ()
-    try:
-        result = run_tmux(
-            "list-clients", "-t", session, "-F", "#{client_tty}", check=False
-        )
-    except (Exception, SystemExit):
-        return ()
-    if getattr(result, "returncode", 1) != 0:
-        return ()
-    return tuple(
-        line.strip()
-        for line in (getattr(result, "stdout", "") or "").splitlines()
-        if line.strip()
-    )
+    return _session_attached_clients_result(session)[0]
 
 
 def _source_session_cleanup_note(source_session: str) -> str:
@@ -1817,19 +1834,25 @@ def _assess_cockpit_reset(session, *, columns, session_present):
     Thin application wrapper over the pure :func:`assess_cockpit_reset`: it reads
     the *extra* runtime facts the grade needs (attached clients + the session's
     window list) and hands them, with the already-read ``columns`` /
-    ``session_present``, to the domain grader. Read-only and tolerant — the
-    client / window reads degrade to empty on any tmux error, never raising, so a
-    bare `cockpit reset` preview cannot break.
+    ``session_present``, to the domain grader. Read-only and tolerant — it never
+    raises, so a bare `cockpit reset` preview cannot break. Crucially it carries
+    the client read's *success* through ``attached_clients_known``: a failed read
+    is fail-closed (unknown client state), never silently "no client attached"
+    (Redmine #11814 review j#57928).
     """
     from mozyo_bridge.domain.cockpit_layout import assess_cockpit_reset
 
-    clients = _session_attached_clients(session) if session_present else ()
-    windows = tuple(list_session_windows(session)) if session_present else ()
+    if session_present:
+        clients, clients_known = _session_attached_clients_result(session)
+        windows = tuple(list_session_windows(session))
+    else:
+        clients, clients_known, windows = (), True, ()
     return assess_cockpit_reset(
         session=session,
         session_present=session_present,
         columns=columns,
         attached_clients=clients,
+        attached_clients_known=clients_known,
         windows=windows,
     )
 

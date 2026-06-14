@@ -1032,12 +1032,16 @@ class CockpitResetTarget:
     """The graded reset target — what a reset/rebuild may (or may not) tear down (#11814).
 
     ``status`` is one of the ``COCKPIT_RESET_*`` grades. Only :data:`COCKPIT_RESET_MANAGED`
-    with no attached client is :pyattr:`resettable`; every other state
-    (``foreign`` / ``unmanaged`` / an attached managed cockpit) carries a
-    ``blocked_reason`` and is left untouched (fail-closed). ``absent`` is a benign
-    no-op (nothing to reset), not a block. ``windows`` / ``managed_panes`` /
-    ``unmanaged_panes`` / ``attached_clients`` are the inventory the preview shows
-    so the operator sees exactly what a confirmed kill would destroy.
+    with a **known-empty** attached-client set is :pyattr:`resettable`; every other
+    state (``foreign`` / ``unmanaged`` / an attached managed cockpit / a managed
+    cockpit whose client state could not be read) carries a ``blocked_reason`` and
+    is left untouched (fail-closed). ``absent`` is a benign no-op (nothing to
+    reset), not a block. ``attached_clients_known`` is ``False`` when the client
+    read failed — an *unknown* client state is fail-closed for a destructive
+    teardown, never treated as "no client attached" (Redmine #11814 review j#57928).
+    ``windows`` / ``managed_panes`` / ``unmanaged_panes`` / ``attached_clients``
+    are the inventory the preview shows so the operator sees exactly what a
+    confirmed kill would destroy.
     """
 
     session: str
@@ -1048,6 +1052,7 @@ class CockpitResetTarget:
     managed_panes: tuple[CockpitPaneIdentity, ...]
     unmanaged_panes: tuple[CockpitPaneIdentity, ...]
     attached_clients: tuple[str, ...]
+    attached_clients_known: bool
     blocked_reason: Optional[str]
 
     @property
@@ -1057,8 +1062,13 @@ class CockpitResetTarget:
 
     @property
     def resettable(self) -> bool:
-        """Safe to run the destructive teardown: mozyo-identified and not attached."""
-        return self.status == COCKPIT_RESET_MANAGED and not self.attached_clients
+        """Safe to run the destructive teardown: mozyo-identified, with a
+        known-empty client set (an unreadable client state is fail-closed)."""
+        return (
+            self.status == COCKPIT_RESET_MANAGED
+            and self.attached_clients_known
+            and not self.attached_clients
+        )
 
     @property
     def absent(self) -> bool:
@@ -1076,6 +1086,7 @@ class CockpitResetTarget:
             "managed_panes": [p.as_dict() for p in self.managed_panes],
             "unmanaged_panes": [p.as_dict() for p in self.unmanaged_panes],
             "attached_clients": list(self.attached_clients),
+            "attached_clients_known": self.attached_clients_known,
             "blocked_reason": self.blocked_reason,
         }
 
@@ -1086,6 +1097,7 @@ def assess_cockpit_reset(
     session_present: bool,
     columns: Optional[Sequence[Mapping[str, object]]],
     attached_clients: Sequence[str] = (),
+    attached_clients_known: bool = True,
     windows: Sequence[str] = (),
 ) -> CockpitResetTarget:
     """Grade a cockpit session for reset/rebuild from a runtime snapshot (#11814, pure).
@@ -1102,8 +1114,12 @@ def assess_cockpit_reset(
     - a cockpit window with **no** marker-carrying pane is :data:`COCKPIT_RESET_UNMANAGED`
       and left untouched.
     - a cockpit window with at least one ``@mozyo_workspace_id`` pane is
-      :data:`COCKPIT_RESET_MANAGED`; it is resettable only when no client is attached
-      (moving the rug out from a live client is fail-closed — detach first).
+      :data:`COCKPIT_RESET_MANAGED`; it is resettable only when the client state was
+      read successfully **and** is empty. ``attached_clients_known=False`` means the
+      client read failed — an *unknown* client state is fail-closed for a destructive
+      teardown (it is never treated as "no client attached"), so a managed cockpit
+      with an unreadable client state blocks rather than killing (Redmine #11814
+      review j#57928). An attached client likewise blocks — detach first.
     """
     clients = tuple(c for c in attached_clients if c)
     wins = tuple(w for w in windows if w)
@@ -1118,11 +1134,13 @@ def assess_cockpit_reset(
                 f"stale, remove it manually with `tmux kill-session -t {session}`."
             )
             return CockpitResetTarget(
-                session, COCKPIT_RESET_FOREIGN, True, False, wins, (), (), clients, reason
+                session, COCKPIT_RESET_FOREIGN, True, False, wins, (), (),
+                clients, attached_clients_known, reason,
             )
         reason = f"no cockpit session {session!r} exists — nothing to reset."
         return CockpitResetTarget(
-            session, COCKPIT_RESET_ABSENT, False, False, wins, (), (), clients, reason
+            session, COCKPIT_RESET_ABSENT, False, False, wins, (), (),
+            clients, attached_clients_known, reason,
         )
 
     managed: list[CockpitPaneIdentity] = []
@@ -1147,11 +1165,22 @@ def assess_cockpit_reset(
         )
         return CockpitResetTarget(
             session, COCKPIT_RESET_UNMANAGED, True, True, wins,
-            (), tuple(unmanaged), clients, reason,
+            (), tuple(unmanaged), clients, attached_clients_known, reason,
         )
 
+    # Managed cockpit: the destructive gate. An *unknown* client state (the read
+    # failed) is fail-closed first — never silently treated as "no client" — then
+    # an actually-attached client blocks. Only a known-empty client set is
+    # resettable (Redmine #11814 review j#57928).
     blocked: Optional[str] = None
-    if clients:
+    if not attached_clients_known:
+        blocked = (
+            f"cannot determine whether a client is attached to cockpit session "
+            f"{session!r} (tmux `list-clients` could not be read); refusing to "
+            f"tear it down while the client state is unknown (fail-closed). Retry, "
+            f"or detach the cockpit and re-run."
+        )
+    elif clients:
         blocked = (
             f"cockpit session {session!r} has attached client(s) "
             f"({', '.join(clients)}); detach it first (close the iTerm2 -CC "
@@ -1160,7 +1189,7 @@ def assess_cockpit_reset(
         )
     return CockpitResetTarget(
         session, COCKPIT_RESET_MANAGED, True, True, wins,
-        tuple(managed), tuple(unmanaged), clients, blocked,
+        tuple(managed), tuple(unmanaged), clients, attached_clients_known, blocked,
     )
 
 
