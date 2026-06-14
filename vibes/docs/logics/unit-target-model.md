@@ -248,6 +248,9 @@ desired event history   -> managed-events.sqlite / event tables
 workflow completion     -> Redmine journal/status
 ```
 
+DB current table の To-Be 境界は `unit-presentation-state-db.md` を正本とする。
+この doc では層だけを示し、table schema を重複定義しない。
+
 ### Static file に残すもの
 
 - docs catalog

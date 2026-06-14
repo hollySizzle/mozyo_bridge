@@ -279,6 +279,21 @@ documents:
       - logic-cockpit-sublane-operating-model
       - logic-worktree-lifecycle-boundary
       - logic-managed-state-model
+      - logic-unit-presentation-state-db
+      - logic-session-inventory
+      - logic-workspace-registry
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-unit-presentation-state-db
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/unit-presentation-state-db.md
+    purpose: Unit / Target projection の desired / presentation state を tracked static file ではなく DB current table で扱う To-Be schema 境界。registry / inventory / managed-events / live tmux / Redmine の責務分担を固定する。
+    audit_role: unit_presentation_state_db_logic
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-managed-state-model
       - logic-session-inventory
       - logic-workspace-registry
       - rule-public-private-boundary
