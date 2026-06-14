@@ -51,7 +51,7 @@ from pathlib import Path
 
 import yaml
 
-from mozyo_bridge.workspace_defaults import WORKSPACE_DEFAULTS_INPUT_RELATIVE
+from mozyo_bridge.workspace_defaults import defaults_resolution
 
 API_KEY_ENV = "MOZYO_REDMINE_API_KEY"
 BASE_URL_ENV = "MOZYO_REDMINE_URL"
@@ -82,15 +82,18 @@ DEFAULT_FETCH_BUDGET = 2
 
 
 def read_redmine_project(repo_root: str | Path) -> tuple[str | None, str | None]:
-    """Best-effort ``(identifier, base_url)`` from workspace-defaults.
+    """Best-effort ``(identifier, base_url)`` from the project defaults.
 
     ``base_url`` is the scheme+host of ``redmine.default_project.url`` —
     the same host-derivation pattern as ``runtime-config install``, so no
     project-specific host is baked into distributed code. Returns
     ``(None, None)`` on any shape problem; the cockpit degrades to
-    ``unconfigured``.
+    ``unconfigured``. Reads the new ``project-defaults.yaml`` first and falls
+    back to the legacy ``workspace-defaults.yaml`` (Redmine #11920 / #11921).
     """
-    source = Path(repo_root) / WORKSPACE_DEFAULTS_INPUT_RELATIVE
+    source = defaults_resolution(Path(repo_root)).read_path
+    if source is None:
+        return None, None
     try:
         raw = yaml.safe_load(source.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):

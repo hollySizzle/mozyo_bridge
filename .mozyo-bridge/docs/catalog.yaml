@@ -552,7 +552,10 @@ file_conventions:
       - .mozyo-bridge/docs/catalog.yaml.example
       - .mozyo-bridge/docs/file_conventions.generated.yaml
       - .mozyo-bridge/scaffold.json
+      - .mozyo-bridge/project-defaults.yaml
       - .mozyo-bridge/workspace-defaults.yaml
+      - .mozyo-bridge/workspace-anchor.json
+      - .mozyo-bridge/workspace.json
       - .mozyo-bridge/redmine-defaults.md
       - .claude-nagger/**
     severity: block

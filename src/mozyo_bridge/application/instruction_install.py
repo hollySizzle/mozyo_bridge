@@ -44,8 +44,7 @@ from mozyo_bridge.application.instruction_doctor import (
 )
 from mozyo_bridge.workspace_defaults import (
     WorkspaceDefaults,
-    load_workspace_defaults,
-    resolve_input_path,
+    load_repo_defaults,
 )
 
 # The Redmine MCP RPC endpoint path. Combined with the host derived from the
@@ -193,18 +192,19 @@ def run_instruction_install(args: argparse.Namespace) -> dict[str, Any]:
         "messages": [],
     }
 
-    # Load the source of truth. `load_workspace_defaults` dies (exit 1) on a
-    # missing/invalid YAML or a credential-shape value, which is the correct
-    # fatal behavior for this command too.
-    defaults = load_workspace_defaults(resolve_input_path(target))
+    # Load the source of truth. `load_repo_defaults` dies (exit 1) on a
+    # missing/invalid YAML, a credential-shape value, or the both-name conflict
+    # (Redmine #11920 / #11921), which is the correct fatal behavior for this
+    # command too; the new project-defaults.yaml wins over the legacy name.
+    defaults = load_repo_defaults(target)
 
     if not defaults.verification.is_complete:
         result["action"] = "unverified"
         result["messages"].append(
-            "workspace-defaults verification is incomplete; refusing to "
+            "project-defaults verification is incomplete; refusing to "
             "install an unverified default project into runtime config. "
             "Set verification.verified/verification_date/verified_by in "
-            ".mozyo-bridge/workspace-defaults.yaml and re-run."
+            f".mozyo-bridge/{defaults.source_path.name} and re-run."
         )
         return result
 

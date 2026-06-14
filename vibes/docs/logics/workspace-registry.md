@@ -16,7 +16,8 @@ identity_layers:
     path: "${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite"
     role: workspace identity の正本 (workspace id / canonical path / display path / readable name / canonical session / preset version)
   workspace_anchor:
-    path: "<repo>/.mozyo-bridge/workspace.json"
+    path: "<repo>/.mozyo-bridge/workspace-anchor.json"
+    legacy_path: "<repo>/.mozyo-bridge/workspace.json"
     role: 最小復元 record。registry 喪失時に同一 identity を再登録する種
   path_derivation:
     impl: domain/session_naming.derive_session_name (Redmine #10796)
@@ -24,17 +25,18 @@ identity_layers:
 解決順序: home_registry -> workspace_anchor -> path_derivation
 ```
 
-Naming note: `workspace.json` は実態として workspace identity recovery anchor である。
-rename 方針は `workspace-anchor-project-defaults-migration.md` を正本とする。runtime
-実装が入るまでは現行 path を維持し、docs-only decision を code の事実として
-先取りしない。
+Naming note: anchor は実態として workspace identity recovery anchor である。
+Redmine #11920 / #11921 で primary 名を `workspace-anchor.json` に rename 済み。
+旧名 `workspace.json` は read-only fallback として残し、新規 write は新名のみ。
+両名が存在する状態は mutating command で fail closed / doctor red になる。rename
+方針と runtime contract の正本は `workspace-anchor-project-defaults-migration.md`。
 
 設計上の不変条件:
 
 - **tmux runtime state を DB に置かない。** live な window / pane / process 情報は tmux が正本。registry が持つ runtime 隣接 field は `last_seen` のみで、identity table (`workspaces`) から分離した cache table (`workspace_activity`) に置く。cache table を失っても identity は壊れない。
 - **読み取りは read-only / 書き込みは `register_workspace()` 経由。** `resolve_canonical_session()` (および `session name` / bare `mozyo` / `status` / smart `init` の session 解決ステップ) は registry を作らず、`last_seen` も更新せず、anchor にも書かない。registry / anchor への書き込みは `register_workspace()` のみが行い、呼び出し元は (1) 明示的な `workspace register` CLI (手動・idempotent) と (2) smart `init` (#11427) の guarded adoption (fail-closed preflight の後・tmux/vscode mutation の前に、未登録 workspace を登録) の 2 つ。`init` の session 解決自体は read-only で、登録は別の明示的 write step。
 - **anchor は path を持たない。** anchor の置き場所そのものが path であり、copy / move されても stale path を主張できない。
-- **anchor は workspace root marker である。** `shared/paths.py` の `WORKSPACE_MARKERS` に `.mozyo-bridge/workspace.json` を含め、登録済み非 git workspace の subdirectory からの root 推測が登録 root に解決されるようにする (review #54760)。`.mozyo-bridge/scaffold.json` (#11301) と同じ「workspace identity を確立する narrow marker」の扱い。
+- **anchor は workspace root marker である。** `shared/paths.py` の `WORKSPACE_MARKERS` に `.mozyo-bridge/workspace-anchor.json` (新名) と `.mozyo-bridge/workspace.json` (旧名 fallback) を含め、登録済み非 git workspace の subdirectory からの root 推測が登録 root に解決されるようにする (review #54760, rename #11920 / #11921)。`.mozyo-bridge/scaffold.json` (#11301) と同じ「workspace identity を確立する narrow marker」の扱い。
 - **特定 VS Code extension / tmux-integrated を公式 backend にしない。** 既存の `.vscode/settings.json` 連携 (#10796) は維持するが、registry の正本性はそれに依存しない。
 
 ## SQLite schema (registry v1)

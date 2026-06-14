@@ -36,9 +36,13 @@ PROJECT_MARKERS = (".git", ".tmux.conf", "pyproject.toml")
 # workspace-identity root: `mozyo-bridge workspace register` writes it exactly
 # once per workspace root, and without it a registered non-git workspace's
 # subdirectories would re-derive a different session name instead of resolving
-# the registered root.
+# the registered root. The anchor was renamed (Redmine #11920 / #11921) from
+# `workspace.json` to `workspace-anchor.json`; both names mark a workspace root
+# during the compatibility window so a registered workspace keeps resolving its
+# root whether it carries the new or the legacy anchor.
 WORKSPACE_MARKERS = (
     ".mozyo-bridge/scaffold.json",
+    ".mozyo-bridge/workspace-anchor.json",
     ".mozyo-bridge/workspace.json",
 )
 # Markers that establish a repo / workspace root for identity inference. The

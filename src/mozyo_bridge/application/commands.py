@@ -4427,7 +4427,8 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     Redmine #11427): upserts the registry
     row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
     rewrites the workspace-local anchor
-    (``<repo>/.mozyo-bridge/workspace.json``). Idempotent: re-running keeps
+    (``<repo>/.mozyo-bridge/workspace-anchor.json``; the legacy
+    ``workspace.json`` stays readable but is never written). Idempotent: re-running keeps
     the existing workspace id and canonical session name; when the home
     registry was lost, the anchor restores the same identity. The canonical
     session name is derived from the path only on first registration.
@@ -4506,7 +4507,11 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
     """
     from mozyo_bridge.domain.session_naming import derive_session_name as _derive
     from mozyo_bridge.workspace_registry import (
+        ANCHOR_LEGACY_RELATIVE,
+        ANCHOR_RELATIVE,
         anchor_path,
+        anchor_resolution,
+        legacy_anchor_path,
         load_workspace_by_path,
         read_anchor,
         registry_path,
@@ -4516,6 +4521,7 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
     repo_root = repo_root_from_args(args)
     record = load_workspace_by_path(repo_root)
     anchor = read_anchor(repo_root)
+    anchor_names = anchor_resolution(repo_root)
     derived = _derive(repo_root)
     resolved = resolve_canonical_session(repo_root)
 
@@ -4526,6 +4532,16 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
             "repo_root": str(resolved.repo_root),
             "registry_path": str(registry_path()),
             "anchor_path": str(anchor_path(resolved.repo_root)),
+            "anchor_legacy_path": str(legacy_anchor_path(resolved.repo_root)),
+            "anchor_name_state": (
+                "both"
+                if anchor_names.both_exist
+                else "legacy"
+                if anchor_names.using_legacy
+                else "new"
+                if anchor_names.new_exists
+                else "none"
+            ),
             "registered": record.as_payload() if record else None,
             "anchor": anchor,
             "derived_fallback": {
@@ -4552,13 +4568,31 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
     else:
         print(f"registry: not registered in {registry_path()}")
     if anchor:
+        anchor_loc = (
+            legacy_anchor_path(resolved.repo_root)
+            if anchor_names.using_legacy
+            else anchor_path(resolved.repo_root)
+        )
         print(
             f"anchor: {anchor['canonical_session']} "
-            f"(workspace_id {anchor['workspace_id']})"
+            f"(workspace_id {anchor['workspace_id']}) at {anchor_loc}"
         )
     else:
         print(f"anchor: none at {anchor_path(resolved.repo_root)}")
     print(f"derived fallback: {derived.name} (source: {derived.source})")
+    if anchor_names.both_exist:
+        print(
+            f"warning: both {ANCHOR_RELATIVE.as_posix()} and "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
+            f"authoritative — remove the legacy "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} (no silent merge)."
+        )
+    elif anchor_names.using_legacy:
+        print(
+            f"warning: anchor uses the legacy name "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge workspace "
+            f"register` to migrate it to {ANCHOR_RELATIVE.as_posix()}."
+        )
     if record and anchor and record.workspace_id != anchor["workspace_id"]:
         print(
             "warning: registry row and anchor disagree on workspace_id; "

@@ -40,7 +40,7 @@ from pathlib import Path
 import yaml
 
 from mozyo_bridge.shared.paths import normalize_path_unicode
-from mozyo_bridge.workspace_defaults import WORKSPACE_DEFAULTS_INPUT_RELATIVE
+from mozyo_bridge.workspace_defaults import defaults_resolution
 
 # All derived names share this prefix so mozyo-bridge sessions are a clear,
 # self-namespaced family and never collide with an arbitrary unrelated session.
@@ -112,11 +112,14 @@ def read_redmine_identifier(repo_root: Path) -> str | None:
     """Best-effort read of ``redmine.default_project.identifier``.
 
     Returns the stripped identifier when present and non-empty; ``None`` when
-    the workspace-defaults file is missing, unreadable, not a mapping, or the
-    identifier is absent / not a string. Never raises: session naming must fall
-    back rather than fail.
+    the defaults file is missing, unreadable, not a mapping, or the identifier
+    is absent / not a string. Never raises: session naming must fall back
+    rather than fail. Reads the new ``project-defaults.yaml`` first and falls
+    back to the legacy ``workspace-defaults.yaml`` (Redmine #11920 / #11921).
     """
-    source = repo_root / WORKSPACE_DEFAULTS_INPUT_RELATIVE
+    source = defaults_resolution(repo_root).read_path
+    if source is None:
+        return None
     try:
         raw = yaml.safe_load(source.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):

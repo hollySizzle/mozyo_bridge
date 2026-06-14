@@ -380,6 +380,8 @@ class WorkspaceCliTest(WorkspaceRegistryBase):
             sorted(payload),
             [
                 "anchor",
+                "anchor_legacy_path",
+                "anchor_name_state",
                 "anchor_path",
                 "derived_fallback",
                 "registered",
@@ -388,6 +390,7 @@ class WorkspaceCliTest(WorkspaceRegistryBase):
                 "resolved",
             ],
         )
+        self.assertEqual(payload["anchor_name_state"], "new")
         self.assertEqual(payload["resolved"]["source"], SOURCE_HOME_REGISTRY)
         self.assertEqual(
             payload["resolved"]["name"],

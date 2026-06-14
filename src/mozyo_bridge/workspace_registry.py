@@ -14,13 +14,17 @@ durable identity instead of a per-call computation:
   rules version. Live tmux window / pane / process state is deliberately NOT
   stored here — the only runtime-adjacent field is ``last_seen``, kept in a
   separate cache table so identity rows never carry runtime state;
-- the **workspace-local anchor** (`<repo>/.mozyo-bridge/workspace.json`) is a
-  minimal recovery record. If the home registry disappears (ephemeral home,
-  reinstall), re-running ``mozyo-bridge workspace register`` inside the
-  workspace restores the same workspace id and canonical session name from
-  the anchor. The anchor intentionally does NOT store the workspace path —
-  its on-disk location *is* the path, so a copied / moved workspace can never
-  present a stale path;
+- the **workspace-local anchor**
+  (`<repo>/.mozyo-bridge/workspace-anchor.json`, formerly
+  `.mozyo-bridge/workspace.json`) is a minimal recovery record. If the home
+  registry disappears (ephemeral home, reinstall), re-running
+  ``mozyo-bridge workspace register`` inside the workspace restores the same
+  workspace id and canonical session name from the anchor. The anchor
+  intentionally does NOT store the workspace path — its on-disk location *is*
+  the path, so a copied / moved workspace can never present a stale path. The
+  name was changed (Redmine #11920 / #11921) to say what the file is — an
+  identity recovery anchor, not the workspace's whole state; the legacy name
+  stays readable as a fallback and new writes only ever create the new name;
 - **resolution order** for the session name is registry → anchor → path
   derivation. Path derivation (`derive_session_name`) remains the
   first-registration and fallback behavior, so a workspace that never
@@ -49,12 +53,17 @@ from pathlib import Path
 
 from mozyo_bridge.domain.session_naming import derive_session_name
 from mozyo_bridge.shared.errors import die
+from mozyo_bridge.shared.name_compat import CompatResolution, resolve_compat_path
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 REGISTRY_FILENAME = "registry.sqlite"
 REGISTRY_SCHEMA_VERSION = 1
 
-ANCHOR_RELATIVE = Path(".mozyo-bridge/workspace.json")
+# New primary anchor name (Redmine #11920 / #11921). The legacy name stays a
+# read-only fallback; new writes only ever create the primary name. See
+# `vibes/docs/logics/workspace-anchor-project-defaults-migration.md`.
+ANCHOR_RELATIVE = Path(".mozyo-bridge/workspace-anchor.json")
+ANCHOR_LEGACY_RELATIVE = Path(".mozyo-bridge/workspace.json")
 ANCHOR_SCHEMA_VERSION = 1
 
 # Scaffold manifest consulted (best-effort) for preset / rules version.
@@ -184,7 +193,18 @@ def registry_path(home: Path | None = None) -> Path:
 
 
 def anchor_path(repo_root: Path) -> Path:
+    """The primary (new-name) anchor path — also the write target."""
     return repo_root / ANCHOR_RELATIVE
+
+
+def legacy_anchor_path(repo_root: Path) -> Path:
+    """The legacy (pre-rename) anchor path, kept as a read-only fallback."""
+    return repo_root / ANCHOR_LEGACY_RELATIVE
+
+
+def anchor_resolution(repo_root: Path) -> CompatResolution:
+    """Resolve which anchor name(s) exist for ``repo_root`` (new vs legacy)."""
+    return resolve_compat_path(repo_root, ANCHOR_RELATIVE, ANCHOR_LEGACY_RELATIVE)
 
 
 def _utc_now() -> str:
@@ -234,8 +254,17 @@ def read_anchor(repo_root: Path) -> dict | None:
     supported schema version, non-empty workspace id, tmux-safe canonical
     session). Anything else returns ``None`` — resolution and registration
     must degrade to derivation, never die, on a corrupt anchor.
+
+    Name compatibility (Redmine #11920 / #11921): the new
+    ``workspace-anchor.json`` wins, the legacy ``workspace.json`` is the
+    fallback. The new name is authoritative even when both exist, so a stray
+    leftover legacy file never breaks identity resolution; the both-exist
+    drift is surfaced by ``doctor`` and fails closed in the mutating
+    ``register`` path instead.
     """
-    path = anchor_path(repo_root)
+    path = anchor_resolution(repo_root).read_path
+    if path is None:
+        return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -463,8 +492,32 @@ def register_workspace(
     now = _utc_now()
     notes: list[str] = []
 
+    # Name compatibility (Redmine #11920 / #11921): a mutating write must not
+    # guess which anchor is authoritative when both names exist. Fail closed and
+    # ask the operator to remove the superseded legacy file. Reads (resolution,
+    # doctor) keep working by preferring the new name; only the write path is
+    # this strict.
+    resolution = anchor_resolution(resolved)
+    if resolution.both_exist:
+        die(
+            f"both {ANCHOR_RELATIVE.as_posix()} and "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist in {resolved}. The new "
+            f"name is authoritative; remove the legacy "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} after confirming the new "
+            f"anchor is correct, then re-run `mozyo-bridge workspace register`."
+        )
+
     anchor = read_anchor(resolved)
     existing_by_path = load_workspace_by_path(resolved, home=home)
+    if resolution.using_legacy:
+        # The identity was recovered from the legacy anchor; the new-name anchor
+        # is written below. Leaving the legacy file in place keeps this commit's
+        # promise not to remove the old fallback, but it should be cleaned up.
+        notes.append(
+            f"legacy anchor {ANCHOR_LEGACY_RELATIVE.as_posix()} migrated to "
+            f"{ANCHOR_RELATIVE.as_posix()}; remove the legacy file once the new "
+            "anchor is confirmed"
+        )
 
     if anchor is not None:
         workspace_id = anchor["workspace_id"]

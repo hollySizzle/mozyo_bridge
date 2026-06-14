@@ -14810,7 +14810,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # skill body so agents pick them up at session start.
         "Default project resolution",
         ".mozyo-bridge/redmine-defaults.md",
-        ".mozyo-bridge/workspace-defaults.yaml",
+        ".mozyo-bridge/project-defaults.yaml",
         "An explicit `project_id` always wins over the default",
         "UNVERIFIED",
     )
@@ -15589,7 +15589,9 @@ class ReleaseCheckDriftTest(unittest.TestCase):
 class WorkspaceDefaultsRendererTest(unittest.TestCase):
     """Pin Redmine #10689: workspace-local Redmine default-project renderer.
 
-    Single source: `<repo>/.mozyo-bridge/workspace-defaults.yaml`.
+    Single source: `<repo>/.mozyo-bridge/project-defaults.yaml` (Redmine
+    #11920 / #11921 rename; the legacy `workspace-defaults.yaml` stays a
+    read-only fallback, covered by the compat tests below).
     Default output: `<repo>/.mozyo-bridge/redmine-defaults.md`.
 
     Tests pin:
@@ -15605,7 +15607,7 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
       leaking the fixture into distributed source.
     """
 
-    INPUT_RELATIVE = Path(".mozyo-bridge/workspace-defaults.yaml")
+    INPUT_RELATIVE = Path(".mozyo-bridge/project-defaults.yaml")
     OUTPUT_RELATIVE = Path(".mozyo-bridge/redmine-defaults.md")
     CLOUD_DRIVE_FIXTURE = {
         "identifier": "giken-cloud-drive-management",
@@ -15624,7 +15626,7 @@ class WorkspaceDefaultsRendererTest(unittest.TestCase):
 
     def _stage_repo(self, dest: Path, *, yaml_body: str) -> Path:
         (dest / ".mozyo-bridge").mkdir(parents=True)
-        (dest / ".mozyo-bridge" / "workspace-defaults.yaml").write_text(
+        (dest / ".mozyo-bridge" / "project-defaults.yaml").write_text(
             yaml_body, encoding="utf-8"
         )
         return dest

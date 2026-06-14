@@ -4,8 +4,22 @@ Redmine #11905 / #11910。`.mozyo-bridge/workspace.json` と
 `.mozyo-bridge/workspace-defaults.yaml` の名前が責務を誤解させるため、rename
 方針と互換 migration を固定する設計正本。
 
-本 doc は migration design であり、runtime 実装ではない。実装時は別 task で
-constants、reader/writer、scaffold、doctor、tests、docs を同期する。
+本 doc は migration design である。runtime compatibility は Redmine #11920 /
+#11921 で実装済み。実装が固定した runtime contract:
+
+- read path (resolution / cockpit / session naming) は新名を優先し、旧名へ
+  fallback する。両名が存在しても新名が authoritative なので read は壊れない。
+  shared helper は `src/mozyo_bridge/shared/name_compat.py`。
+- mutating / explicit command (`workspace register`, `workspace-defaults`,
+  `runtime-config install`) は both-exist で fail closed し、operator に旧名の
+  削除を求める (silent merge しない)。旧名のみのときは command level で
+  deprecation warning を出す (hot read path は静か)。
+- 新規 write は新名のみ (`workspace-anchor.json` / `project-defaults.yaml`)。
+  `workspace register` が旧名のみの workspace を register するときは identity を
+  旧 anchor から復元して新名へ書き、旧 anchor は残したまま削除を促す note を
+  返す (本実装では旧 fallback file を削除しない)。
+- generated `redmine-defaults.md` の source 参照は実際に読んだ入力ファイル名を
+  反映する (新名 workspace は新名、旧名 workspace は旧名を表示)。
 
 ## 決定
 

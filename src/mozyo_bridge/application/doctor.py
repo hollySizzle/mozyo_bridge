@@ -884,6 +884,7 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
     # actually usable; otherwise registration state is "unknown".
     record = wr.load_workspace_by_path(target, home=home) if registry_usable else None
     anchor = wr.read_anchor(target)
+    anchor_names = wr.anchor_resolution(target)
     resolved = wr.resolve_canonical_session(target, home=home)
 
     next_action: list[str] = []
@@ -902,8 +903,20 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
         "preset_version": record.preset_version if record else None,
     }
 
+    # Anchor name compatibility (Redmine #11920 / #11921): report which name is
+    # on disk so the legacy / both-exist migration states are visible.
+    if anchor_names.both_exist:
+        name_state = "both"
+    elif anchor_names.using_legacy:
+        name_state = "legacy"
+    elif anchor_names.new_exists:
+        name_state = "new"
+    else:
+        name_state = "none"
     anchor_info = {
         "path": str(wr.anchor_path(target)),
+        "legacy_path": str(wr.legacy_anchor_path(target)),
+        "name_state": name_state,
         "present": anchor is not None,
         "workspace_id": anchor.get("workspace_id") if anchor else None,
         "canonical_session": anchor.get("canonical_session") if anchor else None,
@@ -991,6 +1004,15 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
             "move the registry aside and re-register from anchors "
             "(`mozyo-bridge workspace register`)"
         )
+    elif anchor_names.both_exist:
+        section_status = "drifted"
+        next_action.append(
+            f"both {wr.ANCHOR_RELATIVE.as_posix()} and "
+            f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
+            f"authoritative — remove the legacy "
+            f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()} after confirming the new "
+            "anchor (no silent merge)"
+        )
     elif consistency_status == "drift":
         section_status = "drifted"
         next_action.append(
@@ -999,6 +1021,13 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
         )
     else:
         section_status = "ok"
+        if anchor_names.using_legacy:
+            next_action.append(
+                f"anchor uses the legacy name "
+                f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge "
+                f"workspace register` to migrate it to "
+                f"{wr.ANCHOR_RELATIVE.as_posix()} (the legacy name still reads)"
+            )
         if consistency_status == "anchor-only":
             next_action.append(
                 "home registry has no row for this workspace; run "
