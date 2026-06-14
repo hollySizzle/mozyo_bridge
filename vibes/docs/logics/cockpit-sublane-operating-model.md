@@ -129,6 +129,24 @@ main Claude に任せるべきではないもの (coordinator Codex が保持す
 - protected workflow / skill / source / test surface への silent edit、または
   gated lane 外の編集。
 
+main Claude が implementation request を受け取った場合は、次の境界で止める。
+
+- まず durable Redmine anchor を読み、実装前に明らかな設計矛盾・scope
+  不足・invariant 衝突があれば Design Consultation を起票してよい。
+- Design Consultation、read-only 調査、reroute 用の事実整理を終えたら、
+  main Claude はそこで停止する。実装 diff は出さない。
+- coordinator Codex は、その issue に専用 sublane / worktree を作り、target-lane
+  Codex gateway 経由で same-lane Claude へ実装を渡す。
+- main Claude は、専用 sublane へ明示的に移されない限り、自分の main
+  worktree で source / tests / scaffold / guardrail 実装を始めない。
+
+Redmine #11955 はこの境界の具体例である。scaffold option 実装依頼が一度 main
+Claude に届いたが、main Claude は実装前に `catalog refs install` と
+`catalog.yaml` 非変更 invariant の衝突を Design Consultation として記録した。
+coordinator Codex はその回答を Redmine に残し、main Claude を停止させ、専用
+`issue_11955` sublane / worktree へ実装を reroute した。この flow が正であり、
+main Claude がそのまま実装する flow は再発させない。
+
 sublane Claude との違い: sublane Claude は自 lane の gate 下で実 diff を出し、
 implementation_done / review_request を記録する bounded implementation worker
 である (上の `### Sublane Claude`)。main Claude は自前の implementation lane を
