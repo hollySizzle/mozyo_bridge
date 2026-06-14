@@ -19,6 +19,22 @@ projection-state 機能は `cockpit_pane` を primary projection として進め
 「どちらでも同格」にはしない。handoff / discovery / docs の判断語彙は
 `TargetRecord` / `UnitRecord` へ寄せる。
 
+## Design-first gate
+
+`TargetRecord` / `UnitRecord` は cockpit / normal local / cross-project /
+DB state 境界にまたがるため、実装を先に走らせると resolver、handoff、docs、
+state store が別々の語彙で育つ。
+
+したがって #11905 配下では、次の順序を守る:
+
+1. Redmine に意思決定と経緯を残す。
+2. repo-local logic doc に現在の設計正本を固定する。
+3. catalog に登録し、`docs resolve` / `audit-impact` の導線へ乗せる。
+4. その後に #11907 以降の実装へ進む。
+
+Redmine journal は意思決定の履歴であり、repo-local logic doc は実装者と監査者が
+読む現在の正本である。片方だけでは足りない。
+
 ## 用語
 
 ### Unit
