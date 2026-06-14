@@ -2772,6 +2772,205 @@ class ScaffoldRulesTest(unittest.TestCase):
                     msg=f"manifest does not track {tracked_path}",
                 )
 
+    # ------------------------------------------------------------------
+    # Redmine #11955: opt-in sublane / worktree runbook scaffold category.
+    # The docs distribute only when `--with-worktree-runbook` is passed;
+    # scaffold must never auto-write the operator-owned catalog.yaml.
+    # ------------------------------------------------------------------
+    WORKTREE_RUNBOOK_PATHS = (
+        "vibes/docs/logics/worktree-lifecycle-boundary.md",
+        "vibes/docs/logics/sublane-worktree-operating-runbook.md",
+        "vibes/docs/logics/worktree-runbook-catalog-registration.md",
+    )
+
+    def test_worktree_runbook_is_off_by_default(self) -> None:
+        """A plain governed `scaffold apply` does NOT ship the runbook docs.
+
+        The `worktree-runbook` category is opt-in (Redmine #11955), so a
+        default apply must neither write the docs to disk nor track them
+        in the manifest. Adopting projects only get them via the explicit
+        `--with-worktree-runbook` flag.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    state = scaffold_state(project)
+                    assert state is not None
+                    tracked = set(state["files"].keys())
+                    for runbook_path in self.WORKTREE_RUNBOOK_PATHS:
+                        self.assertFalse(
+                            (project / runbook_path).exists(),
+                            msg=f"default apply wrote opt-in doc {runbook_path}",
+                        )
+                        self.assertNotIn(
+                            runbook_path,
+                            tracked,
+                            msg=f"default manifest tracks opt-in doc {runbook_path}",
+                        )
+
+    def test_worktree_runbook_installs_with_flag(self) -> None:
+        """`--with-worktree-runbook` ships docs + manual catalog note.
+
+        Option-on installs the two byte-synced runbook docs plus the
+        scaffold-only catalog-registration note, tracks all three in the
+        manifest, and — per the governed invariant — never creates or
+        mutates the operator-owned `catalog.yaml`. `scaffold status`
+        stays clean afterwards.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                            "--with-worktree-runbook",
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    state = scaffold_state(project)
+                    assert state is not None
+                    tracked = set(state["files"].keys())
+                    for runbook_path in self.WORKTREE_RUNBOOK_PATHS:
+                        self.assertTrue(
+                            (project / runbook_path).exists(),
+                            msg=f"--with-worktree-runbook did not write {runbook_path}",
+                        )
+                        self.assertIn(
+                            runbook_path,
+                            tracked,
+                            msg=f"manifest does not track {runbook_path}",
+                        )
+
+                    # B1 invariant: scaffold never auto-writes catalog.yaml.
+                    # Only the `.example` and the manual note are shipped.
+                    self.assertFalse(
+                        (project / ".mozyo-bridge/docs/catalog.yaml").exists(),
+                        msg="opt-in apply must not auto-write operator catalog.yaml",
+                    )
+                    note = project / (
+                        "vibes/docs/logics/worktree-runbook-catalog-registration.md"
+                    )
+                    self.assertIn(
+                        "catalog.yaml",
+                        note.read_text(encoding="utf-8"),
+                        msg="catalog-registration note missing manual snippet guidance",
+                    )
+
+                    # Existing scaffold status check must remain clean.
+                    status_result, status_out = self.run_cli(
+                        [
+                            "scaffold",
+                            "status",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, status_result)
+                    self.assertIn("clean", status_out)
+
+    def test_worktree_runbook_packaged_docs_match_authored_sources(self) -> None:
+        """Sync-check: packaged runbook copies == authored repo sources.
+
+        The scaffold ships byte copies of this repo's authored
+        `vibes/docs/logics/worktree-lifecycle-boundary.md` and
+        `sublane-worktree-operating-runbook.md`. This drift test fails if
+        a packaged copy diverges from the source-of-truth doc; regenerate
+        the copies (re-copy from `vibes/docs/logics/`) when the authored
+        docs change. The catalog-registration note is scaffold-only and
+        intentionally NOT part of this pair.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        synced_docs = (
+            "worktree-lifecycle-boundary.md",
+            "sublane-worktree-operating-runbook.md",
+        )
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            for doc in synced_docs:
+                with self.subTest(preset=preset, doc=doc):
+                    authored = repo_root / "vibes/docs/logics" / doc
+                    packaged = (
+                        repo_root
+                        / "src/mozyo_bridge/scaffold/presets"
+                        / preset
+                        / "files/vibes/docs/logics"
+                        / doc
+                    )
+                    self.assertTrue(
+                        authored.is_file(), msg=f"authored source missing: {authored}"
+                    )
+                    self.assertTrue(
+                        packaged.is_file(), msg=f"packaged copy missing: {packaged}"
+                    )
+                    self.assertEqual(
+                        authored.read_bytes(),
+                        packaged.read_bytes(),
+                        msg=(
+                            f"packaged worktree runbook doc drifted from authored "
+                            f"source: {packaged} != {authored}. Re-copy from "
+                            f"vibes/docs/logics/ to resync."
+                        ),
+                    )
+
+    def test_worktree_runbook_rejects_unknown_opt_in_category(self) -> None:
+        """`with_categories` validation rejects non-opt-in labels.
+
+        A library caller that bypasses the CLI must be told when it asks
+        for a category that is not opt-in (or does not exist), mirroring
+        the skip-category validation.
+        """
+        from mozyo_bridge.scaffold.rules import render_preset_extra_files
+
+        # An opt-out / unknown label is not a valid opt-in target. `die`
+        # raises SystemExit, same as the skip-category validation path.
+        with self.assertRaises(SystemExit):
+            render_preset_extra_files(
+                "redmine-governed", with_categories={"nagger"}
+            )
+        with self.assertRaises(SystemExit):
+            render_preset_extra_files(
+                "redmine-governed", with_categories={"does-not-exist"}
+            )
+
+        # The valid opt-in label surfaces the runbook docs.
+        extras = render_preset_extra_files(
+            "redmine-governed", with_categories={"worktree-runbook"}
+        )
+        paths = {item.path.as_posix() for item in extras}
+        for runbook_path in self.WORKTREE_RUNBOOK_PATHS:
+            self.assertIn(runbook_path, paths)
+
     def test_governed_doctor_reports_skipped_after_skip_with_backup(self) -> None:
         """`--skip-* --backup` opt-out: doctor must use the manifest, not disk.
 

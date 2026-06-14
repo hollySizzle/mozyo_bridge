@@ -36,21 +36,38 @@ PRESET_FILES_DIRNAME = "files"
 PRESET_FILES_SKIP_DIRS = frozenset({"__pycache__"})
 PRESET_FILES_SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
 
-# Opt-out categories that operators can pass to `scaffold apply` /
-# `scaffold diff` to omit a slice of the governed preset's repo-local
-# artifacts. The mapping is repo-relative POSIX path *prefix* → category
-# label; any rendered file whose relative path starts with one of the
-# prefixes is dropped from the rendered set (and therefore from the
-# manifest) when the corresponding category is in the skip set.
-#
-# Adding a new category here is the entire integration point: the CLI
-# wires `--skip-<category>` into `skip_categories`, and the manifest
+# Category → repo-relative POSIX path *prefix* mapping that slices a
+# governed preset's repo-local artifacts. Any rendered file whose
+# relative path starts with one of the prefixes belongs to that
+# category; categories are switched on/off as a group, and the manifest
 # automatically tracks only what was actually written.
+#
+# Categories come in two flavours:
+#   * opt-out (default-on): shipped unless the operator passes
+#     `--skip-<category>`. The CLI wires the flag into `skip_categories`.
+#   * opt-in (default-off): shipped only when the operator passes the
+#     matching `--with-<category>` flag, wired into `with_categories`.
+# Adding a category here plus its flag in the CLI is the entire
+# integration point.
 PRESET_FILES_CATEGORY_PREFIXES: dict[str, str] = {
     "tmux-ui": ".mozyo-bridge/tmux/",
     "nagger": ".claude-nagger/",
+    "worktree-runbook": "vibes/docs/logics/",
 }
 PRESET_FILES_CATEGORIES = frozenset(PRESET_FILES_CATEGORY_PREFIXES.keys())
+
+# Opt-in categories ship only when explicitly enabled (default-off).
+# They are skipped from the rendered set unless their label is present
+# in the `with_categories` opt-in set, so a plain `scaffold apply` never
+# installs them. The worktree/sublane runbook docs are distributed this
+# way (Redmine #11955) because adoption is per-project and the docs are
+# generic, public-safe operator recipes rather than always-on guardrail
+# artifacts.
+PRESET_FILES_OPT_IN_CATEGORIES = frozenset({"worktree-runbook"})
+
+# Opt-out categories are everything that is not opt-in: default-on
+# artifacts an operator can drop with `--skip-<category>`.
+PRESET_FILES_OPT_OUT_CATEGORIES = PRESET_FILES_CATEGORIES - PRESET_FILES_OPT_IN_CATEGORIES
 
 CENTRAL_MODE = "central"
 REPO_LOCAL_MODE = "repo-local"
@@ -463,8 +480,11 @@ def _walk_preset_files_dir(files_root) -> list[tuple[Path, str]]:
 
 
 def _normalize_skip_categories(skip_categories: set[str] | None) -> frozenset[str]:
-    """Validate and freeze the operator-supplied skip category set.
+    """Validate and freeze the operator-supplied opt-out skip category set.
 
+    Only opt-out (default-on) categories are valid skip targets. Passing
+    an opt-in category here is an operator error — opt-in categories are
+    disabled by default and enabled via ``with_categories``, not skipped.
     Unknown labels are an operator error, not a silent miss — the CLI
     layer raises before we reach here, but a library caller that bypasses
     the CLI will also be told. The empty / None case is the common
@@ -472,20 +492,58 @@ def _normalize_skip_categories(skip_categories: set[str] | None) -> frozenset[st
     """
     if not skip_categories:
         return frozenset()
-    unknown = set(skip_categories) - PRESET_FILES_CATEGORIES
+    unknown = set(skip_categories) - PRESET_FILES_OPT_OUT_CATEGORIES
     if unknown:
         die(
             "unknown scaffold skip categories: "
             + ", ".join(sorted(unknown))
-            + f"; expected one of {sorted(PRESET_FILES_CATEGORIES)}"
+            + f"; expected one of {sorted(PRESET_FILES_OPT_OUT_CATEGORIES)}"
         )
     return frozenset(skip_categories)
+
+
+def _normalize_with_categories(with_categories: set[str] | None) -> frozenset[str]:
+    """Validate and freeze the operator-supplied opt-in category set.
+
+    Only opt-in (default-off) categories are valid ``--with-*`` targets.
+    Passing an opt-out / unknown label is an operator error. The empty /
+    None case is the common default-off path (nothing opted in).
+    """
+    if not with_categories:
+        return frozenset()
+    unknown = set(with_categories) - PRESET_FILES_OPT_IN_CATEGORIES
+    if unknown:
+        die(
+            "unknown scaffold opt-in categories: "
+            + ", ".join(sorted(unknown))
+            + f"; expected one of {sorted(PRESET_FILES_OPT_IN_CATEGORIES)}"
+        )
+    return frozenset(with_categories)
+
+
+def _effective_skip_categories(
+    skip_categories: set[str] | None,
+    with_categories: set[str] | None,
+) -> frozenset[str]:
+    """Resolve the final set of categories to drop from the rendered files.
+
+    The effective skip set is the union of:
+      * explicit opt-out labels (``--skip-<category>``), and
+      * every opt-in category that was NOT enabled via ``--with-<category>``.
+    This makes opt-in categories default-off: a plain apply skips them,
+    and they ship only when their label is present in ``with_categories``.
+    """
+    skip = _normalize_skip_categories(skip_categories)
+    enabled = _normalize_with_categories(with_categories)
+    default_skipped = PRESET_FILES_OPT_IN_CATEGORIES - enabled
+    return frozenset(skip | default_skipped)
 
 
 def render_preset_extra_files(
     preset: str,
     *,
     skip_categories: set[str] | None = None,
+    with_categories: set[str] | None = None,
 ) -> list[RenderedFile]:
     """Return the preset's repo-local artifacts as :class:`RenderedFile`.
 
@@ -494,13 +552,15 @@ def render_preset_extra_files(
     so callers can write them directly under the scaffold target.
 
     ``skip_categories`` drops every artifact whose repo-relative path
-    starts with the category's registered prefix (see
-    ``PRESET_FILES_CATEGORY_PREFIXES``). The dropped entries do not
-    appear in the manifest either, so ``scaffold status`` stays clean
-    after a partial apply.
+    starts with an opt-out category's registered prefix (see
+    ``PRESET_FILES_CATEGORY_PREFIXES``). ``with_categories`` enables an
+    opt-in (default-off) category so its artifacts are included; opt-in
+    categories are otherwise skipped. Dropped entries do not appear in
+    the manifest either, so ``scaffold status`` stays clean after a
+    partial apply.
     """
     preset_definition(preset)
-    skip = _normalize_skip_categories(skip_categories)
+    skip = _effective_skip_categories(skip_categories, with_categories)
     skip_prefixes = tuple(
         PRESET_FILES_CATEGORY_PREFIXES[name] for name in skip
     )
@@ -671,13 +731,16 @@ def render_scaffold_files(
     *,
     repo_local: bool = False,
     skip_categories: set[str] | None = None,
+    with_categories: set[str] | None = None,
 ) -> list[RenderedFile]:
     target = target.expanduser().resolve()
     store = _resolve_scaffold_store(target, home, repo_local)
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
-    extras = render_preset_extra_files(preset, skip_categories=skip_categories)
+    extras = render_preset_extra_files(
+        preset, skip_categories=skip_categories, with_categories=with_categories
+    )
     manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,
@@ -716,6 +779,7 @@ def write_scaffold(
     *,
     repo_local: bool = False,
     skip_categories: set[str] | None = None,
+    with_categories: set[str] | None = None,
 ) -> list[Path]:
     if backup and force:
         die("--backup and --force are mutually exclusive")
@@ -724,7 +788,9 @@ def write_scaffold(
     workflow_path = require_installed_preset(preset, store=store)
     rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
     rendered = apply_project_local_preservation(rendered, target)
-    extras = render_preset_extra_files(preset, skip_categories=skip_categories)
+    extras = render_preset_extra_files(
+        preset, skip_categories=skip_categories, with_categories=with_categories
+    )
     manifest_inputs = rendered + extras
     manifest = RenderedFile(
         MANIFEST_RELATIVE_PATH,

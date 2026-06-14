@@ -3886,6 +3886,21 @@ def _skip_categories_from_args(args: argparse.Namespace) -> set[str]:
     return labels
 
 
+def _with_categories_from_args(args: argparse.Namespace) -> set[str]:
+    """Collect opt-in `--with-<category>` flags off the parsed namespace.
+
+    Each `--with-<category>` flag is namespaced as `with_<category>` on
+    the argparse object. Only labels for flags that are present *and*
+    true are forwarded, so callers building Namespace objects
+    programmatically (tests, library entry points) default to the
+    opt-in-off behaviour without naming every flag.
+    """
+    labels: set[str] = set()
+    if getattr(args, "with_worktree_runbook", False):
+        labels.add("worktree-runbook")
+    return labels
+
+
 def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     repo_local = bool(getattr(args, "repo_local", False))
@@ -3899,6 +3914,7 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
         home=home,
         repo_local=repo_local,
         skip_categories=_skip_categories_from_args(args),
+        with_categories=_with_categories_from_args(args),
     )
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
@@ -3923,6 +3939,7 @@ def cmd_scaffold_diff(args: argparse.Namespace) -> int:
         home=home,
         repo_local=repo_local,
         skip_categories=_skip_categories_from_args(args),
+        with_categories=_with_categories_from_args(args),
     )
     any_changes = False
     for item in rendered:

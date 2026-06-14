@@ -74,6 +74,10 @@ mozyo_bridge = [
     "scaffold/presets/*/files/.claude-nagger/**/*",
     "scaffold/presets/*/files/.claude-nagger/*",
     "scaffold/presets/*/files/.claude-nagger/.gitignore",
+    # Opt-in worktree/sublane runbook docs (Redmine #11955). `vibes/` is
+    # not a hidden directory, so `files/**/*` already covers it; this
+    # explicit pattern mirrors the others and pins the wheel contents.
+    "scaffold/presets/*/files/vibes/docs/logics/*.md",
     # Canonical conditional-renderer sources for the router pair
     # (Redmine #10345). Outputs are committed under scaffold/presets/_router/;
     # the YAML and adjacent body files travel with the wheel so an editable

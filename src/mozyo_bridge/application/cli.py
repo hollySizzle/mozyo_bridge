@@ -1249,6 +1249,19 @@ def build_parser() -> argparse.ArgumentParser:
             "use Claude Nagger."
         ),
     )
+    scaffold_apply.add_argument(
+        "--with-worktree-runbook",
+        dest="with_worktree_runbook",
+        action="store_true",
+        help=(
+            "Install the governed preset's sublane / git worktree runbook "
+            "docs under `vibes/docs/logics/` plus a manual catalog-"
+            "registration note. These artifacts are opt-in (default-off); "
+            "without this flag they are not written. The scaffold never "
+            "mutates the operator-owned `catalog.yaml`; use the shipped note "
+            "to register the docs by hand."
+        ),
+    )
     scaffold_apply.set_defaults(func=cmd_scaffold_apply)
 
     scaffold_diff = scaffold_sub.add_parser(
@@ -1286,6 +1299,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="skip_nagger",
         action="store_true",
         help="Preview the diff as if `scaffold apply --skip-nagger` were run.",
+    )
+    scaffold_diff.add_argument(
+        "--with-worktree-runbook",
+        dest="with_worktree_runbook",
+        action="store_true",
+        help=(
+            "Preview the diff as if `scaffold apply --with-worktree-runbook` "
+            "were run (include the opt-in worktree/sublane runbook docs)."
+        ),
     )
     scaffold_diff.set_defaults(func=cmd_scaffold_diff)
 

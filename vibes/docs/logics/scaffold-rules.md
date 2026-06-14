@@ -243,6 +243,49 @@ Repo-local artifacts source:
 
 - Files live under `src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/` in the package source tree. The scaffold walks this subdirectory verbatim into the target repo. Any new artifact must be packaged here (and added to `pyproject.toml` package-data) rather than hard-coded into the scaffold module.
 
+## Scaffold artifact categories (opt-out and opt-in)
+
+A governed preset's repo-local artifacts are sliced into categories, each
+mapped to a repo-relative path prefix in
+`PRESET_FILES_CATEGORY_PREFIXES` (`src/mozyo_bridge/scaffold/rules.py`).
+Categories are switched on/off as a group; the manifest tracks only what
+was actually written, so `scaffold status` stays clean after a partial
+apply.
+
+Two flavours exist:
+
+- **Opt-out (default-on)**: shipped on every `scaffold apply`; an
+  operator drops one with `--skip-<category>`. Current opt-out
+  categories: `tmux-ui` (`.mozyo-bridge/tmux/`), `nagger`
+  (`.claude-nagger/`).
+- **Opt-in (default-off)**: shipped only when the operator passes the
+  matching `--with-<category>` flag; a plain apply never installs them.
+  Listed in `PRESET_FILES_OPT_IN_CATEGORIES`.
+
+### Opt-in: worktree-runbook
+
+The `worktree-runbook` category (Redmine #11955) distributes the sublane
+/ git worktree operating runbook docs to adopting projects without making
+them always-on:
+
+- Prefix: `vibes/docs/logics/`. Flag: `--with-worktree-runbook` on
+  `scaffold apply` / `scaffold diff`.
+- Ships `worktree-lifecycle-boundary.md` and
+  `sublane-worktree-operating-runbook.md` (byte-synced copies of this
+  repo's authored sources under `vibes/docs/logics/`; a drift test in
+  `tests/test_mozyo_bridge.py` fails if the packaged copy diverges) plus
+  a scaffold-only `worktree-runbook-catalog-registration.md` note.
+- **Catalog refs are not auto-written.** Consistent with the governed
+  invariant that scaffold never mutates the operator-owned
+  `.mozyo-bridge/docs/catalog.yaml`, the option ships docs plus a manual
+  registration snippet/note; the operator registers the docs by hand.
+  Do not extend this option to write `catalog.yaml` (that overlay scope
+  belongs to a separate effort, not here).
+- These are generic, public-safe operator recipes. Do not fold private
+  paths, internal lane policy, or operator-specific N-lane rules into the
+  shipped docs, and do not add a core `git worktree add/remove` lifecycle
+  command — worktree lifecycle stays a runbook/recipe, not core CLI.
+
 ## Preset: none
 
 The `none` preset is a minimal router preset for projects without a ticket system.
