@@ -709,3 +709,86 @@ def build_target_candidates(
             )
         )
     return candidates
+
+
+# --- Explicit-pane handoff preflight projection (Redmine #11908) --------------
+
+
+@dataclass(frozen=True)
+class PreflightTarget:
+    """Canonical ``TargetRecord``-shaped identity view of one resolved handoff pane.
+
+    The handoff explicit-pane preflight (Redmine #11908,
+    ``vibes/docs/logics/unit-target-model.md`` "Resolver priority") projects the
+    single pane it resolved onto the **same** role / view vocabulary
+    ``agents targets`` uses (:func:`build_target_candidates`, #11907) instead of
+    re-deriving role from raw window-name fields. So normal local and cockpit
+    panes share one resolver rather than growing two.
+
+    The pane option (``@mozyo_agent_role`` / ``@mozyo_workspace_id`` /
+    ``@mozyo_lane_id``) is the primary identity; the window name is a
+    compatibility fallback tagged ``role_source == window_name``; an ambiguous or
+    ``unknown`` role is surfaced so the caller fails closed. ``view_kind`` is a
+    projection attribute (``cockpit_pane`` vs ``normal_window``), never a routing
+    identity — a renamed cockpit session still classifies because the kind is
+    derived from role provenance, not the session/window name.
+    """
+
+    pane_id: str
+    role: str
+    role_source: str
+    confidence: str
+    ambiguous: bool
+    view_kind: str
+    workspace_id: str | None
+    lane_id: str
+    window_name: str
+    pane_option_role: str
+
+    def binds_receiver(self, receiver: str) -> bool:
+        """True when this target *strongly, non-ambiguously* resolves to ``receiver``.
+
+        The single role-binding predicate the queue-enter explicit-pane gate
+        relies on. A weak (process-inferred) signal, an ambiguous resolution, or
+        a role that does not equal ``receiver`` is never bound — so a marker-miss
+        Enter under the relaxed rail can not land in the wrong receiver's pane.
+        Identical semantics to the inline check it replaces; the safety preflight
+        is not weakened, only routed through the canonical projection.
+        """
+        return (
+            self.role == receiver
+            and self.confidence == CONFIDENCE_STRONG
+            and not self.ambiguous
+        )
+
+
+def project_preflight_target(pane: dict[str, str]) -> PreflightTarget:
+    """Project a resolved pane dict onto the canonical preflight ``TargetRecord``.
+
+    Pure over the fields :func:`mozyo_bridge.infrastructure.tmux_client.pane_lines`
+    emits. Reuses the #11822 role resolver (pane-option primary, window-name
+    fallback, process weak) and the #11907 :func:`_derive_view_kind` so the
+    handoff preflight and ``agents targets`` never grow two divergent resolvers.
+
+    Unlike :func:`build_target_candidates`, an ``unknown``-role pane is **kept**
+    (not dropped) so the explicit-pane preflight can fail closed with full
+    provenance (``role`` / ``role_source`` / ``confidence`` / ``ambiguous`` /
+    ``view_kind``) instead of silently losing the target.
+    """
+    resolution = resolve_agent_role(
+        pane_option_role=pane.get("agent_role"),
+        window_name=pane.get("window_name"),
+        process=pane.get("command"),
+    )
+    return PreflightTarget(
+        pane_id=pane.get("id") or "",
+        role=resolution.role,
+        role_source=resolution.role_source,
+        confidence=resolution.confidence,
+        ambiguous=resolution.ambiguous,
+        view_kind=_derive_view_kind(resolution.role_source),
+        workspace_id=(pane.get("workspace_id") or "").strip() or None,
+        lane_id=_normalize_lane_display(pane.get("lane_id")),
+        window_name=pane.get("window_name") or "",
+        pane_option_role=(pane.get("agent_role") or "").strip(),
+    )

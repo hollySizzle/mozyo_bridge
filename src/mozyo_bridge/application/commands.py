@@ -15,13 +15,12 @@ from mozyo_bridge.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
-    CONFIDENCE_STRONG,
     ROLE_SOURCE_WINDOW_NAME,
     build_target_candidates,
     discover_agents,
     filter_agents,
     infer_repo_root,
-    resolve_agent_role,
+    project_preflight_target,
 )
 from mozyo_bridge.domain.handoff import (
     AUTO_TARGET_REPO,
@@ -2799,31 +2798,30 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         )
         args.target_repo = auto_root
 
-    target_role = resolve_agent_role(
-        pane_option_role=target_info.get("agent_role"),
-        window_name=target_info.get("window_name"),
-        process=target_info.get("command"),
-    )
-    role_binds_receiver = (
-        target_role.role == receiver
-        and target_role.confidence == CONFIDENCE_STRONG
-        and not target_role.ambiguous
-    )
-    if mode == MODE_QUEUE_ENTER and not role_binds_receiver:
-        # Step 9 (v0.2; role-aware since Redmine #11822). Under the relaxed
-        # queue-enter rail, marker miss does NOT roll back, so an explicit
-        # `--target %X` that resolves to a different agent would silently press
-        # Enter into the wrong receiver's pane. The agent gate
+    # Explicit-pane preflight projection (Redmine #11908): resolve the target
+    # pane onto the canonical `TargetRecord` identity vocabulary
+    # (`vibes/docs/logics/unit-target-model.md` "Resolver priority") via the same
+    # projection `agents targets` uses, so normal-local and cockpit panes share
+    # one resolver. Pane option role/workspace/lane is primary; the window name
+    # is a compatibility fallback (`role_source == window_name`); ambiguous /
+    # unknown is surfaced for fail-closed handling below.
+    preflight_target = project_preflight_target(target_info)
+    if mode == MODE_QUEUE_ENTER and not preflight_target.binds_receiver(receiver):
+        # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908).
+        # Under the relaxed queue-enter rail, marker miss does NOT roll back, so
+        # an explicit `--target %X` that resolves to a different agent would
+        # silently press Enter into the wrong receiver's pane. The agent gate
         # (`ensure_agent_target`) only verifies the pane is running *some* agent
         # process (claude / codex / node) and does not bind the pane to the
-        # intended receiver. This guard binds the explicit target to the
-        # receiver via the role resolver: a strong, non-ambiguous role ==
-        # receiver from either the `@mozyo_agent_role` pane option (cockpit) or
-        # the `<agent>` window name (normal `mozyo`). A cockpit pane no longer
-        # needs `--force`; a weak / ambiguous / mismatched signal stays
-        # fail-closed, matching the contract's "Allowed Targets".
-        observed_window = target_info.get("window_name") or "<unknown>"
-        observed_role = target_info.get("agent_role") or "<none>"
+        # intended receiver. `binds_receiver` binds the explicit target to the
+        # receiver via the canonical projection: a strong, non-ambiguous role ==
+        # receiver from either the `@mozyo_agent_role` pane option (cockpit /
+        # `cockpit_pane` view) or the `<agent>` window name (normal `mozyo` /
+        # `normal_window` view). A cockpit pane no longer needs `--force`; a weak
+        # / ambiguous / mismatched signal stays fail-closed, matching the
+        # contract's "Allowed Targets".
+        observed_window = preflight_target.window_name or "<unknown>"
+        observed_role = preflight_target.pane_option_role or "<none>"
         _emit_outcome(
             make_outcome(
                 status="blocked",
@@ -2842,8 +2840,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         die(
             "--mode queue-enter requires the explicit --target pane to resolve "
             f"to the receiver; --to={receiver!r} but pane {target} resolved to "
-            f"role={target_role.role!r} (source={target_role.role_source}, "
-            f"confidence={target_role.confidence}, ambiguous={target_role.ambiguous}; "
+            f"role={preflight_target.role!r} (source={preflight_target.role_source}, "
+            f"confidence={preflight_target.confidence}, "
+            f"ambiguous={preflight_target.ambiguous}, view={preflight_target.view_kind}; "
             f"window={observed_window!r}, @mozyo_agent_role={observed_role!r}). "
             "Drop --target to use role resolution, or pass a pane that resolves "
             "to the receiver."
