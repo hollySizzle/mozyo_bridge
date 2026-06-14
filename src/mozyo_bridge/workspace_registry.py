@@ -66,6 +66,14 @@ REGISTER_CREATED = "created"
 REGISTER_UPDATED = "updated"
 REGISTER_RESTORED = "restored-from-anchor"
 
+# Read-only registry-health markers, used by `doctor` (Redmine #11426). These
+# classify the home registry without ever creating, writing, or `die()`-ing —
+# the opposite contract from `_connect_rw`, which is the write path.
+REGISTRY_HEALTH_MISSING = "missing"
+REGISTRY_HEALTH_OK = "ok"
+REGISTRY_HEALTH_INVALID_SCHEMA = "invalid-schema"
+REGISTRY_HEALTH_UNREADABLE = "unreadable"
+
 # A canonical session name read back from the registry / anchor is operator
 # editable in principle, so it is validated before being handed to tmux.
 # tmux treats `:` as a window separator and `.` as a pane separator; we gate
@@ -357,6 +365,64 @@ def load_workspace_by_id(
 
 def list_workspaces(*, home: Path | None = None) -> list[WorkspaceRecord]:
     return _read_rows(registry_path(home), "ORDER BY w.canonical_path")
+
+
+def inspect_registry_health(home: Path | None = None) -> dict:
+    """Read-only health probe of the home registry for ``doctor`` (#11426).
+
+    Unlike :func:`_connect_rw` (the write path, which creates the file/schema
+    and ``die()``-s on a present-but-corrupt registry), this never creates the
+    registry, never writes, and never exits the process. It classifies the
+    registry so ``doctor`` can report a safe error state without mutating
+    anything:
+
+    - ``missing`` — the file does not exist (a workspace that never registered
+      is a normal, valid state; resolution falls back to derivation);
+    - ``ok`` — opens read-only, ``user_version`` matches
+      :data:`REGISTRY_SCHEMA_VERSION`, and the ``workspaces`` table is
+      queryable;
+    - ``invalid-schema`` — opens and is a real database, but ``user_version``
+      differs (a future schema this CLI cannot read, or a past one). This is
+      the read-side mirror of the write-side schema ``die()``;
+    - ``unreadable`` — present but not a usable SQLite database (truncated,
+      garbage, or missing the identity table).
+
+    The ``workspaces`` probe query matters: a zero-byte or non-SQLite file can
+    still ``connect`` (SQLite opens lazily), so the classification is driven by
+    actually reading ``user_version`` and the identity table, not by the
+    connect call succeeding.
+    """
+    path = registry_path(home)
+    info: dict = {
+        "path": str(path),
+        "exists": path.exists(),
+        "status": REGISTRY_HEALTH_MISSING,
+        "schema_version": None,
+        "expected_schema_version": REGISTRY_SCHEMA_VERSION,
+    }
+    if not path.exists():
+        return info
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            # Force a query against the identity table so a file that "opens"
+            # but is not a real registry (truncated / missing table) is caught
+            # here as unreadable rather than masquerading as schema 0.
+            conn.execute("SELECT 1 FROM workspaces LIMIT 1").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        info["status"] = REGISTRY_HEALTH_UNREADABLE
+        info["error"] = str(exc)
+        return info
+    info["schema_version"] = version
+    info["status"] = (
+        REGISTRY_HEALTH_OK
+        if version == REGISTRY_SCHEMA_VERSION
+        else REGISTRY_HEALTH_INVALID_SCHEMA
+    )
+    return info
 
 
 # --- registration -----------------------------------------------------------

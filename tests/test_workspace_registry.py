@@ -34,14 +34,23 @@ from mozyo_bridge.domain.session_naming import (
     SOURCE_WORKSPACE_DEFAULTS,
     derive_session_name,
 )
+from mozyo_bridge.application.doctor import (
+    doctor_workspace_registry_section,
+    format_doctor_text,
+)
 from mozyo_bridge.shared.paths import find_repo_root
 from mozyo_bridge.workspace_registry import (
     ANCHOR_RELATIVE,
     REGISTER_CREATED,
     REGISTER_RESTORED,
     REGISTER_UPDATED,
+    REGISTRY_HEALTH_INVALID_SCHEMA,
+    REGISTRY_HEALTH_MISSING,
+    REGISTRY_HEALTH_OK,
+    REGISTRY_HEALTH_UNREADABLE,
     SOURCE_HOME_REGISTRY,
     SOURCE_WORKSPACE_ANCHOR,
+    inspect_registry_health,
     list_workspaces,
     load_workspace_by_path,
     read_anchor,
@@ -440,6 +449,219 @@ class RegistrySchemaGuardTest(WorkspaceRegistryBase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 register_workspace(self.repo, home=self.home)
+
+
+class InspectRegistryHealthTest(WorkspaceRegistryBase):
+    """Read-only registry health probe for doctor (#11426)."""
+
+    def test_missing_registry_is_missing_not_error(self) -> None:
+        health = inspect_registry_health(self.home)
+        self.assertEqual(health["status"], REGISTRY_HEALTH_MISSING)
+        self.assertFalse(health["exists"])
+        self.assertIsNone(health["schema_version"])
+
+    def test_registered_registry_is_ok(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        health = inspect_registry_health(self.home)
+        self.assertEqual(health["status"], REGISTRY_HEALTH_OK)
+        self.assertTrue(health["exists"])
+        self.assertEqual(
+            health["schema_version"], health["expected_schema_version"]
+        )
+
+    def test_corrupt_registry_is_unreadable(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        registry_path(self.home).write_bytes(b"not a sqlite database at all")
+        health = inspect_registry_health(self.home)
+        self.assertEqual(health["status"], REGISTRY_HEALTH_UNREADABLE)
+        self.assertIn("error", health)
+
+    def test_future_schema_is_invalid(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        import sqlite3
+
+        conn = sqlite3.connect(registry_path(self.home))
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+        conn.close()
+        health = inspect_registry_health(self.home)
+        self.assertEqual(health["status"], REGISTRY_HEALTH_INVALID_SCHEMA)
+        self.assertEqual(health["schema_version"], 99)
+
+    def test_probe_does_not_create_registry(self) -> None:
+        inspect_registry_health(self.home)
+        self.assertFalse(registry_path(self.home).exists())
+
+
+class DoctorWorkspaceRegistrySectionTest(WorkspaceRegistryBase):
+    """The registry-aware doctor section (#11426). Read-only and additive."""
+
+    def _args(self) -> argparse.Namespace:
+        return argparse.Namespace(repo=str(self.repo), home=str(self.home))
+
+    def _section(self, *, live: object = None) -> dict:
+        # Liveness is a tmux question; patch it so the suite is hermetic and
+        # never touches a real tmux server (CI parity).
+        with patch(
+            "mozyo_bridge.application.doctor._live_session_names",
+            return_value=live,
+        ):
+            return doctor_workspace_registry_section(self._args())
+
+    def test_unregistered_workspace_is_ok(self) -> None:
+        section = self._section()
+        self.assertEqual(section["status"], "ok")
+        self.assertEqual(section["home_registry"]["status"], REGISTRY_HEALTH_MISSING)
+        self.assertFalse(section["registration"]["registered"])
+        self.assertEqual(section["consistency"]["status"], "unregistered")
+        self.assertTrue(
+            any("workspace register" in a for a in section["next_action"])
+        )
+
+    def test_registered_workspace_is_ok_and_consistent(self) -> None:
+        result = register_workspace(self.repo, home=self.home)
+        section = self._section()
+        self.assertEqual(section["status"], "ok")
+        self.assertEqual(section["home_registry"]["status"], REGISTRY_HEALTH_OK)
+        self.assertTrue(section["registration"]["registered"])
+        self.assertEqual(
+            section["registration"]["canonical_session"],
+            result.record.canonical_session,
+        )
+        self.assertTrue(section["anchor"]["present"])
+        self.assertEqual(section["consistency"]["status"], "ok")
+        self.assertEqual(section["runtime"]["last_seen"], result.record.last_seen)
+
+    def test_anchor_only_after_registry_deletion_stays_ok(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        registry_path(self.home).unlink()
+        section = self._section()
+        # Resolution still works from the anchor, so this is recoverable, not red.
+        self.assertEqual(section["status"], "ok")
+        self.assertEqual(
+            section["home_registry"]["status"], REGISTRY_HEALTH_MISSING
+        )
+        self.assertFalse(section["registration"]["registered"])
+        self.assertTrue(section["anchor"]["present"])
+        self.assertEqual(section["consistency"]["status"], "anchor-only")
+        self.assertTrue(
+            any("restore it from the anchor" in a for a in section["next_action"])
+        )
+
+    def test_registry_anchor_mismatch_drifts(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        anchor_file = self.repo / ANCHOR_RELATIVE
+        raw = json.loads(anchor_file.read_text(encoding="utf-8"))
+        raw["workspace_id"] = "f" * 32  # diverge from the registry row
+        anchor_file.write_text(json.dumps(raw), encoding="utf-8")
+        section = self._section()
+        self.assertEqual(section["status"], "drifted")
+        self.assertEqual(section["consistency"]["status"], "drift")
+        self.assertTrue(any("reconcile" in a for a in section["next_action"]))
+
+    def test_missing_anchor_is_registry_only_and_ok(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        (self.repo / ANCHOR_RELATIVE).unlink()
+        section = self._section()
+        self.assertEqual(section["status"], "ok")
+        self.assertEqual(section["consistency"]["status"], "registry-only")
+        self.assertTrue(
+            any("rewrite it" in a for a in section["next_action"])
+        )
+
+    def test_corrupt_registry_is_error(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        registry_path(self.home).write_bytes(b"not a sqlite database at all")
+        section = self._section()
+        self.assertEqual(section["status"], "error")
+        self.assertEqual(
+            section["home_registry"]["status"], REGISTRY_HEALTH_UNREADABLE
+        )
+        # Registration is unknown (None), not falsely "unregistered".
+        self.assertIsNone(section["registration"]["registered"])
+
+    def test_future_schema_is_invalid(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        import sqlite3
+
+        conn = sqlite3.connect(registry_path(self.home))
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+        conn.close()
+        section = self._section()
+        self.assertEqual(section["status"], "invalid")
+        self.assertEqual(
+            section["home_registry"]["status"], REGISTRY_HEALTH_INVALID_SCHEMA
+        )
+
+    def test_runtime_active_when_session_live(self) -> None:
+        result = register_workspace(self.repo, home=self.home)
+        section = self._section(live={result.record.canonical_session})
+        self.assertEqual(section["runtime"]["status"], "active")
+        self.assertTrue(section["runtime"]["session_live"])
+        # Liveness never makes the section red.
+        self.assertEqual(section["status"], "ok")
+
+    def test_runtime_stale_when_session_not_live(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        section = self._section(live=set())
+        self.assertEqual(section["runtime"]["status"], "stale")
+        self.assertFalse(section["runtime"]["session_live"])
+        self.assertEqual(section["status"], "ok")
+
+    def test_runtime_unknown_when_tmux_unavailable(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        section = self._section(live=None)
+        self.assertEqual(section["runtime"]["status"], "unknown")
+        self.assertIsNone(section["runtime"]["session_live"])
+
+    def test_section_json_key_stability(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        section = self._section()
+        self.assertEqual(
+            sorted(section),
+            [
+                "anchor",
+                "consistency",
+                "home_registry",
+                "next_action",
+                "registration",
+                "runtime",
+                "status",
+                "target",
+            ],
+        )
+        self.assertEqual(
+            sorted(section["registration"]),
+            [
+                "canonical_session",
+                "display_path",
+                "preset",
+                "preset_version",
+                "registered",
+                "workspace_id",
+            ],
+        )
+        self.assertEqual(
+            sorted(section["runtime"]),
+            ["canonical_session", "last_seen", "reason", "session_live", "status"],
+        )
+
+    def test_text_output_renders_section_and_is_actionable(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        section = self._section(live=set())
+        result = {
+            "ok": True,
+            "sections": {
+                "workspace_registry": section,
+                # format_doctor_text requires a tmux section.
+                "tmux": {"status": "ok", "next_action": []},
+            },
+        }
+        text = format_doctor_text(result)
+        self.assertIn("workspace_registry:", text)
+        self.assertIn("home_registry:", text)
+        self.assertIn("runtime:", text)
 
 
 if __name__ == "__main__":
