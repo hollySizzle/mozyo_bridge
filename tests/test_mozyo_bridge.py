@@ -3314,6 +3314,132 @@ class ScaffoldRulesTest(unittest.TestCase):
         self.assertIn("colour108", claude)
         self.assertNotIn("colour", other)
 
+    def test_governed_tmux_snippet_declares_attention_marker(self) -> None:
+        """Every distributed agent-ui.conf renders the #11954 attention projection.
+
+        Static checks (no tmux needed, so CI stays green) that both
+        packaged preset copies and the repo-local snippet read the
+        `@mozyo_attention_*` pane user options and map each non-healthy
+        attention state to a short uppercase label, with severity-driven
+        colour as an auxiliary hint. `healthy` carries no label so healthy
+        panes stay quiet, and the agent-name colours are left untouched.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        confs = [
+            repo_root
+            / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
+            repo_root
+            / "src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
+            repo_root / ".mozyo-bridge/tmux/agent-ui.conf",
+        ]
+        for conf in confs:
+            text = conf.read_text(encoding="utf-8")
+            self.assertIn("@mozyo_attention_state", text, msg=str(conf))
+            self.assertIn("@mozyo_attention_severity", text, msg=str(conf))
+            for label in ("OWNER", "REVIEW", "BLOCKED", "STALLED", "DONE", "RETIRE", "UNKNOWN"):
+                self.assertIn(label, text, msg=f"{conf} missing {label}")
+            # healthy is quiet by default: no HEALTHY label is ever rendered.
+            self.assertNotIn("HEALTHY", text, msg=str(conf))
+            # The agent-name colour distinction stays intact.
+            self.assertIn("colour108", text, msg=str(conf))
+            self.assertIn("colour67", text, msg=str(conf))
+
+    def test_repo_local_tmux_snippet_matches_governed_preset(self) -> None:
+        """The repo-local snippet stays byte-identical to the governed preset.
+
+        The preset side is the source of truth for the distributed
+        artifact; the scaffolded repo-local copy must not drift from it.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        preset = (
+            repo_root
+            / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf"
+        ).read_text(encoding="utf-8")
+        local = (repo_root / ".mozyo-bridge/tmux/agent-ui.conf").read_text(encoding="utf-8")
+        self.assertEqual(preset, local)
+
+    def test_governed_tmux_snippet_renders_attention_marker_under_tmux(self) -> None:
+        """Under real tmux the marker reflects the `@mozyo_attention_*` options.
+
+        Sourcing the snippet and setting the pane user options must
+        surface the derived state as a label suffix in the
+        window-status format while leaving the agent-name colour intact.
+        An unset / healthy state renders no marker, and an unrecognised
+        state fails safe to UNKNOWN rather than looking healthy. Skipped
+        when tmux is not on PATH (the static checks above keep CI green).
+        """
+        import shutil as _shutil
+        import subprocess
+
+        if _shutil.which("tmux") is None:
+            self.skipTest("tmux binary not on PATH")
+
+        snippet = Path(__file__).resolve().parents[1] / ".mozyo-bridge/tmux/agent-ui.conf"
+        self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
+
+        socket = f"mozyo-attn-{os.getpid()}"
+        env = os.environ.copy()
+        env.pop("TMUX", None)
+        env.pop("TMUX_PANE", None)
+
+        def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["tmux", "-L", socket, *argv],
+                capture_output=True,
+                text=True,
+                check=check,
+                env=env,
+            )
+
+        subprocess.run(
+            ["tmux", "-L", socket, "kill-server"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        try:
+            tmux("-f", "/dev/null", "new-session", "-d", "-s", "attn", "-n", "codex", "sleep 60")
+            tmux("source-file", str(snippet))
+            fmt = tmux("show-options", "-gqv", "window-status-format").stdout.strip()
+            self.assertTrue(fmt, msg="window-status-format was empty after source-file")
+
+            def render() -> str:
+                return tmux("display-message", "-p", "-t", "attn:codex", fmt).stdout.strip()
+
+            def set_attention(state: str, severity: str = "normal") -> None:
+                tmux("set-option", "-p", "-t", "attn:0", "@mozyo_attention_state", state)
+                tmux("set-option", "-p", "-t", "attn:0", "@mozyo_attention_severity", severity)
+
+            # Unset attention -> no marker, agent colour intact. The quiet
+            # render is exactly the agent-name segment (no label suffix).
+            quiet = "#[fg=colour67]0:codex#[default]"
+            self.assertEqual(quiet, render())
+
+            # review_waiting/notice -> REVIEW label; agent colour preserved.
+            set_attention("review_waiting", "notice")
+            review = render()
+            self.assertIn("[REVIEW]", review, msg=review)
+            self.assertIn("colour67", review)
+
+            # blocked/critical -> BLOCKED label.
+            set_attention("blocked", "critical")
+            self.assertIn("[BLOCKED]", render())
+
+            # Unrecognised state fails safe to UNKNOWN, never healthy-looking.
+            set_attention("weird", "normal")
+            self.assertIn("[UNKNOWN]", render())
+
+            # healthy -> marker suppressed again so healthy panes stay quiet.
+            set_attention("healthy", "normal")
+            self.assertEqual(quiet, render())
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket, "kill-server"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
     def test_governed_scaffold_skip_flags_omit_artifacts_and_manifest_entries(self) -> None:
         """`--skip-tmux-ui` / `--skip-nagger` opt-outs drop the category.
 
