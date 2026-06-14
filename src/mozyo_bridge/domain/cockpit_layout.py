@@ -26,7 +26,7 @@ unit-tested without a live tmux server.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 COCKPIT_SESSION_DEFAULT = "mozyo-cockpit"
 COCKPIT_WINDOW = "cockpit"
@@ -319,6 +319,188 @@ def resolve_lane_identity(
         label = branch_label or _basename(repo_root) or None
         return LaneIdentity(lane_id=_lane_hash(seed), lane_label=label)
     return LaneIdentity(lane_id=DEFAULT_LANE, lane_label=branch_label)
+
+
+# --- Cockpit adopt detection (Redmine #11897, Phase 1: detect + advisory) -----
+#
+# A normal `mozyo` session and a cockpit column can co-exist for the same
+# workspace+lane (Redmine #11816 j#57823): the daily `cd <ws> && mozyo` rail puts
+# each agent in its own tmux *window* (role on the window name), while the cockpit
+# puts them in one `cockpit` window (role on `@mozyo_agent_role`). Phase 1 is
+# strictly NON-DESTRUCTIVE — it only *detects* a co-existing normal session and
+# advises that it is an adopt candidate. It never plans or runs a `join-pane`
+# transfer; the explicit, confirm-gated pane move is Phase 2 (Redmine #11898).
+
+# Adopt advisory grading (fail-closed by design, j#57823):
+ADOPT_STATUS_NONE = "none"  # no co-existing normal session for this workspace+lane
+ADOPT_STATUS_CANDIDATE = "candidate"  # exactly one normal session with BOTH agents
+ADOPT_STATUS_PARTIAL = "partial"  # one normal session but only one role present
+ADOPT_STATUS_AMBIGUOUS = "ambiguous"  # more than one matching normal session
+
+_PHASE2_POINTER = (
+    "Phase 1 detects only; explicit pane adoption is Redmine #11898 / Phase 2 — "
+    "no panes are moved."
+)
+
+
+@dataclass(frozen=True)
+class NormalSessionObservation:
+    """One normal-`mozyo` agent pane projected for adopt detection (#11897).
+
+    A privacy-aware, pure-input projection of a discovered agent pane: the tmux
+    ``session`` it lives in, the resolved ``workspace_id`` + ``lane_id`` of its
+    checkout, its ``role`` (``claude`` / ``codex``), and ``pane_id`` for operator
+    reference. The application layer builds these from the session inventory; the
+    detector below stays pure and testable without tmux.
+    """
+
+    session: str
+    workspace_id: str
+    lane_id: str
+    role: str
+    pane_id: str = ""
+
+
+@dataclass(frozen=True)
+class CoexistingNormalSession:
+    """A normal `mozyo` session co-existing with the cockpit for one workspace+lane."""
+
+    session: str
+    roles: tuple[str, ...]  # sorted distinct agent roles present (claude/codex)
+    pane_ids: tuple[str, ...]  # sorted pane ids, operator reference only
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "roles": list(self.roles),
+            "pane_ids": list(self.pane_ids),
+        }
+
+
+@dataclass(frozen=True)
+class AdoptAdvisory:
+    """The read-only result of cockpit-adopt detection (#11897, Phase 1).
+
+    ``status`` grades adoptability (see ``ADOPT_STATUS_*``); only a
+    ``candidate`` is :pyattr:`adoptable`. ``message`` is the human advisory line
+    (``None`` only for :data:`ADOPT_STATUS_NONE`, where there is nothing to say).
+    This describes what an advisory should report — it carries no plan and moves
+    no panes.
+    """
+
+    workspace_id: str
+    lane_id: str
+    status: str
+    candidates: tuple[CoexistingNormalSession, ...]
+    message: Optional[str]
+
+    @property
+    def adoptable(self) -> bool:
+        return self.status == ADOPT_STATUS_CANDIDATE
+
+    @property
+    def has_candidates(self) -> bool:
+        return bool(self.candidates)
+
+    def as_dict(self) -> dict:
+        return {
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "status": self.status,
+            "adoptable": self.adoptable,
+            "candidates": [c.as_dict() for c in self.candidates],
+            "message": self.message,
+        }
+
+
+def detect_adopt_candidates(
+    *,
+    workspace_id: str,
+    lane_id: str,
+    observations: Iterable[NormalSessionObservation],
+    cockpit_session: str = COCKPIT_SESSION_DEFAULT,
+) -> AdoptAdvisory:
+    """Detect co-existing normal `mozyo` sessions for one workspace+lane (#11897).
+
+    Pure and read-only: it classifies what a non-destructive cockpit-adopt
+    advisory should say and never plans or runs a pane transfer. Only
+    observations matching this exact ``workspace_id`` + ``lane_id`` (lane
+    normalized, so a pre-#11820 empty lane matches ``default``) and carrying a
+    real agent role are considered; the cockpit's own session is excluded so its
+    columns never look like an adopt source.
+
+    Fail-closed grading (Redmine #11816 j#57823): a single normal session
+    carrying BOTH agents is an adopt :data:`ADOPT_STATUS_CANDIDATE`; one role
+    only is :data:`ADOPT_STATUS_PARTIAL`; more than one matching normal session
+    is :data:`ADOPT_STATUS_AMBIGUOUS`; none is :data:`ADOPT_STATUS_NONE`. Only a
+    candidate is adoptable — every other state is advisory-only.
+    """
+    target_lane = normalize_lane(lane_id)
+    by_session: dict[str, dict] = {}
+    order: list[str] = []
+    for obs in observations:
+        if obs.role not in ROLES:
+            continue
+        if obs.session == cockpit_session:
+            continue
+        if obs.workspace_id != workspace_id:
+            continue
+        if normalize_lane(obs.lane_id) != target_lane:
+            continue
+        bucket = by_session.get(obs.session)
+        if bucket is None:
+            bucket = {"roles": set(), "pane_ids": set()}
+            by_session[obs.session] = bucket
+            order.append(obs.session)
+        bucket["roles"].add(obs.role)
+        if obs.pane_id:
+            bucket["pane_ids"].add(obs.pane_id)
+
+    candidates = tuple(
+        CoexistingNormalSession(
+            session=name,
+            roles=tuple(sorted(by_session[name]["roles"])),
+            pane_ids=tuple(sorted(by_session[name]["pane_ids"])),
+        )
+        for name in order
+    )
+
+    if not candidates:
+        return AdoptAdvisory(workspace_id, target_lane, ADOPT_STATUS_NONE, (), None)
+
+    where = f"workspace {workspace_id!r} lane {target_lane!r}"
+    if len(candidates) > 1:
+        names = ", ".join(repr(c.session) for c in candidates)
+        message = (
+            f"notice: {len(candidates)} co-existing normal `mozyo` sessions "
+            f"({names}) match {where}; cockpit adopt is ambiguous and fails "
+            f"closed — resolve to a single session before adopting. {_PHASE2_POINTER}"
+        )
+        return AdoptAdvisory(
+            workspace_id, target_lane, ADOPT_STATUS_AMBIGUOUS, candidates, message
+        )
+
+    only = candidates[0]
+    if set(only.roles) >= set(ROLES):
+        message = (
+            f"notice: co-existing normal `mozyo` session {only.session!r} "
+            f"(claude+codex) is running for {where} and is not in the cockpit. "
+            f"It is an adopt candidate — inspect it with `mozyo cockpit adopt`. "
+            f"{_PHASE2_POINTER}"
+        )
+        return AdoptAdvisory(
+            workspace_id, target_lane, ADOPT_STATUS_CANDIDATE, candidates, message
+        )
+
+    present = ", ".join(only.roles)
+    message = (
+        f"notice: co-existing normal `mozyo` session {only.session!r} for {where} "
+        f"carries only {present}; both claude and codex are required to adopt, so "
+        f"it fails closed. {_PHASE2_POINTER}"
+    )
+    return AdoptAdvisory(
+        workspace_id, target_lane, ADOPT_STATUS_PARTIAL, candidates, message
+    )
 
 
 def build_cockpit_plan(

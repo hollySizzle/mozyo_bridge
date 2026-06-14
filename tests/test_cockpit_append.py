@@ -235,27 +235,46 @@ class CockpitDecisionTest(unittest.TestCase):
         return argparse.Namespace(**base)
 
     @contextlib.contextmanager
-    def _patched(self, *, columns, ws_id="wsX", session_present=False, lane=None):
+    def _patched(
+        self, *, columns, ws_id="wsX", session_present=False, lane=None, advisory=None
+    ):
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
+        from mozyo_bridge.domain.cockpit_layout import (
+            ADOPT_STATUS_NONE,
+            AdoptAdvisory,
+            DEFAULT_LANE,
+            LaneIdentity,
+        )
 
         canon = argparse.Namespace(name="sessX", workspace_id=ws_id)
         lane = lane if lane is not None else LaneIdentity(DEFAULT_LANE, None)
+        # Stub the adopt detector so the create/append/focus tests stay hermetic
+        # (#11897): the real one would read the live session inventory via tmux.
+        advisory = advisory if advisory is not None else AdoptAdvisory(
+            ws_id, DEFAULT_LANE, ADOPT_STATUS_NONE, (), None
+        )
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_agent_launch_command", side_effect=lambda r, s, c: f"{r}-cmd"), \
             patch.object(commands, "require_tmux"), \
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
             patch.object(commands, "_resolve_workspace_lane", return_value=lane), \
+            patch.object(commands, "_cockpit_adopt_advisory", return_value=advisory), \
             patch.object(commands, "session_exists", return_value=session_present), \
             patch.object(commands, "run_tmux") as run_tmux, \
             patch.object(commands.os, "execvp", side_effect=RuntimeError("attach")) as execvp:
             yield run_tmux, execvp
 
-    def _run(self, args, columns, ws_id="wsX", session_present=False, lane=None):
+    def _run(
+        self, args, columns, ws_id="wsX", session_present=False, lane=None, advisory=None
+    ):
         from mozyo_bridge.application.commands import cmd_cockpit
 
         with self._patched(
-            columns=columns, ws_id=ws_id, session_present=session_present, lane=lane
+            columns=columns,
+            ws_id=ws_id,
+            session_present=session_present,
+            lane=lane,
+            advisory=advisory,
         ) as (run_tmux, execvp):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 try:
@@ -455,6 +474,63 @@ class CockpitDecisionTest(unittest.TestCase):
         # the created pane %1 was killed; no blanket kill-session.
         self.assertTrue(any(c[:1] == ("kill-pane",) and "%1" in c for c in calls))
         self.assertFalse(any(c[:1] == ("kill-session",) for c in calls))
+
+    # --- Adopt advisory rides the normal flow as a non-mutating notice (#11897) ---
+
+    def _candidate_advisory(self):
+        from mozyo_bridge.domain.cockpit_layout import detect_adopt_candidates
+        from mozyo_bridge.domain.cockpit_layout import NormalSessionObservation
+
+        return detect_adopt_candidates(
+            workspace_id="wsX",
+            lane_id="default",
+            observations=[
+                NormalSessionObservation("mozyo-ws", "wsX", "default", "codex", "%2"),
+                NormalSessionObservation("mozyo-ws", "wsX", "default", "claude", "%3"),
+            ],
+        )
+
+    def test_advisory_surfaced_in_dry_run_append(self) -> None:
+        cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, advisory=self._candidate_advisory()
+        )
+        self.assertIn("action=append", out)
+        self.assertIn("adopt candidate", out)  # advisory printed under the plan
+
+    def test_advisory_in_json_payload(self) -> None:
+        cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
+        out, _r, _e = self._run(
+            self._args(dry_run=False, json_output=True),
+            columns=cols,
+            advisory=self._candidate_advisory(),
+        )
+        payload = json.loads(out)
+        self.assertEqual("append", payload["action"])
+        self.assertTrue(payload["adopt_advisory"]["adoptable"])
+        self.assertEqual("candidate", payload["adopt_advisory"]["status"])
+
+    def test_no_advisory_on_focus(self) -> None:
+        # The workspace is already a cockpit column (focus): adopt does not fire
+        # even when the detector would surface a candidate (focus priority,
+        # j#57823), so no advisory line is printed.
+        cols = [{"pane_id": "%5", "workspace_id": "wsX", "role": "codex"}]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX", advisory=self._candidate_advisory()
+        )
+        self.assertIn("action=focus", out)
+        self.assertNotIn("adopt candidate", out)
+
+    def test_advisory_surfaced_after_real_append(self) -> None:
+        from mozyo_bridge.application.commands import cmd_cockpit
+
+        cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
+        with self._patched(columns=cols, advisory=self._candidate_advisory()) as (run_tmux, execvp):
+            run_tmux.return_value = argparse.Namespace(returncode=0, stdout="%9", stderr="")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                cmd_cockpit(self._args(dry_run=False))
+        self.assertIn("appended", out.getvalue())
+        self.assertIn("adopt candidate", out.getvalue())
 
     def test_focus_executes_without_attach(self) -> None:
         from mozyo_bridge.application.commands import cmd_cockpit

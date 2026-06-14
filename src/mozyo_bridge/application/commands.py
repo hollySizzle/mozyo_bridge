@@ -16,6 +16,7 @@ from mozyo_bridge.domain.agent_discovery import (
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     CONFIDENCE_STRONG,
+    ROLE_SOURCE_WINDOW_NAME,
     build_target_candidates,
     discover_agents,
     filter_agents,
@@ -1375,6 +1376,144 @@ def _resolve_workspace_lane(repo_root: str, workspace_id):
     )
 
 
+def _coexisting_normal_observations(cockpit_session: str):
+    """Project the live inventory into normal-`mozyo` adopt observations (#11897).
+
+    Tolerant and read-only: it reuses the cross-workspace session inventory
+    (`take_inventory`) and keeps only panes that are a *normal* `mozyo` agent for
+    the adopt detector — a classified codex/claude pane whose role came from the
+    window name (`role_source == window_name`), living outside the cockpit
+    session. Cockpit panes carry the role on `@mozyo_agent_role`
+    (`role_source == pane_option`) and are excluded so a cockpit column never
+    looks like an adopt source. Any failure (no tmux, inventory error) degrades
+    to ``[]`` so the advisory can never break the cockpit flow.
+    """
+    from mozyo_bridge.domain.cockpit_layout import NormalSessionObservation
+
+    try:
+        from mozyo_bridge.session_inventory import take_inventory
+
+        snapshot = take_inventory()
+    except Exception:
+        return []
+
+    lane_cache: dict[str, object] = {}
+    observations = []
+    for rec in snapshot.records:
+        if rec.agent_kind not in (AGENT_KIND_CODEX, AGENT_KIND_CLAUDE):
+            continue
+        if rec.session == cockpit_session:
+            continue
+        if rec.role_source != ROLE_SOURCE_WINDOW_NAME:
+            continue
+        workspace_id = (
+            (rec.workspace.workspace_id if rec.workspace else None)
+            or rec.repo_root
+            or rec.session
+        )
+        repo_root = rec.repo_root or ""
+        if repo_root not in lane_cache:
+            lane_cache[repo_root] = _resolve_workspace_lane(
+                repo_root, rec.workspace.workspace_id if rec.workspace else None
+            )
+        lane = lane_cache[repo_root]
+        observations.append(
+            NormalSessionObservation(
+                session=rec.session,
+                workspace_id=workspace_id,
+                lane_id=lane.lane_id,
+                role=rec.agent_kind,
+                pane_id=rec.pane_id,
+            )
+        )
+    return observations
+
+
+def _cockpit_adopt_advisory(workspace, cockpit_session: str):
+    """Detect a co-existing normal `mozyo` session for ``workspace`` (#11897).
+
+    Wraps the pure :func:`detect_adopt_candidates` over the live inventory
+    projection. Read-only and tolerant: it never moves a pane and always returns
+    an :class:`AdoptAdvisory` (a benign ``none`` advisory when nothing is found
+    or the inventory is unavailable).
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        AdoptAdvisory,
+        ADOPT_STATUS_NONE,
+        detect_adopt_candidates,
+        normalize_lane,
+    )
+
+    lane_id = normalize_lane(workspace.lane_id)
+    try:
+        return detect_adopt_candidates(
+            workspace_id=workspace.workspace_id,
+            lane_id=workspace.lane_id,
+            observations=_coexisting_normal_observations(cockpit_session),
+            cockpit_session=cockpit_session,
+        )
+    except Exception:
+        return AdoptAdvisory(
+            workspace.workspace_id, lane_id, ADOPT_STATUS_NONE, (), None
+        )
+
+
+def _emit_cockpit_adopt(args, workspace, session, *, already_in_cockpit, advisory):
+    """Render `mozyo cockpit adopt` — Phase 1 detect-only output (#11897).
+
+    Non-mutating by contract: it reports the detection result (human or
+    ``--json``) and never plans or runs a pane transfer. ``--dry-run`` and the
+    bare form produce the same human report (both are already read-only); the
+    explicit, confirm-gated pane move is Phase 2 (Redmine #11898).
+    """
+    import json as _json
+
+    from mozyo_bridge.domain.cockpit_layout import normalize_lane
+
+    lane_id = normalize_lane(workspace.lane_id)
+    if bool(getattr(args, "json_output", False)):
+        payload = {
+            "command": "cockpit adopt",
+            "phase": 1,
+            "mutating": False,
+            "session": session,
+            "workspace_id": workspace.workspace_id,
+            "lane_id": lane_id,
+            "lane_label": workspace.lane_label,
+            "already_in_cockpit": already_in_cockpit,
+            "advisory": advisory.as_dict(),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print(
+        f"cockpit adopt (detect-only, Phase 1; no panes moved): session={session} "
+        f"workspace={workspace.workspace_id} ({workspace.label}) lane={lane_id}"
+    )
+    if already_in_cockpit:
+        print(
+            "  this workspace+lane is already a cockpit column; focus it with "
+            "`mozyo cockpit` — nothing to adopt."
+        )
+    for candidate in advisory.candidates:
+        print(
+            f"  candidate: session={candidate.session} "
+            f"roles={','.join(candidate.roles) or '-'} "
+            f"panes={','.join(candidate.pane_ids) or '-'}"
+        )
+    if advisory.message:
+        print(f"  {advisory.message}")
+    elif not advisory.has_candidates:
+        print(
+            "  no co-existing normal `mozyo` session found for this workspace+lane."
+        )
+    print(
+        "  explicit pane adoption (moving the live panes into the cockpit) is "
+        "Redmine #11898 / Phase 2 and is not implemented here."
+    )
+    return 0
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -1401,6 +1540,11 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
     json_output = bool(getattr(args, "json_output", False))
     dry_run = bool(getattr(args, "dry_run", False))
+    # `mozyo cockpit adopt` (Redmine #11897, Phase 1) is a detect-only sub-action:
+    # it reports a co-existing normal `mozyo` session as an adopt candidate and
+    # moves NO panes (explicit transfer is Phase 2 / #11898). Like `--dry-run` /
+    # `--json` it is read-only, so it never gates on tmux being mutable.
+    adopt_mode = getattr(args, "action", None) == "adopt"
     inspect_only = dry_run or json_output
     no_attach = bool(getattr(args, "no_attach", False))
 
@@ -1423,7 +1567,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     # / `--json` only read (never mutate) — `_read_cockpit_columns` /
     # `_cockpit_session_present` are tolerant so a missing/stale cockpit
     # degrades gracefully instead of aborting.
-    if not inspect_only:
+    if not inspect_only and not adopt_mode:
         require_tmux()
     columns = _read_cockpit_columns(session)
     session_present = _cockpit_session_present(session)
@@ -1443,6 +1587,27 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             and normalize_lane(c.get("lane_id")) == target_lane
         ),
         None,
+    )
+
+    # `mozyo cockpit adopt` short-circuits to detect-only reporting (#11897): it
+    # never creates / appends / focuses and moves no panes. `same is not None`
+    # means the workspace+lane is already a cockpit column (focus priority,
+    # j#57823), so there is nothing to adopt.
+    if adopt_mode:
+        return _emit_cockpit_adopt(
+            args,
+            workspace,
+            session,
+            already_in_cockpit=same is not None,
+            advisory=_cockpit_adopt_advisory(workspace, session),
+        )
+
+    # Adopt advisory rides the normal create/append flow as a NON-mutating notice
+    # (#11897): a co-existing normal `mozyo` session for this workspace+lane is an
+    # adopt candidate the operator may prefer over a fresh column. Skipped on the
+    # focus path (`same is not None`), where the cockpit already shows it.
+    adopt_advisory = (
+        _cockpit_adopt_advisory(workspace, session) if same is None else None
     )
 
     # `plan is None` marks a blocked action (stale cockpit) — fail-closed on a
@@ -1499,6 +1664,9 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         payload["lane_label"] = workspace.lane_label
         payload["session"] = session
         payload["blocked"] = blocked_reason
+        payload["adopt_advisory"] = (
+            adopt_advisory.as_dict() if adopt_advisory is not None else None
+        )
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if dry_run:
@@ -1512,6 +1680,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         else:
             for cmd in plan.commands:
                 print("  tmux " + " ".join(_shlex.quote(token) for token in cmd.argv))
+        if adopt_advisory is not None and adopt_advisory.message:
+            print(f"  {adopt_advisory.message}")
         return 0
 
     if blocked_reason:
@@ -1525,6 +1695,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         # killed, so an existing session is left intact (#11803 review).
         execute_cockpit_plan(plan, run_tmux, cleanup_captured=True)
         print(f"cockpit created: session={session} workspace={workspace.label}")
+        if adopt_advisory is not None and adopt_advisory.message:
+            print(f"  {adopt_advisory.message}")
         if no_attach:
             print(f"attach: tmux -CC attach -t {session}")
             return 0
@@ -1550,6 +1722,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         f"appended {workspace.label!r} as a new column to cockpit {session!r}; "
         "switch to your cockpit window to see it (no new iTerm window opened)"
     )
+    if adopt_advisory is not None and adopt_advisory.message:
+        print(f"  {adopt_advisory.message}")
     return 0
 
 

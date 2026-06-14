@@ -479,12 +479,15 @@ def build_parser() -> argparse.ArgumentParser:
     cockpit.add_argument(
         "action",
         nargs="?",
-        choices=["append"],
+        choices=["append", "adopt"],
         default=None,
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
             "behavior as bare `mozyo cockpit`; both auto-decide create / append "
-            "/ focus from the live cockpit state."
+            "/ focus from the live cockpit state. `adopt` (Redmine #11897, "
+            "Phase 1) is detect-only: it reports a co-existing normal `mozyo` "
+            "session for this workspace+lane as an adopt candidate and moves no "
+            "panes (explicit pane adoption is Phase 2 / #11898)."
         ),
     )
     cockpit.add_argument(
