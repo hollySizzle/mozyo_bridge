@@ -285,6 +285,22 @@ documents:
       - logic-worktree-lifecycle-boundary
       - skill-workflow-reference
 
+  - id: logic-cockpit-attention-state
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/cockpit-attention-state.md
+    purpose: cockpit / sublane pane の owner_waiting / review_waiting / blocked / stalled / done などの attention state を durable state から導出し、tmux/cockpit 表示へ projection する責務分界。
+    audit_role: cockpit_attention_state_logic
+    related_document_refs:
+      - logic-cockpit-sublane-operating-model
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-managed-state-model
+      - logic-event-timeline-source
+      - logic-tmux-send-safety-contract
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-cross-project-cockpit-smoke-runbook
     type: logic
     status: active
