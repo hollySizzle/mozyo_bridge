@@ -285,6 +285,21 @@ documents:
       - logic-worktree-lifecycle-boundary
       - skill-workflow-reference
 
+  - id: logic-cross-project-cockpit-smoke-runbook
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/cross-project-cockpit-smoke-runbook.md
+    purpose: "cross-project cockpit に別 project Unit を載せる時の generic runbook と smoke 観点。append / adopt preview、agents targets 確認、Codex gateway handoff、host boundary、follow-up 分割条件を定義する。"
+    audit_role: cross_project_cockpit_smoke_runbook_logic
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-cockpit-sublane-operating-model
+      - logic-tmux-send-safety-contract
+      - logic-worktree-lifecycle-boundary
+      - rule-public-private-boundary
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-unit-target-model
     type: logic
     status: active
@@ -299,6 +314,7 @@ documents:
       - logic-session-inventory
       - logic-workspace-registry
       - logic-workspace-anchor-project-defaults-migration
+      - logic-cross-project-cockpit-smoke-runbook
       - rule-public-private-boundary
       - spec-project-map
 

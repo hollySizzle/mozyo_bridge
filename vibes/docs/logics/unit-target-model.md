@@ -323,6 +323,9 @@ rename の判断と compatibility story は `workspace-anchor-project-defaults-m
 5. workspace anchor / project defaults の rename migration を判断する (#11910)。
 6. cross-project cockpit smoke / runbook を定義する (#11911)。
 
+cross-project cockpit の具体的な preview / append / adopt / discovery / handoff smoke は
+`cross-project-cockpit-smoke-runbook.md` を正本とする。
+
 ## 検証
 
 - `mozyo-bridge docs validate --repo .`
