@@ -266,12 +266,18 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
 
 
 class CockpitAdoptCommandTest(unittest.TestCase):
-    """`mozyo cockpit adopt` is detect-only — it reports, never mutates (#11897)."""
+    """`mozyo cockpit adopt` without `--confirm` is preview-only — reports, never moves.
+
+    Phase 2 (#11898) keeps the Phase 1 safety default: with no `--confirm` the
+    command detects + previews and moves no panes. The confirm-gated move itself
+    is covered in test_cockpit_adopt_phase2.py.
+    """
 
     def _args(self, **over):
         base = dict(
             action="adopt", repo="/workspace/project-alpha", codex_ratio=70,
             cockpit_session=None, dry_run=False, json_output=False, no_attach=False,
+            confirm=False,
         )
         base.update(over)
         return argparse.Namespace(**base)
@@ -288,6 +294,7 @@ class CockpitAdoptCommandTest(unittest.TestCase):
             patch.object(commands, "require_tmux") as require_tmux, \
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
             patch.object(commands, "_cockpit_adopt_advisory", return_value=advisory), \
+            patch.object(commands, "_session_attached_clients", return_value=()), \
             patch.object(commands, "session_exists", return_value=bool(columns)), \
             patch.object(commands, "run_tmux") as run_tmux, \
             patch.object(commands.os, "execvp", side_effect=RuntimeError("attach")) as execvp:
@@ -311,27 +318,39 @@ class CockpitAdoptCommandTest(unittest.TestCase):
             ],
         )
 
-    def test_reports_candidate_and_never_mutates(self) -> None:
+    def _cockpit_columns(self):
+        # An existing cockpit holding a different workspace's column, so an
+        # adopted column can be anchored beside it.
+        return [{"pane_id": "%9", "workspace_id": "wsOTHER", "role": "codex",
+                 "lane_id": "default", "pane_left": 0, "pane_width": 80}]
+
+    def test_previews_candidate_plan_and_never_mutates(self) -> None:
         rc, out, require_tmux, run_tmux, execvp = self._run(
-            self._args(), columns=None, advisory=self._candidate_advisory()
+            self._args(), columns=self._cockpit_columns(),
+            advisory=self._candidate_advisory(),
         )
         self.assertEqual(0, rc)
-        self.assertIn("detect-only", out)
+        self.assertIn("preview", out)
         self.assertIn("candidate: session=mozyo-ws", out)
-        self.assertIn("#11898", out)
-        run_tmux.assert_not_called()  # read-only / non-mutating
+        self.assertIn("adopt plan", out)
+        self.assertIn("join-pane", out)  # the planned move is shown
+        self.assertIn("--confirm", out)  # told how to execute
+        run_tmux.assert_not_called()  # no mutation without --confirm
         execvp.assert_not_called()  # never attaches / spawns a window
-        require_tmux.assert_not_called()  # adopt does not gate on mutable tmux
+        require_tmux.assert_not_called()  # preview does not gate on mutable tmux
 
     def test_json_payload_is_non_mutating(self) -> None:
         rc, out, _rt, run_tmux, _ev = self._run(
-            self._args(json_output=True), columns=None, advisory=self._candidate_advisory()
+            self._args(json_output=True), columns=self._cockpit_columns(),
+            advisory=self._candidate_advisory(),
         )
         payload = json.loads(out)
         self.assertEqual("cockpit adopt", payload["command"])
-        self.assertEqual(1, payload["phase"])
-        self.assertFalse(payload["mutating"])
+        self.assertEqual(2, payload["phase"])
+        self.assertFalse(payload["executes"])  # json never runs tmux
+        self.assertFalse(payload["would_execute"])  # no --confirm
         self.assertFalse(payload["already_in_cockpit"])
+        self.assertIsNotNone(payload["plan"])  # a clean candidate -> a plan
         self.assertTrue(payload["advisory"]["adoptable"])
         run_tmux.assert_not_called()
 
@@ -358,7 +377,8 @@ class CockpitAdoptCommandTest(unittest.TestCase):
             self._args(), columns=None, advisory=none_advisory
         )
         self.assertEqual(0, rc)
-        self.assertIn("no co-existing normal", out)
+        self.assertIn("cannot adopt", out)
+        self.assertIn("co-existing normal", out)
         run_tmux.assert_not_called()
 
 

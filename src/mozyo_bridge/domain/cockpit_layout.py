@@ -338,8 +338,8 @@ ADOPT_STATUS_PARTIAL = "partial"  # one normal session but only one role present
 ADOPT_STATUS_AMBIGUOUS = "ambiguous"  # more than one matching normal session
 
 _PHASE2_POINTER = (
-    "Phase 1 detects only; explicit pane adoption is Redmine #11898 / Phase 2 — "
-    "no panes are moved."
+    "Explicit pane adoption is `mozyo cockpit adopt --confirm` (Redmine #11898); "
+    "without --confirm adopt only previews and moves no panes."
 )
 
 
@@ -368,12 +368,18 @@ class CoexistingNormalSession:
     session: str
     roles: tuple[str, ...]  # sorted distinct agent roles present (claude/codex)
     pane_ids: tuple[str, ...]  # sorted pane ids, operator reference only
+    # Sorted ``(role, pane_id)`` pairs (Redmine #11898 / Phase 2). ``roles`` and
+    # ``pane_ids`` above are sorted independently and so lose the role->pane
+    # mapping; the confirm-gated adopt move (codex top, claude bottom) needs to
+    # know *which* pane is which role, so the mapping is carried explicitly here.
+    agent_panes: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict:
         return {
             "session": self.session,
             "roles": list(self.roles),
             "pane_ids": list(self.pane_ids),
+            "agent_panes": [list(pair) for pair in self.agent_panes],
         }
 
 
@@ -449,18 +455,20 @@ def detect_adopt_candidates(
             continue
         bucket = by_session.get(obs.session)
         if bucket is None:
-            bucket = {"roles": set(), "pane_ids": set()}
+            bucket = {"roles": set(), "pane_ids": set(), "pairs": set()}
             by_session[obs.session] = bucket
             order.append(obs.session)
         bucket["roles"].add(obs.role)
         if obs.pane_id:
             bucket["pane_ids"].add(obs.pane_id)
+            bucket["pairs"].add((obs.role, obs.pane_id))
 
     candidates = tuple(
         CoexistingNormalSession(
             session=name,
             roles=tuple(sorted(by_session[name]["roles"])),
             pane_ids=tuple(sorted(by_session[name]["pane_ids"])),
+            agent_panes=tuple(sorted(by_session[name]["pairs"])),
         )
         for name in order
     )
@@ -500,6 +508,200 @@ def detect_adopt_candidates(
     )
     return AdoptAdvisory(
         workspace_id, target_lane, ADOPT_STATUS_PARTIAL, candidates, message
+    )
+
+
+# --- Cockpit adopt move (Redmine #11898, Phase 2: confirm-gated pane move) -----
+#
+# Phase 1 (#11897) only *detects* a co-existing normal `mozyo` session and advises
+# that it is an adopt candidate. Phase 2 plans the explicit, confirm-gated move of
+# that session's live codex/claude panes into the cockpit as a new column, using
+# `join-pane` (which *moves* a live pane, preserving its `%pane` id and the agent
+# running in it) rather than `split-window` (which would spawn fresh agents). The
+# plan is pure and inspectable; the application-layer executor runs it atomically
+# with best-effort rollback. Scope (j#57880 risk posture): this US adopts into an
+# *existing* cockpit only — bootstrapping a brand-new cockpit session out of a
+# moved pair is deliberately out of scope to avoid a fragile partial live move;
+# the operator creates the cockpit first (`mozyo cockpit`) and then adopts.
+
+
+def adopt_pane_pair(candidate: "CoexistingNormalSession") -> Optional[tuple[str, str]]:
+    """The ``(codex_pane, claude_pane)`` ids to move, or ``None`` if ambiguous.
+
+    Fail-closed on role ambiguity (Redmine #11898 acceptance): a clean adopt
+    needs *exactly one* codex pane and *exactly one* claude pane. If a role maps
+    to zero or more than one pane the pair is unknown, so the move must not be
+    planned (the caller treats ``None`` as a fail-closed block).
+    """
+    codex = [pane for (role, pane) in candidate.agent_panes if role == ROLE_CODEX]
+    claude = [pane for (role, pane) in candidate.agent_panes if role == ROLE_CLAUDE]
+    if len(codex) == 1 and len(claude) == 1:
+        return codex[0], claude[0]
+    return None
+
+
+@dataclass(frozen=True)
+class CockpitAdoptPlan:
+    """Plan for the confirm-gated move of one normal session into the cockpit (#11898).
+
+    ``join_commands`` are the two **atomic** ``join-pane`` moves (codex column,
+    then claude below it); ``stamp_commands`` re-apply the machine-readable
+    identity (`@mozyo_workspace_id` / `@mozyo_agent_role` / `@mozyo_lane_id`) on
+    the moved panes *after* both joins land. The executor treats the joins as a
+    transaction (rollback the first if the second fails) and the stamps as
+    best-effort (the pair is already adopted once both joins succeed). The
+    ``source_*`` fields drive that rollback and the explicit (never implicit)
+    source-session cleanup reporting.
+    """
+
+    session: str
+    window: str
+    codex_ratio: int
+    claude_ratio: int
+    column_index: int
+    workspace_id: str
+    lane_id: str
+    lane_label: Optional[str]
+    source_session: str
+    source_codex_pane: str
+    source_claude_pane: str
+    anchor_pane: str
+    panes: tuple[CockpitPane, ...]
+    join_commands: tuple[CockpitCommand, ...]
+    stamp_commands: tuple[CockpitCommand, ...]
+
+    @property
+    def commands(self) -> tuple[CockpitCommand, ...]:
+        """All planned commands in execution order (for dry-run / JSON preview)."""
+        return self.join_commands + self.stamp_commands
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "window": self.window,
+            "codex_ratio": self.codex_ratio,
+            "claude_ratio": self.claude_ratio,
+            "column_index": self.column_index,
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
+            "source_session": self.source_session,
+            "source_codex_pane": self.source_codex_pane,
+            "source_claude_pane": self.source_claude_pane,
+            "anchor_pane": self.anchor_pane,
+            "panes": [
+                {
+                    "token": p.token,
+                    "column": p.column,
+                    "role": p.role,
+                    "workspace_id": p.workspace_id,
+                    "lane_id": p.lane_id,
+                    "lane_label": p.lane_label,
+                    "title": p.title,
+                    "height_pct": p.height_pct,
+                }
+                for p in self.panes
+            ],
+            "join_commands": [c.as_dict() for c in self.join_commands],
+            "stamp_commands": [c.as_dict() for c in self.stamp_commands],
+        }
+
+
+def build_cockpit_adopt_plan(
+    workspace: CockpitWorkspace,
+    *,
+    source_session: str,
+    source_codex_pane: str,
+    source_claude_pane: str,
+    anchor_pane: str,
+    column_index: int,
+    codex_ratio: int = DEFAULT_CODEX_RATIO,
+    session: str = COCKPIT_SESSION_DEFAULT,
+) -> CockpitAdoptPlan:
+    """Plan moving one normal session's codex/claude panes into the cockpit (#11898).
+
+    ``source_codex_pane`` / ``source_claude_pane`` are the real ``%pane`` ids of
+    the co-existing normal session (resolved by detection). ``anchor_pane`` is the
+    real ``%pane`` id of the cockpit's visually rightmost codex column — the new
+    column is joined to its right, mirroring :func:`build_cockpit_append_plan`'s
+    full-height ``-h -f -l N%`` geometry so existing columns keep their vertical
+    Codex/Claude split. ``join-pane`` preserves pane ids, so the moved panes are
+    referenced by their original ids throughout (no token capture needed) and the
+    identity re-stamp targets those same ids. Pure: returns a
+    :class:`CockpitAdoptPlan`, runs no tmux.
+    """
+    if not source_codex_pane or not source_claude_pane:
+        raise ValueError("adopt needs both source codex and claude pane ids")
+    if source_codex_pane == source_claude_pane:
+        raise ValueError("adopt source codex and claude panes must differ")
+    if not anchor_pane:
+        raise ValueError("adopt needs the cockpit anchor codex pane id")
+
+    codex_ratio = normalize_ratio(codex_ratio)
+    claude_ratio = 100 - codex_ratio
+    even_share = even_column_share(column_index + 1)
+
+    # Atomic joins: codex becomes a new full-height column to the right of the
+    # cockpit, then claude is split in below it. join-pane MOVES the live pane
+    # (agent intact) and keeps its %id, so later commands reference the original
+    # ids directly.
+    join_commands = (
+        CockpitCommand(
+            argv=(
+                "join-pane", "-h", "-f", "-l", f"{even_share}%",
+                "-s", source_codex_pane, "-t", anchor_pane,
+            ),
+            captures=None,
+            purpose=f"adopt codex column {column_index} ({workspace.label})",
+        ),
+        CockpitCommand(
+            argv=(
+                "join-pane", "-v", "-l", f"{claude_ratio}%",
+                "-s", source_claude_pane, "-t", source_codex_pane,
+            ),
+            captures=None,
+            purpose=f"adopt claude under column {column_index} ({workspace.label})",
+        ),
+    )
+
+    panes = (
+        CockpitPane(
+            token=source_codex_pane, column=column_index, role=ROLE_CODEX,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
+            height_pct=codex_ratio, anchor=workspace.codex_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+        ),
+        CockpitPane(
+            token=source_claude_pane, column=column_index, role=ROLE_CLAUDE,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
+            height_pct=claude_ratio, anchor=workspace.claude_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+        ),
+    )
+    stamp_commands: list[CockpitCommand] = []
+    for pane in panes:
+        stamp_commands.extend(_pane_identity_commands(pane))
+
+    return CockpitAdoptPlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        codex_ratio=codex_ratio,
+        claude_ratio=claude_ratio,
+        column_index=column_index,
+        workspace_id=workspace.workspace_id,
+        lane_id=normalize_lane(workspace.lane_id),
+        lane_label=workspace.lane_label,
+        source_session=source_session,
+        source_codex_pane=source_codex_pane,
+        source_claude_pane=source_claude_pane,
+        anchor_pane=anchor_pane,
+        panes=panes,
+        join_commands=join_commands,
+        stamp_commands=tuple(stamp_commands),
     )
 
 

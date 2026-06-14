@@ -484,10 +484,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
             "behavior as bare `mozyo cockpit`; both auto-decide create / append "
-            "/ focus from the live cockpit state. `adopt` (Redmine #11897, "
-            "Phase 1) is detect-only: it reports a co-existing normal `mozyo` "
-            "session for this workspace+lane as an adopt candidate and moves no "
-            "panes (explicit pane adoption is Phase 2 / #11898)."
+            "/ focus from the live cockpit state. `adopt` reports a co-existing "
+            "normal `mozyo` session for this workspace+lane as an adopt candidate "
+            "and, with `--confirm` (Redmine #11898, Phase 2), atomically moves "
+            "its live codex/claude panes into the cockpit as a column. Without "
+            "`--confirm` adopt is detect-only / preview and moves no panes; "
+            "`--dry-run` / `--json` always preview without mutating."
         ),
     )
     cockpit.add_argument(
@@ -528,6 +530,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="On first-time create, build the cockpit but do not attach.",
+    )
+    cockpit.add_argument(
+        "--confirm",
+        dest="confirm",
+        action="store_true",
+        default=False,
+        help=(
+            "For `cockpit adopt` only (Redmine #11898, Phase 2): explicitly "
+            "confirm moving the co-existing normal session's live codex/claude "
+            "panes into the cockpit. Required to mutate; without it adopt is "
+            "detect-only / preview. `--dry-run` / `--json` still only preview."
+        ),
     )
     cockpit.set_defaults(func=cmd_cockpit)
 

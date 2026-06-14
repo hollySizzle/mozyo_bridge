@@ -1109,6 +1109,76 @@ def execute_cockpit_plan(plan, run, *, cleanup_captured: bool = False) -> dict:
     return ids
 
 
+def execute_cockpit_adopt_plan(plan, run) -> dict:
+    """Run a :class:`CockpitAdoptPlan`, atomically, with best-effort rollback (#11898).
+
+    The two ``join_commands`` move the live codex/claude panes and are treated as
+    a transaction: if the first join (codex) lands but a later join fails, the
+    codex pane is **moved back** beside the still-present source claude pane —
+    never ``kill-pane``'d, because it carries a live agent (this is the crucial
+    difference from :func:`execute_cockpit_plan`'s ``cleanup_captured``, which
+    kills freshly-*created* panes). ``stamp_commands`` re-apply identity after
+    both joins succeed and are best-effort: a stamp failure leaves the pair
+    adopted and is reported as a warning, not rolled back. Returns
+    ``{"stamp_warnings": [...]}``.
+    """
+
+    def _detail(result) -> str:
+        return (getattr(result, "stderr", "") or "").strip() or (
+            getattr(result, "stdout", "") or ""
+        ).strip()
+
+    def _rollback(joined_codex: bool) -> str | None:
+        # Only the codex pane can be mid-adopted: it joins first, so if a later
+        # step fails it is alone in the cockpit while the claude pane is still in
+        # the source session. Move it back beside that source pane. Best-effort —
+        # a failed rollback leaves the live codex pane in the cockpit (reported),
+        # never killed.
+        if not joined_codex:
+            return None
+        result = run(
+            "join-pane", "-h", "-s", plan.source_codex_pane,
+            "-t", plan.source_claude_pane, check=False,
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return (
+                f"rollback failed: codex pane {plan.source_codex_pane} could not "
+                f"be moved back to source session {plan.source_session!r} "
+                f"({_detail(result) or 'nonzero exit'}); it is now live in the "
+                f"cockpit — move it manually, it was NOT killed."
+            )
+        return None
+
+    joined_codex = False
+    for cmd in plan.join_commands:
+        result = run(*cmd.argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            rollback_note = _rollback(joined_codex)
+            message = (
+                f"cockpit adopt step failed ({cmd.purpose}): "
+                f"`tmux {' '.join(cmd.argv)}` -> {_detail(result) or 'nonzero exit'}"
+            )
+            if rollback_note:
+                message += f"\n{rollback_note}"
+            elif joined_codex:
+                message += (
+                    f"\nrolled back: codex pane {plan.source_codex_pane} moved "
+                    f"back to source session {plan.source_session!r}."
+                )
+            die(message)
+        joined_codex = True
+
+    # Both joins landed — the pair is adopted. Identity re-stamp is best-effort.
+    stamp_warnings: list[str] = []
+    for cmd in plan.stamp_commands:
+        result = run(*cmd.argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            stamp_warnings.append(
+                f"{cmd.purpose}: {_detail(result) or 'nonzero exit'}"
+            )
+    return {"stamp_warnings": stamp_warnings}
+
+
 def cmd_layout_apply(args: argparse.Namespace) -> int:
     """`mozyo layout apply cockpit` — build/focus the cockpit layout (#11788).
 
@@ -1293,6 +1363,74 @@ def _cockpit_session_present(session: str) -> bool:
         return False
 
 
+def _session_attached_clients(session: str) -> tuple[str, ...]:
+    """tty names of clients attached to ``session`` (Redmine #11898, tolerant).
+
+    Adopt fails closed when the source normal session has an attached client:
+    moving its panes out from under a live client is disruptive (the client may
+    be left blank or the session torn down beneath it). Any tmux error degrades
+    to ``()`` — there is no client to protect when tmux can't be queried.
+    """
+    if not session:
+        return ()
+    try:
+        result = run_tmux(
+            "list-clients", "-t", session, "-F", "#{client_tty}", check=False
+        )
+    except (Exception, SystemExit):
+        return ()
+    if getattr(result, "returncode", 1) != 0:
+        return ()
+    return tuple(
+        line.strip()
+        for line in (getattr(result, "stdout", "") or "").splitlines()
+        if line.strip()
+    )
+
+
+def _source_session_cleanup_note(source_session: str) -> str:
+    """Explicit (never-implicit-kill) report of the source session after adopt (#11898).
+
+    Adopt moves only the two agent panes; tmux destroys a window/session whose
+    last pane is moved away, so an emptied source session is cleaned up *by tmux*,
+    not by an explicit ``kill-session`` from this tool (acceptance: cleanup must
+    be explicit and logged, never an implicit kill). This reports the resulting
+    state — gone (tmux closed it) or still alive with N remaining pane(s), left
+    intact — so the operator sees exactly what happened. Tolerant / read-only.
+    """
+    try:
+        present = bool(session_exists(source_session))
+    except (Exception, SystemExit):
+        present = False
+    if not present:
+        return (
+            f"source session {source_session!r} is now empty and was closed by "
+            f"tmux (both agent panes moved out); not killed explicitly."
+        )
+    remaining = "?"
+    try:
+        result = run_tmux(
+            "list-panes", "-s", "-t", source_session, "-F", "#{pane_id}",
+            check=False,
+        )
+        if getattr(result, "returncode", 1) == 0:
+            remaining = str(
+                len(
+                    [
+                        ln
+                        for ln in (getattr(result, "stdout", "") or "").splitlines()
+                        if ln.strip()
+                    ]
+                )
+            )
+    except (Exception, SystemExit):
+        pass
+    return (
+        f"source session {source_session!r} still has {remaining} pane(s) and was "
+        f"left intact (not killed)."
+    )
+
+
 def _probe_checkout_facts(repo_root: str) -> dict:
     """Best-effort git checkout facts for lane identity (Redmine #11820).
 
@@ -1468,43 +1606,165 @@ def _cockpit_adopt_advisory(workspace, cockpit_session: str):
         )
 
 
-def _emit_cockpit_adopt(args, workspace, session, *, already_in_cockpit, advisory):
-    """Render `mozyo cockpit adopt` — Phase 1 detect-only output (#11897).
+def _resolve_cockpit_adopt(
+    workspace, session, *, columns, session_present, already_in_cockpit,
+    existing_codex, advisory, codex_ratio=70,
+):
+    """Decide the adopt move for ``mozyo cockpit adopt`` — plan or fail-closed (#11898).
 
-    Non-mutating by contract: it reports the detection result (human or
-    ``--json``) and never plans or runs a pane transfer. ``--dry-run`` and the
-    bare form produce the same human report (both are already read-only); the
-    explicit, confirm-gated pane move is Phase 2 (Redmine #11898).
+    Returns ``(plan, blocked_reason, source_clients)``. ``plan`` is a
+    :class:`CockpitAdoptPlan` only when there is a single, unambiguous, fully
+    paired adopt candidate, the cockpit already exists with a column to anchor
+    on, and the source session has no attached client. Every fail-closed
+    condition (already a column / not a clean candidate / role→pane ambiguous /
+    no cockpit yet / attached client / no anchor) yields a ``blocked_reason`` and
+    ``plan is None`` — the move is never planned past a closed gate.
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        ADOPT_STATUS_CANDIDATE,
+        adopt_pane_pair,
+        build_cockpit_adopt_plan,
+    )
+
+    if already_in_cockpit:
+        return None, (
+            "this workspace+lane is already a cockpit column; focus it with "
+            "`mozyo cockpit` — nothing to adopt."
+        ), ()
+    if advisory.status != ADOPT_STATUS_CANDIDATE:
+        return None, (
+            advisory.message
+            or "no adoptable co-existing normal `mozyo` session for this "
+            "workspace+lane."
+        ), ()
+
+    candidate = advisory.candidates[0]
+    pair = adopt_pane_pair(candidate)
+    if pair is None:
+        return None, (
+            f"adopt candidate {candidate.session!r} does not map exactly one "
+            f"codex and one claude pane (roles={','.join(candidate.roles) or '-'}, "
+            f"panes={','.join(candidate.pane_ids) or '-'}); the role→pane pairing "
+            f"is ambiguous and fails closed."
+        ), ()
+
+    if not session_present or columns is None:
+        return None, (
+            f"cockpit session {session!r} does not exist yet (or has no cockpit "
+            f"window); create it first with `mozyo cockpit` (or `mozyo layout "
+            f"apply cockpit`), then re-run `mozyo cockpit adopt`. Bootstrapping a "
+            f"cockpit from the moved panes is out of this Phase 2 scope."
+        ), ()
+
+    source_clients = _session_attached_clients(candidate.session)
+    if source_clients:
+        return None, (
+            f"source session {candidate.session!r} has attached client(s) "
+            f"({', '.join(source_clients)}); detach it before adopting so its "
+            f"panes are not moved out from under a live client (fail-closed)."
+        ), source_clients
+
+    anchor = _rightmost_codex_anchor(existing_codex)
+    if not anchor:
+        return None, (
+            f"cockpit session {session!r} exists but carries no mozyo-identified "
+            f"codex column to anchor the adopted column beside; rebuild it with "
+            f"`mozyo layout apply cockpit` or remove the stale session."
+        ), ()
+
+    codex_pane, claude_pane = pair
+    plan = build_cockpit_adopt_plan(
+        workspace,
+        source_session=candidate.session,
+        source_codex_pane=codex_pane,
+        source_claude_pane=claude_pane,
+        anchor_pane=anchor,
+        column_index=len(existing_codex),
+        codex_ratio=codex_ratio,
+        session=session,
+    )
+    return plan, None, source_clients
+
+
+def _handle_cockpit_adopt(
+    args, workspace, session, *, columns, session_present, already_in_cockpit,
+    existing_codex,
+):
+    """Route `mozyo cockpit adopt` — detect-only preview vs confirm-gated move (#11898).
+
+    Phase 2 keeps the Phase 1 safety default: with no ``--confirm`` the command
+    is read-only (detect + preview the plan, move no panes). ``--json`` and
+    ``--dry-run`` stay non-mutating previews even with ``--confirm`` (the
+    codebase contract: those flags never run tmux). Only an explicit
+    ``--confirm`` (and not ``--dry-run`` / ``--json``) executes the atomic move.
     """
     import json as _json
+    import shlex as _shlex
 
     from mozyo_bridge.domain.cockpit_layout import normalize_lane
 
+    confirm = bool(getattr(args, "confirm", False))
+    json_output = bool(getattr(args, "json_output", False))
+    dry_run = bool(getattr(args, "dry_run", False))
     lane_id = normalize_lane(workspace.lane_id)
-    if bool(getattr(args, "json_output", False)):
+    codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
+    advisory = _cockpit_adopt_advisory(workspace, session)
+    plan, blocked, source_clients = _resolve_cockpit_adopt(
+        workspace, session, columns=columns, session_present=session_present,
+        already_in_cockpit=already_in_cockpit, existing_codex=existing_codex,
+        advisory=advisory, codex_ratio=codex_ratio,
+    )
+
+    if json_output:
         payload = {
             "command": "cockpit adopt",
-            "phase": 1,
-            "mutating": False,
+            "phase": 2,
+            # This invocation never runs tmux (json is a preview surface); a
+            # confirm-run would execute only when a plan exists.
+            "executes": False,
+            "would_execute": bool(confirm and plan is not None),
+            "confirm": confirm,
             "session": session,
             "workspace_id": workspace.workspace_id,
             "lane_id": lane_id,
             "lane_label": workspace.lane_label,
             "already_in_cockpit": already_in_cockpit,
+            "source_clients": list(source_clients),
+            "blocked": blocked,
+            "plan": plan.as_dict() if plan is not None else None,
             "advisory": advisory.as_dict(),
         }
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
+    # Confirm-gated execution: the only path that moves panes. `--dry-run`
+    # outranks `--confirm` as a safe preview, so it is handled below, not here.
+    if confirm and not dry_run:
+        if plan is None:
+            die(blocked or "nothing to adopt for this workspace+lane.")
+        require_tmux()
+        print(
+            f"cockpit adopt: moving normal session {plan.source_session!r} "
+            f"(codex {plan.source_codex_pane} + claude {plan.source_claude_pane}) "
+            f"into cockpit {session!r} as column {plan.column_index} "
+            f"({workspace.label}, lane={lane_id})"
+        )
+        result = execute_cockpit_adopt_plan(plan, run_tmux)
+        print(
+            f"  adopted: {workspace.label!r} is now a cockpit column; switch to "
+            f"the cockpit window to see it (no new iTerm window opened)."
+        )
+        print(f"  {_source_session_cleanup_note(plan.source_session)}")
+        for warning in result.get("stamp_warnings", []):
+            print(f"  warning: identity re-stamp incomplete — {warning}")
+        return 0
+
+    # Detect-only / preview (bare adopt or `--dry-run`): report and, when a clean
+    # candidate exists, show the exact move `--confirm` would run. No mutation.
     print(
-        f"cockpit adopt (detect-only, Phase 1; no panes moved): session={session} "
+        f"cockpit adopt (preview; no panes moved): session={session} "
         f"workspace={workspace.workspace_id} ({workspace.label}) lane={lane_id}"
     )
-    if already_in_cockpit:
-        print(
-            "  this workspace+lane is already a cockpit column; focus it with "
-            "`mozyo cockpit` — nothing to adopt."
-        )
     for candidate in advisory.candidates:
         print(
             f"  candidate: session={candidate.session} "
@@ -1513,14 +1773,21 @@ def _emit_cockpit_adopt(args, workspace, session, *, already_in_cockpit, advisor
         )
     if advisory.message:
         print(f"  {advisory.message}")
+    if plan is not None:
+        print(
+            f"  adopt plan: move {plan.source_codex_pane} (codex) + "
+            f"{plan.source_claude_pane} (claude) from {plan.source_session!r} "
+            f"into cockpit column {plan.column_index}:"
+        )
+        for cmd in plan.commands:
+            print("    tmux " + " ".join(_shlex.quote(tok) for tok in cmd.argv))
+        print("  run `mozyo cockpit adopt --confirm` to execute this move.")
+    elif blocked:
+        print(f"  cannot adopt: {blocked}")
     elif not advisory.has_candidates:
         print(
             "  no co-existing normal `mozyo` session found for this workspace+lane."
         )
-    print(
-        "  explicit pane adoption (moving the live panes into the cockpit) is "
-        "Redmine #11898 / Phase 2 and is not implemented here."
-    )
     return 0
 
 
@@ -1599,17 +1866,22 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         None,
     )
 
-    # `mozyo cockpit adopt` short-circuits to detect-only reporting (#11897): it
-    # never creates / appends / focuses and moves no panes. `same is not None`
-    # means the workspace+lane is already a cockpit column (focus priority,
-    # j#57823), so there is nothing to adopt.
+    # `mozyo cockpit adopt` short-circuits to its own create/append/focus-free
+    # path (#11897 detect / #11898 confirm-gated move): it never spawns fresh
+    # columns. Without `--confirm` it is detect-only / preview (Phase 1 safety
+    # default); with `--confirm` it atomically moves the co-existing normal
+    # session's live panes into the cockpit. `same is not None` means the
+    # workspace+lane is already a cockpit column (focus priority, j#57823), so
+    # there is nothing to adopt.
     if adopt_mode:
-        return _emit_cockpit_adopt(
+        return _handle_cockpit_adopt(
             args,
             workspace,
             session,
+            columns=columns,
+            session_present=session_present,
             already_in_cockpit=same is not None,
-            advisory=_cockpit_adopt_advisory(workspace, session),
+            existing_codex=existing_codex,
         )
 
     # Adopt advisory rides the normal create/append flow as a NON-mutating notice
