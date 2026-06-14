@@ -300,6 +300,21 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-local-remote-cockpit-host-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/local-remote-cockpit-host-boundary.md
+    purpose: "local host と remote SSH host の cockpit を物理統合せず、host-aware target discovery / event projection / handoff gateway として扱う要件正本。"
+    audit_role: local_remote_cockpit_host_boundary_logic
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-session-inventory
+      - logic-tmux-send-safety-contract
+      - rule-public-private-boundary
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-unit-target-model
     type: logic
     status: active
@@ -315,6 +330,7 @@ documents:
       - logic-workspace-registry
       - logic-workspace-anchor-project-defaults-migration
       - logic-cross-project-cockpit-smoke-runbook
+      - logic-local-remote-cockpit-host-boundary
       - rule-public-private-boundary
       - spec-project-map
 

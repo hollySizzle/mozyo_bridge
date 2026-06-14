@@ -326,6 +326,11 @@ rename の判断と compatibility story は `workspace-anchor-project-defaults-m
 cross-project cockpit の具体的な preview / append / adopt / discovery / handoff smoke は
 `cross-project-cockpit-smoke-runbook.md` を正本とする。
 
+local host と remote SSH host の cockpit 境界は
+`local-remote-cockpit-host-boundary.md` を正本とする。`session` / `window` /
+`pane_id` は host の tmux server 内でだけ意味を持つため、host をまたぐ discovery
+や handoff では host-aware preflight を落としてはいけない。
+
 ## 検証
 
 - `mozyo-bridge docs validate --repo .`

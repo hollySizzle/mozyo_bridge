@@ -20,6 +20,8 @@ consumer 側の運用規約に置く。
   ではない。
 - `--target-repo auto` は explicit `%pane` target の cwd から repo identity gate
   を解決する。
+- local host と remote SSH host の cockpit boundary は
+  `local-remote-cockpit-host-boundary.md` を正本とする。
 
 2026-06-14 時点の local baseline:
 
