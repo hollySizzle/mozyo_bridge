@@ -35,6 +35,13 @@ AUDIT_DOCUMENT_ORDER = {
 
 DEFAULT_CATALOG_RELATIVE_PATH = Path(".mozyo-bridge/docs/catalog.yaml")
 
+# Local-only overlay sits next to the public catalog and is git-ignored
+# (Redmine #11819). See ``docs_tools.overlay`` for the merge / leak-guard
+# semantics; the constant lives here so ``CatalogContext`` can derive the
+# default overlay path without importing the overlay module (which would
+# create a cycle).
+DEFAULT_OVERLAY_FILENAME = "catalog.local.yaml"
+
 
 @dataclass(frozen=True)
 class CatalogContext:
@@ -43,17 +50,22 @@ class CatalogContext:
     ``repo_root`` is an absolute path to the project being checked.
     ``catalog_path`` is an absolute path to the catalog YAML; it
     defaults to ``<repo_root>/.mozyo-bridge/docs/catalog.yaml`` so the
-    common case stays a single positional flag.
+    common case stays a single positional flag. ``overlay_path`` is the
+    absolute path to the optional local-only overlay; it defaults to a
+    ``catalog.local.yaml`` sibling of the catalog so a ``--catalog``
+    override keeps the overlay next to whichever catalog is in use.
     """
 
     repo_root: Path
     catalog_path: Path
+    overlay_path: Path
 
     @classmethod
     def build(
         cls,
         repo_root: Path | str,
         catalog_path: Path | str | None = None,
+        overlay_path: Path | str | None = None,
     ) -> "CatalogContext":
         root = Path(repo_root).expanduser().resolve()
         if catalog_path is None:
@@ -61,7 +73,20 @@ class CatalogContext:
         else:
             candidate = Path(catalog_path).expanduser()
             catalog_abs = candidate if candidate.is_absolute() else (root / candidate).resolve()
-        return cls(repo_root=root, catalog_path=catalog_abs)
+        if overlay_path is None:
+            overlay_abs = catalog_abs.parent / DEFAULT_OVERLAY_FILENAME
+        else:
+            overlay_candidate = Path(overlay_path).expanduser()
+            overlay_abs = (
+                overlay_candidate
+                if overlay_candidate.is_absolute()
+                else (root / overlay_candidate).resolve()
+            )
+        return cls(
+            repo_root=root,
+            catalog_path=catalog_abs,
+            overlay_path=overlay_abs,
+        )
 
     def repo_abspath(self, relative_path: str) -> Path:
         return self.repo_root / relative_path

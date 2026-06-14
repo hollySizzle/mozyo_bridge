@@ -12,8 +12,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .catalog import CatalogContext, load_catalog, resolve_audit_documents
+from .catalog import CatalogContext, resolve_audit_documents
 from .generate import run_generate_check
+from .overlay import OverlayInfo, load_effective_catalog
 
 
 IGNORED_PATH_PARTS = frozenset({".git", "__pycache__"})
@@ -61,16 +62,42 @@ def git_changed_paths(
     return paths
 
 
+def audit_doc_impact_detailed(
+    context: CatalogContext,
+    *,
+    staged: bool = False,
+    all_changed: bool = False,
+    include_local: bool = True,
+) -> tuple[list[dict[str, Any]], OverlayInfo]:
+    """Resolve docs for git-changed paths; report whether the overlay applied.
+
+    The effective catalog merges the git-ignored ``catalog.local.yaml``
+    overlay when present (Redmine #11819) so local-only docs surface for
+    changed paths the same way public docs do.
+    """
+    catalog, overlay_info = load_effective_catalog(
+        context, include_local=include_local
+    )
+    paths = git_changed_paths(context.repo_root, staged=staged, all_changed=all_changed)
+    results = [resolve_audit_documents(context, catalog, path) for path in paths]
+    return results, overlay_info
+
+
 def audit_doc_impact(
     context: CatalogContext,
     *,
     staged: bool = False,
     all_changed: bool = False,
+    include_local: bool = True,
 ) -> list[dict[str, Any]]:
     """Resolve docs for every git-changed path. Returns one record per path."""
-    catalog = load_catalog(context.catalog_path)
-    paths = git_changed_paths(context.repo_root, staged=staged, all_changed=all_changed)
-    return [resolve_audit_documents(context, catalog, path) for path in paths]
+    results, _ = audit_doc_impact_detailed(
+        context,
+        staged=staged,
+        all_changed=all_changed,
+        include_local=include_local,
+    )
+    return results
 
 
 def run_audit_impact_check_generated(

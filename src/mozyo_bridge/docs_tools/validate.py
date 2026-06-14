@@ -12,6 +12,12 @@ from .catalog import (
     load_catalog,
     matching_file_conventions,
 )
+from .overlay import (
+    OverlayError,
+    merge_catalog_with_overlay,
+    read_overlay_document,
+    scan_for_secret_shaped_values,
+)
 
 
 STRICT_METADATA_TYPES = frozenset({"rule", "spec", "task"})
@@ -137,6 +143,70 @@ def validate_catalog(
                     errors.append(
                         f"coverage_roots[{index}] must be a non-empty repo-relative string"
                     )
+
+    return errors
+
+
+def validate_overlay(context: CatalogContext) -> list[str]:
+    """Validate the optional local-only overlay (Redmine #11819).
+
+    Returns an empty list when no overlay file exists — public
+    ``docs validate`` stays green on a fresh clone / CI. When the overlay
+    is present it is checked for: secret-shaped values, a usable
+    structure (required document / file_convention fields), local
+    canonical paths that actually exist, and id collisions against the
+    public catalog. Errors are collected (not raised) so the caller can
+    print them alongside the public catalog's own errors.
+    """
+    overlay_path = context.overlay_path
+    if not overlay_path.exists():
+        return []
+
+    try:
+        overlay = read_overlay_document(overlay_path)
+    except OverlayError as exc:
+        return [f"overlay: {exc}"]
+    if not overlay:
+        return []
+
+    errors: list[str] = []
+    for finding in scan_for_secret_shaped_values(overlay):
+        errors.append(f"overlay secret-shaped value: {finding}")
+
+    for document in overlay.get("documents", []):
+        if not isinstance(document, dict):
+            errors.append("overlay document must be a mapping")
+            continue
+        document_id = document.get("id", "<unknown>")
+        for field in ("id", "type", "status", "canonical_path"):
+            if field not in document:
+                errors.append(f"overlay document {document_id}: missing `{field}`")
+        canonical_path = document.get("canonical_path")
+        if (
+            isinstance(canonical_path, str)
+            and document.get("status") in {"active", "deprecated"}
+            and not context.repo_abspath(canonical_path).exists()
+        ):
+            errors.append(
+                f"overlay document {document_id}: canonical_path does not exist: "
+                f"{canonical_path}"
+            )
+
+    for convention in overlay.get("file_conventions", []):
+        if not isinstance(convention, dict):
+            errors.append("overlay file_convention must be a mapping")
+            continue
+        convention_id = convention.get("id", "<unknown>")
+        for field in ("id", "name", "patterns", "severity"):
+            if field not in convention:
+                errors.append(
+                    f"overlay file_convention {convention_id}: missing `{field}`"
+                )
+
+    try:
+        merge_catalog_with_overlay(load_catalog(context.catalog_path), overlay)
+    except OverlayError as exc:
+        errors.append(f"overlay merge: {exc}")
 
     return errors
 

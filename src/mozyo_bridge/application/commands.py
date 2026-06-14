@@ -3038,13 +3038,29 @@ def _docs_context_from_args(args: argparse.Namespace):
 
     repo_raw = getattr(args, "repo", None) or os.getcwd()
     catalog_raw = getattr(args, "catalog", None)
-    return CatalogContext.build(repo_raw, catalog_raw)
+    overlay_raw = getattr(args, "overlay", None)
+    return CatalogContext.build(repo_raw, catalog_raw, overlay_raw)
+
+
+def _docs_overlay_relpath(context, overlay_path) -> str:
+    """Repo-relative overlay path for human-facing notices."""
+    try:
+        return overlay_path.relative_to(context.repo_root).as_posix()
+    except ValueError:
+        return overlay_path.as_posix()
+
+
+def _docs_include_local(args: argparse.Namespace) -> bool:
+    """Local overlay is merged by default; ``--no-local`` forces the
+    public-only view (what a fresh clone / CI sees)."""
+    return not bool(getattr(args, "no_local", False))
 
 
 def cmd_docs_validate(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
         validate_catalog,
         validate_file_coverage,
+        validate_overlay,
     )
 
     context = _docs_context_from_args(args)
@@ -3058,6 +3074,16 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
         )
         errors.extend(coverage_errors)
         notices.extend(coverage_notices)
+    if getattr(args, "include_local", False):
+        overlay_errors = validate_overlay(context)
+        if context.overlay_path.exists():
+            notices.append(
+                "local overlay validated: "
+                f"{_docs_overlay_relpath(context, context.overlay_path)}"
+            )
+        else:
+            notices.append("no local overlay present (catalog.local.yaml)")
+        errors.extend(overlay_errors)
     for notice in notices:
         print(f"notice: {notice}")
     if errors:
@@ -3071,15 +3097,32 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
 
 def cmd_docs_resolve(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        OverlayError,
         render_resolution_json,
         render_resolution_markdown,
         render_resolution_text,
-        resolve_paths,
+        resolve_paths_detailed,
     )
 
     context = _docs_context_from_args(args)
-    results = resolve_paths(context, list(args.paths))
+    try:
+        results, overlay = resolve_paths_detailed(
+            context, list(args.paths), include_local=_docs_include_local(args)
+        )
+    except OverlayError as exc:
+        print(f"local overlay error: {exc}", file=sys.stderr)
+        return 1
     fmt = getattr(args, "format", "text")
+    # The overlay notice goes to stderr so the json/markdown payload on
+    # stdout stays machine-parseable.
+    if overlay.applied:
+        print(
+            "notice: local overlay applied: "
+            f"{_docs_overlay_relpath(context, overlay.path)} "
+            f"({overlay.document_count} document(s), "
+            f"{overlay.file_convention_count} file_convention(s))",
+            file=sys.stderr,
+        )
     if fmt == "json":
         print(render_resolution_json(results))
     elif fmt == "markdown":
@@ -3702,16 +3745,29 @@ def cmd_workspace_defaults(args: argparse.Namespace) -> int:
 
 def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
-        audit_doc_impact,
+        OverlayError,
+        audit_doc_impact_detailed,
         run_generate_check,
     )
 
     context = _docs_context_from_args(args)
-    results = audit_doc_impact(
-        context,
-        staged=bool(getattr(args, "staged", False)),
-        all_changed=bool(getattr(args, "all_changed", False)),
-    )
+    try:
+        results, overlay = audit_doc_impact_detailed(
+            context,
+            staged=bool(getattr(args, "staged", False)),
+            all_changed=bool(getattr(args, "all_changed", False)),
+            include_local=_docs_include_local(args),
+        )
+    except OverlayError as exc:
+        print(f"local overlay error: {exc}", file=sys.stderr)
+        return 1
+    if overlay.applied:
+        print(
+            "notice: local overlay applied: "
+            f"{_docs_overlay_relpath(context, overlay.path)} "
+            f"({overlay.document_count} document(s), "
+            f"{overlay.file_convention_count} file_convention(s))"
+        )
     if not results:
         print("No changed paths.")
     for result in results:

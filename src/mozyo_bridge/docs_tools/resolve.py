@@ -10,15 +10,39 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .catalog import CatalogContext, load_catalog, resolve_audit_documents
+from .catalog import CatalogContext, resolve_audit_documents
+from .overlay import OverlayInfo, load_effective_catalog
+
+
+def resolve_paths_detailed(
+    context: CatalogContext,
+    paths: list[str],
+    *,
+    include_local: bool = True,
+) -> tuple[list[dict[str, Any]], OverlayInfo]:
+    """Resolve docs for ``paths`` and report whether the local overlay applied.
+
+    The effective catalog merges the git-ignored ``catalog.local.yaml``
+    overlay on top of the public catalog when present (Redmine #11819);
+    ``include_local=False`` forces the public-only view CI would see.
+    """
+    catalog, overlay_info = load_effective_catalog(
+        context, include_local=include_local
+    )
+    results = [resolve_audit_documents(context, catalog, path) for path in paths]
+    return results, overlay_info
 
 
 def resolve_paths(
     context: CatalogContext,
     paths: list[str],
+    *,
+    include_local: bool = True,
 ) -> list[dict[str, Any]]:
-    catalog = load_catalog(context.catalog_path)
-    return [resolve_audit_documents(context, catalog, path) for path in paths]
+    results, _ = resolve_paths_detailed(
+        context, paths, include_local=include_local
+    )
+    return results
 
 
 def render_resolution_text(results: list[dict[str, Any]]) -> str:

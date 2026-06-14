@@ -1280,6 +1280,15 @@ def build_parser() -> argparse.ArgumentParser:
                 "`<repo>/.mozyo-bridge/docs/catalog.yaml`."
             ),
         )
+        parser.add_argument(
+            "--overlay",
+            help=(
+                "Local-only overlay YAML path (Redmine #11819). Defaults to a "
+                "git-ignored `catalog.local.yaml` next to the catalog. Present "
+                "only in checkouts that keep local-only docs; absent on fresh "
+                "clone / CI / PyPI consumer."
+            ),
+        )
 
     docs_validate = docs_sub.add_parser(
         "validate",
@@ -1305,6 +1314,16 @@ def build_parser() -> argparse.ArgumentParser:
             "CLI takes precedence over the catalog's `coverage_roots`."
         ),
     )
+    docs_validate.add_argument(
+        "--include-local",
+        dest="include_local",
+        action="store_true",
+        help=(
+            "Also validate the local-only overlay (catalog.local.yaml) when "
+            "present: structure, secret-shaped-value guard, and id collisions. "
+            "No-op on a fresh clone / CI where the overlay is absent."
+        ),
+    )
     docs_validate.set_defaults(func=cmd_docs_validate)
 
     docs_resolve = docs_sub.add_parser(
@@ -1322,6 +1341,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("text", "markdown", "json"),
         default="text",
         help="Output format (default: text).",
+    )
+    docs_resolve.add_argument(
+        "--no-local",
+        dest="no_local",
+        action="store_true",
+        help=(
+            "Ignore the local-only overlay (catalog.local.yaml) and resolve "
+            "against the public catalog only — the view a fresh clone / CI "
+            "sees. By default the overlay is merged when present."
+        ),
     )
     docs_resolve.set_defaults(func=cmd_docs_resolve)
 
@@ -1369,6 +1398,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Override the generated file path for --check-generated. "
             "Defaults to the same path as `docs generate-file-conventions`."
+        ),
+    )
+    docs_impact.add_argument(
+        "--no-local",
+        dest="no_local",
+        action="store_true",
+        help=(
+            "Ignore the local-only overlay (catalog.local.yaml) and resolve "
+            "against the public catalog only. By default the overlay is merged "
+            "when present."
         ),
     )
     docs_impact.set_defaults(func=cmd_docs_audit_impact)

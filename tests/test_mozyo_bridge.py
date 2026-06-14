@@ -2116,6 +2116,241 @@ class ScaffoldRulesTest(unittest.TestCase):
             )
             self.assertEqual(0, drift_code, msg=drift_output)
 
+    # ------------------------------------------------------------------
+    # Local-only docs catalog overlay (Redmine #11819).
+    # ------------------------------------------------------------------
+
+    def _make_catalog_project(self, tmp: str) -> Path:
+        """Scaffold a governed project with a ready-to-use public catalog."""
+        home = Path(tmp) / "home"
+        project = Path(tmp) / "project"
+        project.mkdir()
+        self.run_cli(["rules", "install", "--home", str(home)])
+        self.run_cli(
+            [
+                "scaffold",
+                "apply",
+                "redmine-governed",
+                "--target",
+                str(project),
+                "--home",
+                str(home),
+            ]
+        )
+        shutil.copyfile(
+            project / ".mozyo-bridge/docs/catalog.yaml.example",
+            project / ".mozyo-bridge/docs/catalog.yaml",
+        )
+        return project
+
+    _SAMPLE_OVERLAY = (
+        "schema_version: 1\n"
+        "documents:\n"
+        "  - id: local-only-doc\n"
+        "    type: rule\n"
+        "    status: active\n"
+        "    canonical_path: local_only_doc.md\n"
+        "    purpose: local-only rule\n"
+        "    audit_role: local_only\n"
+        "file_conventions:\n"
+        "  - id: fc-local-only\n"
+        "    name: local only\n"
+        "    patterns:\n"
+        "      - local_only_doc.md\n"
+        "    severity: warn\n"
+        "    document_refs:\n"
+        "      - local-only-doc\n"
+    )
+
+    def _write_overlay(self, project: Path, body: str) -> Path:
+        overlay = project / ".mozyo-bridge/docs/catalog.local.yaml"
+        overlay.write_text(body, encoding="utf-8")
+        return overlay
+
+    def test_docs_overlay_absent_is_noop(self) -> None:
+        """Fresh clone / CI: no overlay file → public catalog verbatim."""
+        from mozyo_bridge.docs_tools import (
+            CatalogContext,
+            load_catalog,
+            load_effective_catalog,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            context = CatalogContext.build(str(project), None)
+            self.assertFalse(context.overlay_path.exists())
+            catalog, overlay = load_effective_catalog(context)
+            self.assertFalse(overlay.applied)
+            self.assertEqual(load_catalog(context.catalog_path), catalog)
+
+    def test_docs_overlay_present_merges_for_resolve(self) -> None:
+        """Overlay present → its docs resolve; --no-local hides them again."""
+        from mozyo_bridge.docs_tools import CatalogContext, resolve_paths_detailed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            (project / "local_only_doc.md").write_text("local\n", encoding="utf-8")
+            self._write_overlay(project, self._SAMPLE_OVERLAY)
+            context = CatalogContext.build(str(project), None)
+
+            results, overlay = resolve_paths_detailed(context, ["local_only_doc.md"])
+            self.assertTrue(overlay.applied)
+            self.assertEqual(1, overlay.document_count)
+            self.assertEqual(1, overlay.file_convention_count)
+            ids = {doc["id"] for doc in results[0]["documents"]}
+            self.assertIn("local-only-doc", ids)
+
+            # --no-local forces the public-only view a fresh clone / CI sees.
+            public_results, public_overlay = resolve_paths_detailed(
+                context, ["local_only_doc.md"], include_local=False
+            )
+            self.assertFalse(public_overlay.applied)
+            public_ids = {doc["id"] for doc in public_results[0]["documents"]}
+            self.assertNotIn("local-only-doc", public_ids)
+
+    def test_docs_overlay_excluded_from_public_artifacts(self) -> None:
+        """Separation guard: overlay never leaks into generate / public validate."""
+        from mozyo_bridge.docs_tools import CatalogContext, load_catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            (project / "local_only_doc.md").write_text("local\n", encoding="utf-8")
+            self._write_overlay(project, self._SAMPLE_OVERLAY)
+
+            # Public catalog load never sees the overlay.
+            context = CatalogContext.build(str(project), None)
+            public_ids = {d["id"] for d in load_catalog(context.catalog_path)["documents"]}
+            self.assertNotIn("local-only-doc", public_ids)
+
+            # generate-file-conventions output excludes overlay data.
+            gen_code, _ = self.run_cli(
+                ["docs", "generate-file-conventions", "--repo", str(project)]
+            )
+            self.assertEqual(0, gen_code)
+            generated = (
+                project / ".mozyo-bridge/docs/file_conventions.generated.yaml"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("fc-local-only", generated)
+            self.assertNotIn("local_only_doc.md", generated)
+
+            # The generated drift check stays clean with the overlay present.
+            check_code, _ = self.run_cli(
+                ["docs", "generate-file-conventions", "--check", "--repo", str(project)]
+            )
+            self.assertEqual(0, check_code)
+
+            # Public validate (no --include-local) passes regardless of overlay.
+            validate_code, validate_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project)]
+            )
+            self.assertEqual(0, validate_code, msg=validate_output)
+            self.assertIn("catalog validation passed", validate_output)
+
+    def test_docs_overlay_secret_guard_fails_closed(self) -> None:
+        """An overlay carrying a secret-shaped value stops the local resolve."""
+        from mozyo_bridge.docs_tools import (
+            CatalogContext,
+            OverlayError,
+            load_effective_catalog,
+            scan_for_secret_shaped_values,
+        )
+
+        # Unit: the scanner reports locations, never the offending value.
+        findings = scan_for_secret_shaped_values(
+            {"documents": [{"id": "x", "api_key": "AKIAABCDEFGHIJKLMNOP"}]}
+        )
+        self.assertTrue(findings)
+        self.assertTrue(all("AKIA" not in finding for finding in findings))
+        self.assertFalse(
+            scan_for_secret_shaped_values(
+                {"documents": [{"id": "x", "canonical_path": "foo/bar.md"}]}
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            (project / "local_only_doc.md").write_text("local\n", encoding="utf-8")
+            self._write_overlay(
+                project,
+                "documents:\n"
+                "  - id: local-only-doc\n"
+                "    type: rule\n"
+                "    status: active\n"
+                "    canonical_path: local_only_doc.md\n"
+                "    token: AKIAABCDEFGHIJKLMNOP\n",
+            )
+            context = CatalogContext.build(str(project), None)
+            with self.assertRaises(OverlayError):
+                load_effective_catalog(context)
+
+            # CLI fails closed with a clean message (no traceback) on stderr.
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code, _ = self.run_cli(
+                    ["docs", "resolve", "--repo", str(project), "local_only_doc.md"]
+                )
+            self.assertEqual(1, code)
+            self.assertIn("local overlay error", stderr.getvalue())
+            self.assertNotIn("AKIA", stderr.getvalue())
+
+    def test_docs_overlay_id_collision_rejected(self) -> None:
+        """Overlay must add new ids, never shadow a public catalog id."""
+        from mozyo_bridge.docs_tools import (
+            CatalogContext,
+            OverlayError,
+            load_effective_catalog,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            # `rule-docs-catalog-governance` is a public id in the skeleton.
+            self._write_overlay(
+                project,
+                "documents:\n"
+                "  - id: rule-docs-catalog-governance\n"
+                "    type: rule\n"
+                "    status: active\n"
+                "    canonical_path: local_only_doc.md\n",
+            )
+            context = CatalogContext.build(str(project), None)
+            with self.assertRaises(OverlayError):
+                load_effective_catalog(context)
+
+    def test_docs_validate_include_local(self) -> None:
+        """`docs validate --include-local` checks the overlay when present."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._make_catalog_project(tmp)
+            (project / "local_only_doc.md").write_text("local\n", encoding="utf-8")
+            self._write_overlay(project, self._SAMPLE_OVERLAY)
+
+            ok_code, ok_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project), "--include-local"]
+            )
+            self.assertEqual(0, ok_code, msg=ok_output)
+            self.assertIn("local overlay validated", ok_output)
+
+            # A missing canonical_path in the overlay is reported as an error.
+            self._write_overlay(
+                project,
+                "documents:\n"
+                "  - id: local-only-doc\n"
+                "    type: rule\n"
+                "    status: active\n"
+                "    canonical_path: does_not_exist.md\n",
+            )
+            bad_code, bad_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project), "--include-local"]
+            )
+            self.assertEqual(1, bad_code)
+            self.assertIn("canonical_path does not exist", bad_output)
+
+            # Without --include-local the overlay error is not surfaced.
+            quiet_code, quiet_output = self.run_cli(
+                ["docs", "validate", "--repo", str(project)]
+            )
+            self.assertEqual(0, quiet_code)
+            self.assertIn("catalog validation passed", quiet_output)
+
     def test_docs_validate_check_file_coverage_canonical_cli_shape(self) -> None:
         """Pin `docs validate --check-file-coverage` as the coverage entrypoint.
 

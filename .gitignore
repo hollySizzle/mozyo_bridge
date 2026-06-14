@@ -15,6 +15,12 @@ tmp/
 .venv/
 venv/
 
+# Local-only docs catalog overlay (Redmine #11819). The public catalog
+# stays free of private paths; this git-ignored overlay carries
+# checkout-local docs that `mozyo-bridge docs resolve` / `audit-impact`
+# merge when present. Never commit it.
+.mozyo-bridge/docs/catalog.local.yaml
+
 # Local secrets and release credentials
 .env
 .env.*
