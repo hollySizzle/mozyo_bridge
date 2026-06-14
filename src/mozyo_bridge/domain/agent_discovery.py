@@ -53,6 +53,17 @@ CONFIDENCE_STRONG = "strong"
 CONFIDENCE_WEAK = "weak"
 CONFIDENCE_NONE = "none"
 
+# Projection kinds for the canonical `TargetRecord` view (Redmine #11907,
+# unit-target-model.md). A `Target` is identity; how it is shown is a
+# projection. A managed / cockpit pane carries `@mozyo_agent_role` (role_source
+# == pane_option) and lives under the cockpit window — its window name is a
+# layout attribute, so it projects as `cockpit_pane`. A normal-`mozyo` pane
+# resolves its role from the `claude` / `codex` window name (or an inferred
+# process) and projects as the compatibility `normal_window`. View kind is a
+# projection attribute, never a routing identity.
+VIEW_KIND_COCKPIT_PANE = "cockpit_pane"
+VIEW_KIND_NORMAL_WINDOW = "normal_window"
+
 # Foreground process basenames that *weakly* hint a role. `node` / versioned
 # native binaries are receiver-agnostic (both CLIs are node-based), so they are
 # deliberately NOT here — a weak hint must still name the role to be usable, and
@@ -526,6 +537,16 @@ class TargetCandidate:
     rather than silently selected. ``repo_short`` is the checkout basename for
     compact text; the absolute ``repo_root`` / ``cwd`` ride in JSON only (the
     same exposure ``agents list`` already allows).
+
+    The ``view_kind`` (Redmine #11907) names how this target is projected —
+    ``cockpit_pane`` for a managed cockpit pane, ``normal_window`` for the
+    compatibility ``mozyo`` rail — so normal local and cockpit share one target
+    vocabulary while staying a *projection* attribute, never a routing identity.
+    ``branch`` is the checkout's current git branch (best-effort, ``None`` for a
+    non-git / detached checkout). :meth:`to_dict` renders the nested canonical
+    ``TargetRecord`` projection (host / runtime / identity / repo / view) defined
+    in ``vibes/docs/logics/unit-target-model.md``; it is a CLI/API projection,
+    not a persisted record.
     """
 
     pane_id: str
@@ -546,27 +567,51 @@ class TargetCandidate:
     repo_root: str | None
     cwd: str
     host: str
+    view_kind: str
+    branch: str | None
 
     def to_dict(self) -> dict[str, object]:
+        """Nested canonical ``TargetRecord`` projection (Redmine #11907).
+
+        Groups the flat fields into the ``host`` / ``runtime`` / ``identity`` /
+        ``repo`` / ``view`` shape from ``unit-target-model.md`` so cockpit and
+        normal local targets read with one vocabulary. JSON is a projection, not
+        a saved file — callers must not persist this per target.
+        """
+        is_cockpit = self.view_kind == VIEW_KIND_COCKPIT_PANE
         return {
-            "pane_id": self.pane_id,
-            "role": self.role,
-            "role_source": self.role_source,
-            "confidence": self.confidence,
-            "ambiguous": self.ambiguous,
-            "session": self.session,
-            "window_name": self.window_name,
-            "window_index": self.window_index,
-            "pane_index": self.pane_index,
-            "active": self.active,
-            "workspace_id": self.workspace_id,
-            "workspace_label": self.workspace_label,
-            "lane_id": self.lane_id,
-            "lane_label": self.lane_label,
-            "repo_short": self.repo_short,
-            "repo_root": self.repo_root,
-            "cwd": self.cwd,
-            "host": self.host,
+            "host": {"id": self.host, "label": self.host, "kind": "local"},
+            "runtime": {
+                "provider": "tmux",
+                "session": self.session,
+                "window": self.window_name,
+                "window_index": self.window_index,
+                "pane_index": self.pane_index,
+                "pane_id": self.pane_id,
+                "cwd": self.cwd,
+            },
+            "identity": {
+                "workspace_id": self.workspace_id,
+                "workspace_label": self.workspace_label,
+                "lane_id": self.lane_id,
+                "lane_label": self.lane_label,
+                "role": self.role,
+                "role_source": self.role_source,
+                "confidence": self.confidence,
+                "ambiguous": self.ambiguous,
+            },
+            "repo": {
+                "label": self.repo_short,
+                "root": self.repo_root,
+                "branch": self.branch,
+            },
+            "view": {
+                "kind": self.view_kind,
+                # The cockpit session doubles as the display group; a normal
+                # window has no cross-workspace group.
+                "group": self.session if is_cockpit else None,
+                "active": self.active,
+            },
         }
 
 
@@ -575,27 +620,49 @@ def _normalize_lane_display(value: str | None) -> str:
     return (value or "").strip() or "default"
 
 
+def _derive_view_kind(role_source: str) -> str:
+    """Projection kind for a target from its role resolver provenance (#11907).
+
+    A pane whose role resolved from the ``@mozyo_agent_role`` option is a
+    managed / cockpit pane (Redmine #11822, journal #57116): its window name is a
+    layout attribute, so it projects as ``cockpit_pane``. Every other source
+    (``window_name`` legacy rail or an ``inferred`` process) is the compatibility
+    ``normal_window`` projection. This reads provenance, never the cockpit
+    session name, so a renamed cockpit session still classifies correctly and the
+    window name never becomes a primary identity.
+    """
+    if role_source == ROLE_SOURCE_PANE_OPTION:
+        return VIEW_KIND_COCKPIT_PANE
+    return VIEW_KIND_NORMAL_WINDOW
+
+
 def build_target_candidates(
     records: Iterable[AgentRecord],
     *,
     resolve_workspace: Callable[[str], tuple[str | None, str | None]] | None = None,
+    resolve_branch: Callable[[str], str | None] | None = None,
     host: str = HOST_LOCAL,
 ) -> list[TargetCandidate]:
-    """Project folded agent records into compact target candidates (#11811).
+    """Project folded agent records into canonical target candidates (#11811, #11907).
 
     ``records`` are already folded by ``pane_id`` (one row per agent). Only
     classified agents (``claude`` / ``codex``) are emitted — an ``unknown`` pane
     is not a handoff target. ``resolve_workspace(repo_root)`` returns
     ``(workspace_id, workspace_label)`` for the checkout (registry → anchor →
-    derivation, same chain as the inventory); it is invoked once per distinct
-    repo root. The lane is read from the pane's ``@mozyo_lane_id`` option
-    (``default`` when absent). This is pure: no tmux, no registry I/O of its own.
+    derivation, same chain as the inventory) and ``resolve_branch(repo_root)``
+    returns the current git branch (``None`` when unknown); each is invoked once
+    per distinct repo root. The lane is read from the pane's ``@mozyo_lane_id``
+    option (``default`` when absent), and ``view_kind`` is derived from the role
+    resolver provenance so cockpit and normal panes share one vocabulary. This is
+    pure: no tmux, no git, no registry I/O of its own — all I/O rides on the
+    injected resolvers.
 
     Listing is deliberately non-selecting — same-role candidates stay
     distinguishable by workspace / lane / pane_id and the caller must choose an
     explicit pane, so a natural name can never auto-cross a safety boundary.
     """
     workspace_cache: dict[str, tuple[str | None, str | None]] = {}
+    branch_cache: dict[str, str | None] = {}
 
     def workspace_for(repo_root: str | None) -> tuple[str | None, str | None]:
         if resolve_workspace is None or not repo_root:
@@ -603,6 +670,13 @@ def build_target_candidates(
         if repo_root not in workspace_cache:
             workspace_cache[repo_root] = resolve_workspace(repo_root)
         return workspace_cache[repo_root]
+
+    def branch_for(repo_root: str | None) -> str | None:
+        if resolve_branch is None or not repo_root:
+            return None
+        if repo_root not in branch_cache:
+            branch_cache[repo_root] = resolve_branch(repo_root)
+        return branch_cache[repo_root]
 
     candidates: list[TargetCandidate] = []
     for record in records:
@@ -630,6 +704,8 @@ def build_target_candidates(
                 repo_root=record.repo_root,
                 cwd=record.cwd,
                 host=host,
+                view_kind=_derive_view_kind(record.role_source),
+                branch=branch_for(record.repo_root),
             )
         )
     return candidates

@@ -85,6 +85,42 @@ class BuildTargetCandidatesTest(unittest.TestCase):
         self.assertEqual("feature/x", c.lane_label)
         self.assertEqual("repo", c.repo_short)  # basename of /work/repo
         self.assertEqual("local", c.host)
+        # Role resolved from the pane option -> managed/cockpit projection.
+        self.assertEqual("cockpit_pane", c.view_kind)
+
+    def test_normal_window_pane_projects_normal_view_kind(self) -> None:
+        # Role from the window name (no `@mozyo_agent_role`) is the normal-`mozyo`
+        # compatibility rail, so it projects as `normal_window` (#11907).
+        records = self._records([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        cands = build_target_candidates(records)
+        self.assertEqual(1, len(cands))
+        c = cands[0]
+        self.assertEqual("claude", c.role)
+        self.assertEqual("window_name", c.role_source)
+        self.assertEqual("normal_window", c.view_kind)
+
+    def test_branch_resolved_once_per_repo_root(self) -> None:
+        records = self._records([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex", agent_role="claude"),
+            _pane("%10", "mozyo-cockpit:0.3", window_name="codex", agent_role="codex"),
+        ])
+        calls: list[str] = []
+
+        def branch_resolver(root):
+            calls.append(root)
+            return "issue_11907"
+
+        cands = build_target_candidates(records, resolve_branch=branch_resolver)
+        self.assertEqual({"issue_11907"}, {c.branch for c in cands})
+        self.assertEqual(["/work/repo"], calls)  # cached per distinct root
+
+    def test_branch_defaults_to_none_without_resolver(self) -> None:
+        records = self._records([
+            _pane("%1", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        self.assertIsNone(build_target_candidates(records)[0].branch)
 
     def test_same_workspace_different_lane_is_distinguishable(self) -> None:
         records = self._records([
@@ -127,7 +163,8 @@ class BuildTargetCandidatesTest(unittest.TestCase):
 
 class AgentsTargetsCommandTest(unittest.TestCase):
     def _run(self, panes, *, as_json=False, session=None, agent=None,
-             workspace_id="wsA", label="mozyo-bridge", repo_root="/work/repo"):
+             workspace_id="wsA", label="mozyo-bridge", repo_root="/work/repo",
+             branch="issue_11907"):
         from mozyo_bridge.application import commands
 
         canon = argparse.Namespace(name=label, workspace_id=workspace_id)
@@ -136,6 +173,8 @@ class AgentsTargetsCommandTest(unittest.TestCase):
             patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
             patch("mozyo_bridge.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
+            patch.object(commands, "_probe_checkout_facts",
+                         return_value={"branch": branch}), \
             contextlib.redirect_stdout(io.StringIO()) as out:
             rc = commands.cmd_agents_targets(args)
         return rc, out.getvalue()
@@ -146,13 +185,28 @@ class AgentsTargetsCommandTest(unittest.TestCase):
                   agent_role="claude", lane_id="lane-abc", lane_label="feat"),
         ])
         self.assertEqual(0, rc)
+        # Original column run is preserved; VIEW_KIND / BRANCH are appended (#11907).
         self.assertIn(
             "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-            "SESSION\tWINDOW",
+            "SESSION\tWINDOW\tVIEW_KIND\tBRANCH",
             out,
         )
         self.assertIn("%9\tclaude\tpane_option\tstrong\t0\tmozyo-bridge\t"
-                      "lane-abc(feat)\trepo\t1\tmozyo-cockpit\tcodex", out)
+                      "lane-abc(feat)\trepo\t1\tmozyo-cockpit\tcodex\t"
+                      "cockpit_pane\tissue_11907", out)
+
+    def test_normal_window_text_uses_one_vocabulary(self) -> None:
+        # A normal-`mozyo` pane lists with the same columns as a cockpit pane,
+        # carrying `normal_window` so both share one target vocabulary (#11907).
+        rc, out = self._run([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        self.assertEqual(0, rc)
+        self.assertIn(
+            "%2\tclaude\twindow_name\tstrong\t0\tmozyo-bridge\tdefault\trepo\t1\t"
+            "repo\tclaude\tnormal_window\tissue_11907",
+            out,
+        )
 
     def test_compact_text_hides_absolute_paths(self) -> None:
         rc, out = self._run([
@@ -163,22 +217,44 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         self.assertNotIn("/private/secret/repo", out)  # only the basename shows
         self.assertIn("\trepo\t", out)
 
-    def test_json_carries_structured_fields_including_repo_root(self) -> None:
+    def test_json_renders_nested_target_record_projection(self) -> None:
+        # --json is the nested canonical TargetRecord projection (#11907):
+        # host / runtime / identity / repo / view, not a flat dict.
         rc, out = self._run([
             _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
                   agent_role="claude", lane_id="lane-abc", lane_label="feat"),
-        ], as_json=True)
+        ], as_json=True, branch="issue_11907")
         self.assertEqual(0, rc)
         payload = json.loads(out)
         self.assertEqual(1, len(payload))
         c = payload[0]
-        self.assertEqual("%9", c["pane_id"])
-        self.assertEqual("claude", c["role"])
-        self.assertEqual("pane_option", c["role_source"])
-        self.assertEqual("wsA", c["workspace_id"])
-        self.assertEqual("lane-abc", c["lane_id"])
-        self.assertEqual("/work/repo", c["repo_root"])  # JSON keeps the full path
-        self.assertEqual("local", c["host"])
+        self.assertEqual("local", c["host"]["id"])
+        self.assertEqual("local", c["host"]["kind"])
+        self.assertEqual("tmux", c["runtime"]["provider"])
+        self.assertEqual("%9", c["runtime"]["pane_id"])
+        self.assertEqual("mozyo-cockpit", c["runtime"]["session"])
+        self.assertEqual("/work/repo", c["runtime"]["cwd"])
+        self.assertEqual("claude", c["identity"]["role"])
+        self.assertEqual("pane_option", c["identity"]["role_source"])
+        self.assertEqual("wsA", c["identity"]["workspace_id"])
+        self.assertEqual("lane-abc", c["identity"]["lane_id"])
+        self.assertFalse(c["identity"]["ambiguous"])
+        self.assertEqual("/work/repo", c["repo"]["root"])  # JSON keeps the full path
+        self.assertEqual("repo", c["repo"]["label"])
+        self.assertEqual("issue_11907", c["repo"]["branch"])
+        self.assertEqual("cockpit_pane", c["view"]["kind"])
+        self.assertEqual("mozyo-cockpit", c["view"]["group"])
+        self.assertTrue(c["view"]["active"])
+
+    def test_json_normal_window_has_no_display_group(self) -> None:
+        # A normal_window target has no cross-workspace cockpit group (#11907).
+        rc, out = self._run([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        c = json.loads(out)[0]
+        self.assertEqual("normal_window", c["view"]["kind"])
+        self.assertIsNone(c["view"]["group"])
 
     def test_unknown_panes_are_not_listed(self) -> None:
         rc, out = self._run([

@@ -223,13 +223,18 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
 
 
 def cmd_agents_targets(args: argparse.Namespace) -> int:
-    """Compact handoff-target discovery for LLM / operator use (Redmine #11811).
+    """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
 
     Read-only. Prints the classified agent panes as candidate handoff targets
     with just the fields needed to pick an explicit ``pane_id`` without parsing
     titles: role + resolver provenance (``role_source`` / ``confidence`` /
     ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
-    repo identifier, liveness, and location. Builds on the same
+    repo identifier, current branch, liveness, location, and the projection
+    ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
+    and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
+    original column order and appends ``VIEW_KIND`` / ``BRANCH``; ``--json``
+    renders the nested canonical ``TargetRecord`` projection (host / runtime /
+    identity / repo / view) — a projection, never a saved file. Builds on the same
     ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
     the two never drift, and resolves workspace identity through the registry →
     anchor → derivation chain. Compact text hides absolute paths (basename
@@ -268,7 +273,21 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
         canon = _canonical(repo_root)
         return (getattr(canon, "workspace_id", None), getattr(canon, "name", None))
 
-    candidates = build_target_candidates(records, resolve_workspace=resolve_workspace)
+    branch_cache: dict[str, str | None] = {}
+
+    def resolve_branch(repo_root: str):
+        # Reuse the tolerant lane-identity git probe (#11820) so a non-git /
+        # detached checkout degrades to ``None`` instead of raising; cached per
+        # distinct repo root.
+        if repo_root not in branch_cache:
+            branch_cache[repo_root] = _probe_checkout_facts(repo_root).get("branch")
+        return branch_cache[repo_root]
+
+    candidates = build_target_candidates(
+        records,
+        resolve_workspace=resolve_workspace,
+        resolve_branch=resolve_branch,
+    )
 
     if getattr(args, "as_json", False):
         import json as _json
@@ -277,9 +296,12 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
+    # Compatibility-preserving text projection (#11907): the original column run
+    # (PANE..WINDOW) keeps its order so existing parsers stay valid; VIEW_KIND /
+    # BRANCH are appended so normal local and cockpit read with one vocabulary.
     print(
         "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW"
+        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH"
     )
     for c in candidates:
         lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
@@ -297,6 +319,8 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     "1" if c.active else "0",
                     c.session or "-",
                     c.window_name or "-",
+                    c.view_kind,
+                    c.branch or "-",
                 ]
             )
         )
