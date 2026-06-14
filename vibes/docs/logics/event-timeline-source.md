@@ -109,7 +109,7 @@ redaction:
 不変条件:
   - prompt 本文は store にそもそも無い (store の不変条件)。projection も再現できない
   - private absolute path を JSON / text どちらにも出さない。
-    workspace_hint は basename のみ (例: `/Users/alice/work/secret-proj` -> `secret-proj`)
+    workspace_hint は basename のみ (例: `/workspace/project-alpha` -> `project-alpha`)
 ```
 
 basename すら出したくない consumer 向けに full redaction option を将来足す余地はあるが、

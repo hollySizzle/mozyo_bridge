@@ -98,9 +98,9 @@ def _basename_hint(cwd: Optional[str]) -> Optional[str]:
     """Leaf component of ``cwd``; never the full path.
 
     A timeline consumer needs to tell workspaces apart, but a private
-    absolute path must not leave the process. ``/Users/alice/work/proj`` ->
-    ``proj``. Pure/string-only — no filesystem access, so it is safe on a
-    path shape from any host.
+    absolute path must not leave the process. ``/workspace/project-alpha``
+    -> ``project-alpha``. Pure/string-only — no filesystem access, so it is
+    safe on a path shape from any host.
     """
     if not cwd:
         return None

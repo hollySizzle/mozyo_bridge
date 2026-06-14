@@ -31,7 +31,7 @@ def _event(**overrides) -> OtelEvent:
         event_name="api_request",
         service_name="claude-code",
         session_id="sess-abc-123456",
-        cwd="/Users/alice/work/secret-proj",
+        cwd="/workspace/project-alpha",
         received_at="2026-06-14T03:00:00+00:00",
         attrs={
             "mozyo.agent": "claude",
@@ -80,22 +80,28 @@ class ProjectionTest(unittest.TestCase):
 
 class RedactionTest(unittest.TestCase):
     def test_full_path_never_emitted_only_basename(self) -> None:
-        ev = project_event(_event(cwd="/Users/alice/work/secret-proj"))
-        self.assertEqual("secret-proj", ev.workspace_hint)
+        ev = project_event(_event(cwd="/workspace/project-alpha"))
+        self.assertEqual("project-alpha", ev.workspace_hint)
         blob = json.dumps(ev.as_payload())
-        self.assertNotIn("/Users/alice", blob)
-        self.assertNotIn("/work/", blob)
+        self.assertNotIn("/workspace", blob)
+        self.assertNotIn("/workspace/project-alpha", blob)
 
     def test_denied_keys_dropped_even_if_persisted(self) -> None:
         # The store persists attrs verbatim; the projection re-asserts the
         # deny boundary so a prompt-shaped attribute that slipped into the
-        # store cannot reach a consumer.
+        # store cannot reach a consumer. The sentinel values are neutral
+        # (neither personal-home-path nor secret-shaped) so the test itself
+        # does not trip the public/private boundary or release scan.
         ev = project_event(
-            _event(attrs={"prompt": "LEAKED", "authorization": "Bearer x", "total_tokens": 9})
+            _event(attrs={
+                "prompt": "DROP-PROMPT-SENTINEL",
+                "authorization": "DROP-AUTH-SENTINEL",
+                "total_tokens": 9,
+            })
         )
         blob = json.dumps(ev.as_payload())
-        self.assertNotIn("LEAKED", blob)
-        self.assertNotIn("Bearer", blob)
+        self.assertNotIn("DROP-PROMPT-SENTINEL", blob)
+        self.assertNotIn("DROP-AUTH-SENTINEL", blob)
         self.assertEqual(9, ev.usage["total_tokens"])
 
     def test_missing_cwd_yields_no_hint(self) -> None:
@@ -192,8 +198,8 @@ class CliTest(unittest.TestCase):
         text = self._run(cmd_events_tail, limit=None, as_json=False)
         self.assertIn("OBSERVED\tLAYER\tCATEGORY", text)
         self.assertIn("claude_evt", text)
-        self.assertIn("secret-proj", text)
-        self.assertNotIn("/Users/alice", text)
+        self.assertIn("project-alpha", text)
+        self.assertNotIn("/workspace", text)
 
     def test_tail_json_envelope(self) -> None:
         payload = json.loads(
