@@ -351,26 +351,62 @@ journal の欠如』で定義し、四状態に分類し、stall check と再通
 #11850 は integration record として保つ。独立した fix path が必要な問題を、
 構造のない dump として #11850 に積まない。
 
-## Claude pane permission mode (#11857)
+## Claude pane permission mode (#11857 / #11925)
 
 PoC 運用中、operator が cockpit / sublane の Claude pane を毎回 `Shift+Tab`
 で auto mode に切り替え忘れ、multi-sublane dogfooding が停止する friction
-が観測された。これを解消するため、managed Claude pane の launch command に
-permission mode を opt-in で渡せるようにした。
+が観測された。#11857 は managed Claude pane の launch command に permission
+mode を渡せる primitive を実装したが、その付与条件が env var の opt-in だけ
+だったため、cockpit session に env が未設定だと bare `claude` で起動し、lane
+が停止し得る冪等性 gap が残った (#11924 j#58206)。
 
-- 設定は環境変数 `MOZYO_CLAUDE_PERMISSION_MODE=<mode>` で行う。値が set されて
-  いると、Claude launch command に `--permission-mode <mode>` が付与される。
-- 適用範囲は `_agent_launch_command` という単一の chokepoint であり、cockpit /
-  layout / sublane / standalone agent window のすべての Claude pane に一律で
-  効く。
-- 既定は unset であり、その場合は従来どおり flag を付けない (既存挙動を
-  silent に変えない)。
-- Codex pane には一切影響しない。env var を export していても Codex launch
-  command は変わらない。
+#11925 で、この gap を **launch-context policy** として解消した。設定責務は
+mozyo の managed pane 作成経路にあり、repo-local の `.claude/settings.json` /
+`.claude/settings.local.json` には書かない (Claude Code v2.1.142 以降は
+repo-local `defaultMode: "auto"` を無視する設計のため。#11924 j#58207)。
+
+resolution は pure module `src/mozyo_bridge/domain/claude_permission_policy.py`
+にあり、launch chokepoint (`_agent_launch_command`) と `doctor` の両方が同じ
+precedence を参照する。
+
+- precedence は `env override > launch-context policy default > none`。
+  1. `MOZYO_CLAUDE_PERMISSION_MODE=<mode>` (env var) が set されていれば、
+     その値が最優先で `--permission-mode <mode>` として付与される。これは
+     #11857 の primitive を **互換 / 明示 override rail** として残したもので、
+     唯一の正本ではない。`MOZYO_CLAUDE_PERMISSION_MODE=default` のように auto を
+     明示的に切る用途にも使える。
+  2. env が unset / blank なら、launch-context の policy default が効く。
+     cockpit / layout / sublane (cockpit append) の managed Claude pane 作成
+     経路は `COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT` (= `auto`) を渡すため、
+     env var なしでも future Claude pane は再現可能に `claude --permission-mode
+     auto` で起動する。
+  3. それ以外 (standalone な `mozyo` window 経路) は policy default を渡さない
+     ため、従来どおり bare `claude` で起動する。既存挙動を silent に変えない。
+- Codex pane には一切影響しない。flag は Claude 限定で、cockpit default を
+  渡しても Codex launch command は変わらない。
 - choices は local `claude --help` 由来: `acceptEdits`, `auto`,
   `bypassPermissions`, `default`, `dontAsk`, `plan`。未知の値は launch 時に
   hard error にして、typo が default-permission pane へ silent fallback する
   ことを防ぐ。
+
+### 非 retroactive 性
+
+- CLI の `--permission-mode` flag は mozyo が **新規に作る** pane の launch
+  command にのみ効く。既に起動済みの Claude pane には retroactive に効かない。
+  既存 pane を auto に変えるには、`Shift+Tab` での手動切替か pane の再起動が
+  必要である。policy 変更 (cockpit default 化や env unset) も、その後に作られる
+  pane にしか効かない。
+
+### 検出 (dry-run / doctor)
+
+- `mozyo layout --dry-run` / `mozyo cockpit --dry-run` は planned launch
+  command を出力するため、future Claude pane が `--permission-mode auto` で
+  起動するかをそのまま確認できる。
+- `mozyo doctor` の `claude_launch_policy` section は、future cockpit /
+  sublane Claude pane の effective permission mode と source (policy default /
+  env override) を報告する。auto にならない状態 (env override で auto を切って
+  いる / env 値が不正) は warning として surface し、unset policy が lane を
+  silent に止めないようにする。
 
 ### 安全境界
 
@@ -379,12 +415,13 @@ permission mode を opt-in で渡せるようにした。
   command に渡すだけで、user / project local settings file を読み書きしない
   ため、on-disk settings と衝突しない。
 - `auto` / `acceptEdits` / `bypassPermissions` / `dontAsk` は autonomy を
-  広げる方向の mode である。bounded な sublane 実装 worker pane に限って
-  使うこと。owner-facing decision を回収する coordinator lane では、
-  default mode を維持し、この env var を export しない運用を推奨する。
+  広げる方向の mode である。cockpit / sublane の実装 worker pane を auto で
+  起動するのは、bounded な lane で実装を進めるための policy default であり、
+  permission mode が広げる autonomy の安全境界は Redmine gate と durable
+  record 側に置く (permission mode は実行境界そのものではない)。
 - env var はその shell / cockpit session のスコープであり、durable な
-  governance state ではない。permission mode を恒久 policy として扱わず、
-  実行境界は Redmine gate と durable record 側に置く。
+  governance state ではない。override rail として使い、恒久 policy の正本とは
+  しない。
 
 ## Redmine task subject / description separation (#11856)
 

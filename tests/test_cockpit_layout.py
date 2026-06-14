@@ -173,7 +173,7 @@ class LayoutCliTest(unittest.TestCase):
             return argparse.Namespace(name=name, workspace_id="id-" + name)
 
         with patch.object(commands, "resolve_canonical_session", side_effect=fake_resolve), \
-            patch.object(commands, "_agent_launch_command", side_effect=lambda role, s, cwd: f"{role}-cmd"), \
+            patch.object(commands, "_agent_launch_command", side_effect=lambda role, s, cwd, **_: f"{role}-cmd"), \
             patch.object(commands, "require_tmux"), \
             patch.object(commands, "session_exists", return_value=session_exists), \
             patch.object(commands, "run_tmux") as run_tmux, \

@@ -85,7 +85,7 @@ git worktree remove <worktree-path>
 | friction | 対処 (本 runbook scope) | 正本 |
 |---|---|---|
 | stale installed CLI (landed 直後の subcommand を拒否) | repo-local CLI (`PYTHONPATH=src python3 -m mozyo_bridge`) を使う | skill `## Dogfooding Version Boundary` / `## Stall ... Stale CLI` |
-| Claude pane が auto mode でない | `settings.json` には書かず、managed pane launch policy / 起動引数 (`claude --permission-mode auto`) で再現可能にする。導入前は operator が手動で有効化する | `#11924` / operator runtime |
+| Claude pane が auto mode でない | cockpit / sublane 作成経路の launch-context policy default で `claude --permission-mode auto` を再現可能に付与する (#11925)。`settings.json` には書かない。`MOZYO_CLAUDE_PERMISSION_MODE` は override rail。既存 pane には非 retroactive (手動切替 / 再起動が必要)。`dry-run` / `doctor claude_launch_policy` で検出する | `#11924` / `#11925` / [[logic-cockpit-sublane-operating-model]] |
 | stalled lane / callback 欠落 | durable record から stall candidate を判定・分類し、再通知を journal に残す | skill `## Stall And No-Progress Detection Standard` |
 | cockpit 列幅の偏り | operator が手動 rebalance (display 品質問題; identity は不変) | operator runtime; [[logic-cockpit-sublane-operating-model]] |
 

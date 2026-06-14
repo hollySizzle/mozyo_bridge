@@ -598,6 +598,69 @@ def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:
     }
 
 
+def doctor_claude_launch_policy_section() -> dict[str, Any]:
+    """Report the reproducible Claude launch permission policy (#11925).
+
+    Read-only: it never launches a pane and never raises. It answers the
+    one operator question that used to silently stall a lane — "will the
+    *next* cockpit / sublane Claude pane mozyo creates come up in auto
+    mode?" — and explains why (launch-context policy default vs the
+    ``MOZYO_CLAUDE_PERMISSION_MODE`` override rail).
+
+    ``ok`` when future cockpit / sublane Claude panes will launch ``auto``;
+    ``warning`` when an env override turns auto off, or when the env var
+    holds an invalid value (which would hard-error at actual launch). The
+    policy is non-retroactive, so this describes future panes only —
+    already-running panes keep whatever mode they started with.
+    """
+    from mozyo_bridge.domain.claude_permission_policy import (
+        SOURCE_ENV_INVALID,
+        SOURCE_ENV_OVERRIDE,
+        describe_launch_policy,
+    )
+
+    policy = describe_launch_policy()
+    next_action: list[str] = []
+
+    if policy["source"] == SOURCE_ENV_INVALID:
+        status = "warning"
+        next_action.append(
+            f"{policy['env_var']}={policy['env_value']!r} is not a valid Claude "
+            "permission mode; future cockpit / sublane Claude panes will fail to "
+            "launch until it is unset or set to a valid mode (auto recommended)"
+        )
+    elif policy["reproducible_auto"]:
+        status = "ok"
+    else:
+        # Either an explicit non-auto env override, or no auto policy at all.
+        status = "warning"
+        if policy["source"] == SOURCE_ENV_OVERRIDE:
+            next_action.append(
+                f"{policy['env_var']}={policy['env_value']!r} overrides the cockpit "
+                "auto policy; future cockpit / sublane Claude panes will launch "
+                f"`--permission-mode {policy['effective_mode']}` instead of auto. "
+                "Unset it to restore reproducible auto mode"
+            )
+        else:
+            next_action.append(
+                "future cockpit / sublane Claude panes will not launch in auto "
+                "mode; this build has no auto launch policy configured"
+            )
+
+    return {
+        "status": status,
+        "scope": "future cockpit / sublane managed Claude panes (non-retroactive)",
+        "effective_mode": policy["effective_mode"],
+        "source": policy["source"],
+        "reproducible_auto": policy["reproducible_auto"],
+        "env_var": policy["env_var"],
+        "env_present": policy["env_present"],
+        "env_value": policy["env_value"],
+        "policy_default": policy["policy_default"],
+        "next_action": next_action,
+    }
+
+
 def _in_tmux() -> bool:
     return bool(os.environ.get("TMUX") or os.environ.get("TMUX_PANE"))
 
@@ -1076,6 +1139,7 @@ def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "scaffold": doctor_scaffold_section(args),
         "workspace_registry": doctor_workspace_registry_section(args),
         "claude_nagger": doctor_claude_nagger_section(args),
+        "claude_launch_policy": doctor_claude_launch_policy_section(),
         "tmux": tmux_section,
         "otel": doctor_otel_section(args),
     }
@@ -1255,6 +1319,22 @@ def format_doctor_text(result: dict[str, Any]) -> str:
                 f"  {name}: present={info['present']} path={info['path']}"
             )
         for action in nagger.get("next_action", []):
+            lines.append(f"  -> {action}")
+
+    launch_policy = sections.get("claude_launch_policy") or {}
+    if launch_policy:
+        lines.append(
+            f"claude_launch_policy: {launch_policy.get('status', 'unknown')} "
+            f"effective_mode={launch_policy.get('effective_mode') or '-'} "
+            f"source={launch_policy.get('source', '-')}"
+        )
+        lines.append(f"  scope: {launch_policy.get('scope', '-')}")
+        if launch_policy.get("env_present"):
+            lines.append(
+                f"  {launch_policy.get('env_var', 'env')}="
+                f"{launch_policy.get('env_value', '') or '-'}"
+            )
+        for action in launch_policy.get("next_action", []):
             lines.append(f"  -> {action}")
 
     tmux = sections["tmux"]

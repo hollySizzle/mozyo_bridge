@@ -254,7 +254,7 @@ class CockpitDecisionTest(unittest.TestCase):
             ws_id, DEFAULT_LANE, ADOPT_STATUS_NONE, (), None
         )
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \
-            patch.object(commands, "_agent_launch_command", side_effect=lambda r, s, c: f"{r}-cmd"), \
+            patch.object(commands, "_agent_launch_command", side_effect=lambda r, s, c, **_: f"{r}-cmd"), \
             patch.object(commands, "require_tmux"), \
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
             patch.object(commands, "_resolve_workspace_lane", return_value=lane), \

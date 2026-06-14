@@ -22,6 +22,11 @@ from mozyo_bridge.domain.agent_discovery import (
     infer_repo_root,
     project_preflight_target,
 )
+from mozyo_bridge.domain.claude_permission_policy import (
+    COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+    InvalidPermissionMode,
+    permission_mode_flag,
+)
 from mozyo_bridge.domain.handoff import (
     AUTO_TARGET_REPO,
     AnchorError,
@@ -667,49 +672,55 @@ def otel_bootstrap_env(
     }
 
 
-# Redmine #11857: opt-in permission mode for managed Claude panes.
-# Operators kept forgetting to Shift+Tab cockpit / sublane Claude panes
-# into auto mode, which stalled multi-sublane dogfooding. Exporting
-# MOZYO_CLAUDE_PERMISSION_MODE=<mode> appends `--permission-mode <mode>`
-# to the Claude launch command at every managed-pane chokepoint (cockpit,
-# layout, sublane, standalone agent windows). Unset / blank keeps the
-# historical bare `claude` launch, so existing behavior never changes
-# silently, and the flag is Claude-only — Codex launches are untouched.
-# A CLI `--permission-mode` flag overrides settings.json's
+# Redmine #11857 / #11925: reproducible permission mode for managed Claude
+# panes. Operators kept forgetting to Shift+Tab cockpit / sublane Claude
+# panes into auto mode, which stalled multi-sublane dogfooding. The launch
+# command appends `--permission-mode <mode>` at every managed-pane
+# chokepoint (cockpit, layout, sublane, standalone agent windows). Cockpit
+# / sublane creation passes a launch-context policy default of `auto`
+# (#11925) so future managed Claude panes are reproducibly auto without an
+# env var; the standalone `mozyo` window path passes no default, so its
+# historical bare `claude` launch never changes silently. The env var
+# `MOZYO_CLAUDE_PERMISSION_MODE` remains the compatibility / explicit
+# override rail and wins when set. The flag is Claude-only — Codex launches
+# are untouched. A CLI `--permission-mode` flag overrides settings.json's
 # permissions.defaultMode for that one session only; it neither reads nor
 # writes any user / project settings file, so it cannot conflict with
-# local on-disk settings.
-CLAUDE_PERMISSION_MODE_ENV = "MOZYO_CLAUDE_PERMISSION_MODE"
-# Choices confirmed from local `claude --help` (#11857).
-CLAUDE_PERMISSION_MODES = frozenset(
-    {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
-)
+# local on-disk settings, and it is non-retroactive (already-running panes
+# keep their mode). Resolution lives in the pure policy module so `doctor`
+# introspects the same precedence.
 
 
-def _claude_permission_mode_flag(agent: str) -> str:
+def _claude_permission_mode_flag(
+    agent: str, *, policy_default: str | None = None
+) -> str:
     """`--permission-mode <mode>` suffix for managed Claude panes, or ``""``.
 
-    Opt-in via MOZYO_CLAUDE_PERMISSION_MODE and scoped to the Claude agent
-    only. An unset / blank value yields no flag (unchanged launch). An
-    unrecognized value is a hard error so a typo cannot silently fall back
-    to a default-permission pane the operator did not intend.
+    Delegates to the pure policy resolver (env override > launch-context
+    policy default > none) and turns an invalid value into a hard CLI error
+    so a typo cannot silently fall back to a default-permission pane the
+    operator did not intend.
     """
-    if agent != "claude":
-        return ""
-    mode = os.environ.get(CLAUDE_PERMISSION_MODE_ENV, "").strip()
-    if not mode:
-        return ""
-    if mode not in CLAUDE_PERMISSION_MODES:
-        die(
-            f"{CLAUDE_PERMISSION_MODE_ENV}={mode!r} is not a valid Claude "
-            f"permission mode (choices: "
-            f"{', '.join(sorted(CLAUDE_PERMISSION_MODES))})"
-        )
-    return f" --permission-mode {mode}"
+    try:
+        return permission_mode_flag(agent, policy_default=policy_default)
+    except InvalidPermissionMode as exc:
+        die(str(exc))
 
 
-def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
-    """The shell command tmux runs for a new agent pane, with OTel env."""
+def _agent_launch_command(
+    agent: str,
+    session: str,
+    cwd: str | None,
+    *,
+    permission_mode_default: str | None = None,
+) -> str:
+    """The shell command tmux runs for a new agent pane, with OTel env.
+
+    ``permission_mode_default`` is the launch-context policy default for the
+    Claude permission mode (cockpit / sublane pass ``auto``; the standalone
+    path passes ``None`` to preserve the historical bare ``claude`` launch).
+    The ``MOZYO_CLAUDE_PERMISSION_MODE`` env var still overrides it.
+    """
     import shlex
 
     env_pairs = " ".join(
@@ -718,7 +729,7 @@ def _agent_launch_command(agent: str, session: str, cwd: str | None) -> str:
     )
     return (
         f"env {env_pairs} {AGENT_COMMANDS[agent]}"
-        f"{_claude_permission_mode_flag(agent)}"
+        f"{_claude_permission_mode_flag(agent, policy_default=permission_mode_default)}"
     )
 
 
@@ -1255,7 +1266,14 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
         )
 
     def launch(role: str, ws) -> str:
-        return _agent_launch_command(role, session, ws.repo_root)
+        # Cockpit managed Claude panes launch auto reproducibly (#11925);
+        # env var still overrides. Codex is unaffected (Claude-only flag).
+        return _agent_launch_command(
+            role,
+            session,
+            ws.repo_root,
+            permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+        )
 
     plan = build_cockpit_plan(
         workspaces, codex_ratio=codex_ratio, session=session, launch=launch
@@ -2094,7 +2112,13 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     )
 
     def launch(role: str, ws) -> str:
-        return _agent_launch_command(role, session, ws.repo_root)
+        # Cockpit / sublane append: same reproducible auto policy (#11925).
+        return _agent_launch_command(
+            role,
+            session,
+            ws.repo_root,
+            permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+        )
 
     # Read-only state read drives the create/append/focus decision. `--dry-run`
     # / `--json` only read (never mutate) — `_read_cockpit_columns` /

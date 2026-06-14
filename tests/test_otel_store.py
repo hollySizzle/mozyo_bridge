@@ -531,7 +531,15 @@ class BootstrapInjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
             patch.dict(
                 "os.environ",
-                {"MOZYO_BRIDGE_HOME": str(Path(tmp) / "home")},
+                {
+                    "MOZYO_BRIDGE_HOME": str(Path(tmp) / "home"),
+                    # Standalone window keeps the historical bare `claude`
+                    # launch (no cockpit policy default), so neutralize any
+                    # MOZYO_CLAUDE_PERMISSION_MODE the operator exported in
+                    # their shell (#11925 override rail) to keep this test
+                    # hermetic regardless of the launching environment.
+                    "MOZYO_CLAUDE_PERMISSION_MODE": "",
+                },
                 clear=False,
             ), \
             patch("mozyo_bridge.application.commands.require_tmux"), \
