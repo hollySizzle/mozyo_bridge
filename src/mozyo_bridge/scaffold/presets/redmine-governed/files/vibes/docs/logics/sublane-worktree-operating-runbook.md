@@ -72,12 +72,15 @@ sublane Claude は bounded implementation worker (skill `### Sublane Claude` / `
 - review 粒度は preset に従う (UserStory 単位の US-level audit、または単独 issue の per-issue review; central preset / skill `## Ticket System Conventions`)。
 - commit は audit record 成立後に Codex が audit-approved diff のみを commit する (skill `## Audit-Owned Commit Authority`)。implementer は commit を作らず diff を残す運用も可。
 - push / CI は coordinator / owner gated。push 前に local checks が green であること、push 後に CI 結果を durable record に記録する。
-- lane retirement (worktree 削除) は **素の git** で行い、削除前に dirty / in-scope 変更が無いことを確認する safety step を必ず踏む ([[logic-worktree-lifecycle-boundary]])。破壊的退役 (pane kill + worktree remove + 未 commit 破棄) は owner approval を durable record に残してから行う。
+- lane retirement (worktree 削除) は **素の git** で行い、削除前に dirty / in-scope 変更が無いことを確認する safety step を必ず踏む ([[logic-worktree-lifecycle-boundary]])。
+- routine retirement は coordinator Codex の責務であり、条件を満たす lane は owner 確認なしに退役してよい。条件は [[logic-worktree-lifecycle-boundary]] `## sublane retirement authority` を読む。
+- owner approval が必要なのは、未統合 commit、scope 不明 dirty diff、credential / private 情報の可能性、owner 判断待ち、active review / handoff、identity ambiguity など、routine retirement 条件を外れる場合である。
 
 ```text
-git status --short                  # in-scope dirty が無いことを確認 (削除可否は operator 判断)
+git status --short                  # in-scope dirty が無いこと、または disposable local runtime state のみであることを確認
+git cherry -v <base> <branch>        # 必要なら patch-equivalent / integrated を確認
 git worktree remove <worktree-path>
-# 必要なら cockpit pane を kill。退役承認は durable record に残す
+# 必要なら cockpit pane を kill。material な退役は durable record に残す
 ```
 
 ## 7. known friction と対処
