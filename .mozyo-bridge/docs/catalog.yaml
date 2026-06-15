@@ -301,6 +301,24 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-refactor-split-strategy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/refactor-split-strategy.md
+    purpose: "commands.py / cli.py / tests/test_mozyo_bridge.py の巨大化に対し、一括リファクタではなく feature family 単位で behavior-preserving に分割する方針。"
+    audit_role: refactor_split_strategy_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-fallback-retirement-ledger
+      - logic-release-helper-contract
+      - logic-tmux-send-safety-contract
+      - logic-pane-centric-cockpit-semantics
+      - logic-cockpit-sublane-operating-model
+      - logic-cockpit-attention-state
+      - logic-workspace-defaults-renderer
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-managed-state-model
     type: logic
     status: active
