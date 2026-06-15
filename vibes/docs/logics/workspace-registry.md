@@ -22,6 +22,9 @@ identity_layers:
   path_derivation:
     impl: domain/session_naming.derive_session_name (Redmine #10796)
     role: 初回登録時の名前決定と、未登録 workspace の fallback
+    bounded_variant: domain/session_naming.derive_session_name_without_defaults
+      は path-hash のみで導出し、workspace-local defaults を一切読まない。hot
+      discovery path 用 (Redmine #12038、後述「未登録 fallback の degrading mode」)。
 解決順序: home_registry -> workspace_anchor -> path_derivation
 ```
 
@@ -92,7 +95,19 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 - `mozyo-bridge workspace inspect [--repo PATH] [--json]` — registry row / anchor / derived fallback / 効いている解決を並べて表示。drift の可視化用。
 - read-only consumer (`session name`, bare `mozyo`, `status`, `session vscode-settings`) は `resolve_canonical_session()` 経由で、書き込みを伴わない。
 - smart `init` (#11427) は解決自体は `resolve_canonical_session()` 経由 (read-only) だが、未登録 workspace のときは guarded adoption の一部として `register_workspace()` を呼んで登録する (`workspace register` と同じ write 関数)。これは `workspace register` 以外の唯一の write 呼び出し元。
-- 未登録 workspace の解決は従来の導出と byte 一致で後方互換。
+- 未登録 workspace の解決は、既定 (`derive_unregistered=True`) では従来の導出と byte 一致で後方互換。
+
+## 未登録 fallback の degrading mode (Redmine #12038)
+
+`resolve_canonical_session(repo_root, *, derive_unregistered=True)` は registry / anchor のどちらも無い未登録 workspace のときだけ path_derivation へ落ちる。既定はフル `derive_session_name` (workspace-local `project-defaults.yaml` / 旧 `workspace-defaults.yaml` の Redmine identifier を読む) で、後方互換のため byte 一致。
+
+`derive_unregistered=False` を渡すと、未登録 branch は `derive_session_name_without_defaults` (path-hash のみ) へ degrade し、workspace-local defaults を**一切読まない**。これは read-only な discovery hot path 用の安全弁である:
+
+- `agents targets` / attention projection (`application/commands._agents_target_candidates`) は無関係 workspace の pane も列挙する。その workspace の defaults file が CloudStorage の dataless placeholder だと、`read()` が hydration 待ちで無限 block し、listing 全体が固まる (#12038 の再現)。
+- registered workspace は home_registry / anchor で解決され derivation に到達しないため、この flag の影響を受けない。degrade するのは「無関係かつ未登録」の workspace の表示用 session 名だけで、path-hash fallback (`mozyo-<slug>-<hash>`) に落ちる。
+- workspace_id は元々未登録なら `None` で、flag の有無で変わらない。target identity gate / same-lane narrowing / coordinator pseudo-target / cross-project Codex gateway は pane_id / workspace_id を見るため、表示名の degrade では弱まらない。
+
+canonical session / defaults 解決そのものが目的の command (`session name`、smart `init` の adoption など) は既定 (`derive_unregistered=True`) のまま、フル derivation を使う。`session_inventory.collect_runtime_inventory(..., derive_unregistered=False)` も同じ degrading 契約 (lightweight inventory、#12032) を共有する。
 
 ## 検証
 

@@ -138,6 +138,34 @@ def read_redmine_identifier(repo_root: Path) -> str | None:
     return identifier.strip() or None
 
 
+def derive_session_name_without_defaults(repo_root: Path | str) -> SessionName:
+    """Path-hash fallback name that never reads workspace-local defaults.
+
+    This is the ``SOURCE_REPO_FALLBACK`` branch of :func:`derive_session_name`
+    on its own, for hot discovery paths (``agents targets``, session inventory)
+    that must resolve a never-registered workspace's identity without opening
+    its ``project-defaults.yaml`` / legacy ``workspace-defaults.yaml`` — a read
+    that can block indefinitely when the file lives on a dataless CloudStorage
+    placeholder (Redmine #12038). Always suffixes the path hash so distinct
+    repos that share a basename (or whose non-ASCII basenames slug to the same
+    value) stay distinct, and so an all-non-ASCII basename never collapses to a
+    bare ``____``-style name.
+    """
+    resolved = Path(repo_root).expanduser().resolve()
+    basename_slug = slugify(resolved.name)
+    repo_hash = _repo_path_hash(resolved)
+    if basename_slug:
+        name = f"{SESSION_NAME_PREFIX}-{basename_slug}-{repo_hash}"
+    else:
+        name = f"{SESSION_NAME_PREFIX}-{repo_hash}"
+    return SessionName(
+        name=name,
+        source=SOURCE_REPO_FALLBACK,
+        repo_root=resolved,
+        identifier=None,
+    )
+
+
 def derive_session_name(repo_root: Path | str) -> SessionName:
     """Derive a collision-safe ASCII tmux session name for ``repo_root``.
 
@@ -158,21 +186,9 @@ def derive_session_name(repo_root: Path | str) -> SessionName:
                 identifier=identifier,
             )
 
-    # Fallback. Always suffix the path hash so distinct repos that share a
-    # basename (or whose non-ASCII basenames slug to the same value) stay
-    # distinct, and so an all-non-ASCII basename never collapses to ``____``.
-    basename_slug = slugify(resolved.name)
-    repo_hash = _repo_path_hash(resolved)
-    if basename_slug:
-        name = f"{SESSION_NAME_PREFIX}-{basename_slug}-{repo_hash}"
-    else:
-        name = f"{SESSION_NAME_PREFIX}-{repo_hash}"
-    return SessionName(
-        name=name,
-        source=SOURCE_REPO_FALLBACK,
-        repo_root=resolved,
-        identifier=None,
-    )
+    # Fallback. The path-hash branch reads no defaults, so reuse the shared
+    # helper rather than duplicating the slug/hash assembly.
+    return derive_session_name_without_defaults(resolved)
 
 
 def merge_vscode_session_name(existing_text: str | None, session_name: str) -> str:

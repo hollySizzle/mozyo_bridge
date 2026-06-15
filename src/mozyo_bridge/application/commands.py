@@ -287,8 +287,17 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
     canonical_cache: dict[str, object] = {}
 
     def _canonical(repo_root: str):
+        # ``derive_unregistered=False``: this is a read-only discovery hot path
+        # (``agents targets`` / the attention projection, #11954). A pane in a
+        # never-registered workspace must degrade to the path-hash fallback
+        # rather than open its workspace-local defaults, which can block the
+        # whole listing when that file is a dataless CloudStorage placeholder
+        # (Redmine #12038). Registered panes resolve from registry/anchor and
+        # are unaffected.
         if repo_root not in canonical_cache:
-            canonical_cache[repo_root] = resolve_canonical_session(repo_root)
+            canonical_cache[repo_root] = resolve_canonical_session(
+                repo_root, derive_unregistered=False
+            )
         return canonical_cache[repo_root]
 
     records = filter_agents(

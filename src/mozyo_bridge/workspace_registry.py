@@ -51,7 +51,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mozyo_bridge.domain.session_naming import derive_session_name
+from mozyo_bridge.domain.session_naming import (
+    derive_session_name,
+    derive_session_name_without_defaults,
+)
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.name_compat import CompatResolution, resolve_compat_path
 from mozyo_bridge.shared.paths import mozyo_bridge_home
@@ -644,7 +647,10 @@ def register_workspace(
 
 
 def resolve_canonical_session(
-    repo_root: Path | str, *, home: Path | None = None
+    repo_root: Path | str,
+    *,
+    home: Path | None = None,
+    derive_unregistered: bool = True,
 ) -> ResolvedSession:
     """Resolve the workspace's session name: registry → anchor → derivation.
 
@@ -652,6 +658,15 @@ def resolve_canonical_session(
     over re-deriving from the path; path derivation is reached only for
     never-registered workspaces (and is then byte-identical to the
     pre-registry behavior of `derive_session_name`).
+
+    ``derive_unregistered=False`` makes the never-registered branch degrade to
+    the path-hash fallback (`derive_session_name_without_defaults`) instead of
+    reading the workspace-local ``project-defaults.yaml`` / legacy
+    ``workspace-defaults.yaml``. Hot discovery surfaces (``agents targets``)
+    pass this so an unrelated workspace whose defaults file is a dataless
+    CloudStorage placeholder cannot block the listing on a hung ``read``
+    (Redmine #12038). Registered workspaces are unaffected — they resolve from
+    the registry / anchor and never reach derivation.
     """
     resolved = Path(repo_root).expanduser().resolve()
 
@@ -675,7 +690,11 @@ def resolve_canonical_session(
             identifier=None,
         )
 
-    derived = derive_session_name(resolved)
+    derived = (
+        derive_session_name(resolved)
+        if derive_unregistered
+        else derive_session_name_without_defaults(resolved)
+    )
     return ResolvedSession(
         name=derived.name,
         source=derived.source,

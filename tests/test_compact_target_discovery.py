@@ -274,6 +274,85 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         self.assertNotIn("%9\t", out)
 
 
+class AgentsTargetsUnregisteredDefaultsTest(unittest.TestCase):
+    """`agents targets` must not read unrelated workspace defaults (#12038).
+
+    A pane in a never-registered workspace previously fell through
+    ``resolve_canonical_session`` to ``derive_session_name``, which opens the
+    workspace-local ``project-defaults.yaml`` / legacy ``workspace-defaults.yaml``.
+    When that file is a dataless CloudStorage placeholder the ``read`` blocks
+    forever and the whole listing hangs. These tests run the *real*
+    ``resolve_canonical_session`` (not the stub the other command tests use) and
+    pin that discovery degrades to the path-hash fallback instead of reading
+    defaults.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.home = base / "mozyo-home"
+        self.home.mkdir()
+        self.repo = base / "unrelated-cloud-repo"
+        self.repo.mkdir()
+        env_patch = patch.dict(
+            "os.environ", {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def _run(self):
+        from mozyo_bridge.application import commands
+        from mozyo_bridge import workspace_registry
+
+        args = argparse.Namespace(session=None, agent=None, as_json=False)
+        # `derive_session_name` is the defaults-reading branch; make it explode
+        # so the test fails loudly if the hot path ever reaches it again. The
+        # registry is empty (fresh home) and the repo is unregistered, so the
+        # only thing standing between discovery and a hang is the fix.
+        with patch.object(commands, "require_tmux"), \
+            patch("mozyo_bridge.domain.agent_discovery.pane_lines",
+                  return_value=[_pane("%9", "mozyo-cockpit:0.1",
+                                      window_name="codex", agent_role="claude",
+                                      cwd=str(self.repo))]), \
+            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root",
+                  return_value=str(self.repo)), \
+            patch.object(workspace_registry, "derive_session_name",
+                         side_effect=AssertionError(
+                             "must not read workspace defaults")), \
+            patch.object(commands, "_probe_checkout_facts",
+                         return_value={"branch": "main"}), \
+            contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = commands.cmd_agents_targets(args)
+        return rc, out.getvalue()
+
+    def test_unregistered_workspace_degrades_instead_of_reading_defaults(self) -> None:
+        rc, out = self._run()
+        self.assertEqual(0, rc)
+        # The pane is still listed (degraded, not dropped); the path-hash
+        # fallback session name is what surfaces in the WORKSPACE column.
+        self.assertIn("%9\tclaude", out)
+        self.assertIn("mozyo-unrelated-cloud-repo-", out)
+
+    def test_present_defaults_file_is_not_opened(self) -> None:
+        # Even with a defaults file physically present, the hot path must not
+        # open it (the real risk is a placeholder whose read blocks).
+        defaults = self.repo / ".mozyo-bridge" / "workspace-defaults.yaml"
+        defaults.parent.mkdir(parents=True, exist_ok=True)
+        defaults.write_text(
+            "redmine:\n  default_project:\n    identifier: unrelated\n",
+            encoding="utf-8",
+        )
+        rc, out = self._run()
+        self.assertEqual(0, rc)
+        # The identifier-derived name (`mozyo-unrelated`) must NOT appear; the
+        # path-hash fallback wins because defaults were never read.
+        self.assertIn("mozyo-unrelated-cloud-repo-", out)
+        self.assertNotIn("\tmozyo-unrelated\t", out)
+
+
 class AgentsTargetsAttentionTest(unittest.TestCase):
     """Additive attention projection in `agents targets` (Redmine #11952).
 

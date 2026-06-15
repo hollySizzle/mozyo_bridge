@@ -283,6 +283,46 @@ class ResolveCanonicalSessionTest(WorkspaceRegistryBase):
         self.assertFalse(registry_path(self.home).exists())
         self.assertFalse((self.repo / ANCHOR_RELATIVE).exists())
 
+    def test_derive_unregistered_false_skips_defaults_read(self) -> None:
+        """Hot discovery degrades an unregistered workspace to the path hash.
+
+        Redmine #12038: ``agents targets`` must not open a never-registered
+        workspace's ``project-defaults.yaml`` / legacy ``workspace-defaults.yaml``
+        — that ``read`` can block forever on a dataless CloudStorage placeholder.
+        ``derive_unregistered=False`` must therefore never call the
+        defaults-reading ``derive_session_name``.
+        """
+        # Even with a present defaults file that would yield an identifier name,
+        # the lightweight path returns the path-hash fallback instead.
+        defaults = self.repo / ".mozyo-bridge" / "workspace-defaults.yaml"
+        defaults.parent.mkdir(parents=True, exist_ok=True)
+        defaults.write_text(
+            "redmine:\n  default_project:\n    identifier: some-project\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            workspace_registry,
+            "derive_session_name",
+            side_effect=AssertionError("must not read workspace defaults"),
+        ):
+            resolved = resolve_canonical_session(
+                self.repo, home=self.home, derive_unregistered=False
+            )
+        self.assertEqual(resolved.source, SOURCE_REPO_FALLBACK)
+        self.assertIsNone(resolved.workspace_id)
+        self.assertIsNone(resolved.identifier)
+        self.assertTrue(resolved.name.startswith("mozyo-demo-repo-"))
+
+    def test_derive_unregistered_false_still_prefers_registry(self) -> None:
+        """The flag only affects the never-registered branch."""
+        registered = register_workspace(self.repo, home=self.home)
+        resolved = resolve_canonical_session(
+            self.repo, home=self.home, derive_unregistered=False
+        )
+        self.assertEqual(resolved.source, SOURCE_HOME_REGISTRY)
+        self.assertEqual(resolved.workspace_id, registered.record.workspace_id)
+        self.assertEqual(resolved.name, registered.record.canonical_session)
+
     def test_anchor_wins_when_registry_missing(self) -> None:
         first = register_workspace(self.repo, home=self.home)
         registry_path(self.home).unlink()

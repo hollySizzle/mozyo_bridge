@@ -57,11 +57,9 @@ from mozyo_bridge.domain.agent_discovery import (
     fold_agents_by_pane,
 )
 from mozyo_bridge.domain.session_naming import (
-    SESSION_NAME_PREFIX,
     SOURCE_REPO_FALLBACK,
-    _repo_path_hash,
     derive_session_name,
-    slugify,
+    derive_session_name_without_defaults,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home, normalize_path_unicode
 from mozyo_bridge.workspace_registry import (
@@ -238,11 +236,7 @@ class InventorySnapshot:
 
 def _fallback_session_name_without_defaults(root: Path) -> str:
     """Path-derived session name without reading workspace-local defaults."""
-    basename_slug = slugify(root.resolve().name)
-    repo_hash = _repo_path_hash(root.resolve())
-    if basename_slug:
-        return f"{SESSION_NAME_PREFIX}-{basename_slug}-{repo_hash}"
-    return f"{SESSION_NAME_PREFIX}-{repo_hash}"
+    return derive_session_name_without_defaults(root).name
 
 
 def _resolve_identity(
