@@ -197,20 +197,71 @@ Core owns:
 - canonical path / related refs semantics
 - file convention matching
 - generator ownership rules
+- source-of-truth ordering for catalog, committed Markdown, generated artifacts,
+  and optional local overlays
 
 Provider owns:
 
 - storage and indexing mechanics
 - validation / query implementation details
+- cache freshness metadata and rebuild mechanics
+- read/query acceleration for resolver and audit tooling
 
 Boundary:
 
 - committed docs and catalog remain reviewable source of truth for governance docs.
 - DB may cache / index, but must not silently replace committed rule docs.
+- generated file conventions remain generator output from the catalog, not DB-owned
+  source.
+- local overlays remain checkout-local and must not be folded into public DB/index
+  snapshots.
 
 First-candidate score: low for v0.8 start. The temptation to centralize all static files into
 DB is high, but docs/rules need diffability. Treat DB as index/cache until a concrete query
 problem forces more.
+
+#### Cache / Index Boundary (Redmine #12036)
+
+The catalog backend provider may eventually be useful for faster lookup, richer audit
+queries, or offline inspection, but it must stay below the governance source-of-truth
+line. The provider can materialize an index from already-reviewable inputs; it cannot
+be the place where governance decisions are authored.
+
+Source-of-truth order:
+
+1. Committed Markdown rule / design docs are the human-readable policy source.
+2. `.mozyo-bridge/docs/catalog.yaml` maps those docs to ids, relationships, and
+   file conventions.
+3. Generated file conventions are reproducible output from the catalog.
+4. A future DB / SQLite backend is a rebuildable cache or query index over those
+   inputs.
+
+Provider contract:
+
+- build from committed docs, committed catalog, and generator output only;
+- expose freshness, source commit, and rebuild status so stale results can fail closed;
+- answer resolver / audit queries without changing the semantics of document ids,
+  related refs, file convention matching, or generator ownership;
+- keep local overlay data local-only and out of public snapshots;
+- treat unreadable, stale, or contradictory index state as `unknown` / rebuild-required,
+  not as a reason to bypass catalog validation.
+
+Provider non-goals:
+
+- no DB-authored rule docs;
+- no silent replacement of committed Markdown or `.mozyo-bridge/docs/catalog.yaml`;
+- no DB-to-generated-file write path that skips the existing generator;
+- no public plugin API or arbitrary external backend loading;
+- no workflow authority, owner approval, or routing authority.
+
+Implementation split:
+
+- docs-only boundary is enough for this issue;
+- runtime DB / SQLite index creation, migration, query command, or cache invalidation
+  requires a separate child issue and task-level review;
+- any future implementation must keep `mozyo-bridge docs validate`,
+  `generate-file-conventions --check`, and `audit-impact --check-generated` as the
+  authoritative verification gates.
 
 ### Telemetry / runtime observer adapter
 
