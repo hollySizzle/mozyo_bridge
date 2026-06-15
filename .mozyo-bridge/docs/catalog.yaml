@@ -437,6 +437,23 @@ documents:
       - logic-cockpit-web-ui
       - logic-event-timeline-source
       - logic-unit-target-model
+      - logic-pane-centric-cockpit-semantics
+      - logic-cockpit-attention-state
+      - logic-cross-project-cockpit-smoke-runbook
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-pane-centric-cockpit-semantics
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/pane-centric-cockpit-semantics.md
+    purpose: iTerm2 / VS Code / tmux plugin / 手動 tmux 操作に耐えるため、cockpit の意味構造を session/window/layout ではなく pane marker・durable identity・desired presentation state・display projection に分離する仕様正本。
+    audit_role: pane_centric_cockpit_semantics_logic
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-managed-state-model
+      - logic-iterm-webviewer-presentation-boundary
       - logic-cockpit-attention-state
       - logic-cross-project-cockpit-smoke-runbook
       - rule-public-private-boundary
