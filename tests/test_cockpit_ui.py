@@ -276,6 +276,51 @@ class CockpitHttpTest(unittest.TestCase):
             "source_unreadable", unreadable["attention"]["reason_code"]
         )
 
+    def test_attach_attention_stale_snapshot_degrades_to_unknown(self) -> None:
+        # Review #58888: a stale snapshot (tmux runtime unreadable, cached
+        # rows) cannot honestly assert liveness, so even a strong cached
+        # identity must derive unknown / source_unreadable, never healthy
+        # (cockpit-attention-state.md / runtime-observability-boundary.md).
+        payload = {
+            "stale": True,
+            "panes": [
+                {
+                    "pane_id": "%9",
+                    "agent_kind": "codex",
+                    "role_source": "pane_option",
+                    "confidence": "strong",
+                    "workspace": {"workspace_id": "ws-codex"},
+                }
+            ],
+        }
+        out = attach_attention(payload, observed_at="2026-06-15T00:00:00+00:00")
+        attention = out["panes"][0]["attention"]
+        self.assertEqual("unknown", attention["attention_state"])
+        self.assertEqual("source_unreadable", attention["reason_code"])
+
+    def test_units_endpoint_stale_cache_attention_is_unknown(self) -> None:
+        # End-to-end: a live poll seeds the inventory cache, then a poll with
+        # tmux unavailable serves that cache as stale — the cached claude row's
+        # attention must read unknown, not healthy, at the /api/units boundary.
+        panes = [pane("%1", "mozyo-demo", "claude")]
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=panes,
+        ):
+            self._get("/api/units")  # seed the cache from a live snapshot
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=None,  # tmux unavailable -> stale cache snapshot
+        ):
+            status, body = self._get("/api/units")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        self.assertTrue(payload["stale"])
+        self.assertEqual(1, len(payload["panes"]))
+        attention = payload["panes"][0]["attention"]
+        self.assertEqual("unknown", attention["attention_state"])
+        self.assertEqual("source_unreadable", attention["reason_code"])
+
     def test_transitions_endpoint_reports_observed_changes(self) -> None:
         # First poll establishes baseline (unknown), second poll after an
         # activity change yields a transition.

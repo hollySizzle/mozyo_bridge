@@ -64,11 +64,22 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
 
     Additive and public-safe: it adds one ``attention`` key per pane, never
     removing or altering the ``pane_id`` identity or the tmux / OTel / Redmine
-    layers; no durable attention source is wired yet, so it never fabricates an
-    owner/review signal (a cleanly-identified pane derives ``healthy`` /
-    ``no_attention_source``, an unreadable one ``unknown``); and ``source_refs``
-    carry only the tmux pane id, so no path / secret leaks. Cockpit-layer only —
-    like the Redmine join, the ``session list`` CLI payload stays attention-free.
+    layers; no durable attention source is wired yet, so on a live (runtime-
+    readable) snapshot it never fabricates an owner/review signal — a cleanly-
+    identified pane derives ``healthy`` / ``no_attention_source`` and an
+    unreadable identity ``unknown``; and ``source_refs`` carry only the tmux pane
+    id, so no path / secret leaks. Cockpit-layer only — like the Redmine join,
+    the ``session list`` CLI payload stays attention-free.
+
+    Stale fail-safe (Redmine #12007 review j#58888): when the snapshot is
+    ``stale`` (tmux runtime unreadable, rows served from the cache), per-pane
+    liveness cannot be honestly asserted, so attention degrades to ``unknown`` /
+    ``source_unreadable`` for the whole payload rather than showing a cached row
+    as ``healthy``. ``cockpit-attention-state.md`` (the ``unknown`` state and its
+    verification note) and ``runtime-observability-boundary.md`` both require
+    source-unreadable to derive ``unknown``, never ``healthy`` — a frontend
+    consumer must not read a runtime-unreadable pane as healthy from the
+    attention field even when the top-level ``stale`` flag is set.
 
     Limitation: the inventory layer does not resolve the ``@mozyo_lane_id`` pane
     option, so the projected ``lane_id`` is the ``default`` lane and there is no
@@ -85,6 +96,9 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
         conservative_attention,
     )
 
+    # A stale snapshot makes the runtime source unreadable for every pane, so no
+    # row can derive `healthy` regardless of how strong its cached identity is.
+    stale = bool(payload.get("stale"))
     for pane in payload.get("panes") or []:
         if not isinstance(pane, dict):
             continue
@@ -96,7 +110,8 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
             else ""
         )
         identity_readable = (
-            role in (ROLE_CLAUDE, ROLE_CODEX)
+            not stale
+            and role in (ROLE_CLAUDE, ROLE_CODEX)
             and pane.get("confidence") != CONFIDENCE_NONE
             and pane.get("role_source") != ROLE_SOURCE_UNKNOWN
         )
