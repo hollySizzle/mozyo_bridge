@@ -97,6 +97,122 @@ def _active_or_first(panes: list[dict[str, str]]) -> dict[str, str]:
     return panes[0]
 
 
+def _pane_lane_identity(pane: dict[str, str]) -> tuple[str, str]:
+    """The ``(workspace_id, lane_id)`` a pane belongs to (Redmine #11820).
+
+    The lane normalizes an empty / missing ``@mozyo_lane_id`` to the
+    backward-compatible ``default`` lane, matching the compact-discovery
+    projection so the two surfaces agree on lane identity.
+    """
+    workspace_id = (pane.get("workspace_id") or "").strip()
+    lane_id = (pane.get("lane_id") or "").strip() or "default"
+    return workspace_id, lane_id
+
+
+def _has_concrete_lane_identity(workspace_id: str, lane_id: str) -> bool:
+    """True when a pane carries enough identity to narrow same-lane on (#12011).
+
+    A pane with no workspace marker that sits in only the backward-compatible
+    ``default`` lane — a normal-``mozyo`` window, or any pane the cockpit never
+    stamped — has nothing to disambiguate against, so same-lane narrowing stays
+    off and the caller keeps its existing fail-closed behavior.
+    """
+    return bool(workspace_id) or lane_id != "default"
+
+
+def _optional_current_pane_id() -> str | None:
+    """The sender's ``TMUX_PANE`` id, or ``None`` outside tmux (best-effort)."""
+    return os.environ.get("TMUX_PANE") or None
+
+
+def _sender_pane(panes: list[dict[str, str]]) -> dict[str, str] | None:
+    """The sender's own pane within ``panes`` (live tmux snapshot), if known."""
+    pane_id = _optional_current_pane_id()
+    if not pane_id:
+        return None
+    return next((pane for pane in panes if pane.get("id") == pane_id), None)
+
+
+def narrow_to_sender_lane(
+    targets: list[dict[str, str]],
+    sender: dict[str, str] | None,
+) -> list[dict[str, str]]:
+    """Narrow agent-pane candidates to the sender's own workspace + lane (#12011).
+
+    Returns the subset of ``targets`` that share the sender pane's
+    ``(workspace_id, lane_id)`` identity. This is **same-lane addressing only**:
+    it can only shrink the candidate set and never selects a pane outside the
+    sender's own lane, so it cannot cross the lane governance boundary
+    (``vibes/docs/logics/cockpit-sublane-operating-model.md`` "Cross-Lane
+    Routing Rule") — a cross-lane handoff still has to be addressed explicitly
+    through the target lane's Codex gateway. It returns ``targets`` unchanged,
+    leaving the caller's fail-closed ambiguity handling intact, when the sender
+    pane is unknown or carries no concrete lane identity to match on. Live tmux
+    stays the identity source: both the sender's and the candidates' lanes come
+    from the ``@mozyo_*`` pane options in the snapshot, never a pane title.
+    """
+    if sender is None:
+        return targets
+    sender_identity = _pane_lane_identity(sender)
+    if not _has_concrete_lane_identity(*sender_identity):
+        return targets
+    return [pane for pane in targets if _pane_lane_identity(pane) == sender_identity]
+
+
+def _format_agent_candidate(pane: dict[str, str]) -> str:
+    """One ``%pane (workspace=..., lane=...)`` row for the fail-closed message."""
+    workspace_id, lane_id = _pane_lane_identity(pane)
+    lane_label = (pane.get("lane_label") or "").strip()
+    pane_id = pane.get("id") or pane.get("location") or "?"
+    return (
+        f"{pane_id} (workspace={workspace_id or '<none>'}, "
+        f"lane={lane_label or lane_id})"
+    )
+
+
+def _ambiguous_agent_targets_message(
+    agent: str,
+    session: str,
+    targets: list[dict[str, str]],
+    sender: dict[str, str] | None,
+) -> str:
+    """Fail-closed guidance naming the candidates, the reason, and the retry.
+
+    Same-lane narrowing (#12011) could not pick a unique target, so surface the
+    concrete candidate identities, *why* the sender lane did not resolve them,
+    and the explicit ``--target %pane`` override rather than guessing.
+    """
+    candidates = "; ".join(
+        _format_agent_candidate(pane)
+        for pane in sorted(targets, key=lambda pane: pane.get("id") or "")
+    )
+    if sender is None:
+        sender_clause = (
+            "the sender pane is unknown (run from inside the lane's pane), so "
+            "same-lane resolution could not narrow the candidates"
+        )
+    else:
+        sender_ws, sender_lane = _pane_lane_identity(sender)
+        sender_lane_label = (sender.get("lane_label") or "").strip() or sender_lane
+        if not _has_concrete_lane_identity(sender_ws, sender_lane):
+            sender_clause = (
+                "the sender pane carries no workspace/lane identity "
+                "(workspace=<none>, lane=default), so same-lane resolution could "
+                "not narrow the candidates"
+            )
+        else:
+            sender_clause = (
+                f"the sender lane (workspace={sender_ws or '<none>'}, "
+                f"lane={sender_lane_label}) matched no unique same-lane "
+                f"'{agent}' pane among the candidates"
+            )
+    return (
+        f"multiple '{agent}' panes found in session '{session}': {candidates}. "
+        f"{sender_clause}. Name the exact pane with `--target %pane` "
+        "(see `mozyo-bridge agents targets` for the candidate identities)."
+    )
+
+
 def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
     """Resolve the pane in ``session`` whose *resolved role* is ``agent``.
 
@@ -109,16 +225,23 @@ def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
     conflict never auto-targets. Returns ``None`` when nothing in ``session``
     resolves to ``agent``.
 
-    Fails closed on more than one distinct logical target. A window-named match
-    collapses its split panes to one target (the active pane); cockpit packs
-    several agents into one window, so each pane-option match is its own
-    target. Two ``<agent>`` windows, or several cockpit ``agent`` panes for the
-    same session, therefore die rather than pick one silently — tmux tolerates
-    the duplication, so resolver safety has to fail closed.
+    Fails closed on more than one distinct logical target, *after* attempting
+    same-lane narrowing (Redmine #12011). A window-named match collapses its
+    split panes to one target (the active pane); cockpit packs several agents
+    into one window, so each pane-option match is its own target. When more than
+    one distinct target survives, the sender's own ``(workspace_id, lane_id)``
+    narrows the set to its same-lane pane — a cockpit hosting several lanes
+    auto-resolves ``--to codex`` to the sender lane's Codex gateway without an
+    explicit ``--target``. That is same-lane addressing only and never crosses a
+    lane boundary. If the sender lane still does not pick a unique pane (sender
+    unknown / no lane identity / no or several same-lane matches) the resolver
+    dies with the concrete candidates rather than picking one silently — tmux
+    tolerates the duplication, so resolver safety has to fail closed.
     """
+    panes = pane_lines()
     window_groups: dict[str, list[dict[str, str]]] = {}
     option_panes: list[dict[str, str]] = []
-    for pane in pane_lines():
+    for pane in panes:
         location = pane.get("location") or ""
         if location.split(":", 1)[0] != session:
             continue
@@ -153,13 +276,14 @@ def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
     if not targets:
         return None
     if len(targets) > 1:
-        labels = ", ".join(
-            sorted(target.get("id") or target.get("location") or "?" for target in targets)
-        )
-        die(
-            f"multiple '{agent}' panes found in session '{session}': {labels}. "
-            "Name the exact pane with `--target %pane`."
-        )
+        # Same-lane narrowing (Redmine #12011): a multi-lane cockpit resolves
+        # `--to codex` with no explicit `--target` to the sender lane's own
+        # gateway. Same-lane addressing only — never a foreign lane's pane.
+        sender_pane = _sender_pane(panes)
+        narrowed = narrow_to_sender_lane(targets, sender_pane)
+        if len(narrowed) == 1:
+            return narrowed[0]
+        die(_ambiguous_agent_targets_message(agent, session, targets, sender_pane))
     return targets[0]
 
 

@@ -133,8 +133,23 @@ preflight では少なくとも次を確認する:
 4. window name fallback:
    - normal local compatibility のためだけに使う
    - `role_source=window_name` と明示する
-5. ambiguous / missing:
-   - fail closed または explicit target を要求する
+5. same-lane narrowing (Redmine #12011):
+   - explicit `--target` 不在で role resolution が同一 session 内に複数 agent pane
+     を返したとき、fail closed する前に sender pane 自身の
+     `(workspace_id, lane_id)` で候補を絞る。一意に決まればその same-lane pane を
+     auto-resolve する (例: 複数 lane を載せた cockpit で `--to codex` を sender
+     lane の Codex gateway に解決する)。
+   - これは **same-lane addressing 限定** であり、候補集合を縮小するだけで sender 自身の
+     lane 外の pane を選ばない。lane 境界を越える handoff は引き続き target lane の
+     Codex gateway に明示 addressing する (`cockpit-sublane-operating-model.md`
+     `## Cross-Lane Routing Rule`)。
+   - sender pane が不明、または concrete な lane identity を持たない (`workspace_id`
+     空かつ lane が `default`) 場合は narrowing を行わず、6 の fail closed に落とす。
+     identity source は live tmux の pane option であり、pane title を正本にしない。
+6. ambiguous / missing:
+   - fail closed または explicit target を要求する。fail closed 時は具体的な候補
+     (pane_id / workspace / lane)、絞り込めなかった理由、推奨 retry
+     (`--target %pane`) を提示する。
 
 ## Projection policy
 
