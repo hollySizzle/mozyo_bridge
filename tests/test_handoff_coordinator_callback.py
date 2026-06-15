@@ -94,6 +94,9 @@ def _runtime(panes, *, sender_pane_id):
         env["TMUX_PANE"] = sender_pane_id
     with patch(
         "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+    ), patch(
+        "mozyo_bridge.domain.pane_resolver.current_session_name",
+        return_value="mozyo-cockpit",
     ), patch.dict(os.environ, env, clear=True):
         yield
 
