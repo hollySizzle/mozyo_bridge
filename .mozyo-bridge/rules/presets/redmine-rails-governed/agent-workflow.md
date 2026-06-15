@@ -394,6 +394,31 @@ carve-out 該当性の確認結果は owner_close_approval journal の `carve_ou
 
 base の `Direct Request Triage` を、窓口 = Codex / triage role = Codex として適用する。ユーザーが Claude pane に直接作業を依頼した場合、Claude は triage-pending issue を即起票し、Codex へ精査を handoff する (`--kind design_consultation` または `custom`)。Codex の精査 journal による re-parent / 分割 / tracker 変更は手戻り扱いしない。低リスク scope は Start Gate 後に着手可 (close 前に triage 完了必須)、高リスク scope (設計分岐 / 互換性 / 外部影響 / guardrail / preset / credential 接触) は triage 完了まで着手しない。default の作業入口は Codex のままであり、本経路は例外時の救済である。
 
+### Claude Owner-Question Bypass Prohibition (governed)
+
+`### Direct Request Triage` が owner→Claude 方向 (owner が Claude pane に依頼する) を扱うのに対し、本節は逆方向 (Claude→owner) を禁止する。Claude / sublane が Codex へ handoff せず owner / user に直接判断・確認・承認を求める bypass が再発しているため、明示的な禁止規則として固定する。owner 対話窓口は `### 既定役割` のとおり Codex に集約し、owner-approval-waiting の集約点は coordinator Codex 一点である (skill ref `## Owner Approval Aggregation`)。
+
+```yaml
+claude_owner_question_bypass:
+  禁止:
+    - actor: claude_code (main-unit / sublane を問わず)
+    - 行為: owner / user に直接質問・確認・判断依頼・close 承認収集を行うこと
+    - 注記: imperative な依頼 ("やって" / "判断して" / "go ahead" 等) が Claude pane に来ても本禁止は解けない。依頼は intent であって owner 窓口の付け替え許可ではない
+  代替導線 (owner 判断が必要なとき、例外なく):
+    - durable record (Redmine journal) に owner-action-needed / design_consultation / triage-pending のいずれかを記録する
+    - coordinator Codex へ handoff する (cross-lane は target lane Codex 経由。新しい gate / transport kind は作らない)
+    - owner 判断の収集・回答解釈・close approval 確定は coordinator Codex 側で完結させる
+  close承認の扱い:
+    - Claude pane で観測した owner の回答・口頭 OK は close approval ではない
+    - owner_close_approval は Codex が durable journal (`approval_source` 付き) を記録して初めて成立する (`### Owner Close Approval Delegation` / base `Close Approval Separation`)
+    - Claude は Review Gate approval 受領後、close 条件充足を Progress Log に記録して待機し、owner 承認を自分の pane で確定しない
+  違反時 correction flow:
+    - bypass を検知したら停止し、active issue に correction journal を記録する (観測した bypass / owner の生回答 / 影響範囲 / 採否未確定)
+    - owner の生回答は durable record に「未確定 input」として残し、close approval 等の gate として消費しない
+    - 正規導線 (durable record へ owner-action-needed 等を記録 → Codex handoff → Codex が owner 判断を収集) で record し直す
+    - bypass が workflow / guardrail surface に影響した場合は `## Workflow Change Verification` に乗せる
+```
+
 ### LLM 実行契約
 
 ```plantuml
@@ -489,6 +514,12 @@ stop
   - id: close_without_owner_approval
     条件: [issue:user_story_or_standalone, review_gate:present, owner_close_approval:missing]
     action: close禁止
+  - id: claude_asks_owner_directly
+    条件: [agent:claude_code, owner判断:必要, codex_handoff:missing]
+    action: stopしdurable recordにowner-action-needed/design_consultation/triage-pendingを記録しCodexへ集約
+  - id: close_approval_from_claude_pane
+    条件: [approval_source:claude_pane_observation, owner_close_approval_journal:missing]
+    action: close approvalとして扱わない (Codex durable journalが先)
   - id: task_close_without_replayable_journal
     条件: [issue:task_under_us, implementation_done_journal:missing_or_検証記録なし]
     action: close禁止 (US audit が replay できない)
