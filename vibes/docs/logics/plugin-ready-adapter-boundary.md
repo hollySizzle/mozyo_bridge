@@ -442,6 +442,51 @@ byte-compatible.
 - No second place that sends the Redmine API key anywhere — normalization is
   pure over already-fetched data.
 
+## Internal Provider Registry Skeleton (Redmine #12035)
+
+The ticket adapter seam (#12034) classified *one* provider. #12035 adds the
+smallest place to classify *all* built-in providers, so future ticket /
+presentation / catalog / telemetry providers have a home before they are
+written. It is a classification skeleton, not a plugin system.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/provider_registry.py` — **core**, pure. It defines
+  the core-owned `ProviderCategory` vocabulary (`ticket`, `presentation`,
+  `terminal_runtime`, `catalog`, `telemetry`, `release_helper` — the design
+  doc's Adapter Categories), the frozen `BuiltinProvider` *description*
+  (category, provider id, capabilities, safety constraints, experimental flag),
+  the in-memory `BuiltinProviderRegistry`, and a module-level
+  `BUILTIN_PROVIDER_REGISTRY` seeded with the providers this codebase actually
+  ships today (`redmine` ticket, `tmux` terminal runtime). It imports no
+  provider implementation, so the dependency only ever points provider -> core.
+
+### Internal-only, by construction
+
+- **No external plugin loading.** Registration takes a pure `BuiltinProvider`
+  description, never a module path or callable, so no registration path can
+  import, load, or execute foreign code. There is no entry point, no
+  third-party contract, and no user-script load. This is the explicit non-goal:
+  external plugin loading is out of scope.
+- **No public ABI / compatibility promise.** The category names and record
+  shapes are internal and may change with no deprecation window.
+- **Empty categories are still expressible.** A category with no built-in
+  provider yet (`catalog`, `telemetry`, …) is a valid classification a future
+  provider slots into — that is the point of a skeleton. No placeholder
+  provider is invented for an unwritten category.
+
+### Authority stays core-owned
+
+The registry classifies providers; it does not hand them authority.
+`FORBIDDEN_PROVIDER_AUTHORITIES` enumerates the decisions core never delegates —
+`workflow_authority`, `owner_approval`, `close_approval`, `routing_authority` —
+and a `BuiltinProvider` that lists any of them as a capability is rejected at
+construction (`ProviderRegistryError`). This is the same boundary the ticket
+seam enforces functionally (`classify_workflow_gate` / `owner_approval` are core
+functions, never provider methods); the registry makes it a checked invariant
+for every classified provider. Tests pin both the forbidden set and the
+rejection.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
