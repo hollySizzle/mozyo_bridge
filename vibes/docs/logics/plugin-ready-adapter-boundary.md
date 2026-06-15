@@ -394,6 +394,54 @@ When this design moves from docs to code:
 6. Any new provider surface that writes tickets, tmux, release state, or local files requires
    per-task review.
 
+## Implemented Seam (Redmine #12034)
+
+The first concrete cut of the ticket adapter boundary now exists in code. It is
+deliberately the smallest seam that makes the design's record concepts explicit
+while keeping the existing Redmine-governed workflow and the cockpit read model
+byte-compatible.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/ticket_adapter.py` — **core**. Pure normalized
+  records `IssueRef`, `JournalRef`, `CommentRef`, `WorkflowGate`,
+  `OwnerApproval`; the `TicketProvider` protocol (the built-in provider
+  boundary); the core-owned `WORKFLOW_GATE_KINDS` vocabulary; and the
+  core-owned decisions `classify_workflow_gate` and `owner_approval`. No I/O,
+  no network, no provider import — the dependency only ever points
+  provider -> core.
+- `src/mozyo_bridge/infrastructure/redmine_ticket_provider.py` — the built-in
+  **Redmine provider**. It converts Redmine API JSON (the `/issues.json`
+  object, the `journals` array) and the existing handoff `RedmineAnchor` into
+  the normalized records, and owns Redmine-specific URL formatting. It performs
+  no network call itself (the trusted-base / credential boundary stays in
+  `redmine_context`) and owns no approval or gate semantics.
+- `src/mozyo_bridge/redmine_context.py` — the cockpit Redmine read model now
+  routes its API response through `RedmineTicketProvider.normalize_issue` and
+  projects the record back onto the same minimized `latest_issue` payload
+  (numeric id preserved, subject still never surfaced).
+
+### Boundary as enforced in code
+
+- The gate vocabulary is the durable-record subset of the handoff
+  `KIND_LABELS` (`implementation_done`, `review_request`, `review_result`),
+  sourced from `handoff` so the two cannot diverge. A provider cannot add gate
+  names; `WorkflowGate` is only constructible through `classify_workflow_gate`.
+- Owner close approval is **not** a gate. Reaching a gate is a
+  provider-observable journal fact; "close approval is satisfied" is a core
+  decision produced only by `owner_approval`. The built-in provider exposes no
+  approval API at all, and tests pin that.
+
+### Non-goals (unchanged, restated for the implementation)
+
+- No third-party or arbitrary-code provider loading; Redmine is the only
+  provider implementation.
+- No public ABI or long-term compatibility promise for these record shapes —
+  they are internal and may change.
+- No provider-defined workflow truth, gate names, or approval semantics.
+- No second place that sends the Redmine API key anywhere — normalization is
+  pure over already-fetched data.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

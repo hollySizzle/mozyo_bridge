@@ -51,6 +51,10 @@ from pathlib import Path
 
 import yaml
 
+from mozyo_bridge.domain.ticket_adapter import IssueRef
+from mozyo_bridge.infrastructure.redmine_ticket_provider import (
+    REDMINE_TICKET_PROVIDER,
+)
 from mozyo_bridge.workspace_defaults import defaults_resolution
 
 API_KEY_ENV = "MOZYO_REDMINE_API_KEY"
@@ -110,6 +114,29 @@ def read_redmine_project(repo_root: str | Path) -> tuple[str | None, str | None]
     return identifier.strip(), normalize_base_url(
         url if isinstance(url, str) else None
     )
+
+
+def _latest_issue_payload(issue: IssueRef) -> dict:
+    """Project a normalized :class:`IssueRef` onto the minimized cockpit payload.
+
+    Backwards compatible with the pre-seam shape (Redmine #11686): the id is
+    emitted as an ``int`` when the provider id is purely numeric so the
+    existing ``latest_issue.id`` JSON contract (a number) is preserved, and as
+    ``None`` when the provider had no id. ``status`` / ``updated_on`` come
+    straight from the record; no subject is ever included.
+    """
+    issue_id: object
+    if issue.id == "":
+        issue_id = None
+    elif issue.id.isdigit():
+        issue_id = int(issue.id)
+    else:
+        issue_id = issue.id
+    return {
+        "id": issue_id,
+        "status": issue.status,
+        "updated_on": issue.updated_on,
+    }
 
 
 @dataclass
@@ -206,18 +233,15 @@ class RedmineContextCache:
             return {"state": STATE_UNAVAILABLE, "project": identifier}
         latest = None
         if issues and isinstance(issues[0], dict):
-            top = issues[0]
-            status = top.get("status")
-            # Surface minimization (review #56232): subjects can carry
-            # personal or confidential summaries and the v1 UI does not
-            # display them, so they are never put on the payload.
-            latest = {
-                "id": top.get("id"),
-                "status": (
-                    status.get("name") if isinstance(status, dict) else None
-                ),
-                "updated_on": top.get("updated_on"),
-            }
+            # Ticket adapter seam (Redmine #12034): the Redmine API response is
+            # normalized into a core-facing record by the built-in provider,
+            # then projected back onto the minimized cockpit payload. Surface
+            # minimization (review #56232) is preserved by the projection —
+            # subjects can carry personal or confidential summaries and the
+            # provider never reads them, so they never reach the payload.
+            latest = _latest_issue_payload(
+                REDMINE_TICKET_PROVIDER.normalize_issue(issues[0])
+            )
         return {
             "state": STATE_AVAILABLE,
             "project": identifier,
