@@ -356,6 +356,21 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             redmine_cache = getattr(self.server, "redmine_context", None)
             if redmine_cache is not None:
                 payload = attach_redmine_context(payload, redmine_cache)
+            # Fourth join layer (Redmine #12007): derived attention projection,
+            # additive and cockpit-layer only — the same conservative
+            # AttentionRecord vocabulary `agents targets --json` exposes, so a
+            # cockpit frontend can triage panes from one source. Pure (no
+            # network); the observation clock is stamped here at the I/O layer.
+            from datetime import datetime, timezone
+
+            from mozyo_bridge.application.cockpit_ui import attach_attention
+
+            payload = attach_attention(
+                payload,
+                observed_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+            )
             self._respond_json(200, payload)
             return
         if self.path == "/api/transitions":

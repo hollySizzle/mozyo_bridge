@@ -227,12 +227,6 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
 
 
 # Reason code for the conservative pre-wiring attention projection (#11952):
-# no durable attention source (Redmine gate / owner / review / managed event) is
-# connected yet, so a cleanly-identified target derives `healthy` with this
-# reason rather than a fabricated owner/review signal.
-_ATTENTION_NO_SOURCE_REASON = "no_attention_source"
-
-
 def _attention_for_candidate(candidate, observed_at: str):
     """Derive a conservative :class:`AttentionRecord` for one target (#11952).
 
@@ -243,7 +237,9 @@ def _attention_for_candidate(candidate, observed_at: str):
     whose identity itself is ambiguous / unreadable (``unknown``). Later
     extraction tasks feed real durable / observed signals into the same pure
     :func:`derive_attention`; this stays an additive projection and is never used
-    for routing / target selection.
+    for routing / target selection. Delegates to the shared
+    :func:`~mozyo_bridge.domain.attention.conservative_attention` so this and the
+    cockpit ``/api/units`` join (#12007) cannot drift.
     """
     from mozyo_bridge.domain.agent_discovery import (
         CONFIDENCE_NONE,
@@ -252,40 +248,24 @@ def _attention_for_candidate(candidate, observed_at: str):
     from mozyo_bridge.domain.attention import (
         ROLE_CLAUDE,
         ROLE_CODEX,
-        ROLE_OTHER,
-        AttentionInputs,
-        derive_attention,
+        conservative_attention,
     )
 
-    role = candidate.role if candidate.role in (ROLE_CLAUDE, ROLE_CODEX) else ROLE_OTHER
     identity_readable = (
-        role in (ROLE_CLAUDE, ROLE_CODEX)
+        candidate.role in (ROLE_CLAUDE, ROLE_CODEX)
         and candidate.confidence != CONFIDENCE_NONE
         and candidate.role_source != ROLE_SOURCE_UNKNOWN
     )
-    contradictory = bool(candidate.ambiguous)
-    host = candidate.host or "local"
-    workspace_id = candidate.workspace_id or ""
-    lane_id = candidate.lane_id or "default"
-    pane_id = candidate.pane_id
-    inputs = AttentionInputs(
-        unit_id=f"unit:{host}:{workspace_id}:{lane_id}",
+    return conservative_attention(
         observed_at=observed_at,
-        host_id=host,
-        workspace_id=workspace_id,
-        lane_id=lane_id,
-        role=role,
-        target_key=f"tmux:{host}:{pane_id}" if pane_id else None,
-        source_refs=(f"tmux:{pane_id}",) if pane_id else (),
-        source_readable=identity_readable,
-        contradictory=contradictory,
-        reason_code=(
-            _ATTENTION_NO_SOURCE_REASON
-            if identity_readable and not contradictory
-            else None
-        ),
+        role=candidate.role,
+        identity_readable=identity_readable,
+        contradictory=bool(candidate.ambiguous),
+        host=candidate.host or "local",
+        workspace_id=candidate.workspace_id or "",
+        lane_id=candidate.lane_id or "default",
+        pane_id=candidate.pane_id,
     )
-    return derive_attention(inputs)
 
 
 def _agents_target_candidates(args: argparse.Namespace) -> list:

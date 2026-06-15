@@ -11,7 +11,7 @@ Redmine #11639 (#11679/#11680/#11681/#11682)。コックピット表示面の設
   host非依存: 既定 host は iTerm2 Toolbelt webview。任意ブラウザで同一 UI (iTerm2 専用 code を UI に入れない)
 endpoints:
   "GET /": 単一 self-contained HTML (外部 asset / CDN なし — 持ち出し経路を作らない)
-  "GET /api/units": session inventory snapshot (三層: tmux=行の存在+stale / OTel=activity / Redmine=段階4 join 予定)
+  "GET /api/units": session inventory snapshot (四層: tmux=行の存在+stale / OTel=activity / Redmine=段階4 join / attention=#12007 派生 projection)
   "GET /api/transitions": activity 遷移の ring buffer (memory のみ、daemon 再起動で消える = best-effort 整合)
   "POST /api/actions/reveal": repo_root を macOS `open` で開く
   "POST /api/actions/jump": attach client を `tmux switch-client -c <client> -t <session>:<window>` で移動
@@ -34,6 +34,15 @@ endpoints:
 - 攻撃面・負荷の抑制: fetch は TTL cache (成功 60s / 失敗 30s) + per-call budget (既定 2 project) で、single-thread daemon が Redmine 遅延で OTLP ingestion を停めない。timeout 2s。cold cache は poll をまたいで温まる。
 - **cockpit 層限定の join**: `redmine` field は `/api/units` でのみ付与。`session list` CLI は network に依存しない (listing が Redmine 障害で遅延しない)。
 - UI: redmine 列は phase 3 と同じ DOM API / class whitelist (`rm-available` / `rm-unconfigured` / `rm-unavailable`) で描画。
+
+## Attention projection join (#12007)
+
+- **additive な第四 join 層**: `/api/units` の各 pane に派生 `attention` field (#11951 `AttentionRecord`) を付与する。実装は `domain/attention.py` `conservative_attention` を `agents targets --json` (#11952) と共有し、二つの read-only attention projection が drift しない。tmux / OTel / Redmine 層と `pane_id` identity は変更しない (既存 field は不変、純粋に追加)。
+- **projection only / source of truth にしない**: derived 値であり、color / DOM / pane title を正本にしない。routing / handoff target 選択には使わない (`cockpit-attention-state.md` / `runtime-observability-boundary.md` 準拠)。
+- **durable source 未接続**: owner/review/blocked/stalled の durable source はまだ wire していないため、捏造しない。identity が清く解決した pane は `healthy` (`no_attention_source`)、role_source=unknown / confidence=none の pane は `unknown` に倒す。
+- **public-safe**: `source_refs` は tmux pane id のみで、private path / secret を出さない。
+- **cockpit 層限定 + 制限**: `redmine` join と同様 `/api/units` でのみ付与し、`session list` CLI payload は attention-free。inventory 層は `@mozyo_lane_id` を解決しないため projected `lane_id` は `default`、per-pane の role-ambiguity flag も持たない (`agents targets` は `ambiguous` を持つ)。`unit_id` は opaque provenance であり routing key ではない。
+- UI: built-in HTML は本 join を必須描画しない (indicator surface であり app platform ではない)。private consumer / 外部 frontend が `attention` field を読んで独自 view を組む。
 
 ## 遷移フィード (#11681)
 

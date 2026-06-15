@@ -222,3 +222,61 @@ def derive_attention(inputs: AttentionInputs) -> AttentionRecord:
         observed_at=inputs.observed_at,
         expires_at=inputs.expires_at,
     )
+
+
+# No durable attention source (Redmine gate / owner / review / managed event)
+# is wired into the read-only projections yet, so a cleanly-identified target
+# derives ``healthy`` with this reason rather than a fabricated owner/review
+# signal. See ``vibes/docs/logics/cockpit-attention-state.md`` `Implementation
+# Split`.
+NO_ATTENTION_SOURCE_REASON = "no_attention_source"
+
+
+def conservative_attention(
+    *,
+    observed_at: str,
+    role: str,
+    identity_readable: bool,
+    contradictory: bool,
+    host: str = "local",
+    workspace_id: str = "",
+    lane_id: str = "default",
+    pane_id: str | None = None,
+) -> AttentionRecord:
+    """Conservative read-only :class:`AttentionRecord` for one discovered target.
+
+    The single shared convention behind both read-only attention projections —
+    ``agents targets --json`` (#11952) and the cockpit ``/api/units`` join
+    (#12007) — so the two never drift. No durable attention source is connected
+    yet, so this never fabricates an owner / review / blocked / stalled signal:
+    a cleanly identified target (``identity_readable`` and not ``contradictory``)
+    derives ``healthy`` with reason :data:`NO_ATTENTION_SOURCE_REASON`, and an
+    ambiguous / unreadable identity derives ``unknown``.
+
+    The caller extracts ``identity_readable`` / ``contradictory`` from its own
+    field vocabulary (a target candidate's ``confidence`` / ``role_source`` /
+    ``ambiguous`` vs an inventory pane's), and the ``unit_id`` / ``target_key``
+    provenance conventions from ``unit-target-model.md`` are stamped here once.
+    ``source_refs`` carry only the tmux ``pane_id`` (no path / secret), keeping
+    the projection public-safe. This stays a triage / display projection and is
+    never used to pick a routing target.
+    """
+    role_norm = role if role in (ROLE_CLAUDE, ROLE_CODEX) else ROLE_OTHER
+    inputs = AttentionInputs(
+        unit_id=f"unit:{host}:{workspace_id}:{lane_id}",
+        observed_at=observed_at,
+        host_id=host,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        role=role_norm,
+        target_key=f"tmux:{host}:{pane_id}" if pane_id else None,
+        source_refs=(f"tmux:{pane_id}",) if pane_id else (),
+        source_readable=identity_readable,
+        contradictory=contradictory,
+        reason_code=(
+            NO_ATTENTION_SOURCE_REASON
+            if identity_readable and not contradictory
+            else None
+        ),
+    )
+    return derive_attention(inputs)

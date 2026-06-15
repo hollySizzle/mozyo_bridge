@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cockpit_ui import (
     CockpitActionError,
+    attach_attention,
     jump_to_unit,
     reveal_in_finder,
 )
@@ -211,6 +212,69 @@ class CockpitHttpTest(unittest.TestCase):
         self.assertEqual(1, len(payload["panes"]))
         self.assertEqual("%1", payload["panes"][0]["pane_id"])
         self.assertIn("activity", payload["panes"][0])
+
+    def test_units_endpoint_attaches_attention_projection(self) -> None:
+        # Redmine #12007: the cockpit data source gains the same derived
+        # AttentionRecord vocabulary `agents targets --json` already exposes,
+        # as an additive fourth layer that never disturbs the existing ones.
+        panes = [pane("%1", "mozyo-demo", "claude")]
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=panes,
+        ):
+            status, body = self._get("/api/units")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        row = payload["panes"][0]
+        # Additive: the prior layers are untouched.
+        self.assertEqual("%1", row["pane_id"])
+        self.assertIn("activity", row)
+        attention = row["attention"]
+        # No durable attention source is wired, so a cleanly-identified pane
+        # derives healthy / no_attention_source — never a fabricated gate.
+        self.assertEqual("healthy", attention["attention_state"])
+        self.assertEqual("no_attention_source", attention["reason_code"])
+        self.assertEqual("claude", attention["role"])
+        # Public-safe: provenance carries only the tmux pane id, no path/secret.
+        self.assertEqual(["tmux:%1"], attention["source_refs"])
+        for ref in attention["source_refs"]:
+            self.assertNotIn("/", ref)
+
+    def test_attach_attention_is_additive_and_fails_safe(self) -> None:
+        # Pure-join unit test: a readable identity → healthy; an unreadable
+        # one (role_source unknown) → unknown, never healthy; existing keys
+        # are preserved and only `attention` is added.
+        payload = {
+            "panes": [
+                {
+                    "pane_id": "%7",
+                    "agent_kind": "codex",
+                    "role_source": "pane_option",
+                    "confidence": "strong",
+                    "workspace": {"workspace_id": "ws-codex"},
+                    "activity": {"state": "active"},
+                },
+                {
+                    "pane_id": "%8",
+                    "agent_kind": "claude",
+                    "role_source": "unknown",
+                    "confidence": "none",
+                    "workspace": None,
+                    "activity": {"state": "unknown"},
+                },
+            ]
+        }
+        out = attach_attention(payload, observed_at="2026-06-15T00:00:00+00:00")
+        readable, unreadable = out["panes"]
+        self.assertEqual("healthy", readable["attention"]["attention_state"])
+        self.assertEqual("ws-codex", readable["attention"]["workspace_id"])
+        # Existing layers preserved (additive only).
+        self.assertEqual("active", readable["activity"]["state"])
+        # Fail-safe: unreadable identity is unknown, not healthy.
+        self.assertEqual("unknown", unreadable["attention"]["attention_state"])
+        self.assertEqual(
+            "source_unreadable", unreadable["attention"]["reason_code"]
+        )
 
     def test_transitions_endpoint_reports_observed_changes(self) -> None:
         # First poll establishes baseline (unknown), second poll after an

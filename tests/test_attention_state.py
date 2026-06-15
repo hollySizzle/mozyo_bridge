@@ -201,5 +201,70 @@ class NonRoutingBoundaryTest(unittest.TestCase):
         )
 
 
+class ConservativeAttentionTest(unittest.TestCase):
+    """The shared conservative projection (#11952 / #12007).
+
+    Pins the single convention behind ``agents targets --json`` and the cockpit
+    ``/api/units`` join so the two read-only attention surfaces cannot drift.
+    """
+
+    def test_readable_identity_derives_healthy_no_source(self) -> None:
+        from mozyo_bridge.domain.attention import (
+            NO_ATTENTION_SOURCE_REASON,
+            conservative_attention,
+        )
+
+        record = conservative_attention(
+            observed_at="2026-06-15T00:00:00Z",
+            role="claude",
+            identity_readable=True,
+            contradictory=False,
+            workspace_id="ws1",
+            pane_id="%1",
+        )
+        self.assertEqual(STATE_HEALTHY, record.attention_state)
+        self.assertEqual(NO_ATTENTION_SOURCE_REASON, record.reason_code)
+        self.assertEqual("claude", record.role)
+        # Provenance conventions from unit-target-model.md, public-safe.
+        self.assertEqual("unit:local:ws1:default", record.unit_id)
+        self.assertEqual("tmux:local:%1", record.target_key)
+        self.assertEqual(["tmux:%1"], list(record.source_refs))
+
+    def test_unreadable_or_contradictory_identity_fails_safe(self) -> None:
+        from mozyo_bridge.domain.attention import conservative_attention
+
+        unreadable = conservative_attention(
+            observed_at="2026-06-15T00:00:00Z",
+            role="claude",
+            identity_readable=False,
+            contradictory=False,
+        )
+        self.assertEqual(STATE_UNKNOWN, unreadable.attention_state)
+        self.assertEqual(REASON_SOURCE_UNREADABLE, unreadable.reason_code)
+
+        contradictory = conservative_attention(
+            observed_at="2026-06-15T00:00:00Z",
+            role="codex",
+            identity_readable=True,
+            contradictory=True,
+        )
+        self.assertEqual(STATE_UNKNOWN, contradictory.attention_state)
+        self.assertEqual(REASON_CONTRADICTORY, contradictory.reason_code)
+
+    def test_non_agent_role_normalizes_to_other(self) -> None:
+        from mozyo_bridge.domain.attention import ROLE_OTHER, conservative_attention
+
+        record = conservative_attention(
+            observed_at="2026-06-15T00:00:00Z",
+            role="unknown",
+            identity_readable=False,
+            contradictory=False,
+        )
+        self.assertEqual(ROLE_OTHER, record.role)
+        # No pane id → no routing target key fabricated.
+        self.assertIsNone(record.target_key)
+        self.assertEqual([], list(record.source_refs))
+
+
 if __name__ == "__main__":
     unittest.main()

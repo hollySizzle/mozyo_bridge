@@ -50,6 +50,71 @@ def units_payload(*, home: Path | None = None) -> dict:
     return take_inventory(home=home).as_payload()
 
 
+def attach_attention(payload: dict, *, observed_at: str) -> dict:
+    """Enrich a units payload's panes with the additive ``attention`` field (#12007).
+
+    A fourth, read-only projection layer over the inventory snapshot — after the
+    tmux liveness (the row's presence + ``stale``), OTel ``activity``, and
+    Redmine gate layers: the derived #11951 ``AttentionRecord`` so a cockpit
+    frontend consumer can triage owner_waiting / review_waiting / blocked /
+    stalled panes from the same data source as ``agents targets --json``, which
+    already carries this field (#11952). Shares
+    :func:`~mozyo_bridge.domain.attention.conservative_attention` with that
+    surface so the two attention projections never drift.
+
+    Additive and public-safe: it adds one ``attention`` key per pane, never
+    removing or altering the ``pane_id`` identity or the tmux / OTel / Redmine
+    layers; no durable attention source is wired yet, so it never fabricates an
+    owner/review signal (a cleanly-identified pane derives ``healthy`` /
+    ``no_attention_source``, an unreadable one ``unknown``); and ``source_refs``
+    carry only the tmux pane id, so no path / secret leaks. Cockpit-layer only —
+    like the Redmine join, the ``session list`` CLI payload stays attention-free.
+
+    Limitation: the inventory layer does not resolve the ``@mozyo_lane_id`` pane
+    option, so the projected ``lane_id`` is the ``default`` lane and there is no
+    per-pane role-ambiguity flag here (``agents targets`` carries ``ambiguous``);
+    ``unit_id`` is opaque provenance, never a routing key.
+    """
+    from mozyo_bridge.domain.agent_discovery import (
+        CONFIDENCE_NONE,
+        ROLE_SOURCE_UNKNOWN,
+    )
+    from mozyo_bridge.domain.attention import (
+        ROLE_CLAUDE,
+        ROLE_CODEX,
+        conservative_attention,
+    )
+
+    for pane in payload.get("panes") or []:
+        if not isinstance(pane, dict):
+            continue
+        role = pane.get("agent_kind") or ""
+        workspace = pane.get("workspace")
+        workspace_id = (
+            (workspace.get("workspace_id") or "")
+            if isinstance(workspace, dict)
+            else ""
+        )
+        identity_readable = (
+            role in (ROLE_CLAUDE, ROLE_CODEX)
+            and pane.get("confidence") != CONFIDENCE_NONE
+            and pane.get("role_source") != ROLE_SOURCE_UNKNOWN
+        )
+        record = conservative_attention(
+            observed_at=observed_at,
+            role=role,
+            identity_readable=identity_readable,
+            # The inventory payload carries no per-pane role-ambiguity flag; a
+            # genuinely unreadable identity already degrades via
+            # ``identity_readable`` above.
+            contradictory=False,
+            workspace_id=workspace_id,
+            pane_id=pane.get("pane_id"),
+        )
+        pane["attention"] = record.as_payload()
+    return payload
+
+
 def _resolve_record(
     pane_id: str, *, home: Path | None = None
 ) -> InventoryRecord:
