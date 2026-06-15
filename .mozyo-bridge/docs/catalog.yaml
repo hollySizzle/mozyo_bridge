@@ -250,10 +250,33 @@ documents:
     purpose: ".mozyo-bridge/workspace.json を workspace identity recovery anchor、.mozyo-bridge/workspace-defaults.yaml を project-level defaults として rename する判断と互換 migration 方針の設計正本。"
     audit_role: workspace_anchor_project_defaults_migration_logic
     related_document_refs:
+      - logic-fallback-retirement-ledger
       - logic-workspace-registry
       - logic-workspace-defaults-renderer
       - logic-unit-target-model
       - logic-unit-presentation-state-db
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-fallback-retirement-ledger
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/fallback-retirement-ledger.md
+    purpose: compat / fallback / legacy rail の owner、source of truth、退役条件、minimum release window、current risk を管理する repo-local 退役台帳。
+    audit_role: fallback_retirement_ledger_logic
+    related_document_refs:
+      - logic-workspace-anchor-project-defaults-migration
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - logic-tmux-send-safety-contract
+      - logic-ack-completion-receiver-state
+      - logic-pane-centric-cockpit-semantics
+      - logic-cockpit-sublane-operating-model
+      - logic-bootstrap
+      - logic-skill-distribution
+      - logic-otel-event-store
+      - logic-session-inventory
+      - logic-iterm-webviewer-presentation-boundary
       - rule-public-private-boundary
       - spec-project-map
 
