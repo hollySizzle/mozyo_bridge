@@ -423,6 +423,22 @@ documents:
     related_document_refs:
       - logic-otel-event-store
       - logic-cockpit-web-ui
+      - logic-iterm-webviewer-presentation-boundary
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-iterm-webviewer-presentation-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/iterm-webviewer-presentation-boundary.md
+    purpose: iTerm Toolbelt / WebViewer / private cockpit UI を mozyo-bridge の event・target・attention contract を読む presentation consumer として扱う責務分界。UI を正本にせず、private policy を OSS default に混入させない設計正本。
+    audit_role: iterm_webviewer_presentation_boundary_logic
+    related_document_refs:
+      - logic-cockpit-web-ui
+      - logic-event-timeline-source
+      - logic-unit-target-model
+      - logic-cockpit-attention-state
+      - logic-cross-project-cockpit-smoke-runbook
       - rule-public-private-boundary
       - spec-project-map
 
@@ -435,6 +451,7 @@ documents:
     related_document_refs:
       - logic-otel-event-store
       - logic-session-inventory
+      - logic-iterm-webviewer-presentation-boundary
       - spec-project-map
 
   - id: logic-executive-terminal-setup
