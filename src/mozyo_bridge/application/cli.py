@@ -920,7 +920,14 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.add_argument(
             "--target",
             required=target_required,
-            help="Optional tmux target override; defaults to same-session agent-window resolution from --to",
+            help=(
+                "Required explicit tmux target (an explicit `%%pane` for the "
+                "Codex gateway); the target pane must resolve to the fixed "
+                "receiver in every mode"
+                if target_required
+                else "Optional tmux target override; defaults to same-session "
+                "agent-window resolution from --to"
+            ),
         )
         parser_.add_argument(
             "--target-repo",

@@ -100,6 +100,7 @@ class ConsultDelegationTest(unittest.TestCase):
         window_name="codex",
         command="codex",
         pane_active="1",
+        mode=None,
     ):
         from mozyo_bridge.application import commands
 
@@ -122,9 +123,18 @@ class ConsultDelegationTest(unittest.TestCase):
             argv += ["--target-repo", target_repo]
         if kind is not None:
             argv += ["--kind", kind]
+        if mode is not None:
+            argv += ["--mode", mode]
         args = build_parser().parse_args(argv)
 
+        # Record any literal `send-keys -l` typing so a blocked gate can be
+        # proven to fail *before* the body reaches the pane.
+        self.typed = []
+
         def fake_run_tmux(*a, check: bool = True):
+            flat = a[0] if (a and isinstance(a[0], (list, tuple))) else a
+            if "send-keys" in flat and "-l" in flat:
+                self.typed.append(flat)
             return argparse.Namespace(returncode=0, stdout="", stderr="")
 
         with patch.object(commands, "require_tmux"), \
@@ -202,6 +212,50 @@ class ConsultDelegationTest(unittest.TestCase):
             target="%884", cwd=repo, command="zsh", window_name="codex"
         )
         self.assertEqual("target_not_agent", outcome["reason"])
+
+    # --- Boundary: receiver binding holds in EVERY mode (Redmine #11779 j#58685) ---
+
+    def _assert_foreign_claude_blocked(self, mode):
+        # An explicit %pane resolving to a *Claude* pane must be rejected before
+        # any typing, regardless of mode. Without the mode-independent binding
+        # gate this slipped through under --mode standard / pending and typed a
+        # `to=codex` body into a foreign Claude pane.
+        repo = self._git_repo()
+        outcome, _out, err = self._run(
+            target="%884",
+            cwd=repo,
+            command="claude",
+            window_name="claude",
+            mode=mode,
+        )
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        # No marker was built and nothing was typed into the pane.
+        self.assertIsNone(outcome["notification_marker"])
+        self.assertEqual([], self.typed)
+        self.assertIn("resolve to the receiver", err)
+
+    def test_standard_mode_does_not_bypass_codex_binding(self) -> None:
+        self._assert_foreign_claude_blocked("standard")
+
+    def test_pending_mode_does_not_bypass_codex_binding(self) -> None:
+        self._assert_foreign_claude_blocked("pending")
+
+    def test_queue_enter_mode_also_blocks_foreign_claude(self) -> None:
+        # The original (queue-enter) rail stays closed too — consistency across
+        # all three modes.
+        self._assert_foreign_claude_blocked("queue-enter")
+
+    def test_standard_mode_to_codex_pane_is_not_blocked_by_binding(self) -> None:
+        # Positive control: a genuine Codex pane under --mode standard passes the
+        # binding gate (it does not get rejected with invalid_args). The mock has
+        # no observable marker, so a standard send rolls back with marker_timeout
+        # — the point is that it reached typing, i.e. the binding gate admitted it.
+        repo = self._git_repo()
+        outcome, _out, _err = self._run(target="%884", cwd=repo, mode="standard")
+        self.assertNotEqual("invalid_args", outcome["reason"])
+        self.assertEqual("codex", outcome["receiver"])
+        self.assertNotEqual([], self.typed)
 
 
 if __name__ == "__main__":

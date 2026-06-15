@@ -2781,7 +2781,12 @@ def _record_command_from_args(args: argparse.Namespace) -> str | None:
     return None
 
 
-def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = None) -> int:
+def orchestrate_handoff(
+    args: argparse.Namespace,
+    *,
+    default_kind: str | None = None,
+    require_receiver_binding: bool = False,
+) -> int:
     """High-level handoff/reply primitive.
 
     Owns: receiver-pane resolution, agent-target validation, internal pane
@@ -2791,6 +2796,17 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
 
     The standard path does its own pre-type capture so callers do not need to
     run ``mozyo-bridge read`` first.
+
+    ``require_receiver_binding`` forces the explicit-``--target`` role-binding
+    gate (``binds_receiver``) to run in **every** mode, not just under the
+    relaxed ``queue-enter`` rail. The standard `handoff send` rail leaves
+    ``standard`` / ``pending`` to the generic agent check (a marker_timeout
+    C-u rollback covers a misaddressed standard send), but a wrapper whose
+    contract is "this receiver and no other" (the cross-workspace consult
+    primitive, Redmine #11779) must bind the target to the receiver before
+    typing regardless of mode — otherwise `--mode standard` / `--mode pending`
+    would let an explicit `%pane` for a foreign Claude pane be typed into under
+    a ``to=codex`` marker, defeating the gateway boundary.
     """
     require_tmux()
 
@@ -3022,8 +3038,9 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
     # is a compatibility fallback (`role_source == window_name`); ambiguous /
     # unknown is surfaced for fail-closed handling below.
     preflight_target = project_preflight_target(target_info)
-    if mode == MODE_QUEUE_ENTER and not preflight_target.binds_receiver(receiver):
-        # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908).
+    if (mode == MODE_QUEUE_ENTER or require_receiver_binding) and not preflight_target.binds_receiver(receiver):
+        # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908;
+        # mode-independent for receiver-locked wrappers since Redmine #11779).
         # Under the relaxed queue-enter rail, marker miss does NOT roll back, so
         # an explicit `--target %X` that resolves to a different agent would
         # silently press Enter into the wrong receiver's pane. The agent gate
@@ -3036,6 +3053,12 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
         # `normal_window` view). A cockpit pane no longer needs `--force`; a weak
         # / ambiguous / mismatched signal stays fail-closed, matching the
         # contract's "Allowed Targets".
+        #
+        # `require_receiver_binding` extends this gate to `standard` / `pending`
+        # for wrappers whose contract fixes the receiver (cross-workspace
+        # consult): without it, `--mode standard` / `--mode pending` would skip
+        # the binding and let an explicit foreign-Claude `%pane` be typed into
+        # under a `to=codex` marker.
         observed_window = preflight_target.window_name or "<unknown>"
         observed_role = preflight_target.pane_option_role or "<none>"
         _emit_outcome(
@@ -3053,8 +3076,13 @@ def orchestrate_handoff(args: argparse.Namespace, *, default_kind: str | None = 
             record_format=record_format,
             command=record_command,
         )
+        gate_label = (
+            f"--mode {MODE_QUEUE_ENTER}"
+            if mode == MODE_QUEUE_ENTER
+            else "this handoff primitive"
+        )
         die(
-            "--mode queue-enter requires the explicit --target pane to resolve "
+            f"{gate_label} requires the explicit --target pane to resolve "
             f"to the receiver; --to={receiver!r} but pane {target} resolved to "
             f"role={preflight_target.role!r} (source={preflight_target.role_source}, "
             f"confidence={preflight_target.confidence}, "
@@ -3488,11 +3516,18 @@ def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:
     receiver-process binding, marker/landing rail, ``--target-repo auto``
     explicit-``%pane`` requirement) is delegated to :func:`orchestrate_handoff`
     so this wrapper cannot hide or weaken it.
+
+    ``require_receiver_binding=True`` closes the boundary in **every** mode
+    (Redmine #11779 review j#58685): the role-binding gate that `handoff send`
+    runs only under ``queue-enter`` must also run under ``--mode standard`` /
+    ``--mode pending`` here, or an explicit foreign-Claude ``%pane`` could be
+    typed into under a ``to=codex`` marker — exactly the gateway bypass this
+    primitive promises to prevent.
     """
     args.to = "codex"
     if getattr(args, "kind", None) is None:
         args.kind = CONSULT_DEFAULT_KIND
-    return orchestrate_handoff(args)
+    return orchestrate_handoff(args, require_receiver_binding=True)
 
 
 def _confident_workspace_root(cwd: str) -> Path | None:
