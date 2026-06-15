@@ -6,9 +6,58 @@
 
 ## Unreleased
 
-次の release 候補 — Version #218 `v0.7.1 cockpit dogfooding stabilization`。
+post-v0.7.1 の作業期間です。`v0.7.1` tag(production release は #11949 で完了)以降、`main` には 2 つの流れが乗っています。1 つは **v0.8.0 architecture / plugin-ready refactor の方針整理**で、現時点では design / docs 先行であり、core の実コード分割や adapter 抽出はまだ行っていません。もう 1 つは **v0.7.x cockpit ラインと sublane 運用 guardrail の follow-up**(attention 投影・`/api/units`・cockpit discovery blocker 修正・coordinator/sublane routing)です。後者はいずれも additive / 後方互換で、既存 CLI の JSON / text 出力互換は壊していません。`pyproject.toml` / `src/mozyo_bridge/__init__.py` の version は現在も `0.7.1` のままで、この期間の変更は **未 release** です。version 決定 / tag / publish はこのメモでは行わず、別 gate と owner 承認のもとで実施します。
 
-この期間の主題は、v0.7.0 で建てた **workspace 横断 session 基盤 / ユニット状態コックピット** を実運用(dogfooding)で **安定化**することです。registry-aware な identity 解決の完成、cockpit サブレーン運用の primitive 強化と運用 runbook の整備、scaffold 配布物の最小化方針の固定が中心です。いずれも additive / 後方互換で、既存 CLI の JSON / text 出力互換は壊していません。version 決定 / tag / publish はこのメモでは行わず、別 gate と owner 承認のもとで実施します。
+### v0.8.0 architecture / plugin-ready refactor の方針整理(design / docs 先行)
+
+外部システム連携(ticket / catalog / cockpit layout / telemetry / release helper)を core に足し続けると Redmine 前提の全部入りに肥大化する、という問題意識(#11826、親 #11825 `Plugin / Adapter 境界設計`)に対し、まず **plugin-ready な built-in adapter / provider 境界**を設計 doc として固める段階です。この期間に landing したのは設計・台帳の docs であり、実際の adapter 抽出 / provider registry / catalog backend の実装(#12034 / #12035 / #12036)はまだ着手していません(external plugin API も未公開)。
+
+- compat / fallback 退役台帳を整備し、どの後方互換経路をいつ畳むかを記録できるようにしました。(#12000)
+- core に残す責務(workspace / session identity、tmux discovery の最小抽象、handoff transport、safety / dry-run / audit 契約)と、adapter / provider / preset へ出す候補(ticket.redmine / ticket.asana、catalog.yaml / catalog.sqlite、cockpit layout、iTerm2、telemetry.otel など)を分類しました。external plugin API は core boundary が固まるまで公開しません。(#12001)
+- `commands.py` / `cli.py` / 巨大 test の分割方針を設計 doc 化しました。(#12002)
+- runtime observability の正本境界(desired-state event log / live tmux liveness / inventory projection)を整理しました。(#12003)
+- iTerm2 WebViewer の presentation boundary を doc 化しました。(#11808)
+
+### cockpit attention / `/api/units` follow-up
+
+v0.7.0 / v0.7.1 で建てたユニット状態コックピットに「今どの unit が operator の番(attention)か」を additive に投影する follow-up です。Redmine gate / OTel activity / tmux liveness の三層 join の上に派生 attention state を read model として足し、tmux options・agent-ui snippet・pane border・cockpit `/api/units` の各 surface へ投影しています。
+
+- attention state projection の設計を doc 化しました。(#11950)
+- attention 派生の read model を追加しました。(#11951)
+- `agents targets` に attention を露出しました。(#11952)
+- attention state を tmux options へ投影しました。(#11954)
+- tmux agent-ui snippet と pane border に attention 投影を描画し、multi-pane の layout hook を idempotent にしました(colour のみで、window 名 / resolver routing は変更していません)。(#11957 / #11958)
+- pane-centric な cockpit semantics を doc 化しました。(#11999)
+- cockpit frontend / API projection を強化し、派生 AttentionRecord を `/api/units` の各 pane に join しました。stale snapshot 時は attention を `unknown` に degrade し、沈黙を「番」と誤認しないようにしています。(#12007)
+
+### cockpit discovery blocker / advisory defaults fix
+
+`mozyo cockpit` の append / focus advisory が、別 workspace の CloudStorage dataless な `workspace-defaults.yaml` を hot path で読み、provider materialization 待ちで pane 作成前に無音停止する事象を修正しました。advisory を軽量 inventory mode(`derive_unregistered=False` / `persist=False`)に切り替え、未登録 workspace の fallback では workspace-local defaults を読まず path hash 由来の deterministic session name に degrade します。registry / anchor 解決は従来どおり維持し、inventory cache も更新しません。(#12032)
+
+- 同じ root cause で `agents targets` 側が停止する事象(#12038)は別 issue として進行中で、本メモ時点では **local branch のみで `main` 未 merge** です。
+
+### coordinator / sublane routing guardrails
+
+sublane(worktree)と main coordinator Codex の間の routing / callback を強化しました。
+
+- handoff target resolver で same-lane Codex gateway を auto-resolution するようにしました。(#12011)
+- sublane → main coordinator Codex への callback 用に `coordinator` target を追加しました。(#12015)
+- coordinator callback の tests を tmux 非依存にしました。(#12031)
+- implementation_done / review_request / review_result / owner-close-waiting / blocked の際に main coordinator への callback を必須とする項目を completion checklist に固定しました。(#12039)
+- main Claude の implementation boundary(どこを main lane が実装し、どこを sublane に出すか)を doc 化しました。(#11956)
+
+### cross-workspace consult / sublane retirement / owner-question guardrails
+
+- 別 workspace への設計相談を安全に送るための handoff `cross-workspace-consult` primitive を追加し、全 mode で Codex gateway binding を強制して boundary bypass を塞ぎました。(#11779)
+- sublane の retirement 権限を coordinator-owned として doc 化しました(初稿 #11959 を一度 revert し、coordinator-owned 版 #11960 に確定)。
+- governed preset に Claude の owner-question bypass 禁止を追加しました(親 #11441 Codex-gateway revision の一部、#12009)。
+- worktree 運用 runbook を opt-in の scaffold category として追加しました。(#11955)
+
+## v0.7.1 - 2026-06-14
+
+Version #218 `v0.7.1 cockpit dogfooding stabilization`。`0.7.0` からの patch release で、production publish は #11949 で完了しています(tag `v0.7.1` target `c8e45db`、GitHub Release / PyPI publish / install validation / close gate 済み)。
+
+この期間の主題は、v0.7.0 で建てた **workspace 横断 session 基盤 / ユニット状態コックピット** を実運用(dogfooding)で **安定化**することでした。registry-aware な identity 解決の完成、cockpit サブレーン運用の primitive 強化と運用 runbook の整備、scaffold 配布物の最小化方針の固定が中心です。いずれも additive / 後方互換で、既存 CLI の JSON / text 出力互換は壊していません。
 
 ### registry-aware identity の完成
 
@@ -44,13 +93,11 @@
 - cross-project cockpit smoke runbook を整備しました。(#11911)
 - local / remote cockpit host 境界を doc 化しました。(#11817)
 
-### リリース準備メモ(release gate 用)
+### release 実績(#11949)
 
-本 Unreleased 期間を Version #218 `v0.7.1 cockpit dogfooding stabilization` の release 候補として整理します。version 決定 / tag / publish はこのメモでは行わず、別 gate と owner 承認のもとで実施します。
-
-- **変更概要**: registry-aware identity の完成(#11426 / #11427)、unit target model / TargetRecord projection(#11906 / #11907 / #11908 / #11909)、Claude pane auto permission mode 起動 policy(#11924 / #11925)、workspace anchor / project-defaults rename 互換(#11910 / #11921)、配布物最小化・worktree 境界・portable runbook の方針固定(#11428 / #11889 / #11929 / #11922)、cockpit 運用 docs(#11911 / #11817)。いずれも additive で、破壊的 CLI rename を含みません。
-- **version 候補の考え方**: v0.7.0 cockpit ラインの stabilization + additive であり、破壊的変更を含まないため、Version 名(#218 `v0.7.1`)どおり `0.7.0` からの **patch(0.7.1)** が妥当な目安です。最終的な version 決定は owner 判断とします。
-- **release gate の実行手順**: 実際の検証・配布手順は `skills/mozyo-bridge-agent/references/release.md` の Standard Verification / Release Flow / Release Artifact Guardrails / Distribution Gates / Trusted Publishing を正本とします。version bump は standalone commit とし、`main` push → GitHub Actions `Test` 成功確認 → TestPyPI → `pipx` install 検証 → owner 判断で production PyPI、の順で進めます。本メモはこの gate の入口を明確化するもので、本 issue では gate を実行しません。
+- **release**: Version #218 `v0.7.1`(`0.7.0` からの patch、破壊的 CLI rename なし)を production publish 済みです。tag `v0.7.1`(target `c8e45db`)、GitHub Release、PyPI publish、`pipx` install validation、close gate が完了しています(#11949 j#58464 / j#58466 / j#58467)。
+- **変更概要**: registry-aware identity の完成(#11426 / #11427)、unit target model / TargetRecord projection(#11906 / #11907 / #11908 / #11909)、Claude pane auto permission mode 起動 policy(#11924 / #11925)、workspace anchor / project-defaults rename 互換(#11910 / #11921)、配布物最小化・worktree 境界・portable runbook の方針固定(#11428 / #11889 / #11929 / #11922)、cockpit 運用 docs(#11911 / #11817)。いずれも additive です。
+- **配布手順の正本**: 検証・配布手順は `skills/mozyo-bridge-agent/references/release.md` の Standard Verification / Release Flow / Release Artifact Guardrails / Distribution Gates / Trusted Publishing を正本とします。
 
 ## v0.7.0 - 2026-06-12
 
