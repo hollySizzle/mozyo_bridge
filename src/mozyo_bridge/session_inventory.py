@@ -56,7 +56,13 @@ from mozyo_bridge.domain.agent_discovery import (
     discover_agents,
     fold_agents_by_pane,
 )
-from mozyo_bridge.domain.session_naming import derive_session_name
+from mozyo_bridge.domain.session_naming import (
+    SESSION_NAME_PREFIX,
+    SOURCE_REPO_FALLBACK,
+    _repo_path_hash,
+    derive_session_name,
+    slugify,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home, normalize_path_unicode
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -230,8 +236,17 @@ class InventorySnapshot:
 # --- workspace identity resolution -------------------------------------------
 
 
+def _fallback_session_name_without_defaults(root: Path) -> str:
+    """Path-derived session name without reading workspace-local defaults."""
+    basename_slug = slugify(root.resolve().name)
+    repo_hash = _repo_path_hash(root.resolve())
+    if basename_slug:
+        return f"{SESSION_NAME_PREFIX}-{basename_slug}-{repo_hash}"
+    return f"{SESSION_NAME_PREFIX}-{repo_hash}"
+
+
 def _resolve_identity(
-    repo_root: str, registry_by_path: dict[str, object]
+    repo_root: str, registry_by_path: dict[str, object], *, derive_unregistered: bool
 ) -> WorkspaceIdentity:
     """Resolve a pane's repo root to its workspace identity.
 
@@ -259,6 +274,13 @@ def _resolve_identity(
             project_name=name if isinstance(name, str) and name.strip() else None,
             source=SOURCE_WORKSPACE_ANCHOR,
         )
+    if not derive_unregistered:
+        return WorkspaceIdentity(
+            workspace_id=None,
+            canonical_session=_fallback_session_name_without_defaults(root),
+            project_name=None,
+            source=SOURCE_REPO_FALLBACK,
+        )
     derived = derive_session_name(root)
     return WorkspaceIdentity(
         workspace_id=None,
@@ -282,6 +304,7 @@ def collect_runtime_inventory(
     panes: Iterable[dict[str, str]],
     *,
     home: Path | None = None,
+    derive_unregistered: bool = True,
 ) -> list[InventoryRecord]:
     """Build inventory records from raw tmux pane lines.
 
@@ -297,7 +320,11 @@ def collect_runtime_inventory(
     def identity_for(repo_root: str) -> WorkspaceIdentity:
         key = normalize_path_unicode(repo_root)
         if key not in identity_cache:
-            identity_cache[key] = _resolve_identity(repo_root, registry_by_path)
+            identity_cache[key] = _resolve_identity(
+                repo_root,
+                registry_by_path,
+                derive_unregistered=derive_unregistered,
+            )
         return identity_cache[key]
 
     folded = fold_agents_by_pane(
@@ -585,6 +612,8 @@ def take_inventory(
     *,
     home: Path | None = None,
     panes: Iterable[dict[str, str]] | None = None,
+    derive_unregistered: bool = True,
+    persist: bool = True,
 ) -> InventorySnapshot:
     """Collect the live inventory, refreshing the cache; degrade to cache.
 
@@ -599,8 +628,13 @@ def take_inventory(
         panes = try_pane_lines()
     if panes is not None:
         now = _utc_now()
-        records = collect_runtime_inventory(panes, home=home)
-        path, notes = save_snapshot(records, home=home, now=now)
+        records = collect_runtime_inventory(
+            panes, home=home, derive_unregistered=derive_unregistered
+        )
+        path = inventory_path(home)
+        notes: tuple[str, ...] = ()
+        if persist:
+            path, notes = save_snapshot(records, home=home, now=now)
         records = attach_activity(records, home=home)
         return InventorySnapshot(
             records=tuple(records),

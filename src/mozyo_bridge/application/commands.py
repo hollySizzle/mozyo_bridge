@@ -1784,7 +1784,7 @@ def _coexisting_normal_observations(cockpit_session: str):
     try:
         from mozyo_bridge.session_inventory import take_inventory
 
-        snapshot = take_inventory()
+        snapshot = take_inventory(derive_unregistered=False, persist=False)
     except Exception:
         return []
 

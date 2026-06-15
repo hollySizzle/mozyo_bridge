@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge import session_inventory
 from mozyo_bridge.application.commands import cmd_session_list
 from mozyo_bridge.domain.session_naming import derive_session_name
+from mozyo_bridge.domain.session_naming import SOURCE_REPO_FALLBACK
 from mozyo_bridge.session_inventory import (
     SOURCE_CACHE,
     SOURCE_RUNTIME,
@@ -119,6 +120,23 @@ class CollectRuntimeInventoryTest(SessionInventoryBase):
         self.assertEqual(
             first.workspace.source, derive_session_name(self.repo).source
         )
+
+    def test_lightweight_inventory_skips_unregistered_defaults_derivation(self) -> None:
+        with patch.object(
+            session_inventory,
+            "derive_session_name",
+            side_effect=AssertionError("must not read workspace defaults"),
+        ):
+            records = collect_runtime_inventory(
+                [pane("%1", "mozyo-demo:1.0", cwd=str(self.repo))],
+                home=self.home,
+                derive_unregistered=False,
+            )
+        workspace = records[0].workspace
+        assert workspace is not None
+        self.assertIsNone(workspace.workspace_id)
+        self.assertEqual(workspace.source, SOURCE_REPO_FALLBACK)
+        self.assertTrue(workspace.canonical_session.startswith("mozyo-demo-repo-"))
 
     def test_registered_workspace_resolves_from_registry(self) -> None:
         registered = register_workspace(self.repo, home=self.home)
