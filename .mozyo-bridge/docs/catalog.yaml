@@ -319,6 +319,24 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-runtime-observability-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/runtime-observability-boundary.md
+    purpose: Redmine durable state、live tmux、tmux user option projection、OTel event store、future sidecar の runtime observability 正本境界を整理する設計正本。
+    audit_role: runtime_observability_boundary_logic
+    related_document_refs:
+      - logic-cockpit-attention-state
+      - logic-otel-event-store
+      - logic-event-timeline-source
+      - logic-managed-state-model
+      - logic-pane-centric-cockpit-semantics
+      - logic-iterm-webviewer-presentation-boundary
+      - logic-plugin-ready-adapter-boundary
+      - logic-fallback-retirement-ledger
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-managed-state-model
     type: logic
     status: active
