@@ -71,6 +71,39 @@ class ProviderRegistryError(ValueError):
     """A built-in provider description or registration violates the contract."""
 
 
+def _frozen_label_set(value: object, *, field: str, provider_id: str) -> frozenset[str]:
+    """Normalize a descriptive label collection into a validated ``frozenset``.
+
+    A bare ``str``/``bytes`` is **rejected** rather than normalized: both are
+    iterable, so ``frozenset("owner_approval")`` would silently become a set of
+    single characters and slip past the :data:`FORBIDDEN_PROVIDER_AUTHORITIES`
+    check — exactly the authority leak this seam must prevent. Each entry must
+    be a non-empty ``str``; any other input raises
+    :class:`ProviderRegistryError`. ``list`` / ``tuple`` / ``set`` / ``frozenset``
+    of strings normalize as before.
+    """
+    if isinstance(value, (str, bytes)):
+        raise ProviderRegistryError(
+            f"provider {provider_id!r} {field} must be a collection of strings, "
+            f"not a bare {type(value).__name__}; a bare string is iterated "
+            f"character-by-character and would bypass the authority check"
+        )
+    try:
+        items = frozenset(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ProviderRegistryError(
+            f"provider {provider_id!r} {field} must be an iterable of strings, "
+            f"got {type(value).__name__}"
+        ) from exc
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ProviderRegistryError(
+                f"provider {provider_id!r} {field} entries must be non-empty "
+                f"strings; got {item!r}"
+            )
+    return items
+
+
 @dataclass(frozen=True)
 class BuiltinProvider:
     """A pure description of one built-in provider — classification, not code.
@@ -109,10 +142,25 @@ class BuiltinProvider:
         if not self.provider_id:
             raise ProviderRegistryError("provider_id must be a non-empty string")
         # Normalize the descriptive sets to frozensets so callers may pass any
-        # iterable while the record stays immutable and hashable.
-        object.__setattr__(self, "capabilities", frozenset(self.capabilities))
+        # iterable of strings while the record stays immutable and hashable. A
+        # bare str/bytes is rejected (see _frozen_label_set) so a single
+        # forbidden-authority string can never be exploded into characters that
+        # slip past the authority check below.
         object.__setattr__(
-            self, "safety_constraints", frozenset(self.safety_constraints)
+            self,
+            "capabilities",
+            _frozen_label_set(
+                self.capabilities, field="capabilities", provider_id=self.provider_id
+            ),
+        )
+        object.__setattr__(
+            self,
+            "safety_constraints",
+            _frozen_label_set(
+                self.safety_constraints,
+                field="safety_constraints",
+                provider_id=self.provider_id,
+            ),
         )
         leaked = self.capabilities & FORBIDDEN_PROVIDER_AUTHORITIES
         if leaked:

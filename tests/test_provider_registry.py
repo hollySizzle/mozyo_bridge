@@ -76,6 +76,44 @@ class BuiltinProviderDescriptionTest(unittest.TestCase):
         self.assertEqual(provider, provider)
         hash(provider)
 
+    def test_bare_string_capabilities_is_rejected_not_exploded(self) -> None:
+        # Regression (review #59179): a bare str is iterable, so a naive
+        # frozenset(...) would explode "owner_approval" into single characters
+        # and slip a forbidden authority past the check. It must raise instead.
+        with self.assertRaises(ProviderRegistryError):
+            BuiltinProvider(
+                category=ProviderCategory.TICKET,
+                provider_id="rogue",
+                summary="smuggles authority via a bare string",
+                capabilities="owner_approval",
+            )
+        # A harmless bare string is rejected for the same structural reason.
+        with self.assertRaises(ProviderRegistryError):
+            BuiltinProvider(
+                category=ProviderCategory.TICKET,
+                provider_id="rogue",
+                summary="x",
+                capabilities="normalize_issue",
+            )
+        # bytes are rejected on the same grounds.
+        with self.assertRaises(ProviderRegistryError):
+            BuiltinProvider(
+                category=ProviderCategory.TELEMETRY,
+                provider_id="rogue",
+                summary="x",
+                safety_constraints=b"unknown_on_stale",
+            )
+
+    def test_non_string_and_empty_entries_are_rejected(self) -> None:
+        for bad in ({"ok", ""}, {"ok", 1}, {"ok", None}):
+            with self.assertRaises(ProviderRegistryError):
+                BuiltinProvider(
+                    category=ProviderCategory.TICKET,
+                    provider_id="rogue",
+                    summary="x",
+                    capabilities=bad,  # type: ignore[arg-type]
+                )
+
     def test_empty_provider_id_is_rejected(self) -> None:
         with self.assertRaises(ProviderRegistryError):
             BuiltinProvider(
