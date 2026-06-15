@@ -151,6 +151,27 @@ preflight では少なくとも次を確認する:
      (pane_id / workspace / lane)、絞り込めなかった理由、推奨 retry
      (`--target %pane`) を提示する。
 
+### Coordinator target resolution (Redmine #12015)
+
+same-lane narrowing (5) は sender 自身の lane に解決するため、sublane から
+**main coordinator Codex** への cross-lane callback には使えない (sender lane の
+Codex = sublane 自身に解決してしまう)。そこで pseudo-target `coordinator` を
+別経路として用意する。
+
+- `coordinator` は **sender と同じ `workspace_id`** で **`lane_id == default`
+  (primary checkout = coordinator lane; `cockpit_layout.resolve_lane_identity`)**
+  の Codex pane に解決する。これは sanctioned な sublane -> coordinator callback
+  路 (Codex-to-Codex) であり、`%953` 等を手で拾わずに済む導線を与える。
+- **workspace-scoped 限定**: 別 workspace の coordinator には決して到達しない
+  (cross-workspace consult は別 primitive #11779)。sender が同一 workspace の
+  default-lane Codex を一意に持つ場合のみ解決する。
+- **fail-closed**: sender 不明 / workspace identity 不在 / default-lane Codex が
+  0 または複数 のときは解決せず、理由・候補・推奨 retry (`--target %pane`) を
+  提示する。silent な選択はしない。
+- identity source は live tmux の `@mozyo_*` pane option であり、pane title /
+  iTerm UI を正本にしない。`coordinator` は explicit `%pane` override を置換せず、
+  通常運用の導線として追加するだけ (override は常に残る)。
+
 ## Projection policy
 
 ### cockpit_pane

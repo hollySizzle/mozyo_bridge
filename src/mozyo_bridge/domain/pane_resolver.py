@@ -8,10 +8,12 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.domain.agent_discovery import (
+    AGENT_KIND_CODEX,
     CONFIDENCE_STRONG,
     ROLE_SOURCE_PANE_OPTION,
     resolve_agent_role,
 )
+from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE
 from mozyo_bridge.infrastructure.tmux_client import (
     pane_lines,
     resolve_pane_id,
@@ -28,6 +30,11 @@ AGENT_COMMANDS = {
     "codex": "codex",
 }
 AGENT_LABELS = frozenset(AGENT_COMMANDS)
+# Pseudo-target label (Redmine #12015): resolves to the sender workspace's main
+# coordinator Codex (the default-lane Codex), so a sublane can call back the
+# coordinator without hand-picking its `%pane`. Not an `AGENT_LABELS` member —
+# it routes through a dedicated workspace-scoped resolver, not window resolution.
+COORDINATOR_LABEL = "coordinator"
 VERSIONED_NATIVE_BINARY_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+].*)?")
 READ_MARK_TTL_SECONDS = 300
 
@@ -213,6 +220,118 @@ def _ambiguous_agent_targets_message(
     )
 
 
+def _is_strong_codex(pane: dict[str, str]) -> bool:
+    """True when ``pane`` strongly, non-ambiguously resolves to the Codex role."""
+    resolution = resolve_agent_role(
+        pane_option_role=pane.get("agent_role"),
+        window_name=pane.get("window_name"),
+        process=pane.get("command"),
+    )
+    return (
+        resolution.role == AGENT_KIND_CODEX
+        and resolution.confidence == CONFIDENCE_STRONG
+        and not resolution.ambiguous
+    )
+
+
+def coordinator_codex_candidates(
+    panes: list[dict[str, str]],
+    workspace_id: str,
+) -> list[dict[str, str]]:
+    """Default-lane (coordinator) Codex panes in ``workspace_id`` (Redmine #12015).
+
+    The coordinator lane is a workspace's primary checkout — the lane the cockpit
+    stamps as :data:`DEFAULT_LANE` (``cockpit_layout.resolve_lane_identity``),
+    as opposed to a linked-worktree / clone sublane that carries a hashed lane
+    id. Its owner-facing actor is the Codex pane. Candidates are deduplicated by
+    ``pane_id`` (grouped-session views collapse to one). Identity comes from the
+    live tmux ``@mozyo_*`` pane options in ``panes``, never a pane title.
+    """
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for pane in panes:
+        pane_ws, pane_lane = _pane_lane_identity(pane)
+        if pane_ws != workspace_id or pane_lane != DEFAULT_LANE:
+            continue
+        if not _is_strong_codex(pane):
+            continue
+        pane_id = pane.get("id") or ""
+        if pane_id in seen:
+            continue
+        seen.add(pane_id)
+        unique.append(pane)
+    return unique
+
+
+def resolve_coordinator_codex(
+    panes: list[dict[str, str]],
+    sender: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """The main coordinator Codex pane for the sender's workspace (Redmine #12015).
+
+    A sublane resolves its coordinator by selecting the Codex pane that shares
+    its own ``workspace_id`` and sits in the :data:`DEFAULT_LANE`. This is the
+    sanctioned cross-lane sublane->coordinator callback path (Codex-to-Codex; see
+    ``vibes/docs/logics/cockpit-sublane-operating-model.md`` "owner 承認待ちの集約"
+    and ``skills/mozyo-bridge-agent/references/workflow.md`` "Sublane Coordinator
+    Callback"). It is strictly **workspace-scoped**: it never reaches another
+    workspace's coordinator (that is the cross-workspace consult primitive's job,
+    Redmine #11779), and it stays fail-closed — returns ``None`` when the sender
+    is unknown, carries no workspace identity, or the match is not unique. Live
+    tmux pane options are the identity source, never a pane title.
+    """
+    if sender is None:
+        return None
+    sender_ws, _sender_lane = _pane_lane_identity(sender)
+    if not sender_ws:
+        return None
+    candidates = coordinator_codex_candidates(panes, sender_ws)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _no_coordinator_message(
+    panes: list[dict[str, str]],
+    sender: dict[str, str] | None,
+) -> str:
+    """Fail-closed guidance when the coordinator Codex cannot be resolved (#12015)."""
+    if sender is None:
+        return (
+            "cannot resolve `coordinator`: the sender pane is unknown (run from "
+            "inside the lane's pane). Name the coordinator Codex explicitly with "
+            "`--target %pane` (see `mozyo-bridge agents targets`)."
+        )
+    sender_ws, _sender_lane = _pane_lane_identity(sender)
+    if not sender_ws:
+        return (
+            "cannot resolve `coordinator`: the sender pane carries no workspace "
+            "identity, so its workspace's coordinator lane cannot be selected. "
+            "Name the coordinator Codex explicitly with `--target %pane` "
+            "(see `mozyo-bridge agents targets`)."
+        )
+    candidates = coordinator_codex_candidates(panes, sender_ws)
+    if not candidates:
+        reason = (
+            f"no default-lane (coordinator) Codex pane was found in workspace "
+            f"{sender_ws!r}. Ensure the workspace's main checkout has a running "
+            "Codex pane"
+        )
+    else:
+        listed = ", ".join(
+            _format_agent_candidate(pane)
+            for pane in sorted(candidates, key=lambda pane: pane.get("id") or "")
+        )
+        reason = (
+            f"multiple default-lane Codex panes resolved in workspace "
+            f"{sender_ws!r}: {listed}"
+        )
+    return (
+        f"cannot resolve `coordinator`: {reason}. Name the coordinator Codex "
+        "explicitly with `--target %pane` (see `mozyo-bridge agents targets`)."
+    )
+
+
 def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
     """Resolve the pane in ``session`` whose *resolved role* is ``agent``.
 
@@ -316,11 +435,23 @@ def resolve_target(target: str) -> str:
         if target.startswith("%"):
             return target
         return resolve_pane_id(target)
+    if target == COORDINATOR_LABEL:
+        # Workspace-scoped coordinator resolution (Redmine #12015): pick the
+        # sender workspace's default-lane Codex so a sublane callback does not
+        # need a hand-picked `%pane`. Fail-closed with concrete guidance.
+        panes = pane_lines()
+        sender = _sender_pane(panes)
+        coordinator = resolve_coordinator_codex(panes, sender)
+        if coordinator is not None:
+            return coordinator["id"]
+        die(_no_coordinator_message(panes, sender))
+        raise AssertionError("unreachable")
     if target not in AGENT_LABELS:
         die(
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
-            "location (`session:window.pane`), or an agent label "
-            f"({', '.join(sorted(AGENT_LABELS))})."
+            "location (`session:window.pane`), an agent label "
+            f"({', '.join(sorted(AGENT_LABELS))}), or `{COORDINATOR_LABEL}` "
+            "(the sender workspace's main coordinator Codex)."
         )
     session = current_session_name()
     if not session:
