@@ -103,15 +103,24 @@ class CommentRef:
 class WorkflowGate:
     """A core-recognized workflow gate observed on an issue.
 
-    ``name`` is always one of :data:`WORKFLOW_GATE_KINDS`; construction goes
-    through :func:`classify_workflow_gate` so a provider can never smuggle in
-    an unrecognized gate name. ``journal_ref`` points at the journal the gate
-    was observed in, when known.
+    ``name`` is always one of :data:`WORKFLOW_GATE_KINDS`; the invariant is
+    enforced in :meth:`__post_init__`, so even direct construction cannot
+    smuggle in an unrecognized gate name (a provider therefore cannot widen the
+    gate vocabulary). :func:`classify_workflow_gate` is the convenience path
+    that returns ``None`` for non-gate kinds instead of raising.
+    ``journal_ref`` points at the journal the gate was observed in, when known.
     """
 
     name: str
     issue_id: str
     journal_ref: Optional[JournalRef] = None
+
+    def __post_init__(self) -> None:
+        if self.name not in WORKFLOW_GATE_KINDS:
+            raise TicketRecordError(
+                f"unknown workflow gate name: {self.name!r}; expected one of "
+                f"{sorted(WORKFLOW_GATE_KINDS)}"
+            )
 
 
 @dataclass(frozen=True)

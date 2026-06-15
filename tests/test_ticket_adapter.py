@@ -26,6 +26,7 @@ from mozyo_bridge.domain.ticket_adapter import (
     JournalRef,
     OwnerApproval,
     TicketProvider,
+    TicketRecordError,
     WorkflowGate,
     classify_workflow_gate,
     owner_approval,
@@ -167,6 +168,21 @@ class WorkflowGateVocabularyTest(unittest.TestCase):
                 classify_workflow_gate(kind, "12034"),
                 msg=f"{kind} must not be a workflow gate",
             )
+
+    def test_direct_construction_rejects_unrecognized_name(self) -> None:
+        # The gate vocabulary is core-owned: even direct construction (not via
+        # classify_workflow_gate) cannot smuggle in an unknown gate name, so a
+        # provider can never widen the vocabulary.
+        with self.assertRaises(TicketRecordError):
+            WorkflowGate(name="bogus", issue_id="12034")
+        with self.assertRaises(TicketRecordError):
+            # A non-gate handoff kind is still rejected at the type boundary.
+            WorkflowGate(name="implementation_request", issue_id="12034")
+
+    def test_direct_construction_accepts_recognized_name(self) -> None:
+        for name in WORKFLOW_GATE_KINDS:
+            gate = WorkflowGate(name=name, issue_id="12034")
+            self.assertEqual(name, gate.name)
 
 
 class OwnerApprovalDecisionTest(unittest.TestCase):
