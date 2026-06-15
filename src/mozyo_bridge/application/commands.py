@@ -3453,6 +3453,48 @@ def cmd_handoff_reply(args: argparse.Namespace) -> int:
     return orchestrate_handoff(args, default_kind="reply")
 
 
+CONSULT_DEFAULT_KIND = "design_consultation"
+"""Default ``--kind`` for `handoff cross-workspace-consult` (Redmine #11779).
+
+The cross-workspace primitive exists to carry design-consultation requests
+through the target workspace's Codex gateway, so it defaults to
+``design_consultation`` while still accepting any other ``KIND_LABELS`` value
+(e.g. a cross-workspace ``review_request``) via an explicit ``--kind``.
+"""
+
+
+def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:
+    """Cross-workspace design-consultation primitive (Redmine #11779).
+
+    A thin, boundary-preserving wrapper over :func:`orchestrate_handoff`. It
+    encodes the *standard cross-workspace consult route* as a single command
+    without re-implementing or relaxing any safety gate:
+
+    - The receiver is fixed to ``codex``: the consult always lands on the
+      target workspace's Codex gateway pane, never directly in a foreign Claude
+      pane (a cross-session ``--to claude`` is blocked by the Cross-Workspace
+      Handoff gate anyway). The target Codex reads the durable anchor and, if
+      implementation is needed, performs the local same-session Claude handoff
+      inside its own workspace.
+    - ``--target`` and ``--target-repo`` are mandatory at the parser surface,
+      so the cross-workspace identity gate (Redmine #10332 / #11301 / #11778)
+      always runs. This *tightens* `handoff send` (which only runs the repo
+      gate when ``--target-repo`` is supplied); it never relaxes it.
+    - ``--kind`` defaults to ``design_consultation`` and may be overridden.
+    - The durable source of truth stays the Redmine issue / Asana task; the
+      pane notification is only the pointer.
+
+    All actual gating (cross_session_claude block, target_repo identity gate,
+    receiver-process binding, marker/landing rail, ``--target-repo auto``
+    explicit-``%pane`` requirement) is delegated to :func:`orchestrate_handoff`
+    so this wrapper cannot hide or weaken it.
+    """
+    args.to = "codex"
+    if getattr(args, "kind", None) is None:
+        args.kind = CONSULT_DEFAULT_KIND
+    return orchestrate_handoff(args)
+
+
 def _confident_workspace_root(cwd: str) -> Path | None:
     """Return the workspace root for ``cwd`` only when its identity is confident.
 

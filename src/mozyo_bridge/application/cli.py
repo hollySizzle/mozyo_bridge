@@ -13,6 +13,7 @@ from mozyo_bridge.application.commands import (
     cmd_doctor_instruction,
     cmd_events_query,
     cmd_events_tail,
+    cmd_handoff_cross_workspace_consult,
     cmd_handoff_reply,
     cmd_handoff_send,
     cmd_id,
@@ -893,8 +894,13 @@ def build_parser() -> argparse.ArgumentParser:
         parser_: argparse.ArgumentParser,
         *,
         kind_required: bool,
+        include_to: bool = True,
+        include_force: bool = True,
+        target_required: bool = False,
+        target_repo_required: bool = False,
     ) -> None:
-        parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
+        if include_to:
+            parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
         parser_.add_argument("--source", required=True, choices=sorted(SOURCES), help="Durable record source system")
         parser_.add_argument(
             "--kind",
@@ -913,11 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.add_argument("--journal", help="Redmine journal id (source=redmine)")
         parser_.add_argument(
             "--target",
+            required=target_required,
             help="Optional tmux target override; defaults to same-session agent-window resolution from --to",
         )
         parser_.add_argument(
             "--target-repo",
             dest="target_repo",
+            required=target_repo_required,
             help=(
                 "Optional cross-workspace gate (Redmine #10332): the target "
                 "pane's cwd must resolve to this repo root, otherwise the "
@@ -950,11 +958,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--summary",
             help="Optional short hint appended to the generated notification; required for --kind custom",
         )
-        parser_.add_argument(
-            "--force",
-            action="store_true",
-            help="Allow sending to a non-agent-looking pane",
-        )
+        if include_force:
+            parser_.add_argument(
+                "--force",
+                action="store_true",
+                help="Allow sending to a non-agent-looking pane",
+            )
         parser_.add_argument(
             "--landing-timeout",
             dest="landing_timeout",
@@ -1004,6 +1013,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure_handoff_parser(handoff_reply, kind_required=False)
     handoff_reply.set_defaults(func=cmd_handoff_reply)
+
+    handoff_consult = handoff_sub.add_parser(
+        "cross-workspace-consult",
+        help=(
+            "Cross-workspace design-consultation route through a target "
+            "workspace's Codex gateway pane"
+        ),
+        description=(
+            "Standard cross-workspace design-consultation primitive (Redmine "
+            "#11779). It is a boundary-preserving wrapper over `handoff send`: "
+            "the receiver is fixed to `codex` (the consult lands on the target "
+            "workspace's Codex gateway pane, never directly in a foreign Claude "
+            "pane), and the cross-workspace identity gate is mandatory — both "
+            "`--target` and `--target-repo` are required, so the gate that "
+            "`handoff send` only runs when `--target-repo` is supplied always "
+            "runs here. `--kind` defaults to `design_consultation`. Every "
+            "actual safety gate (cross-session Claude block, repo identity "
+            "gate, receiver-process binding, landing rail) is delegated to the "
+            "same `handoff send` orchestration and is neither hidden nor "
+            "weakened by this wrapper."
+        ),
+        epilog=(
+            "Operational route:\n"
+            "  1. Discover the target workspace's Codex pane with "
+            "`mozyo-bridge agents list` / `agents targets` (read-only).\n"
+            "  2. Record the consult request on the durable source of truth "
+            "(Redmine issue/journal or Asana task/comment) first; the pane "
+            "notification is only the pointer.\n"
+            "  3. Run this command with an explicit `%pane` target and "
+            "`--target-repo` (or `--target-repo auto` to infer the root from "
+            "that `%pane`'s cwd).\n"
+            "  4. The target Codex reads the durable anchor and, if "
+            "implementation is needed, performs the local same-session Claude "
+            "handoff inside its own workspace.\n\n"
+            "Example:\n"
+            "  mozyo-bridge handoff cross-workspace-consult \\\n"
+            "    --source redmine --issue 11779 --journal 58668 \\\n"
+            "    --target %42 --target-repo auto \\\n"
+            "    --summary 'cross-workspace gateway primitive design'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    configure_handoff_parser(
+        handoff_consult,
+        kind_required=False,
+        include_to=False,
+        include_force=False,
+        target_required=True,
+        target_repo_required=True,
+    )
+    handoff_consult.set_defaults(func=cmd_handoff_cross_workspace_consult)
 
     reply_alias = sub.add_parser(
         "reply",
