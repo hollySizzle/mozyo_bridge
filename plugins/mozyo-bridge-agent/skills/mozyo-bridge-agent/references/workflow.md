@@ -162,6 +162,38 @@ These are the transitions where another lane must act or update its view. Routin
 4. **Send a short, anchored notification.** Use `mozyo-bridge handoff send --to codex --target coordinator --mode standard` (the coordinator pane is typically not the active split, so `standard` is the usual mode; fall back to an explicit `--target <coordinator_codex_%pane> --target-repo auto` when `coordinator` cannot resolve) with the durable anchor in the body: the issue id, the gate journal id, the state reached, and — when relevant — the commit hash. Keep it to the minimal state + pointer; retry plans, attempted commands, and detailed findings live in the durable record, not the callback chat. Record the callback outcome (sent / blocked-with-reason / not-attempted) in the durable record — a silent re-poke is prohibited; a missing callback must stay detectable as `progress_without_callback` (`## Stall And No-Progress Detection Standard`).
 5. **Do not poll the coordinator pane afterward.** Delivery is only a pointer; the coordinator reads the durable anchor and decides the next action (audit, owner-approval collection, close, or further routing). The sublane resumes from its own durable record.
 
+### Completion checklist (run before treating a handoff-worthy state as done)
+
+The procedure above is necessary but, on its own, easy to skip: a sublane can record its gate journals and notify its *own same-lane* Codex, then treat the state as finished without ever crossing the lane boundary to the main coordinator. That is exactly the `progress_without_callback` failure: durable Redmine state advances (implementation_done → review_request → review approval → owner-close-waiting) but the main coordinator only learns of it through a manual Redmine sweep (Redmine #12038 j#59102, where review_request / review landed on the sublane's own Codex `%1075` and never reached the main coordinator via `--target coordinator`). To make the callback a pre-condition rather than an after-the-fact detection, **a sublane does not consider any of the states below complete until every box is recorded on the durable record.** This checklist is the enforceable form of steps 1–5; it does not add a new gate or transport kind.
+
+For each state in `### States that require a coordinator callback` — concretely **implementation_done, review_request, review result (approval or findings), owner-close-waiting, and blocked** — confirm all of:
+
+1. **Durable gate journal recorded.** The state's own gate / Progress Log journal exists on the Redmine issue first (step 1). The callback never substitutes for it.
+2. **Same-lane surfacing is not the callback.** Notifying your own lane's Codex (the Claude → same-lane Codex hop) satisfies same-lane addressing, but it is *not* the coordinator callback. The main coordinator is a different lane's Codex; delivering review_request / review only to the sublane's own Codex leaves the coordinator blind. This is the specific step #12038 skipped.
+3. **Cross-lane callback sent to the main coordinator via `--target coordinator`.** Run `mozyo-bridge handoff send --to codex --target coordinator --mode standard` with the durable anchor (issue id, gate journal id, state reached, commit hash when relevant). `--target coordinator` is the normal route — it is workspace-scoped and fail-closed, so a sublane never hand-picks the coordinator `%pane` on the happy path. Fall back to an explicit `--target <coordinator_codex_%pane> --target-repo auto` (resolved through `mozyo-bridge agents targets`, `## Natural-Name Target Handoff`) only when `coordinator` cannot resolve.
+4. **Callback outcome journal recorded** (see template below), with one of exactly three results:
+   - `sent` — target, command, and the observed landing marker.
+   - `blocked` — the blocked reason, the candidate panes (`agents targets` rows), and the concrete `--target %pane` retry command, so the next attempt is replayable from the durable record and the gap stays detectable as `progress_without_callback`.
+   - `not-attempted` — only with an explicit reason (e.g. this lane *is* the coordinator lane, so no cross-lane hop applies). Silence is never a valid outcome.
+
+A state with boxes 1–4 incomplete is not handed off, regardless of how the work is framed (`## Handoff Lifecycle` "every" rule). If `--target coordinator` fails, box 4's `blocked` outcome — not silence — is what keeps the state recoverable; do not re-poke the pane silently.
+
+### Callback outcome journal template
+
+Record this as a journal on the same Redmine issue (or fold the fields into the gate journal) so the callback is auditable and a missing one stays detectable:
+
+```markdown
+## coordinator callback
+- state: implementation_done | review_request | review_result | owner_close_approval_waiting | blocked
+- durable_anchor: #<issue_id> j#<gate_journal_id>
+- target: coordinator (`--target coordinator`) | <coordinator_codex_%pane>
+- result: sent | blocked | not-attempted
+- on sent: command + observed landing marker
+- on blocked: reason / candidates (`agents targets` rows) / retry command (`--target %pane --target-repo auto`)
+- on not-attempted: explicit reason (e.g. this lane is the coordinator lane)
+- commit_hash: (when the state carries one)
+```
+
 ### Boundaries this procedure does not relax
 
 - **Redmine / Asana stays the source of truth.** The callback pane message is only a pointer. A coordinator receiving a callback reads the named journal / comment — not pane scrollback, `status`, or `doctor` — before acting.
