@@ -146,6 +146,17 @@ preflight では少なくとも次を確認する:
    - sender pane が不明、または concrete な lane identity を持たない (`workspace_id`
      空かつ lane が `default`) 場合は narrowing を行わず、6 の fail closed に落とす。
      identity source は live tmux の pane option であり、pane title を正本にしない。
+   - same-session local Claude auto-select (Redmine #12070): `--to claude` が同一
+     session 内に複数 Claude pane を返したときは、lane narrowing に加えて
+     **(a) sender が non-empty `workspace_id` を持つこと** と
+     **(b) repo identity gate** を要求する。repo identity gate は、sender と候補の
+     cwd がともに repo root を infer できればその root が一致すること、どちらも infer
+     できなければ同一 registered `workspace_id` で identity を担保すること、を満たした
+     場合だけ通過する。片側だけ root を持つ / root が異なる / sender が `workspace_id`
+     を持たない場合は fail closed する。これにより、同一 `(workspace_id, lane_id)` だが
+     別 repo checkout に居る複数 Claude pane でも sender 自身の local Claude を一意選択
+     できる。pane 選択のみを解決し、nested project の実行 root 伝搬 (Redmine #12098)
+     は別問題として扱う。cross-session Claude direct / cross-lane Claude は緩めない。
 6. ambiguous / missing:
    - fail closed または explicit target を要求する。fail closed 時は具体的な候補
      (pane_id / workspace / lane)、絞り込めなかった理由、推奨 retry

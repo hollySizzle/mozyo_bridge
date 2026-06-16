@@ -8,9 +8,11 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.domain.agent_discovery import (
+    AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     CONFIDENCE_STRONG,
     ROLE_SOURCE_PANE_OPTION,
+    infer_repo_root,
     resolve_agent_role,
 )
 from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE
@@ -21,7 +23,7 @@ from mozyo_bridge.infrastructure.tmux_client import (
     validate_target,
 )
 from mozyo_bridge.shared.errors import die
-from mozyo_bridge.shared.paths import READ_MARK_PREFIX
+from mozyo_bridge.shared.paths import READ_MARK_PREFIX, normalize_path_unicode
 
 
 AGENT_PROCESSES = {"claude", "codex", "node"}
@@ -164,6 +166,81 @@ def narrow_to_sender_lane(
     if not _has_concrete_lane_identity(*sender_identity):
         return targets
     return [pane for pane in targets if _pane_lane_identity(pane) == sender_identity]
+
+
+def _repo_identity_matches(
+    sender: dict[str, str], candidate: dict[str, str]
+) -> bool:
+    """Repo identity gate for same-session local Claude auto-select (#12070).
+
+    Design condition 6 (Redmine #12069 j#59568): the sender and a candidate must
+    resolve to the same repo identity before the candidate can be auto-selected.
+
+    - When both cwds infer a :func:`infer_repo_root`, the roots must be equal
+      (Unicode-normalized, matching the cross-workspace identity gate in
+      ``orchestrate_handoff``). This is what disambiguates several Claude panes
+      that share a ``(workspace_id, lane_id)`` but live in different repo
+      checkouts within one cockpit session.
+    - When *neither* cwd infers a repo root, the shared registered
+      ``workspace_id`` (already required by the same-lane gate upstream) carries
+      the match, so a non-git scaffolded workspace still auto-selects.
+    - A root inferable on only one side, or two different roots, is fail-closed
+      (the candidate is dropped) — "missing or mismatched repo root is
+      fail-closed".
+
+    This selects the *pane*; it deliberately does not solve nested project
+    execution-root propagation (Redmine #12098), which is a handoff-payload /
+    durable-record concern, not a pane-selection one.
+    """
+    sender_root = infer_repo_root(sender.get("cwd") or "")
+    candidate_root = infer_repo_root(candidate.get("cwd") or "")
+    if sender_root is not None and candidate_root is not None:
+        return normalize_path_unicode(sender_root) == normalize_path_unicode(
+            candidate_root
+        )
+    if sender_root is None and candidate_root is None:
+        sender_ws = (sender.get("workspace_id") or "").strip()
+        candidate_ws = (candidate.get("workspace_id") or "").strip()
+        return bool(sender_ws) and sender_ws == candidate_ws
+    return False
+
+
+def narrow_to_local_claude(
+    targets: list[dict[str, str]],
+    sender: dict[str, str] | None,
+) -> list[dict[str, str]]:
+    """Narrow same-session Claude candidates for ``--to claude`` auto-select (#12070).
+
+    Stricter superset of :func:`narrow_to_sender_lane`, encoding the safe
+    auto-select conditions fixed in the design (Redmine #12069 j#59568):
+
+    - **condition 2** — the sender must carry a machine-checkable, non-empty
+      ``workspace_id``. A ``default`` lane is admissible only with a workspace
+      id; a sender with no workspace marker cannot disambiguate, so ``targets``
+      is returned unchanged and the caller fails closed.
+    - **condition 5** — candidates are restricted to the sender's own
+      ``(workspace_id, lane_id)``. A different lane is never selected (it routes
+      through that lane's Codex gateway, ``cockpit-sublane-operating-model.md``
+      "Cross-Lane Routing Rule").
+    - **condition 6** — each kept candidate must pass :func:`_repo_identity_matches`.
+
+    Like :func:`narrow_to_sender_lane`, this can only *shrink* the candidate set,
+    so the caller's "exactly one" check (condition 7) and its ``> 1`` / ``== 0``
+    fail-closed handling stay intact, and it never crosses a lane / session
+    boundary. The identity source is the live tmux ``@mozyo_*`` pane options and
+    cwd in the snapshot, never a pane title.
+    """
+    if sender is None:
+        return targets
+    sender_ws, sender_lane = _pane_lane_identity(sender)
+    if not sender_ws:
+        return targets
+    same_lane = [
+        pane
+        for pane in targets
+        if _pane_lane_identity(pane) == (sender_ws, sender_lane)
+    ]
+    return [pane for pane in same_lane if _repo_identity_matches(sender, pane)]
 
 
 def _format_agent_candidate(pane: dict[str, str]) -> str:
@@ -399,7 +476,17 @@ def find_agent_window(agent: str, session: str) -> dict[str, str] | None:
         # `--to codex` with no explicit `--target` to the sender lane's own
         # gateway. Same-lane addressing only — never a foreign lane's pane.
         sender_pane = _sender_pane(panes)
-        narrowed = narrow_to_sender_lane(targets, sender_pane)
+        if agent == AGENT_KIND_CLAUDE:
+            # Same-session local Claude auto-select (Redmine #12070): layer the
+            # repo identity gate and the stricter non-empty `workspace_id`
+            # requirement on top of #12011 lane narrowing, so a cockpit hosting
+            # several Claude panes that share a `(workspace_id, lane_id)` but
+            # live in different repo checkouts still resolves the sender's own
+            # local Claude. This only shrinks the set; cross-session and
+            # cross-lane Claude stay blocked (here and downstream).
+            narrowed = narrow_to_local_claude(targets, sender_pane)
+        else:
+            narrowed = narrow_to_sender_lane(targets, sender_pane)
         if len(narrowed) == 1:
             return narrowed[0]
         die(_ambiguous_agent_targets_message(agent, session, targets, sender_pane))
