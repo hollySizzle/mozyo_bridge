@@ -27,7 +27,9 @@
   "scripts": {
     "compile": "tsc -p ./",
     "dev:host": "./scripts/open-dev-host.sh",
+    "mcp": "node ./out/mcp/main.js",
     "test:e2e": "npm run compile && node ./out/test/e2e/runTest.js",
+    "test:unit": "npm run compile && node --test ./out/test/unit/*.test.js",
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {

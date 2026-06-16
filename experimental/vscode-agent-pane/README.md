@@ -90,6 +90,39 @@ These two failures look similar in a broken host but have different causes. Do n
 
 Rule of thumb: a TaskPilot popup means the host environment is not isolated; a `(no workspace)` inspector means the host has no target folder. Neither is diagnosed by editing PoC source.
 
+## MCP Server PoC (read-only workspace inspection)
+
+Redmine #11578 decided the first agent-facing surface is a **mozyo MCP server** (not a VS Code Language Model Tool). Redmine #11579 implements exactly one read-only capability on it: `mozyo.workspace.inspect`.
+
+The server is a minimal, dependency-free stdio MCP server. It exposes the same capability two ways so any MCP client can consume it:
+
+- **Resource** `mozyo://workspace/inspect` (primary) — read-only workspace/session facts as `application/json`.
+- **Tool** `mozyo_workspace_inspect` (read-only wrapper; underscore name for client compatibility, conceptual id `mozyo.workspace.inspect`) — same facts, optionally for an explicit `workspace_path`. VS Code's agent consumes tools more readily than resources.
+
+Run it:
+
+```sh
+npm run compile
+node ./out/mcp/main.js --repo <workspace-path>
+# or: MOZYO_WORKSPACE=<workspace-path> node ./out/mcp/main.js
+```
+
+Workspace resolution order: `--repo <path>`, then `MOZYO_WORKSPACE`, then `process.cwd()`.
+
+The returned facts are curated and CLI-backed (`mozyo-bridge session name --json`, `mozyo-bridge doctor --json`): workspace path, session name / repo root / source, doctor overall plus `cli` / `rules` / `tmux` section statuses, a `blocked` flag, and the command lines used as provenance. `blocked` is `true` unless session identity resolved **and** doctor reports healthy — this is the judgment material an agent uses *before* opening terminal panes. Note that `doctor --json` exits non-zero when health is not green while still emitting valid facts; the server parses those facts rather than discarding them.
+
+Scope and boundary (do not exceed in this PoC):
+
+- Read-only only. No session ensure, no Claude/Codex launch, no terminal/xterm pane (those remain Redmine #11521 / #11527).
+- Never persists or returns secrets, tokens, or chat logs; raw stdout/stderr are not surfaced in the facts.
+- Experimental surface. The resource/tool names and payload shape are **not** a public, versioned contract; do not depend on them externally. Production should adopt the official `@modelcontextprotocol/sdk` instead of this hand-rolled transport.
+
+Hermetic unit tests (no real CLI or tmux; injected fakes) cover the inspection backing and the MCP protocol handling:
+
+```sh
+npm run test:unit
+```
+
 ## Automated E2E Smoke
 
 ```sh

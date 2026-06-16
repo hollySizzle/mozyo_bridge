@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { execFile } from 'child_process';
+import { CommandResult, NO_WORKSPACE, WorkspaceInspection, inspectWorkspace } from './workspaceInspect';
 
 export function activate(context: vscode.ExtensionContext): void {
   const disposable = vscode.commands.registerCommand('mozyoAgentPane.open', async () => {
@@ -10,7 +10,7 @@ export function activate(context: vscode.ExtensionContext): void {
       { enableScripts: false }
     );
 
-    const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '(no workspace)';
+    const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? NO_WORKSPACE;
     panel.webview.html = renderLoadingPanel(workspacePath);
 
     const inspection = await inspectWorkspace(workspacePath);
@@ -22,94 +22,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   // No persistent resources yet.
-}
-
-interface CommandResult {
-  ok: boolean;
-  command: string;
-  stdout: string;
-  stderr: string;
-  error?: string;
-  json?: unknown;
-}
-
-interface WorkspaceInspection {
-  sessionName: CommandResult;
-  doctor: CommandResult;
-}
-
-async function inspectWorkspace(workspacePath: string): Promise<WorkspaceInspection> {
-  if (workspacePath === '(no workspace)') {
-    const skipped: CommandResult = {
-      ok: false,
-      command: '(skipped)',
-      stdout: '',
-      stderr: '',
-      error: 'No VS Code workspace folder is open.'
-    };
-
-    return {
-      sessionName: skipped,
-      doctor: skipped
-    };
-  }
-
-  const sessionName = await runJsonCommand('mozyo-bridge', [
-    'session',
-    'name',
-    '--repo',
-    workspacePath,
-    '--json'
-  ]);
-  const doctor = await runJsonCommand('mozyo-bridge', [
-    'doctor',
-    '--target',
-    workspacePath,
-    '--json'
-  ]);
-
-  return { sessionName, doctor };
-}
-
-function runJsonCommand(command: string, args: string[]): Promise<CommandResult> {
-  const commandLine = [command, ...args].join(' ');
-
-  return new Promise(resolve => {
-    execFile(command, args, { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        resolve({
-          ok: false,
-          command: commandLine,
-          stdout,
-          stderr,
-          error: error.message
-        });
-        return;
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(stdout);
-      } catch (parseError) {
-        resolve({
-          ok: false,
-          command: commandLine,
-          stdout,
-          stderr,
-          error: parseError instanceof Error ? parseError.message : String(parseError)
-        });
-        return;
-      }
-
-      resolve({
-        ok: true,
-        command: commandLine,
-        stdout,
-        stderr,
-        json: parsed
-      });
-    });
-  });
 }
 
 function renderLoadingPanel(workspacePath: string): string {
