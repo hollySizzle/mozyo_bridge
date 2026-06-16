@@ -31,6 +31,25 @@ preset が listing する **lane 不可** path を本 project でも継続して
 
 これらに変更が必要な場合は `codex_direct_edit` gate (Codex が直接編集する場合) または Claude handoff (default) を使う。
 
+## Guardrail Health Check Scope
+
+guardrail health check は lane の編集可否確認ではなく、guardrail とその配布 mirror / 隣接 spec が矛盾していないかを読む点検である。したがって、health check の読取対象は editable lane scope より広く取る。
+
+次回以降の guardrail health check では、plain `rg --files` だけに依存しない。hidden directory を含む列挙 (`rg --files --hidden`) または明示 path list で、少なくとも次を対象に含める。
+
+- `.mozyo-bridge/rules/**`
+- `.mozyo-bridge/docs/catalog.yaml`
+- `vibes/docs/rules/**`
+- `vibes/docs/logics/**`
+- `vibes/docs/specs/**`
+- `skills/mozyo-bridge-agent/references/**`
+- `src/mozyo_bridge/scaffold/presets/**`
+- `src/mozyo_bridge/scaffold/presets/*/files/.mozyo-bridge/**`
+
+`src/mozyo_bridge/scaffold/presets/*/files/.mozyo-bridge/**` は hidden directory 配下の preset-internal mirror である。health check では対象に含めるが、編集権限は lane scope へ昇格しない。変更が必要なら Claude handoff または `codex_direct_edit` gate を使う。
+
+mirror / generated copy を重複として省く場合は、byte identity や generator check などの根拠を journal に残す。根拠なしに「mirror なので同等」と扱って読取対象から外さない。
+
 ## `mozyo_bridge` での `codex_autonomous_edit` 実行例
 
 preset 側 schema をそのまま採用する。journal field の最小例:
