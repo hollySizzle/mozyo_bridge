@@ -62,7 +62,9 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMAT_JSON,
     RECORD_FORMAT_TEXT,
     RedmineAnchor,
+    ExecutionRoot,
     build_delivery_record,
+    build_execution_root,
     build_marker,
     build_notification_body,
     make_outcome,
@@ -11302,6 +11304,190 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertNotIn("Operator note", record)
 
 
+class ExecutionRootPropagationTest(unittest.TestCase):
+    """Nested project execution-root / workdir propagation (Redmine #12098).
+
+    A handoff must be able to carry an explicit target execution root distinct
+    from the pane cwd / cross-workspace repo root, so a receiver recovers a
+    nested project root from the durable record instead of pane scrollback.
+    Abstract `/workspace/...` placeholders are used deliberately — no personal
+    home path or private project absolute path in tracked test files
+    (`vibes/docs/rules/public-private-boundary.md`).
+    """
+
+    def test_build_execution_root_derives_relative_pointer_under_repo(self) -> None:
+        er = build_execution_root(
+            "/workspace/project-alpha/services/api",
+            repo_root_abs="/workspace/project-alpha",
+        )
+
+        self.assertEqual("/workspace/project-alpha/services/api", er.workdir)
+        self.assertEqual("/workspace/project-alpha", er.repo_root)
+        self.assertEqual("services/api", er.relative)
+        self.assertTrue(er.is_nested)
+        self.assertEqual(
+            "`services/api` (relative to the target repo root)", er.portable_pointer()
+        )
+
+    def test_build_execution_root_resolves_nested_unicode_path(self) -> None:
+        # The #12098 reproduction nested a Japanese checkout below a Japanese
+        # workspace root; NFC/NFD spelling drift must still yield a relative
+        # pointer rather than collapsing to absolute-only.
+        import unicodedata
+
+        repo = unicodedata.normalize("NFC", "/workspace/IT導入/anchor")
+        workdir = unicodedata.normalize("NFD", "/workspace/IT導入/anchor/rovoice/shinsei_llm")
+
+        er = build_execution_root(workdir, repo_root_abs=repo)
+
+        self.assertEqual("rovoice/shinsei_llm", er.relative)
+        self.assertTrue(er.is_nested)
+
+    def test_build_execution_root_out_of_tree_keeps_workdir_without_relative(self) -> None:
+        er = build_execution_root(
+            "/workspace/other/checkout", repo_root_abs="/workspace/project-alpha"
+        )
+
+        self.assertIsNone(er.relative)
+        self.assertFalse(er.is_nested)
+        self.assertEqual("`/workspace/other/checkout`", er.portable_pointer())
+
+    def test_build_execution_root_equal_to_repo_root_is_not_nested(self) -> None:
+        er = build_execution_root(
+            "/workspace/project-alpha", repo_root_abs="/workspace/project-alpha"
+        )
+
+        self.assertEqual(".", er.relative)
+        self.assertFalse(er.is_nested)
+
+    def test_build_execution_root_without_anchor_carries_absolute_only(self) -> None:
+        er = build_execution_root("/workspace/project-alpha/services/api")
+
+        self.assertIsNone(er.repo_root)
+        self.assertIsNone(er.relative)
+        self.assertEqual("`/workspace/project-alpha/services/api`", er.portable_pointer())
+
+    def test_notification_body_appends_execution_root_clause(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+        er = build_execution_root(
+            "/workspace/project-alpha/services/api",
+            repo_root_abs="/workspace/project-alpha",
+        )
+
+        body = build_notification_body(
+            anchor, "implementation_request", None, "claude", execution_root=er
+        )
+
+        # The durable-anchor contract is preserved verbatim ...
+        self.assertIn("durable anchor", body)
+        self.assertIn("read it from the source-of-truth", body)
+        # ... and the execution-root pointer is appended as a portable,
+        # confirm-from-anchor hint (not a new authority).
+        self.assertIn("Target execution root: `services/api`", body)
+        self.assertIn("confirm it from the durable anchor", body)
+
+    def test_notification_body_unchanged_without_execution_root(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+
+        with_none = build_notification_body(
+            anchor, "implementation_request", None, "claude"
+        )
+        explicit_none = build_notification_body(
+            anchor, "implementation_request", None, "claude", execution_root=None
+        )
+
+        self.assertEqual(with_none, explicit_none)
+        self.assertNotIn("Target execution root", with_none)
+
+    def test_make_outcome_carries_execution_root_in_json(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+        er = build_execution_root(
+            "/workspace/project-alpha/services/api",
+            repo_root_abs="/workspace/project-alpha",
+        )
+
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+            execution_root=er,
+        )
+
+        payload = json.loads(outcome.to_json())
+        self.assertEqual(
+            {
+                "workdir": "/workspace/project-alpha/services/api",
+                "repo_root": "/workspace/project-alpha",
+                "relative": "services/api",
+            },
+            payload["execution_root"],
+        )
+
+    def test_make_outcome_execution_root_defaults_to_none(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+        )
+
+        self.assertIsNone(outcome.execution_root)
+        self.assertIsNone(json.loads(outcome.to_json())["execution_root"])
+
+    def test_delivery_record_shows_relative_and_absolute_execution_root(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+        er = build_execution_root(
+            "/workspace/project-alpha/services/api",
+            repo_root_abs="/workspace/project-alpha",
+        )
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+            execution_root=er,
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn(
+            "- Target execution root: `services/api` (relative to the target "
+            "repo root; abs `/workspace/project-alpha/services/api`)",
+            record,
+        )
+
+    def test_delivery_record_execution_root_dash_when_absent(self) -> None:
+        anchor = normalize_anchor("redmine", issue="12098", journal="59652")
+        outcome = make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+        )
+
+        record = build_delivery_record(outcome)
+
+        self.assertIn("- Target execution root: —", record)
+
+
 class DeliveryRecordTest(unittest.TestCase):
     """Coverage for the durable delivery-record generator.
 
@@ -11573,6 +11759,69 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 result = exc
 
         return result, sent, stdout.getvalue()
+
+    def test_workdir_propagates_nested_execution_root_to_record_and_body(self) -> None:
+        # Redmine #12098: an explicit --workdir below the pane cwd / repo root
+        # must surface a repo-relative execution-root pointer in both the typed
+        # notification body and the durable delivery record, so the receiver
+        # recovers the nested project root without pane scrollback.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp).resolve()
+            (repo_root / ".git").mkdir()
+            nested = repo_root / "services" / "api"
+            nested.mkdir(parents=True)
+            pane = {
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": str(repo_root),
+                "window_name": "claude",
+            }
+
+            result, sent, stdout = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff",
+                    "send",
+                    "--to",
+                    "claude",
+                    "--source",
+                    "redmine",
+                    "--kind",
+                    "implementation_request",
+                    "--issue",
+                    "12098",
+                    "--journal",
+                    "59652",
+                    "--target",
+                    "%2",
+                    "--target-repo",
+                    str(repo_root),
+                    "--workdir",
+                    str(nested),
+                    "--mode",
+                    "standard",
+                    "--submit-delay",
+                    "0",
+                ],
+                pane=pane,
+            )
+
+        self.assertEqual(0, result)
+        # Durable record carries the portable relative pointer plus the abs root.
+        self.assertIn(
+            "- Target execution root: `services/api` (relative to the target "
+            f"repo root; abs `{nested}`)",
+            stdout,
+        )
+        # The typed pane body carries the portable pointer and keeps the
+        # confirm-from-anchor contract.
+        typed = "".join(call[-1] for call in sent if call[:4] == ("send-keys", "-t", "%2", "-l"))
+        self.assertIn("Target execution root: `services/api`", typed)
+        self.assertIn("confirm it from the durable anchor", typed)
+        # Structured outcome carries the execution_root block for replay.
+        json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
+        outcome = json.loads(json_lines[-1])
+        self.assertEqual("services/api", outcome["execution_root"]["relative"])
 
     def test_standard_mode_emits_record_then_json_outcome_by_default(self) -> None:
         # Pinned to `--mode standard` so the record/JSON ordering is verified

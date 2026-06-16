@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 from typing import Any, Iterable, Literal, Optional, Sequence
 
 
@@ -143,6 +145,104 @@ def build_marker(anchor: NormalizedAnchor, kind: str, receiver: str) -> str:
     return "[mozyo:handoff:" + ":".join(parts) + "]"
 
 
+@dataclass(frozen=True)
+class ExecutionRoot:
+    """Receiver target execution root / workdir carried by a handoff.
+
+    Redmine #12098: the pane cwd / cross-workspace repo root is not always the
+    directory the receiver must operate from. In a cockpit workspace whose pane
+    cwd is the workspace root (`IT導入_`-style anchor), the real work target can
+    be a nested project several levels below (`.../rovoice/shinsei_llm`). When
+    the durable anchor only stores relative save paths, the receiver cannot
+    uniquely recover that nested execution root and ends up searching the wrong
+    checkout. This value object carries the execution root explicitly so the
+    notification body and durable delivery record can point the receiver at it
+    without relying on pane scrollback, session/window name, or manual grep.
+
+    Fields:
+
+    - ``workdir`` — the absolute, resolved execution root (a runtime fact; the
+      CLI runtime record may carry it per the issue's constraint).
+    - ``repo_root`` — the cross-workspace repo / workspace root anchor the
+      relative form was computed against (``None`` when no anchor was known).
+    - ``relative`` — the repo-root-relative pointer (e.g. ``rovoice/shinsei_llm``)
+      when ``workdir`` lives under ``repo_root``. This is the **portable**
+      pointer: it carries no personal home prefix, so it is the form surfaced in
+      the pane notification and preferred in pasteable records
+      (``vibes/docs/rules/public-private-boundary.md``).
+    """
+
+    workdir: str
+    repo_root: Optional[str] = None
+    relative: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def is_nested(self) -> bool:
+        """True when the execution root is a nested path below ``repo_root``.
+
+        ``relative in (None, ".")`` means the execution root either could not be
+        expressed relative to the anchor or equals the anchor itself; only a
+        genuine sub-path is "nested" in the sense the issue cares about.
+        """
+        return bool(self.relative) and self.relative != "."
+
+    def portable_pointer(self) -> str:
+        """Relative-first pointer with no private home prefix when possible."""
+        if self.is_nested:
+            return f"`{self.relative}` (relative to the target repo root)"
+        return f"`{self.workdir}`"
+
+    def record_pointer(self) -> str:
+        """Pointer for the durable record: portable form plus the runtime abs."""
+        if self.is_nested:
+            return f"`{self.relative}` (relative to the target repo root; abs `{self.workdir}`)"
+        return f"`{self.workdir}`"
+
+    def notification_clause(self) -> str:
+        """Sentence appended to the pane notification body.
+
+        Keeps the receiver contract intact: the execution root is a pointer the
+        receiver still confirms from the durable anchor, not a new authority.
+        """
+        return (
+            f"Target execution root: {self.portable_pointer()} — distinct from "
+            "the pane cwd / workspace root; confirm it from the durable anchor "
+            "before operating, not from the pane location."
+        )
+
+
+def build_execution_root(
+    workdir_abs: str, *, repo_root_abs: Optional[str] = None
+) -> ExecutionRoot:
+    """Construct an :class:`ExecutionRoot` from resolved absolute paths.
+
+    Pure: callers resolve ``workdir_abs`` / ``repo_root_abs`` against the
+    filesystem first, this only derives the repo-relative portable pointer.
+    The relative form is computed on NFC-normalized operands so a nested
+    Japanese path (the #12098 reproduction had NFD/NFC-spelled directories)
+    still resolves instead of falling through to an absolute-only pointer.
+    Returns ``relative=None`` when ``workdir_abs`` does not live under
+    ``repo_root_abs`` (an out-of-tree workdir is still carried, just without a
+    portable relative pointer).
+    """
+    relative: Optional[str] = None
+    if repo_root_abs:
+        try:
+            rel = PurePosixPath(
+                unicodedata.normalize("NFC", workdir_abs)
+            ).relative_to(PurePosixPath(unicodedata.normalize("NFC", repo_root_abs)))
+        except ValueError:
+            relative = None
+        else:
+            relative = str(rel)
+    return ExecutionRoot(
+        workdir=workdir_abs, repo_root=repo_root_abs or None, relative=relative
+    )
+
+
 def _default_body_for_kind(kind: str, receiver: str) -> str:
     if kind == "implementation_request":
         return f"implementation request ready for {receiver}"
@@ -164,18 +264,29 @@ def build_notification_body(
     kind: str,
     summary: Optional[str],
     receiver: str,
+    execution_root: Optional["ExecutionRoot"] = None,
 ) -> str:
-    """Compose the pane text body that follows the landing marker."""
+    """Compose the pane text body that follows the landing marker.
+
+    When ``execution_root`` is supplied (Redmine #12098), a trailing clause
+    points the receiver at the target execution root / workdir so a nested
+    project root is recoverable without pane scrollback. The clause does not
+    replace the durable-anchor contract: the receiver still reads the anchor
+    from the source-of-truth system before acting.
+    """
     if kind not in KIND_LABELS:
         raise AnchorError(f"unknown handoff kind: {kind!r}; expected one of {sorted(KIND_LABELS)}")
     if kind == "custom" and not summary:
         raise AnchorError("--summary is required when --kind custom")
     intent = summary if summary else _default_body_for_kind(kind, receiver)
     pointer = anchor.human_pointer()
-    return (
+    body = (
         f"{intent}. {pointer} is the durable anchor; read it from the source-of-truth "
         "system before acting."
     )
+    if execution_root is not None:
+        body = f"{body} {execution_root.notification_clause()}"
+    return body
 
 
 Status = Literal["sent", "pending_input", "blocked"]
@@ -213,6 +324,9 @@ class DeliveryOutcome:
     next_action_owner: NextActionOwner
     next_action: str
     notification_marker: Optional[str]
+    # Redmine #12098: receiver target execution root / workdir, when it differs
+    # from the pane cwd / repo root. `None` for the common same-root case.
+    execution_root: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -651,6 +765,16 @@ def _anchor_pointer_or_dash(anchor_payload: Optional[dict[str, Any]]) -> str:
     return "—"
 
 
+def _execution_root_pointer_or_dash(execution_root: Optional[dict[str, Any]]) -> str:
+    if not execution_root:
+        return "—"
+    return ExecutionRoot(
+        workdir=execution_root.get("workdir") or "",
+        repo_root=execution_root.get("repo_root"),
+        relative=execution_root.get("relative"),
+    ).record_pointer()
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome", *, command: Optional[str] = None
 ) -> str:
@@ -678,6 +802,7 @@ def build_delivery_record(
         f"- Target pane: `{outcome.target or '—'}`",
         f"- Notification marker: `{outcome.notification_marker or '—'}`",
         f"- Durable anchor: {_anchor_pointer_or_dash(outcome.anchor)}",
+        f"- Target execution root: {_execution_root_pointer_or_dash(outcome.execution_root)}",
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -731,6 +856,7 @@ def make_outcome(
     kind: Optional[str],
     notification_marker: Optional[str],
     source: Optional[str] = None,
+    execution_root: Optional[ExecutionRoot] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -752,6 +878,7 @@ def make_outcome(
         next_action_owner=owner,
         next_action=action,
         notification_marker=notification_marker,
+        execution_root=execution_root.to_dict() if execution_root else None,
     )
 
 
@@ -760,6 +887,7 @@ __all__: Iterable[str] = (
     "AnchorError",
     "AsanaAnchor",
     "DeliveryOutcome",
+    "ExecutionRoot",
     "KIND_LABELS",
     "LastInputProjection",
     "MODES",
@@ -779,6 +907,7 @@ __all__: Iterable[str] = (
     "SOURCE_REDMINE",
     "AUTO_TARGET_REPO",
     "build_delivery_record",
+    "build_execution_root",
     "build_marker",
     "build_notification_body",
     "cross_session_gateway_hint",

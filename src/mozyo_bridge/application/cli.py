@@ -947,6 +947,23 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         parser_.add_argument(
+            "--workdir",
+            dest="workdir",
+            help=(
+                "Optional target execution root / workdir for the receiver "
+                "(Redmine #12098). Use when the work target is a nested project "
+                "below the pane cwd / workspace root (e.g. a cockpit workspace "
+                "whose pane cwd is the workspace anchor, not the nested "
+                "checkout). The resolved root is carried in the notification "
+                "body and durable delivery record — as a repo-root-relative "
+                "pointer when it lives under `--target-repo` (or the pane's "
+                "inferred repo root) — so the receiver recovers the execution "
+                "root from the durable record instead of pane scrollback. This "
+                "is record/wording only: it does not change pane selection or "
+                "relax any cross-session / cross-lane gate."
+            ),
+        )
+        parser_.add_argument(
             "--mode",
             choices=sorted(MODES),
             default=MODE_QUEUE_ENTER,

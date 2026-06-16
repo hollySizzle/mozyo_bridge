@@ -156,7 +156,8 @@ preflight では少なくとも次を確認する:
      を持たない場合は fail closed する。これにより、同一 `(workspace_id, lane_id)` だが
      別 repo checkout に居る複数 Claude pane でも sender 自身の local Claude を一意選択
      できる。pane 選択のみを解決し、nested project の実行 root 伝搬 (Redmine #12098)
-     は別問題として扱う。cross-session Claude direct / cross-lane Claude は緩めない。
+     は `## Execution root propagation` が扱う別レイヤである。cross-session Claude
+     direct / cross-lane Claude は緩めない。
 6. ambiguous / missing:
    - fail closed または explicit target を要求する。fail closed 時は具体的な候補
      (pane_id / workspace / lane)、絞り込めなかった理由、推奨 retry
@@ -182,6 +183,55 @@ Codex = sublane 自身に解決してしまう)。そこで pseudo-target `coord
 - identity source は live tmux の `@mozyo_*` pane option であり、pane title /
   iTerm UI を正本にしない。`coordinator` は explicit `%pane` override を置換せず、
   通常運用の導線として追加するだけ (override は常に残る)。
+
+## Execution root propagation (Redmine #12098)
+
+pane 選択 (Resolver priority) は「どの pane に送るか」を解決するが、「receiver が
+どの directory を作業 root にするか」までは決めない。両者は別レイヤである。
+
+cockpit workspace では pane cwd が workspace anchor root (例: 一段上の workspace
+root) になり、実際の作業対象がその配下の nested project (例:
+`.../rovoice/shinsei_llm`) のことがある。durable anchor が相対保存 path しか持た
+ないと、receiver は nested execution root を一意に復元できず、別 checkout を誤探索
+する。`%pane` scrollback を手で grep して訂正する運用は durable handoff の再現性を
+壊すため、標準導線にしない。
+
+そこで handoff は **target execution root / workdir** を明示 carrier として運べる。
+
+```text
+pane cwd / repo root   != target execution root (nested project)
+解決: pane 選択 (上記)   別レイヤ: execution root 伝搬 (本節)
+```
+
+- `mozyo-bridge handoff send --workdir <path>` で receiver の作業 root を明示する。
+  pane 選択や cross-session / cross-lane gate は変えない。record / wording 層のみ。
+- carrier は `repo-root-relative pointer` を第一に持つ。repo anchor は
+  `--target-repo` (指定時; `auto` は解決後の root) を優先し、無ければ target pane の
+  inferred repo root を使う。workdir が anchor 配下にあるとき relative pointer
+  (例: `rovoice/shinsei_llm`) を計算する。relative pointer は personal home prefix
+  を持たない portable 表現であり、pane notification と durable record の第一表記に
+  使う (`public-private-boundary.md`)。
+- absolute workdir は CLI runtime record / structured outcome (`execution_root`
+  block) が runtime fact として持つ。OSS docs / defaults には焼かず、抽象化する。
+- receiver 契約は不変: pane notification は pointer であり、receiver は durable
+  anchor を source-of-truth として読んでから着手する。execution root も「anchor で
+  確認する」pointer であって新しい権威ではない。
+- nested execution root の復元は pane scrollback / session / window name / 手 grep
+  に依存しない。durable record (`- Target execution root:` 行) と structured outcome
+  の `execution_root` から復元する。
+
+JSON structured outcome の `execution_root` 形:
+
+```json
+{
+  "workdir": "<abs runtime path>",
+  "repo_root": "<abs repo anchor or null>",
+  "relative": "rovoice/shinsei_llm"
+}
+```
+
+`--workdir` 未指定 (pane cwd == execution root の通常ケース) では carrier は
+`null` で、notification body / record は従来どおり execution-root 行を `—` にする。
 
 ## Projection policy
 

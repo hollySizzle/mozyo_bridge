@@ -42,6 +42,7 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMATS,
     SOURCES,
     build_delivery_record,
+    build_execution_root,
     build_marker,
     build_notification_body,
     is_explicit_pane_target,
@@ -3394,8 +3395,32 @@ def orchestrate_handoff(
             )
             raise
 
+    # Target execution root / workdir propagation (Redmine #12098). When the
+    # operator asserts a `--workdir`, carry it as an explicit execution root so
+    # the receiver can recover a nested project root (distinct from the pane cwd
+    # / cross-workspace repo root) from the durable record instead of grepping
+    # pane scrollback. The relative pointer is computed against the strongest
+    # available repo anchor: an explicit `--target-repo` (already resolved from
+    # `auto` above when used), else the target pane's inferred repo root. This
+    # is wording/record-layer only — it does not gate pane selection and does
+    # not relax any cross-session / cross-lane boundary.
+    execution_root = None
+    workdir_arg = getattr(args, "workdir", None)
+    if workdir_arg:
+        workdir_abs = str(Path(workdir_arg).expanduser().resolve())
+        repo_anchor = getattr(args, "target_repo", None)
+        if repo_anchor and repo_anchor != AUTO_TARGET_REPO:
+            repo_anchor_abs = str(Path(repo_anchor).expanduser().resolve())
+        else:
+            repo_anchor_abs = infer_repo_root(target_info.get("cwd") or "") or None
+        execution_root = build_execution_root(
+            workdir_abs, repo_root_abs=repo_anchor_abs
+        )
+
     try:
-        body = build_notification_body(anchor, kind, summary, receiver)
+        body = build_notification_body(
+            anchor, kind, summary, receiver, execution_root=execution_root
+        )
     except AnchorError as exc:
         _emit_outcome(
             make_outcome(
@@ -3408,6 +3433,7 @@ def orchestrate_handoff(
                 kind=kind,
                 notification_marker=None,
                 source=source,
+                execution_root=execution_root,
             ),
             record_format=record_format,
             command=record_command,
@@ -3434,6 +3460,7 @@ def orchestrate_handoff(
             mode=mode,
             kind=kind,
             notification_marker=marker,
+            execution_root=execution_root,
         )
         _emit_outcome(outcome, record_format=record_format, command=record_command)
         return 0
@@ -3453,6 +3480,7 @@ def orchestrate_handoff(
             mode=mode,
             kind=kind,
             notification_marker=marker,
+            execution_root=execution_root,
         )
         _emit_outcome(outcome, record_format=record_format, command=record_command)
         _emit_handoff_marker_timeout_guidance(receiver)
@@ -3482,6 +3510,7 @@ def orchestrate_handoff(
         mode=mode,
         kind=kind,
         notification_marker=marker,
+        execution_root=execution_root,
     )
     _emit_outcome(outcome, record_format=record_format, command=record_command)
     return 0
