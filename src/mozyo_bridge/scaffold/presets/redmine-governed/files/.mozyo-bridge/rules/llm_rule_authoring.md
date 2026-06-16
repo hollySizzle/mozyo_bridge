@@ -104,6 +104,46 @@ gate:
     - path不明
 ```
 
+## 条件駆動 guardrail 設計
+
+抽象的注意喚起 (`適宜` / `必要に応じて` / `太ったら`) だけの guardrail は agent 間で判断が揺れる。guardrail は観測可能な trigger と durable-record 出力を持つ条件駆動構造で書く。条件は agent の判断を奪う checklist ではなく、判断を durable record 化させる trigger である。
+
+```yaml
+三層モデル:
+  hard_gate:
+    意味: 原則 stop。分解 / owner 判断 / design decision なしに先へ進めない条件
+    出力: 停止 + 該当条件 + escalation 先を durable record に残す
+  soft_trigger:
+    意味: checkpoint journal を開き、分解か継続かを理由付きで判断する条件
+    出力: checkpoint journal (該当trigger / 判断 / 理由 / 次アクション)
+  judgment_override:
+    意味: 条件に該当しても単一issue継続で進めてよいが、理由を残す条件
+    出力: override理由を replayable に durable record へ記録
+共通必須:
+  - 観測可能な trigger (主観語だけで条件を定義しない)
+  - durable-record 出力 (journal / gate)
+禁止:
+  - trigger も出力もない「適宜」「必要に応じて」「太ったら」だけの委譲
+  - 判断記録を伴わない機械的強制だけの条件
+```
+
+### 例: Scope Decomposition Checkpoint
+
+```yaml
+分類: soft_trigger
+trigger: 1 issue が次の複数を併せ持つ
+  - product direction / 設計判断
+  - implementation
+  - diagnostics / 調査
+  - tests
+  - docs
+  - 独立した複数の受け入れ条件
+checkpoint: 実装継続前に checkpoint journal を開く
+判断: 親US + 子issueへ分解 / 単一issue継続 を理由付きで選ぶ
+override: 単一issue継続なら override理由を残す (judgment_override)
+記録先: 対象issueのRedmine journal
+```
+
 ## 正本分離
 
 ```yaml
