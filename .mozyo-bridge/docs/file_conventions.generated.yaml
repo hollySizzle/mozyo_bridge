@@ -138,6 +138,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: session boundary detection, next-session prompt, and pane lifecycle source
+  patterns:
+  - src/mozyo_bridge/domain/session_boundary.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/session-boundary.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/logics/cockpit-sublane-operating-model.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: scaffold implementation and packaged presets
   patterns:
   - src/mozyo_bridge/scaffold/**

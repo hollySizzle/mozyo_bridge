@@ -50,8 +50,10 @@ from mozyo_bridge.application.commands import (
     cmd_otel_launchd,
     cmd_otel_serve,
     cmd_otel_status,
+    cmd_session_boundary_prompt,
     cmd_session_list,
     cmd_session_name,
+    cmd_session_pane_decision,
     cmd_session_vscode_settings,
     cmd_workspace_defaults,
     cmd_workspace_inspect,
@@ -87,6 +89,7 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMATS,
     SOURCES,
 )
+from mozyo_bridge.domain.session_boundary import SESSION_BOUNDARY_SIGNALS
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
 
 
@@ -1902,6 +1905,148 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply the change to `<repo>/.vscode/settings.json` (default: dry-run print only).",
     )
     session_vscode.set_defaults(func=cmd_session_vscode_settings)
+
+    session_boundary = session_sub.add_parser(
+        "boundary-prompt",
+        help=(
+            "Emit the compact next-session boundary prompt (Redmine #12122) so "
+            "the next Codex session resumes from the durable Redmine journal "
+            "plus repo / execution root, not pane scrollback or window/session "
+            "naming. The repo is referenced by its portable canonical session "
+            "name; absolute paths appear only under --json. Read-only towards "
+            "tmux, git, and Redmine."
+        ),
+    )
+    add_repo_option(session_boundary)
+    session_boundary.add_argument(
+        "--issue", required=True, help="Active Redmine issue id (durable anchor)."
+    )
+    session_boundary.add_argument(
+        "--journal",
+        required=True,
+        help="Latest Redmine journal id on the issue (the anchor to read first).",
+    )
+    session_boundary.add_argument(
+        "--parent", help="Parent UserStory issue id, when the active issue is a child Task."
+    )
+    session_boundary.add_argument(
+        "--commit", help="Latest relevant commit hash, when one exists."
+    )
+    session_boundary.add_argument(
+        "--target-lane",
+        dest="target_lane",
+        help="Target lane / branch label (e.g. the sublane worktree branch).",
+    )
+    session_boundary.add_argument(
+        "--execution-root",
+        dest="execution_root",
+        help=(
+            "Absolute target execution root / workdir when it differs from the "
+            "repo root (Redmine #12098). Rendered as a portable repo-relative "
+            "pointer in the prompt; the absolute form stays in --json only."
+        ),
+    )
+    session_boundary.add_argument(
+        "--gate", help="Current gate state (e.g. implementation_done, review_request)."
+    )
+    session_boundary.add_argument(
+        "--verification", help="Verification state summary (e.g. tests green / pending)."
+    )
+    session_boundary.add_argument(
+        "--residual",
+        action="append",
+        help="A residual risk line (repeatable).",
+    )
+    session_boundary.add_argument(
+        "--pending-action",
+        dest="pending_action",
+        help="The next pending action to carry into the next session.",
+    )
+    session_boundary.add_argument(
+        "--next-actor",
+        dest="next_actor",
+        choices=["owner", "claude", "codex"],
+        help="Who owns the next action.",
+    )
+    session_boundary.add_argument(
+        "--signal",
+        action="append",
+        choices=list(SESSION_BOUNDARY_SIGNALS),
+        help="A boundary candidate signal that fired (repeatable).",
+    )
+    session_boundary.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help=(
+            "Emit structured JSON (prompt fields + prompt_markdown + absolute "
+            "repo_root) instead of the pasteable markdown prompt."
+        ),
+    )
+    session_boundary.set_defaults(func=cmd_session_boundary_prompt)
+
+    session_pane = session_sub.add_parser(
+        "pane-decision",
+        help=(
+            "Decide the guarded Claude-pane lifecycle action (Redmine #12122): "
+            "reuse / new / orphan / guarded_kill / blocked. Default leans to a "
+            "new pane; kill/discard is blocked while unfinished durable state "
+            "is present or no owner kill approval is recorded. Exits 3 when "
+            "blocked so a kill cannot silently proceed. Read-only."
+        ),
+    )
+    session_pane.add_argument(
+        "--requested",
+        choices=["reuse", "new", "orphan", "kill", "discard"],
+        default="new",
+        help="The pane action under consideration (default: new).",
+    )
+    session_pane.add_argument(
+        "--same-lane",
+        dest="same_lane",
+        action="store_true",
+        help="The existing pane belongs to the same issue / lane / worktree.",
+    )
+    session_pane.add_argument(
+        "--dirty-diff",
+        dest="dirty_diff",
+        action="store_true",
+        help="The pane has uncommitted changes (preservation signal).",
+    )
+    session_pane.add_argument(
+        "--running-process",
+        dest="running_process",
+        action="store_true",
+        help="The pane has a running process (preservation signal).",
+    )
+    session_pane.add_argument(
+        "--pending-approval",
+        dest="pending_approval",
+        action="store_true",
+        help="The pane is waiting on a pending approval (preservation signal).",
+    )
+    session_pane.add_argument(
+        "--unrecorded-journal",
+        dest="unrecorded_journal",
+        action="store_true",
+        help="The pane has work not yet recorded to a durable journal (preservation signal).",
+    )
+    session_pane.add_argument(
+        "--owner-approved-kill",
+        dest="owner_approved_kill",
+        action="store_true",
+        help=(
+            "An owner kill/close approval has been recorded through the Codex "
+            "window. Required (with a clean pane) before guarded_kill."
+        ),
+    )
+    session_pane.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON (decision, blockers, rationale).",
+    )
+    session_pane.set_defaults(func=cmd_session_pane_decision)
 
     workspace = sub.add_parser(
         "workspace",

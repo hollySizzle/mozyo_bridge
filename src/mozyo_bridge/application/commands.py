@@ -4772,6 +4772,119 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_session_boundary_prompt(args: argparse.Namespace) -> int:
+    """Emit the compact next-session boundary prompt (Redmine #12122).
+
+    Renders a pasteable prompt a Codex session hands the operator / next Codex
+    session so the next session re-anchors from the durable Redmine journal plus
+    repo / execution root, not from pane scrollback or window/session naming.
+    The repo is referenced by its **portable** canonical session name (resolved
+    from ``--repo``); the absolute repo root and execution-root workdir appear
+    only in ``--json`` so a pasted prompt never carries a private absolute path
+    (``vibes/docs/rules/public-private-boundary.md``). Pure / read-only towards
+    tmux, git, and Redmine.
+    """
+    from mozyo_bridge.domain.session_boundary import (
+        BoundaryPrompt,
+        SessionBoundaryError,
+        build_boundary_prompt,
+        classify_boundary,
+    )
+
+    repo_root = repo_root_from_args(args)
+    session = resolve_canonical_session(repo_root)
+
+    execution_root = None
+    exec_root_arg = getattr(args, "execution_root", None)
+    if exec_root_arg:
+        workdir_abs = str(Path(exec_root_arg).expanduser().resolve())
+        execution_root = build_execution_root(
+            workdir_abs, repo_root_abs=str(repo_root)
+        )
+
+    signals = tuple(getattr(args, "signal", None) or ())
+    try:
+        if signals:
+            # Validate the signal vocabulary up front so a typo fails loudly
+            # instead of being pasted into a next-session prompt.
+            classify_boundary(signals)
+        prompt = BoundaryPrompt(
+            issue=str(args.issue),
+            journal=str(args.journal),
+            repo_pointer=session.name,
+            parent_issue=getattr(args, "parent", None),
+            commit=getattr(args, "commit", None),
+            target_lane=getattr(args, "target_lane", None),
+            execution_root=execution_root,
+            gate_state=getattr(args, "gate", None),
+            verification_state=getattr(args, "verification", None),
+            residual_risks=tuple(getattr(args, "residual", None) or ()),
+            pending_action=getattr(args, "pending_action", None),
+            next_actor=getattr(args, "next_actor", None),
+            signals=signals,
+        )
+    except SessionBoundaryError as exc:
+        die(str(exc))
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = prompt.to_dict()
+        # The structured outcome is allowed to carry runtime absolutes (the
+        # execution_root.workdir already does); add the repo root here so an
+        # automation consumer can resolve the checkout. Pasteable text never
+        # gets these.
+        payload["repo_root"] = str(repo_root)
+        payload["prompt_markdown"] = build_boundary_prompt(prompt)
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print(build_boundary_prompt(prompt))
+    return 0
+
+
+def cmd_session_pane_decision(args: argparse.Namespace) -> int:
+    """Decide the guarded Claude-pane lifecycle action (Redmine #12122).
+
+    Encodes the parent US (#12113) acceptance criteria: default lean to a new
+    pane, reuse only same-lane, orphan is non-destructive, and kill/discard is
+    blocked whenever unfinished durable state is present (dirty diff, running
+    process, pending approval, unrecorded journal) or no owner kill approval has
+    been recorded. Exits non-zero (3) when the decision is ``blocked`` so an
+    operator's ``&&`` chain cannot silently proceed to a kill. Pure / read-only.
+    """
+    from mozyo_bridge.domain.session_boundary import (
+        PaneLifecycleState,
+        SessionBoundaryError,
+        decide_pane_lifecycle,
+    )
+
+    state = PaneLifecycleState(
+        requested=getattr(args, "requested", None) or "new",
+        same_lane=getattr(args, "same_lane", False),
+        dirty_diff=getattr(args, "dirty_diff", False),
+        running_process=getattr(args, "running_process", False),
+        pending_approval=getattr(args, "pending_approval", False),
+        unrecorded_journal=getattr(args, "unrecorded_journal", False),
+        owner_approved_kill=getattr(args, "owner_approved_kill", False),
+    )
+    try:
+        decision = decide_pane_lifecycle(state)
+    except SessionBoundaryError as exc:
+        die(str(exc))
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        print(_json.dumps(decision.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(f"decision: {decision.decision}")
+        if decision.blockers:
+            print("blockers: " + ", ".join(decision.blockers))
+        print(f"rationale: {decision.rationale}")
+    return 3 if decision.is_blocked else 0
+
+
 def cmd_workspace_register(args: argparse.Namespace) -> int:
     """Register (or refresh) this workspace in the home registry (#11429).
 

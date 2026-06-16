@@ -349,6 +349,23 @@ documents:
       - logic-otel-event-store
       - spec-project-map
 
+  - id: logic-session-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/session-boundary.md
+    purpose: "Codex / Claude / pane / compact 境界の判定 (scope / pressure / preservation signal)、next-session boundary prompt の内容仕様、Claude pane lifecycle (reuse / new / orphan / guarded kill) の運用正本。durable Redmine journal + repo / execution root から replay でき、kill は owner-approval gate に保つ。"
+    audit_role: session_boundary_logic
+    related_document_refs:
+      - logic-cockpit-sublane-operating-model
+      - logic-unit-target-model
+      - logic-managed-state-model
+      - logic-session-inventory
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - rule-llm-rule-authoring
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-cockpit-sublane-operating-model
     type: logic
     status: active
@@ -824,6 +841,17 @@ file_conventions:
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state
       - skill-safety-reference
+
+  - id: fc-session-boundary-source
+    name: session boundary detection, next-session prompt, and pane lifecycle source
+    patterns:
+      - src/mozyo_bridge/domain/session_boundary.py
+    severity: block
+    document_refs:
+      - logic-session-boundary
+      - rule-public-private-boundary
+      - logic-cockpit-sublane-operating-model
+      - spec-project-map
 
   - id: fc-scaffold-source
     name: scaffold implementation and packaged presets
