@@ -363,6 +363,7 @@ documents:
       - logic-session-inventory
       - logic-tmux-send-safety-contract
       - logic-worktree-lifecycle-boundary
+      - logic-sublane-bandwidth-policy
       - skill-workflow-reference
 
   - id: logic-cockpit-attention-state
@@ -454,7 +455,22 @@ documents:
       - logic-cockpit-sublane-operating-model
       - logic-scaffold-distribution-minimization
       - logic-sublane-worktree-operating-runbook
+      - logic-sublane-bandwidth-policy
       - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-sublane-bandwidth-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/sublane-bandwidth-policy.md
+    purpose: sublane を増やす前の coordinator bandwidth / admission / drain order / routine retirement cadence と mozyo_bridge dogfood soft profile を定義する repo-local policy。
+    audit_role: sublane_bandwidth_policy_logic
+    related_document_refs:
+      - logic-cockpit-sublane-operating-model
+      - logic-sublane-worktree-operating-runbook
+      - logic-worktree-lifecycle-boundary
+      - rule-public-private-boundary
+      - skill-workflow-reference
       - spec-project-map
 
   - id: logic-sublane-worktree-operating-runbook
@@ -466,6 +482,7 @@ documents:
     related_document_refs:
       - logic-cockpit-sublane-operating-model
       - logic-worktree-lifecycle-boundary
+      - logic-sublane-bandwidth-policy
       - logic-workspace-registry
       - skill-workflow-reference
       - rule-public-private-boundary
