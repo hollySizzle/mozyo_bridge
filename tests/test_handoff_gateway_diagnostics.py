@@ -362,5 +362,104 @@ class AutoTargetRepoTest(unittest.TestCase):
         self.assertIn("cross-session handoff to Claude is not allowed", err)
 
 
+class InactiveQueueEnterPaneFallbackTest(unittest.TestCase):
+    """Redmine #12071: an inactive queue-enter pane surfaces the `--mode standard`
+    fallback so the operator does not have to know the active-split constraint is
+    queue-enter-only. queue-enter stays the default rail — `--mode standard` reads
+    as a fallback, never a requirement (`tmux-send-safety-contract.md`).
+    """
+
+    def _git_repo(self) -> str:
+        ctx = tempfile.TemporaryDirectory()
+        tmp = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        repo = (Path(tmp) / "ws").resolve()
+        (repo / ".git").mkdir(parents=True)
+        return str(repo)
+
+    def _run(self, *, target, cwd, target_repo, pane_active="0"):
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.application.cli import build_parser
+
+        pane = {
+            "id": "%884",
+            "location": "mysess:1.0",
+            "command": "codex",
+            "cwd": cwd,
+            "window_name": "codex",
+            "pane_active": pane_active,
+        }
+        argv = [
+            "handoff", "send", "--to", "codex",
+            "--source", "redmine", "--issue", "12071", "--journal", "59628",
+            "--kind", "review_request",
+            "--landing-timeout", "0.01", "--submit-delay", "0",
+        ]
+        if target is not None:
+            argv += ["--target", target]
+        if target_repo is not None:
+            argv += ["--target-repo", target_repo]
+        args = build_parser().parse_args(argv)
+
+        def fake_run_tmux(*a, check: bool = True):
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(commands, "require_tmux"), \
+            patch.object(commands, "capture_pane", return_value=""), \
+            patch.object(commands, "run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch.object(commands, "current_session_name", return_value="mysess"), \
+            patch.object(commands, "pane_info", return_value=pane), \
+            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            contextlib.redirect_stdout(io.StringIO()) as out, \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                args.func(args)
+            except SystemExit:
+                pass
+        outcome = None
+        for line in out.getvalue().splitlines():
+            if line.strip().startswith("{"):
+                try:
+                    outcome = json.loads(line)
+                except ValueError:
+                    pass
+        return outcome, err.getvalue()
+
+    def test_inactive_pane_with_repo_identity_names_standard_fallback(self) -> None:
+        # Explicit pane + `--target-repo auto` (resolves to a concrete root): the
+        # safest retry is the strict `--mode standard` rail, which does not need
+        # the active split. The active-split constraint is still explained.
+        outcome, err = self._run(
+            target="%884", cwd=self._git_repo(), target_repo="auto"
+        )
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("active split of its window", err)
+        self.assertIn("pane_active=", err)
+        self.assertIn("--mode standard", err)
+        self.assertIn("fallback", err)
+
+    def test_inactive_pane_without_repo_identity_hints_pin_and_standard(self) -> None:
+        # No `--target-repo`: the fallback hint guides the operator to pin the
+        # pane and re-check identity (`--target %pane --target-repo auto`) and
+        # retry under `--mode standard`, still framed as a fallback.
+        outcome, err = self._run(
+            target="%884", cwd=self._git_repo(), target_repo=None
+        )
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("active split of its window", err)
+        self.assertIn("--target %pane --target-repo auto", err)
+        self.assertIn("--mode standard", err)
+        self.assertIn("fallback", err)
+
+    def test_active_pane_is_not_blocked_by_the_active_split_gate(self) -> None:
+        # Control: the same explicit pane, active, is not rejected by Step 11 —
+        # the fallback hint only fires on the inactive-pane block.
+        outcome, _err = self._run(
+            target="%884", cwd=self._git_repo(), target_repo="auto", pane_active="1"
+        )
+        self.assertEqual("sent", outcome["status"])
+
+
 if __name__ == "__main__":
     unittest.main()

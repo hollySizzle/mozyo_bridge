@@ -478,6 +478,49 @@ class FindAgentWindowLocalClaudeTest(unittest.TestCase):
         self.assertIn("%904", message)
         self.assertIn("--target %pane", message)
 
+    def test_ambiguity_message_surfaces_candidate_diagnostics(self) -> None:
+        # Redmine #12071: the fail-closed candidate rows carry the identity an
+        # operator needs to pick by hand — role source, workspace, lane, repo
+        # root, cwd, active state — and the retry hint prefers the explicit pane
+        # plus the auto repo-identity gate.
+        sender, local_claude = self._sender_and_panes()
+        sibling_claude = _pane(
+            "%904",
+            "mozyo-cockpit:0.4",
+            agent_role="claude",
+            workspace_id="ws-it-donyu",
+            lane_id="lane-main",
+            cwd="/ws/it-donyu/api",
+            pane_active="0",
+        )
+        roots = {
+            "/ws/it-donyu": "/ws/it-donyu",
+            "/ws/it-donyu/app": "/ws/it-donyu",
+            "/ws/it-donyu/api": "/ws/it-donyu",
+        }
+        panes = [sender, local_claude, sibling_claude]
+        err = io.StringIO()
+        with _runtime(panes, sender_pane_id="%900"), patch(
+            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            _fake_infer_repo_root(roots),
+        ):
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit):
+                    find_agent_window("claude", "mozyo-cockpit")
+        message = err.getvalue()
+        # Per-candidate diagnostics.
+        self.assertIn("role_source=pane_option", message)
+        self.assertIn("workspace=ws-it-donyu", message)
+        self.assertIn("lane=lane-main", message)
+        self.assertIn("repo_root=/ws/it-donyu", message)
+        self.assertIn("cwd=/ws/it-donyu/app", message)
+        self.assertIn("cwd=/ws/it-donyu/api", message)
+        # Both the active and the inactive split are labelled.
+        self.assertIn(", active)", message)
+        self.assertIn(", inactive)", message)
+        # Retry hint prefers the explicit pane + auto repo-identity gate.
+        self.assertIn("--target %pane --target-repo auto", message)
+
     def test_sender_without_workspace_identity_fails_closed(self) -> None:
         plain_sender = _pane("%50", "mozyo-cockpit:0.50", agent_role="codex")
         _sender, local_claude = self._sender_and_panes()

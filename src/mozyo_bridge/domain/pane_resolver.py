@@ -244,13 +244,33 @@ def narrow_to_local_claude(
 
 
 def _format_agent_candidate(pane: dict[str, str]) -> str:
-    """One ``%pane (workspace=..., lane=...)`` row for the fail-closed message."""
+    """One diagnostics row for the fail-closed candidate list (Redmine #12071).
+
+    Surfaces the identity an operator needs to pick the right pane by hand
+    without re-running ``mozyo-bridge agents targets``: the pane id, the resolved
+    role source (which signal decided the role — ``pane_option`` / ``window_name``
+    / ``inferred``), the ``(workspace, lane)`` identity, the inferred repo root,
+    the cwd, and whether the pane is the active split of its window. These are
+    exactly the fields that disambiguate several same-session Claude panes and the
+    ones a Redmine fail-closed journal needs transcribed. Identity comes from the
+    live tmux ``@mozyo_*`` pane options and cwd in the snapshot, never a pane
+    title.
+    """
     workspace_id, lane_id = _pane_lane_identity(pane)
     lane_label = (pane.get("lane_label") or "").strip()
     pane_id = pane.get("id") or pane.get("location") or "?"
+    cwd = (pane.get("cwd") or "").strip()
+    repo_root = infer_repo_root(cwd) if cwd else None
+    role_source = resolve_agent_role(
+        pane_option_role=pane.get("agent_role"),
+        window_name=pane.get("window_name"),
+        process=pane.get("command"),
+    ).role_source
+    active = "active" if pane.get("pane_active") == "1" else "inactive"
     return (
         f"{pane_id} (workspace={workspace_id or '<none>'}, "
-        f"lane={lane_label or lane_id})"
+        f"lane={lane_label or lane_id}, role_source={role_source}, "
+        f"repo_root={repo_root or '<none>'}, cwd={cwd or '<none>'}, {active})"
     )
 
 
@@ -292,7 +312,10 @@ def _ambiguous_agent_targets_message(
             )
     return (
         f"multiple '{agent}' panes found in session '{session}': {candidates}. "
-        f"{sender_clause}. Name the exact pane with `--target %pane` "
+        f"{sender_clause}. Name the exact pane with "
+        "`--target %pane --target-repo auto` — the explicit pane plus the auto "
+        "repo-identity gate is the safest retry, since it pins the receiver by "
+        "pane id and re-checks the workspace/repo root from that pane's own cwd "
         "(see `mozyo-bridge agents targets` for the candidate identities)."
     )
 

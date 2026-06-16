@@ -3306,11 +3306,36 @@ def orchestrate_handoff(
             record_format=record_format,
             command=record_command,
         )
+        # `--mode standard` fallback discoverability (Redmine #12071): the active
+        # split is a queue-enter-only requirement (Step 11) — strict `standard`
+        # relies on landing-marker observation rather than the pane being the
+        # foreground split, so it can deliver to an inactive same-identity pane.
+        # When the operator already named an explicit `%pane` *and* a
+        # `--target-repo` identity gate (a concrete root, or one resolved from
+        # `--target-repo auto` above), that fallback is the safest retry: the
+        # receiver is pinned by id and the workspace/repo root is re-checked. We
+        # present it as a fallback, never as a requirement — queue-enter stays the
+        # default rail (`tmux-send-safety-contract.md`).
+        explicit_pane = is_explicit_pane_target(getattr(args, "target", None))
+        has_repo_identity = bool(getattr(args, "target_repo", None))
+        if explicit_pane and has_repo_identity:
+            fallback_hint = (
+                " Because you named an explicit `%pane` with a `--target-repo` "
+                "identity gate, the safest retry is `--mode standard` (fallback): "
+                "it does not require the receiver pane to be the active split, so "
+                "it can deliver to this inactive same-identity pane."
+            )
+        else:
+            fallback_hint = (
+                " As a fallback you can pin the pane and re-check identity with "
+                "`--target %pane --target-repo auto` and retry under "
+                "`--mode standard`, which does not require the active split."
+            )
         die(
             "--mode queue-enter requires the target pane to be the active "
             f"split of its window; pane {target} has pane_active="
             f"{observed_active!r}. Activate the receiver pane in tmux, or "
-            "drop --target to use window-name resolution."
+            "drop --target to use window-name resolution." + fallback_hint
         )
         raise AssertionError("unreachable")
 
