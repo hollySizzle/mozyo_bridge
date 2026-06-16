@@ -11343,14 +11343,22 @@ class ExecutionRootPropagationTest(unittest.TestCase):
         self.assertEqual("rovoice/shinsei_llm", er.relative)
         self.assertTrue(er.is_nested)
 
-    def test_build_execution_root_out_of_tree_keeps_workdir_without_relative(self) -> None:
+    def test_build_execution_root_out_of_tree_omits_absolute_from_pasteable(self) -> None:
+        # An out-of-tree workdir has no repo-relative form. The absolute path
+        # must NOT surface in the pane body or the pasteable record (Redmine
+        # #12098 review j#59662); it stays only in the structured outcome.
         er = build_execution_root(
             "/workspace/other/checkout", repo_root_abs="/workspace/project-alpha"
         )
 
         self.assertIsNone(er.relative)
         self.assertFalse(er.is_nested)
-        self.assertEqual("`/workspace/other/checkout`", er.portable_pointer())
+        self.assertIsNone(er.portable_pointer())
+        self.assertNotIn("/workspace/other/checkout", er.record_pointer())
+        self.assertNotIn("/workspace/other/checkout", er.notification_clause())
+        self.assertIn("execution_root.workdir", er.record_pointer())
+        # The absolute is still retained as a structured runtime fact.
+        self.assertEqual("/workspace/other/checkout", er.workdir)
 
     def test_build_execution_root_equal_to_repo_root_is_not_nested(self) -> None:
         er = build_execution_root(
@@ -11360,12 +11368,17 @@ class ExecutionRootPropagationTest(unittest.TestCase):
         self.assertEqual(".", er.relative)
         self.assertFalse(er.is_nested)
 
-    def test_build_execution_root_without_anchor_carries_absolute_only(self) -> None:
+    def test_build_execution_root_without_anchor_omits_absolute_from_pasteable(self) -> None:
         er = build_execution_root("/workspace/project-alpha/services/api")
 
         self.assertIsNone(er.repo_root)
         self.assertIsNone(er.relative)
-        self.assertEqual("`/workspace/project-alpha/services/api`", er.portable_pointer())
+        # No anchor → no portable form → absolute is kept out of pasteable text.
+        self.assertIsNone(er.portable_pointer())
+        self.assertNotIn(
+            "/workspace/project-alpha/services/api", er.record_pointer()
+        )
+        self.assertEqual("/workspace/project-alpha/services/api", er.workdir)
 
     def test_notification_body_appends_execution_root_clause(self) -> None:
         anchor = normalize_anchor("redmine", issue="12098", journal="59652")
@@ -11444,7 +11457,10 @@ class ExecutionRootPropagationTest(unittest.TestCase):
         self.assertIsNone(outcome.execution_root)
         self.assertIsNone(json.loads(outcome.to_json())["execution_root"])
 
-    def test_delivery_record_shows_relative_and_absolute_execution_root(self) -> None:
+    def test_delivery_record_shows_relative_pointer_without_absolute(self) -> None:
+        # Pasteable record carries the portable repo-relative pointer only;
+        # the absolute workdir must never land in a Redmine-pastable record
+        # (Redmine #12098 review j#59662; public-private-boundary.md).
         anchor = normalize_anchor("redmine", issue="12098", journal="59652")
         er = build_execution_root(
             "/workspace/project-alpha/services/api",
@@ -11465,9 +11481,16 @@ class ExecutionRootPropagationTest(unittest.TestCase):
         record = build_delivery_record(outcome)
 
         self.assertIn(
-            "- Target execution root: `services/api` (relative to the target "
-            "repo root; abs `/workspace/project-alpha/services/api`)",
+            "- Target execution root: `services/api` (relative to the target repo root)",
             record,
+        )
+        # No absolute path leaks into the pasteable markdown record ...
+        self.assertNotIn("/workspace/project-alpha", record)
+        self.assertNotIn("abs ", record)
+        # ... while the structured outcome still retains it for tooling/replay.
+        self.assertEqual(
+            "/workspace/project-alpha/services/api",
+            json.loads(outcome.to_json())["execution_root"]["workdir"],
         )
 
     def test_delivery_record_execution_root_dash_when_absent(self) -> None:
@@ -11807,21 +11830,27 @@ class HandoffRecordEmissionTest(unittest.TestCase):
             )
 
         self.assertEqual(0, result)
-        # Durable record carries the portable relative pointer plus the abs root.
+        # Durable record carries the portable relative pointer only — the
+        # absolute nested path must not leak into a Redmine-pastable record
+        # (Redmine #12098 review j#59662).
         self.assertIn(
-            "- Target execution root: `services/api` (relative to the target "
-            f"repo root; abs `{nested}`)",
+            "- Target execution root: `services/api` (relative to the target repo root)",
             stdout,
         )
+        self.assertNotIn(str(nested), stdout.split("{", 1)[0])
         # The typed pane body carries the portable pointer and keeps the
-        # confirm-from-anchor contract.
+        # confirm-from-anchor contract, without the absolute path.
         typed = "".join(call[-1] for call in sent if call[:4] == ("send-keys", "-t", "%2", "-l"))
         self.assertIn("Target execution root: `services/api`", typed)
         self.assertIn("confirm it from the durable anchor", typed)
-        # Structured outcome carries the execution_root block for replay.
+        self.assertNotIn(str(nested), typed)
+        # Structured outcome retains both the relative pointer and the absolute
+        # workdir for tooling/replay (the runtime fact, separate from the
+        # pasteable markdown).
         json_lines = [line for line in stdout.splitlines() if line.strip().startswith("{")]
         outcome = json.loads(json_lines[-1])
         self.assertEqual("services/api", outcome["execution_root"]["relative"])
+        self.assertEqual(str(nested), outcome["execution_root"]["workdir"])
 
     def test_standard_mode_emits_record_then_json_outcome_by_default(self) -> None:
         # Pinned to `--mode standard` so the record/JSON ordering is verified

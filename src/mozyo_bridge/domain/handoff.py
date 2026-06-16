@@ -189,28 +189,63 @@ class ExecutionRoot:
         """
         return bool(self.relative) and self.relative != "."
 
-    def portable_pointer(self) -> str:
-        """Relative-first pointer with no private home prefix when possible."""
-        if self.is_nested:
-            return f"`{self.relative}` (relative to the target repo root)"
-        return f"`{self.workdir}`"
+    def portable_pointer(self) -> Optional[str]:
+        """Repo-relative pointer with no private home prefix, or ``None``.
+
+        Returns ``None`` when no repo-relative form exists (the execution root
+        is out-of-tree, or no repo anchor was known): the only remaining value
+        would be the absolute ``workdir``, which must NOT leak into pane text or
+        a pasteable Asana/Redmine record (Redmine #12098 review j#59662;
+        ``vibes/docs/rules/public-private-boundary.md``). Callers fall back to a
+        redaction phrase that points at the structured outcome's
+        ``execution_root.workdir`` instead. The repo-root-itself case
+        (``relative == "."``) is still portable and is rendered as such.
+        """
+        if self.relative is None:
+            return None
+        if self.relative == ".":
+            return "`.` (the target repo root)"
+        return f"`{self.relative}` (relative to the target repo root)"
+
+    # Redaction phrase used wherever a portable pointer is unavailable: the
+    # absolute path stays only in the structured runtime outcome, never in
+    # pasteable text. Kept as one constant so the record and the notification
+    # body redact identically.
+    _OMITTED_ABS = (
+        "outside the target repo — see `execution_root.workdir` in the "
+        "structured delivery outcome (absolute path omitted to keep private "
+        "paths out of pasteable records)"
+    )
 
     def record_pointer(self) -> str:
-        """Pointer for the durable record: portable form plus the runtime abs."""
-        if self.is_nested:
-            return f"`{self.relative}` (relative to the target repo root; abs `{self.workdir}`)"
-        return f"`{self.workdir}`"
+        """Pointer for the durable, pasteable delivery record.
+
+        Repo-relative (portable) form only — never the absolute ``workdir`` —
+        so a record pasted into a Redmine journal carries no personal home /
+        private project path.
+        """
+        pointer = self.portable_pointer()
+        return pointer if pointer is not None else self._OMITTED_ABS
 
     def notification_clause(self) -> str:
         """Sentence appended to the pane notification body.
 
         Keeps the receiver contract intact: the execution root is a pointer the
         receiver still confirms from the durable anchor, not a new authority.
+        Uses the portable (repo-relative) pointer; when none exists the absolute
+        path is omitted (it remains in the structured outcome) rather than
+        printed into pane text.
         """
+        pointer = self.portable_pointer()
+        if pointer is None:
+            return (
+                f"Target execution root: {self._OMITTED_ABS}. Confirm it from "
+                "the durable anchor before operating, not from the pane location."
+            )
         return (
-            f"Target execution root: {self.portable_pointer()} — distinct from "
-            "the pane cwd / workspace root; confirm it from the durable anchor "
-            "before operating, not from the pane location."
+            f"Target execution root: {pointer} — distinct from the pane cwd / "
+            "workspace root; confirm it from the durable anchor before "
+            "operating, not from the pane location."
         )
 
 

@@ -209,10 +209,17 @@ pane cwd / repo root   != target execution root (nested project)
   `--target-repo` (指定時; `auto` は解決後の root) を優先し、無ければ target pane の
   inferred repo root を使う。workdir が anchor 配下にあるとき relative pointer
   (例: `rovoice/shinsei_llm`) を計算する。relative pointer は personal home prefix
-  を持たない portable 表現であり、pane notification と durable record の第一表記に
-  使う (`public-private-boundary.md`)。
-- absolute workdir は CLI runtime record / structured outcome (`execution_root`
-  block) が runtime fact として持つ。OSS docs / defaults には焼かず、抽象化する。
+  を持たない portable 表現であり、pane notification と durable delivery record の
+  唯一の表記に使う (`public-private-boundary.md`)。
+- **absolute workdir は structured delivery outcome (`execution_root.workdir`) に
+  だけ runtime fact として残す**。Redmine / Asana に貼る pasteable markdown delivery
+  record と pane notification body には absolute path を出さない。Redmine journal や
+  tracked file に personal home / private project absolute path を入れない境界
+  (`public-private-boundary.md` Public Record Constraints) を満たすため。
+- workdir が anchor 配下に無い (out-of-tree) / anchor 不明で relative pointer を
+  計算できないときは、pasteable record / notification body は absolute を出さず、
+  `execution_root.workdir` (structured outcome) を見るよう redaction 表記に倒す。
+  OSS docs / defaults / tests には abstract placeholder のみ使う。
 - receiver 契約は不変: pane notification は pointer であり、receiver は durable
   anchor を source-of-truth として読んでから着手する。execution root も「anchor で
   確認する」pointer であって新しい権威ではない。
