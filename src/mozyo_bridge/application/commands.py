@@ -1574,6 +1574,67 @@ def _read_cockpit_columns(session: str):
     return columns
 
 
+def _read_cockpit_geometry(session: str):
+    """Read every cockpit-window pane with full 2D geometry + identity (#12131).
+
+    Unlike :func:`_read_cockpit_columns` (which serves append/reset and only needs
+    the x-axis), the read-only ``doctor-geometry`` diagnostic needs the whole
+    rectangle and must also see panes that carry NO ``@mozyo_*`` markers — a
+    manually-created / half-bound pane (the #12130 ``%1106`` case) is exactly what
+    the role-less detection reports. So this lists every pane in the cockpit window
+    and reads ``pane_left`` / ``pane_top`` / ``pane_width`` / ``pane_height`` plus
+    the identity options. Returns one ``{pane_id, workspace_id, role, lane_id,
+    pane_left, pane_top, pane_width, pane_height}`` per pane, or ``None`` when the
+    cockpit window does not exist.
+
+    Read-only and tolerant: a missing tmux binary / server, or a missing cockpit
+    window, degrade to ``None`` (no cockpit) rather than raising, so the diagnostic
+    never mutates and never aborts.
+    """
+    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    def _as_int(value: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        result = run_tmux(
+            "list-panes",
+            "-t",
+            f"{session}:{COCKPIT_WINDOW}",
+            "-F",
+            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
+            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_top}"
+            "\t#{pane_width}\t#{pane_height}",
+            check=False,
+        )
+    except (Exception, SystemExit):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    panes = []
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        parts = line.split("\t")
+        if not parts or not parts[0]:
+            continue
+        parts = (parts + [""] * 8)[:8]
+        panes.append(
+            {
+                "pane_id": parts[0],
+                "workspace_id": parts[1],
+                "role": parts[2],
+                "lane_id": parts[3],
+                "pane_left": _as_int(parts[4]),
+                "pane_top": _as_int(parts[5]),
+                "pane_width": _as_int(parts[6]),
+                "pane_height": _as_int(parts[7]),
+            }
+        )
+    return panes
+
+
 def _rightmost_codex_anchor(codex_columns) -> str | None:
     """The codex pane id of the visually rightmost cockpit column (#11849).
 
@@ -2242,6 +2303,33 @@ def _handle_cockpit_reset(
     raise AssertionError("unreachable")
 
 
+def _handle_cockpit_doctor_geometry(session: str, *, json_output: bool) -> int:
+    """`mozyo cockpit doctor-geometry` — read-only geometry drift diagnosis (#12131).
+
+    Reads the live cockpit window panes and diagnoses display-geometry drift
+    (missing role, role-less pane, split / mixed-Unit columns, width imbalance).
+    Strictly read-only: it runs no tmux mutation and never repairs / rebalances /
+    moves panes. Mirrors `doctor`'s exit convention — JSON (or text) is emitted
+    regardless, and the exit code is ``0`` when no warning-level drift is found,
+    ``1`` otherwise — so a script can branch on the code while still parsing the
+    full diagnosis from stdout.
+    """
+    import json as _json
+
+    from mozyo_bridge.domain.cockpit_geometry import (
+        diagnose_cockpit_geometry,
+        format_geometry_text,
+    )
+
+    panes = _read_cockpit_geometry(session)
+    diagnosis = diagnose_cockpit_geometry(session=session, panes=panes)
+    if json_output:
+        print(_json.dumps(diagnosis.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_geometry_text(diagnosis))
+    return 0 if diagnosis.ok else 1
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -2268,6 +2356,13 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
     json_output = bool(getattr(args, "json_output", False))
     dry_run = bool(getattr(args, "dry_run", False))
+
+    # `mozyo cockpit doctor-geometry` (Redmine #12131) is a read-only,
+    # whole-cockpit diagnostic — it inspects every cockpit pane's observed
+    # geometry, not the current workspace, so it short-circuits before workspace
+    # resolution and never gates on tmux being mutable.
+    if getattr(args, "action", None) == "doctor-geometry":
+        return _handle_cockpit_doctor_geometry(session, json_output=json_output)
     # `mozyo cockpit adopt` (Redmine #11897, Phase 1) is a detect-only sub-action:
     # it reports a co-existing normal `mozyo` session as an adopt candidate and
     # moves NO panes (explicit transfer is Phase 2 / #11898). Like `--dry-run` /

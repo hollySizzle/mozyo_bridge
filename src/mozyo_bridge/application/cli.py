@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     cockpit.add_argument(
         "action",
         nargs="?",
-        choices=["append", "adopt", "reset", "rebuild"],
+        choices=["append", "adopt", "reset", "rebuild", "doctor-geometry"],
         default=None,
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
@@ -499,9 +499,15 @@ def build_parser() -> argparse.ArgumentParser:
             "cockpit: `reset` kills the mozyo-identified cockpit session, "
             "`rebuild` then recreates a fresh one for the current workspace. Both "
             "act only on a session proven mozyo-managed by its identity markers "
-            "(never by name) and only with `--confirm`. Without `--confirm` every "
-            "sub-action is detect-only / preview and mutates nothing; "
-            "`--dry-run` / `--json` always preview without mutating."
+            "(never by name) and only with `--confirm`. `doctor-geometry` "
+            "(Redmine #12131) is a read-only diagnosis of cockpit display-geometry "
+            "drift (missing codex/claude, role-less pane, a Unit's codex/claude "
+            "not sharing one column, a column carrying more than one Unit, width "
+            "imbalance); it observes geometry only — identity/routing stay on the "
+            "pane options — and never repairs / rebalances / moves panes. Without "
+            "`--confirm` every other sub-action is detect-only / preview and "
+            "mutates nothing; `--dry-run` / `--json` always preview without "
+            "mutating."
         ),
     )
     cockpit.add_argument(

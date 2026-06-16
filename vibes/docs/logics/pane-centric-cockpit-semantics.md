@@ -199,6 +199,35 @@ authority は user option / registry / preflight に置く。
 drift があっても handoff を自動禁止しない。handoff safety は live target
 preflight で判断する。drift は operator UX / recovery issue である。
 
+### Geometry Diagnosis (`cockpit doctor-geometry`)
+
+Redmine #12131 で上記 drift detection の最初の read-only 入口を実装した:
+`mozyo cockpit doctor-geometry [--session <group>] [--json]`。live tmux の
+cockpit window から各 pane の identity option (`@mozyo_workspace_id` /
+`@mozyo_agent_role` / `@mozyo_lane_id`) と observed geometry (`pane_left` /
+`pane_top` / `pane_width` / `pane_height`) を読み、Unit
+(`workspace_id` + `lane_id`) と vertical column (x-range overlap) を導出して
+診断する。
+
+実装は pure domain (`diagnose_cockpit_geometry`) + read-only tmux reader で、
+**tmux layout を一切変更しない**。repair / rebalance / move は本入口の scope 外
+(US #12130 が後続 issue に分割)。出力 finding code:
+
+- `missing_codex` / `missing_claude` — Unit に片側 agent しか無い。
+- `role_less_pane` — cockpit pane が role/workspace marker を欠く
+  (#12130 の手動復旧 `%1106` ケース)。
+- `unit_column_split` — 同一 Unit の codex/claude が同じ column に収まらない。
+- `mixed_unit_column` — 一つの vertical column に複数 Unit が同居する。
+- `narrow_pane` — column 幅が median から極端に外れた width imbalance
+  (advisory notice; `ok` を倒さない)。
+
+severity は `warning` (構造 drift) と `notice` (width imbalance) の二段で、
+`warning` が一つでもあれば `ok=false` / exit 1、無ければ exit 0。これは
+`doctor` の exit 規約と揃え、JSON は exit code に関わらず stdout へ出す。
+diagnosis は **observed geometry であり identity authority ではない** —
+どの Unit に属するかを再決定せず、handoff も禁止しない。private absolute path は
+出力に含めない (geometry reader は cwd / repo root を読まない)。
+
 ## Public / Private Boundary
 
 OSS default に入れてよいもの:
@@ -224,6 +253,7 @@ OSS default に入れてよいもの:
 候補:
 
 1. `cockpit doctor-geometry`: live layout drift の read-only diagnosis。
+   **実装済み (Redmine #12131)** — `### Geometry Diagnosis` を読む。
 2. `cockpit rebalance`: current live columns の width を desired / fair share に戻す。
 3. `cockpit move`: Unit column reorder primitive。
 4. `presentation-state DB`: `cockpit_group_membership` current table。
