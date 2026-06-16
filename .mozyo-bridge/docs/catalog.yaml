@@ -247,7 +247,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workspace-anchor-project-defaults-migration.md
-    purpose: ".mozyo-bridge/workspace.json を workspace identity recovery anchor、.mozyo-bridge/workspace-defaults.yaml を project-level defaults として rename する判断と互換 migration 方針の設計正本。"
+    purpose: ".mozyo-bridge/workspace-anchor.json を workspace identity recovery anchor、.mozyo-bridge/project-defaults.yaml を project-level defaults として新名優先にし、旧名を互換 fallback として扱う migration 方針の設計正本。"
     audit_role: workspace_anchor_project_defaults_migration_logic
     related_document_refs:
       - logic-fallback-retirement-ledger
