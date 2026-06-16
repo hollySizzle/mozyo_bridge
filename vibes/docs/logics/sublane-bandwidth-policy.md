@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document defines the repo-local policy for deciding when the coordinator may
-open another sublane, when it must stop dispatching and drain existing lanes, and
-how lane retirement interacts with cockpit throughput.
+This document defines the repo-local policy for deciding when the coordinator
+should open another sublane, when it must stop dispatching and drain existing
+lanes, and how lane retirement interacts with cockpit throughput.
 
 It complements [[logic-cockpit-sublane-operating-model]],
 [[logic-sublane-worktree-operating-runbook]], and
@@ -21,9 +21,20 @@ state, route a decision, audit a result, collect owner approval, or retire local
 state. A lane that is "waiting" can be more expensive than a lane that is still
 implementing, because it can block review, close, release, or retirement.
 
-The coordinator must not open work only because a pane or worktree can be
+Efficient parallel development is an explicit goal. The coordinator should use
+sublanes aggressively when the durable state shows ready implementation work and
+the admission checks below pass. Serializing all work into the main lane wastes
+the cockpit model and should be treated as a throughput smell, not the default.
+
+The coordinator still must not open work only because a pane or worktree can be
 created. It may dispatch only when it can also receive callbacks, perform the
 required audit, and retire completed lanes without losing durable state.
+
+Conversely, the coordinator should intentionally serialize when parallel work
+would increase total latency or risk. Examples include a blocking design
+decision, overlapping files or invariants, pending review / owner decisions that
+only the coordinator can drain, release / credential / destructive-operation
+gates, or a callback backlog that would make another lane invisible.
 
 ## Lane State Classes
 
@@ -53,10 +64,15 @@ Before dispatching a new sublane, the coordinator records or verifies:
 
 - target issue, target lane, branch/worktree identity, and durable dispatch
   anchor are known;
+- the work is implementation-shaped and should not be performed by the main
+  coordinator lane or main-unit Claude;
 - no unread `review_request`, `owner_waiting`, `blocked`, or
   `callback_delivery_failed` item is waiting for coordinator action;
 - the coordinator can perform the expected next review / owner aggregation /
   retirement step for the lane it is about to open;
+- the work does not overlap materially with another active sublane's files,
+  invariants, or release-critical surface unless the ordering / merge plan is
+  recorded;
 - the new work is not a lower-priority optional item while a production,
   release, credential, destructive-operation, or owner decision gate is active;
 - any existing `retire_ready` lane above the local soft profile has been retired
@@ -64,6 +80,10 @@ Before dispatching a new sublane, the coordinator records or verifies:
 
 If any check fails, do not dispatch another sublane. Record the blocking state
 and drain it first.
+
+If all checks pass and there is ready implementation work, dispatch is the
+preferred action. A coordinator stop that leaves ready work undispatched should
+record why serial execution is more efficient or safer for that specific state.
 
 ## Drain Order
 
@@ -139,6 +159,8 @@ operator-specific cockpit details.
   staffing assumptions in OSS defaults.
 - Do not let a bandwidth decision waive Redmine gates, Codex review, owner close
   approval, or the Codex gateway rule.
+- Do not use the main coordinator lane or main-unit Claude as a substitute
+  implementation lane merely because it is already open.
 
 ## Verification
 

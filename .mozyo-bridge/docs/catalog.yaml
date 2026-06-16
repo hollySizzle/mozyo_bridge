@@ -463,7 +463,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/sublane-bandwidth-policy.md
-    purpose: sublane を増やす前の coordinator bandwidth / admission / drain order / routine retirement cadence と mozyo_bridge dogfood soft profile を定義する repo-local policy。
+    purpose: 効率的な並列開発のため、coordinator が sublane を積極 dispatch すべき条件、serial/drain を選ぶ条件、bandwidth / admission / drain order / routine retirement cadence と mozyo_bridge dogfood soft profile を定義する repo-local policy。
     audit_role: sublane_bandwidth_policy_logic
     related_document_refs:
       - logic-cockpit-sublane-operating-model

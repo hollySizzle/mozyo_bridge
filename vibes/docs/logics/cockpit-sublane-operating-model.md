@@ -65,6 +65,15 @@ main Codex lane は direct edit に慎重であるべきである。project rule
 repo-local guardrail autonomous lane は使ってよいが、通常の実装や配布対象の
 workflow surface は project の role boundary に従う。
 
+coordinator は単に止める actor ではなく、throughput owner でもある。実装可能な
+ready work があり、[[logic-sublane-bandwidth-policy]] の admission check を
+満たす場合は、専用 sublane / worktree を作り target-lane Codex gateway へ
+dispatch するのが通常動作である。main lane に実装を抱え込むこと、または
+main-unit Claude を実装 lane の代替にすることは、parallel cockpit model の効率を
+落とすため避ける。逆に、blocking design decision、重複 file / invariant、owner
+decision、release / credential / destructive gate、callback backlog がある場合は、
+serial 化または drain を選び、その理由を durable journal に残す。
+
 ### Sublane Codex
 
 sublane Codex pane はその lane の gateway である。主に次を行う。
