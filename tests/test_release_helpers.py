@@ -291,6 +291,24 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             # The safe identifier lines are filtered out and not reported.
             self.assertNotIn("os.environ.get(API_KEY_ENV)", output)
 
+    def test_token_shaped_secret_with_punctuation_still_blocks(self) -> None:
+        # Redmine #12175 j#60466: a real credential literal carrying token
+        # punctuation (slash/base64, dotted) must still block the tree check.
+        from mozyo_bridge.application import release as release_mod
+
+        slash_secret = "REDMINE" + "_API_KEY=" + "ab" + "c+def/123="
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "config.env", slash_secret + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            self.assertIn(slash_secret, output)
+
 
 class SecretValueClassifierTest(unittest.TestCase):
     """Redmine #12175: pin the second-stage credential-value classifier that
@@ -310,6 +328,9 @@ class SecretValueClassifierTest(unittest.TestCase):
             "str | None",
             "API_KEY",  # uppercase constant reference
             "TRUSTED",
+            "os.environ",  # dotted attribute reference
+            "config.API_KEY",  # dotted constant reference
+            "self.api_key",  # dotted instance-attr reference
             '"test-key-not-a-real-credential"',  # explicit non-secret sentinel
             '"<your-api-key>"',  # placeholder
             "",  # empty
@@ -333,6 +354,25 @@ class SecretValueClassifierTest(unittest.TestCase):
             self.assertTrue(
                 release_mod._secret_value_is_real(value),
                 msg=f"expected real secret: {value!r}",
+            )
+
+    def test_accepts_token_shaped_literals_with_punctuation(self) -> None:
+        # Redmine #12175 j#60466: real credential tokens routinely contain
+        # `.`, `/`, `+`, and padding `=`. These must stay classified as real
+        # secrets — rejecting on token punctuation suppressed actual leaks.
+        from mozyo_bridge.application import release as release_mod
+
+        accept_values = (
+            "ab" + "c/123",  # slash / base64-ish
+            "ab" + "c+def/123=",  # base64 with padding
+            "ab" + "c.def.123",  # dotted, digit segment -> token not a ref
+            "sk." + "live." + "ab" + "c123",  # provider-style dotted key
+            "eyJ" + "hbGci.eyJ" + "zdWIi.sig123",  # JWT-like header.payload.sig
+        )
+        for value in accept_values:
+            self.assertTrue(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected real token secret: {value!r}",
             )
 
     def test_assignment_classifier_pins_request_cases(self) -> None:

@@ -89,9 +89,14 @@ _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:" + _SECRET_KEY_ALTERNATION + r")\s*[:=]\s*(?P<value>[^\s#]+)",
     re.IGNORECASE,
 )
-# Characters that indicate the captured value is code / an expression / a
-# reference / a path rather than an opaque literal credential.
-_SECRET_EXPRESSION_CHARS = frozenset("()[]{}.|<>\\/ \t")
+# Characters that mark the captured value as code structure — a call, an
+# index/slice, a dict/set, a union/generic, a redirect — rather than an opaque
+# literal credential. `.` and `/` are deliberately NOT here: real credential
+# tokens legitimately contain them (dotted JWTs, slash/base64 secrets,
+# provider-style `sk.live.…` keys), so rejecting on them suppressed real leaks
+# (Redmine #12175 j#60466). Dotted *code references* (e.g. `os.environ`) are
+# instead rejected by `_is_attribute_path_reference`.
+_SECRET_EXPRESSION_CHARS = frozenset("()[]{}|<>\\ \t")
 # Python / JSON / shell literals that are never a credential value.
 _SECRET_VALUE_KEYWORDS = frozenset(
     {"none", "true", "false", "null", "nil", "undefined", "..."}
@@ -121,16 +126,36 @@ _SECRET_PLACEHOLDER_MARKERS = (
 )
 
 
+def _is_attribute_path_reference(inner: str) -> bool:
+    """True if `inner` is a dotted code reference rather than a token literal.
+
+    A dotted code reference (``os.environ``, ``config.API_KEY``,
+    ``self.api_key``) has every dot-separated segment be a digit-free Python
+    identifier. Token-shaped values escape this: a non-identifier segment
+    (``abc.def.123`` → ``123``) or a digit-bearing segment (``sk.live.abc123``,
+    base64/JWT chunks) makes it a literal, not a reference.
+    """
+    if "." not in inner:
+        return False
+    for segment in inner.split("."):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_]*", segment):
+            return False
+    return True
+
+
 def _secret_value_is_real(value: str) -> bool:
     """Classify a captured assignment value as a real credential literal.
 
-    Rejects code / expressions / paths, keyword literals, explicit non-secret
-    placeholders, and bare identifier / constant / type references: an
-    ``os.environ`` read, a ``None`` default, a ``str`` annotation, an uppercase
-    constant reference, or an explicit non-credential test sentinel. Accepts an
-    opaque literal value — the non-placeholder right-hand side of an
-    ``api_key`` / ``*_API_KEY`` assignment. See the focused tests for the exact
-    accept / reject cases pinned by Redmine #12175.
+    Rejects code structure / expressions, keyword literals, explicit non-secret
+    placeholders, and bare identifier / constant / type / attribute references:
+    an ``os.environ`` read, a ``None`` default, a ``str`` annotation, an
+    uppercase constant reference, or an explicit non-credential test sentinel.
+    Accepts an opaque literal value — the non-placeholder right-hand side of an
+    ``api_key`` / ``*_API_KEY`` assignment — INCLUDING token-shaped literals
+    that carry common credential punctuation such as ``.``, ``/``, ``+`` and
+    padding ``=`` (dotted JWTs, slash/base64 secrets, provider-style keys). See
+    the focused tests for the exact accept / reject cases pinned by Redmine
+    #12175 (j#60460, j#60466).
     """
     raw = value.strip().rstrip(",;")
     quoted = False
@@ -145,7 +170,9 @@ def _secret_value_is_real(value: str) -> bool:
     # (stray quotes, separators) are never a leaked secret.
     if not any(ch.isalnum() for ch in inner):
         return False
-    # Code / expression / reference / path indicators are not literal secrets.
+    # Code-structure characters (calls, indexing, unions, redirects) mark an
+    # expression, not a literal. `.` / `/` are excluded on purpose so real
+    # token shapes survive — dotted code references are handled separately.
     if any(ch in _SECRET_EXPRESSION_CHARS for ch in raw):
         return False
     lowered = inner.lower()
@@ -153,13 +180,18 @@ def _secret_value_is_real(value: str) -> bool:
         return False
     if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
         return False
-    # Bare unquoted identifiers are name/type/constant references, not values:
-    # SCREAMING_SNAKE constants (API_KEY) and all-letter identifiers (str).
-    # A quoted value, or one mixing letters and digits (abc123), is a literal.
-    if not quoted and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
-        if inner == inner.upper():
-            return False
-        if inner.isalpha() and inner == inner.lower():
+    # Unquoted name references are not values. A quoted value, or one mixing
+    # letters and digits (abc123) / token punctuation, is a literal.
+    if not quoted:
+        # Bare identifiers: SCREAMING_SNAKE constants (API_KEY), all-letter
+        # identifiers (str).
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
+            if inner == inner.upper():
+                return False
+            if inner.isalpha() and inner == inner.lower():
+                return False
+        # Dotted attribute references (os.environ, config.API_KEY).
+        if _is_attribute_path_reference(inner):
             return False
     return True
 
