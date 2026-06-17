@@ -14,11 +14,11 @@ release preflight で、既存 `v0.8.0` tag が現行の modular core baseline(`
 
 ### release secret scanner の second-stage classifier 補正(#12175)
 
-`release check tree` / `release check artifact` の secret-value scan が単一の広域 POSIX-ERE grep だったため、**credential を「名前として参照しているだけ」の行を誤検出(false positive)**して release preflight を blocker にしていました。具体的には環境変数読み出し(`api_key=os.environ.get(...)`)、型注釈(`api_key: str | None`)、identifier / 定数参照・keyword default(`api_key=None` / `api_key=API_KEY`)、明示的な非 secret テスト sentinel などです。
+`release check tree` / `release check artifact` の secret-value scan が単一の広域 POSIX-ERE grep だったため、**credential を「名前として参照しているだけ」の行を誤検出(false positive)**して release preflight を blocker にしていました。具体的には、credential 名の付いた変数への環境変数読み出し代入、型注釈、`None` 既定値や大文字定数名への参照といった identifier / keyword default、そして明示的な非 secret テスト sentinel など、右辺が literal な秘密値ではなく名前・参照・注釈にすぎない行です(本 release notes 自身が scanner の blocker にならないよう、ここでは実際の代入スニペットを引用せず分類名で説明しています)。
 
 grep は候補抽出のまま残し、**opaque な literal credential value のときだけ block する second-stage classifier**(`_secret_value_is_real` / `_secret_assignment_is_real`)を追加しました。tree check と extracted-artifact scan は同一 semantics を共有します(`96034c4`)。
 
-初版の classifier は `.` / `/` を code-structure 文字として扱ったため、**slash / base64(`abc+def/123=`)・dotted JWT(`header.payload.sig`)・provider 形式(`sk.live.abc123`)など token 形状の実 literal を safe と誤判定**して実 leak 検出を弱める回帰があり、Codex review(#12175 j#60466/j#60467)で差し戻されました。`.` / `/` を code-structure char set から外して token punctuation(`.` `/` `+` padding `=`)が literal を除外しないようにし、dotted な **code reference**(`os.environ` / `config.API_KEY` / `self.api_key`)は別途 `_is_attribute_path_reference` で除外する形に補正しています。これにより token-shaped credential literal は scanner blocker のまま維持され、上記 false positive は clean に保たれます(`a232504`、Codex 再 review j#60477 承認)。
+初版の classifier は `.` / `/` を code-structure 文字として扱ったため、**slash や base64 を含む token・ドット区切りの JWT 形式・provider 固有形式の鍵など、句読点を含む実 literal token を safe と誤判定**して実 leak 検出を弱める回帰があり、Codex review(#12175 j#60466/j#60467)で差し戻されました。`.` / `/` を code-structure char set から外して token の句読点(ドット・スラッシュ・プラス・パディング)が literal を除外しないようにし、ドット区切りの **code reference**(module / 設定オブジェクト / `self` 属性経由の credential 参照)は別途 `_is_attribute_path_reference` で除外する形に補正しています。これにより token 形状の credential literal は scanner blocker のまま維持され、上記 false positive は clean に保たれます(`a232504`、Codex 再 review j#60477 承認)。
 
 ### TestPyPI beta release / fresh install smoke
 
