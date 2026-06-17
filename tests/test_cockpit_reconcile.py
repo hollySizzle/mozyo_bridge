@@ -402,6 +402,30 @@ class CockpitReconcileCommandTest(unittest.TestCase):
         self.assertIn("could not parse", out)
         self.assertEqual([], run.calls)
 
+    def test_unparseable_present_layout_json_matches_audit_contract(self) -> None:
+        # Regression (#12136 j#59881): the malformed-layout --json branch must
+        # carry the SAME audit fields as the normal branch (blocked_reason +
+        # current_layout/current_cells/target_layout/target_layout_checksum), and
+        # must not expose a top-level `blocked`.
+        rc, out, run, _ = self._run_cmd(
+            self._args(json_output=True), layout="garbage-not-a-layout",
+            identity=_DEGEN_ID,
+        )
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        for field in (
+            "blocked_reason", "current_layout", "current_cells",
+            "target_layout", "target_layout_checksum",
+        ):
+            self.assertIn(field, payload)
+        self.assertNotIn("blocked", payload)
+        self.assertEqual("garbage-not-a-layout", payload["current_layout"])
+        self.assertEqual([], payload["current_cells"])
+        self.assertIsNone(payload["target_layout"])
+        self.assertIsNone(payload["target_layout_checksum"])
+        self.assertIn("could not parse", payload["blocked_reason"])
+        self.assertEqual([], run.calls)
+
     def test_absent_cockpit_is_benign(self) -> None:
         rc, out, run, require_tmux = self._run_cmd(
             self._args(), layout=None, identity=None

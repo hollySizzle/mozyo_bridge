@@ -2826,11 +2826,14 @@ def _handle_cockpit_reconcile(
             f"and retry, or inspect the cockpit manually."
         )
         if json_output:
+            # Same audit-field contract as the normal JSON branch (#12136 j#59881):
+            # an unparseable layout has no cells/target, so those are empty/None.
             print(_json.dumps(
                 {"command": "cockpit reconcile", "executes": False,
                  "would_execute": False, "confirm": confirm, "session": session,
                  "cockpit_present": True, "drift": False, "clean": False,
                  "blocked_reason": message, "current_layout": layout,
+                 "current_cells": [], "target_layout": None,
                  "target_layout_checksum": None, "plan": None},
                 ensure_ascii=False, indent=2, sort_keys=True,
             ))
