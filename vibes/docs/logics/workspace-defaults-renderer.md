@@ -79,7 +79,7 @@ outputs:
 | --- | --- | --- | --- |
 | `redmine_markdown` | `render_redmine_defaults_markdown` | Markdown snippet (Codex / Claude 両用)。Resolution Priority / Verification / Constraints セクションを含む。| `.md`, `.markdown` |
 
-`KNOWN_OUTPUT_KINDS` と `KIND_ALLOWED_SUFFIXES` は `src/mozyo_bridge/workspace_defaults.py` で定義される。`tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest::test_supported_kinds_list_is_pinned` と `test_kind_allowed_suffixes_table_is_pinned` がそれぞれ verbatim で pin する。set / suffix を増やすときは両 test、本表、`_render_for_kind` dispatch を **同一 commit で同期** する。
+`KNOWN_OUTPUT_KINDS` と `KIND_ALLOWED_SUFFIXES` は `src/mozyo_bridge/workspace_defaults.py` で定義される。`tests/test_docs_canonical_workspace.py::WorkspaceDefaultsRendererTest::test_supported_kinds_list_is_pinned` と `test_kind_allowed_suffixes_table_is_pinned` がそれぞれ verbatim で pin する。set / suffix を増やすときは両 test、本表、`_render_for_kind` dispatch を **同一 commit で同期** する。
 
 target suffix の判定は lowercase。`.MD` 等は `.md` と同一視される。kind が allowed suffix を持たない (= 空 set) ことを意味する宣言は禁止 — 新 kind を追加する場合は必ず allowed suffix を 1 つ以上指定する。
 
@@ -186,7 +186,7 @@ acceptance criteria は次を要求する。
 
 ## Tests
 
-`tests/test_mozyo_bridge.py::WorkspaceDefaultsRendererTest` で次を pin する。
+`tests/test_docs_canonical_workspace.py::WorkspaceDefaultsRendererTest` で次を pin する。
 
 - **round-trip**: 本 workspace (`mozyo_bridge`) 自身の入力 YAML (現状はまだ旧名 `.mozyo-bridge/workspace-defaults.yaml`、新名は `project-defaults.yaml`) が `.mozyo-bridge/redmine-defaults.md` と byte-equal に再現される。generated snippet の source 参照は実際に読んだファイル名を反映するため、旧名のままでも drift しない。
 - **CLI**: clean / drift / missing-output / 復旧 path。stderr に runnable recovery command が出る。
