@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
@@ -620,6 +621,13 @@ def build_inactive_pane_fallback_command(
     ids, and the ``auto`` sentinel — never an absolute path — so it is safe to
     paste into a durable record
     (``vibes/docs/rules/public-private-boundary.md``).
+
+    Every token is rendered through ``shlex.quote`` so the command is genuinely
+    copy-pasteable (Redmine #12162 review j#60107): an Asana ``--anchor-url``
+    permalink commonly carries shell metacharacters (``?`` / ``&`` query params)
+    that would otherwise background or re-parse the command in a normal shell.
+    Tokens without metacharacters (the Redmine ``--issue`` / ``--journal`` path,
+    flag names, the ``mozyo-bridge`` prefix) are left unchanged by ``shlex.quote``.
     """
     if not is_explicit_pane_target(target) or anchor is None or receiver not in RECEIVERS:
         return None
@@ -650,7 +658,7 @@ def build_inactive_pane_fallback_command(
         "--mode",
         MODE_STANDARD,
     ]
-    return " ".join(parts)
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def _gateway_candidate_lines(candidates: "Iterable[Any]") -> list[str]:

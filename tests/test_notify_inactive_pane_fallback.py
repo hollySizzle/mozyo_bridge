@@ -87,6 +87,30 @@ class BuildInactivePaneFallbackCommandTest(unittest.TestCase):
         self.assertIn("--task-id 111 --anchor-url https://app.asana.com/x", command)
         self.assertNotIn("--comment-id", command)
 
+    def test_asana_anchor_url_with_shell_metacharacters_is_quoted(self) -> None:
+        # Redmine #12162 review j#60107: a real Asana permalink carries `?`/`&`
+        # query params. The recovery command must stay copy-pasteable — the
+        # anchor-url token is shell-quoted so `&` does not background the command
+        # or re-parse it in a normal shell.
+        import shlex
+
+        url = "https://app.asana.com/0/111/222?focus=true&timestamp=123"
+        command = build_inactive_pane_fallback_command(
+            receiver="codex",
+            kind="review_request",
+            target="%2",
+            anchor=AsanaAnchor(task_id="111", anchor_url=url),
+        )
+        assert command is not None
+        # The url is present but quoted as a single shell token (not bare).
+        self.assertIn(shlex.quote(url), command)
+        self.assertNotIn(f"--anchor-url {url} ", command)
+        # The quoted command parses back to the exact argv, with the url intact
+        # as one token (i.e. `&` did not split it).
+        argv = shlex.split(command)
+        self.assertIn(url, argv)
+        self.assertEqual(url, argv[argv.index("--anchor-url") + 1])
+
     def test_recovery_carries_no_absolute_path(self) -> None:
         # Public/private boundary: the command must be pasteable into a durable
         # record, so it carries only pane/anchor ids and the `auto` sentinel.
