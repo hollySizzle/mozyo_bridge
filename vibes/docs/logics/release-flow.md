@@ -4,13 +4,13 @@
 
 `mozyo-bridge release …` helper family は本 doc に記述された mechanical step を CLI として再現する read-only / bounded-mutation な薄い wrapper である。helper の admit する surface と human-vs-script boundary は `vibes/docs/logics/release-helper-contract.md` を正本とする。本 doc は判断付きの release step (GA / beta judgment, release notes wording, blocker disposition) を helper 化しない。
 
-helper invocation を以下の節で各 step に併記する。helper を呼ばずに manual command を直接実行する従来手順も引き続き有効であり、helper はそれと等価な mechanical step を 1 command に括り出すための facade である。Asana task / comment が引き続き durable な作業ログであり、helper stdout は durable record の代替にならない。
+helper invocation を以下の節で各 step に併記する。helper を呼ばずに manual command を直接実行する従来手順も引き続き有効であり、helper はそれと等価な mechanical step を 1 command に括り出すための facade である。active release ticket (Redmine journal / Asana comment; preset に従う) が引き続き durable な作業ログであり、helper stdout は durable record の代替にならない。
 
 | step | helper subcommand | judgment 残し方 |
 | --- | --- | --- |
-| Source Tree Hygiene | `mozyo-bridge release check tree` | false-positive 判定は operator |
+| Source Tree Hygiene | `mozyo-bridge release check tree` | classifier 後の blocker disposition は operator |
 | Fresh Scaffold Smoke | `mozyo-bridge release check scaffold` | strict-fail; preset 修正で再実行 |
-| Build Artifact Inspection | `mozyo-bridge release check artifact` | false-positive 判定は operator |
+| Build Artifact Inspection | `mozyo-bridge release check artifact` | classifier 後の blocker disposition は operator |
 | Canonical Renderer / Plugin Mirror Drift | `mozyo-bridge release check drift` | strict-fail; canonical 再 render または mirror 再 sync で復旧 |
 | Release Ref Consistency (mirror set 内 version 確認) | `mozyo-bridge release bump --check` | mirror set 不一致は strict-fail |
 | GitHub Actions run status / conclusion 確認 | `mozyo-bridge release check workflow --run-id <id>` | `failure` 受領可否は operator |
@@ -63,7 +63,7 @@ Published-package 専用 smoke は追加しない。理由:
 
 ## Release Flow
 
-1. Asana release task から開始する。
+1. active release ticket から開始する (Redmine governed preset では Redmine issue / journal、Asana governed preset では Asana task / comment)。
 2. local unit test と build check を実行する。
 3. Release Artifact Guardrails を実行する。
 4. `main` に push し、GitHub Actions `Test` の成功を確認する。
@@ -91,7 +91,7 @@ git grep -nEi '(^|[^[:alnum:]_])(api[_-]?key|access[_-]?token|refresh[_-]?token|
   ':!*.pyc' ':!build' ':!dist' ':!.git' ':!.venv' ':!tmp'
 ```
 
-`git grep` は説明文中の `token` / `secret` という単語だけでは blocker にしない。credential らしい代入形、tracked `.env` / `.pypirc`、実パスらしい personal home path を blocker として扱う。false positive は Asana release task に理由を記録する。
+`git grep` は説明文中の `token` / `secret` という単語だけでは blocker にしない。credential らしい代入形、tracked `.env` / `.pypirc`、実パスらしい personal home path を candidate として扱う。candidate のうち、env read / type annotation / identifier reference / placeholder / test sentinel など safe-code pattern は helper の second-stage classifier で除外する。placeholder ではない literal credential value は blocker であり、token punctuation (`.`, `/`, `+`, `=`, `_`, `-`) を含む値も blocker として扱う。classifier 後に残った blocker は clean に直すか、設計上残すなら active release ticket に disposition と理由を記録してから進める。
 `/Users/<name>` のような個人ホーム絶対パスが router、skill、docs、scaffold preset、manifest に入っている場合は release しない。
 
 Helper:
@@ -100,7 +100,7 @@ Helper:
 mozyo-bridge release check tree
 ```
 
-上記の `git status` / `git log -S'/Users/'` / `git grep` を 1 command として再現する。同じ pathspec exclusion を内側で適用し、personal path / secret-shape の検出を strict-fail (exit 1) で返す。false-positive 判定 (例: docs 内の意図された path) は引き続き operator が Asana task に残してから release を進める。
+上記の `git status` / `git log -S'/Users/'` / `git grep` を 1 command として再現する。同じ pathspec exclusion を内側で適用し、personal path は strict-fail (exit 1) で返す。secret-shape candidate は second-stage classifier を通し、safe-code pattern は helper が除外し、real credential literal と判断できるものだけを strict-fail にする。classifier 後の blocker を既知 drift として流さず、operator は clean に直すか active release ticket に disposition を残してから release を進める。
 
 ### Fresh Scaffold Smoke
 
@@ -154,7 +154,7 @@ find "$tmp" \( -name '.env' -o -name '.env.*' -o -name '.pypirc' \) ! -name '.en
 rg -n '/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/|C:\\Users\\[A-Za-z0-9._-]+\\|\\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\\b\\s*[:=]\\s*[^<\\s#][^\\s#]*|\\b(ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)\\b\\s*[:=]\\s*[^<\\s#][^\\s#]*' "$tmp" && exit 1
 ```
 
-この検査は説明文中の `token` / `secret` という単語だけでは blocker にしない。false positive が出た場合も、release task に artifact path と判断理由を残す。
+この検査は説明文中の `token` / `secret` という単語だけでは blocker にしない。artifact 内の credential-shape candidate も source tree と同じ classifier semantics で扱い、safe-code pattern は除外し、real credential literal / tracked secret file / personal path は blocker にする。classifier 後に blocker が残る場合は clean に直すか、active release ticket に artifact path と disposition を残す。
 
 Helper:
 
@@ -162,7 +162,7 @@ Helper:
 mozyo-bridge release check artifact
 ```
 
-helper は `release check` family の read-only invariant を守るため repo の `dist/` を一切触らない。`python -m build --outdir <tmp>/dist` で隔離 tmp に書き出し、wheel / sdist を `<tmp>/extracted` に展開してから grep する。false-positive 判定は引き続き operator が Asana task に残し、helper は strict-fail (exit 1) を返す。
+helper は `release check` family の read-only invariant を守るため repo の `dist/` を一切触らない。`python -m build --outdir <tmp>/dist` で隔離 tmp に書き出し、wheel / sdist を `<tmp>/extracted` に展開してから candidate scan と classifier を実行する。helper は safe-code pattern を内部で除外し、real credential literal / tracked secret file / personal path を strict-fail (exit 1) で返す。operator は残った blocker を clean に直すか active release ticket に disposition を残す。
 
 ### Canonical Renderer / Plugin Mirror Drift
 
@@ -186,7 +186,7 @@ mozyo-bridge release check drift
 CI gate:
 
 - `.github/workflows/test.yml` の `python -m unittest discover -s tests -v` step が、`tests/test_docs_canonical_workspace.py` の `CanonicalRendererTest` / `GovernedWorkflowCanonicalTest` (canonical render) と `tests/test_plugin_marketplace.py` の `PluginMarketplaceTest` (mirror byte gate + `sync_plugin_skill.sh --check` shell gate) を毎 push / PR で実行する。release helper を pre-merge gate として別に追加せず、unittest layer に集約する。
-- release helper `release check drift` は pre-release operator が release commit 直前に 1 command で確認するための facade。release task の audit trail にも `release check drift` の出力を貼る運用とする。
+- release helper `release check drift` は pre-release operator が release commit 直前に 1 command で確認するための facade。active release ticket の audit trail にも `release check drift` の出力を貼る運用とする。
 
 ### Release Ref Consistency
 
@@ -243,7 +243,7 @@ mozyo-bridge doctor --json
 
 その後、`README.md` の `Beta Tester Install (GitHub main)` 節にある isolated target smoke を、GitHub `main`
 install の代わりに該当 PyPI / TestPyPI install で実行する。特に ticket-ID entrypoint と scaffold guardrail の検証として、
-Asana / Redmine / none の scaffold、`scaffold status`、`doctor --target` を release task に記録する。
+Asana / Redmine / none の scaffold、`scaffold status`、`doctor --target` を active release ticket に記録する。
 
 ## Trusted Publishing
 
@@ -363,7 +363,7 @@ GA / patch 手順:
 
 - pre-release は production publish を起こしてはならないので、GitHub Release を作らない。
 - bump → push → `Publish to TestPyPI` workflow を `workflow_dispatch` で起動する流れだけで完了する。
-  - Helper: `mozyo-bridge release publish --testpypi --version 0.1.0a1` は version literal を validate した上で `gh workflow run testpypi.yml --ref main` 相当の dispatch を行う。workflow は `main` の `pyproject.toml` から version を読むため、workflow input は渡さない。helper は続けて run-id を Asana task に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
+  - Helper: `mozyo-bridge release publish --testpypi --version 0.1.0a1` は version literal を validate した上で `gh workflow run testpypi.yml --ref main` 相当の dispatch を行う。workflow は `main` の `pyproject.toml` から version を読むため、workflow input は渡さない。helper は続けて run-id を active release ticket に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
 - 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
 - `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。
 - 必要なら `git tag -a v0.1.0a1 -m "Pre-release v0.1.0a1"` で tag を打って push する。GitHub Release は作らない。

@@ -4,7 +4,7 @@
 
 この doc は `mozyo-bridge` の release 操作のうち、機械化可能な mechanics を `mozyo-bridge release <subcommand>` 系の stepwise helper として括り出すための contract を定義する。実行手順そのものや、release Gate の judgment 規約は引き続き `vibes/docs/logics/release-flow.md` と `vibes/docs/rules/release-distribution.md` を正本とする。
 
-この contract は release を 1 つの opaque な `release do-everything` script に collapse するためのものではない。helper はあくまで release-flow の各 step を再現性のある CLI として薄く包むもので、Asana durable workflow と human release judgment を上書きしない。
+この contract は release を 1 つの opaque な `release do-everything` script に collapse するためのものではない。helper はあくまで release-flow の各 step を再現性のある CLI として薄く包むもので、active ticket による durable workflow (Redmine journal / Asana comment; preset に従う) と human release judgment を上書きしない。
 
 ## Helper Command Families
 
@@ -14,9 +14,9 @@
 
 local guardrail と artifact / workflow 状態を検査するための read-only helper 群。worktree や remote state を mutate しない。
 
-- `release check tree` — `release-flow.md` の `Source Tree Hygiene` (`git status --short --branch` / `git log -S'/Users/'` / `git grep` で個人ホーム絶対パス・secret-shape を探す検査) を 1 command として再現する。release blocker を検出したら non-zero で終了する。
+- `release check tree` — `release-flow.md` の `Source Tree Hygiene` (`git status --short --branch` / `git log -S'/Users/'` / `git grep` で個人ホーム絶対パス・secret-shape candidate を探し、credential candidate を classifier に通す検査) を 1 command として再現する。release blocker を検出したら non-zero で終了する。
 - `release check scaffold` — `release-flow.md` の `Fresh Scaffold Smoke` (isolated home / isolated target で全 preset の fresh scaffold + `scaffold status`) を 1 command として再現する。生成物に host 固有パスが含まれていないことと、portable `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 表現が残ることを assert する。
-- `release check artifact` — `release-flow.md` の `Build Artifact Inspection` (`python -m build` 結果の wheel / sdist を展開し、`/Users/` 等の personal path と secret-shape token を grep する) を 1 command として再現する。dist artifact path と false-positive 候補を stdout に列挙し、judgment は人間に残す。
+- `release check artifact` — `release-flow.md` の `Build Artifact Inspection` (`python -m build` 結果の wheel / sdist を展開し、`/Users/` 等の personal path と secret-shape candidate を scan し、credential candidate を classifier に通す) を 1 command として再現する。dist artifact path と classifier 後に残った blocker を stdout に列挙し、blocker disposition は人間に残す。
 - `release check drift` — `release-flow.md` の `Canonical Renderer / Plugin Mirror Drift` を 1 command として再現する。`mozyo-bridge scaffold canonical --check` (router pair + governed workflow pair, Redmine #10345 / #10426) と `scripts/sync_plugin_skill.sh --check` (plugin mirror, Redmine #10663) を順に subprocess として実行し、いずれかが drift を検出したら strict-fail (exit 1) で `result: blocker` を返す。helper 自身は worktree を mutate せず、復旧 command (`mozyo-bridge scaffold canonical` / `scripts/sync_plugin_skill.sh`, いずれも `--check` なし) を stdout に verbatim で列挙する。判断 (例: drift を accept して release を進める) は operator に残す。
 - `release check workflow --run-id <id>` — GitHub Actions `Test` / `Publish to TestPyPI` / `Publish to PyPI` の run status / conclusion を取得し、`success` / `failure` / `in_progress` を出力する。judgment (例: 「`failure` でも release を進める」) は実行しない。
 
@@ -44,7 +44,7 @@ repo の **現在 authoritative な release-version mirror set** を 1 つの ve
 
 publish workflow の dispatch / 状態確認に専念する helper。version 文字列の整合・gate 判定・release notes は扱わない。
 
-- `release publish --testpypi --version <X.Y.Z>` — `gh workflow run testpypi.yml --ref main -f version=X.Y.Z` 相当の dispatch を実行する。dispatch 後の run-id を Asana task に貼れる shape で stdout に出す。workflow 完了の polling はこの subcommand では行わず、`release check workflow --run-id <id>` に明示的に委ねる。
+- `release publish --testpypi --version <X.Y.Z>` — `gh workflow run testpypi.yml --ref main -f version=X.Y.Z` 相当の dispatch を実行する。dispatch 後の run-id を active ticket に貼れる shape で stdout に出す。workflow 完了の polling はこの subcommand では行わず、`release check workflow --run-id <id>` に明示的に委ねる。
 - `release publish --pypi --tag vX.Y.Z` — production publish の trigger を組み立てる。具体的には `gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file <path>` のドライランを出力し、release notes file path と tag が揃っていることを assert する。`--execute` flag が明示的に渡された場合のみ `gh release create` を実行する。
 - `release publish --plan` — TestPyPI / PyPI それぞれで、現在の git ref / pyproject version / 最新の `Test` workflow conclusion / TestPyPI 既存 version の有無を読み取り、operator が次に取りうる選択肢を列挙する。判定はしない。
 
@@ -57,9 +57,9 @@ publish workflow の dispatch / 状態確認に専念する helper。version 文
 - `release workflow runs --workflow <name>` — 指定 workflow の最近 run を `created_at` / `status` / `conclusion` / `head_sha` / `html_url` で一覧する。
 - `release workflow wait --run-id <id> --timeout <seconds>` — 指定 run が `completed` になるまで polling し、最終 `conclusion` を返す。`--timeout` を超えたら non-zero で終了する。何の judgment もしない。
 
-この family は GitHub Actions の状態を Asana に貼り直すためのもので、release 全体を helper の内部 state machine で進めるためのものではない。
+この family は GitHub Actions の状態を active ticket に貼り直すためのもので、release 全体を helper の内部 state machine で進めるためのものではない。
 
-## Human / Script / Asana Boundary
+## Human / Script / Ticket Boundary
 
 helper が触ってよい層と触ってはいけない層を明示する。
 
@@ -77,22 +77,22 @@ helper が触ってよい層と触ってはいけない層を明示する。
 - release notes の最終文言。helper は path を assert するだけで、生成も書き換えもしない。
 - `git commit` / `git push` / `git tag -a` / `gh release create --execute` 系の **state-mutating release action** の最終 trigger。
 - workflow が `failure` で返ったとき、`release を中断するか / 再 run するか / blocker を許容するか` の判定。
-- `release check artifact` で grep が false positive を返したときの可否判定。
+- `release check tree` / `release check artifact` で classifier 後の blocker が残ったときに、clean に直すか設計 disposition として受領するかの判定。
 
-### Asana が引き続き正本であること
+### Active ticket が引き続き正本であること
 
-- release task description / comment が **durable source of truth** である。helper の stdout や local log を durable record と見做さない。
-- 各 helper の attempted command と observed result は Asana task の comment に operator が貼る。helper は Asana には書き込まない。
-- residual blocker / 受領 method / commit hash / workflow run url の記録先は Asana task comment であり、helper-local の `.mozyo-bridge/` 配下 state ではない。
-- audit-owned commit hash の記録 (`Audit: Asana comment <comment_id>` 等) は helper 化対象に含めない。Audit-Owned Commit Authority の経路を経た human / audit actor が直接 Asana に書く。
+- active release ticket の description / journal / comment が **durable source of truth** である。Redmine governed preset では Redmine issue / journal、Asana governed preset では Asana task / comment を使う。helper の stdout や local log を durable record と見做さない。
+- 各 helper の attempted command と observed result は active ticket に operator が貼る。helper は ticket system には書き込まない。
+- residual blocker / 受領 method / commit hash / workflow run url の記録先は active ticket であり、helper-local の `.mozyo-bridge/` 配下 state ではない。
+- audit-owned commit hash の記録 (`Audit: Redmine journal <journal_id>` / `Audit: Asana comment <comment_id>` 等) は helper 化対象に含めない。Audit-Owned Commit Authority の経路を経た human / audit actor が直接 active ticket に書く。
 
 ## Failure Posture
 
 ### Strict fail vs warning-only
 
-- `release check tree` / `release check scaffold` / `release check artifact` は personal path や secret-shape の検出を strict fail とする。release blocker をそのまま exit code 0 にしない。
+- `release check tree` / `release check scaffold` / `release check artifact` は personal path や classifier 後に残る real credential literal の検出を strict fail とする。release blocker をそのまま exit code 0 にしない。
 - `release check workflow` / `release workflow wait` の `conclusion == failure` は strict fail ではなく **observed failure を non-zero exit で返すだけ**。 `この failure を receive するかどうか` は operator の judgment に残す (helper は再 run しない、tag を巻き戻さない)。
-- `release check artifact` の grep false positive 候補 (例えば docs 内の意図された path) は **warning として stdout に列挙するが exit は 0 のままにしない**。strict fail で止め、operator が Asana task に false positive と判断理由を残してから再実行する運用を helper 側でも担保する。
+- `release check tree` / `release check artifact` の credential-shape candidate は second-stage classifier に通し、env read / type annotation / identifier reference / placeholder / test sentinel など safe-code pattern は helper が除外する。placeholder ではない literal credential value は blocker であり、token punctuation (`.`, `/`, `+`, `=`, `_`, `-`) を含む値も blocker として扱う。classifier 後に blocker が残った場合は strict fail で止め、operator が clean に直すか active ticket に disposition と判断理由を残してから再実行する運用を helper 側でも担保する。
 
 ### Never mutate implicitly
 
@@ -134,8 +134,8 @@ helper が触ってよい層と触ってはいけない層を明示する。
 
 - 全 release を 1 command に collapse する `release run` / `release all` 系 helper は admit しない。
 - GA / beta の判断、release notes 文言、blocker 受領可否を helper の内部判定にしない。
-- Asana task / comment driven な durable workflow を helper-local state (`.mozyo-bridge/release-state.json` 等) で置き換えない。
-- 現在 release line がまだ exercise していない future helper (例: `release announce`, `release notify-slack`, `release rollback`, `release sign`) は admit しない。必要が出た時点で別 Asana task として contract を拡張する。
+- active ticket driven な durable workflow を helper-local state (`.mozyo-bridge/release-state.json` 等) で置き換えない。
+- 現在 release line がまだ exercise していない future helper (例: `release announce`, `release notify-slack`, `release rollback`, `release sign`) は admit しない。必要が出た時点で別 active ticket として contract を拡張する。
 
 ## Followup Implication
 
@@ -145,4 +145,4 @@ helper が触ってよい層と触ってはいけない層を明示する。
 - `1214798644479548` *Implement version-bump and publish helpers for TestPyPI / PyPI flows* — `release bump` は worktree への書き換えだけに留めること、mirror set 全 file (現状: `pyproject.toml` + `src/mozyo_bridge/__init__.py`) を 1 invocation で書き換え、`tests/test_mozyo_bridge.py:test_module_version_matches_pyproject_version` の invariant を実装側でも前提にすること、`release publish --pypi` の default dry-run / `--execute` 規約、`gh release create` を helper が握る範囲を明示する。
 - `1214798360431566` *Update release-flow docs and operator guidance for helper-driven release execution* — `release-flow.md` の各 step に helper subcommand を併記する update を行う。judgment 節を helper 化しないことも明示する。 release-version mirror set が現状 2-file (`pyproject.toml` + `src/mozyo_bridge/__init__.py`) であることを `release-flow.md` 側で明示し、follow-up `1214798255863579` の wording-sync を本 contract と整合させる。
 
-これらの subtask は本 contract が定める surface と boundary を逸脱しない範囲で実装する。判断付きの自動化が必要な気配が出た時点で、subtask の中で済ませず、Asana task として contract 側に戻して合意し直す。
+これらの subtask は本 contract が定める surface と boundary を逸脱しない範囲で実装する。判断付きの自動化が必要な気配が出た時点で、subtask の中で済ませず、active ticket として contract 側に戻して合意し直す。
