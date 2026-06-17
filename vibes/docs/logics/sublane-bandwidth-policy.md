@@ -48,19 +48,27 @@ durable record. Do not infer state from pane layout alone.
   is needed.
 - `owner_waiting`: review or close flow needs owner approval through the main
   coordinator Codex.
-- `close_waiting`: review / owner close approval / integration or no-commit
-  close conditions are satisfied, but the Redmine issue status is still open.
+- `close_waiting`: review / owner close approval / integration disposition
+  or explicit no-integration decision is recorded, but the Redmine issue status
+  is still open.
+- `integration_waiting`: review / owner close approval may be satisfied, but a
+  commit-bearing implementation has no durable disposition yet: merged to the
+  target branch, pushed for CI / merge, patch-equivalent to the target branch,
+  or explicitly deferred with a branch / commit owner.
 - `blocked`: the lane recorded a blocker, design consultation, failed handoff, or
   unresolved dependency.
 - `retire_ready`: work is integrated or patch-equivalent, issue scope is done,
   and no active gate is pending.
 - `idle`: lane has no active durable work and can be reused or retired.
 
-`callback_due`, `review_waiting`, `owner_waiting`, `close_waiting`, and
-`blocked` all count as coordinator-blocking states. They must be drained before
-opening optional new work. A close-ready issue left in `着手中` is not harmless
-bookkeeping: it keeps the durable state inconsistent and can hide whether a
-sublane is still active or ready to retire.
+`callback_due`, `review_waiting`, `owner_waiting`, `integration_waiting`,
+`close_waiting`, and `blocked` all count as coordinator-blocking states. They
+must be drained before opening optional new work. A close-ready issue left in
+`着手中` is not harmless bookkeeping: it keeps the durable state inconsistent
+and can hide whether a sublane is still active or ready to retire. Likewise, a
+closed issue with only an unmerged local sublane commit is not a complete drain:
+the implementation exists, but the target branch / CI / release path cannot be
+reconstructed from the issue alone.
 
 ## Admission Rule
 
@@ -70,8 +78,9 @@ Before dispatching a new sublane, the coordinator records or verifies:
   anchor are known;
 - the work is implementation-shaped and should not be performed by the main
   coordinator lane or main-unit Claude;
-- no unread `review_request`, `owner_waiting`, `close_waiting`, `blocked`, or
-  `callback_delivery_failed` item is waiting for coordinator action;
+- no unread `review_request`, `owner_waiting`, `integration_waiting`,
+  `close_waiting`, `blocked`, or `callback_delivery_failed` item is waiting for
+  coordinator action;
 - the coordinator can perform the expected next review / owner aggregation /
   retirement step for the lane it is about to open;
 - the work does not overlap materially with another active sublane's files,
@@ -97,10 +106,12 @@ records a stronger dependency:
 1. production / release / credential / destructive-operation blockers;
 2. `owner_waiting` items that only the coordinator can aggregate;
 3. `review_waiting` items;
-4. `close_waiting` items whose durable close gates are already satisfied;
-5. `blocked` or `callback_due` items, including callback delivery failures;
-6. `retire_ready` lanes that consume cockpit or worktree attention;
-7. new dispatch.
+4. `integration_waiting` items where a commit exists but merge / push /
+   patch-equivalence / explicit deferral is not yet recorded;
+5. `close_waiting` items whose durable close gates are already satisfied;
+6. `blocked` or `callback_due` items, including callback delivery failures;
+7. `retire_ready` lanes that consume cockpit or worktree attention;
+8. new dispatch.
 
 This order is about coordinator bandwidth. It does not change Redmine gate
 requirements, review quality, or owner close approval separation.
