@@ -7,12 +7,14 @@
 - Package name: `mozyo-bridge`
 - Workspace: repository root
 - GitHub repository: https://github.com/hollySizzle/mozyo_bridge
-- Asana project: configure per user or private workspace
+- Redmine project: `giken-3800-mozyo-bridge`
 
 ## Source of Truth
 
-- 実行キュー: 利用者自身の Asana project
-- グローバル規約・知識: 利用者自身の Notion workspace
+- 実行キュー / durable work record: Redmine project `giken-3800-mozyo-bridge`
+- runtime guardrails: root router (`AGENTS.md` / `CLAUDE.md`)、central preset
+  `.mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md`、および
+  catalog で解決される repo-local docs
 - code と release artifact: この repository
 - package metadata: `pyproject.toml`
 - user-facing usage / safety: `README.md`
