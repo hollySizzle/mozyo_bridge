@@ -237,6 +237,153 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertEqual(release_mod.EXIT_CLEAN, rc)
             self.assertIn("result: clean", out.getvalue())
 
+    def test_credential_identifier_code_does_not_block_tree_check(self) -> None:
+        # Redmine #12175: lines that merely name a credential identifier are not
+        # leaked values. Env reads, type annotations, keyword/identifier
+        # defaults, constant references, and explicit non-secret sentinels must
+        # all pass the tree check cleanly.
+        from mozyo_bridge.application import release as release_mod
+
+        false_positives = "\n".join(
+            (
+                "api_key=os.environ.get(API_KEY_ENV) or None",
+                "def __init__(self, *, api_key: str | None, base_url=None):",
+                "self._api_key = api_key",
+                'API_KEY = "test-key-not-a-real-credential"',
+                "cache = RedmineContextCache(api_key=None, base_url=TRUSTED)",
+                "cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)",
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "service.py", false_positives + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            self.assertEqual(release_mod.EXIT_CLEAN, rc)
+            self.assertIn("result: clean", out.getvalue())
+
+    def test_real_secret_among_identifier_code_still_blocks(self) -> None:
+        # Mixing safe identifier lines with one real literal credential must
+        # still block, and only the real line is reported as a hit.
+        from mozyo_bridge.application import release as release_mod
+
+        real_secret = "REDMINE" + "_API_KEY=" + "abc123"
+        body = "\n".join(
+            (
+                "api_key=os.environ.get(API_KEY_ENV) or None",
+                "cache = RedmineContextCache(api_key=None, base_url=TRUSTED)",
+                real_secret,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_repo(root)
+            self._commit_file(root, "config.env", body + "\n")
+            args = argparse.Namespace(repo=str(root))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = release_mod.cmd_release_check_tree(args)
+            output = out.getvalue()
+            self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+            self.assertIn("result: blocker", output)
+            self.assertIn(real_secret, output)
+            # The safe identifier lines are filtered out and not reported.
+            self.assertNotIn("os.environ.get(API_KEY_ENV)", output)
+
+
+class SecretValueClassifierTest(unittest.TestCase):
+    """Redmine #12175: pin the second-stage credential-value classifier that
+    separates real leaked literals from code that merely names a credential.
+    Real-secret-shaped tokens are assembled by concatenation so this test file
+    does not itself carry a contiguous secret-shaped literal.
+    """
+
+    def test_rejects_code_identifier_and_sentinel_values(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        reject_values = (
+            "os.environ.get(API_KEY_ENV)",  # env read / call expression
+            "os.environ.get(API_KEY_ENV) or None",
+            "None",  # keyword default
+            "str",  # type annotation
+            "str | None",
+            "API_KEY",  # uppercase constant reference
+            "TRUSTED",
+            '"test-key-not-a-real-credential"',  # explicit non-secret sentinel
+            '"<your-api-key>"',  # placeholder
+            "",  # empty
+        )
+        for value in reject_values:
+            self.assertFalse(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected non-secret: {value!r}",
+            )
+
+    def test_accepts_opaque_literal_values(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        token = "ab" + "c123"
+        accept_values = (
+            token,  # bare env-style right-hand side of a *_API_KEY assignment
+            "'" + token + "'",  # quoted literal
+            '"' + token + '"',
+        )
+        for value in accept_values:
+            self.assertTrue(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected real secret: {value!r}",
+            )
+
+    def test_assignment_classifier_pins_request_cases(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        safe_lines = (
+            "api_key=os.environ.get(API_KEY_ENV) or None",
+            "    def __init__(self, *, api_key: str | None, base_url=None):",
+            "self._api_key = api_key",
+            'API_KEY = "test-key-not-a-real-credential"',
+            "cache = RedmineContextCache(api_key=None, base_url=TRUSTED)",
+            "cache = RedmineContextCache(api_key=API_KEY, base_url=TRUSTED)",
+            "Do not store credentials, tokens, secrets, or passwords.",
+        )
+        for line in safe_lines:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected safe line: {line!r}",
+            )
+
+        # Split key/separator so this test source never carries a contiguous
+        # matchable `key[:=]value` token that the repo's own tree scan would
+        # flag; the runtime strings below still reconstruct real assignments.
+        token = "ab" + "c123"
+        unsafe_lines = (
+            "REDMINE" + "_API_KEY=" + token,
+            "api_key" + ": " + token,
+            "client" + "_secret = '" + token + "'",
+        )
+        for line in unsafe_lines:
+            self.assertTrue(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected unsafe line: {line!r}",
+            )
+
+    def test_real_secret_grep_line_filter_keeps_only_real_hits(self) -> None:
+        from mozyo_bridge.application import release as release_mod
+
+        token = "ab" + "c123"
+        grep_stdout = "\n".join(
+            (
+                "service.py:10:api_key=os.environ.get(API_KEY_ENV) or None",
+                "service.py:11:    api_key: str | None",
+                "config.env:1:REDMINE" + "_API_KEY=" + token,
+            )
+        )
+        kept = release_mod._real_secret_grep_lines(grep_stdout)
+        self.assertEqual(1, len(kept))
+        self.assertIn(token, kept[0])
+        self.assertTrue(kept[0].startswith("config.env:1:"))
+
 
 class ReleaseCheckScaffoldTest(unittest.TestCase):
     def test_scaffold_check_uses_isolated_home_and_targets(self) -> None:
@@ -271,6 +418,46 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
         fake_secret = "REDMINE" + "_API_KEY=" + "abc123"
         self.assertIsNone(pattern.search("Do not store tokens or secrets."))
         self.assertIsNotNone(pattern.search(fake_secret))
+
+    def test_artifact_tree_scan_filters_identifier_false_positives(self) -> None:
+        # Redmine #12175: the extracted-artifact scan applies the same
+        # credential classifier as `release check tree`, so packaged source
+        # that names a credential identifier is not flagged, while a personal
+        # path or a real literal secret still is.
+        from mozyo_bridge.application import release as release_mod
+
+        real_secret = "REDMINE" + "_API_KEY=" + "abc123"
+        personal_path = "/Users" + "/example/project"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "client.py").write_text(
+                "\n".join(
+                    (
+                        "api_key=os.environ.get(API_KEY_ENV) or None",
+                        "def __init__(self, *, api_key: str | None):",
+                        'API_KEY = "test-key-not-a-real-credential"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "pkg" / "leak.txt").write_text(
+                f"home: {personal_path}\n{real_secret}\n", encoding="utf-8"
+            )
+            personal_pattern = re.compile(
+                "|".join(release_mod._PERSONAL_PATH_PATTERNS)
+            )
+            hits = release_mod._grep_artifact_tree(root, personal_pattern)
+            hit_lines = [line for _path, _lineno, line in hits]
+            self.assertTrue(any(real_secret in line for line in hit_lines))
+            self.assertTrue(any(personal_path in line for line in hit_lines))
+            self.assertFalse(
+                any("os.environ.get(API_KEY_ENV)" in line for line in hit_lines)
+            )
+            self.assertFalse(
+                any("test-key-not-a-real-credential" in line for line in hit_lines)
+            )
 
     def test_does_not_mutate_repo_dist_directory(self) -> None:
         from mozyo_bridge.application import release as release_mod

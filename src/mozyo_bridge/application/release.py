@@ -71,6 +71,121 @@ _TREE_SECRET_VALUE_PATTERNS = (
     r"(^|[^[:alnum:]_])(ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|KEY)[[:space:]]*[:=][[:space:]]*[^<[:space:]#][^[:space:]#]*",
 )
 
+# The grep patterns above intentionally cast a wide net so they can run as a
+# single POSIX-ERE pass under `git grep` / artifact scanning. That net also
+# catches code that merely *names* a credential identifier — environment
+# lookups, type annotations, keyword/identifier references, and explicit
+# non-secret test sentinels — none of which are leaked credential values.
+# `_secret_assignment_is_real` is the second-stage classifier that decides
+# whether a candidate `key [:=] value` is an actual credential-shaped literal.
+# Both `release check tree` and the artifact scan post-filter grep candidates
+# through it so the gate fails on real leaks without blocking on safe code.
+_SECRET_KEY_ALTERNATION = (
+    r"(?:[A-Za-z0-9_]*(?:ASANA|GITHUB|PYPI|TWINE|REDMINE)[A-Za-z0-9_]*"
+    r"(?:TOKEN|SECRET|PASSWORD|KEY))"
+    r"|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:" + _SECRET_KEY_ALTERNATION + r")\s*[:=]\s*(?P<value>[^\s#]+)",
+    re.IGNORECASE,
+)
+# Characters that indicate the captured value is code / an expression / a
+# reference / a path rather than an opaque literal credential.
+_SECRET_EXPRESSION_CHARS = frozenset("()[]{}.|<>\\/ \t")
+# Python / JSON / shell literals that are never a credential value.
+_SECRET_VALUE_KEYWORDS = frozenset(
+    {"none", "true", "false", "null", "nil", "undefined", "..."}
+)
+# Case-insensitive substrings marking an explicit non-secret placeholder /
+# sentinel value (e.g. the `test-key-not-a-real-credential` test dummy).
+_SECRET_PLACEHOLDER_MARKERS = (
+    "example",
+    "placeholder",
+    "changeme",
+    "change-me",
+    "change_me",
+    "redacted",
+    "not-a-real",
+    "not_a_real",
+    "test-key",
+    "test_key",
+    "test-token",
+    "test_token",
+    "your-",
+    "your_",
+    "dummy",
+    "sentinel",
+    "sample",
+    "fake",
+    "xxxx",
+)
+
+
+def _secret_value_is_real(value: str) -> bool:
+    """Classify a captured assignment value as a real credential literal.
+
+    Rejects code / expressions / paths, keyword literals, explicit non-secret
+    placeholders, and bare identifier / constant / type references: an
+    ``os.environ`` read, a ``None`` default, a ``str`` annotation, an uppercase
+    constant reference, or an explicit non-credential test sentinel. Accepts an
+    opaque literal value — the non-placeholder right-hand side of an
+    ``api_key`` / ``*_API_KEY`` assignment. See the focused tests for the exact
+    accept / reject cases pinned by Redmine #12175.
+    """
+    raw = value.strip().rstrip(",;")
+    quoted = False
+    if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+        inner = raw[1:-1]
+        quoted = True
+    else:
+        inner = raw
+    if not inner:
+        return False
+    # A real credential carries alphanumeric content; punctuation-only values
+    # (stray quotes, separators) are never a leaked secret.
+    if not any(ch.isalnum() for ch in inner):
+        return False
+    # Code / expression / reference / path indicators are not literal secrets.
+    if any(ch in _SECRET_EXPRESSION_CHARS for ch in raw):
+        return False
+    lowered = inner.lower()
+    if lowered in _SECRET_VALUE_KEYWORDS:
+        return False
+    if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
+        return False
+    # Bare unquoted identifiers are name/type/constant references, not values:
+    # SCREAMING_SNAKE constants (API_KEY) and all-letter identifiers (str).
+    # A quoted value, or one mixing letters and digits (abc123), is a literal.
+    if not quoted and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
+        if inner == inner.upper():
+            return False
+        if inner.isalpha() and inner == inner.lower():
+            return False
+    return True
+
+
+def _secret_assignment_is_real(content: str) -> bool:
+    """True if any `key [:=] value` in `content` is a real credential literal."""
+    for match in _SECRET_ASSIGNMENT_RE.finditer(content):
+        if _secret_value_is_real(match.group("value")):
+            return True
+    return False
+
+
+def _real_secret_grep_lines(grep_stdout: str) -> list[str]:
+    """Keep only `git grep -n` lines whose value is a real credential literal.
+
+    `git grep -n` emits `path:lineno:content`; split off the content (which may
+    itself contain colons) before classifying.
+    """
+    real: list[str] = []
+    for line in grep_stdout.splitlines():
+        parts = line.split(":", 2)
+        content = parts[2] if len(parts) == 3 else line
+        if _secret_assignment_is_real(content):
+            real.append(line)
+    return real
+
 
 def _run(
     argv: Sequence[str],
@@ -218,16 +333,36 @@ def cmd_release_check_tree(args: argparse.Namespace) -> int:
             print(f"{path}: tracked local-secret file")
     elif not secret_file_check_ok:
         blockers.append("git ls-files failed")
-    for grep in (hygiene_grep, secret_grep):
-        if grep.returncode == 0 and grep.stdout:
+    # Personal-path hits are unambiguous and block as-is. Secret-value hits are
+    # only candidates: post-filter them through the credential classifier so the
+    # gate fails on real literal secrets but not on code that merely names a
+    # credential identifier (env reads, type annotations, references, sentinels).
+    if hygiene_grep.returncode == 0 and hygiene_grep.stdout:
+        matched = True
+        print(
+            hygiene_grep.stdout,
+            end="" if hygiene_grep.stdout.endswith("\n") else "\n",
+        )
+    elif hygiene_grep.returncode not in (0, 1):
+        if hygiene_grep.stderr:
+            print(
+                hygiene_grep.stderr,
+                end="" if hygiene_grep.stderr.endswith("\n") else "\n",
+            )
+        blockers.append("git grep failed")
+    if secret_grep.returncode in (0, 1):
+        real_secret_lines = _real_secret_grep_lines(secret_grep.stdout)
+        if real_secret_lines:
             matched = True
-            print(grep.stdout, end="" if grep.stdout.endswith("\n") else "\n")
-        elif grep.returncode == 1:
-            continue
-        else:
-            if grep.stderr:
-                print(grep.stderr, end="" if grep.stderr.endswith("\n") else "\n")
-            blockers.append("git grep failed")
+            for line in real_secret_lines:
+                print(line)
+    else:
+        if secret_grep.stderr:
+            print(
+                secret_grep.stderr,
+                end="" if secret_grep.stderr.endswith("\n") else "\n",
+            )
+        blockers.append("git grep failed")
     if matched:
         blockers.append("git grep hit personal path or secret-shape token")
     if not matched and not blockers:
@@ -469,7 +604,12 @@ def _extract_artifact(artifact: Path, dest: Path) -> Path:
     return target
 
 
-def _grep_artifact_tree(root: Path, pattern: re.Pattern[str]) -> list[tuple[Path, int, str]]:
+def _grep_artifact_tree(
+    root: Path, personal_pattern: re.Pattern[str]
+) -> list[tuple[Path, int, str]]:
+    # Personal-path matches block as-is; secret-value matches are post-filtered
+    # through the same credential classifier as `release check tree` so the
+    # artifact scan does not block on code that merely names a credential.
     hits: list[tuple[Path, int, str]] = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for filename in filenames:
@@ -484,7 +624,7 @@ def _grep_artifact_tree(root: Path, pattern: re.Pattern[str]) -> list[tuple[Path
             except (UnicodeDecodeError, OSError):
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
-                if pattern.search(line):
+                if personal_pattern.search(line) or _secret_assignment_is_real(line):
                     hits.append((path, lineno, line))
     return hits
 
@@ -538,11 +678,11 @@ def cmd_release_check_artifact(args: argparse.Namespace) -> int:
             print("- python -m build produced no artifacts")
             return EXIT_BLOCKER
 
-        pattern = re.compile(_artifact_grep_pattern())
+        personal_pattern = re.compile("|".join(_PERSONAL_PATH_PATTERNS))
         for artifact in artifacts:
             extracted = _extract_artifact(artifact, extract_root)
             _print_section(f"scan {artifact.name}")
-            hits = _grep_artifact_tree(extracted, pattern)
+            hits = _grep_artifact_tree(extracted, personal_pattern)
             if not hits:
                 print("(no matches)")
                 continue
