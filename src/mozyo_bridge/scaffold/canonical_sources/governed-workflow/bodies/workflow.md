@@ -168,12 +168,13 @@ implementation_done:
   actor: 実装者
   粒度: Task / Test / Bug / US のいずれにも記録できる。Task-level の記録は Codex review を伴わず、US audit の input になる
   必須: [変更ファイル, 実装意図, 前提, 未確認事項, 検証結果, docs更新, commit_or_diff]
+  commit記録要件: commit hash を durable anchor として記録する前に origin (共有 remote) から到達可能であること。未 push なら push 後に記録し、push 不能なら gate を blocked とする (`### Commit Hash Origin 到達可能性`)
 review_request:
   actor: 実装者
   標準粒度: UserStory (US-level audit request)。Task-level は us_level_audit.task_level例外 に該当する場合のみ
   必須:
     - implementation_done_journal (US-level では配下 issue の implementation_done journal 一覧)
-    - commit_or_diff (US-level では対象 commit 群)
+    - commit_or_diff (US-level では対象 commit 群。記録する commit hash は origin 到達可能であること: `### Commit Hash Origin 到達可能性`)
     - 変更ファイル
     - 配下issue一覧と各状態 (US-level のみ。残リスク・未完 scope を含む)
     - review観点
@@ -183,7 +184,8 @@ review_request:
 review:
   actor: 監査者
   標準粒度: UserStory。対象 commit だけでなく配下 Task / Test / Bug の issue / journal / docs / residual risk を横断して読む
-  必須: [対象commit_or_diff, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 未確認事項, 再review要否, 結論]
+  必須: [対象commit_or_diff, remote_verification, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 未確認事項, 再review要否, 結論]
+  remote_verification: 対象 commit 群が origin (共有 remote) 上に到達可能であることを read-only で確認する。確認できない場合は事実指摘ではなく blocker とし close へ進めない (`### Commit Hash Origin 到達可能性`)
   指摘事項_分類:
     - 事実: コード・設定・docs で確認済みの不整合のみ
     - 仮説: 確認すべき事項と確認方法を併記
@@ -205,7 +207,7 @@ owner_close_approval:
     - carve_out_check: none | <該当理由>
     - review_journal
     - qa_journal / production_verification_journal (該当 gate がある場合)
-    - commit_hash
+    - commit_hash (origin 到達可能であること: `### Commit Hash Origin 到達可能性`)
   制約: Review Gate とは別 journal。standing_delegation は `### Owner Close Approval Delegation` の発動条件をすべて満たす場合のみ
 close:
   us_close必須 (UserStory および親USを持たない単独issue):
@@ -214,11 +216,11 @@ close:
     - 残留リスク
     - review結果 (US では US-level audit)
     - owner_close_approval (Review Gate とは別 journal)
-    - commit_hash_record
+    - commit_hash_record (origin 到達可能であること。local-only commit では close 不可: `### Commit Hash Origin 到達可能性`)
     - close判断
   task_close必須 (US 配下の Task / Test / Bug):
     - implementation_done journal (検証結果・残リスクを含む)
-    - commit_hash_record (commit を伴う場合)
+    - commit_hash_record (commit を伴う場合。origin 到達可能であること: `### Commit Hash Origin 到達可能性`)
     - 未完 scope / 残リスクの親US引き継ぎ記録
     - per-issue Codex review: 不要 (us_level_audit.task_level例外 に該当する場合を除く)
     - 制約: US audit が journal から replay できない task close は invalid。US audit で gap が見つかれば reopen する
@@ -241,6 +243,27 @@ codex_direct_edit:
     - "お願いします"
     - "進めて"
     上記の短い命令だけでは codex_direct_edit gate は有効化しない
+```
+
+### Commit Hash Origin 到達可能性
+
+Implementation Done / Review Request / Review / owner_close_approval / Close の各 gate に記録する commit hash は、durable anchor として扱う前に **origin (共有 remote) から到達可能でなければならない**。未 push の local-only commit はサーバー側から原理的に検出できず、後続の監査・close・引き継ぎが replay できない anchor になる。
+
+```yaml
+origin到達可能性:
+  対象gate: [implementation_done, review_request, review, owner_close_approval, close]
+  実装者責務:
+    - Implementation Done / Review Request で commit hash を記録する前に、その commit が共有 remote へ push 済みで到達可能であることを確認する
+    - 確認は read-only (例: `git fetch` 後の `git branch -r --contains <hash>`、または `git merge-base --is-ancestor <hash> origin/<branch>`)
+    - 到達不能なら記録前に push する。push できない場合は gate を blocked とし理由を journal に残す。未 push の hash を anchor として記録しない
+  監査者責務:
+    - Review Gate で対象 commit 群が origin 上に到達可能であることを remote verification として確認し、結果を review journal に残す
+    - 到達性が確認できない場合は事実指摘ではなく blocker として扱い、close へ進めない
+  close制約:
+    - owner_close_approval / Close gate は origin 到達不能な commit hash では成立しない
+    - local-only commit に対する close は invalid。reopen + correction journal を起票する
+  禁止:
+    - 自動 push/pull 機構の導入。push は実装者の明示操作のままとし、gate 検証は read-only な到達性確認に限る
 ```
 
 ### Codex Direct Edit Gate
@@ -442,6 +465,12 @@ if ($agentがcodex()) then (yes)
   endif
 endif
 if ($gate有効("review_request")) then (yes)
+  $対象commitのorigin到達性をremote検証()
+  if ($commitがorigin到達不能()) then (yes)
+    $blockerを記録("対象commitがorigin到達不能でcloseへ進めない")
+    $claude_codeへ通知()
+    stop
+  endif
   $codex_us_auditを実行(対象commit群, 配下issue, journals, docs, residual_risk)
   $review_gateを記録()
   $claude_codeへ通知()
@@ -461,6 +490,7 @@ if ($agentがclaude_code() && $役割が実装者()) then (yes)
       $codexへ通知()
     endif
   endwhile
+  $記録前にcommitのorigin到達性を確認()
   $USのimplementation_doneを記録()
   $US_audit_requestを記録(review_request gate)
   $codexへaudit通知()
@@ -474,7 +504,7 @@ if ($close要求()) then (yes)
       stop
     endif
   else (no)
-    if ($review_gateあり() && $owner_close_approvalあり() && $commit_hash_recordあり()) then (yes)
+    if ($review_gateあり() && $owner_close_approvalあり() && $commit_hash_recordあり() && $commit_hashがorigin到達可能()) then (yes)
       $close_gateを記録()
     else (no)
       $close_blockedを記録()
@@ -502,6 +532,15 @@ stop
   - id: close_without_owner_approval
     条件: [issue:user_story_or_standalone, review_gate:present, owner_close_approval:missing]
     action: close禁止
+  - id: record_unreachable_commit_as_anchor
+    条件: [gate:implementation_done_or_review_request, commit_hash:未push_origin到達不能]
+    action: anchor記録禁止 (push後に記録、push不能ならblocked)
+  - id: review_without_remote_verification
+    条件: [agent:codex, gate:review, 対象commit:origin到達不能_または未確認]
+    action: blocker記録 (事実指摘扱いしない)しcloseへ進めない
+  - id: close_on_local_only_commit
+    条件: [gate:close_or_owner_close_approval, commit_hash:origin到達不能]
+    action: close禁止 (local-only commit を anchor にしない); reopen+correction
   - id: claude_asks_owner_directly
     条件: [agent:claude_code, owner判断:必要, codex_handoff:missing]
     action: stopしdurable recordにowner-action-needed/design_consultation/triage-pendingを記録しCodexへ集約
@@ -590,6 +629,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - 配下issue状態: (#<id> 状態 / implementation_done journal / 残リスク を issue ごとに列挙)
 - implementation_done_journal: (US 自身の summary journal)
 - commit_or_diff: (対象 commit 群)
+- commit_origin到達: (対象 commit が origin 到達可能か: push済み確認方法 / 未push理由)
 - changed_paths:
 - review_focus:
 - 未確認事項:
@@ -598,6 +638,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 
 ## Gate: review (US-level audit)
 - target_commit_or_diff: (対象 commit 群)
+- remote_verification: (対象 commit の origin 到達確認: 方法 / 結果。到達不能なら blocker)
 - 配下issue確認結果: (#<id> ごとの journal / 検証 / close 妥当性)
 - resolved_docs:
 - 照合規約:
@@ -609,7 +650,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 
 ## Gate: task_close (US 配下の Task / Test / Bug)
 - implementation_done_journal:
-- commit_hash: (commit を伴う場合)
+- commit_hash: (commit を伴う場合。origin 到達可能であること)
 - 親USへの引き継ぎ: (未完 scope / 残リスク / なし)
 - task_level例外該当: none | <該当理由と対応journal>
 
@@ -627,7 +668,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - review_journal:
 - qa_journal:
 - production_verification_journal:
-- commit_hash:
+- commit_hash: (origin 到達可能であること)
 
 ## Gate: close
 - 受け入れ確認:
@@ -635,7 +676,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - 残留リスク:
 - review結果journal:
 - owner_close_approval_journal:
-- commit_hash:
+- commit_hash: (origin 到達可能であること。local-only commit では close 不可)
 - close判断:
 ```
 
