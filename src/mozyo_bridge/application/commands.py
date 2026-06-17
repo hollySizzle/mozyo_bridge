@@ -47,6 +47,7 @@ from mozyo_bridge.domain.handoff import (
     SOURCES,
     build_delivery_record,
     build_execution_root,
+    build_inactive_pane_fallback_command,
     build_marker,
     build_notification_body,
     is_explicit_pane_target,
@@ -2825,7 +2826,13 @@ def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
     return notify_agent(args, "claude")
 
 
-def _emit_outcome(outcome, *, record_format: str = RECORD_FORMAT_BOTH, command: str | None = None) -> None:
+def _emit_outcome(
+    outcome,
+    *,
+    record_format: str = RECORD_FORMAT_BOTH,
+    command: str | None = None,
+    recovery_command: str | None = None,
+) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
     ``record_format=both`` (default) prints the multi-line record first, a
@@ -2834,11 +2841,18 @@ def _emit_outcome(outcome, *, record_format: str = RECORD_FORMAT_BOTH, command: 
     can paste the record block verbatim into the source-of-truth ticket
     system. ``json`` preserves the prior CLI shape for scripts; ``text`` is
     for callers that only want the markdown.
+
+    ``recovery_command`` (Redmine #12162) is an optional copy-pasteable
+    recovery command threaded into the markdown record for failure paths whose
+    structured ``(status, reason)`` is too generic to special-case inside
+    ``build_delivery_record`` (e.g. the queue-enter inactive-split block, which
+    emits the shared ``blocked / invalid_args`` reason). It does not affect the
+    ``json`` outcome shape that scripts scrape.
     """
     if record_format not in RECORD_FORMATS:
         die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {record_format!r}")
     if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
-        print(build_delivery_record(outcome, command=command))
+        print(build_delivery_record(outcome, command=command, recovery_command=recovery_command))
         if record_format == RECORD_FORMAT_BOTH:
             print("")
     if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
@@ -3380,6 +3394,22 @@ def orchestrate_handoff(
         # construction, not the foreground process the operator is looking at.
         # queue-enter requires the receiver pane to be the active split.
         observed_active = target_info.get("pane_active") or "<unknown>"
+        # Concrete strict-rail recovery (Redmine #12162). `target` is the
+        # already-resolved pane id (an explicit `%pane`), so `--target-repo auto`
+        # can pin its identity, and the command carries the same receiver /
+        # source / kind / anchor. This is the executable form of the prose hint
+        # that #12071 added — the dogfooding failure (#12137 j#60072/#60073) was
+        # that a `notify-*` caller forwarded into this rail, got blocked, and was
+        # left to reassemble the strict-rail command by hand. It does NOT weaken
+        # the guard: queue-enter still requires the active split; we only hand
+        # back the strict `--mode standard` retry, which observes the landing
+        # marker instead (`tmux-send-safety-contract.md`).
+        recovery_command = build_inactive_pane_fallback_command(
+            receiver=receiver,
+            kind=kind,
+            target=target,
+            anchor=anchor,
+        )
         _emit_outcome(
             make_outcome(
                 status="blocked",
@@ -3394,27 +3424,19 @@ def orchestrate_handoff(
             ),
             record_format=record_format,
             command=record_command,
+            recovery_command=recovery_command,
         )
-        # `--mode standard` fallback discoverability (Redmine #12071): the active
-        # split is a queue-enter-only requirement (Step 11) — strict `standard`
-        # relies on landing-marker observation rather than the pane being the
-        # foreground split, so it can deliver to an inactive same-identity pane.
-        # When the operator already named an explicit `%pane` *and* a
-        # `--target-repo` identity gate (a concrete root, or one resolved from
-        # `--target-repo auto` above), that fallback is the safest retry: the
-        # receiver is pinned by id and the workspace/repo root is re-checked. We
-        # present it as a fallback, never as a requirement — queue-enter stays the
-        # default rail (`tmux-send-safety-contract.md`).
-        explicit_pane = is_explicit_pane_target(getattr(args, "target", None))
-        has_repo_identity = bool(getattr(args, "target_repo", None))
-        if explicit_pane and has_repo_identity:
+        if recovery_command:
             fallback_hint = (
-                " Because you named an explicit `%pane` with a `--target-repo` "
-                "identity gate, the safest retry is `--mode standard` (fallback): "
-                "it does not require the receiver pane to be the active split, so "
-                "it can deliver to this inactive same-identity pane."
+                " The safest retry is the strict rail, which does not require "
+                "the receiver pane to be the active split (it observes the "
+                f"landing marker instead): `{recovery_command}`"
             )
         else:
+            # Defensive: `target` here is always an explicit resolved pane and
+            # `anchor` is already validated, so the recovery command normally
+            # builds. Keep the descriptive hint for any future caller shape that
+            # cannot form one.
             fallback_hint = (
                 " As a fallback you can pin the pane and re-check identity with "
                 "`--target %pane --target-repo auto` and retry under "

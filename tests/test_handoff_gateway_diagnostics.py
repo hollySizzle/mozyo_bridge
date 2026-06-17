@@ -363,10 +363,13 @@ class AutoTargetRepoTest(unittest.TestCase):
 
 
 class InactiveQueueEnterPaneFallbackTest(unittest.TestCase):
-    """Redmine #12071: an inactive queue-enter pane surfaces the `--mode standard`
-    fallback so the operator does not have to know the active-split constraint is
-    queue-enter-only. queue-enter stays the default rail — `--mode standard` reads
-    as a fallback, never a requirement (`tmux-send-safety-contract.md`).
+    """Redmine #12071 / #12162: an inactive queue-enter pane surfaces the
+    `--mode standard` fallback so the operator does not have to know the
+    active-split constraint is queue-enter-only. #12162 upgraded the prose hint
+    to a concrete, copy-pasteable `handoff send … --target %pane --target-repo
+    auto --mode standard` recovery command built from the resolved pane and
+    anchor. queue-enter stays the default rail — `--mode standard` reads as a
+    fallback, never a requirement (`tmux-send-safety-contract.md`).
     """
 
     def _git_repo(self) -> str:
@@ -429,28 +432,37 @@ class InactiveQueueEnterPaneFallbackTest(unittest.TestCase):
     def test_inactive_pane_with_repo_identity_names_standard_fallback(self) -> None:
         # Explicit pane + `--target-repo auto` (resolves to a concrete root): the
         # safest retry is the strict `--mode standard` rail, which does not need
-        # the active split. The active-split constraint is still explained.
+        # the active split. #12162: the hint is now the concrete recovery command
+        # carrying the resolved pane id and the durable anchor.
         outcome, err = self._run(
             target="%884", cwd=self._git_repo(), target_repo="auto"
         )
         self.assertEqual("invalid_args", outcome["reason"])
         self.assertIn("active split of its window", err)
         self.assertIn("pane_active=", err)
-        self.assertIn("--mode standard", err)
-        self.assertIn("fallback", err)
+        self.assertIn(
+            "mozyo-bridge handoff send --to codex --source redmine "
+            "--kind review_request --issue 12071 --journal 59628 "
+            "--target %884 --target-repo auto --mode standard",
+            err,
+        )
 
     def test_inactive_pane_without_repo_identity_hints_pin_and_standard(self) -> None:
-        # No `--target-repo`: the fallback hint guides the operator to pin the
-        # pane and re-check identity (`--target %pane --target-repo auto`) and
-        # retry under `--mode standard`, still framed as a fallback.
+        # No `--target-repo` on the original send: the recovery command is still
+        # built from the resolved pane id (#12162), so the operator gets the same
+        # concrete `--target %884 --target-repo auto --mode standard` retry — the
+        # resolved pane is always an explicit `%pane`, so `auto` can pin it.
         outcome, err = self._run(
             target="%884", cwd=self._git_repo(), target_repo=None
         )
         self.assertEqual("invalid_args", outcome["reason"])
         self.assertIn("active split of its window", err)
-        self.assertIn("--target %pane --target-repo auto", err)
-        self.assertIn("--mode standard", err)
-        self.assertIn("fallback", err)
+        self.assertIn(
+            "mozyo-bridge handoff send --to codex --source redmine "
+            "--kind review_request --issue 12071 --journal 59628 "
+            "--target %884 --target-repo auto --mode standard",
+            err,
+        )
 
     def test_active_pane_is_not_blocked_by_the_active_split_gate(self) -> None:
         # Control: the same explicit pane, active, is not rejected by Step 11 —

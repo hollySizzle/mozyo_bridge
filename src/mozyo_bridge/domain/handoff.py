@@ -588,6 +588,71 @@ def is_explicit_pane_target(target_arg: "Optional[str]") -> bool:
     return bool(target_arg) and target_arg.startswith("%")
 
 
+def build_inactive_pane_fallback_command(
+    *,
+    receiver: str,
+    kind: Optional[str],
+    target: Optional[str],
+    anchor: Optional[NormalizedAnchor],
+) -> Optional[str]:
+    """Build the copy-pasteable strict-rail recovery command for a queue-enter
+    inactive-split rejection (Redmine #12162).
+
+    When a `--mode queue-enter` send (including a `notify-*` wrapper that
+    defaults to queue-enter) resolves an explicit receiver pane but that pane is
+    not the active split, the Step 11 admission gate blocks with
+    ``blocked / invalid_args`` and types nothing. Pre-#12162 the operator only
+    got prose telling them strict ``--mode standard`` would work; they still had
+    to reassemble the whole command by hand, so the dogfooding handoff stalled on
+    a human re-dispatch decision (Redmine #12137 j#60072/#60073).
+
+    This returns the exact ``mozyo-bridge handoff send … --target %pane
+    --target-repo auto --mode standard`` they can run verbatim: same receiver,
+    source, kind, and durable anchor, pinned to the already-resolved ``%pane``
+    with a fail-closed ``--target-repo auto`` identity gate. The strict rail
+    observes the landing marker instead of requiring the active split, so it can
+    deliver to the inactive same-identity pane **without** weakening the
+    queue-enter guard (which stays the default rail).
+
+    Returns ``None`` when a safe explicit recovery cannot be formed (no resolved
+    explicit ``%pane``, unknown receiver, or no durable anchor); callers then
+    fall back to the descriptive hint. The command carries only pane ids, anchor
+    ids, and the ``auto`` sentinel — never an absolute path — so it is safe to
+    paste into a durable record
+    (``vibes/docs/rules/public-private-boundary.md``).
+    """
+    if not is_explicit_pane_target(target) or anchor is None or receiver not in RECEIVERS:
+        return None
+    parts = [
+        "mozyo-bridge",
+        "handoff",
+        "send",
+        "--to",
+        receiver,
+        "--source",
+        anchor.source,
+        "--kind",
+        kind or "<kind>",
+    ]
+    if isinstance(anchor, RedmineAnchor):
+        parts += ["--issue", anchor.issue, "--journal", anchor.journal]
+    else:  # AsanaAnchor
+        parts += ["--task-id", anchor.task_id]
+        if anchor.comment_id:
+            parts += ["--comment-id", anchor.comment_id]
+        elif anchor.anchor_url:
+            parts += ["--anchor-url", anchor.anchor_url]
+    parts += [
+        "--target",
+        str(target),
+        "--target-repo",
+        AUTO_TARGET_REPO,
+        "--mode",
+        MODE_STANDARD,
+    ]
+    return " ".join(parts)
+
+
 def _gateway_candidate_lines(candidates: "Iterable[Any]") -> list[str]:
     """Format Codex gateway candidate panes as ``- pane window cwd repo_root``.
 
@@ -811,7 +876,10 @@ def _execution_root_pointer_or_dash(execution_root: Optional[dict[str, Any]]) ->
 
 
 def build_delivery_record(
-    outcome: "DeliveryOutcome", *, command: Optional[str] = None
+    outcome: "DeliveryOutcome",
+    *,
+    command: Optional[str] = None,
+    recovery_command: Optional[str] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -844,6 +912,22 @@ def build_delivery_record(
     ]
     if command:
         lines.append(f"- Command: `{command}`")
+    if recovery_command:
+        # Redmine #12162: a concrete, copy-pasteable recovery command supplied
+        # by the caller for failure paths whose `(status, reason)` is too
+        # generic to special-case here (the queue-enter inactive-split block
+        # emits `blocked / invalid_args`, a reason shared with several gates).
+        # Keeping the command out of the shared-reason branches below means
+        # only the inactive-split rejection — which actually resolved a pane
+        # and anchor — surfaces it. Carries only pane/anchor ids and the `auto`
+        # sentinel, never an absolute path, so it is durable-record safe.
+        lines.append(
+            "- Fallback recovery: run "
+            f"`{recovery_command}` — the strict `--mode standard` rail observes "
+            "the landing marker instead of requiring the active split, so it "
+            "reaches the resolved inactive same-identity pane without weakening "
+            "the queue-enter guard."
+        )
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
         # Wording Requirements. This note does NOT override `next_action`;
@@ -943,6 +1027,7 @@ __all__: Iterable[str] = (
     "AUTO_TARGET_REPO",
     "build_delivery_record",
     "build_execution_root",
+    "build_inactive_pane_fallback_command",
     "build_marker",
     "build_notification_body",
     "cross_session_gateway_hint",
