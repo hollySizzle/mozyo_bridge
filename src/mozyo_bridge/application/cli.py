@@ -59,6 +59,14 @@ from mozyo_bridge.application import (
     cli_release,
     cli_workspace,
 )
+from mozyo_bridge.application.sublane_diagnostics import (
+    cmd_sublane_callback_recovery,
+    cmd_sublane_readiness,
+)
+from mozyo_bridge.domain.sublane_callback import (
+    CALLBACK_ABSENT,
+    CALLBACK_CHOICES,
+)
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.domain.agent_discovery import AGENT_KINDS
 from mozyo_bridge.domain.handoff import (
@@ -1184,6 +1192,78 @@ def build_parser() -> argparse.ArgumentParser:
         "`redmine-codex` is defined today.",
     )
     doctor_instruction.set_defaults(func=cmd_doctor_instruction)
+
+    # `sublane` groups the read-only sublane startup / callback-stall
+    # diagnostics (Redmine #12159). Both subcommands are pure over their inputs
+    # and never change handoff / queue-enter / launch behavior.
+    sublane = sub.add_parser(
+        "sublane",
+        help=(
+            "Read-only sublane startup readiness and callback-stall recovery "
+            "diagnostics (Redmine #12159)"
+        ),
+    )
+    sublane_sub = sublane.add_subparsers(dest="sublane_command", required=True)
+
+    sublane_readiness = sublane_sub.add_parser(
+        "readiness",
+        help=(
+            "Report whether future managed Claude panes launch in auto mode, "
+            "the coordinator-callback states this lane owes, and where the "
+            "stall-recovery path lives. Exits non-zero when permission mode is "
+            "not reproducible auto."
+        ),
+    )
+    sublane_readiness.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    sublane_readiness.set_defaults(func=cmd_sublane_readiness)
+
+    sublane_callback = sublane_sub.add_parser(
+        "callback-recovery",
+        help=(
+            "Classify a delivered-but-quiet unit of work into the four "
+            "callback-stall states from durable-record facts and print the "
+            "standard recovery path. Exits non-zero on a genuine stall."
+        ),
+    )
+    sublane_callback.add_argument(
+        "--dispatch-delivered",
+        dest="dispatch_delivered",
+        action="store_true",
+        help="A durable dispatch journal (Start / implementation_request / "
+        "coordinator routing) exists on the issue.",
+    )
+    sublane_callback.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        help="A newer durable gate / Progress Log journal appeared after the "
+        "dispatch (implementation_done, review_request, ...).",
+    )
+    sublane_callback.add_argument(
+        "--callback",
+        dest="callback",
+        choices=CALLBACK_CHOICES,
+        default=CALLBACK_ABSENT,
+        help="What the durable record shows about the cross-lane coordinator "
+        "callback. Default: absent.",
+    )
+    sublane_callback.add_argument(
+        "--stale-cli",
+        dest="stale_cli",
+        action="store_true",
+        help="Corroborating signal that a recorded callback attempt failed on "
+        "a stale installed CLI (only meaningful with `--callback delivery_failed`).",
+    )
+    sublane_callback.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON output instead of human-readable text",
+    )
+    sublane_callback.set_defaults(func=cmd_sublane_callback_recovery)
 
     # `runtime-config` is the canonical repo-local LLM runtime config group
     # (renamed from `instruction` in Redmine #11051 to free the word
