@@ -311,6 +311,39 @@ plan を適用する。境界:
 - tolerance 内 (既に fair) または column 2 未満なら benign no-op。
 - private absolute path は出力に含めない。
 
+### Structural Reconcile (`cockpit reconcile`)
+
+Redmine #12136 で structural layout-tree drift の repair 入口を実装した:
+`mozyo cockpit reconcile [--session <group>] [--ratio N] [--dry-run | --json] [--confirm]`。
+#12133 peer-adopt 後も残る、2 つの Unit column が 1 つの tmux top-level cell に
+nested する 2x2 grid drift (live `[ {%1104|%953}, {%1106|%954} ]`) を、各 Unit が
+独立した clean column になるよう flatten する。これにより #12135 rebalance が
+fail-closed せず動けるようになる。
+
+実装は pure domain (`parse_window_layout` / `build_cockpit_reconcile_plan` /
+`build_unit_columns_layout` / `layout_checksum`) + confirm-gated executor。
+**order-preserving** な手法を採る: `select-layout` は layout 文字列内の pane id を
+無視し live pane を **pane 順** で leaf に割り当てる (scratch 確認済み) ため、まず
+`swap-pane` で live pane 順を column-major (Unit0 codex, Unit0 claude, Unit1 codex,
+…) に揃え、続いて checksum-valid な `select-layout` を 1 回適用して各 Unit を
+既存の左右順のまま clean column に並べる。preview-first / confirm gate:
+`--dry-run` / `--json` と bare command は非変更 preview、`--confirm` のみ適用。境界:
+
+- Unit identity は pane option (`@mozyo_workspace_id` / `@mozyo_lane_id` /
+  `@mozyo_agent_role`) から読む。geometry から identity を推測しない。geometry
+  (`pane_left`) は Unit を左右に **並べる順序** にのみ使う。
+- **pane kill しない**。`swap-pane` / `select-layout` は live pane を move/relayout
+  するだけで identity option はそのまま乗る (re-stamp 不要)。
+- fail-closed: unidentified (role-less) pane (identity adoption = `cockpit adopt`
+  flow scope)、Unit 内の同一 role 重複 pane、1 Unit が複数 top-level cell に
+  またがる split、parse 不能 layout のいずれかで commands を出さず blocked。
+- residual risk: swap 後に `select-layout` が失敗した場合、pane は順序が変わるのみ
+  (kill なし) で recoverable。executor は fail-fast し「no pane killed / re-run」を
+  返す。再実行で live 順から再 sort する。
+- column 幅は valid な even fair share に設定する (`select-layout` が幅を要求する
+  ため)。細かな幅調整 / weight は #12135 rebalance / 将来 scope。
+- private absolute path は出力に含めない。
+
 ## Public / Private Boundary
 
 OSS default に入れてよいもの:
@@ -342,10 +375,13 @@ OSS default に入れてよいもの:
    `### Peer Adopt` を読む。
 2. `cockpit rebalance`: current live columns の width を desired / fair share に戻す。
    **実装済み (Redmine #12135)** — `### Width Rebalance` を読む。
-3. `cockpit move`: Unit column reorder primitive。
-4. `presentation-state DB`: `cockpit_group_membership` current table。
-5. display prefix projection: pane title / border label に `mozyo:` prefix を追加。
-6. drift-safe iTerm/WebViewer controls: raw pane move ではなく Unit move を呼ぶ UI。
+3. `cockpit reconcile`: nested 2x2 top-level cell drift を per-Unit column へ
+   flatten する structural repair。**実装済み (Redmine #12136)** —
+   `### Structural Reconcile` を読む。
+4. `cockpit move`: Unit column reorder primitive。
+5. `presentation-state DB`: `cockpit_group_membership` current table。
+6. display prefix projection: pane title / border label に `mozyo:` prefix を追加。
+7. drift-safe iTerm/WebViewer controls: raw pane move ではなく Unit move を呼ぶ UI。
 
 ## Non-Goals
 

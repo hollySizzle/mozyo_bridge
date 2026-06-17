@@ -1474,6 +1474,30 @@ def execute_cockpit_rebalance_plan(plan, run) -> None:
             )
 
 
+def execute_cockpit_reconcile_plan(plan, run) -> None:
+    """Run a :class:`CockpitReconcilePlan`'s swap + relayout commands (#12136), fail-fast.
+
+    ``run`` is a ``run_tmux``-style callable. The plan's ``swap-pane`` commands
+    reorder the live panes, then the single ``select-layout`` applies the per-Unit
+    columns. No command kills a pane — `swap-pane` / `select-layout` only move /
+    relayout live panes (identity rides with them). A non-zero tmux exit aborts
+    (``die``); because nothing is killed, a partial reorder is recoverable by
+    re-running reconcile (it re-sorts from the live order).
+    """
+    for cmd in plan.commands:
+        result = run(*cmd.argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip() or (
+                getattr(result, "stdout", "") or ""
+            ).strip()
+            die(
+                f"cockpit reconcile step failed ({cmd.purpose}): "
+                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}\n"
+                f"No pane was killed; re-run `mozyo cockpit reconcile` to continue "
+                f"from the current live layout."
+            )
+
+
 def cmd_layout_apply(args: argparse.Namespace) -> int:
     """`mozyo layout apply cockpit` — build/focus the cockpit layout (#11788).
 
@@ -2649,8 +2673,8 @@ def _handle_cockpit_rebalance(
     plan touches column width only — it emits no `set-option` (identity pane
     options stay put) and never `select-layout even-horizontal` (the Codex/Claude
     vertical splits stay intact). It fails closed on a structurally drifted column
-    (a #12130/#12133 nested cell), deferring that repair to doctor-geometry /
-    #12133. A cockpit already balanced within tolerance, or with fewer than two
+    (a nested 2x2 cell), deferring that repair to `mozyo cockpit reconcile`
+    (#12136). A cockpit already balanced within tolerance, or with fewer than two
     columns, is a benign no-op.
     """
     import json as _json
@@ -2741,6 +2765,176 @@ def _handle_cockpit_rebalance(
     return 0
 
 
+def _cockpit_pane_identity(session: str):
+    """``{pane_id: {workspace_id, lane_id, role}}`` from the live cockpit panes (#12136).
+
+    Reuses the read-only :func:`_read_cockpit_geometry` reader (it already lists
+    every cockpit pane with its `@mozyo_*` options) and projects the identity map
+    the reconcile planner groups Units by. Returns ``{}`` when the cockpit window
+    is absent.
+    """
+    panes = _read_cockpit_geometry(session)
+    if not panes:
+        return {}
+    return {
+        p["pane_id"]: {
+            "workspace_id": p.get("workspace_id", ""),
+            "lane_id": p.get("lane_id", ""),
+            "role": p.get("role", ""),
+        }
+        for p in panes
+        if p.get("pane_id")
+    }
+
+
+def _handle_cockpit_reconcile(
+    session: str, *, confirm: bool, json_output: bool, dry_run: bool,
+    codex_ratio: int = 70,
+) -> int:
+    """`mozyo cockpit reconcile` — preview/confirm structural layout-tree repair (#12136).
+
+    Reads the live cockpit ``window_layout`` tree and pane identity, and plans an
+    order-preserving flatten of any nested top-level cell (a 2x2 / mixed-Unit
+    drift) into clean per-Unit columns via `swap-pane` + a checksum-valid
+    `select-layout`. ``codex_ratio`` (CLI ``--ratio``) sizes the codex-over-claude
+    vertical split of each rebuilt column. Safety contract: the default path and
+    `--dry-run` / `--json` are non-mutating previews; only an explicit `--confirm`
+    (and not `--dry-run` / `--json`) runs the plan. It never kills a pane and never
+    re-infers identity from geometry. Fails closed on an unidentified pane (#12133
+    scope), a Unit split across cells, a duplicate same-role pane, or an
+    unparseable layout. A cockpit already one-Unit-per-column, or absent, is a
+    benign no-op.
+    """
+    import json as _json
+    import shlex as _shlex
+
+    from mozyo_bridge.domain.cockpit_layout import (
+        build_cockpit_reconcile_plan,
+        parse_window_layout,
+    )
+
+    layout = _read_cockpit_window_layout(session)
+    present = layout is not None
+    root = parse_window_layout(layout) if layout else None
+    # Fail closed on an unparseable-but-present layout: a non-empty layout string
+    # that did not parse must NOT be reported as "clean" (a no-op success); the
+    # safe outcome is a blocked preview / refusal, never a mutation.
+    if present and root is None:
+        message = (
+            f"cockpit reconcile: could not parse the live `window_layout` for "
+            f"session {session!r}; refusing to reconcile (fail-closed). Re-read "
+            f"and retry, or inspect the cockpit manually."
+        )
+        if json_output:
+            print(_json.dumps(
+                {"command": "cockpit reconcile", "executes": False,
+                 "would_execute": False, "confirm": confirm, "session": session,
+                 "cockpit_present": True, "drift": False, "clean": False,
+                 "blocked_reason": message, "current_layout": layout,
+                 "target_layout_checksum": None, "plan": None},
+                ensure_ascii=False, indent=2, sort_keys=True,
+            ))
+            return 0
+        die(message) if confirm and not dry_run else print(message)
+        return 0
+    identity = _cockpit_pane_identity(session)
+    plan = build_cockpit_reconcile_plan(
+        root, identity, session=session, codex_ratio=codex_ratio
+    )
+
+    would_execute = bool(
+        confirm and not dry_run and present and plan.drift and not plan.blocked_reason
+    )
+
+    if json_output:
+        target = plan.target_layout
+        payload = {
+            "command": "cockpit reconcile",
+            "executes": False,
+            "would_execute": would_execute,
+            "confirm": confirm,
+            "session": session,
+            "cockpit_present": present,
+            "drift": plan.drift,
+            "clean": plan.clean,
+            # Normalized audit fields: `blocked_reason` matches `plan.blocked_reason`;
+            # `current_layout` / `current_cells` are the observed before-state and
+            # `target_layout` / `target_layout_checksum` the planned after-state.
+            "blocked_reason": plan.blocked_reason,
+            "current_layout": layout,
+            "current_cells": [c.as_dict() for c in plan.cells],
+            "target_layout": target,
+            "target_layout_checksum": (
+                target.split(",", 1)[0] if target else None
+            ),
+            "plan": plan.as_dict(),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if not present:
+        print(
+            f"cockpit reconcile: no cockpit window for session {session!r} — "
+            "nothing to reconcile."
+        )
+        return 0
+
+    units = " | ".join(f"{ws}/{lane}" for ws, lane in plan.units_in_order)
+
+    # Preview: bare command (no `--confirm`) or `--dry-run`. No mutation.
+    if dry_run or not confirm:
+        print(
+            f"cockpit reconcile (preview; no tmux changes): session={session} "
+            f"cells={plan.cell_count} units={len(plan.units_in_order)}"
+        )
+        for cell in plan.cells:
+            names = ", ".join(f"{ws}/{lane}" for ws, lane in cell.unit_keys) or "-"
+            flag = " [tangled: >1 Unit in one cell]" if cell.tangled else ""
+            extra = (
+                f" unidentified={list(cell.unidentified_panes)}"
+                if cell.unidentified_panes
+                else ""
+            )
+            print(f"  cell {cell.index} (x={cell.x} w={cell.width}): {names}{flag}{extra}")
+        if plan.blocked_reason:
+            print(f"  cannot reconcile: {plan.blocked_reason}")
+        elif plan.clean:
+            print("  already one Unit per top-level column — nothing to reconcile.")
+        else:
+            print(f"  target Unit columns (left-to-right, order preserved): {units}")
+            print("  reconcile plan (swap-pane order fix + checksum select-layout; "
+                  "no pane killed, identity untouched):")
+            for cmd in plan.commands:
+                print(
+                    "    tmux " + " ".join(_shlex.quote(tok) for tok in cmd.argv)
+                )
+            print("  run `mozyo cockpit reconcile --confirm` to apply.")
+        return 0
+
+    # Confirm-gated execution: the only path that mutates tmux.
+    if plan.blocked_reason:
+        die(plan.blocked_reason)
+    if plan.clean or not plan.commands:
+        print(
+            f"cockpit reconcile: session {session!r} already one Unit per "
+            "top-level column — nothing to do."
+        )
+        return 0
+
+    require_tmux()
+    print(
+        f"cockpit reconcile: flattening nested cells into {len(plan.units_in_order)} "
+        f"per-Unit columns in cockpit {session!r}..."
+    )
+    execute_cockpit_reconcile_plan(plan, run_tmux)
+    _, after = _cockpit_rebalance_columns(session)
+    print(
+        f"  reconciled: {len(after)} top-level columns now align with Units; "
+        "run `mozyo cockpit rebalance` to even widths."
+    )
+    return 0
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -2794,6 +2988,18 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             confirm=bool(getattr(args, "confirm", False)),
             json_output=json_output,
             dry_run=dry_run,
+        )
+    # `mozyo cockpit reconcile` (Redmine #12136) is a whole-cockpit, confirm-gated
+    # structural repair — it flattens nested top-level cells into per-Unit columns
+    # so rebalance can run. Like rebalance/doctor-geometry it inspects every cell,
+    # not the current workspace, so it short-circuits before workspace resolution.
+    if getattr(args, "action", None) == "reconcile":
+        return _handle_cockpit_reconcile(
+            session,
+            confirm=bool(getattr(args, "confirm", False)),
+            json_output=json_output,
+            dry_run=dry_run,
+            codex_ratio=codex_ratio,
         )
     # `mozyo cockpit adopt` (Redmine #11897, Phase 1) is a detect-only sub-action:
     # it reports a co-existing normal `mozyo` session as an adopt candidate and

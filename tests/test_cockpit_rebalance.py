@@ -10,7 +10,7 @@ executor, and the preview-first / confirm-gated CLI wiring — all hermetic (no 
 tmux). Load-bearing guarantees: the plan touches column *width* only (no
 `set-option`, so identity pane options stay put; no `select-layout`, so the
 Codex/Claude vertical splits are not flattened); it conserves the total content
-width; and it FAILS CLOSED on a structurally drifted (#12130/#12133 nested) cell
+width; and it FAILS CLOSED on a structurally drifted (nested 2x2) cell
 rather than corrupting the layout. Synthetic, neutral identifiers only.
 """
 
@@ -58,7 +58,7 @@ def _clean_skew_layout():
 
 
 def _degenerate_layout():
-    """The live #12130/#12133 drift: cell A is a 2x2 grid of two Units.
+    """The live nested 2x2 drift: cell A is a 2x2 grid of two Units (#12136 scope).
 
     Top-level split has 4 cells; cell A is a vertical split whose children are
     horizontal sub-splits (two codex panes side by side over two claude panes),
@@ -166,7 +166,8 @@ class BuildRebalancePlanTest(unittest.TestCase):
         self.assertTrue(plan.drift)
         self.assertFalse(plan.balanced)
         self.assertEqual((), plan.commands)
-        self.assertIn("doctor-geometry", plan.blocked_reason)
+        self.assertIn("reconcile", plan.blocked_reason)
+        self.assertIn("#12136", plan.blocked_reason)
 
     def test_already_equal_is_balanced_no_op(self) -> None:
         layout = (
@@ -330,7 +331,7 @@ class CockpitRebalanceCommandTest(unittest.TestCase):
         )
         self.assertEqual(0, rc)
         self.assertIn("cannot rebalance", out)
-        self.assertIn("doctor-geometry", out)
+        self.assertIn("reconcile", out)
         require_tmux.assert_not_called()
         self.assertEqual([], run.calls)
 

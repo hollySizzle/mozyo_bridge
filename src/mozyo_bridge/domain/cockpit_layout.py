@@ -1281,13 +1281,13 @@ def build_cockpit_reset_plan(
 #
 # The column model is the tmux *window layout tree's top-level cells* — NOT an
 # x-overlap geometry cluster. The live `doctor-geometry` clustering can read a
-# structurally-drifted cockpit (a #12130/#12133 2x2 grid where two Units share
-# one tmux cell) as if it were clean columns; resizing such a cluster's pane only
-# moves an inner sub-split boundary and corrupts the layout. The layout tree is
-# the single source of truth for which boundaries are resizable, so rebalance
-# parses it and fails closed when a top-level column is not a clean,
-# full-width-resizable cell (deferring that structural repair to #12133 /
-# doctor-geometry, never half-resizing it).
+# structurally-drifted cockpit (a 2x2 grid where two Units share one tmux cell)
+# as if it were clean columns; resizing such a cluster's pane only moves an inner
+# sub-split boundary and corrupts the layout. The layout tree is the single source
+# of truth for which boundaries are resizable, so rebalance parses it and fails
+# closed when a top-level column is not a clean, full-width-resizable cell
+# (deferring that structural repair to `mozyo cockpit reconcile` / #12136, never
+# half-resizing it).
 #
 # Boundaries (`pane-centric-cockpit-semantics.md`):
 # - Observed geometry is the ONLY thing rebalance reads and writes: it equalizes
@@ -1365,8 +1365,9 @@ class LayoutColumn:
     when that leaf spans the FULL column width (a single pane, or a vertical
     Codex/Claude split whose panes share the column x-range). A column whose first
     leaf is narrower than the column carries a horizontal sub-split (a
-    #12130/#12133 structural drift), so resizing that leaf would move an inner
-    boundary, not the column — rebalance fails closed on it.
+    structural layout-tree drift; #12136 `cockpit reconcile` scope), so resizing
+    that leaf would move an inner boundary, not the column — rebalance fails closed
+    on it.
     """
 
     index: int
@@ -1527,8 +1528,9 @@ class CockpitRebalancePlan:
     """Plan to equalize the live cockpit's top-level column widths (#12135, pure).
 
     ``drift`` is ``True`` when a top-level column is not cleanly resizable (a
-    #12130/#12133 structural drift); then ``blocked_reason`` is set, ``commands``
-    is empty, and the confirm path refuses to mutate. ``balanced`` is ``True``
+    structural layout-tree drift; #12136 `cockpit reconcile` scope); then
+    ``blocked_reason`` is set, ``commands`` is empty, and the confirm path refuses
+    to mutate. ``balanced`` is ``True``
     when every column is already within ``tolerance`` of its fair share (or there
     are fewer than two columns) — also an empty-``commands`` no-op. Otherwise
     ``commands`` is the ordered `resize-pane -x` sequence, left to right, sizing
@@ -1581,8 +1583,8 @@ def build_cockpit_rebalance_plan(
     Fail-closed on structural drift: if ANY column is not cleanly resizable
     (``LayoutColumn.clean`` is ``False`` — a horizontal sub-split crams two Units
     into one tmux cell), the plan is :pyattr:`CockpitRebalancePlan.drift` with a
-    ``blocked_reason`` and NO commands; that structural repair is #12133 /
-    doctor-geometry scope, and half-resizing it would corrupt the layout. The
+    ``blocked_reason`` and NO commands; that structural repair is `mozyo cockpit
+    reconcile` / #12136 scope, and half-resizing it would corrupt the layout. The
     fair share otherwise keeps the total column *content* width constant (borders
     are not pane width and a resize never moves them), so the columns are
     redistributed evenly without resizing the window; columns are resized left to
@@ -1600,9 +1602,9 @@ def build_cockpit_rebalance_plan(
         reason = (
             f"cockpit {session!r} has a structurally drifted column that is not a "
             f"clean full-width split ({names}); its tmux cell carries a horizontal "
-            f"sub-split (a #12130/#12133 2x2 / mixed-Unit drift), so a width "
+            f"sub-split (a 2x2 / mixed-Unit layout-tree drift), so a width "
             f"resize would move an inner boundary and corrupt the layout. Resolve "
-            f"the structure first with `mozyo cockpit doctor-geometry` / #12133, "
+            f"the structure first with `mozyo cockpit reconcile` (#12136), "
             f"then rebalance. (rebalance only equalizes width; it does not repair "
             f"structure.)"
         )
@@ -1681,4 +1683,455 @@ def build_cockpit_rebalance_plan(
         drift=False,
         blocked_reason=None,
         commands=tuple(commands),
+    )
+
+
+# --- Cockpit structural reconcile (Redmine #12136) ----------------------------
+#
+# After #12133 peer-adopt resolved the missing/role-less identity, the live
+# cockpit can still carry a *structural* layout-tree drift: two Unit columns
+# nested inside ONE tmux top-level cell as a 2x2 grid (the live
+# `[ {%1104|%953}, {%1106|%954} ]` case). `doctor-geometry`'s x-cluster diagnosis
+# reports `ok` for it, but #12135 rebalance correctly fails closed because a width
+# resize would move an inner sub-split boundary. `mozyo cockpit reconcile` repairs
+# that structure so every Unit becomes its own clean top-level column and #12135
+# rebalance can then run.
+#
+# Mechanism (verified in scratch tmux, #12136 j#59853/j#59857): order-preserving
+# `swap-pane` + a checksum-valid `select-layout`. `select-layout` assigns the
+# window's CURRENT panes to the target layout's leaves in pane order, ignoring the
+# ids written in the layout string (scratch-confirmed). So reconcile first emits
+# `swap-pane` commands that sort the live pane order into the desired column-major
+# order (Unit0 codex, Unit0 claude, Unit1 codex, ...), then one `select-layout`
+# with a hand-built, checksum-valid layout that lays every Unit out as a clean
+# `[codex/claude]` top-level column in the SAME left-to-right order the operator
+# already sees. No pane is killed and identity options ride with the panes.
+#
+# Boundaries (`pane-centric-cockpit-semantics.md`, #12136 acceptance):
+# - Unit identity is read from pane options, NEVER inferred from geometry;
+#   geometry (`pane_left`) only ORDERS Units left-to-right for display.
+# - No pane kill. `swap-pane` / `select-layout` move/relayout live panes; identity
+#   rides with them (no re-stamp).
+# - Fails closed on an unidentified (role-less) pane (#12133 identity-adoption
+#   scope) or a Unit split across more than one top-level cell (a different drift).
+# - Column widths are set to an even fair share (a valid `select-layout` must
+#   specify widths); #12135 rebalance / future `width_weight` refine width.
+
+
+def layout_checksum(body: str) -> int:
+    """tmux ``window_layout`` checksum of a layout ``body`` (the part after ``csum,``).
+
+    Mirrors tmux's ``layout_checksum`` (layout-custom.c): a 16-bit rotate-add over
+    the body bytes. ``select-layout`` rejects a layout whose ``%04x`` checksum
+    prefix does not match, so reconcile computes it here (pure) to build a valid
+    custom layout string.
+    """
+    csum = 0
+    for ch in body:
+        csum = ((csum >> 1) + ((csum & 1) << 15)) & 0xFFFF
+        csum = (csum + ord(ch)) & 0xFFFF
+    return csum
+
+
+def format_custom_layout(body: str) -> str:
+    """Prefix a layout ``body`` with its tmux checksum: ``<csum>,<body>`` (pure)."""
+    return f"{layout_checksum(body):04x},{body}"
+
+
+def _pane_num(pane_id: str) -> str:
+    """tmux layout strings carry the bare pane number (no leading ``%``)."""
+    return pane_id[1:] if pane_id.startswith("%") else pane_id
+
+
+@dataclass(frozen=True)
+class ReconcileUnit:
+    """One Unit projected for reconcile, with its panes by role (#12136).
+
+    Identity (``workspace_id`` / ``lane_id``) is from pane options; ``codex_pane``
+    / ``claude_pane`` are ``""`` when that role is absent (a missing peer, #12133
+    scope, kept as a single-pane column rather than adopted). ``min_x`` is the
+    leftmost observed x, used only to order Units left-to-right.
+    """
+
+    workspace_id: str
+    lane_id: str
+    codex_pane: str
+    claude_pane: str
+    pane_ids: tuple[str, ...]
+    min_x: int
+    cell_index: int
+
+    @property
+    def ordered_panes(self) -> tuple[str, ...]:
+        """The Unit's panes top-to-bottom: codex over claude (present roles only)."""
+        out = []
+        if self.codex_pane:
+            out.append(self.codex_pane)
+        if self.claude_pane:
+            out.append(self.claude_pane)
+        return tuple(out)
+
+    def as_dict(self) -> dict:
+        return {
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "codex_pane": self.codex_pane,
+            "claude_pane": self.claude_pane,
+            "pane_ids": list(self.pane_ids),
+            "min_x": self.min_x,
+            "cell_index": self.cell_index,
+        }
+
+
+@dataclass(frozen=True)
+class ReconcileCell:
+    """One top-level tmux cell projected for reconcile (#12136).
+
+    ``tangled`` (more than one Unit in the cell) is the structural drift reconcile
+    repairs. ``unidentified_panes`` are leaves with no Unit identity; their
+    presence blocks reconcile (identity adoption is the `cockpit adopt` flow, not
+    structural reconcile).
+    """
+
+    index: int
+    x: int
+    width: int
+    pane_ids: tuple[str, ...]
+    unit_keys: tuple[tuple[str, str], ...]
+    unidentified_panes: tuple[str, ...]
+
+    @property
+    def tangled(self) -> bool:
+        return len(self.unit_keys) > 1
+
+    def as_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "x": self.x,
+            "width": self.width,
+            "pane_ids": list(self.pane_ids),
+            "unit_keys": [list(k) for k in self.unit_keys],
+            "unidentified_panes": list(self.unidentified_panes),
+            "tangled": self.tangled,
+        }
+
+
+@dataclass(frozen=True)
+class CockpitReconcilePlan:
+    """Plan to flatten nested top-level cells into per-Unit columns (#12136, pure).
+
+    ``drift`` is ``True`` when a top-level cell is tangled (more than one Unit).
+    ``blocked_reason`` is set (and ``commands`` empty) when reconcile cannot safely
+    proceed — an unidentified pane (identity-adoption / `cockpit adopt` scope), a
+    duplicate same-role pane, or a Unit split across more than
+    one top-level cell. ``clean`` is ``True`` when every top-level cell already
+    maps to exactly one Unit (a benign no-op). When ``drift``, ``swap_commands``
+    sort the live pane order and ``layout_command`` applies the checksum-valid
+    ``target_layout`` (one clean ``[codex/claude]`` column per Unit, original
+    left-to-right order). No command kills a pane.
+    """
+
+    session: str
+    window: str
+    codex_ratio: int
+    claude_ratio: int
+    cells: tuple[ReconcileCell, ...]
+    units_in_order: tuple[tuple[str, str], ...]
+    drift: bool
+    clean: bool
+    blocked_reason: Optional[str]
+    swap_commands: tuple[CockpitCommand, ...]
+    layout_command: Optional[CockpitCommand]
+    target_layout: Optional[str]
+
+    @property
+    def cell_count(self) -> int:
+        return len(self.cells)
+
+    @property
+    def commands(self) -> tuple[CockpitCommand, ...]:
+        """All planned commands in execution order: swaps, then the relayout."""
+        if self.layout_command is None:
+            return self.swap_commands
+        return self.swap_commands + (self.layout_command,)
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "window": self.window,
+            "codex_ratio": self.codex_ratio,
+            "claude_ratio": self.claude_ratio,
+            "cell_count": self.cell_count,
+            "units_in_order": [list(k) for k in self.units_in_order],
+            "drift": self.drift,
+            "clean": self.clean,
+            "blocked_reason": self.blocked_reason,
+            "target_layout": self.target_layout,
+            "swap_commands": [c.as_dict() for c in self.swap_commands],
+            "layout_command": (
+                self.layout_command.as_dict()
+                if self.layout_command is not None
+                else None
+            ),
+            "commands": [c.as_dict() for c in self.commands],
+        }
+
+
+def _collect_reconcile_units(
+    root: Optional[LayoutCell],
+    identity: Mapping[str, Mapping[str, object]],
+) -> tuple[list[ReconcileCell], list[ReconcileUnit], list[str], list[str]]:
+    """Project top-level cells + their Units from the layout tree + pane identity.
+
+    Returns ``(cells, units, unidentified_panes, duplicate_role_panes)``.
+    """
+    if root is None:
+        return [], [], [], []
+    cells_in = root.children if root.orient == "h" else (root,)
+    cells: list[ReconcileCell] = []
+    units: list[ReconcileUnit] = []
+    all_unidentified: list[str] = []
+    duplicates: list[str] = []
+    for index, cell in enumerate(cells_in):
+        leaves = cell.leaves()
+        by_unit: dict[tuple[str, str], dict] = {}
+        order: list[tuple[str, str]] = []
+        unidentified: list[str] = []
+        for leaf in leaves:
+            pane_id = leaf.pane_id or ""
+            info = identity.get(pane_id) or {}
+            ws = str(info.get("workspace_id") or "")
+            role = str(info.get("role") or "")
+            lane = normalize_lane(info.get("lane_id"))  # type: ignore[arg-type]
+            if not ws or role not in ROLES:
+                unidentified.append(pane_id)
+                all_unidentified.append(pane_id)
+                continue
+            key = (ws, lane)
+            bucket = by_unit.get(key)
+            if bucket is None:
+                bucket = {"codex": "", "claude": "", "panes": [], "min_x": leaf.x}
+                by_unit[key] = bucket
+                order.append(key)
+            if bucket[role]:
+                # A Unit must have at most one pane per role; a second codex (or
+                # second claude) is ambiguous — record it so reconcile blocks
+                # rather than silently dropping a pane.
+                duplicates.append(pane_id)
+            else:
+                bucket[role] = pane_id
+            bucket["panes"].append(pane_id)
+            bucket["min_x"] = min(bucket["min_x"], leaf.x)
+        order.sort(key=lambda k: (by_unit[k]["min_x"], k[0], k[1]))
+        cells.append(
+            ReconcileCell(
+                index=index,
+                x=cell.x,
+                width=cell.width,
+                pane_ids=tuple(leaf.pane_id for leaf in leaves if leaf.pane_id),
+                unit_keys=tuple(order),
+                unidentified_panes=tuple(unidentified),
+            )
+        )
+        for key in order:
+            units.append(
+                ReconcileUnit(
+                    workspace_id=key[0],
+                    lane_id=key[1],
+                    codex_pane=by_unit[key]["codex"],
+                    claude_pane=by_unit[key]["claude"],
+                    pane_ids=tuple(by_unit[key]["panes"]),
+                    min_x=by_unit[key]["min_x"],
+                    cell_index=index,
+                )
+            )
+    return cells, units, all_unidentified, duplicates
+
+
+def plan_pane_swaps(
+    current_order: Sequence[str], desired_order: Sequence[str]
+) -> list[tuple[str, str]]:
+    """Selection-sort ``current_order`` into ``desired_order`` as ``swap-pane`` pairs.
+
+    Each returned ``(a, b)`` is a ``swap-pane -s a -t b`` that exchanges the two
+    panes' positions; applying them in order transforms the live pane order into
+    ``desired_order`` (pure — the caller emits the tmux commands). Assumes both
+    sequences are permutations of the same pane set.
+    """
+    cur = list(current_order)
+    swaps: list[tuple[str, str]] = []
+    for i, want in enumerate(desired_order):
+        if cur[i] == want:
+            continue
+        j = cur.index(want, i + 1)
+        swaps.append((cur[i], cur[j]))
+        cur[i], cur[j] = cur[j], cur[i]
+    return swaps
+
+
+def build_unit_columns_layout(
+    units_in_order: Sequence[ReconcileUnit],
+    *,
+    window_width: int,
+    window_height: int,
+    codex_ratio: int = DEFAULT_CODEX_RATIO,
+) -> tuple[str, list[str]]:
+    """Build a checksum-less layout body of one clean column per Unit (pure).
+
+    Returns ``(body, desired_leaf_order)``: a tmux layout body laying each Unit
+    out left-to-right as a full-height column (a ``[codex/claude]`` vertical split,
+    or a single leaf for a missing-peer Unit) at an even fair-share width, plus the
+    column-major pane-id order the live panes must be swapped into before
+    ``select-layout`` (it assigns panes by order). Widths/heights are kept
+    internally consistent so tmux accepts the layout.
+    """
+    codex_ratio = normalize_ratio(codex_ratio)
+    n = len(units_in_order)
+    w = max(1, int(window_width))
+    h = max(2, int(window_height))
+    content_w = max(n, w - (n - 1)) if n else w
+    widths = fair_share_widths(content_w, n) if n else []
+
+    cols: list[str] = []
+    leaf_order: list[str] = []
+    x = 0
+    for i, unit in enumerate(units_in_order):
+        cw = widths[i]
+        panes = unit.ordered_panes
+        if len(panes) >= 2:
+            codex_h = max(1, min(h - 2, round((h - 1) * codex_ratio / 100)))
+            claude_h = (h - 1) - codex_h
+            col = (
+                f"{cw}x{h},{x},0["
+                f"{cw}x{codex_h},{x},0,{_pane_num(panes[0])},"
+                f"{cw}x{claude_h},{x},{codex_h + 1},{_pane_num(panes[1])}]"
+            )
+            leaf_order.extend([panes[0], panes[1]])
+        else:
+            col = f"{cw}x{h},{x},0,{_pane_num(panes[0])}"
+            leaf_order.append(panes[0])
+        cols.append(col)
+        x += cw + 1
+
+    body = f"{w}x{h},0,0{{" + ",".join(cols) + "}"
+    return body, leaf_order
+
+
+def build_cockpit_reconcile_plan(
+    root: Optional[LayoutCell],
+    identity: Mapping[str, Mapping[str, object]],
+    *,
+    session: str = COCKPIT_SESSION_DEFAULT,
+    codex_ratio: int = DEFAULT_CODEX_RATIO,
+) -> CockpitReconcilePlan:
+    """Plan flattening nested top-level cells into per-Unit columns (#12136, pure).
+
+    ``root`` is the parsed ``window_layout`` tree (:func:`parse_window_layout`);
+    ``identity`` maps each ``pane_id`` to its ``{workspace_id, lane_id, role}`` from
+    pane options. Pure: returns a :class:`CockpitReconcilePlan`, runs no tmux.
+
+    Fail-closed (``blocked_reason``, no commands) when a cockpit pane is
+    unidentified (#12133 identity-adoption scope), a Unit has a duplicate same-role
+    pane, or a Unit spans more than one top-level cell. When a top-level cell is
+    tangled, the plan is the
+    order-preserving `swap-pane` sequence (sort the live pane order into
+    column-major Unit order) followed by one checksum-valid `select-layout` that
+    lays every Unit out as a clean column in its existing left-to-right order.
+    """
+    codex_ratio = normalize_ratio(codex_ratio)
+    claude_ratio = 100 - codex_ratio
+    cells, units, unidentified, duplicates = _collect_reconcile_units(root, identity)
+
+    # Global left-to-right Unit order: cells are left-to-right, and units within a
+    # cell are already min_x-sorted, so concatenating preserves visual order.
+    units_in_order = tuple((u.workspace_id, u.lane_id) for u in units)
+
+    cell_of_unit: dict[tuple[str, str], set[int]] = {}
+    for u in units:
+        cell_of_unit.setdefault((u.workspace_id, u.lane_id), set()).add(u.cell_index)
+    split_units = sorted(k for k, idx in cell_of_unit.items() if len(idx) > 1)
+
+    blocked_reason: Optional[str] = None
+    if unidentified:
+        blocked_reason = (
+            f"cockpit {session!r} has unidentified pane(s) "
+            f"({', '.join(sorted(set(unidentified)))}) with no @mozyo_workspace_id "
+            f"/ @mozyo_agent_role; structural reconcile needs Unit identity from "
+            f"pane options. Adopt identity with the `mozyo cockpit adopt` flow "
+            f"(diagnose first with `mozyo cockpit doctor-geometry`); resolve "
+            f"identity, then reconcile."
+        )
+    elif duplicates:
+        blocked_reason = (
+            f"cockpit {session!r} has a Unit with more than one pane of the same "
+            f"role (duplicate pane(s) {', '.join(sorted(set(duplicates)))}); a clean "
+            f"column needs exactly one codex and/or one claude per Unit. Refusing "
+            f"to reconcile (fail-closed) — resolve the duplicate role first."
+        )
+    elif split_units:
+        names = ", ".join(f"{ws}/{lane}" for ws, lane in split_units)
+        blocked_reason = (
+            f"cockpit {session!r} has Unit(s) split across more than one top-level "
+            f"cell ({names}); this reconcile flattens nested cells but does not "
+            f"re-merge a split Unit. Resolve manually or via a future reconcile mode."
+        )
+
+    tangled = any(c.tangled for c in cells)
+    drift = tangled and blocked_reason is None
+    clean = blocked_reason is None and not drift
+
+    swap_commands: list[CockpitCommand] = []
+    layout_command: Optional[CockpitCommand] = None
+    target_layout: Optional[str] = None
+
+    if drift and root is not None:
+        current_order = [leaf.pane_id for leaf in root.leaves() if leaf.pane_id]
+        body, desired_order = build_unit_columns_layout(
+            units,
+            window_width=root.width,
+            window_height=root.height,
+            codex_ratio=codex_ratio,
+        )
+        if sorted(current_order) != sorted(desired_order):
+            # The leaf set and the identified-Unit pane set disagree (e.g. a pane
+            # appeared/vanished mid-read): refuse rather than emit a layout that
+            # would not cover every pane.
+            blocked_reason = (
+                f"cockpit {session!r} live pane set does not match the identified "
+                f"Unit panes; refusing to relayout. Re-read and retry."
+            )
+            drift = False
+            clean = False
+        else:
+            for src, dst in plan_pane_swaps(current_order, desired_order):
+                swap_commands.append(
+                    CockpitCommand(
+                        argv=("swap-pane", "-s", src, "-t", dst),
+                        captures=None,
+                        purpose=f"reconcile: order pane {src} before {dst}",
+                    )
+                )
+            target_layout = format_custom_layout(body)
+            layout_command = CockpitCommand(
+                argv=(
+                    "select-layout", "-t", f"{session}:{COCKPIT_WINDOW}",
+                    target_layout,
+                ),
+                captures=None,
+                purpose="reconcile: apply per-Unit top-level columns",
+            )
+
+    return CockpitReconcilePlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        codex_ratio=codex_ratio,
+        claude_ratio=claude_ratio,
+        cells=tuple(cells),
+        units_in_order=units_in_order,
+        drift=drift,
+        clean=clean,
+        blocked_reason=blocked_reason,
+        swap_commands=tuple(swap_commands),
+        layout_command=layout_command,
+        target_layout=target_layout,
     )

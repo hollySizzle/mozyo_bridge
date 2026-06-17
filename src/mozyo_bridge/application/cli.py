@@ -506,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=[
             "append", "adopt", "reset", "rebuild", "doctor-geometry",
-            "peer-adopt", "rebalance",
+            "peer-adopt", "rebalance", "reconcile",
         ],
         default=None,
         help=(
@@ -536,7 +536,13 @@ def build_parser() -> argparse.ArgumentParser:
             "live columns toward an equal fair-share width with `resize-pane` and "
             "`--confirm`; it touches column width only — identity pane options are "
             "untouched, the Codex/Claude vertical splits are not flattened, and the "
-            "#12133 missing/role-less drift is left to that scope. Without "
+            "#12133 missing/role-less drift is left to that scope. `reconcile` (Redmine "
+            "#12136) repairs a structural layout-tree drift where two Units are "
+            "nested in one tmux cell (a 2x2 grid): with `--confirm` it flattens "
+            "each tangled cell into clean per-Unit columns (order preserved) via "
+            "`swap-pane` + a checksum-valid `select-layout`, killing no pane and "
+            "reading Unit identity from pane options; it fails closed on an "
+            "unidentified pane (#12133 scope). Without "
             "`--confirm` every other sub-action is detect-only / preview and "
             "mutates nothing; `--dry-run` / `--json` always preview without "
             "mutating."
@@ -592,9 +598,10 @@ def build_parser() -> argparse.ArgumentParser:
             "codex/claude panes into the cockpit; for `reset` / `rebuild` "
             "(Redmine #11814) it kills (and, for rebuild, recreates) the "
             "mozyo-identified cockpit session; for `rebalance` (Redmine #12135) "
-            "it applies the `resize-pane` fair-share width plan. Required to "
-            "mutate; without it these sub-actions are detect-only / preview. "
-            "`--dry-run` / `--json` still only preview."
+            "it applies the `resize-pane` fair-share width plan; for `reconcile` "
+            "(Redmine #12136) it applies the `swap-pane` + `select-layout` "
+            "structural flatten. Required to mutate; without it these sub-actions "
+            "are detect-only / preview. `--dry-run` / `--json` still only preview."
         ),
     )
     cockpit.add_argument(
