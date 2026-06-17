@@ -70,11 +70,42 @@ sublane Claude は bounded implementation worker (skill `### Sublane Claude` / `
 - callback が来ない場合は「delivered dispatch journal + 期待 durable journal 欠如」で stall candidate を判定し 4 状態に分類する (skill `## Stall And No-Progress Detection Standard`)。
 - main unit に Claude pane がある場合は assistant 用途に限定する (skill `## Main-Unit Claude Safe-Use Boundary`)。
 
+### callback が欠けた時の coordinator sweep
+
+callback は pointer なので、欠けても durable progress が消えるわけではない。
+coordinator は新しい sublane を開く前に、active lane の Redmine journal を sweep
+し、次を分類して記録する。
+
+- durable progress があるが coordinator callback / ack が無い:
+  `progress_without_callback`。既存 journal を拾って review / close flow へ進め、
+  done な work を再 dispatch しない。
+- durable progress も無い: `no_progress_after_handoff`。delivery anchor と期待 gate
+  を明示して再通知または blocker 化する。
+- callback 試行が失敗している: `callback_delivery_failed`。失敗理由を読み、
+  stale CLI なら repo-local CLI で再通知する。
+- progress はあるが callback / receive-method journal が無い:
+  `callback_not_attempted`。process gap として記録し、必要なら sublane 側へ補正を
+  依頼する。
+
+この sweep は owner approval や close を self-authorize しない。review gate、
+owner close approval、status close はそれぞれ別 gate として処理する。#12145 の
+ように implementation_done / review / owner_close_approval / integration が揃った
+後も Redmine status が `着手中` のまま残る場合は、[[logic-sublane-bandwidth-policy]]
+の `close_waiting` として扱い、新規 dispatch より先に close gate と status を
+整合させる。
+
 ## 6. review / merge / push / CI / lane retirement
 
 - review 粒度は preset に従う (UserStory 単位の US-level audit、または単独 issue の per-issue review; central preset / skill `## Ticket System Conventions`)。
 - commit は audit record 成立後に Codex が audit-approved diff のみを commit する (skill `## Audit-Owned Commit Authority`)。implementer は commit を作らず diff を残す運用も可。
 - push / CI は coordinator / owner gated。push 前に local checks が green であること、push 後に CI 結果を durable record に記録する。
+- commit-bearing work を close する前に、integration disposition を durable record に残す。少なくとも次のいずれかを Close Gate の basis に含める:
+  - target branch に merge 済み。
+  - push 済みで、CI / merge owner / branch が記録済み。
+  - `git cherry -v <base> <branch>` 等で target branch と patch-equivalent と確認済み。
+  - integration を明示 defer し、残す branch / commit / owner / follow-up issue が記録済み。
+  - no-commit / docs-only 等で integration 不要であることが明示済み。
+  review approval と owner close approval だけでは、local sublane commit の所在を保証しない。commit-bearing work の integration disposition が無い場合は `integration_waiting` として扱い、status close より先に drain する。
 - lane retirement (worktree 削除) は **素の git** で行い、削除前に dirty / in-scope 変更が無いことを確認する safety step を必ず踏む ([[logic-worktree-lifecycle-boundary]])。
 - routine retirement は coordinator Codex の責務であり、条件を満たす lane は owner 確認なしに退役してよい。条件は [[logic-worktree-lifecycle-boundary]] `## sublane retirement authority` を読む。
 - owner approval が必要なのは、未統合 commit、scope 不明 dirty diff、credential / private 情報の可能性、owner 判断待ち、active review / handoff、identity ambiguity など、routine retirement 条件を外れる場合である。
@@ -94,6 +125,7 @@ git worktree remove <worktree-path>
 | stale installed CLI (landed 直後の subcommand を拒否) | repo-local CLI (`PYTHONPATH=src python3 -m mozyo_bridge`) を使う | skill `## Dogfooding Version Boundary` / `## Stall ... Stale CLI` |
 | Claude pane が auto mode でない | cockpit / sublane 作成経路の launch-context policy default で `claude --permission-mode auto` を再現可能に付与する (#11925)。`settings.json` には書かない。`MOZYO_CLAUDE_PERMISSION_MODE` は override rail。既存 pane には非 retroactive (手動切替 / 再起動が必要)。`dry-run` / `doctor claude_launch_policy` で検出する | `#11924` / `#11925` / [[logic-cockpit-sublane-operating-model]] |
 | stalled lane / callback 欠落 | durable record から stall candidate を判定・分類し、再通知を journal に残す | skill `## Stall And No-Progress Detection Standard` |
+| close-ready issue が open のまま残る | close gate / owner close approval / integration record を照合し、`close_waiting` として新規 dispatch より先に閉じる | [[logic-sublane-bandwidth-policy]] |
 | cockpit 列幅の偏り | operator が手動 rebalance (display 品質問題; identity は不変) | operator runtime; [[logic-cockpit-sublane-operating-model]] |
 
 これらは observed friction ([[logic-cockpit-sublane-operating-model]] `## 観測された前提`) への運用対処であり、core CLI への取り込みではない。
