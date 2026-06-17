@@ -295,6 +295,32 @@ def _seed_builtin_registry() -> BuiltinProviderRegistry:
             ),
         )
     )
+    # The tmux attention presentation provider seam landed in #12156. It is
+    # read/projection-first: it projects core attention records onto pane user
+    # options and never owns routing or approval. ``provider_id`` matches the
+    # real TmuxAttentionPresentationProvider.name.
+    registry.register(
+        BuiltinProvider(
+            category=ProviderCategory.PRESENTATION,
+            provider_id="tmux-presentation",
+            summary="Built-in tmux attention presentation provider (projects "
+            "core attention records onto pane user options; read-only).",
+            capabilities=frozenset(
+                {
+                    "project_attention",
+                    "tmux_user_option_projection",
+                }
+            ),
+            safety_constraints=frozenset(
+                {
+                    "projection_only",
+                    "no_routing_authority",
+                    "no_owner_approval_decision",
+                    "re_derivable_cache",
+                }
+            ),
+        )
+    )
     return registry
 
 

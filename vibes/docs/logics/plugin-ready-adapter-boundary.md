@@ -487,6 +487,56 @@ functions, never provider methods); the registry makes it a checked invariant
 for every classified provider. Tests pin both the forbidden set and the
 rejection.
 
+## Implemented Presentation Seam (Redmine #12156)
+
+The presentation adapter boundary's first concrete cut (the v0.8 "Candidate 2"
+slice) now exists in code, deliberately the smallest read-only/projection-first
+seam that makes the design's presentation-provider concept explicit without
+giving display any routing or approval authority.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/presentation_adapter.py` — **core**, pure. The
+  recognized projection-surface vocabulary (`tmux_user_option`, `text`); the
+  normalized records `ProjectionField` and `SurfaceProjection`; and the
+  `PresentationProvider` protocol (the built-in presentation-provider boundary).
+  It imports no provider implementation, so the dependency only ever points
+  provider -> core. The core projection shapes (`TargetRecord` / `UnitRecord` /
+  `AttentionRecord`, the event envelope) are unchanged and stay core-owned.
+- `src/mozyo_bridge/application/tmux_attention_presentation_provider.py` — the
+  built-in **tmux presentation provider**. It projects an already-derived
+  `AttentionRecord` into a `SurfaceProjection` for the `tmux_user_option`
+  surface, reusing the canonical `@mozyo_attention_*` option names from
+  `attention_projection` (Redmine #11954) as the single source of truth. It runs
+  no tmux I/O; the `set-option` argv mechanics stay in `attention_projection`.
+- `src/mozyo_bridge/domain/provider_registry.py` — the `presentation` category
+  is no longer empty: the registry classifies `tmux-presentation` (matching the
+  provider's `name`) with `projection_only` / `no_routing_authority` /
+  `no_owner_approval_decision` safety constraints.
+
+### Boundary as enforced in code
+
+- **Projection only.** `SurfaceProjection` rejects any field whose key names a
+  core-owned authority. The forbidden set is reused verbatim from the registry
+  seam's `FORBIDDEN_PROVIDER_AUTHORITIES` (`workflow_authority`,
+  `owner_approval`, `close_approval`, `routing_authority`), so a projection and a
+  registered provider are checked against the same list and cannot drift. Display
+  state therefore can never become workflow, owner, close, or routing truth.
+- **No invented surfaces.** A provider cannot construct a projection on an
+  unrecognized surface; the surface vocabulary is core-owned.
+- **Read-only protocol.** `PresentationProvider` exposes only `project`; there is
+  no `send` / `route` / `approve` method, and tests pin that the tmux provider
+  grows none. The option values remain a re-derivable cache, never consulted for
+  routing / handoff preflight (unchanged from #11954).
+
+### Non-goals (unchanged, restated for the implementation)
+
+- No third-party or arbitrary-code provider loading; the tmux projection is the
+  only presentation provider implementation.
+- No public ABI or long-term compatibility promise for these record shapes.
+- No presentation-defined workflow truth, owner approval, or routing authority;
+  iTerm / WebViewer stay consumers until a generic loopback contract is needed.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

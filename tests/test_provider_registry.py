@@ -25,6 +25,9 @@ from mozyo_bridge.domain.provider_registry import (
     ProviderCategory,
     ProviderRegistryError,
 )
+from mozyo_bridge.application.tmux_attention_presentation_provider import (
+    PROVIDER_NAME as TMUX_PRESENTATION_PROVIDER_NAME,
+)
 from mozyo_bridge.infrastructure.redmine_ticket_provider import (
     PROVIDER_NAME as REDMINE_PROVIDER_NAME,
 )
@@ -45,14 +48,14 @@ class ProviderCategoryVocabularyTest(unittest.TestCase):
         )
 
     def test_registry_categories_are_expressible_without_a_provider(self) -> None:
-        # The catalog / telemetry / presentation categories have no built-in
-        # provider yet, but they are still valid classifications a future
-        # provider can slot into — that is what the skeleton enables.
+        # The catalog / telemetry categories have no built-in provider yet, but
+        # they are still valid classifications a future provider can slot into —
+        # that is what the skeleton enables. (presentation gained a provider in
+        # #12156; it is covered by SeededBuiltinsTest below.)
         cats = BuiltinProviderRegistry.categories()
         for empty in (
             ProviderCategory.CATALOG,
             ProviderCategory.TELEMETRY,
-            ProviderCategory.PRESENTATION,
             ProviderCategory.RELEASE_HELPER,
         ):
             self.assertIn(empty, cats)
@@ -217,6 +220,22 @@ class SeededBuiltinsTest(unittest.TestCase):
         assert provider is not None
         self.assertIs(ProviderCategory.TERMINAL_RUNTIME, provider.category)
         self.assertIn("not_durable_identity", provider.safety_constraints)
+
+    def test_tmux_presentation_provider_is_classified(self) -> None:
+        provider = BUILTIN_PROVIDER_REGISTRY.get("tmux-presentation")
+        self.assertIsNotNone(provider)
+        assert provider is not None
+        self.assertIs(ProviderCategory.PRESENTATION, provider.category)
+        # The registry id matches the real built-in provider's name (#12156).
+        self.assertEqual(TMUX_PRESENTATION_PROVIDER_NAME, provider.provider_id)
+        # Read-only projection: the constraints restate the boundary, and the
+        # registry's authority check (ForbiddenAuthorityTest) already pins that
+        # the capabilities claim no core-owned authority.
+        self.assertIn("projection_only", provider.safety_constraints)
+        self.assertEqual(
+            (provider,),
+            BUILTIN_PROVIDER_REGISTRY.by_category(ProviderCategory.PRESENTATION),
+        )
 
 
 if __name__ == "__main__":
