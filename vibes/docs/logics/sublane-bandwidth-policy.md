@@ -48,15 +48,19 @@ durable record. Do not infer state from pane layout alone.
   is needed.
 - `owner_waiting`: review or close flow needs owner approval through the main
   coordinator Codex.
+- `close_waiting`: review / owner close approval / integration or no-commit
+  close conditions are satisfied, but the Redmine issue status is still open.
 - `blocked`: the lane recorded a blocker, design consultation, failed handoff, or
   unresolved dependency.
 - `retire_ready`: work is integrated or patch-equivalent, issue scope is done,
   and no active gate is pending.
 - `idle`: lane has no active durable work and can be reused or retired.
 
-`callback_due`, `review_waiting`, `owner_waiting`, and `blocked` all count as
-coordinator-blocking states. They must be drained before opening optional new
-work.
+`callback_due`, `review_waiting`, `owner_waiting`, `close_waiting`, and
+`blocked` all count as coordinator-blocking states. They must be drained before
+opening optional new work. A close-ready issue left in `着手中` is not harmless
+bookkeeping: it keeps the durable state inconsistent and can hide whether a
+sublane is still active or ready to retire.
 
 ## Admission Rule
 
@@ -66,7 +70,7 @@ Before dispatching a new sublane, the coordinator records or verifies:
   anchor are known;
 - the work is implementation-shaped and should not be performed by the main
   coordinator lane or main-unit Claude;
-- no unread `review_request`, `owner_waiting`, `blocked`, or
+- no unread `review_request`, `owner_waiting`, `close_waiting`, `blocked`, or
   `callback_delivery_failed` item is waiting for coordinator action;
 - the coordinator can perform the expected next review / owner aggregation /
   retirement step for the lane it is about to open;
@@ -93,9 +97,10 @@ records a stronger dependency:
 1. production / release / credential / destructive-operation blockers;
 2. `owner_waiting` items that only the coordinator can aggregate;
 3. `review_waiting` items;
-4. `blocked` or `callback_due` items, including callback delivery failures;
-5. `retire_ready` lanes that consume cockpit or worktree attention;
-6. new dispatch.
+4. `close_waiting` items whose durable close gates are already satisfied;
+5. `blocked` or `callback_due` items, including callback delivery failures;
+6. `retire_ready` lanes that consume cockpit or worktree attention;
+7. new dispatch.
 
 This order is about coordinator bandwidth. It does not change Redmine gate
 requirements, review quality, or owner close approval separation.
