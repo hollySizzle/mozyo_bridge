@@ -4,6 +4,35 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.8.1 - 2026-06-18
+
+`0.8.0` からの **patch release** で、v0.8 modular core baseline を **TestPyPI へ beta 配布**したライン(#12175)と、その実装結果に合わせた **release guardrail docs alignment**(#12176)をまとめています。配布対象は TestPyPI beta までで、**production PyPI publish は本メモでは行わず、別 gate と owner 承認のもとで beta acceptance 後に判断します**。release scanner / version mirror 以外の `src/**` / `tests/**` 挙動は変更しておらず、既存 CLI の JSON / text 出力互換も壊していません。
+
+### version mirror を `0.8.1` に確定
+
+release preflight で、既存 `v0.8.0` tag が現行の modular core baseline(`main`)を指していないことを検出したため、`0.8.0` を再利用せず **`main` から新しい patch beta `0.8.1` を切り出し**ました。`release bump --to 0.8.1` で version mirror のみ(`pyproject.toml` `[project].version` と `src/mozyo_bridge/__init__.py` `__version__`)を `0.8.0` → `0.8.1` に更新し、実装本体と分離した standalone commit としています(`013b54c`)。
+
+### release secret scanner の second-stage classifier 補正(#12175)
+
+`release check tree` / `release check artifact` の secret-value scan が単一の広域 POSIX-ERE grep だったため、**credential を「名前として参照しているだけ」の行を誤検出(false positive)**して release preflight を blocker にしていました。具体的には環境変数読み出し(`api_key=os.environ.get(...)`)、型注釈(`api_key: str | None`)、identifier / 定数参照・keyword default(`api_key=None` / `api_key=API_KEY`)、明示的な非 secret テスト sentinel などです。
+
+grep は候補抽出のまま残し、**opaque な literal credential value のときだけ block する second-stage classifier**(`_secret_value_is_real` / `_secret_assignment_is_real`)を追加しました。tree check と extracted-artifact scan は同一 semantics を共有します(`96034c4`)。
+
+初版の classifier は `.` / `/` を code-structure 文字として扱ったため、**slash / base64(`abc+def/123=`)・dotted JWT(`header.payload.sig`)・provider 形式(`sk.live.abc123`)など token 形状の実 literal を safe と誤判定**して実 leak 検出を弱める回帰があり、Codex review(#12175 j#60466/j#60467)で差し戻されました。`.` / `/` を code-structure char set から外して token punctuation(`.` `/` `+` padding `=`)が literal を除外しないようにし、dotted な **code reference**(`os.environ` / `config.API_KEY` / `self.api_key`)は別途 `_is_attribute_path_reference` で除外する形に補正しています。これにより token-shaped credential literal は scanner blocker のまま維持され、上記 false positive は clean に保たれます(`a232504`、Codex 再 review j#60477 承認)。
+
+### TestPyPI beta release / fresh install smoke
+
+`a232504` を release head として annotated tag `v0.8.1` を作成・push し、GitHub Actions の Test workflow 成功(全 unit suite 1439 件 OK)を確認のうえ `release publish --testpypi --version 0.8.1` を実行しました。TestPyPI workflow は success で完了し、`mozyo-bridge==0.8.1` を TestPyPI から隔離 venv に install して検証しています。fresh install smoke として、TMUX 非依存の隔離環境で `rules install` → `scaffold apply redmine-governed` → `scaffold status`(`result: clean`)→ `doctor`(`result: ok`)が green であることを release acceptance signal としました。
+
+### release guardrail docs alignment(#12176)
+
+上記 second-stage classifier 化に合わせて、cataloged release docs(`vibes/docs/logics/release-flow.md` / `vibes/docs/logics/release-helper-contract.md`)に残っていた旧 raw-grep / operator false-positive 前提の表現を、classifier 方針(credential-shape candidate を classifier に通し、safe code pattern を除外し、token punctuation を含む literal credential value を blocker とする)へ同期しました。`.mozyo-bridge/docs/catalog.yaml` は既存 `fc-release-docs` / `logic-release-flow` / `logic-release-helper-contract` の graph で対象 docs を解決できるため変更不要で、catalog validation / generated conventions / audit impact checks はいずれも clean です(`2c66ea2`、#12176 close 済み)。
+
+### リリース状況メモ
+
+- **配布実績**: tag `v0.8.1`(peeled commit `a232504`)、TestPyPI beta publish 完了、fresh install / scaffold / doctor smoke green。
+- **production PyPI**: 未実施。`skills/mozyo-bridge-agent/references/release.md` の Distribution Gates / Trusted Publishing に従い、beta acceptance 後の別 gate と owner 明示承認のもとで実施します。本メモでは production publish を行いません。
+
 ## v0.8.0 - 2026-06-16
 
 `0.7.1` からの **minor 相当**の additive release 候補です。`v0.7.1` tag(production release は #11949 で完了)以降、`main` には 2 つの流れが乗っています。1 つは **v0.8.0 architecture / plugin-ready refactor** で、方針 / 台帳の design docs を固めたうえで、最初の built-in adapter / provider seam(#12034 / #12035 / #12036)を core に実装・統合しました(external plugin API は引き続き非公開)。もう 1 つは **v0.7.x cockpit ラインと sublane 運用 guardrail の follow-up**(attention 投影・`/api/units`・cockpit discovery blocker 修正・coordinator/sublane routing)です。いずれも additive / 後方互換で、既存 CLI の JSON / text 出力互換は壊していません。
