@@ -278,22 +278,36 @@ Redmine #12135 で width skew の repair 入口を実装した:
 integration で column 幅 skew (US 対象の `56 / 50 / 99 / 69` 等) を抱えた場合に、
 observed column を **equal fair-share 幅** へ戻す。
 
-実装は pure domain (`build_cockpit_rebalance_plan`) + confirm-gated executor で、
-`doctor-geometry` と同じ read-only clustering で observed column を導出し、
-`resize-pane -x` の plan を出す。preview-first / confirm gate:
+実装は pure domain (`parse_window_layout` / `top_level_columns` /
+`build_cockpit_rebalance_plan`) + confirm-gated executor で、column model は
+**tmux `window_layout` tree の top-level cell** を正本にする。`doctor-geometry`
+の x-range overlap clustering とは **別物** であり、それを再利用しない。理由:
+x-cluster は構造 drift した cockpit (top-level cell に複数 Unit が nested する
+2x2 grid など) を clean column と誤認し、cluster 代表 pane を `resize-pane` すると
+内側 sub-split 境界を動かして layout を壊す (#12135 live apply gap の原因)。layout
+tree だけが resizable boundary の正本なので、それを parse して top-level cell から
+column を導出し、`resize-pane -x` の plan を出す。preview-first / confirm gate:
 `--dry-run` / `--json` と bare command は非変更の preview、`--confirm` のときだけ
 plan を適用する。境界:
 
-- **observed geometry のみ** を読み書きする。`width_weight` desired-presentation
-  table (`unit-presentation-state-db.md`) は未実装のため、interim target は
+- column model は `window_layout` top-level cell。**identity authority ではない**
+  (Live Geometry Contract どおり observed state)。Unit 所属 / role / lane は
+  pane option / registry のまま。
+- target は equal fair-share。`width_weight` desired-presentation table
+  (`unit-presentation-state-db.md`) は未実装のため、interim target は
   `even_column_share` と同じ equal fair-share。table 実装後はそちらへ寄せる。
 - column 幅のみを `resize-pane -x` で変える。`set-option` は出さない —
   identity pane option (`@mozyo_workspace_id` / `@mozyo_agent_role` /
   `@mozyo_lane_id`) は不変更。
 - `select-layout even-horizontal` を実行しない — 各 column の Codex/Claude
   vertical split を flatten しない (#11807 regression を避ける)。
-- `missing_claude` / `role_less_pane` 等の構造 drift (#12133 scope) は repair
-  しない。observed column 間で width を再配分するだけ。
+- top-level cell が clean な full-width split でない (= 横 sub-split を抱える
+  nested 2x2 / mixed-Unit の layout-tree drift) 場合は **fail-closed**。width
+  resize はその構造を直せないので、layout-tree structural reconcile (#12136
+  scope) へ委譲する。`doctor-geometry` の x-cluster diagnosis はこの nested cell を
+  `ok` と報告し得る (検出しない) 点に注意。`missing_claude` / `role_less_pane`
+  単体は rebalance failure 扱いしない (#12133 scope) — clean な full-width column
+  なら resize する。
 - tolerance 内 (既に fair) または column 2 未満なら benign no-op。
 - private absolute path は出力に含めない。
 
