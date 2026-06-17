@@ -31,9 +31,13 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.domain.cockpit_layout import (
+    COCKPIT_WINDOW,
     ROLE_CLAUDE,
     ROLE_CODEX,
+    ROLES,
+    CockpitCommand,
     normalize_lane,
+    pane_identity_commands,
 )
 
 # Two panes count as sharing a vertical column when their x-ranges overlap by at
@@ -538,4 +542,330 @@ def format_geometry_text(diagnosis: GeometryDiagnosis) -> str:
     for finding in diagnosis.findings:
         panes = f" [{', '.join(finding.pane_ids)}]" if finding.pane_ids else ""
         lines.append(f"[{finding.severity}] {finding.code}: {finding.message}{panes}")
+    return "\n".join(lines)
+
+
+# --- Peer adopt: bind a role-less cockpit pane as a Unit's missing peer (#12133) -
+#
+# `cockpit doctor-geometry` (#12131) reports two cooperating drifts: a Unit that is
+# `missing_claude` / `missing_codex` (one agent only) and a `role_less_pane` (a
+# cockpit pane carrying no `@mozyo_*` markers — the #12130 manual-recovery `%1106`
+# case). Peer adopt is the first safe *repair* slice (US #12132): it adopts exactly
+# that role-less pane as the Unit's missing peer role by binding the pane's identity
+# options, nothing else. It deliberately does NOT move / kill / split / rebalance
+# panes — only `set-option` identity binding plus the necessary minimal metadata.
+#
+# Unit grouping stays pane-option/workspace/lane/role authoritative; observed
+# geometry is never promoted to identity authority. Apply is fail-closed: it is
+# allowed only when exactly one missing peer role and exactly the selected role-less
+# candidate satisfy every guard, and the candidate's resolved cwd/process must not
+# contradict the destination workspace / lane / role. This keeps the cross-session /
+# cross-lane Claude direct boundary intact — a pane whose checkout contradicts the
+# destination Unit is blocked, never silently re-homed.
+
+# Block reason codes (stable identifiers a JSON consumer can switch on).
+PEER_ADOPT_COCKPIT_ABSENT = "cockpit_absent"
+PEER_ADOPT_INVALID_ROLE = "invalid_role"
+PEER_ADOPT_CANDIDATE_NOT_IN_COCKPIT = "candidate_not_in_cockpit"
+PEER_ADOPT_CANDIDATE_NOT_ROLE_LESS = "candidate_not_role_less"
+PEER_ADOPT_UNIT_NOT_FOUND = "unit_not_found"
+PEER_ADOPT_ROLE_ALREADY_PRESENT = "role_already_present"
+PEER_ADOPT_NO_PEER_ANCHOR = "no_peer_anchor"
+PEER_ADOPT_CWD_CONTRADICTS_WORKSPACE = "cwd_contradicts_workspace"
+PEER_ADOPT_CWD_CONTRADICTS_LANE = "cwd_contradicts_lane"
+PEER_ADOPT_PROCESS_CONTRADICTS_ROLE = "process_contradicts_role"
+
+PEER_ADOPT_OK = "ok"
+
+
+@dataclass(frozen=True)
+class PeerAdoptCandidate:
+    """Resolved runtime facts about the role-less candidate pane (#12133, pure input).
+
+    The application layer reads the live pane's cwd / foreground process and
+    resolves them through the same registry → anchor → derivation chain the rest
+    of the cockpit uses, then hands the *resolved* facts here so the planner stays
+    pure and free of tmux / filesystem access. ``cwd_workspace_id`` /
+    ``cwd_lane_id`` are the identity the candidate's working directory resolves to
+    (empty when it could not be resolved — treated as "unknown", not a
+    contradiction). ``process_role`` is the agent role implied by the foreground
+    process (``claude`` / ``codex`` / ``""`` for a neutral shell); ``process_name``
+    is the raw basename for operator-facing messages only. No absolute path is
+    carried — privacy boundary (only ids / labels surface in records).
+    """
+
+    pane_id: str
+    cwd_workspace_id: str = ""
+    cwd_lane_id: str = ""
+    process_role: str = ""
+    process_name: str = ""
+
+
+@dataclass(frozen=True)
+class PeerAdoptTarget:
+    """The destination Unit a role-less pane is adopted into (#12133, pure input).
+
+    ``workspace_id`` + ``lane_id`` name the Unit (the planner confirms it exists
+    in the diagnosis and is missing exactly the requested peer role). ``lane_label``
+    / ``label`` are display-only metadata the application layer reads off the Unit's
+    existing peer pane so the adopted pane's stamp matches its sibling.
+    """
+
+    workspace_id: str
+    lane_id: str
+    lane_label: Optional[str] = None
+    label: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PeerAdoptPlan:
+    """The pure, inspectable plan to bind one role-less pane as a missing peer (#12133).
+
+    ``stamp_commands`` are the identity ``set-option`` (+ title) binds — the ONLY
+    mutations peer adopt performs. There is no join / kill / split / layout command:
+    the pane already lives in the cockpit window, so adopting it is purely a
+    re-identification. ``peer_panes`` are the destination Unit's existing
+    opposite-role pane(s), for operator reference.
+    """
+
+    session: str
+    window: str
+    pane_id: str
+    role: str
+    workspace_id: str
+    lane_id: str
+    lane_label: Optional[str]
+    peer_panes: tuple[str, ...]
+    stamp_commands: tuple[CockpitCommand, ...]
+
+    @property
+    def commands(self) -> tuple[CockpitCommand, ...]:
+        return self.stamp_commands
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "window": self.window,
+            "pane_id": self.pane_id,
+            "role": self.role,
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
+            "peer_panes": list(self.peer_panes),
+            "stamp_commands": [c.as_dict() for c in self.stamp_commands],
+        }
+
+
+@dataclass(frozen=True)
+class PeerAdoptDecision:
+    """The result of :func:`plan_peer_adopt`: an applicable plan or a fail-closed block.
+
+    :pyattr:`ok` is ``True`` only when ``plan`` is set; otherwise ``reason_code`` is
+    one of the ``PEER_ADOPT_*`` block codes and ``message`` explains the block.
+    """
+
+    session: str
+    reason_code: str
+    message: str
+    plan: Optional[PeerAdoptPlan] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.plan is not None and self.reason_code == PEER_ADOPT_OK
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "ok": self.ok,
+            "reason_code": self.reason_code,
+            "message": self.message,
+            "plan": self.plan.as_dict() if self.plan is not None else None,
+        }
+
+
+def _peer_role_of(role: str) -> Optional[str]:
+    """The opposite agent role, or ``None`` for a non-agent role."""
+    if role == ROLE_CLAUDE:
+        return ROLE_CODEX
+    if role == ROLE_CODEX:
+        return ROLE_CLAUDE
+    return None
+
+
+def plan_peer_adopt(
+    *,
+    diagnosis: GeometryDiagnosis,
+    target: PeerAdoptTarget,
+    pane_id: str,
+    role: str,
+    candidate: PeerAdoptCandidate,
+) -> PeerAdoptDecision:
+    """Plan (or fail-closed block) adopting a role-less pane as a Unit's missing peer (#12133).
+
+    Pure and read-only: it inspects the #12131 :class:`GeometryDiagnosis` (Units +
+    role-less panes derived from pane options, never geometry) and the resolved
+    candidate facts, and returns a :class:`PeerAdoptDecision`. It plans no tmux and
+    mutates nothing; the returned plan's ``stamp_commands`` are the only mutations,
+    run later by the application executor behind a ``--confirm`` gate.
+
+    Fail-closed guards (every one must pass to produce a plan):
+
+    1. the cockpit window exists;
+    2. ``role`` is a real agent role (``claude`` / ``codex``);
+    3. ``pane_id`` names a pane currently in the cockpit window;
+    4. that pane is **role-less** (an already-identified pane is never re-homed);
+    5. the destination Unit (``target.workspace_id`` + ``lane_id``) already exists;
+    6. the Unit is missing **exactly** ``role`` and already carries its peer role
+       (so there is exactly one missing peer to fill, anchored on a present peer);
+    7. the candidate's resolved cwd workspace / lane does not contradict the
+       destination (an unknown cwd is permitted; a *conflicting* one is blocked);
+    8. the candidate's foreground process does not imply the *other* agent role.
+    """
+    session = diagnosis.session
+    target_lane = normalize_lane(target.lane_id)
+
+    def block(reason: str, message: str) -> PeerAdoptDecision:
+        return PeerAdoptDecision(session, reason, message)
+
+    if not diagnosis.cockpit_present:
+        return block(
+            PEER_ADOPT_COCKPIT_ABSENT,
+            f"no cockpit window for session {session!r}; nothing to adopt into.",
+        )
+
+    if role not in ROLES:
+        return block(
+            PEER_ADOPT_INVALID_ROLE,
+            f"role {role!r} is not an agent role; expected one of {list(ROLES)}.",
+        )
+
+    pane = next((p for p in diagnosis.panes if p.pane_id == pane_id), None)
+    if pane is None:
+        return block(
+            PEER_ADOPT_CANDIDATE_NOT_IN_COCKPIT,
+            f"pane {pane_id!r} is not in the cockpit window of session "
+            f"{session!r}; pick a role-less pane from `doctor-geometry`.",
+        )
+    if pane.identified:
+        return block(
+            PEER_ADOPT_CANDIDATE_NOT_ROLE_LESS,
+            f"pane {pane_id!r} already carries identity "
+            f"(workspace_id={pane.workspace_id!r}, role={pane.role!r}); peer adopt "
+            f"only binds a role-less pane and never re-homes an identified one.",
+        )
+
+    where = f"workspace {target.workspace_id!r} lane {target_lane!r}"
+    unit = next(
+        (
+            u
+            for u in diagnosis.units
+            if u.workspace_id == target.workspace_id
+            and normalize_lane(u.lane_id) == target_lane
+        ),
+        None,
+    )
+    if unit is None:
+        return block(
+            PEER_ADOPT_UNIT_NOT_FOUND,
+            f"no existing Unit for {where} in the cockpit; peer adopt fills a "
+            f"missing peer of an existing Unit, it does not bootstrap a new one.",
+        )
+
+    peer_role = _peer_role_of(role)  # guaranteed non-None: role is in ROLES
+    has_target = unit.has_claude if role == ROLE_CLAUDE else unit.has_codex
+    peer_panes = unit.codex_panes if role == ROLE_CLAUDE else unit.claude_panes
+    if has_target:
+        return block(
+            PEER_ADOPT_ROLE_ALREADY_PRESENT,
+            f"Unit {where} already has a {role} pane; there is no missing {role} "
+            f"peer to adopt into.",
+        )
+    if not peer_panes:
+        return block(
+            PEER_ADOPT_NO_PEER_ANCHOR,
+            f"Unit {where} has no {peer_role} peer to anchor the adopt; both roles "
+            f"are missing, so this is not a single missing-peer case.",
+        )
+
+    if candidate.cwd_workspace_id and candidate.cwd_workspace_id != target.workspace_id:
+        return block(
+            PEER_ADOPT_CWD_CONTRADICTS_WORKSPACE,
+            f"candidate pane {pane_id!r} cwd resolves to workspace "
+            f"{candidate.cwd_workspace_id!r}, which contradicts destination "
+            f"workspace {target.workspace_id!r}; refusing to re-home across "
+            f"workspaces.",
+        )
+    if (
+        candidate.cwd_workspace_id == target.workspace_id
+        and normalize_lane(candidate.cwd_lane_id) != target_lane
+    ):
+        return block(
+            PEER_ADOPT_CWD_CONTRADICTS_LANE,
+            f"candidate pane {pane_id!r} cwd resolves to lane "
+            f"{normalize_lane(candidate.cwd_lane_id)!r}, which contradicts "
+            f"destination lane {target_lane!r}; refusing to cross lanes.",
+        )
+
+    if candidate.process_role in ROLES and candidate.process_role != role:
+        proc = candidate.process_name or candidate.process_role
+        return block(
+            PEER_ADOPT_PROCESS_CONTRADICTS_ROLE,
+            f"candidate pane {pane_id!r} foreground process {proc!r} implies role "
+            f"{candidate.process_role!r}, which contradicts the requested "
+            f"{role!r} peer; refusing to mislabel a running agent.",
+        )
+
+    title = f"{target.label or target.workspace_id} · {role}"
+    stamp_commands = tuple(
+        pane_identity_commands(
+            pane_token=pane_id,
+            workspace_id=target.workspace_id,
+            role=role,
+            lane_id=target_lane,
+            lane_label=target.lane_label,
+            title=title,
+        )
+    )
+    plan = PeerAdoptPlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        pane_id=pane_id,
+        role=role,
+        workspace_id=target.workspace_id,
+        lane_id=target_lane,
+        lane_label=target.lane_label,
+        peer_panes=tuple(peer_panes),
+        stamp_commands=stamp_commands,
+    )
+    return PeerAdoptDecision(
+        session,
+        PEER_ADOPT_OK,
+        f"adopt pane {pane_id} as the missing {role} peer of {where} "
+        f"(anchored on {', '.join(peer_panes)}).",
+        plan=plan,
+    )
+
+
+def format_peer_adopt_text(decision: PeerAdoptDecision, *, applied: bool = False) -> str:
+    """Human-readable rendering of a :class:`PeerAdoptDecision` (pure).
+
+    ``applied`` switches the heading between a preview and a post-apply confirmation;
+    a blocked decision renders the same either way (nothing was applied).
+    """
+    lines: list[str] = []
+    if not decision.ok:
+        lines.append(f"cockpit peer-adopt blocked [{decision.reason_code}]: {decision.message}")
+        return "\n".join(lines)
+
+    plan = decision.plan
+    assert plan is not None  # ok implies a plan
+    heading = "applied" if applied else "preview (no panes moved)"
+    lines.append(f"cockpit peer-adopt {heading}: {decision.message}")
+    lines.append(
+        f"pane={plan.pane_id} role={plan.role} workspace={plan.workspace_id} "
+        f"lane={plan.lane_id} peers=[{', '.join(plan.peer_panes)}]"
+    )
+    lines.append("note: identity binding only — no pane move / kill / split / rebalance.")
+    for cmd in plan.stamp_commands:
+        lines.append(f"  tmux {' '.join(cmd.argv)}  # {cmd.purpose}")
     return "\n".join(lines)

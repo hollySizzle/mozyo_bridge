@@ -161,53 +161,85 @@ def _pane_title(label: str, role: str, anchor: Optional[str]) -> str:
     return f"{base} · {anchor}" if anchor else base
 
 
-def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
+def pane_identity_commands(
+    *,
+    pane_token: str,
+    workspace_id: str,
+    role: str,
+    lane_id: str,
+    lane_label: Optional[str] = None,
+    title: Optional[str] = None,
+) -> list["CockpitCommand"]:
     """Title (human-facing) + workspace/role/lane tmux user options (machine-readable).
 
-    The lane id always lands (normalized to ``default``) so duplicate detection
-    can read ``workspace_id + lane_id`` off every cockpit pane; the human-facing
-    lane label is only stamped when present.
+    The single source of truth for stamping a cockpit pane's identity. Every
+    cockpit construction (initial layout, append, adopt move, and the #12133
+    peer-adopt of a role-less pane) routes through here so the option set —
+    ``@mozyo_workspace_id`` / ``@mozyo_agent_role`` / ``@mozyo_lane_id`` (+ the
+    optional human-facing ``@mozyo_lane_label``) — can never drift between
+    construction paths. The lane id always lands (normalized to ``default``) so
+    duplicate detection / Unit grouping can read ``workspace_id + lane_id`` off
+    every cockpit pane; the human-facing lane label and the pane title are only
+    stamped when provided.
     """
-    commands = [
-        CockpitCommand(
-            argv=("select-pane", "-t", pane.token, "-T", pane.title),
-            captures=None,
-            purpose=f"title {pane.workspace_id} {pane.role}",
-        ),
-        CockpitCommand(
-            argv=(
-                "set-option", "-p", "-t", pane.token,
-                WORKSPACE_OPTION, pane.workspace_id,
+    commands: list[CockpitCommand] = []
+    if title is not None:
+        commands.append(
+            CockpitCommand(
+                argv=("select-pane", "-t", pane_token, "-T", title),
+                captures=None,
+                purpose=f"title {workspace_id} {role}",
+            )
+        )
+    commands.extend(
+        [
+            CockpitCommand(
+                argv=(
+                    "set-option", "-p", "-t", pane_token,
+                    WORKSPACE_OPTION, workspace_id,
+                ),
+                captures=None,
+                purpose=f"mark workspace {workspace_id} ({role})",
             ),
-            captures=None,
-            purpose=f"mark workspace {pane.workspace_id} ({pane.role})",
-        ),
-        CockpitCommand(
-            argv=("set-option", "-p", "-t", pane.token, ROLE_OPTION, pane.role),
-            captures=None,
-            purpose=f"mark role {pane.role} ({pane.workspace_id})",
-        ),
-        CockpitCommand(
-            argv=(
-                "set-option", "-p", "-t", pane.token,
-                LANE_OPTION, normalize_lane(pane.lane_id),
+            CockpitCommand(
+                argv=("set-option", "-p", "-t", pane_token, ROLE_OPTION, role),
+                captures=None,
+                purpose=f"mark role {role} ({workspace_id})",
             ),
-            captures=None,
-            purpose=f"mark lane {normalize_lane(pane.lane_id)} ({pane.workspace_id})",
-        ),
-    ]
-    if pane.lane_label:
+            CockpitCommand(
+                argv=(
+                    "set-option", "-p", "-t", pane_token,
+                    LANE_OPTION, normalize_lane(lane_id),
+                ),
+                captures=None,
+                purpose=f"mark lane {normalize_lane(lane_id)} ({workspace_id})",
+            ),
+        ]
+    )
+    if lane_label:
         commands.append(
             CockpitCommand(
                 argv=(
-                    "set-option", "-p", "-t", pane.token,
-                    LANE_LABEL_OPTION, pane.lane_label,
+                    "set-option", "-p", "-t", pane_token,
+                    LANE_LABEL_OPTION, lane_label,
                 ),
                 captures=None,
-                purpose=f"label lane {pane.lane_label} ({pane.workspace_id})",
+                purpose=f"label lane {lane_label} ({workspace_id})",
             )
         )
     return commands
+
+
+def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
+    """Identity stamp for a planned :class:`CockpitPane` (delegates to the shared builder)."""
+    return pane_identity_commands(
+        pane_token=pane.token,
+        workspace_id=pane.workspace_id,
+        role=pane.role,
+        lane_id=pane.lane_id,
+        lane_label=pane.lane_label,
+        title=pane.title,
+    )
 
 
 def normalize_ratio(codex_ratio: int) -> int:

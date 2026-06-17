@@ -504,7 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     cockpit.add_argument(
         "action",
         nargs="?",
-        choices=["append", "adopt", "reset", "rebuild", "doctor-geometry"],
+        choices=["append", "adopt", "reset", "rebuild", "doctor-geometry", "peer-adopt"],
         default=None,
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
@@ -522,10 +522,16 @@ def build_parser() -> argparse.ArgumentParser:
             "drift (missing codex/claude, role-less pane, a Unit's codex/claude "
             "not sharing one column, a column carrying more than one Unit, width "
             "imbalance); it observes geometry only — identity/routing stay on the "
-            "pane options — and never repairs / rebalances / moves panes. Without "
-            "`--confirm` every other sub-action is detect-only / preview and "
-            "mutates nothing; `--dry-run` / `--json` always preview without "
-            "mutating."
+            "pane options — and never repairs / rebalances / moves panes. "
+            "`peer-adopt` (Redmine #12133) is the first safe repair slice: it binds "
+            "a role-less cockpit pane (`--pane`) as the missing peer role (`--role`) "
+            "of an existing Unit (`--unit workspace/lane`), via pane-option identity "
+            "binding only — never a pane move / kill / split / rebalance — and "
+            "fail-closed (it applies only with `--confirm` when exactly one missing "
+            "peer and the selected candidate pass every guard, including a "
+            "cwd/process preflight). Without `--confirm` every other sub-action is "
+            "detect-only / preview and mutates nothing; `--dry-run` / `--json` "
+            "always preview without mutating."
         ),
     )
     cockpit.add_argument(
@@ -580,6 +586,37 @@ def build_parser() -> argparse.ArgumentParser:
             "mozyo-identified cockpit session. Required to mutate; without it "
             "these sub-actions are detect-only / preview. `--dry-run` / `--json` "
             "still only preview."
+        ),
+    )
+    cockpit.add_argument(
+        "--pane",
+        dest="peer_pane",
+        default=None,
+        help=(
+            "For `peer-adopt` (Redmine #12133): the role-less cockpit pane id "
+            "(`%%id`, as reported by `cockpit doctor-geometry`) to adopt as a "
+            "Unit's missing peer."
+        ),
+    )
+    cockpit.add_argument(
+        "--unit",
+        dest="peer_unit",
+        default=None,
+        help=(
+            "For `peer-adopt` (Redmine #12133): the destination Unit as "
+            "`workspace_id/lane_id` (the lane is optional and defaults to "
+            "`default`). The Unit must already exist and be missing exactly the "
+            "`--role` peer."
+        ),
+    )
+    cockpit.add_argument(
+        "--role",
+        dest="peer_role",
+        default=None,
+        choices=["claude", "codex"],
+        help=(
+            "For `peer-adopt` (Redmine #12133): the missing peer role to bind the "
+            "`--pane` as (`claude` or `codex`)."
         ),
     )
     cockpit.set_defaults(func=cmd_cockpit)
