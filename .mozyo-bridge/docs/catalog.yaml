@@ -641,6 +641,19 @@ documents:
       - logic-release-flow
       - rule-release-distribution
 
+  - id: logic-modular-config-driven-refactor
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/modular-config-driven-refactor.md
+    purpose: v0.9 line の modular / configuration-aware built-in composition 方針。module / provider / feature selection を設定駆動に寄せつつ、workflow authority / safety / credential 境界を設定で弱めないための設計正本。
+    audit_role: modular_config_driven_refactor_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-workspace-defaults-renderer
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-skill-distribution
     type: logic
     status: active
@@ -1023,6 +1036,18 @@ file_conventions:
       - logic-release-flow
       - logic-release-helper-contract
       - skill-release-reference
+
+  - id: fc-modular-config-driven-docs
+    name: modular config-driven refactor docs
+    patterns:
+      - vibes/docs/logics/modular-config-driven-refactor.md
+      - vibes/docs/logics/plugin-ready-adapter-boundary.md
+    severity: block
+    document_refs:
+      - logic-modular-config-driven-refactor
+      - logic-plugin-ready-adapter-boundary
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
 
   - id: fc-tmux-handoff-docs
     name: tmux and handoff safety docs
