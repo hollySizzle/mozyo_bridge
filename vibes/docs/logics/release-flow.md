@@ -185,7 +185,7 @@ mozyo-bridge release check drift
 
 CI gate:
 
-- `.github/workflows/test.yml` の `python -m unittest discover -s tests -v` step が、`CanonicalRendererTest` / `GovernedWorkflowCanonicalTest` (canonical render) と `PluginMarketplaceTest` (mirror byte gate + `sync_plugin_skill.sh --check` shell gate) を毎 push / PR で実行する。release helper を pre-merge gate として別に追加せず、unittest layer に集約する。
+- `.github/workflows/test.yml` の `python -m unittest discover -s tests -v` step が、`tests/test_docs_canonical_workspace.py` の `CanonicalRendererTest` / `GovernedWorkflowCanonicalTest` (canonical render) と `tests/test_plugin_marketplace.py` の `PluginMarketplaceTest` (mirror byte gate + `sync_plugin_skill.sh --check` shell gate) を毎 push / PR で実行する。release helper を pre-merge gate として別に追加せず、unittest layer に集約する。
 - release helper `release check drift` は pre-release operator が release commit 直前に 1 command で確認するための facade。release task の audit trail にも `release check drift` の出力を貼る運用とする。
 
 ### Release Ref Consistency
