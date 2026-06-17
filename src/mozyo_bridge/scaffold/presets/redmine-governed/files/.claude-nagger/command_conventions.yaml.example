@@ -33,3 +33,22 @@ rules:
     severity: warn
     message: >-
       Recursive removal. Double-check the path before running.
+
+  # Warn before routing an implementation request to the default-lane
+  # Claude. Guardrail / scaffold / preset / workflow / release work should
+  # have a recorded sublane dispatch decision first; sending such an
+  # implementation request to the default-lane Claude without one is an
+  # operational smell that loses sublane isolation and parallelism.
+  - id: default-lane-implementation-handoff
+    name: default-lane implementation handoff without dispatch decision
+    patterns:
+      - "mozyo-bridge handoff send --to claude * --kind implementation_request*"
+      - "mozyo-bridge notify-claude*"
+    severity: warn
+    message: >-
+      Default-lane Claude implementation handoff. For guardrail, scaffold,
+      preset, workflow, or release implementation requests, confirm a Redmine
+      dispatch decision exists before sending. Prefer sublane-first routing
+      through the target lane Codex over a direct default-lane Claude handoff.
+      If you intentionally choose default-lane implementation, record the
+      exception reason in the Redmine issue.

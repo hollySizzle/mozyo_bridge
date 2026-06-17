@@ -1678,6 +1678,62 @@ class ScaffoldRulesTest(unittest.TestCase):
                     msg=f"manifest does not track {tracked_path}",
                 )
 
+    def test_governed_nagger_warns_on_default_lane_implementation_handoff(self) -> None:
+        """Redmine #12171: governed Nagger skeleton ships the dispatch warning.
+
+        The shipped `command_conventions.yaml.example` must carry a `warn`
+        (not `block`) rule that fires before an implementation-shaped
+        default-lane Claude handoff, so a sender is reminded to confirm a
+        Redmine dispatch decision first. This guards against the #11619
+        j#60252 failure mode of dispatching guardrail / scaffold / preset /
+        workflow / release implementation requests to the default-lane
+        Claude without a recorded dispatch decision.
+        """
+        import yaml
+
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+                    self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+
+                    skeleton = (
+                        project
+                        / ".claude-nagger/command_conventions.yaml.example"
+                    )
+                    data = yaml.safe_load(skeleton.read_text(encoding="utf-8"))
+                    rules = {r["id"]: r for r in data["rules"]}
+                    self.assertIn(
+                        "default-lane-implementation-handoff",
+                        rules,
+                        msg="governed Nagger skeleton missing the "
+                        "default-lane implementation handoff warning",
+                    )
+                    rule = rules["default-lane-implementation-handoff"]
+                    # Warning, never a hard block (#12171 keeps this advisory).
+                    self.assertEqual("warn", rule["severity"])
+                    self.assertIn(
+                        "mozyo-bridge handoff send --to claude * "
+                        "--kind implementation_request*",
+                        rule["patterns"],
+                    )
+                    self.assertIn("mozyo-bridge notify-claude*", rule["patterns"])
+                    # The reminder names the dispatch-decision precondition.
+                    self.assertIn("dispatch decision", rule["message"])
+
     # ------------------------------------------------------------------
     # Redmine #11955: opt-in sublane / worktree runbook scaffold category.
     # The docs distribute only when `--with-worktree-runbook` is passed;
