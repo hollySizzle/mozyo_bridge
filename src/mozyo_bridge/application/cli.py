@@ -504,7 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     cockpit.add_argument(
         "action",
         nargs="?",
-        choices=["append", "adopt", "reset", "rebuild", "doctor-geometry", "peer-adopt"],
+        choices=[
+            "append", "adopt", "reset", "rebuild", "doctor-geometry",
+            "peer-adopt", "rebalance",
+        ],
         default=None,
         help=(
             "Optional explicit sub-action. `append` is the same append/focus "
@@ -529,9 +532,14 @@ def build_parser() -> argparse.ArgumentParser:
             "binding only — never a pane move / kill / split / rebalance — and "
             "fail-closed (it applies only with `--confirm` when exactly one missing "
             "peer and the selected candidate pass every guard, including a "
-            "cwd/process preflight). Without `--confirm` every other sub-action is "
-            "detect-only / preview and mutates nothing; `--dry-run` / `--json` "
-            "always preview without mutating."
+            "cwd/process preflight). `rebalance` (Redmine #12135) restores existing "
+            "live columns toward an equal fair-share width with `resize-pane` and "
+            "`--confirm`; it touches column width only — identity pane options are "
+            "untouched, the Codex/Claude vertical splits are not flattened, and the "
+            "#12133 missing/role-less drift is left to that scope. Without "
+            "`--confirm` every other sub-action is detect-only / preview and "
+            "mutates nothing; `--dry-run` / `--json` always preview without "
+            "mutating."
         ),
     )
     cockpit.add_argument(
@@ -583,9 +591,10 @@ def build_parser() -> argparse.ArgumentParser:
             "(Redmine #11898) it moves the co-existing normal session's live "
             "codex/claude panes into the cockpit; for `reset` / `rebuild` "
             "(Redmine #11814) it kills (and, for rebuild, recreates) the "
-            "mozyo-identified cockpit session. Required to mutate; without it "
-            "these sub-actions are detect-only / preview. `--dry-run` / `--json` "
-            "still only preview."
+            "mozyo-identified cockpit session; for `rebalance` (Redmine #12135) "
+            "it applies the `resize-pane` fair-share width plan. Required to "
+            "mutate; without it these sub-actions are detect-only / preview. "
+            "`--dry-run` / `--json` still only preview."
         ),
     )
     cockpit.add_argument(

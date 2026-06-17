@@ -270,6 +270,33 @@ re-home されることはない。preflight が読む cwd は workspace_id / la
 apply 後は `doctor-geometry` と `agents targets` で missing-peer / role-less
 finding の解消を smoke する。
 
+### Width Rebalance (`cockpit rebalance`)
+
+Redmine #12135 で width skew の repair 入口を実装した:
+`mozyo cockpit rebalance [--session <group>] [--dry-run | --json] [--confirm]`。
+既存 live cockpit が manual `resize-pane` / #11854 以前の append / 外部 tmux
+integration で column 幅 skew (US 対象の `56 / 50 / 99 / 69` 等) を抱えた場合に、
+observed column を **equal fair-share 幅** へ戻す。
+
+実装は pure domain (`build_cockpit_rebalance_plan`) + confirm-gated executor で、
+`doctor-geometry` と同じ read-only clustering で observed column を導出し、
+`resize-pane -x` の plan を出す。preview-first / confirm gate:
+`--dry-run` / `--json` と bare command は非変更の preview、`--confirm` のときだけ
+plan を適用する。境界:
+
+- **observed geometry のみ** を読み書きする。`width_weight` desired-presentation
+  table (`unit-presentation-state-db.md`) は未実装のため、interim target は
+  `even_column_share` と同じ equal fair-share。table 実装後はそちらへ寄せる。
+- column 幅のみを `resize-pane -x` で変える。`set-option` は出さない —
+  identity pane option (`@mozyo_workspace_id` / `@mozyo_agent_role` /
+  `@mozyo_lane_id`) は不変更。
+- `select-layout even-horizontal` を実行しない — 各 column の Codex/Claude
+  vertical split を flatten しない (#11807 regression を避ける)。
+- `missing_claude` / `role_less_pane` 等の構造 drift (#12133 scope) は repair
+  しない。observed column 間で width を再配分するだけ。
+- tolerance 内 (既に fair) または column 2 未満なら benign no-op。
+- private absolute path は出力に含めない。
+
 ## Public / Private Boundary
 
 OSS default に入れてよいもの:
@@ -300,6 +327,7 @@ OSS default に入れてよいもの:
    採用する最初の repair slice。**実装済み (Redmine #12133)** —
    `### Peer Adopt` を読む。
 2. `cockpit rebalance`: current live columns の width を desired / fair share に戻す。
+   **実装済み (Redmine #12135)** — `### Width Rebalance` を読む。
 3. `cockpit move`: Unit column reorder primitive。
 4. `presentation-state DB`: `cockpit_group_membership` current table。
 5. display prefix projection: pane title / border label に `mozyo:` prefix を追加。

@@ -1453,6 +1453,27 @@ def execute_cockpit_reset_plan(plan, run) -> None:
             )
 
 
+def execute_cockpit_rebalance_plan(plan, run) -> None:
+    """Run a :class:`CockpitRebalancePlan`'s ``resize-pane`` commands (#12135), fail-fast.
+
+    ``run`` is a ``run_tmux``-style callable. The plan already targets real
+    ``%pane`` ids (no token resolution needed) and touches no identity option, so
+    this just runs each ``resize-pane -x`` in left-to-right order and aborts
+    (``die``) on a non-zero tmux exit rather than reporting a half-rebalanced
+    layout as success.
+    """
+    for cmd in plan.commands:
+        result = run(*cmd.argv, check=False)
+        if getattr(result, "returncode", 0) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip() or (
+                getattr(result, "stdout", "") or ""
+            ).strip()
+            die(
+                f"cockpit rebalance step failed ({cmd.purpose}): "
+                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}"
+            )
+
+
 def cmd_layout_apply(args: argparse.Namespace) -> int:
     """`mozyo layout apply cockpit` — build/focus the cockpit layout (#11788).
 
@@ -2567,6 +2588,159 @@ def _handle_cockpit_peer_adopt(
     return 0
 
 
+def _read_cockpit_window_layout(session: str):
+    """Read the cockpit window's tmux ``window_layout`` string (#12135).
+
+    The layout tree is the source of truth for which boundaries are resizable
+    (unlike :func:`_read_cockpit_geometry`'s flat pane list, it shows the nested
+    split structure). Returns the raw layout string, or ``None`` when the cockpit
+    window does not exist or tmux cannot be read. Read-only and tolerant: a
+    missing tmux binary / server / window degrades to ``None`` rather than
+    raising, so the preview never mutates and never aborts.
+    """
+    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    try:
+        result = run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            f"{session}:{COCKPIT_WINDOW}",
+            "-F",
+            "#{window_layout}",
+            check=False,
+        )
+    except (Exception, SystemExit):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    layout = (getattr(result, "stdout", "") or "").strip()
+    return layout or None
+
+
+def _cockpit_rebalance_columns(session: str):
+    """``(present, columns)`` — top-level cockpit columns from the live layout tree.
+
+    ``present`` is ``False`` when the cockpit window is absent (a benign no-op);
+    ``columns`` is the :func:`top_level_columns` projection of the parsed
+    ``window_layout`` otherwise.
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        parse_window_layout,
+        top_level_columns,
+    )
+
+    layout = _read_cockpit_window_layout(session)
+    if layout is None:
+        return False, ()
+    root = parse_window_layout(layout)
+    return True, top_level_columns(root)
+
+
+def _handle_cockpit_rebalance(
+    session: str, *, confirm: bool, json_output: bool, dry_run: bool
+) -> int:
+    """`mozyo cockpit rebalance` — preview/confirm equal fair-share width restore (#12135).
+
+    Reads the live cockpit ``window_layout`` tree, projects its top-level columns,
+    and plans an EQUAL fair-share width rebalance. Safety contract: the default
+    path and `--dry-run` / `--json` are non-mutating previews; only an explicit
+    `--confirm` (and not `--dry-run` / `--json`) runs the `resize-pane` plan. The
+    plan touches column width only — it emits no `set-option` (identity pane
+    options stay put) and never `select-layout even-horizontal` (the Codex/Claude
+    vertical splits stay intact). It fails closed on a structurally drifted column
+    (a #12130/#12133 nested cell), deferring that repair to doctor-geometry /
+    #12133. A cockpit already balanced within tolerance, or with fewer than two
+    columns, is a benign no-op.
+    """
+    import json as _json
+    import shlex as _shlex
+
+    from mozyo_bridge.domain.cockpit_layout import build_cockpit_rebalance_plan
+
+    present, columns = _cockpit_rebalance_columns(session)
+    plan = build_cockpit_rebalance_plan(columns, session=session)
+
+    would_execute = bool(
+        confirm
+        and not dry_run
+        and present
+        and not plan.balanced
+        and not plan.drift
+        and plan.commands
+    )
+
+    if json_output:
+        payload = {
+            "command": "cockpit rebalance",
+            # This invocation never runs tmux (json is a preview surface).
+            "executes": False,
+            "would_execute": would_execute,
+            "confirm": confirm,
+            "session": session,
+            "cockpit_present": present,
+            "balanced": plan.balanced,
+            "drift": plan.drift,
+            "plan": plan.as_dict(),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    if not present:
+        print(
+            f"cockpit rebalance: no cockpit window for session {session!r} — "
+            "nothing to rebalance."
+        )
+        return 0
+
+    # Preview: bare command (no `--confirm`) or `--dry-run`. No mutation.
+    if dry_run or not confirm:
+        print(
+            f"cockpit rebalance (preview; no tmux changes): session={session} "
+            f"columns={plan.column_count} total_width={plan.total_content_width}"
+        )
+        for col in plan.columns:
+            flag = "" if col.clean else " [drift: not a clean full-width split]"
+            print(
+                f"  column {col.index}: current={col.current_width} -> "
+                f"target={col.target_width} (delta {col.delta:+d}) "
+                f"pane={col.target_pane or '-'}{flag}"
+            )
+        if plan.drift:
+            print(f"  cannot rebalance: {plan.blocked_reason}")
+        elif plan.balanced:
+            print("  already balanced within tolerance — nothing to rebalance.")
+        else:
+            print("  rebalance plan (width only; identity untouched, splits kept):")
+            for cmd in plan.commands:
+                print(
+                    "    tmux " + " ".join(_shlex.quote(tok) for tok in cmd.argv)
+                )
+            print("  run `mozyo cockpit rebalance --confirm` to apply.")
+        return 0
+
+    # Confirm-gated execution: the only path that mutates tmux.
+    if plan.drift:
+        die(plan.blocked_reason or "cockpit rebalance blocked by structural drift.")
+    if plan.balanced or not plan.commands:
+        print(
+            f"cockpit rebalance: session {session!r} columns already balanced "
+            "within tolerance — nothing to do."
+        )
+        return 0
+
+    require_tmux()
+    print(
+        f"cockpit rebalance: restoring {plan.column_count} columns toward "
+        f"fair-share width in cockpit {session!r}..."
+    )
+    execute_cockpit_rebalance_plan(plan, run_tmux)
+    _, after = _cockpit_rebalance_columns(session)
+    widths = [c.width for c in after]
+    print(f"  rebalanced: column widths now {widths}.")
+    return 0
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -2609,6 +2783,17 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     if getattr(args, "action", None) == "peer-adopt":
         return _handle_cockpit_peer_adopt(
             session, args, json_output=json_output, dry_run=dry_run
+        )
+    # `mozyo cockpit rebalance` (Redmine #12135) is a whole-cockpit, confirm-gated
+    # width restore — it reads every column's observed geometry, not the current
+    # workspace, so it short-circuits before workspace resolution like
+    # doctor-geometry; its own preview path never gates on tmux being mutable.
+    if getattr(args, "action", None) == "rebalance":
+        return _handle_cockpit_rebalance(
+            session,
+            confirm=bool(getattr(args, "confirm", False)),
+            json_output=json_output,
+            dry_run=dry_run,
         )
     # `mozyo cockpit adopt` (Redmine #11897, Phase 1) is a detect-only sub-action:
     # it reports a co-existing normal `mozyo` session as an adopt candidate and

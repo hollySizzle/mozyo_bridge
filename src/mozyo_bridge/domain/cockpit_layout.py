@@ -1266,3 +1266,419 @@ def build_cockpit_reset_plan(
             ),
         ),
     )
+
+
+
+
+# --- Cockpit column width rebalance (Redmine #12135) --------------------------
+#
+# An existing cockpit accumulates column-width skew: a manual `resize-pane`, an
+# append from before the #11854 fair-share sizing landed, or an external tmux
+# integration can leave one column ballooned while others starve (the live
+# `56 / 50 / 99 / 69` skew US #12135 targets, #11854 j#57547 residual gap).
+# `mozyo cockpit rebalance` restores the live columns toward an EQUAL fair-share
+# width with a preview-first, confirm-gated plan of `resize-pane -x` commands.
+#
+# The column model is the tmux *window layout tree's top-level cells* — NOT an
+# x-overlap geometry cluster. The live `doctor-geometry` clustering can read a
+# structurally-drifted cockpit (a #12130/#12133 2x2 grid where two Units share
+# one tmux cell) as if it were clean columns; resizing such a cluster's pane only
+# moves an inner sub-split boundary and corrupts the layout. The layout tree is
+# the single source of truth for which boundaries are resizable, so rebalance
+# parses it and fails closed when a top-level column is not a clean,
+# full-width-resizable cell (deferring that structural repair to #12133 /
+# doctor-geometry, never half-resizing it).
+#
+# Boundaries (`pane-centric-cockpit-semantics.md`):
+# - Observed geometry is the ONLY thing rebalance reads and writes: it equalizes
+#   the live top-level cell widths and never re-decides Unit / role / lane
+#   identity, so it emits NO `set-option` — identity pane options stay exactly as
+#   they are.
+# - It changes column *width* only via `resize-pane -x` and never runs
+#   `select-layout even-horizontal`, so each column keeps its vertical
+#   Codex/Claude split (which even-horizontal would flatten — the #11807
+#   regression :func:`build_cockpit_append_plan` also avoids).
+# - Equal fair-share is the interim target: per-column ``width_weight`` from the
+#   desired-presentation table (`unit-presentation-state-db.md`) is future scope;
+#   until it lands, rebalance mirrors :func:`even_column_share`'s equal policy
+#   that #11854 already sizes appended columns to.
+
+# A column is "off" — worth a resize — only when its width deviates from its
+# fair-share target by MORE than this many cells; within tolerance a column is
+# treated as already balanced (a 1-cell rounding difference is not skew).
+DEFAULT_REBALANCE_TOLERANCE = 1
+
+
+def fair_share_widths(total_content: int, columns: int) -> list[int]:
+    """Split ``total_content`` cells across ``columns`` as evenly as possible (pure).
+
+    The base share is ``total_content // columns``; the leftover cells
+    (``total_content % columns``) are handed to the leftmost columns one each, so
+    the resulting widths differ by at most one cell and sum back to
+    ``total_content`` exactly. The inter-column borders are not part of a pane
+    width and a `resize-pane` never moves them, so conserving the content total is
+    what keeps the window width unchanged while the columns are equalized.
+    """
+    n = max(1, int(columns))
+    total = max(0, int(total_content))
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+@dataclass(frozen=True)
+class LayoutCell:
+    """One node of a parsed tmux ``window_layout`` tree (observed geometry, pure).
+
+    A leaf carries a ``pane_id`` (``%``-prefixed) and no children; a split carries
+    ``orient`` (``"h"`` for a left/right ``{...}`` split, ``"v"`` for a top/bottom
+    ``[...]`` split) and ``children``. ``width`` / ``height`` / ``x`` / ``y`` are
+    the observed cell rectangle in tmux cells.
+    """
+
+    width: int
+    height: int
+    x: int
+    y: int
+    pane_id: Optional[str]
+    orient: Optional[str]
+    children: tuple["LayoutCell", ...]
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.pane_id is not None
+
+    def leaves(self) -> tuple["LayoutCell", ...]:
+        if self.is_leaf:
+            return (self,)
+        out: list[LayoutCell] = []
+        for child in self.children:
+            out.extend(child.leaves())
+        return tuple(out)
+
+
+@dataclass(frozen=True)
+class LayoutColumn:
+    """One top-level cockpit column projected from the tmux layout tree (#12135).
+
+    ``target_pane`` is the resize target — the column's first (top-left) leaf
+    pane. ``clean`` is the load-bearing field: a column is cleanly resizable only
+    when that leaf spans the FULL column width (a single pane, or a vertical
+    Codex/Claude split whose panes share the column x-range). A column whose first
+    leaf is narrower than the column carries a horizontal sub-split (a
+    #12130/#12133 structural drift), so resizing that leaf would move an inner
+    boundary, not the column — rebalance fails closed on it.
+    """
+
+    index: int
+    width: int
+    x: int
+    target_pane: str
+    pane_ids: tuple[str, ...]
+    clean: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "width": self.width,
+            "x": self.x,
+            "target_pane": self.target_pane,
+            "pane_ids": list(self.pane_ids),
+            "clean": self.clean,
+        }
+
+
+def _read_uint(text: str, i: int) -> tuple[int, int]:
+    start = i
+    while i < len(text) and text[i].isdigit():
+        i += 1
+    return int(text[start:i]), i
+
+
+def _parse_layout_cell(text: str, i: int) -> tuple[LayoutCell, int]:
+    """Parse one ``WxH,X,Y[,pane|{...}|[...]]`` node at ``text[i:]`` (pure)."""
+    width, i = _read_uint(text, i)
+    if i >= len(text) or text[i] != "x":
+        raise ValueError(f"bad layout cell at {i}: expected 'x'")
+    i += 1
+    height, i = _read_uint(text, i)
+    if i >= len(text) or text[i] != ",":
+        raise ValueError(f"bad layout cell at {i}: expected ',' after height")
+    x, i = _read_uint(text, i + 1)
+    if i >= len(text) or text[i] != ",":
+        raise ValueError(f"bad layout cell at {i}: expected ',' after x")
+    y, i = _read_uint(text, i + 1)
+
+    if i < len(text) and text[i] in "{[":
+        opener = text[i]
+        orient = "h" if opener == "{" else "v"
+        closer = "}" if opener == "{" else "]"
+        i += 1
+        children: list[LayoutCell] = []
+        while True:
+            child, i = _parse_layout_cell(text, i)
+            children.append(child)
+            if i < len(text) and text[i] == ",":
+                i += 1
+                continue
+            if i < len(text) and text[i] == closer:
+                i += 1
+                break
+            break
+        return (
+            LayoutCell(width, height, x, y, None, orient, tuple(children)),
+            i,
+        )
+
+    # Leaf: ``,<pane_number>`` — tmux writes a bare number; the ``%`` id is
+    # ``%`` + that number.
+    if i >= len(text) or text[i] != ",":
+        raise ValueError(f"bad layout leaf at {i}: expected ',' before pane id")
+    pane_num, i = _read_uint(text, i + 1)
+    return (
+        LayoutCell(width, height, x, y, f"%{pane_num}", None, ()),
+        i,
+    )
+
+
+def parse_window_layout(layout: str) -> Optional[LayoutCell]:
+    """Parse a tmux ``window_layout`` string into a :class:`LayoutCell` tree (pure).
+
+    Strips the optional leading ``<checksum>,`` tmux prefixes, then parses the
+    nested ``WxH,X,Y`` grammar (``{...}`` = left/right split, ``[...]`` =
+    top/bottom split, ``,<n>`` = a leaf pane). Returns ``None`` for an empty or
+    unparseable string so the caller degrades to "nothing to rebalance" rather
+    than raising on a malformed read.
+    """
+    text = (layout or "").strip()
+    if not text:
+        return None
+    # Drop a leading hex checksum (`a3cd,`) if present — the body starts at the
+    # first `WxH` group.
+    head, sep, rest = text.partition(",")
+    if sep and head and all(c in "0123456789abcdefABCDEF" for c in head) and (
+        "x" in rest.partition(",")[0]
+    ):
+        text = rest
+    try:
+        root, _ = _parse_layout_cell(text, 0)
+    except (ValueError, IndexError):
+        return None
+    return root
+
+
+def top_level_columns(root: Optional[LayoutCell]) -> tuple[LayoutColumn, ...]:
+    """Project a parsed layout tree into its left-to-right top-level columns (#12135).
+
+    When the root is a left/right (``{...}``) split, its direct children are the
+    columns; otherwise the whole window is a single column. Each column's
+    ``target_pane`` is its first (top-left) leaf and ``clean`` records whether
+    that leaf spans the full column width (so a `resize-pane -x` on it moves the
+    column boundary rather than an inner sub-split).
+    """
+    if root is None:
+        return ()
+    cells = root.children if root.orient == "h" else (root,)
+    columns: list[LayoutColumn] = []
+    for index, cell in enumerate(cells):
+        leaves = cell.leaves()
+        first = leaves[0] if leaves else None
+        columns.append(
+            LayoutColumn(
+                index=index,
+                width=cell.width,
+                x=cell.x,
+                target_pane=first.pane_id if first else "",
+                pane_ids=tuple(leaf.pane_id for leaf in leaves if leaf.pane_id),
+                clean=bool(first and first.width == cell.width),
+            )
+        )
+    return tuple(columns)
+
+
+@dataclass(frozen=True)
+class RebalanceColumn:
+    """One top-level column with its observed and fair-share target width (#12135)."""
+
+    index: int
+    target_pane: str
+    pane_ids: tuple[str, ...]
+    current_width: int
+    target_width: int
+    clean: bool
+
+    @property
+    def delta(self) -> int:
+        return self.target_width - self.current_width
+
+    def as_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "target_pane": self.target_pane,
+            "pane_ids": list(self.pane_ids),
+            "current_width": self.current_width,
+            "target_width": self.target_width,
+            "delta": self.delta,
+            "clean": self.clean,
+        }
+
+
+@dataclass(frozen=True)
+class CockpitRebalancePlan:
+    """Plan to equalize the live cockpit's top-level column widths (#12135, pure).
+
+    ``drift`` is ``True`` when a top-level column is not cleanly resizable (a
+    #12130/#12133 structural drift); then ``blocked_reason`` is set, ``commands``
+    is empty, and the confirm path refuses to mutate. ``balanced`` is ``True``
+    when every column is already within ``tolerance`` of its fair share (or there
+    are fewer than two columns) — also an empty-``commands`` no-op. Otherwise
+    ``commands`` is the ordered `resize-pane -x` sequence, left to right, sizing
+    every column EXCEPT the last to its fair-share width; the rightmost absorbs
+    the remainder, so N columns need only N-1 commands. No identity option is
+    touched and no layout is flattened.
+    """
+
+    session: str
+    window: str
+    columns: tuple[RebalanceColumn, ...]
+    total_content_width: int
+    tolerance: int
+    balanced: bool
+    drift: bool
+    blocked_reason: Optional[str]
+    commands: tuple[CockpitCommand, ...]
+
+    @property
+    def column_count(self) -> int:
+        return len(self.columns)
+
+    def as_dict(self) -> dict:
+        return {
+            "session": self.session,
+            "window": self.window,
+            "column_count": self.column_count,
+            "total_content_width": self.total_content_width,
+            "tolerance": self.tolerance,
+            "balanced": self.balanced,
+            "drift": self.drift,
+            "blocked_reason": self.blocked_reason,
+            "columns": [c.as_dict() for c in self.columns],
+            "commands": [c.as_dict() for c in self.commands],
+        }
+
+
+def build_cockpit_rebalance_plan(
+    columns: Sequence[LayoutColumn],
+    *,
+    session: str = COCKPIT_SESSION_DEFAULT,
+    tolerance: int = DEFAULT_REBALANCE_TOLERANCE,
+) -> CockpitRebalancePlan:
+    """Plan an equal fair-share width rebalance of the cockpit's columns (#12135).
+
+    ``columns`` is the top-level column projection :func:`top_level_columns`
+    derives from the live ``window_layout`` tree. Pure: returns a
+    :class:`CockpitRebalancePlan`, runs no tmux.
+
+    Fail-closed on structural drift: if ANY column is not cleanly resizable
+    (``LayoutColumn.clean`` is ``False`` — a horizontal sub-split crams two Units
+    into one tmux cell), the plan is :pyattr:`CockpitRebalancePlan.drift` with a
+    ``blocked_reason`` and NO commands; that structural repair is #12133 /
+    doctor-geometry scope, and half-resizing it would corrupt the layout. The
+    fair share otherwise keeps the total column *content* width constant (borders
+    are not pane width and a resize never moves them), so the columns are
+    redistributed evenly without resizing the window; columns are resized left to
+    right and the rightmost absorbs the remainder.
+    """
+    ordered = sorted(columns, key=lambda c: (c.x, c.index))
+    n = len(ordered)
+    total_content = sum(c.width for c in ordered)
+
+    dirty = [c for c in ordered if not c.clean]
+    if dirty:
+        names = ", ".join(
+            f"column {c.index} (pane {c.target_pane or '?'})" for c in dirty
+        )
+        reason = (
+            f"cockpit {session!r} has a structurally drifted column that is not a "
+            f"clean full-width split ({names}); its tmux cell carries a horizontal "
+            f"sub-split (a #12130/#12133 2x2 / mixed-Unit drift), so a width "
+            f"resize would move an inner boundary and corrupt the layout. Resolve "
+            f"the structure first with `mozyo cockpit doctor-geometry` / #12133, "
+            f"then rebalance. (rebalance only equalizes width; it does not repair "
+            f"structure.)"
+        )
+        rebalance_cols = tuple(
+            RebalanceColumn(
+                index=c.index,
+                target_pane=c.target_pane,
+                pane_ids=c.pane_ids,
+                current_width=c.width,
+                target_width=c.width,
+                clean=c.clean,
+            )
+            for c in ordered
+        )
+        return CockpitRebalancePlan(
+            session=session,
+            window=COCKPIT_WINDOW,
+            columns=rebalance_cols,
+            total_content_width=total_content,
+            tolerance=tolerance,
+            balanced=False,
+            drift=True,
+            blocked_reason=reason,
+            commands=(),
+        )
+
+    targets = fair_share_widths(total_content, n) if n else []
+    rebalance_cols = []
+    balanced = True
+    for i, col in enumerate(ordered):
+        target = targets[i] if i < len(targets) else col.width
+        rebalance_cols.append(
+            RebalanceColumn(
+                index=col.index,
+                target_pane=col.target_pane,
+                pane_ids=col.pane_ids,
+                current_width=col.width,
+                target_width=target,
+                clean=col.clean,
+            )
+        )
+        if abs(target - col.width) > tolerance:
+            balanced = False
+    if n < 2:
+        balanced = True
+
+    commands: list[CockpitCommand] = []
+    if not balanced:
+        # Resize every column except the rightmost; the last absorbs the
+        # remainder. `resize-pane -x` sets an absolute cell width and moves only
+        # the column border, so the vertical Codex/Claude split is preserved and
+        # no identity option is touched.
+        for col in rebalance_cols[:-1]:
+            if not col.target_pane:
+                continue
+            commands.append(
+                CockpitCommand(
+                    argv=(
+                        "resize-pane", "-t", col.target_pane,
+                        "-x", str(col.target_width),
+                    ),
+                    captures=None,
+                    purpose=(
+                        f"rebalance column {col.index} to {col.target_width} cells"
+                    ),
+                )
+            )
+
+    return CockpitRebalancePlan(
+        session=session,
+        window=COCKPIT_WINDOW,
+        columns=tuple(rebalance_cols),
+        total_content_width=total_content,
+        tolerance=tolerance,
+        balanced=balanced,
+        drift=False,
+        blocked_reason=None,
+        commands=tuple(commands),
+    )
