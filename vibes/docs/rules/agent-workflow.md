@@ -69,6 +69,8 @@
 - Codex は escalation、audit、ユーザー対話窓口、source of truth からの判断整理を担当する。
 - Codex が通常開発 task ID を受けた場合の standard 動作は、自ら実装することではなく、Claude handoff に変換することである。task の規模、緊急度、実装難易度、ユーザーからの催促、ユーザーが Codex pane に直接書いたことを理由に standard を曲げない。
 - cockpit / sublane 運用中の通常開発 task は、coordinator / main lane / main Claude で実装しない。coordinator は owner-facing、audit、routing、drain 判断を担当する。実装可能な ready work は、`review_waiting` / `owner_waiting` / `close_waiting` / `blocked` / `callback_due` を先に drain したうえで、専用 sublane / worktree を作り target-lane Codex gateway 経由で dispatch する。main Claude へ直接渡してよいのは read-only 調査、要約、draft、Design Consultation までであり、専用 sublane へ明示的に移されるまで実装 diff を出させない。
+- coordinator は implementation-shaped work の Implementation Request を作る前に、Redmine に dispatch decision を記録する。dispatch decision では、work shape、current lane states、blocking queue、sublane dispatch 可否、default-lane / main-lane 例外理由を明示する。理由のない main Claude / default-lane Claude への implementation_request は process gap として correction 対象である。
+- `mozyo_bridge` dogfooding では 3 本の active implementation sublane を標準目安とする。4 本目は burst decision、5 本目以降は explicit owner/operator decision を durable record に残す。review / owner / close / callback queue が詰まっている場合は新規 dispatch を止めて drain を優先する。
 - ユーザーからの「実行せよ」「対応して」「やって」「お願いします」「実装して」「進めて」など命令形・依頼形・激励形の指示は、それ単独では Codex の direct edit 権限の根拠にならない。これらは「実行してほしい」という意思表示であり、「Claude を経由しなくてよい」という意思表示ではない。
 - Codex 受領時に上記 standard handoff を上書きできるのは、Policy / Skill Authoring Boundary に定義された Codex direct edit 例外に明示的に該当する場合だけである。
 - Codex が自律フロー反映確認 task を受けた場合、検証対象となる通常開発 task を選定し、Claude へ handoff する。

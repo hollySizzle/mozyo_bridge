@@ -49,9 +49,25 @@ cockpit group (named tmux session) は display grouping であって routing ide
 
 cross-lane handoff は **target lane の Codex** を gateway として通す。同一物理 session でも lane 境界は governance 境界 (skill `## Natural-Name Target Handoff` の cross-lane rule / [[logic-cockpit-sublane-operating-model]] `## Cross-Lane Routing Rule`)。
 
+- Implementation Request を作る前に [[logic-sublane-bandwidth-policy]] の
+  dispatch decision を durable record に残す。implementation-shaped work は
+  sublane-first が default であり、main unit / default-lane Claude に直接渡す
+  場合は例外理由を明示する。理由のない default-lane handoff は correction
+  対象である。
 - dispatch 前に [[logic-sublane-bandwidth-policy]] の admission rule を確認する。空き pane / worktree があっても、coordinator に unread review_request、owner_waiting、blocked callback、retire_ready lane が残っている場合は先に drain する。
 - durable anchor を先に記録 → `mozyo-bridge handoff send --to codex --target <target_lane_codex_%pane> --target-repo auto` で通知。
 - Claude への direct delivery は same-lane addressing に限定。cross-session `--to claude` は CLI が拒否する。
+
+### recommended dispatch batch
+
+通常の v0.8 以降の実装 batch では、coordinator は 3 本までの active
+implementation sublane を標準運用として使う。1 本ずつ完了を待つ逐次運用は、
+blocking queue が無い状態では throughput smell として扱い、serial にする理由を
+dispatch decision に書く。
+
+4 本目は burst として扱い、review / owner / close / callback queue を starving
+しない根拠を記録する。5 本目以降は explicit owner/operator decision なしに開か
+ない。
 
 ## 4. sublane Claude の implementation 境界
 

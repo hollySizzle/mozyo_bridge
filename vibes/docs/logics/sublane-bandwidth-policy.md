@@ -72,6 +72,25 @@ reconstructed from the issue alone.
 
 ## Admission Rule
 
+Before any implementation-shaped work receives an Implementation Request, the
+coordinator records a dispatch decision. This applies even when the receiver
+would be the already-open main-unit Claude. Skipping this decision is a process
+gap, because it silently turns the coordinator lane into an implementation lane.
+
+The decision records:
+
+- whether the work is implementation-shaped or coordinator-only;
+- whether sublane dispatch is the default route;
+- if sublane dispatch is not used, the concrete exception that makes
+  main-lane / default-lane work safer or faster;
+- current active lane count and any coordinator-blocking queue;
+- the next drain action if dispatch is stopped.
+
+For implementation-shaped work, sublane dispatch is the default. Main-unit
+Claude is an exception for read-only investigation, summary/draft work, design
+consultation preparation, urgent minimal correction with a durable reason, or an
+explicit owner/operator decision. "The pane is already open" is not a reason.
+
 Before dispatching a new sublane, the coordinator records or verifies:
 
 - target issue, target lane, branch/worktree identity, and durable dispatch
@@ -95,8 +114,9 @@ If any check fails, do not dispatch another sublane. Record the blocking state
 and drain it first.
 
 If all checks pass and there is ready implementation work, dispatch is the
-preferred action. A coordinator stop that leaves ready work undispatched should
-record why serial execution is more efficient or safer for that specific state.
+preferred action. A coordinator stop that leaves ready work undispatched, or a
+direct default-lane Claude handoff, must record why serial execution is more
+efficient or safer for that specific state.
 
 ## Drain Order
 
@@ -120,11 +140,11 @@ requirements, review quality, or owner close approval separation.
 
 mozyo_bridge dogfooding uses the following repo-local soft profile:
 
-- target: at most two active implementation sublanes plus the main coordinator;
-- burst: a third active implementation sublane is allowed only when the
+- target: three active implementation sublanes plus the main coordinator;
+- burst: a fourth active implementation sublane is allowed only when the
   coordinator records why existing review / owner / blocker / retirement queues
   will not be starved;
-- stop: do not open a fourth active implementation sublane without explicit
+- stop: do not open a fifth active implementation sublane without explicit
   owner/operator decision recorded in the durable issue;
 - cleanup: when the lane count is above target, retire `retire_ready` lanes
   before the next optional dispatch batch.
@@ -155,12 +175,13 @@ When dispatching above target or stopping dispatch because bandwidth is full,
 record a short journal:
 
 ```markdown
-## Sublane bandwidth decision
+## Sublane dispatch decision
 
 - current_lanes:
   - <issue>: <state>
 - coordinator_blocking_states: <none | list>
-- admission_decision: <dispatch | stop_and_drain | burst_dispatch>
+- work_shape: <implementation | coordinator_only | read_only | design_consultation>
+- admission_decision: <dispatch_sublane | stop_and_drain | burst_dispatch | main_lane_exception>
 - reason: <why this decision is safe>
 - next_drain_action: <review | owner aggregation | blocker | retirement | none>
 ```
