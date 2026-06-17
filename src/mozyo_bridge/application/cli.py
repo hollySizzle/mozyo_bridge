@@ -72,6 +72,45 @@ from mozyo_bridge.domain.handoff import (
 from mozyo_bridge.domain.session_boundary import SESSION_BOUNDARY_SIGNALS
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
 
+# --- Backward-compatible import surface (Redmine #12138 / #12141). ---
+# Before the parser split, these handler / helper symbols were importable as
+# ``mozyo_bridge.application.cli.<name>`` because ``cli.py`` imported them
+# directly. The parser *registration* moved to the family modules
+# (`cli_release` / `cli_docs_scaffold` / `cli_workspace`), but the module-level
+# import path is preserved here so downstream imports / monkeypatch targets that
+# referenced them through ``application.cli`` keep working. This is the #12138
+# scope guard "do not retire legacy import paths" applied to ``cli.py``; it does
+# not affect parser behavior.
+from mozyo_bridge.application.cli_common import add_scaffold_target_option  # noqa: F401,E402
+from mozyo_bridge.application.commands import (  # noqa: F401,E402
+    cmd_docs_audit_impact,
+    cmd_docs_generate,
+    cmd_docs_resolve,
+    cmd_docs_validate,
+    cmd_rules_home,
+    cmd_rules_install,
+    cmd_rules_status,
+    cmd_scaffold_apply,
+    cmd_scaffold_canonical,
+    cmd_scaffold_diff,
+    cmd_scaffold_status,
+    cmd_workspace_defaults,
+    cmd_workspace_inspect,
+    cmd_workspace_list,
+    cmd_workspace_register,
+)
+from mozyo_bridge.application.release import (  # noqa: F401,E402
+    cmd_release_bump,
+    cmd_release_check_artifact,
+    cmd_release_check_drift,
+    cmd_release_check_scaffold,
+    cmd_release_check_tree,
+    cmd_release_check_workflow,
+    cmd_release_publish,
+    cmd_release_workflow_runs,
+    cmd_release_workflow_wait,
+)
+
 
 def repo_root_from_args(args: argparse.Namespace):
     return resolve_repo_root(getattr(args, "repo", None))
