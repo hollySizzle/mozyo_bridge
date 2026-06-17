@@ -24,8 +24,10 @@ from mozyo_bridge.application.instruction_doctor import (
 from mozyo_bridge.application import (
     cli_agents,
     cli_cockpit,
+    cli_core,
     cli_docs_scaffold,
     cli_handoff,
+    cli_modules,
     cli_observability,
     cli_release,
     cli_runtime_config,
@@ -154,28 +156,13 @@ def normalize_paths(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def _add_doctor_diagnostic_options(parser: argparse.ArgumentParser) -> None:
-    """Shared --target/--repo/--home/--json for `doctor` and `doctor instruction`."""
-    parser.add_argument(
-        "--target",
-        dest="repo",
-        help="Project root to check for scaffold and Claude project-skill readiness. "
-        "Defaults to MOZYO_REPO or the current working directory.",
-    )
-    parser.add_argument(
-        "--repo",
-        dest="repo",
-        help="Alias for --target.",
-    )
-    parser.add_argument(
-        "--home",
-        help="mozyo-bridge home. Defaults to MOZYO_BRIDGE_HOME or ~/.mozyo_bridge",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
+# `_add_doctor_diagnostic_options` moved into ``cli_core`` with the doctor /
+# sublane lifecycle block (Redmine #12155); re-exported here so the legacy
+# ``application.cli._add_doctor_diagnostic_options`` import / monkeypatch path
+# keeps working (same #12138 scope guard as the symbols above).
+from mozyo_bridge.application.cli_core import (  # noqa: F401,E402
+    _add_doctor_diagnostic_options,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -244,210 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=False)
 
-    status = sub.add_parser("status")
-    add_repo_option(status)
-    status.add_argument(
-        "--session",
-        default=None,
-        help=(
-            "Tmux session to describe. Defaults to the current session when "
-            "run inside tmux, else the bare-`mozyo` derived session name "
-            "(`mozyo-bridge session name`)."
-        ),
-    )
-    status.set_defaults(func=cmd_status)
-
-    sub.add_parser("list").set_defaults(func=cmd_list)
-
-    # `layout` + `cockpit` (first cockpit-family half); `agents` sits between
-    # them and the `tmux-ui` half, so registration is ordered explicitly to
-    # keep the pre-split top-level subcommand sequence (Redmine #12153).
-    cli_cockpit.register(sub)
-
-    cli_agents.register(sub)
-
-    cli_cockpit.register_tmux_ui(sub)
-
-    sub.add_parser("id").set_defaults(func=cmd_id)
-
-    resolve = sub.add_parser("resolve")
-    resolve.add_argument("target")
-    resolve.set_defaults(func=cmd_resolve)
-
-    read = sub.add_parser("read")
-    read.add_argument("target")
-    read.add_argument("lines", type=int, nargs="?", default=50)
-    read.set_defaults(func=cmd_read)
-
-    type_cmd = sub.add_parser("type")
-    type_cmd.add_argument("target")
-    type_cmd.add_argument("text")
-    type_cmd.set_defaults(func=cmd_type)
-
-    # `message` registers before `keys`; the notify-* / handoff / reply block
-    # registers after it (Redmine #12153 ordering guard).
-    cli_handoff.register_message(sub)
-
-    keys = sub.add_parser("keys")
-    keys.add_argument("target")
-    keys.add_argument("keys", nargs="+")
-    keys.set_defaults(func=cmd_keys)
-
-    cli_handoff.register(sub)
-
-    init = sub.add_parser(
-        "init",
-        help=(
-            "Adopt the current/target pane into its workspace as a `claude` / "
-            "`codex` agent. Smart default: derive the workspace's expected tmux "
-            "session, pin it into `.vscode/settings.json`, rename a "
-            "tmux-integrated fallback session (e.g. `___________`) into the "
-            "derived name, then rename the window to the agent. Fails closed when "
-            "adoption is not provably safe (meaningful foreign session, "
-            "expected-session collision, unidentifiable workspace root). Defaults "
-            "to the current pane when no target is given."
-        ),
-    )
-    init.add_argument("agent", choices=["claude", "codex"])
-    init.add_argument("target", nargs="?")
-    init.add_argument(
-        "--window-only",
-        action="store_true",
-        default=False,
-        dest="window_only",
-        help=(
-            "Legacy low-level behavior: only rename the current/target window, "
-            "with no session rename and no `.vscode/settings.json` write. Use for "
-            "manual / debug workflows or to adopt into a meaningful (non-fallback) "
-            "session in place."
-        ),
-    )
-    init.add_argument(
-        "--no-vscode-settings",
-        action="store_true",
-        default=False,
-        dest="no_vscode_settings",
-        help=(
-            "Run the smart session/window adoption but do not write "
-            "`<workspace>/.vscode/settings.json`."
-        ),
-    )
-    init.set_defaults(func=cmd_init)
-
-    doctor = sub.add_parser(
-        "doctor",
-        help="Diagnose CLI, central rules, agent skills, and scaffold readiness",
-    )
-    _add_doctor_diagnostic_options(doctor)
-    doctor.set_defaults(func=cmd_doctor)
-
-    # `doctor instruction` is the read-only recovery runbook (Redmine #11051):
-    # given the doctor diagnostics, it prints the ordered fix procedure with
-    # primary vs legacy-fallback commands. Bare `doctor` keeps running the
-    # diagnostics (subparser is optional so set_defaults(func=cmd_doctor) wins).
-    doctor_sub = doctor.add_subparsers(dest="doctor_command", required=False)
-    doctor_instruction = doctor_sub.add_parser(
-        "instruction",
-        help=(
-            "Read-only recovery runbook: orders the fix steps for the current "
-            "doctor diagnostics, distinguishing primary (Claude plugin) from "
-            "legacy fallback paths and routing scaffold drift through "
-            "review-before-restore. Does not write, install, or hit the network."
-        ),
-    )
-    _add_doctor_diagnostic_options(doctor_instruction)
-    doctor_instruction.add_argument(
-        "--profile",
-        choices=list(KNOWN_PROFILES),
-        default=PROFILE_REDMINE_CODEX,
-        help="Runtime-config profile to fold into the runbook. Only "
-        "`redmine-codex` is defined today.",
-    )
-    doctor_instruction.set_defaults(func=cmd_doctor_instruction)
-
-    # `sublane` groups the read-only sublane startup / callback-stall
-    # diagnostics (Redmine #12159). Both subcommands are pure over their inputs
-    # and never change handoff / queue-enter / launch behavior.
-    sublane = sub.add_parser(
-        "sublane",
-        help=(
-            "Read-only sublane startup readiness and callback-stall recovery "
-            "diagnostics (Redmine #12159)"
-        ),
-    )
-    sublane_sub = sublane.add_subparsers(dest="sublane_command", required=True)
-
-    sublane_readiness = sublane_sub.add_parser(
-        "readiness",
-        help=(
-            "Report whether future managed Claude panes launch in auto mode, "
-            "the coordinator-callback states this lane owes, and where the "
-            "stall-recovery path lives. Exits non-zero when permission mode is "
-            "not reproducible auto."
-        ),
-    )
-    sublane_readiness.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
-    sublane_readiness.set_defaults(func=cmd_sublane_readiness)
-
-    sublane_callback = sublane_sub.add_parser(
-        "callback-recovery",
-        help=(
-            "Classify a delivered-but-quiet unit of work into the four "
-            "callback-stall states from durable-record facts and print the "
-            "standard recovery path. Exits non-zero on a genuine stall."
-        ),
-    )
-    sublane_callback.add_argument(
-        "--dispatch-delivered",
-        dest="dispatch_delivered",
-        action="store_true",
-        help="A durable dispatch journal (Start / implementation_request / "
-        "coordinator routing) exists on the issue.",
-    )
-    sublane_callback.add_argument(
-        "--progress",
-        dest="progress",
-        action="store_true",
-        help="A newer durable gate / Progress Log journal appeared after the "
-        "dispatch (implementation_done, review_request, ...).",
-    )
-    sublane_callback.add_argument(
-        "--callback",
-        dest="callback",
-        choices=CALLBACK_CHOICES,
-        default=CALLBACK_ABSENT,
-        help="What the durable record shows about the cross-lane coordinator "
-        "callback. Default: absent.",
-    )
-    sublane_callback.add_argument(
-        "--stale-cli",
-        dest="stale_cli",
-        action="store_true",
-        help="Corroborating signal that a recorded callback attempt failed on "
-        "a stale installed CLI (only meaningful with `--callback delivery_failed`).",
-    )
-    sublane_callback.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit structured JSON output instead of human-readable text",
-    )
-    sublane_callback.set_defaults(func=cmd_sublane_callback_recovery)
-
-    cli_runtime_config.register(sub)
-
-    cli_docs_scaffold.register(sub)
-
-    cli_observability.register(sub)
-
-    cli_session.register(sub)
-
-    cli_workspace.register(sub)
-
-    cli_release.register(sub)
+    # Compose the top-level subparsers from the internal built-in CLI module
+    # registry (Redmine #12155). The default config enables every family in
+    # registration order, reproducing the prior inlined sequence exactly; the
+    # registry forbids a config from disabling core / authority-bearing families.
+    cli_modules.compose_parser(sub)
     return parser
 
 

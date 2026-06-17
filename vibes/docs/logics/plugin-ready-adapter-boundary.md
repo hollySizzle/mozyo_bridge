@@ -537,6 +537,84 @@ giving display any routing or approval authority.
 - No presentation-defined workflow truth, owner approval, or routing authority;
   iTerm / WebViewer stay consumers until a generic loopback contract is needed.
 
+## Internal CLI Module Registry / Configuration-Aware Baseline (Redmine #12155)
+
+The provider registry (#12035) classifies built-in *providers*. #12155 adds the
+parser-composition analogue: an internal, built-in **CLI command family**
+registry so `build_parser()` composes the family modules from a registry instead
+of a hand-ordered inline sequence, and so the codebase has a configuration-aware
+baseline (module selection / feature flags) before any external plugin surface
+exists. It is a classification + composition skeleton, not a plugin system.
+
+### Why now
+
+The feature-family parser split (#12153 / #12154) already moved each command
+family into its own module with a `register(sub)` entry point. Those modules
+were still wired into `build_parser()` by a fixed, hand-ordered call sequence.
+#12155 turns that sequence into a registry the core walks, which (a) makes the
+"core small and hard, families addable/swappable" goal concrete, and (b) gives a
+single place to express *which* built-in families a composition includes —
+without inventing the machinery a real plugin system would need.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/module_registry.py` — **core**, pure. It defines the
+  frozen `CliFamily` *description* (name, summary, the core-owned authorities the
+  family's commands participate in, `core` / `experimental` flags), the
+  `CliCompositionConfig` (module-selection-only config), the insertion-ordered
+  `BuiltinCliModuleRegistry`, and `CORE_OWNED_AUTHORITIES`. It imports no
+  application or argparse code; the dependency only points application -> domain,
+  exactly like `provider_registry`.
+- `src/mozyo_bridge/application/cli_modules.py` — the application-layer binding.
+  It maps each classified family *name* to the built-in registrar callable that
+  adds its subparsers (`cli_core` plus the feature-family modules), seeds
+  `BUILTIN_CLI_MODULE_REGISTRY` in the exact pre-registry order, and exposes
+  `compose_parser(sub, config)`.
+- `src/mozyo_bridge/application/cli_core.py` — the residual inline `build_parser()`
+  blocks (status/list, pane I/O, keys, init/doctor/sublane), moved verbatim into
+  four ordered registrars so the core command set composes through the registry
+  like the feature families. `build_parser()` now only builds the root options
+  and calls `compose_parser(sub)`.
+
+### Internal-only, by construction
+
+- **No external plugin loading.** The registry classifies families by pure
+  `CliFamily` descriptions; the name -> registrar binding references only
+  statically-imported built-in functions, never a runtime-resolved module path,
+  entry point, or user script. Composing the CLI can never import or execute
+  foreign code. This is the explicit non-goal: arbitrary external plugin loading
+  / dynamic registration is out of scope.
+- **No public ABI / compatibility promise.** Family names, the config shape, and
+  the record shapes are internal and may change with no deprecation window.
+- **Default composition is behavior-preserving.** The seeded order reproduces the
+  prior inlined `build_parser()` subcommand sequence exactly; the default config
+  disables nothing, so the full recursive `--help` tree is byte-identical to the
+  pre-registry CLI.
+
+### Authority stays core-owned (config cannot weaken it)
+
+The configuration surface is limited to module selection / feature flags — a
+config may name non-mandatory families to disable, nothing more. It cannot
+reorder, add a family, supply a registrar, or grant authority.
+`CORE_OWNED_AUTHORITIES` enumerates the decisions config never makes
+configurable — `workflow_authority`, `owner_approval`, `review_authority`,
+`close_approval`, `send_safety`, `routing_authority`. A family that carries any
+of them (the send / handoff / routing / release families) and the hard core
+command set are **mandatory**: `resolve_enabled` rejects a config that tries to
+disable a mandatory family (and one that names an unknown family), so owner
+approval / review / close / send safety can never be configured away. This is the
+CLI-composition counterpart to the provider registry's
+`FORBIDDEN_PROVIDER_AUTHORITIES` rejection. Tests pin the mandatory set and the
+rejection.
+
+### Provider selection vs module selection
+
+"Provider selection" in the configuration scope is the provider-registry concern
+(#12035); this CLI module registry owns "module selection / feature flags" for
+parser families. The two registries are deliberately separate: one classifies
+adapter providers, the other composes command families. Neither exposes an
+external plugin API.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
