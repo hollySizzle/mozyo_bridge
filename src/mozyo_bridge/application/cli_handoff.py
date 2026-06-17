@@ -1,0 +1,384 @@
+"""CLI parser registration for the handoff / notify / message / reply family.
+
+Split out of ``application/cli.py`` (Redmine #12153). Behavior-preserving;
+the handlers themselves live in ``application/commands.py``. Block text is
+moved verbatim from ``build_parser()`` so help / choices / defaults / dest /
+``func`` bindings are unchanged.
+
+The ``message`` command sits *before* ``keys`` in the pre-split parser, while
+the ``notify-*`` / ``handoff`` / ``reply`` block sits *after* it. Top-level
+subcommand order is observable in ``--help``, so registration is split:
+:func:`register_message` emits ``message``; the caller then registers ``keys``;
+:func:`register` emits the notify / handoff / reply block. Call them in that
+order to reproduce the pre-split sequence exactly.
+
+``add_notify_delivery_options`` / ``add_notify_options`` /
+``add_legacy_notify_options`` are re-exported from ``application/cli.py`` to
+preserve the pre-split module-level import surface (Redmine #12138 scope guard).
+"""
+from __future__ import annotations
+
+import argparse
+
+from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.application.commands import (
+    cmd_handoff_cross_workspace_consult,
+    cmd_handoff_reply,
+    cmd_handoff_send,
+    cmd_message,
+    cmd_notify_claude,
+    cmd_notify_claude_legacy_task,
+    cmd_notify_claude_review_result,
+    cmd_notify_codex,
+    cmd_notify_codex_legacy_task,
+    cmd_notify_codex_review,
+)
+from mozyo_bridge.domain.handoff import (
+    KIND_LABELS,
+    MODE_QUEUE_ENTER,
+    MODES,
+    RECORD_FORMAT_BOTH,
+    RECORD_FORMATS,
+    SOURCES,
+)
+
+
+def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
+    parser.add_argument("--issue", required=issue_required)
+    parser.add_argument("--commit")
+    parser.add_argument("--target")
+    parser.add_argument("--prompt")
+    parser.add_argument("--read-lines", type=int, default=20)
+    parser.add_argument(
+        "--landing-timeout",
+        type=float,
+        default=8.0,
+        help=(
+            "Seconds to wait for the header marker to render in the target "
+            "pane before pressing Enter. Larger values absorb Claude/Codex "
+            "TUI redraw delay; the command proceeds as soon as the marker is "
+            "observed. Marker observation is not a delivery guarantee."
+        ),
+    )
+    parser.add_argument("--submit-delay", type=float, default=0.2, help="Seconds to wait after text is observed before pressing Enter")
+    parser.add_argument("--force", action="store_true", help="Allow sending to a non-agent-looking pane")
+
+
+def add_notify_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
+    parser.add_argument("--journal", help="Redmine journal id used as the canonical gate")
+    add_notify_delivery_options(parser, issue_required=issue_required)
+    # The standard notify-* wrappers route through `orchestrate_handoff` so
+    # they accept the same record knobs as `mozyo-bridge handoff send/reply`.
+    # Legacy queue notify-* commands stay on `notify_agent` and intentionally
+    # do not expose these flags.
+    parser.add_argument(
+        "--record-format",
+        dest="record_format",
+        choices=sorted(RECORD_FORMATS),
+        default=RECORD_FORMAT_BOTH,
+        help=(
+            "Format of the durable delivery-record emitted alongside the "
+            "structured outcome. Defaults to `both`; pass `json` for the "
+            "prior single-line JSON shape that scripts expect."
+        ),
+    )
+    parser.add_argument(
+        "--record-command",
+        dest="record_command",
+        help=(
+            "Optional literal command string included in the generated "
+            "delivery record under `- Command:` for audit replay."
+        ),
+    )
+
+
+def add_legacy_notify_options(parser: argparse.ArgumentParser) -> None:
+    add_notify_delivery_options(parser, issue_required=True)
+    parser.add_argument("--task-id", required=True, help="Retired queue task id used only for legacy cleanup")
+    add_repo_option(parser)
+    parser.add_argument("--queue", help="Retired queue path used only with --task-id")
+
+
+def configure_handoff_parser(
+    parser_: argparse.ArgumentParser,
+    *,
+    kind_required: bool,
+    include_to: bool = True,
+    include_force: bool = True,
+    target_required: bool = False,
+    target_repo_required: bool = False,
+) -> None:
+    if include_to:
+        parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
+    parser_.add_argument("--source", required=True, choices=sorted(SOURCES), help="Durable record source system")
+    parser_.add_argument(
+        "--kind",
+        required=kind_required,
+        choices=sorted(KIND_LABELS),
+        help="Durable intent label. Required for `handoff send`; defaults to `reply` for `handoff reply` / `reply`",
+    )
+    parser_.add_argument("--task-id", dest="task_id", help="Asana task gid (source=asana)")
+    parser_.add_argument("--comment-id", dest="comment_id", help="Asana story/comment gid (source=asana)")
+    parser_.add_argument(
+        "--anchor-url",
+        dest="anchor_url",
+        help="Asana task permalink + comment timestamp/context when a stable comment id is unavailable",
+    )
+    parser_.add_argument("--issue", help="Redmine issue id (source=redmine)")
+    parser_.add_argument("--journal", help="Redmine journal id (source=redmine)")
+    parser_.add_argument(
+        "--target",
+        required=target_required,
+        help=(
+            "Required explicit tmux target (an explicit `%%pane` for the "
+            "Codex gateway); the target pane must resolve to the fixed "
+            "receiver in every mode"
+            if target_required
+            else "Optional tmux target override; defaults to same-session "
+            "agent-window resolution from --to"
+        ),
+    )
+    parser_.add_argument(
+        "--target-repo",
+        dest="target_repo",
+        required=target_repo_required,
+        help=(
+            "Optional cross-workspace gate (Redmine #10332): the target "
+            "pane's cwd must resolve to this repo root, otherwise the "
+            "handoff is rejected with `target_repo_mismatch`. Use when "
+            "the sender wants to assert which workspace the target lives "
+            "in before delivery. Drop the flag to skip the repo gate. "
+            "Pass `auto` (Redmine #11778) to infer the root from an "
+            "explicit `%%pane` target's own cwd instead of running "
+            "`tmux display-message ... pane_current_path` by hand; "
+            "`auto` requires an explicit `%%pane` target and stays "
+            "fail-closed when no workspace/repo marker is reachable."
+        ),
+    )
+    parser_.add_argument(
+        "--workdir",
+        dest="workdir",
+        help=(
+            "Optional target execution root / workdir for the receiver "
+            "(Redmine #12098). Use when the work target is a nested project "
+            "below the pane cwd / workspace root (e.g. a cockpit workspace "
+            "whose pane cwd is the workspace anchor, not the nested "
+            "checkout). The resolved root is carried in the notification "
+            "body and durable delivery record — as a repo-root-relative "
+            "pointer when it lives under `--target-repo` (or the pane's "
+            "inferred repo root) — so the receiver recovers the execution "
+            "root from the durable record instead of pane scrollback. This "
+            "is record/wording only: it does not change pane selection or "
+            "relax any cross-session / cross-lane gate."
+        ),
+    )
+    parser_.add_argument(
+        "--mode",
+        choices=sorted(MODES),
+        default=MODE_QUEUE_ENTER,
+        help=(
+            "`queue-enter` (default since v0.4; Claude/Codex agent "
+            "panes only, --force not allowed) types and presses "
+            "Enter regardless of marker observation, emitting "
+            "reason=queue_enter on marker miss without rollback; "
+            "`standard` (strict explicit fallback) types and presses "
+            "Enter after the landing marker, with C-u rollback on "
+            "marker timeout; "
+            "`pending` types but leaves the input pending"
+        ),
+    )
+    parser_.add_argument(
+        "--summary",
+        help="Optional short hint appended to the generated notification; required for --kind custom",
+    )
+    if include_force:
+        parser_.add_argument(
+            "--force",
+            action="store_true",
+            help="Allow sending to a non-agent-looking pane",
+        )
+    parser_.add_argument(
+        "--landing-timeout",
+        dest="landing_timeout",
+        type=float,
+        default=8.0,
+        help=(
+            "Seconds to wait for the landing marker to render before "
+            "pressing Enter. Larger values absorb Claude/Codex TUI redraw "
+            "delay; delivery proceeds as soon as the marker is observed."
+        ),
+    )
+    parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
+    parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
+    parser_.add_argument(
+        "--record-format",
+        dest="record_format",
+        choices=sorted(RECORD_FORMATS),
+        default=RECORD_FORMAT_BOTH,
+        help=(
+            "Format of the durable delivery-record emitted alongside the "
+            "structured outcome. `both` (default) prints the markdown "
+            "record then the JSON outcome; `text` prints only the markdown "
+            "record; `json` preserves the prior single-line JSON shape."
+        ),
+    )
+    parser_.add_argument(
+        "--record-command",
+        dest="record_command",
+        help=(
+            "Optional literal command string included in the generated "
+            "delivery record under `- Command:` for audit replay."
+        ),
+    )
+
+
+def register_message(sub) -> None:
+    """Register the `message` subcommand onto ``sub`` (pre-`keys` position)."""
+    message = sub.add_parser("message")
+    message.add_argument("target")
+    message.add_argument("text")
+    message.add_argument(
+        "--no-submit",
+        dest="submit",
+        action="store_false",
+        help="Type the message but do not press Enter; leave the input pending at the target prompt",
+    )
+    message.add_argument(
+        "--landing-timeout",
+        type=float,
+        default=8.0,
+        help=(
+            "Seconds to wait for the header marker to render in the target "
+            "pane before pressing Enter. Larger values absorb Claude/Codex "
+            "TUI redraw delay; the command proceeds as soon as the marker is "
+            "observed. Marker observation is not a delivery guarantee. "
+            "Claude TUI redraw-delay environments may also want "
+            "`--submit-delay 0.5`."
+        ),
+    )
+    message.add_argument(
+        "--submit-delay",
+        type=float,
+        default=0.2,
+        help="Seconds to wait after the marker is observed before pressing Enter",
+    )
+    message.add_argument(
+        "--read-lines",
+        type=int,
+        default=50,
+        help="Number of pane lines to inspect when waiting for the header marker",
+    )
+    message.add_argument(
+        "--attempt",
+        dest="attempt",
+        type=int,
+        default=None,
+        help=(
+            "Optional retry counter for the per-preset `--no-submit` retry "
+            "budget. Pass `--attempt N` on each retry so gate-failure stderr "
+            "trailers can report `N/cap` remaining accurately; omit on the "
+            "first call. Counter is operator-tracked because the CLI is "
+            "stateless across invocations."
+        ),
+    )
+    message.set_defaults(func=cmd_message, submit=True)
+
+
+def register(sub) -> None:
+    """Register the notify-* / handoff / reply block onto ``sub`` (post-`keys`)."""
+    for name_, func in [("notify-codex", cmd_notify_codex), ("notify-claude", cmd_notify_claude)]:
+        notify = sub.add_parser(name_)
+        add_notify_options(notify)
+        notify.add_argument("--type")
+        notify.set_defaults(func=func)
+
+    for name_, func in [
+        ("notify-codex-review", cmd_notify_codex_review),
+        ("notify-claude-review-result", cmd_notify_claude_review_result),
+    ]:
+        notify = sub.add_parser(name_)
+        add_notify_options(notify, issue_required=True)
+        notify.set_defaults(func=func)
+
+    for name_, func in [
+        ("notify-codex-legacy-task", cmd_notify_codex_legacy_task),
+        ("notify-claude-legacy-task", cmd_notify_claude_legacy_task),
+    ]:
+        notify = sub.add_parser(name_)
+        add_legacy_notify_options(notify)
+        notify.add_argument("--type")
+        notify.set_defaults(func=func)
+
+    handoff = sub.add_parser(
+        "handoff",
+        help="High-level cross-agent notification primitive anchored at a durable record",
+    )
+    handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
+    handoff_send = handoff_sub.add_parser("send", help="Send a handoff notification from sender to receiver")
+    configure_handoff_parser(handoff_send, kind_required=True)
+    handoff_send.set_defaults(func=cmd_handoff_send)
+
+    handoff_reply = handoff_sub.add_parser(
+        "reply",
+        help="Send a reply notification from sender to receiver (kind defaults to `reply`)",
+    )
+    configure_handoff_parser(handoff_reply, kind_required=False)
+    handoff_reply.set_defaults(func=cmd_handoff_reply)
+
+    handoff_consult = handoff_sub.add_parser(
+        "cross-workspace-consult",
+        help=(
+            "Cross-workspace design-consultation route through a target "
+            "workspace's Codex gateway pane"
+        ),
+        description=(
+            "Standard cross-workspace design-consultation primitive (Redmine "
+            "#11779). It is a boundary-preserving wrapper over `handoff send`: "
+            "the receiver is fixed to `codex` (the consult lands on the target "
+            "workspace's Codex gateway pane, never directly in a foreign Claude "
+            "pane), and the cross-workspace identity gate is mandatory — both "
+            "`--target` and `--target-repo` are required, so the gate that "
+            "`handoff send` only runs when `--target-repo` is supplied always "
+            "runs here. `--kind` defaults to `design_consultation`. Every "
+            "actual safety gate (cross-session Claude block, repo identity "
+            "gate, receiver-process binding, landing rail) is delegated to the "
+            "same `handoff send` orchestration and is neither hidden nor "
+            "weakened by this wrapper."
+        ),
+        epilog=(
+            "Operational route:\n"
+            "  1. Discover the target workspace's Codex pane with "
+            "`mozyo-bridge agents list` / `agents targets` (read-only).\n"
+            "  2. Record the consult request on the durable source of truth "
+            "(Redmine issue/journal or Asana task/comment) first; the pane "
+            "notification is only the pointer.\n"
+            "  3. Run this command with an explicit `%pane` target and "
+            "`--target-repo` (or `--target-repo auto` to infer the root from "
+            "that `%pane`'s cwd).\n"
+            "  4. The target Codex reads the durable anchor and, if "
+            "implementation is needed, performs the local same-session Claude "
+            "handoff inside its own workspace.\n\n"
+            "Example:\n"
+            "  mozyo-bridge handoff cross-workspace-consult \\\n"
+            "    --source redmine --issue 11779 --journal 58668 \\\n"
+            "    --target %42 --target-repo auto \\\n"
+            "    --summary 'cross-workspace gateway primitive design'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    configure_handoff_parser(
+        handoff_consult,
+        kind_required=False,
+        include_to=False,
+        include_force=False,
+        target_required=True,
+        target_repo_required=True,
+    )
+    handoff_consult.set_defaults(func=cmd_handoff_cross_workspace_consult)
+
+    reply_alias = sub.add_parser(
+        "reply",
+        help="Alias for `mozyo-bridge handoff reply` (kind defaults to `reply`)",
+    )
+    configure_handoff_parser(reply_alias, kind_required=False)
+    reply_alias.set_defaults(func=cmd_handoff_reply)
