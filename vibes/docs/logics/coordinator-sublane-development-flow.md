@@ -2,6 +2,8 @@
 
 Redmine #12200。`mozyo_bridge` の通常開発が cockpit-visible sublane 前提へ移行したため、管制塔とサブレーンの責務分担を 1 つの spine として定義する。
 
+この文書は repo-local の **一次 spine** である。管制塔 / サブレーン開発フローに関する dispatch、callback、review、close、integration、retirement の順序と責務はこの文書を先に読む。旧 `cockpit-sublane-operating-model.md` と `sublane-worktree-operating-runbook.md` は互換参照 / 履歴詳細とし、この文書と矛盾する別個の完全な規約本文として扱わない。
+
 この文書は詳細規則の複製ではない。既存の `agent-workflow.md`、`sublane-bandwidth-policy.md`、`sublane-worktree-operating-runbook.md`、skill workflow reference、central preset を、どの順序で読むかを決める地図である。
 
 ## 用語と表記ゆれ
@@ -26,6 +28,27 @@ owner / user は状況に応じて、同じ運用単位を `管制塔`、`メイ
 - US close と Version close の承認境界を分ける。
 - close 済み sublane を退役させ、cockpit / worktree / agent context を残し続けない。
 - ルールを既存 guardrail へ追記し続けるのではなく、本 flow を参照 spine として使う。
+
+## 文書言語
+
+この repo の LLM 向け規約本文は日本語で書く。英字の固定フィールド名、gate 名、CLI option、コード識別子、branch 名、path はそのまま保持してよいが、見出しと説明本文を英語だけで置かない。
+
+```yaml
+language_policy:
+  prose: 日本語
+  headings: 日本語
+  allowed_literal_tokens:
+    - fixed field names
+    - gate names
+    - CLI options
+    - code identifiers
+    - branch / path names
+  forbid:
+    - operator-facing 規約本文を英語のみで追加する
+    - skill / runbook へ英語本文を置き、repo-local 日本語 spine と意味を分岐させる
+```
+
+LLM 向け規約文書の一般 authoring rule は `.mozyo-bridge/rules/llm_rule_authoring.md` の `## 言語` を正本とする。本 flow では、サブレーン開発フロー固有の適用として「本文は日本語、固定フィールド名は literal token」と明示する。
 
 ## ルール配置判断
 
@@ -99,14 +122,14 @@ sublane Claude:
 - 「どちらでも実装できる」が、選択により今後の roadmap が変わる判断。
 - sublane 間で file / invariant / merge order が衝突する判断。
 
-### sublane で決めてよい
+### サブレーンで決めてよい
 
 - 1 UserStory 内に閉じる local implementation detail。
 - helper 関数、class split、test file 分割、internal naming。
 - coordinator 決定済み方針から機械的に導ける edge case。
 - migration や利用者影響が無い小さい error message detail。
 
-### escalation
+### エスカレーション
 
 実装中に coordinator-owned 仕様決定が必要になった場合、sublane は実装を止め、Redmine に design consultation / blocked / owner-action-needed を記録し、coordinator Codex へ callback する。
 
@@ -210,7 +233,7 @@ stop
 - commit-bearing work は、target branch merge / push / patch-equivalence / explicit deferral のいずれかを Close Gate の basis に含める。
 - Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。
 
-## sublane retirement
+## サブレーン退役
 
 管制塔は、US close 後に sublane retirement を必ず検討する。retirement は後続提案より前に行う。
 
@@ -223,6 +246,55 @@ routine retirement の条件:
 - lane identity が明確で、削除対象 worktree を取り違えない。
 
 条件を満たす場合、管制塔は owner 確認なしに退役してよい。条件を外れる場合は Redmine に理由を残し、retirement を止める。
+
+### 退役 fixed fields
+
+retirement は destructive 寄りの操作なので、pane kill / worktree remove の前後を Redmine journal で挟む。閉じた lane は default retire candidate だが、dependency ancestor lane は downstream merge / rebase が消費されるまで保持できる。
+
+```yaml
+retirement_state:
+  candidate: retire_candidate
+  ready: retire_ready
+  retained: retain_until_downstream_consumed
+  blocked: retire_blocked
+  done: retired
+fixed_fields:
+  - retirement_state
+  - lane
+  - worktree
+  - pane
+  - redmine_issue_state
+  - retain_reason
+  - downstream_consumed
+  - retire_blockers
+  - safety_preflight
+  - durable_anchor
+```
+
+`retire_ready` に進める前に、次の `safety_preflight` がすべて true であることを記録する。
+
+```yaml
+safety_preflight:
+  redmine_closed: true
+  worktree_clean: true
+  origin_reachable: true
+  pending_prompt_absent: true
+  callback_drained: true
+  target_identity_known: true
+```
+
+次のいずれかが残る lane は `retire_blockers` に記録し、`retire_ready` にしない。
+
+- active lane。
+- review pending。
+- owner approval pending。
+- unresolved callback。
+- dirty worktree。
+- pending prompt。
+- unpushed commit。
+- unknown target identity。
+
+退役後は `retired` journal に removed / killed した worktree、pane、branch、`durable_anchor` (`retire_ready` journal) を残す。retirement は close を自己承認しない。既に close 済み、または explicit defer 済みの lane だけを対象にする。
 
 ## 後続 Version / US 提案の順序
 
