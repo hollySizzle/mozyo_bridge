@@ -88,46 +88,20 @@ PlantUML activity + swimlane を原則とする理由:
 
 ## 役割
 
-### Owner
+詳細な実行責務は `標準フロー` の swimlane を読む。ここでは actor の authority だけを定義する。
 
-- product / release / version close の最終判断を持つ。
-- 通常開発 US の close approval は、central preset の standing delegation 条件を満たす限り管制塔へ事前委任できる。
-- Version close、production publish、release/tag/publish、credential、destructive、security-sensitive な判断は管制塔へ委任しない。
-
-### 管制塔 Codex
-
-- 最初の prompt / pane marker / ticket ID を受け取り、Redmine と catalog docs を source of truth として読む。
-- 作業を分類し、sublane に委譲するか、管制塔だけで扱うかを決める。
-- 実装型作業を自分では実装しない。
-- 実装型作業を main lane Claude に直接渡さない。ただし read-only 調査、要約、draft、Design Consultation 準備は例外。
-- coordinator-owned 仕様決定を行い、Redmine journal または cataloged design doc に durable record として残す。
-- sublane の Review Gate を読むか実施し、owner close approval を集約し、integration / Close Gate / status close を処理する。
-- routine retirement 条件を満たす sublane を owner 確認なしに退役させる。
-- sublane 承認と退役の後に、後続 Version / US の提案を owner に出す。
-- 後続 Version / US 作成後、必要な仕様決定と管制塔自身の guardrail 更新要否を再評価する。
-- 新規セッションへ渡す prompt 例を、Redmine issue ID とともに示す。
-
-### main lane Claude
-
-- 管制塔が使う補助 actor である。
-- 実装型 diff を作らない。
-- 許される用途は read-only 調査、要約、draft、Design Consultation 補助、または管制塔が明示した非実装作業に限る。
-- 通常開発実装が必要になった場合は、専用 sublane へ移す。
-
-### target-lane Codex
-
-- cross-lane dispatch の gateway である。
-- durable anchor を読み、自 lane の Claude へ same-lane handoff する。
-- sublane の review result、owner_waiting、blocked、implementation_done、review_request など handoff-worthy state を coordinator へ callback する。
-- coordinator-owned 仕様決定を勝手に確定しない。必要なら option / tradeoff / recommendation として coordinator へ戻す。
-
-### sublane Claude
-
-- bounded implementation worker である。
-- Redmine issue / journal と catalog docs から実装する。
-- 実装判断は行えるが、coordinator-owned 仕様決定は確定しない。
-- implementation_done / review_request を durable record に残し、verification と residual risk を再現可能にする。
-- owner close approval を収集しない。
+```yaml
+Owner:
+  authority: product / release / Version close / production publish / credential / destructive / security-sensitive approval
+管制塔 Codex:
+  authority: owner-facing, dispatch, coordinator-owned design decision, audit, US close, integration disposition, sublane retirement, follow-up planning
+main lane Claude:
+  authority: read-only 調査 / 要約 / draft / design consultation 補助。通常開発実装者ではない
+target-lane Codex:
+  authority: cross-lane gateway / same-lane Claude handoff / coordinator callback
+sublane Claude:
+  authority: bounded implementation / implementation_done / review_request。owner close approval は収集しない
+```
 
 ## 仕様決定 routing
 
@@ -280,14 +254,7 @@ routine retirement の条件:
 
 ## 失敗として扱う例
 
-- 実装型 work を理由なく main lane Claude へ直接渡す。
-- invisible worker / hidden subagent を sublane として扱う。
-- sublane が coordinator-owned 仕様決定を実装 commit 内で黙って確定する。
-- review approval と owner close approval を同じ journal に混ぜる。
-- commit-bearing work を integration disposition なしに close する。
-- close 済み lane を退役検討せず、新規 sublane を増やす。
-- Version close を owner approval なしに進める。
-- 後続 Version / US を作った後に、前提となる仕様決定を未記録のまま実装へ流す。
+`標準フロー` の `$forbid` / `$validate` に反する状態は失敗として扱う。特に、main lane Claude への実装直送、hidden subagent の sublane 扱い、owner close approval と Review Gate の混同、integration disposition なし close、retirement 未検討の lane 放置、Version close の owner approval bypass は invalid である。
 
 ## 参照正本
 
