@@ -86,6 +86,29 @@ PlantUML activity + swimlane を原則とする理由:
 
 ただし、macro / function は少数の primitive に留める。関数を増やしすぎると図だけで読めなくなり、guardrail の目的である実行時判断の明瞭さが落ちる。
 
+swimlane activity を使う場合、Markdown の補足は次に限定する。
+
+```yaml
+markdownに残す:
+  - 目的と非目標
+  - 用語、alias、非同義語
+  - actor authority (実行責務ではなく権限境界)
+  - routing の静的判定条件
+  - schema、必須 journal field、verification command などの静的 checklist
+  - 参照正本と catalog / generated file の接続
+  - 図へ入れると可読性が落ちる前提、例外、後続 issue
+swimlaneへ寄せる:
+  - 誰が何をするか
+  - 実行順序
+  - handoff / callback / approval / close / retirement
+  - stop condition
+  - actor ごとの validation / forbid / record
+markdownに重複させない:
+  - swimlane にある実行責務の再掲
+  - `$validate` / `$forbid` にある禁足事項の長い箇条書き
+  - retry path や command detail の過剰展開 (runbook へ逃がす)
+```
+
 ## 役割
 
 詳細な実行責務は `標準フロー` の swimlane を読む。ここでは actor の authority だけを定義する。
