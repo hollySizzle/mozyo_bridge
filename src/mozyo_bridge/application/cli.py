@@ -270,6 +270,38 @@ def _warn_deprecated_alias(args: argparse.Namespace) -> None:
     )
 
 
+def _root_repo_override(argv: Optional[list[str]] = None) -> Optional[str]:
+    """Extract the root-level ``--repo`` value before full parser composition.
+
+    Composition (which CLI families exist) must be decided before argparse can
+    parse the real arguments, but the repo-local config that drives composition
+    lives under the repo root that the documented root-level ``--repo`` may
+    override (see the ``--repo`` help on the top-level parser). So the config
+    source has to honor the same ``--repo`` override, which means reading it
+    *before* the real parse.
+
+    A tiny ``add_help=False`` pre-parser mirrors the root-level options and
+    slurps everything from the first positional (the subcommand) onward into an
+    ``argparse.REMAINDER`` tail. That makes it read only the *root-level*
+    ``--repo`` — a subcommand-local ``--repo`` (which applies to that command,
+    not to which families compose) lands in the tail and is ignored here,
+    matching exactly how the real parser binds the root ``--repo`` before the
+    subparsers. The mirrored root options exist only so their values are not
+    mistaken for the first positional; this list must track the root options on
+    :func:`build_parser`. An absent ``--repo`` yields ``None`` -> the cwd /
+    ``MOZYO_REPO`` default, so config-absent default behavior is unchanged.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--repo", default=None)
+    pre.add_argument("--session", default=None)
+    pre.add_argument("--no-attach", action="store_true")
+    pre.add_argument("--cc", action="store_true")
+    pre.add_argument("--json", action="store_true", dest="json_output")
+    pre.add_argument("rest", nargs=argparse.REMAINDER)
+    known, _ = pre.parse_known_args(argv)
+    return known.repo
+
+
 def _exit_on_repo_local_config_error(exc: Exception) -> int:
     """Fail closed on a broken repo-local config with actionable error text.
 
@@ -292,18 +324,22 @@ def _exit_on_repo_local_config_error(exc: Exception) -> int:
     return 2
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     # Read the repo-local YAML config (Redmine #12190 loader) and compose the
-    # parser from it (Redmine #12191). A missing/empty config resolves to the
-    # behavior-preserving default, so the default CLI is unchanged; a present
-    # but broken config (parse / schema / family-resolution failure) fails
-    # closed here with actionable text instead of a traceback.
+    # parser from it (Redmine #12191). The config is loaded from the same repo
+    # root the root-level ``--repo`` selects (resolved before composition by
+    # ``_root_repo_override``), so an explicit ``--repo <target>`` reads
+    # ``<target>/.mozyo-bridge/config.yaml``, preserving the documented
+    # ``--repo`` override contract (review j#60857). A missing/empty config
+    # resolves to the behavior-preserving default, so the default CLI is
+    # unchanged; a present but broken config (parse / schema / family-resolution
+    # failure) fails closed here with actionable text instead of a traceback.
     try:
-        config = load_repo_local_config()
+        config = load_repo_local_config(_root_repo_override(argv))
         parser = build_parser(config)
     except (RepoLocalConfigError, ModuleRegistryError) as exc:
         return _exit_on_repo_local_config_error(exc)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not getattr(args, "command", None):
         return cmd_mozyo(args)
     args = normalize_paths(args)

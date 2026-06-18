@@ -710,6 +710,15 @@ through the #12190 loader and composes the parser from it. The contract:
   codebase and tests — it composes the full CLI exactly as before, so the change
   is transparent to existing callers. With a config it threads `config.cli` into
   `compose_parser(sub, config.cli)`; `main()` is the only caller that supplies one.
+- **Config source honors the root-level `--repo`.** Composition must be decided
+  before argparse parses the real arguments, yet the config lives under the repo
+  root that the documented root-level `--repo` may override. `main()` resolves
+  that override first (`_root_repo_override`, a tiny pre-parser that reads only
+  the root-level `--repo` and routes everything from the subcommand onward into a
+  REMAINDER tail), then loads the config from that root. So
+  `mozyo-bridge --repo <target>` reads `<target>/.mozyo-bridge/config.yaml`,
+  preserving the `--repo` contract; a *subcommand-local* `--repo` applies to that
+  command and never changes which families compose.
 - **Config-absent is unchanged.** A repo with no `.mozyo-bridge/config.yaml`
   resolves to `RepoLocalConfig.default()`, whose `cli` disables nothing, so the
   top-level help / subcommand tree is byte-identical to the pre-#12191 CLI.
