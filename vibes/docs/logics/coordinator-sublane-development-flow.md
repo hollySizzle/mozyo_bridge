@@ -2,7 +2,7 @@
 
 Redmine #12200。`mozyo_bridge` の通常開発が cockpit-visible sublane 前提へ移行したため、管制塔とサブレーンの責務分担を 1 つの spine として定義する。
 
-この文書は repo-local の **一次 spine** である。管制塔 / サブレーン開発フローに関する dispatch、callback、review、close、integration、retirement の順序と責務はこの文書を先に読む。旧 `cockpit-sublane-operating-model.md` と `sublane-worktree-operating-runbook.md` は互換参照 / 履歴詳細とし、この文書と矛盾する別個の完全な規約本文として扱わない。
+この文書は repo-local の **一次 spine** である。管制塔 / サブレーン開発フローに関する dispatch、callback、review、close、integration、retirement の順序と責務はこの文書を先に読む。旧 `cockpit-sublane-operating-model.md` と `sublane-worktree-operating-runbook.md` の規約本文は本書へ統合済みであり、旧 docs は互換 pointer と履歴参照だけを残す。
 
 この文書は詳細規則の複製ではない。既存の `agent-workflow.md`、`sublane-bandwidth-policy.md`、`sublane-worktree-operating-runbook.md`、skill workflow reference、central preset を、どの順序で読むかを決める地図である。
 
@@ -107,6 +107,76 @@ target-lane Codex:
 sublane Claude:
   authority: bounded implementation / implementation_done / review_request。owner close approval は収集しない
 ```
+
+## 運用モデル
+
+cockpit-visible sublane では、次の 4 つを混同しない。
+
+```yaml
+identity: workspace / lane / role / pane の durable な事実
+routing: どの agent が handoff を受け取り、行動してよいか
+display: pane / window / tab / iTerm / tmux view の見せ方
+governance: どの Redmine gate が実行や close を承認しているか
+```
+
+window layout は人間が関連作業を見やすくするための display であり、routing の source of truth ではない。隣に pane が見えていても、lane 境界や project 境界を越えた direct send の承認にはならない。
+
+### レーンと actor
+
+- **管制塔 Codex** は coordinator、auditor、owner-facing actor である。owner への質問、close approval 回収、Redmine gate 解釈、review conclusion、release / push / CI coordination、sublane 作成・退役、PoC finding の Redmine / repo-local docs 記録を担当する。
+- **target-lane Codex** はその lane の gateway である。durable Redmine anchor を読み、自 lane に属する request か確認し、same-lane Claude へ route し、blocked / review-ready / owner-action-needed を管制塔へ callback する。
+- **sublane Claude** は bounded implementation worker である。pane scrollback ではなく Redmine journal から実装し、implementation_done / review_request / verification / residual risk を再現可能に残す。owner close approval は回収しない。
+- **main lane Claude** は補助 actor である。長い journal / diff / log の要約、candidate 抽出、read-only 調査、draft wording、非権威的な option 比較には使えるが、通常開発実装者でも owner-facing coordinator でもない。
+
+main lane Claude が implementation request を受け取った場合は、実装前の設計矛盾・scope 不足・invariant 衝突を design consultation として整理してよい。ただし、調査や reroute 用の事実整理を終えたら停止する。実装 diff は専用 sublane / worktree に移して、target-lane Codex gateway 経由で same-lane Claude へ渡す。
+
+### レーン作成単位
+
+一つの作業単位は次の対応で扱う。対応は Redmine issue / journal に記録し、pane 配置から推測しない。
+
+```text
+work unit = 1 issue
+          + 1 branch
+          + 1 git worktree
+          + 1 lane
+          + 1 Codex pane
+          + 1 Claude pane
+```
+
+worktree の add / remove は素の git で行う。mozyo-bridge core は Git worktree manager ではない。具体 path / branch 命名、local soft profile、private cockpit composition は operator runtime policy であり OSS default に混ぜない。
+
+```text
+git worktree add <worktree-path> -b <branch>
+mozyo cockpit ...
+mozyo-bridge init claude   # / codex
+mozyo-bridge agents targets --session <cockpit-session>
+```
+
+## 実行 runbook
+
+この節はサブレーン作成から退役までの時系列手順である。判断規約は本書の各節を正とし、旧 runbook へ再分散しない。
+
+1. Redmine issue / journal / parent / Version / 参照 docs を読む。
+2. work unit と branch / worktree / lane / pane の対応を Redmine に記録する。
+3. dispatch 前に bandwidth admission を確認する。未読 review_request、owner_waiting、blocked callback、retire_ready lane が残る場合は先に drain する。
+4. cross-lane handoff は target-lane Codex gateway へ送る。Claude への direct delivery は same-lane addressing に限定する。
+5. target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す。`--no-submit` / `--mode pending` は operator / debug fallback であり標準 dispatch default にしない。
+6. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
+7. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
+8. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
+9. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
+10. callback / review / owner / integration / close / retirement を drain してから、後続 Version / US 提案へ進む。
+
+### callback 欠落時の sweep
+
+callback は pointer なので、欠けても durable progress は消えない。管制塔は新しい sublane を開く前に active lane の Redmine journal を sweep し、次を分類して記録する。
+
+- `progress_without_callback`: durable progress はあるが coordinator callback / ack が無い。既存 journal を拾って review / close flow へ進め、done な work を再 dispatch しない。
+- `no_progress_after_handoff`: delivery anchor はあるが新しい durable journal が無い。期待 gate を明示して再通知または blocker 化する。
+- `callback_delivery_failed`: callback 試行が失敗している。target 解決、window-binding preflight、stale CLI などの失敗理由を読む。
+- `callback_not_attempted`: durable progress はあるが callback / receive-method journal が無い。process gap として記録し、必要なら sublane 側へ補正を依頼する。
+
+この sweep は owner approval や close を self-authorize しない。review gate、owner close approval、status close はそれぞれ別 gate として処理する。
 
 ## 仕様決定 routing
 
