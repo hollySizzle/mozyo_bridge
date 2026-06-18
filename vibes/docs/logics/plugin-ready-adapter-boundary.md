@@ -509,6 +509,17 @@ giving display any routing or approval authority.
   surface, reusing the canonical `@mozyo_attention_*` option names from
   `attention_projection` (Redmine #11954) as the single source of truth. It runs
   no tmux I/O; the `set-option` argv mechanics stay in `attention_projection`.
+- `src/mozyo_bridge/application/text_attention_presentation_provider.py`
+  (Redmine #12185) — the built-in **text presentation provider**, the second
+  built-in provider. It projects the same already-derived `AttentionRecord` onto
+  the `text` surface, using stable human-readable label keys (`state` /
+  `severity` / `reason` / `updated_at`) that carry the same four logical cells,
+  in the same order, as the tmux projection, so the two surfaces cannot drift in
+  which facts they show. It also exposes `render_surface_text`, a pure renderer
+  that turns *any* `SurfaceProjection` (tmux or text) into a deterministic
+  `key: value` text block — the "text output" half of the presentation MVP. It
+  runs no I/O and, to minimise #12184 merge risk, does not register itself in
+  `provider_registry`; it stands on its own as a built-in projection.
 - `src/mozyo_bridge/domain/provider_registry.py` — the `presentation` category
   is no longer empty: the registry classifies `tmux-presentation` (matching the
   provider's `name`) with `projection_only` / `no_routing_authority` /
@@ -531,8 +542,9 @@ giving display any routing or approval authority.
 
 ### Non-goals (unchanged, restated for the implementation)
 
-- No third-party or arbitrary-code provider loading; the tmux projection is the
-  only presentation provider implementation.
+- No third-party or arbitrary-code provider loading; the built-in tmux and text
+  (Redmine #12185) projections are the only presentation provider
+  implementations.
 - No public ABI or long-term compatibility promise for these record shapes.
 - No presentation-defined workflow truth, owner approval, or routing authority;
   iTerm / WebViewer stay consumers until a generic loopback contract is needed.
