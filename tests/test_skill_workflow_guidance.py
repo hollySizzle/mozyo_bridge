@@ -112,6 +112,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Ticket System Conventions",
         "## Handoff Lifecycle",
         "## Cross-Workspace Handoff",
+        "## Same-Lane Claude Dispatch",
         "## Sublane Coordinator Callback",
         "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
         "## Coordinator Stop And Next-Action Standard",
@@ -166,6 +167,15 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "send a concise callback to the coordinator lane",
         "owner close approval requested",
         "The sublane's Codex owns the cross-lane callback",
+        # Same-lane Claude dispatch submit-completion (Redmine #12207). A
+        # same-lane Codex→Claude dispatch is a standard handoff that must reach
+        # submit (queue-enter on an active split, marker-observed `--mode
+        # standard` on an inactive cockpit-grid split); `--no-submit` /
+        # `--mode pending` stays an explicit operator/debug fallback, not the
+        # standard dispatch path.
+        "that dispatch is a **standard handoff and must complete the submit**",
+        "Inactive-split Claude pane uses marker-observed `--mode standard`",
+        "`--no-submit` / `--mode pending` is not the standard dispatch path",
         # Named cockpit groups — grouping vs identity separation
         # (Redmine #11853). A multi-cockpit layout must not become an
         # implicit cross-group send shortcut, and the cross-group rail
@@ -260,6 +270,55 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
             self._body(*self.PLUGIN_MIRROR_PATH),
             label="plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md",
         )
+
+
+class SameLaneDispatchDurableDocTest(unittest.TestCase):
+    """Pin the same-lane dispatch submit-completion contract in the durable
+    operating-model doc (Redmine #12207).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth (a Repo-Local Guardrail Autonomous Lane
+    doc). It must carry the same submit-completion contract the skill body
+    pins, so an agent reading the operating model — not just the skill — learns
+    that a same-lane dispatch reaches submit and does not rest at a pending
+    prompt. A future edit that drops the section fails here loudly rather than
+    silently reopening the #12207 stall.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## Same-Lane Claude Dispatch の Submit 完結",
+        "標準 handoff であり、submit まで完結する",
+        # The inactive-split case routes to the submit-completing standard rail.
+        "recovery command どおり `--mode standard --target",
+        # The pending fallbacks are explicitly not the standard dispatch path.
+        "`--no-submit` / `--mode pending` は標準 dispatch 経路ではない",
+        # The non-goals are spelled out: no gate relaxation, no blind Enter.
+        "blind Enter も導入しない",
+        # The reproduction anchor stays cited.
+        "#12207",
+    )
+
+    def test_operating_model_doc_carries_same_lane_dispatch_contract(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12207 same-lane dispatch marker {marker!r}; "
+                        "the submit-completion contract regressed or this anchor "
+                        "list needs an intentional update in the same commit."
+                    ),
+                )
 
 
 if __name__ == "__main__":

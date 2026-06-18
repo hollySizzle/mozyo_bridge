@@ -177,6 +177,40 @@ local Claude へ route する。
 Claude への direct delivery は same-lane addressing に限定する。これは
 cross-session Claude direct-send prohibition と同じ原則を守るためである。
 
+## Same-Lane Claude Dispatch の Submit 完結
+
+target lane の Codex が同一 lane の Claude implementer へ実装 / review request を
+渡す same-lane `--to claude` hop (`## Cross-Lane Routing Rule` が sanctioned route と
+する local hop) は **標準 handoff であり、submit まで完結する**。typed-but-unsubmitted
+な pending 入力で止めない。pending のまま放置すると operator / coordinator が手で
+Enter を押す必要が生じ、これは本 model が排除しようとする stall である (Redmine
+#12207 j#60739 / j#60741: same-lane Codex→Claude dispatch が `blocked` を返しつつ通知が
+Claude pane に staged のまま残り、coordinator が手動 Enter で unblock した事例)。
+
+- default の `queue-enter` rail は、Claude pane が自 window の active split のとき
+  `--mode` 不要で submit (Enter) する。
+- Claude pane が inactive split (Codex pane が active な cockpit grid の通常形) のとき
+  `queue-enter` は active-split gate で fail-closed (`blocked` / `invalid_args`) し何も
+  type しない。block が出力する recovery command どおり `--mode standard --target
+  <claude_%pane> --target-repo auto` で再 dispatch する。`standard` は landing marker を
+  観測してから Enter するため、active-split guard を緩めずに inactive な same-identity
+  pane へ submit 完結する。これは coordinator callback が (やはり通常 inactive な)
+  coordinator pane に対して `--mode standard` を使うのと同じ選択である
+  (`skills/mozyo-bridge-agent/references/workflow.md` `### Callback procedure`)。
+- `--no-submit` / `--mode pending` は標準 dispatch 経路ではない。通知を type して
+  operator submit のため pending に残す明示的な operator / debug fallback (および
+  per-preset `marker_timeout` retry path) であり、same-lane Claude への routing default
+  にはしない。標準 dispatch でこれを選ぶことが #12207 が直す regression である:
+  dispatch は delivered に見えるのに implementer は turn を受け取らない。
+- dispatch outcome (sent / blocked-with-reason + replayable retry command) を callback と
+  同様に durable record に残す。recovery command を伴う `blocked` は dispatch を
+  replayable に保つ。pending に黙って残した dispatch は delivered handoff ではない。
+- submit rail そのものの定義は `vibes/docs/logics/tmux-send-safety-contract.md` が正本
+  (`queue-enter` default / `standard` strict explicit fallback / `pending` operator-submit
+  path)。本節は same-lane dispatch が pending に停まらず submit へ進むよう *どの rail を
+  使うか* を固定するだけで、active-split / receiver-binding / process gate を緩めず、
+  blind Enter も導入しない。
+
 ## Cockpit Groups
 
 関連 project は同時に見える必要がある。portable rule は次である。
