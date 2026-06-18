@@ -422,6 +422,93 @@ Record the applicable subset on the state's gate / callback journal (or fold the
 - **It does not relax the stop / aggregation / role boundaries.** Coordinator drain and resume still route owner-gated next actions through `## Owner Approval Aggregation`, still present stops per `## Coordinator Stop And Next-Action Standard`, and still keep cross-lane routing Codex-to-Codex. The coordinator owning resume does not let it self-authorize a close or a carve-out.
 - **Keep operator-specific policy out of OSS defaults.** The concrete drain cadence, how often the coordinator sweeps the callback set, and any private resume prioritization are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a handoff-worthy state is incomplete until its callback outcome journal lands, that a dependency hold parks on the durable record instead of waiting on a go-ahead, that the coordinator owns callback drain and downstream resume, and that a commit hash is origin-reachability-checked before it is recorded in a gate* — all in the fixed-field shape above.
 
+## Sublane Retirement Drain
+
+`## Sublane Completion Guardrails` closes the front of a sublane's life: a handoff-worthy state is not complete until its callback outcome journal lands, and the coordinator owns callback drain and downstream resume. It leaves the *back* of the life implicit. Running several sublanes at once on Version #222 surfaced the gap: after a lane's issue is closed, the lane / worktree / cockpit pane keep living indefinitely, so a single version accumulates many Redmine-closed-but-still-resident lanes (Redmine #12214, generalizing the v0.9.1 sublane PoC; successor to #12213). This is not just operator cleanup laziness — the workflow never treated *retirement* as an explicit completion stage, so nothing owns it and nothing makes it safe. This standard defines sublane retirement as a **coordinator-owned drain that runs after the callback drain**, in the same fixed-field shape a future checker can read. It adds no automated retire CLI or checker and does not itself kill any existing lane / worktree (Redmine #12214 non-goals); it fixes *which lanes are retire candidates*, *what forbids retirement*, *what safety preflight a destructive pane-kill / worktree-remove requires*, and *which journals bracket the retire*.
+
+Retirement touches destructive operations (pane kill, worktree remove), so it is gated harder than the completion states. The fields below share the checker-friendly shape: `retirement_state`, `lane`, `worktree`, `pane`, `redmine_issue_state`, `retain_reason`, `downstream_consumed`, `retire_blockers`, `safety_preflight`, `durable_anchor`. Each state uses the subset that applies; the full template is in `### retire_ready and retired journal shape` below.
+
+### A closed lane is the default retire candidate
+
+When a lane's Redmine issue (the UserStory or standalone issue the lane was dispatched for) is **closed**, the lane is by default a `retire_candidate`: its worktree and cockpit pane are slated for removal. Closure here means the durable close, not `implementation_done` and not a Review Gate approval — `implementation_done` is not completion (base preset), and a Review Gate approval is not a close. A lane whose issue is merely at `implementation_done` or `owner_close_approval_waiting` is **not** a retire candidate; it is still in-flight per `## Sublane Completion Guardrails`.
+
+- `retirement_state: retire_candidate` records that the lane is eligible *in principle*; it does not authorize the destructive op. Retirement only proceeds after the prohibitions below are all clear and the safety preflight is green (`retirement_state: retire_ready`), and the kill / remove itself is recorded as `retirement_state: retired`.
+- The candidate set is derived from the durable record — the lane's issue state on Redmine — not from pane scrollback / `status` / `doctor`. A pane that *looks* idle is not a retire candidate unless its issue is closed; an issue that is closed makes its lane a candidate even if the pane was never visited again.
+
+### A dependency ancestor lane is retained until downstream consumed
+
+A closed lane is not always safe to retire immediately: a lane whose branch is an **ancestor that a downstream lane still has to merge or rebase onto** must survive until that downstream consumption completes, or the downstream rebase loses its base. Such a lane records `retirement_state: retain_until_downstream_consumed` instead of `retire_candidate`, with `retain_reason` (which downstream issue / lane still depends on this branch) and `downstream_consumed: false`.
+
+- This is the retirement-side mirror of the `## Sublane Completion Guardrails` dependency hold: there a *dependent* parks on `blocked_by` until its ancestor completes; here the *ancestor* is held from retirement until the dependent has consumed it. The hold is anchored on the durable record, not on an operator remembering the dependency.
+- The retain is released — `downstream_consumed: true`, and the lane becomes a `retire_candidate` — when the downstream lane has merged or rebased onto the ancestor commit and that consumption is itself recorded (the downstream lane's merge / rebase journal). The coordinator owns this transition as part of the retirement drain; the ancestor lane does not self-release by polling.
+
+### Retirement is prohibited while any hold condition is open
+
+A closed-issue lane is a candidate, but retirement is **forbidden** while any of the following is open. Each is a `retire_blockers` entry; a non-empty `retire_blockers` list means `retirement_state: retire_blocked`, never `retire_ready`:
+
+- **active lane** — the lane is still doing work (any state other than a closed issue with no outstanding gate).
+- **review pending** — a Review Request is outstanding with no Review Gate result.
+- **owner approval pending** — `owner_close_approval_waiting` with no owner_close_approval journal yet (the close is not real, so the lane is not closed).
+- **unresolved callback** — a handoff-worthy state whose callback outcome journal has not landed (`## Sublane Completion Guardrails` first guardrail). Retirement after the callback drain means the callbacks are already drained.
+- **dirty worktree** — uncommitted or untracked changes in the lane's worktree; removing it would discard them.
+- **pending prompt** — a queued / unsubmitted prompt on the lane's pane; killing it would drop in-flight input (`## Same-Lane Claude Dispatch` submit-completion concerns).
+- **unpushed commit** — a commit on the lane branch not reachable from `origin`; removing the worktree could orphan it (the `origin_reachable` preflight from `## Sublane Completion Guardrails`, applied to *every* lane commit, not just a recorded gate hash).
+- **unknown target identity** — the lane / worktree / pane identity is not resolved from the durable record / resolver; a destructive op against an unverified target is prohibited (do not kill a pane you cannot positively identify).
+
+### Destructive-operation safety preflight
+
+Before the destructive pane-kill / worktree-remove, the coordinator runs and records a `safety_preflight` whose every field must be true; a green preflight is exactly what moves a lane from `retire_candidate` to `retirement_state: retire_ready`:
+
+- `redmine_closed: true` — the lane's issue is durably closed (not `implementation_done`, not Review-approved-only).
+- `worktree_clean: true` — `git status` in the worktree shows no uncommitted / untracked changes.
+- `origin_reachable: true` — every commit on the lane branch is reachable from `origin` (push the branch, then confirm — for example `git branch -r --contains <hash>` / `git ls-remote origin` for the branch tip), so worktree removal loses no work.
+- `pending_prompt_absent: true` — no queued / unsubmitted prompt on the pane.
+- `callback_drained: true` — the coordinator callback drain for this lane is complete; no outstanding callback outcome journal is owed.
+- `target_identity_known: true` — the pane id / worktree path / lane branch are positively resolved from the durable record / resolver before any kill or remove.
+
+If any field is false the lane stays `retire_blocked`; the destructive op does not run, and the open field is the `retire_blockers` entry to clear first.
+
+### retire_ready and retired journal shape
+
+Bracket the destructive op with two durable journals on the lane's issue: `retire_ready` (preflight green, about to retire) and `retired` (pane killed / worktree removed). Record the applicable subset so a future checker can read it without parsing prose:
+
+```markdown
+## retire_ready
+- retirement_state: retire_ready
+- lane: <lane id / branch name>
+- worktree: <worktree path>
+- pane: <pane id>
+- redmine_issue_state: closed
+- retain_reason: none | <downstream issue still consuming this ancestor>
+- downstream_consumed: true | n/a
+- retire_blockers: []  (must be empty to be retire_ready)
+- safety_preflight: redmine_closed=true worktree_clean=true origin_reachable=true pending_prompt_absent=true callback_drained=true target_identity_known=true
+- durable_anchor: #<issue_id> j#<close_journal_id>
+
+## retired
+- retirement_state: retired
+- lane: <lane id / branch name>
+- worktree: <worktree path> (removed)
+- pane: <pane id> (killed)
+- durable_anchor: #<issue_id> j#<retire_ready_journal_id>
+```
+
+### The coordinator owns the retirement drain, after the callback drain
+
+Retirement is a coordinator duty, sequenced explicitly: **the coordinator runs the retirement drain after the callback drain.** The callback drain (`## Sublane Completion Guardrails`) clears outstanding callbacks and downstream resumes; only once a lane's callbacks are drained and its issue is closed does the coordinator evaluate it for retirement. The order matters — retiring a lane whose callbacks are still owed would drop a handoff-worthy state on the floor.
+
+- **Derive the candidate set from the durable record.** The coordinator enumerates closed-issue lanes from Redmine (per the pane-count-independent enumeration in `## Owner Approval Aggregation` / `## Stall And No-Progress Detection Standard`), not from pane inventory. A `retain_until_downstream_consumed` lane stays out of the retire set until its `downstream_consumed` flips.
+- **Run the preflight, then retire.** For each candidate the coordinator clears `retire_blockers`, records `retire_ready` with the green `safety_preflight`, performs the destructive op, and records `retired`. A lane that cannot reach `retire_ready` stays `retire_blocked` and is the coordinator's backlog item, exactly like an undrained callback.
+- **Retirement does not self-authorize a close.** The drain retires lanes whose issues are *already* closed; it never closes an issue to make a lane retireable. If a lane looks done but its issue is not closed, that routes through the normal close path (US-level audit → `## Owner Approval Aggregation` → owner_close_approval), not through retirement.
+
+### Boundaries this standard does not relax
+
+- **It defines a stage, it does not add a checker.** No automated retire CLI, no Redmine automation, no schema change (Redmine #12214 non-goals). The fixed-field shape only makes the retire journals machine-readable for a future checker; the enforcement today is the definition that retirement is coordinator-owned, candidate-gated, prohibition-gated, and preflight-gated.
+- **It retires nothing existing.** This standard does not kill the resident Version #222 lanes / worktrees / panes (Redmine #12214 non-goal — actual kill / remove is out of scope); it defines how retirement is done going forward.
+- **Durable record stays the source of truth.** The candidate set, the retain hold, the blockers, the preflight, and the retire bracket are all read from and recorded on the issue, never from pane scrollback / `status` / `doctor`. A pane looking idle is not a retire signal; a closed issue is.
+- **Destructive ops stay gated and identified.** A pane-kill / worktree-remove runs only with a green `safety_preflight` and a positively identified target; an unverified target identity is itself a `retire_blockers` entry. The standard never authorizes a destructive op on an unclosed issue, a dirty worktree, an unpushed commit, or an unknown target.
+- **Keep operator-specific policy out of OSS defaults.** The concrete retirement cadence, the Redmine saved query used to enumerate closed-lane candidates, and any private grace window before a closed lane is retired are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a closed lane is a retire candidate, that a dependency ancestor is retained until downstream consumed, that an open hold condition forbids retirement, that a destructive op requires a green safety preflight, and that the coordinator owns the retirement drain after the callback drain* — all in the fixed-field shape above, bracketed by `retire_ready` and `retired`.
+
 ## Main-Unit Claude Safe-Use Boundary
 
 `## Sublane Coordinator Callback` and `## Coordinator Stop And Next-Action Standard` assume the main coordinator lane is a Codex pane. Some cockpit layouts also place a **Claude pane in the main coordinator unit itself**, idle in auto mode beside the coordinator Codex. It is tempting to spend that pane on coordinator work to save the coordinator Codex's context. This section bounds that use so the main-unit Claude saves context without blurring the coordinator's owner-facing / gate-deciding role (Redmine #11858, from the #11850 multi-lane PoC).

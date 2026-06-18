@@ -471,6 +471,85 @@ parked state を記録して止まる、coordinator が callback drain / downstr
 を owns、commit hash は origin reachability を確認してから gate に記録する」を
 上記 fixed fields の形で残すことである。
 
+## サブレーン retirement drain (#12214)
+
+#12213 はサブレーンの life の *前半* を締めた: handoff-worthy state は callback
+outcome journal まで未完了で、coordinator が callback drain / downstream resume を
+owns する。だが life の *後半* — issue close 後の lane 撤収 — は未定義のままだった。
+version #222 で複数サブレーンを同時運用したところ、issue が closed になった後も
+lane / worktree / cockpit pane が無期限に残存し、1 version に
+Redmine-closed だが resident な lane が多数積み上がった (#12214、v0.9.1 サブレーン
+PoC の再発防止一般化、#12213 の後続)。これは単なる operator cleanup の怠慢ではなく、
+workflow が *retirement* を明示的な完了工程として扱っておらず、誰も owns せず安全化も
+していない設計 gap である。本 doc は sublane retirement を **callback drain の次に
+走る coordinator-owned drain** として定義する。新しい automated retire CLI / checker
+は作らず、既存 lane の実 kill / worktree remove も行わない (#12214 非スコープ)。
+fixed fields は将来 checker 化しやすい形に固定する: `retirement_state`, `lane`,
+`worktree`, `pane`, `redmine_issue_state`, `retain_reason`, `downstream_consumed`,
+`retire_blockers`, `safety_preflight`, `durable_anchor`。
+
+観測された portable な判断は次である。
+
+- **closed lane は default retire candidate。** lane の Redmine issue が closed に
+  なったら、その lane は default で `retire_candidate` (worktree / pane が撤収対象)
+  になる。ここでの close は durable な close であり、`implementation_done` でも
+  Review Gate approval でもない (implementation_done は完了ではない)。
+  `implementation_done` / `owner_close_approval_waiting` 止まりの lane は
+  retire candidate ではなく、#12213 のとおり in-flight である。candidate 集合は
+  durable record (issue state) から導出し、pane scrollback / `status` / `doctor`
+  から推測しない。
+- **dependency ancestor lane は downstream consumed まで retain。** branch が
+  downstream lane の merge / rebase 先になっている ancestor lane は、その消費完了まで
+  撤収を保留する。`retirement_state: retain_until_downstream_consumed` を `retain_reason`
+  (どの downstream issue / lane が依存しているか) と `downstream_consumed: false` で
+  記録する。これは #12213 の dependency hold の retirement 側の鏡である (あちらは
+  dependent が `blocked_by` で park、こちらは ancestor が retirement から hold)。
+  downstream が ancestor commit に merge / rebase し、その消費が記録されたら
+  (`downstream_consumed: true`) hold を解除し candidate に戻す。解除は coordinator が
+  owns し、ancestor lane は polling で self-release しない。
+- **retire 禁止条件 (どれか open なら `retire_blocked`、`retire_ready` にしない)。**
+  active lane / review pending / owner approval pending / unresolved callback /
+  dirty worktree / pending prompt / unpushed commit / unknown target identity の
+  いずれかが open な間は撤収を禁止する。各 open 条件は `retire_blockers` の entry に
+  なる。unresolved callback は #12213 の callback drain 完了で消える。dirty worktree /
+  unpushed commit は worktree remove が作業を捨てる危険、pending prompt は pane kill が
+  in-flight 入力を落とす危険、unknown target identity は識別できない pane を kill しない
+  という destructive 安全条件である。
+- **destructive 操作前の safety preflight を必須化。** pane kill / worktree remove の
+  前に `safety_preflight` を実行し記録する。全 field が true であることが
+  `retire_candidate` を `retirement_state: retire_ready` に進める条件である:
+  `redmine_closed` (durable close), `worktree_clean` (`git status` clean),
+  `origin_reachable` (lane branch の全 commit が origin から reachable、push 後に
+  `git branch -r --contains` 等で確認し worktree remove が work を失わない),
+  `pending_prompt_absent`, `callback_drained` (この lane の callback drain 完了),
+  `target_identity_known` (pane id / worktree path / branch を durable record /
+  resolver から positively 解決)。どれか false なら `retire_blocked` のままで
+  destructive 操作は走らせない。
+- **retire 前後を journal で bracket する。** 撤収を `retire_ready` (preflight green、
+  撤収直前) と `retired` (pane kill / worktree remove 実施済み) の 2 journal で挟む。
+  `retire_ready` は `retire_blockers: []`、green な `safety_preflight`、
+  `durable_anchor` (#<issue_id> j#<close_journal_id>) を残す。`retired` は
+  `retirement_state: retired` と removed/killed の worktree / pane、`durable_anchor`
+  (retire_ready journal) を残す。
+- **coordinator は callback drain の次に retirement drain を owns。** retirement は
+  coordinator の責務で、callback drain の後に sequence する。callback がまだ owed な
+  lane を retire すると handoff-worthy state を取りこぼすため、順序が重要である。
+  coordinator は closed-issue lane を durable record から列挙し (owner 承認集約 /
+  stall 検出と同じ pane-count 非依存の列挙)、`retire_blockers` を clear し、
+  `retire_ready` を記録し、destructive 操作を行い、`retired` を記録する。
+  `retire_ready` に到達できない lane は `retire_blocked` のまま coordinator の
+  backlog になる。retirement は close を self-authorize しない (既に closed な issue の
+  lane のみ retire し、retire のために issue を close しない)。
+
+これは停止点標準 (#11860) / owner 承認集約 (#11867) / stall 検出 (#11880) /
+#12213 完了条件を緩めない。具体的な retirement cadence / closed-lane 列挙 query /
+撤収前 grace window は operator runtime policy であり OSS default に混ぜない
+(public-private boundary)。portable な部分は「closed lane は retire candidate、
+dependency ancestor は downstream consumed まで retain、open hold 条件は retirement を
+禁止、destructive 操作は green safety preflight を要する、coordinator が callback drain
+の次に retirement drain を owns」を上記 fixed fields の形で `retire_ready` / `retired`
+journal で bracket して残すことである。
+
 ## Ticket 化するもの
 
 この PoC では、運用上の friction を意図的に child issue 化する。finding が

@@ -119,6 +119,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Owner Approval Aggregation",
         "## Stall And No-Progress Detection Standard",
         "## Sublane Completion Guardrails",
+        "## Sublane Retirement Drain",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -231,6 +232,24 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "verify the commit is reachable from `origin` and record the result as `origin_reachable`",
         "### Fixed-field journal shape",
         "`resume_condition`, `resume_owner`, `origin_reachable`",
+        # Sublane retirement drain (Redmine #12214). A closed lane is the
+        # default retire candidate, a dependency ancestor is retained until
+        # downstream consumed, an open hold condition forbids retirement, a
+        # destructive op requires a green safety preflight, and the coordinator
+        # owns the retirement drain after the callback drain — bracketed by
+        # retire_ready / retired journals in a checker-readable fixed-field
+        # shape.
+        "### A closed lane is the default retire candidate",
+        "the lane is by default a `retire_candidate`",
+        "### A dependency ancestor lane is retained until downstream consumed",
+        "`retirement_state: retain_until_downstream_consumed`",
+        "### Retirement is prohibited while any hold condition is open",
+        "a non-empty `retire_blockers` list means `retirement_state: retire_blocked`",
+        "### Destructive-operation safety preflight",
+        "moves a lane from `retire_candidate` to `retirement_state: retire_ready`",
+        "### retire_ready and retired journal shape",
+        "### The coordinator owns the retirement drain, after the callback drain",
+        "the coordinator runs the retirement drain after the callback drain",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
@@ -390,6 +409,67 @@ class SublaneCompletionGuardrailsDocTest(unittest.TestCase):
                         f"{marker!r}; the completion-condition redefinition "
                         "regressed or this anchor list needs an intentional "
                         "update in the same commit."
+                    ),
+                )
+
+
+class SublaneRetirementDrainDocTest(unittest.TestCase):
+    """Pin the sublane retirement drain in the durable operating-model doc
+    (Redmine #12214).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth. #12213 defined the front of a sublane's
+    life (completion / callback drain); #12214 defines the back (retirement).
+    The doc must carry the five #12214 guardrails — a closed lane is the default
+    retire candidate, a dependency ancestor is retained until downstream
+    consumed, an open hold condition forbids retirement, a destructive op
+    requires a green safety preflight, and the coordinator owns the retirement
+    drain after the callback drain — in the checker-readable fixed-field shape
+    bracketed by retire_ready / retired journals. A future edit that drops the
+    section fails here loudly rather than silently reopening the Version #222
+    resident-closed-lane accumulation gap.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## サブレーン retirement drain (#12214)",
+        # Guardrail 1: a closed lane is the default retire candidate.
+        "closed lane は default retire candidate",
+        # Guardrail 2: a dependency ancestor is retained until downstream
+        # consumed.
+        "dependency ancestor lane は downstream consumed まで retain",
+        # Guardrail 3: an open hold condition forbids retirement.
+        "retire 禁止条件 (どれか open なら `retire_blocked`、`retire_ready` にしない)",
+        # Guardrail 4: destructive op requires a green safety preflight.
+        "destructive 操作前の safety preflight を必須化",
+        # Guardrail 5: coordinator owns the retirement drain after the callback
+        # drain.
+        "coordinator は callback drain の次に retirement drain を owns",
+        # The retire is bracketed by retire_ready / retired journals.
+        "retire 前後を journal で bracket する",
+        # The fixed-field shape stays explicit so a checker can read it.
+        "`retire_blockers`, `safety_preflight`, `durable_anchor`",
+    )
+
+    def test_operating_model_doc_carries_retirement_drain(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12214 sublane retirement drain marker "
+                        f"{marker!r}; the retirement-stage definition regressed "
+                        "or this anchor list needs an intentional update in the "
+                        "same commit."
                     ),
                 )
 
