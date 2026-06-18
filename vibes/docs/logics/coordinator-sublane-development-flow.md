@@ -71,10 +71,20 @@ flow 型 guardrail を作る場合は、原則として次を含める。
 - `目的`: 何を減らすための flow か。
 - `役割`: actor ごとの責務。管制塔 / sublane / Owner を混ぜない。
 - `routing 条件`: 管制塔で決める条件、sublane へ渡す条件、停止条件。
-- `PlantUML activity + swimlane`: 誰が何をするかを図で固定する。
+- `PlantUML activity + swimlane`: 誰が何をするかを図で固定する。workflow 文書では原則これを使う。
+- `PlantUML macro / function`: `$validate`、`$forbid`、`$record` のような少数の契約関数で validation / 禁止事項 / durable record を圧縮する。
 - `用語と表記ゆれ`: 正規語、alias、非同義語を分ける。
 - `参照正本`: 既存 rule / runbook / catalog への参照。本文を複製しない。
 - `検証`: catalog validate、generated check、audit-impact、resolve、diff check。
+
+PlantUML activity + swimlane を原則とする理由:
+
+- actor ごとの lane を見れば責務が分かる。
+- branching、stop、handoff、owner approval、callback の順序を具体化できる。
+- text の箇条書きより少ない行数で、agent が実行順に読みやすい。
+- `$validate` / `$forbid` / `$record` の契約関数により、validation や禁足事項を図の近くに置ける。
+
+ただし、macro / function は少数の primitive に留める。関数を増やしすぎると図だけで読めなくなり、guardrail の目的である実行時判断の明瞭さが落ちる。
 
 ## 役割
 
@@ -148,32 +158,53 @@ flow 型 guardrail を作る場合は、原則として次を含める。
 
 PlantUML の activity diagram + swimlane 記法で、誰が責務を持つかを明示する。管制塔と sublane の境界を読むための図なので、細かい retry path はここに複製しない。
 
+validation / 禁止事項 / durable record は、図の流れから離れた長い箇条書きにせず、必要に応じて `$validate` / `$forbid` / `$record` で近接させる。
+
 ```plantuml
 @startuml
+!procedure $validate($rule)
+:validate: $rule;
+!endprocedure
+!procedure $forbid($rule)
+:forbid: $rule;
+!endprocedure
+!procedure $record($anchor)
+:record: $anchor;
+!endprocedure
+
 |管制塔 Codex|
 start
 :管制塔が prompt / marker / ticket ID を受け取る;
 :Redmine issue / journal / Version / catalog docs を読む;
+$validate("pane / chat message を正本にしない");
 :作業形状を分類する;
 
 if (coordinator-owned 仕様決定が必要?) then (yes)
   :管制塔が仕様決定を Redmine / cataloged doc に記録;
+  $record("coordinator-owned design decision");
 endif
 
 if (実装型?) then (yes)
+  $forbid("管制塔 Codex が通常実装 diff を直接作る");
+  $forbid("main lane Claude へ実装型 work を直接渡す");
   :blocking queue を drain;
   :sublane admission を判定;
   if (dispatch 可能?) then (yes)
     :dispatch decision を Redmine に記録;
+    $record("dispatch decision");
     :target-lane Codex gateway へ handoff;
     |target-lane Codex|
+    $validate("cross-lane は target-lane Codex gateway 経由");
     :target-lane Codex が same-lane Claude へ handoff;
     |sublane Claude|
     :sublane Claude が実装;
+    $forbid("coordinator-owned 仕様決定を実装 commit 内で黙って確定");
     :Implementation Done / Review Request を記録;
+    $record("implementation_done / review_request");
     |target-lane Codex|
     :target-lane Codex が coordinator へ callback;
     |管制塔 Codex|
+    $validate("callback は Redmine durable anchor への pointer");
     :管制塔が Review Gate を処理;
   else (no)
     |管制塔 Codex|
@@ -187,7 +218,9 @@ endif
 
 if (Review approved?) then (yes)
   :owner close approval を確認または standing delegation で記録;
+  $validate("Review approval と owner close approval を分離");
   :commit-bearing work の integration disposition を記録;
+  $validate("commit-bearing work に integration disposition がある");
   :Close Gate を記録;
   :US status を close;
   :routine retirement 条件を確認;
@@ -205,6 +238,7 @@ if (Review approved?) then (yes)
 else (no)
   |管制塔 Codex|
   :findings を Redmine に記録;
+  $record("review findings");
   |target-lane Codex|
   :sublane Claude へ修正依頼;
 endif
