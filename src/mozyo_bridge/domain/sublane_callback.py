@@ -11,8 +11,8 @@ of re-deriving them by hand from pane scrollback:
 - the four callback-stall states a coordinator classifies a delivered-but-quiet
   unit of work into, plus the standard recovery path for each
   (``## Stall And No-Progress Detection Standard`` and
-  ``vibes/docs/logics/cockpit-sublane-operating-model.md``
-  ``## stall / no-progress 検出``).
+  ``vibes/docs/logics/coordinator-sublane-development-flow.md``
+  ``### callback 欠落時の sweep``).
 
 It deliberately takes *no* I/O: every input is a fact the caller has already
 read from the durable Redmine record. The module never touches tmux, never

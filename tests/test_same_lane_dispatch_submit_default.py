@@ -2,8 +2,9 @@
 
 Locks the expected behavior of the same-lane `--to claude` dispatch hop a
 target-lane Codex uses to route work to the Claude implementer in its own lane
-(`vibes/docs/logics/cockpit-sublane-operating-model.md` ``## Same-Lane Claude
-Dispatch の Submit 完結`` and ``skills/mozyo-bridge-agent/references/workflow.md``
+(`vibes/docs/logics/coordinator-sublane-development-flow.md` ``## 標準フロー`` —
+same-lane Claude へ submit 完結で渡す — and
+``skills/mozyo-bridge-agent/references/workflow.md``
 ``## Same-Lane Claude Dispatch``).
 
 The reproduction in #12207 j#60741 was a same-lane dispatch that reported

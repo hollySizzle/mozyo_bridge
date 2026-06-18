@@ -152,8 +152,9 @@ def narrow_to_sender_lane(
     ``(workspace_id, lane_id)`` identity. This is **same-lane addressing only**:
     it can only shrink the candidate set and never selects a pane outside the
     sender's own lane, so it cannot cross the lane governance boundary
-    (``vibes/docs/logics/cockpit-sublane-operating-model.md`` "Cross-Lane
-    Routing Rule") — a cross-lane handoff still has to be addressed explicitly
+    (``vibes/docs/logics/coordinator-sublane-development-flow.md`` ``## 役割`` —
+    cross-lane routing goes through the target lane's Codex gateway) — a
+    cross-lane handoff still has to be addressed explicitly
     through the target lane's Codex gateway. It returns ``targets`` unchanged,
     leaving the caller's fail-closed ambiguity handling intact, when the sender
     pane is unknown or carries no concrete lane identity to match on. Live tmux
@@ -220,8 +221,8 @@ def narrow_to_local_claude(
       is returned unchanged and the caller fails closed.
     - **condition 5** — candidates are restricted to the sender's own
       ``(workspace_id, lane_id)``. A different lane is never selected (it routes
-      through that lane's Codex gateway, ``cockpit-sublane-operating-model.md``
-      "Cross-Lane Routing Rule").
+      through that lane's Codex gateway,
+      ``coordinator-sublane-development-flow.md`` ``## 役割``).
     - **condition 6** — each kept candidate must pass :func:`_repo_identity_matches`.
 
     Like :func:`narrow_to_sender_lane`, this can only *shrink* the candidate set,
@@ -372,9 +373,9 @@ def resolve_coordinator_codex(
     A sublane resolves its coordinator by selecting the Codex pane that shares
     its own ``workspace_id`` and sits in the :data:`DEFAULT_LANE`. This is the
     sanctioned cross-lane sublane->coordinator callback path (Codex-to-Codex; see
-    ``vibes/docs/logics/cockpit-sublane-operating-model.md`` "owner 承認待ちの集約"
-    and ``skills/mozyo-bridge-agent/references/workflow.md`` "Sublane Coordinator
-    Callback"). It is strictly **workspace-scoped**: it never reaches another
+    ``skills/mozyo-bridge-agent/references/workflow.md`` ``## Owner Approval
+    Aggregation`` and ``## Sublane Coordinator Callback``). It is strictly
+    **workspace-scoped**: it never reaches another
     workspace's coordinator (that is the cross-workspace consult primitive's job,
     Redmine #11779), and it stays fail-closed — returns ``None`` when the sender
     is unknown, carries no workspace identity, or the match is not unique. Live
