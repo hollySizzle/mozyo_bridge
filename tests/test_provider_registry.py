@@ -294,6 +294,27 @@ class ProviderSelectionConfigTest(unittest.TestCase):
         with self.assertRaises(ProviderRegistryError):
             ProviderSelectionConfig.from_record([("ticket", "redmine")])
 
+    def test_from_record_mixed_type_unknown_keys_fail_closed(self) -> None:
+        # Regression (review j#60633 finding 1): mixed-type unknown top-level
+        # keys must fail through ProviderRegistryError, not leak the raw
+        # TypeError that sorting a mixed-type set would otherwise raise.
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig.from_record({1: "x", "x": "y"})
+
+    def test_mapping_is_not_accepted_as_a_pair(self) -> None:
+        # Regression (review j#60633 finding 2): a Mapping with keys 0 and 1 is
+        # not a schema-shaped (category, provider) pair and must be rejected,
+        # not normalized via pair[0] / pair[1] indexing.
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig.from_record(
+                {"selections": [{0: "ticket", 1: "redmine"}]}
+            )
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig(selections=[{0: "ticket", 1: "redmine"}])
+        # A set is also not an ordered 2-element pair sequence.
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig(selections=[{"ticket", "redmine"}])
+
     def test_from_record_accepts_selections_only(self) -> None:
         config = ProviderSelectionConfig.from_record(
             {"selections": {"ticket": "redmine"}}

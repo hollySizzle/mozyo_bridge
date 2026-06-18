@@ -44,7 +44,7 @@ closed. This is the provider-side analogue of the CLI module registry's
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterator, Optional
@@ -195,7 +195,10 @@ def _normalize_selections(
     iterable of ``(category, provider_id)`` pairs; both normalize to a sorted
     tuple of pairs so the config stays frozen, hashable, and deterministic. A
     bare ``str``/``bytes`` is rejected (it is iterable but not a mapping of
-    selections). Every key and value must be a non-empty ``str``; a duplicate
+    selections). A pair-iterable element must be an explicit 2-element sequence
+    (``list``/``tuple``) — a ``Mapping`` is **not** accepted as a pair even if it
+    happens to have keys ``0`` and ``1``, so a non-schema shape can never slip in
+    as a selection. Every key and value must be a non-empty ``str``; a duplicate
     category key, or a key/value naming a member of
     :data:`FORBIDDEN_PROVIDER_AUTHORITIES`, is rejected here so an authority-shaped
     field can never be smuggled into a provider selection. Category and provider
@@ -219,10 +222,13 @@ def _normalize_selections(
             ) from exc
         items = []
         for pair in raw:
-            if isinstance(pair, (str, bytes)) or not hasattr(pair, "__len__"):
+            # An explicit 2-element sequence only: a Mapping (or set, or any
+            # non-Sequence) is rejected even if it has keys 0/1, so a
+            # non-schema shape cannot masquerade as a (category, provider) pair.
+            if isinstance(pair, (str, bytes)) or not isinstance(pair, Sequence):
                 raise ProviderRegistryError(
                     f"{source} selections pairs must be (category, provider id) "
-                    f"2-tuples; got {pair!r}"
+                    f"2-element sequences (list/tuple); got {pair!r}"
                 )
             if len(pair) != 2:
                 raise ProviderRegistryError(
@@ -309,9 +315,13 @@ class ProviderSelectionConfig:
         allowed = {"selections"}
         unknown = set(record) - allowed
         if unknown:
+            # Sort by repr: the record's keys may be of mixed types (e.g. an int
+            # key alongside a str), and ``sorted`` on mixed types raises a raw
+            # TypeError. A typed config record must fail closed through
+            # ProviderRegistryError, not leak that TypeError to callers.
             raise ProviderRegistryError(
-                f"unknown provider selection config key(s) {sorted(unknown)}; "
-                f"allowed keys: {sorted(allowed)}"
+                f"unknown provider selection config key(s) "
+                f"{sorted(map(repr, unknown))}; allowed keys: {sorted(allowed)}"
             )
         return cls(selections=record.get("selections", ()))
 
