@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application import cli_modules
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.domain.module_registry import (
+    COMPOSITION_RECORD_VERSION,
     CORE_OWNED_AUTHORITIES,
     BuiltinCliModuleRegistry,
     CliCompositionConfig,
@@ -171,6 +172,130 @@ class ComposeParserBehaviorTest(unittest.TestCase):
             cli_modules.compose_parser(
                 sub, CliCompositionConfig(disabled=frozenset({"handoff"}))
             )
+
+
+class CompositionConfigRecordTest(unittest.TestCase):
+    """The typed repo-local config record loader/normalizer (Redmine #12183).
+
+    `CliCompositionConfig.from_record` turns an already-parsed YAML/TOML-shaped
+    mapping into a `CliCompositionConfig`, validating record *shape*: a closed
+    schema, typed values, and rejection of any field that would name a module /
+    callable / authority / credential. Family *existence* and the mandatory rule
+    stay with `resolve_enabled` (exercised via `load_composition_config`).
+    """
+
+    # --- default preserves full composition --------------------------------
+
+    def test_none_record_is_the_behavior_preserving_default(self) -> None:
+        self.assertEqual(CliCompositionConfig.from_record(None), CliCompositionConfig.default())
+        self.assertEqual(CliCompositionConfig.from_record(None).disabled, frozenset())
+
+    def test_empty_record_is_the_default(self) -> None:
+        self.assertEqual(CliCompositionConfig.from_record({}), CliCompositionConfig.default())
+
+    def test_explicit_supported_version_with_no_disable_is_default(self) -> None:
+        cfg = CliCompositionConfig.from_record({"version": COMPOSITION_RECORD_VERSION})
+        self.assertEqual(cfg.disabled, frozenset())
+
+    def test_default_record_preserves_full_builtin_composition(self) -> None:
+        # The end-to-end read layer: a missing config resolves to every shipped
+        # family enabled, in registration order — the unchanged default CLI.
+        cfg = cli_modules.load_composition_config(None)
+        self.assertEqual(
+            cli_modules.BUILTIN_CLI_MODULE_REGISTRY.resolve_enabled(cfg),
+            cli_modules.BUILTIN_CLI_MODULE_REGISTRY.names(),
+        )
+
+    # --- valid optional disable --------------------------------------------
+
+    def test_valid_optional_disable_resolves_to_config(self) -> None:
+        cfg = CliCompositionConfig.from_record({"disabled": ["agents", "session"]})
+        self.assertEqual(cfg.disabled, frozenset({"agents", "session"}))
+
+    def test_load_composition_config_validates_optional_disable_against_registry(self) -> None:
+        cfg = cli_modules.load_composition_config({"disabled": ["agents"]})
+        enabled = cli_modules.BUILTIN_CLI_MODULE_REGISTRY.resolve_enabled(cfg)
+        self.assertNotIn("agents", enabled)
+        self.assertIn("handoff", enabled)
+
+    # --- unknown family / mandatory disable fail closed (via registry) ------
+
+    def test_unknown_family_fails_closed(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            cli_modules.load_composition_config({"disabled": ["not-a-real-family"]})
+
+    def test_mandatory_family_disable_fails_closed(self) -> None:
+        # handoff carries send/routing/review/workflow authority — config may
+        # never disable it, so the typed record cannot weaken authority.
+        with self.assertRaises(ModuleRegistryError):
+            cli_modules.load_composition_config({"disabled": ["handoff"]})
+
+    # --- closed schema / typed values --------------------------------------
+
+    def test_non_mapping_record_is_rejected(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record(["agents"])  # type: ignore[arg-type]
+
+    def test_unknown_top_level_key_fails_closed(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"enabled": ["agents"]})
+
+    def test_unsupported_version_fails_closed(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"version": COMPOSITION_RECORD_VERSION + 1})
+
+    def test_non_integer_version_is_rejected(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"version": "1"})
+        # bool is an int subclass but must not read as version 1.
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"version": True})
+
+    def test_disabled_must_be_a_list_not_a_bare_string(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"disabled": "agents"})
+
+    def test_disabled_must_be_a_list_not_a_mapping(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"disabled": {"agents": True}})
+
+    def test_disabled_entries_must_be_strings(self) -> None:
+        with self.assertRaises(ModuleRegistryError):
+            CliCompositionConfig.from_record({"disabled": [123]})
+
+    # --- secret-shaped / authority-changing / code-loading fields rejected --
+
+    def test_authority_changing_field_is_rejected(self) -> None:
+        # A record that tries to grant authority, name a registrar, or supply a
+        # module path is rejected with a boundary-specific message — these are
+        # not "unknown future keys", they are boundaries this surface owns.
+        for key in ("authorities", "registrar", "module_path", "approval", "routing"):
+            with self.subTest(key=key):
+                with self.assertRaises(ModuleRegistryError):
+                    CliCompositionConfig.from_record({key: ["x"]})
+
+    def test_code_loading_field_is_rejected(self) -> None:
+        for key in ("import", "plugin_path", "entry_point", "callable", "exec"):
+            with self.subTest(key=key):
+                with self.assertRaises(ModuleRegistryError):
+                    CliCompositionConfig.from_record({key: "anything"})
+
+    def test_secret_shaped_field_is_rejected(self) -> None:
+        # Field *names* only — no real secret values — but a record may never
+        # carry a credential-shaped field.
+        for key in ("api_token", "secret", "password", "credential"):
+            with self.subTest(key=key):
+                with self.assertRaises(ModuleRegistryError):
+                    CliCompositionConfig.from_record({key: "x"})
+
+    def test_secret_or_path_shaped_disable_value_is_rejected(self) -> None:
+        # A value not shaped like a family id is rejected before resolution: an
+        # uppercase secret-shaped sentinel, a filesystem path, and a dotted
+        # module path all fail the family-identifier guard.
+        for entry in ("DROP-SECRET-SENTINEL", "/workspace/project-alpha", "workspace.project_alpha"):
+            with self.subTest(entry=entry):
+                with self.assertRaises(ModuleRegistryError):
+                    CliCompositionConfig.from_record({"disabled": [entry]})
 
 
 if __name__ == "__main__":
