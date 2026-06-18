@@ -2,9 +2,9 @@
 
 Redmine #12200。`mozyo_bridge` の通常開発が cockpit-visible sublane 前提へ移行したため、管制塔とサブレーンの責務分担を 1 つの spine として定義する。
 
-この文書は repo-local の **一次 spine** である。管制塔 / サブレーン開発フローに関する dispatch、callback、review、close、integration、retirement の順序と責務はこの文書を先に読む。旧 `cockpit-sublane-operating-model.md` と `sublane-worktree-operating-runbook.md` の規約本文は本書へ統合済みであり、旧 docs は互換 pointer と履歴参照だけを残す。
+この文書は repo-local の **一次 spine** である。管制塔 / サブレーン開発フローに関する dispatch、callback、review、close、integration、retirement の順序と責務はこの文書を先に読む。旧 operating model / runbook 文書の規約本文は本書へ統合済みであり、旧ファイルは物理削除する。
 
-この文書は詳細規則の複製ではない。既存の `agent-workflow.md`、`sublane-bandwidth-policy.md`、`sublane-worktree-operating-runbook.md`、skill workflow reference、central preset を、どの順序で読むかを決める地図である。
+この文書は詳細規則の複製ではない。既存の `agent-workflow.md`、`sublane-bandwidth-policy.md`、skill workflow reference、central preset を、どの順序で読むかを決める地図である。
 
 ## 用語と表記ゆれ
 
@@ -279,9 +279,7 @@ retirement は destructive 寄りの操作なので、pane kill / worktree remov
 
 - `vibes/docs/rules/agent-workflow.md`
 - `vibes/docs/logics/sublane-bandwidth-policy.md`
-- `vibes/docs/logics/sublane-worktree-operating-runbook.md`
 - `vibes/docs/logics/worktree-lifecycle-boundary.md`
-- `vibes/docs/logics/cockpit-sublane-operating-model.md`
 - `skills/mozyo-bridge-agent/references/workflow.md`
 - `.mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md`
 - `.mozyo-bridge/rules/llm_rule_authoring.md`

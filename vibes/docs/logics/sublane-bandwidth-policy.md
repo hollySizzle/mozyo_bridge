@@ -6,8 +6,7 @@ This document defines the repo-local policy for deciding when the coordinator
 should open another sublane, when it must stop dispatching and drain existing
 lanes, and how lane retirement interacts with cockpit throughput.
 
-It complements [[logic-cockpit-sublane-operating-model]],
-[[logic-sublane-worktree-operating-runbook]], and
+It complements [[logic-coordinator-sublane-development-flow]] and
 [[logic-worktree-lifecycle-boundary]]. Those documents define lane roles,
 sequencing, and retirement authority. This document defines coordinator
 bandwidth.

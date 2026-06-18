@@ -176,7 +176,7 @@ minimum release window、current risk を監査可能にする。
 ### Claude permission mode override rail
 
 - owner: managed Claude pane launch
-- source of truth: `cockpit-sublane-operating-model.md`
+- source of truth: `coordinator-sublane-development-flow.md`
 - fallback: `MOZYO_CLAUDE_PERMISSION_MODE` による Claude permission mode override。
 - safety condition: default policy を壊さない opt-in / explicit override として扱う。
   private operator 固有の Claude mode policy を OSS default に焼き込まない。

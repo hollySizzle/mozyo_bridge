@@ -126,7 +126,7 @@ optional_opt_in:
 
 - 公開 template / packaged preset / central public preset に host path・credential・個人 policy・private URL を入れない ([[rule-public-private-boundary]] と [[logic-scaffold-rules]] Common constraints)。
 - repo-local mode の `rule_path` は repo-relative を維持し、host 絶対 path を committed router / manifest に漏らさない ([[logic-scaffold-rules]] Repo-Local Rules Mode)。
-- operator-specific cockpit composition / lane policy は OSS default に混ぜない ([[logic-cockpit-sublane-operating-model]])。
+- operator-specific cockpit composition / lane policy は OSS default に混ぜない ([[logic-coordinator-sublane-development-flow]])。
 
 ## scope 境界 / Design Consultation triggers
 

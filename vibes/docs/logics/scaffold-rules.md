@@ -264,17 +264,16 @@ Two flavours exist:
 
 ### Opt-in: worktree-runbook
 
-The `worktree-runbook` category (Redmine #11955) distributes the sublane
-/ git worktree operating runbook docs to adopting projects without making
-them always-on:
+The historical `worktree-runbook` category (Redmine #11955) distributed
+sublane / git worktree operating runbook docs to adopting projects without
+making them always-on. After #12215, the sublane workflow body is consolidated
+into [[logic-coordinator-sublane-development-flow]], so new workflow guidance
+must not add another runbook file.
 
 - Prefix: `vibes/docs/logics/`. Flag: `--with-worktree-runbook` on
   `scaffold apply` / `scaffold diff`.
-- Ships `worktree-lifecycle-boundary.md` and
-  `sublane-worktree-operating-runbook.md` (byte-synced copies of this
-  repo's authored sources under `vibes/docs/logics/`; a drift test in
-  `tests/test_mozyo_bridge.py` fails if the packaged copy diverges) plus
-  a scaffold-only `worktree-runbook-catalog-registration.md` note.
+- Do not add a new sublane runbook document. Any scaffold distribution cleanup
+  for old packaged copies belongs to a gated scaffold implementation issue.
 - **Catalog refs are not auto-written.** Consistent with the governed
   invariant that scaffold never mutates the operator-owned
   `.mozyo-bridge/docs/catalog.yaml`, the option ships docs plus a manual

@@ -271,7 +271,7 @@ documents:
       - logic-tmux-send-safety-contract
       - logic-ack-completion-receiver-state
       - logic-pane-centric-cockpit-semantics
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-bootstrap
       - logic-skill-distribution
       - logic-otel-event-store
@@ -289,7 +289,7 @@ documents:
     related_document_refs:
       - logic-managed-state-model
       - logic-workspace-registry
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-cockpit-attention-state
       - logic-pane-centric-cockpit-semantics
       - logic-iterm-webviewer-presentation-boundary
@@ -313,7 +313,7 @@ documents:
       - logic-release-helper-contract
       - logic-tmux-send-safety-contract
       - logic-pane-centric-cockpit-semantics
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-cockpit-attention-state
       - logic-workspace-defaults-renderer
       - rule-public-private-boundary
@@ -356,7 +356,7 @@ documents:
     purpose: "Codex / Claude / pane / compact 境界の判定 (scope / pressure / preservation signal)、next-session boundary prompt の内容仕様、Claude pane lifecycle (reuse / new / orphan / guarded kill) の運用正本。durable Redmine journal + repo / execution root から replay でき、kill は owner-approval gate に保つ。"
     audit_role: session_boundary_logic
     related_document_refs:
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-unit-target-model
       - logic-managed-state-model
       - logic-session-inventory
@@ -366,23 +366,6 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
-  - id: logic-cockpit-sublane-operating-model
-    type: logic
-    status: active
-    canonical_path: vibes/docs/logics/cockpit-sublane-operating-model.md
-    purpose: cockpit multi-lane PoC から得た coordinator / sublane / Codex gateway / Claude worker / Redmine durable-state の運用哲学と責務分界。
-    audit_role: cockpit_sublane_operating_model_logic
-    related_document_refs:
-      - rule-project-agent-workflow
-      - rule-public-private-boundary
-      - logic-unit-target-model
-      - logic-managed-state-model
-      - logic-session-inventory
-      - logic-tmux-send-safety-contract
-      - logic-worktree-lifecycle-boundary
-      - logic-sublane-bandwidth-policy
-      - skill-workflow-reference
-
   - id: logic-cockpit-attention-state
     type: logic
     status: active
@@ -390,7 +373,7 @@ documents:
     purpose: cockpit / sublane pane の owner_waiting / review_waiting / blocked / stalled / done などの attention state を durable state から導出し、tmux/cockpit 表示へ projection する責務分界。
     audit_role: cockpit_attention_state_logic
     related_document_refs:
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-unit-target-model
       - logic-unit-presentation-state-db
       - logic-managed-state-model
@@ -407,7 +390,7 @@ documents:
     audit_role: cross_project_cockpit_smoke_runbook_logic
     related_document_refs:
       - logic-unit-target-model
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-tmux-send-safety-contract
       - logic-worktree-lifecycle-boundary
       - rule-public-private-boundary
@@ -436,7 +419,7 @@ documents:
     purpose: cockpit / normal local / cross-project を同じ Unit / Target / Projection model で扱う設計正本。TargetRecord / UnitRecord、cockpit primary + normal compatibility、session/window/pane の責務、DB/static/runtime/Redmine state 境界を定義する。
     audit_role: unit_target_model_logic
     related_document_refs:
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-worktree-lifecycle-boundary
       - logic-managed-state-model
       - logic-unit-presentation-state-db
@@ -469,9 +452,8 @@ documents:
     purpose: git worktree lifecycle (add/remove、branch/path 命名、削除 policy、N-lane 並列 policy) を core CLI に入れず skill / runbook / operator recipe で扱う責務境界と汎用 runbook の方針正本。core は identity / discovery / safety primitive に限定する。
     audit_role: worktree_lifecycle_boundary_logic
     related_document_refs:
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
-      - logic-sublane-worktree-operating-runbook
       - logic-sublane-bandwidth-policy
       - rule-public-private-boundary
       - spec-project-map
@@ -483,8 +465,7 @@ documents:
     purpose: 効率的な並列開発のため、coordinator が sublane を積極 dispatch すべき条件、serial/drain を選ぶ条件、bandwidth / admission / drain order / routine retirement cadence と mozyo_bridge dogfood soft profile を定義する repo-local policy。
     audit_role: sublane_bandwidth_policy_logic
     related_document_refs:
-      - logic-cockpit-sublane-operating-model
-      - logic-sublane-worktree-operating-runbook
+      - logic-coordinator-sublane-development-flow
       - logic-worktree-lifecycle-boundary
       - rule-public-private-boundary
       - skill-workflow-reference
@@ -500,26 +481,13 @@ documents:
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
-      - logic-cockpit-sublane-operating-model
       - logic-sublane-bandwidth-policy
-      - logic-sublane-worktree-operating-runbook
       - logic-worktree-lifecycle-boundary
+      - logic-unit-target-model
+      - logic-managed-state-model
+      - logic-session-inventory
+      - logic-tmux-send-safety-contract
       - skill-workflow-reference
-      - spec-project-map
-
-  - id: logic-sublane-worktree-operating-runbook
-    type: logic
-    status: active
-    canonical_path: vibes/docs/logics/sublane-worktree-operating-runbook.md
-    purpose: sublane / worktree 運用を他プロジェクトで再現する時系列順 portable runbook (prereq / mapping / lane 作成 / gateway dispatch / sublane 実装境界 / coordinator callback・owner approval 集約 / review・merge・push・CI・retirement / known friction)。規約本文は既存正本へリンクする sequenced spine。
-    audit_role: sublane_worktree_operating_runbook_logic
-    related_document_refs:
-      - logic-cockpit-sublane-operating-model
-      - logic-worktree-lifecycle-boundary
-      - logic-sublane-bandwidth-policy
-      - logic-workspace-registry
-      - skill-workflow-reference
-      - rule-public-private-boundary
       - spec-project-map
 
   - id: logic-session-inventory
@@ -880,7 +848,7 @@ file_conventions:
     document_refs:
       - logic-session-boundary
       - rule-public-private-boundary
-      - logic-cockpit-sublane-operating-model
+      - logic-coordinator-sublane-development-flow
       - spec-project-map
 
   - id: fc-scaffold-source

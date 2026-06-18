@@ -141,7 +141,7 @@ preflight では少なくとも次を確認する:
      lane の Codex gateway に解決する)。
    - これは **same-lane addressing 限定** であり、候補集合を縮小するだけで sender 自身の
      lane 外の pane を選ばない。lane 境界を越える handoff は引き続き target lane の
-     Codex gateway に明示 addressing する (`cockpit-sublane-operating-model.md`
+     Codex gateway に明示 addressing する (`coordinator-sublane-development-flow.md`
      `## Cross-Lane Routing Rule`)。
    - sender pane が不明、または concrete な lane identity を持たない (`workspace_id`
      空かつ lane が `default`) 場合は narrowing を行わず、6 の fail closed に落とす。
