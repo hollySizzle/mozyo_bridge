@@ -54,8 +54,10 @@ Markdown:
   用途: 正本全体、説明、短い見出し、コードブロック保持
 YAML:
   用途: 優先順位、権限、必須項目、invalid marker
-PlantUML風DSL:
-  用途: gate、分岐、停止条件、agent実行契約
+PlantUML activity + swimlane:
+  用途: workflow、gate、分岐、停止条件、handoff、approval、actor責務、agent実行契約
+PlantUML macro / function:
+  用途: validation、禁止事項、durable record 出力を図の近くに圧縮する
 Mermaid:
   用途: 人間にも図として見せる必要がある関係図
 txt:
@@ -90,6 +92,77 @@ $生成物を再生成()
 $syncとvalidationを実行()
 stop
 @enduml
+```
+
+## Flow 型 guardrail authoring
+
+workflow / gate / handoff / approval / close / retirement のように actor と順序が重要な guardrail は、原則として PlantUML activity diagram + swimlane 記法で書く。swimlane は actor ごとの責務境界であり、箇条書き checklist の代替ではなく、実行契約の本体である。
+
+```yaml
+使う条件:
+  - 複数 actor が関与する
+  - handoff / callback / approval / close / retirement がある
+  - stop condition や branch がある
+  - actor ごとの責務や禁足事項を誤読すると workflow が壊れる
+使わない条件:
+  - 単なる静的 schema
+  - verification command list
+  - journal field list
+  - file placement / catalog registration の静的 checklist
+```
+
+PlantUML macro / function は少数 primitive に絞る。推奨 primitive は次の 3 つである。
+
+```plantuml
+!procedure $validate($rule)
+:validate: $rule;
+!endprocedure
+!procedure $forbid($rule)
+:forbid: $rule;
+!endprocedure
+!procedure $record($anchor)
+:record: $anchor;
+!endprocedure
+```
+
+swimlane activity を使う場合、Markdown の補足は次に限定する。
+
+```yaml
+markdownに残す:
+  - 目的と非目標
+  - 用語、alias、非同義語
+  - actor authority (実行責務ではなく権限境界)
+  - routing の静的判定条件
+  - schema、必須 journal field、verification command などの静的 checklist
+  - 参照正本と catalog / generated file の接続
+  - 図へ入れると可読性が落ちる前提、例外、後続 issue
+swimlaneへ寄せる:
+  - 誰が何をするか
+  - 実行順序
+  - handoff / callback / approval / close / retirement
+  - stop condition
+  - actor ごとの validation / forbid / record
+markdownに重複させない:
+  - swimlane にある実行責務の再掲
+  - `$validate` / `$forbid` にある禁足事項の長い箇条書き
+  - retry path や command detail の過剰展開 (runbook へ逃がす)
+```
+
+flow 型 guardrail は次の section を持つ。
+
+```yaml
+必須:
+  - 目的
+  - 用語と表記ゆれ
+  - actor authority
+  - routing / stop の静的判定条件
+  - PlantUML activity + swimlane
+  - 参照正本
+  - 検証
+禁止:
+  - swimlane と同じ実行責務を Markdown に再掲する
+  - 複数文書に同じ判断材料を重複させる
+  - macro / function を増やしすぎて図だけで読めなくする
 ```
 
 ## Gate 記述規約

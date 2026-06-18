@@ -66,48 +66,7 @@ placement_order:
 - 入口文書、router、skill reference へ詳細本文を複製しようとしている。
 - central preset 配布面 (`.mozyo-bridge/rules/**`、skill、scaffold preset) の話なのに、repo-local doc で恒久正本化しようとしている。
 
-flow 型 guardrail を作る場合は、原則として次を含める。
-
-- `目的`: 何を減らすための flow か。
-- `役割`: actor ごとの責務。管制塔 / sublane / Owner を混ぜない。
-- `routing 条件`: 管制塔で決める条件、sublane へ渡す条件、停止条件。
-- `PlantUML activity + swimlane`: 誰が何をするかを図で固定する。workflow 文書では原則これを使う。
-- `PlantUML macro / function`: `$validate`、`$forbid`、`$record` のような少数の契約関数で validation / 禁止事項 / durable record を圧縮する。
-- `用語と表記ゆれ`: 正規語、alias、非同義語を分ける。
-- `参照正本`: 既存 rule / runbook / catalog への参照。本文を複製しない。
-- `検証`: catalog validate、generated check、audit-impact、resolve、diff check。
-
-PlantUML activity + swimlane を原則とする理由:
-
-- actor ごとの lane を見れば責務が分かる。
-- branching、stop、handoff、owner approval、callback の順序を具体化できる。
-- text の箇条書きより少ない行数で、agent が実行順に読みやすい。
-- `$validate` / `$forbid` / `$record` の契約関数により、validation や禁足事項を図の近くに置ける。
-
-ただし、macro / function は少数の primitive に留める。関数を増やしすぎると図だけで読めなくなり、guardrail の目的である実行時判断の明瞭さが落ちる。
-
-swimlane activity を使う場合、Markdown の補足は次に限定する。
-
-```yaml
-markdownに残す:
-  - 目的と非目標
-  - 用語、alias、非同義語
-  - actor authority (実行責務ではなく権限境界)
-  - routing の静的判定条件
-  - schema、必須 journal field、verification command などの静的 checklist
-  - 参照正本と catalog / generated file の接続
-  - 図へ入れると可読性が落ちる前提、例外、後続 issue
-swimlaneへ寄せる:
-  - 誰が何をするか
-  - 実行順序
-  - handoff / callback / approval / close / retirement
-  - stop condition
-  - actor ごとの validation / forbid / record
-markdownに重複させない:
-  - swimlane にある実行責務の再掲
-  - `$validate` / `$forbid` にある禁足事項の長い箇条書き
-  - retry path や command detail の過剰展開 (runbook へ逃がす)
-```
+flow 型 guardrail の書き方、PlantUML activity + swimlane の使い方、Markdown 補足境界、`$validate` / `$forbid` / `$record` primitive は `.mozyo-bridge/rules/llm_rule_authoring.md` を正本とする。この文書にはサブレーン開発フロー固有の判断だけを残す。
 
 ## 役割
 

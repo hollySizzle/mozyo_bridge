@@ -22,19 +22,19 @@
       "sha256": "824e48bc8aca095e2221fc1402bb4deb9b497219bfba600343c5fff57318b3b6"
     },
     ".mozyo-bridge/rules/llm_rule_authoring.md": {
-      "sha256": "b9a60fc2c867935568901467b62359bf2890199534bf5e22999f085202b5ae78"
+      "sha256": "87a7237463082887fea9e68aa36f56d8fc12b5e38ad43ac8f41403c31acde9d1"
     },
     ".mozyo-bridge/tmux/agent-ui.conf": {
       "sha256": "718e6707047608a7f830c5a06b9c2796ff1114f0d926011dfde59d4afcd949c2"
     },
     "AGENTS.md": {
-      "sha256": "33f6e296e59c209eac0e54fe6d58c7e2624d6170869aebfece98069ae5b3ddc9"
+      "sha256": "45c0c19d8dd1902adc045fcf182ebbab8422642ac2571eb12ee18630fdf1651c"
     },
     "CLAUDE.md": {
       "sha256": "3a2cd3ee11ea5bef470987bf8e10c9e55633920e0bb030271d5f4007e10cf381"
     }
   },
-  "generated_by": "mozyo-bridge 0.8.0",
+  "generated_by": "mozyo-bridge 0.9.0a1",
   "mode": "repo-local",
   "preset": "redmine-governed",
   "preset_hash": "6711b3c4ab794d62cc032aff31c7168f80a241f668ef989617a441ef14fe6976",
