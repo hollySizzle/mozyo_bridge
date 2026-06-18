@@ -615,6 +615,54 @@ parser families. The two registries are deliberately separate: one classifies
 adapter providers, the other composes command families. Neither exposes an
 external plugin API.
 
+## Internal Provider Selection Config (Redmine #12184)
+
+The provider registry (#12035) classifies built-in *providers* and the CLI
+module registry (#12155) added module selection for command families. #12184
+adds the missing provider-side piece the v0.9 direction calls for
+(`vibes/docs/logics/modular-config-driven-refactor.md`, "provider selection for
+built-in adapters and backends"): the smallest typed config that *selects* a
+built-in provider per category, resolved fail-closed against the registry. It is
+internal-only selection of already-registered built-ins, not a plugin loader.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/provider_registry.py` — **core**, pure. It adds the
+  frozen `ProviderSelectionConfig` (a `category -> chosen provider id` typed
+  record, normalized to sorted pairs) and the registry resolvers
+  `resolve_selection` (all populated categories) / `resolve_provider` (one
+  category). No new I/O, import, or provider code — the dependency still only
+  points provider -> core.
+
+### Behavior-preserving default
+
+- The default config (empty `selections`) resolves every populated category to
+  its current built-in default — the sole provider registered in that category
+  (`ticket` -> `redmine`, `terminal_runtime` -> `tmux`, `presentation` ->
+  `tmux-presentation`). Empty categories (`catalog` / `telemetry` /
+  `release_helper`) simply have no resolution. Current built-in behavior is
+  unchanged when no config is supplied.
+
+### Internal-only, by construction
+
+- A selection may only name a `provider_id` **already registered** in the
+  built-in registry and sitting in the selected category. There is no module
+  path, callable, entry point, or dynamic import — selection can never introduce
+  foreign code, the same non-goal the registry skeleton enforces.
+- No public ABI / compatibility promise; the config shape and category vocabulary
+  are internal and may change with no deprecation window.
+
+### Fail-closed surface
+
+`ProviderSelectionConfig` rejects, at construction, a non-mapping/ill-typed
+record, an unknown top-level key (`from_record`), and any key/value naming a
+member of `FORBIDDEN_PROVIDER_AUTHORITIES` (authority-shaped fields). The
+registry rejects, at resolution, an unknown category, an unknown provider id, a
+category/provider mismatch, and an ambiguous category (more than one provider,
+no selection — no implicit default). Authority stays core-owned: this is
+selection of classified providers, never a grant of `workflow_authority`,
+`owner_approval`, `close_approval`, or `routing_authority`.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

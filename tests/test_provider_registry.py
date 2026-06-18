@@ -24,6 +24,7 @@ from mozyo_bridge.domain.provider_registry import (
     BuiltinProviderRegistry,
     ProviderCategory,
     ProviderRegistryError,
+    ProviderSelectionConfig,
 )
 from mozyo_bridge.application.tmux_attention_presentation_provider import (
     PROVIDER_NAME as TMUX_PRESENTATION_PROVIDER_NAME,
@@ -236,6 +237,167 @@ class SeededBuiltinsTest(unittest.TestCase):
             (provider,),
             BUILTIN_PROVIDER_REGISTRY.by_category(ProviderCategory.PRESENTATION),
         )
+
+
+def _two_ticket_registry() -> BuiltinProviderRegistry:
+    """A registry with two providers in one category, for selection tests.
+
+    The built-in registry seeds exactly one provider per populated category, so
+    a *meaningful* "valid selection between alternatives" / "ambiguous default"
+    case needs a registry that holds more than one provider in a category.
+    """
+    registry = BuiltinProviderRegistry()
+    registry.register(
+        BuiltinProvider(
+            category=ProviderCategory.TICKET, provider_id="redmine", summary="a"
+        )
+    )
+    registry.register(
+        BuiltinProvider(
+            category=ProviderCategory.TICKET, provider_id="asana", summary="b"
+        )
+    )
+    return registry
+
+
+class ProviderSelectionConfigTest(unittest.TestCase):
+    def test_default_is_empty_and_behavior_preserving(self) -> None:
+        config = ProviderSelectionConfig.default()
+        self.assertEqual((), config.selections)
+        self.assertEqual({}, config.mapping)
+        self.assertIsNone(config.selection_for(ProviderCategory.TICKET))
+
+    def test_mapping_input_normalizes_to_sorted_pairs(self) -> None:
+        config = ProviderSelectionConfig(
+            selections={"ticket": "redmine", "terminal_runtime": "tmux"}
+        )
+        self.assertEqual(
+            (("terminal_runtime", "tmux"), ("ticket", "redmine")),
+            config.selections,
+        )
+        self.assertEqual("redmine", config.selection_for(ProviderCategory.TICKET))
+        # Frozen + hashable so the typed record stays immutable metadata.
+        hash(config)
+        self.assertEqual(config, ProviderSelectionConfig(selections={"ticket": "redmine", "terminal_runtime": "tmux"}))
+
+    def test_pairs_iterable_input_is_accepted(self) -> None:
+        config = ProviderSelectionConfig(selections=[("ticket", "redmine")])
+        self.assertEqual("redmine", config.selection_for(ProviderCategory.TICKET))
+
+    def test_from_record_rejects_unknown_top_level_key(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig.from_record(
+                {"selections": {"ticket": "redmine"}, "providers": {}}
+            )
+
+    def test_from_record_rejects_non_mapping_record(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig.from_record([("ticket", "redmine")])
+
+    def test_from_record_accepts_selections_only(self) -> None:
+        config = ProviderSelectionConfig.from_record(
+            {"selections": {"ticket": "redmine"}}
+        )
+        self.assertEqual("redmine", config.selection_for(ProviderCategory.TICKET))
+        self.assertEqual(ProviderSelectionConfig.default(), ProviderSelectionConfig.from_record({}))
+
+    def test_invalid_types_fail_closed(self) -> None:
+        for bad in (
+            "ticket",  # bare string is not a selection mapping
+            {"ticket": 1},  # non-string provider id
+            {1: "redmine"},  # non-string category key
+            {"ticket": ""},  # empty provider id
+            {"": "redmine"},  # empty category key
+            42,  # not iterable
+        ):
+            with self.assertRaises(ProviderRegistryError, msg=repr(bad)):
+                ProviderSelectionConfig(selections=bad)  # type: ignore[arg-type]
+
+    def test_authority_shaped_selection_is_rejected(self) -> None:
+        for authority in FORBIDDEN_PROVIDER_AUTHORITIES:
+            # authority as a category key
+            with self.assertRaises(ProviderRegistryError, msg=f"key:{authority}"):
+                ProviderSelectionConfig(selections={authority: "redmine"})
+            # authority as a selected provider id
+            with self.assertRaises(ProviderRegistryError, msg=f"val:{authority}"):
+                ProviderSelectionConfig(selections={"ticket": authority})
+
+    def test_duplicate_category_via_pairs_is_rejected(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig(
+                selections=[("ticket", "redmine"), ("ticket", "asana")]
+            )
+
+    def test_selection_for_requires_a_category(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            ProviderSelectionConfig().selection_for("ticket")  # type: ignore[arg-type]
+
+
+class ResolveSelectionTest(unittest.TestCase):
+    def test_default_config_resolves_current_builtin_defaults(self) -> None:
+        resolved = BUILTIN_PROVIDER_REGISTRY.resolve_selection()
+        self.assertEqual(
+            "redmine", resolved[ProviderCategory.TICKET].provider_id
+        )
+        self.assertEqual(
+            "tmux", resolved[ProviderCategory.TERMINAL_RUNTIME].provider_id
+        )
+        self.assertEqual(
+            "tmux-presentation",
+            resolved[ProviderCategory.PRESENTATION].provider_id,
+        )
+        # Empty categories have no built-in provider, so they are simply absent.
+        self.assertNotIn(ProviderCategory.CATALOG, resolved)
+        self.assertNotIn(ProviderCategory.TELEMETRY, resolved)
+
+    def test_resolve_provider_default_matches_singleton(self) -> None:
+        provider = BUILTIN_PROVIDER_REGISTRY.resolve_provider(
+            ProviderCategory.TICKET
+        )
+        self.assertEqual("redmine", provider.provider_id)
+
+    def test_explicit_selection_of_registered_provider(self) -> None:
+        registry = _two_ticket_registry()
+        config = ProviderSelectionConfig(selections={"ticket": "asana"})
+        self.assertEqual(
+            "asana",
+            registry.resolve_provider(ProviderCategory.TICKET, config).provider_id,
+        )
+        self.assertEqual(
+            "asana",
+            registry.resolve_selection(config)[ProviderCategory.TICKET].provider_id,
+        )
+
+    def test_ambiguous_category_without_selection_fails_closed(self) -> None:
+        registry = _two_ticket_registry()
+        with self.assertRaises(ProviderRegistryError):
+            registry.resolve_provider(ProviderCategory.TICKET)
+        with self.assertRaises(ProviderRegistryError):
+            registry.resolve_selection()
+
+    def test_unknown_category_selection_fails_closed(self) -> None:
+        config = ProviderSelectionConfig(selections=[("not_a_category", "redmine")])
+        with self.assertRaises(ProviderRegistryError):
+            BUILTIN_PROVIDER_REGISTRY.resolve_selection(config)
+
+    def test_unknown_provider_selection_fails_closed(self) -> None:
+        config = ProviderSelectionConfig(selections={"ticket": "ghost"})
+        with self.assertRaises(ProviderRegistryError):
+            BUILTIN_PROVIDER_REGISTRY.resolve_provider(ProviderCategory.TICKET, config)
+
+    def test_category_provider_mismatch_fails_closed(self) -> None:
+        # tmux is a real provider, but it is terminal_runtime, not ticket.
+        config = ProviderSelectionConfig(selections={"ticket": "tmux"})
+        with self.assertRaises(ProviderRegistryError):
+            BUILTIN_PROVIDER_REGISTRY.resolve_selection(config)
+
+    def test_empty_category_has_no_resolvable_provider(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            BUILTIN_PROVIDER_REGISTRY.resolve_provider(ProviderCategory.CATALOG)
+
+    def test_resolve_provider_requires_a_category(self) -> None:
+        with self.assertRaises(ProviderRegistryError):
+            BUILTIN_PROVIDER_REGISTRY.resolve_provider("ticket")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

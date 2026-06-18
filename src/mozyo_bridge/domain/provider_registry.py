@@ -26,10 +26,25 @@ It is deliberately **not** a plugin API:
 The module is pure (dataclasses + a small in-memory mapping) and imports no
 provider implementation, so the dependency only ever points provider -> core,
 exactly like ``mozyo_bridge.domain.ticket_adapter``.
+
+On top of the classification skeleton, Redmine #12184 adds the smallest
+*provider-selection* layer: a typed, internal-only :class:`ProviderSelectionConfig`
+(category -> chosen built-in provider id) and the registry's
+:meth:`BuiltinProviderRegistry.resolve_selection` /
+:meth:`BuiltinProviderRegistry.resolve_provider`. The default (empty config)
+resolves every populated category to its current built-in default, so behavior
+is unchanged. A selection may only name a provider id already registered in the
+built-in registry *and* sitting in the selected category — there is still no
+module path, callable, entry point, or dynamic import, so selection can never
+introduce foreign code. Unknown category, unknown provider id, category/provider
+mismatch, unknown config key, invalid type, and authority-shaped fields all fail
+closed. This is the provider-side analogue of the CLI module registry's
+``CliCompositionConfig`` / ``resolve_enabled`` (Redmine #12155).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterator, Optional
@@ -171,6 +186,152 @@ class BuiltinProvider:
             )
 
 
+def _normalize_selections(
+    value: object, *, source: str
+) -> tuple[tuple[str, str], ...]:
+    """Normalize a category->provider-id selection into validated, sorted pairs.
+
+    Accepts either a :class:`~collections.abc.Mapping` (the common case) or an
+    iterable of ``(category, provider_id)`` pairs; both normalize to a sorted
+    tuple of pairs so the config stays frozen, hashable, and deterministic. A
+    bare ``str``/``bytes`` is rejected (it is iterable but not a mapping of
+    selections). Every key and value must be a non-empty ``str``; a duplicate
+    category key, or a key/value naming a member of
+    :data:`FORBIDDEN_PROVIDER_AUTHORITIES`, is rejected here so an authority-shaped
+    field can never be smuggled into a provider selection. Category and provider
+    *existence* are not checked here — that needs the registry and happens at
+    resolution.
+    """
+    if isinstance(value, (str, bytes)):
+        raise ProviderRegistryError(
+            f"{source} selections must be a mapping of category->provider id, "
+            f"not a bare {type(value).__name__}"
+        )
+    if isinstance(value, Mapping):
+        items: list[tuple[object, object]] = list(value.items())
+    else:
+        try:
+            raw = list(value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ProviderRegistryError(
+                f"{source} selections must be a mapping or an iterable of "
+                f"(category, provider id) pairs, got {type(value).__name__}"
+            ) from exc
+        items = []
+        for pair in raw:
+            if isinstance(pair, (str, bytes)) or not hasattr(pair, "__len__"):
+                raise ProviderRegistryError(
+                    f"{source} selections pairs must be (category, provider id) "
+                    f"2-tuples; got {pair!r}"
+                )
+            if len(pair) != 2:
+                raise ProviderRegistryError(
+                    f"{source} selections pairs must have exactly 2 elements; "
+                    f"got {pair!r}"
+                )
+            items.append((pair[0], pair[1]))
+    seen: dict[str, str] = {}
+    for key, prov in items:
+        if not isinstance(key, str) or not key:
+            raise ProviderRegistryError(
+                f"{source} selection category keys must be non-empty strings; "
+                f"got {key!r}"
+            )
+        if not isinstance(prov, str) or not prov:
+            raise ProviderRegistryError(
+                f"{source} selection provider ids must be non-empty strings; "
+                f"got {prov!r} (for category {key!r})"
+            )
+        if key in FORBIDDEN_PROVIDER_AUTHORITIES or prov in FORBIDDEN_PROVIDER_AUTHORITIES:
+            raise ProviderRegistryError(
+                f"{source} selection may not name a core-owned authority "
+                f"({key!r} -> {prov!r}); workflow / owner / close / routing "
+                f"authority stays core-owned and is never a category or provider."
+            )
+        if key in seen:
+            raise ProviderRegistryError(
+                f"{source} selects category {key!r} more than once"
+            )
+        seen[key] = prov
+    return tuple(sorted(seen.items()))
+
+
+@dataclass(frozen=True)
+class ProviderSelectionConfig:
+    """Internal-only provider-selection config: category -> chosen provider id.
+
+    The *only* thing config may do is name, per category, which already-registered
+    built-in provider id to select. It cannot add a provider, supply a module
+    path / callable / entry point, choose a provider outside the built-in
+    registry, or grant authority — selection keys/values naming a
+    :data:`FORBIDDEN_PROVIDER_AUTHORITIES` member are rejected at construction.
+
+    The default (empty ``selections``) resolves every populated category to its
+    current built-in default, so the default composition is behavior-preserving.
+    Construction validates structure / types / authority shape only; whether a
+    selected category and provider actually exist (and match) is a registry
+    decision made in :meth:`BuiltinProviderRegistry.resolve_selection`.
+
+    ``selections`` accepts a mapping (``{"ticket": "redmine"}``) or an iterable
+    of pairs and is normalized to a sorted tuple of ``(category, provider_id)``
+    pairs so the record stays frozen and hashable.
+    """
+
+    selections: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "selections",
+            _normalize_selections(self.selections, source="provider selection config"),
+        )
+
+    @classmethod
+    def default(cls) -> "ProviderSelectionConfig":
+        """The behavior-preserving default: no selections, current defaults."""
+        return cls()
+
+    @classmethod
+    def from_record(cls, record: object) -> "ProviderSelectionConfig":
+        """Build a config from a raw typed record, failing closed on stray keys.
+
+        The record must be a mapping whose only recognized key is ``selections``.
+        Any other top-level key is rejected (typo / authority-smuggling
+        protection) rather than silently ignored, and a non-mapping record is an
+        invalid type. This is the entry point for parsing an external/serialized
+        config shape into the typed record.
+        """
+        if not isinstance(record, Mapping):
+            raise ProviderRegistryError(
+                f"provider selection record must be a mapping, got "
+                f"{type(record).__name__}"
+            )
+        allowed = {"selections"}
+        unknown = set(record) - allowed
+        if unknown:
+            raise ProviderRegistryError(
+                f"unknown provider selection config key(s) {sorted(unknown)}; "
+                f"allowed keys: {sorted(allowed)}"
+            )
+        return cls(selections=record.get("selections", ()))
+
+    def selection_for(self, category: "ProviderCategory") -> Optional[str]:
+        """The provider id selected for ``category``, or ``None`` if unselected."""
+        if not isinstance(category, ProviderCategory):
+            raise ProviderRegistryError(
+                f"category must be a ProviderCategory, got {category!r}"
+            )
+        for key, prov in self.selections:
+            if key == category.value:
+                return prov
+        return None
+
+    @property
+    def mapping(self) -> dict[str, str]:
+        """The selections as a plain ``{category: provider_id}`` dict (a copy)."""
+        return dict(self.selections)
+
+
 class BuiltinProviderRegistry:
     """An in-memory classification of built-in providers.
 
@@ -222,6 +383,122 @@ class BuiltinProviderRegistry:
         catalog / telemetry providers have a home before they are written.
         """
         return tuple(ProviderCategory)
+
+    def _validate_selection_config(self, config: ProviderSelectionConfig) -> None:
+        """Fail-closed check that every selection names a real built-in provider.
+
+        Rejects (a) a selection keyed by a category name that is not a known
+        :class:`ProviderCategory` (unknown category), (b) a provider id that is
+        not registered (unknown provider), and (c) a registered provider that
+        sits in a different category than the one selecting it (category/provider
+        mismatch). Structure / type / authority-shape are already enforced by
+        :class:`ProviderSelectionConfig`.
+        """
+        known = {c.value for c in ProviderCategory}
+        unknown_categories = sorted(k for k, _ in config.selections if k not in known)
+        if unknown_categories:
+            raise ProviderRegistryError(
+                f"config selects unknown categor(ies) {unknown_categories}; "
+                f"known categories: {sorted(known)}"
+            )
+        for cat_value, provider_id in config.selections:
+            provider = self.get(provider_id)
+            if provider is None:
+                raise ProviderRegistryError(
+                    f"config selects unknown provider id {provider_id!r} for "
+                    f"category {cat_value!r}; registered ids: {sorted(self._by_id)}"
+                )
+            if provider.category.value != cat_value:
+                raise ProviderRegistryError(
+                    f"provider {provider_id!r} is category "
+                    f"{provider.category.value!r}, not {cat_value!r} "
+                    f"(category/provider mismatch)"
+                )
+
+    def _unambiguous_default(
+        self, category: ProviderCategory
+    ) -> Optional[BuiltinProvider]:
+        """The implicit default provider for ``category`` when config selects none.
+
+        Returns the sole registered provider in the category (the current
+        built-in shape: one provider per populated category), ``None`` when the
+        category is empty, and **raises** when more than one provider is
+        registered — an ambiguous category has no implicit default and requires
+        an explicit selection (fail-closed).
+        """
+        members = self.by_category(category)
+        if not members:
+            return None
+        if len(members) > 1:
+            raise ProviderRegistryError(
+                f"category {category.value!r} has multiple built-in providers "
+                f"{[m.provider_id for m in members]} and no selection; an "
+                f"explicit provider selection is required (no implicit default)."
+            )
+        return members[0]
+
+    def resolve_provider(
+        self,
+        category: ProviderCategory,
+        config: Optional[ProviderSelectionConfig] = None,
+    ) -> BuiltinProvider:
+        """Resolve the selected built-in provider for one ``category``.
+
+        With the default (or ``None``) config the category's current built-in
+        default is returned; a config may select another registered provider in
+        the same category. Fails closed on every invalid selection (see
+        :meth:`_validate_selection_config`) and on a category that has no
+        resolvable provider (empty, or ambiguous with no selection).
+        """
+        if not isinstance(category, ProviderCategory):
+            raise ProviderRegistryError(
+                f"category must be a ProviderCategory, got {category!r}"
+            )
+        if config is None:
+            config = ProviderSelectionConfig.default()
+        self._validate_selection_config(config)
+        chosen = config.selection_for(category)
+        if chosen is not None:
+            # Existence + category match were checked above.
+            provider = self.get(chosen)
+            assert provider is not None  # narrow for type-checkers
+            return provider
+        default = self._unambiguous_default(category)
+        if default is None:
+            raise ProviderRegistryError(
+                f"category {category.value!r} has no resolvable provider: the "
+                f"config selects none and no built-in provider is registered "
+                f"for it."
+            )
+        return default
+
+    def resolve_selection(
+        self, config: Optional[ProviderSelectionConfig] = None
+    ) -> dict[ProviderCategory, BuiltinProvider]:
+        """Resolve every category that has a provider, for ``config``.
+
+        Categories with a selection resolve to the selected provider; categories
+        without a selection resolve to their unambiguous built-in default.
+        Empty categories (no built-in provider, e.g. ``catalog`` / ``telemetry``)
+        are simply absent from the result. An ambiguous category with no
+        selection fails closed. With the default config the result is each
+        populated category mapped to its current built-in default.
+        """
+        if config is None:
+            config = ProviderSelectionConfig.default()
+        self._validate_selection_config(config)
+        resolved: dict[ProviderCategory, BuiltinProvider] = {}
+        for category in ProviderCategory:
+            chosen = config.selection_for(category)
+            if chosen is not None:
+                provider = self.get(chosen)
+                assert provider is not None  # narrow; validated above
+                resolved[category] = provider
+                continue
+            default = self._unambiguous_default(category)
+            if default is not None:
+                resolved[category] = default
+        return resolved
 
     def __contains__(self, provider_id: object) -> bool:
         return provider_id in self._by_id
@@ -336,4 +613,5 @@ __all__ = (
     "FORBIDDEN_PROVIDER_AUTHORITIES",
     "ProviderCategory",
     "ProviderRegistryError",
+    "ProviderSelectionConfig",
 )
