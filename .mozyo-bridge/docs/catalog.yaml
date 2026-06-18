@@ -498,6 +498,8 @@ documents:
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - rule-project-agent-workflow
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
       - logic-cockpit-sublane-operating-model
       - logic-sublane-bandwidth-policy
       - logic-sublane-worktree-operating-runbook

@@ -27,6 +27,55 @@ owner / user は状況に応じて、同じ運用単位を `管制塔`、`メイ
 - close 済み sublane を退役させ、cockpit / worktree / agent context を残し続けない。
 - ルールを既存 guardrail へ追記し続けるのではなく、本 flow を参照 spine として使う。
 
+## ルール配置判断
+
+guardrail は書けばよいものではない。agent が迷った事実を durable record 化するために書くが、配置を誤ると「読まれるべき rule」が増えるだけで、実行時の判断精度は下がる。
+
+新しい超大 rule を作る前に、管制塔は次を確認する。
+
+```yaml
+placement_order:
+  1_existing_spine:
+    条件: 既存 flow / runbook / policy の責務内で説明できる
+    action: 既存文書へ短い section または参照を追加する
+  2_authoring_rule:
+    条件: LLM 向け規約文書の書き方、正本分離、形式選択、gate 構造化そのもの
+    action: `.mozyo-bridge/rules/llm_rule_authoring.md` の upstream / central preset 更新候補として扱う
+  3_catalog_governance:
+    条件: catalog、resolver、generated file、coverage、audit-impact の統治
+    action: `.mozyo-bridge/rules/docs_catalog_governance.yaml` の upstream / central preset 更新候補として扱う
+  4_new_repo_local_logic:
+    条件: 既存 spine に入れると責務が混ざり、かつ project-local に閉じる判断軸がある
+    action: `vibes/docs/logics/**` に小さい spine を作り catalog 登録する
+  5_new_central_rule:
+    条件: 複数 project に配布すべき実行契約で、既存 authoring / catalog / workflow へ自然に入らない
+    action: central preset 昇格 issue を作る。repo-local で巨大 rule を先に固定しない
+```
+
+新規 rule / logic を増やす soft trigger:
+
+- 既存文書へ入れると、読者 actor、責務、停止条件、検証責務が混ざる。
+- 1 つの判断を 2 つ以上の既存文書へ重複記載しそうになる。
+- PlantUML activity + swimlane で actor 境界を描かないと、管制塔 / sublane / Owner の責務が誤読される。
+- 表記ゆれ、alias、非同義語を明示しないと、次セッションで routing が壊れる。
+
+新規 rule / logic を増やさない hard stop:
+
+- 「念のため」「あとで迷いそう」だけで、観測可能な trigger と durable-record 出力が無い。
+- 既存 spine へ 5-10 行で足せる。
+- 入口文書、router、skill reference へ詳細本文を複製しようとしている。
+- central preset 配布面 (`.mozyo-bridge/rules/**`、skill、scaffold preset) の話なのに、repo-local doc で恒久正本化しようとしている。
+
+flow 型 guardrail を作る場合は、原則として次を含める。
+
+- `目的`: 何を減らすための flow か。
+- `役割`: actor ごとの責務。管制塔 / sublane / Owner を混ぜない。
+- `routing 条件`: 管制塔で決める条件、sublane へ渡す条件、停止条件。
+- `PlantUML activity + swimlane`: 誰が何をするかを図で固定する。
+- `用語と表記ゆれ`: 正規語、alias、非同義語を分ける。
+- `参照正本`: 既存 rule / runbook / catalog への参照。本文を複製しない。
+- `検証`: catalog validate、generated check、audit-impact、resolve、diff check。
+
 ## 役割
 
 ### Owner
@@ -215,6 +264,8 @@ routine retirement の条件:
 - `vibes/docs/logics/cockpit-sublane-operating-model.md`
 - `skills/mozyo-bridge-agent/references/workflow.md`
 - `.mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md`
+- `.mozyo-bridge/rules/llm_rule_authoring.md`
+- `.mozyo-bridge/rules/docs_catalog_governance.yaml`
 
 ## 検証
 
