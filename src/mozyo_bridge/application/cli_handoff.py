@@ -184,7 +184,9 @@ def configure_handoff_parser(
             "`standard` (strict explicit fallback) types and presses "
             "Enter after the landing marker, with C-u rollback on "
             "marker timeout; "
-            "`pending` types but leaves the input pending"
+            "`pending` (operator/debug fallback, NOT the standard "
+            "dispatch path) types but leaves the input pending for an "
+            "operator to submit"
         ),
     )
     parser_.add_argument(
@@ -241,7 +243,15 @@ def register_message(sub) -> None:
         "--no-submit",
         dest="submit",
         action="store_false",
-        help="Type the message but do not press Enter; leave the input pending at the target prompt",
+        help=(
+            "Operator/debug fallback: type the message but do not press Enter, "
+            "leaving the input pending at the target prompt for an operator to "
+            "submit. NOT the standard handoff path — standard same-lane dispatch "
+            "/ handoff/reply submit-completes (`mozyo-bridge handoff send` on the "
+            "default queue-enter rail, or marker-observed `--mode standard`). "
+            "Sanctioned only as the per-preset `--no-submit` marker_timeout retry "
+            "path or explicit operator debugging (Redmine #12207)."
+        ),
     )
     message.add_argument(
         "--landing-timeout",

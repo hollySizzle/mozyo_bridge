@@ -675,6 +675,73 @@ no selection — no implicit default). Authority stays core-owned: this is
 selection of classified providers, never a grant of `workflow_authority`,
 `owner_approval`, `close_approval`, or `routing_authority`.
 
+## Repo-Local YAML Config Wiring (Redmine #12189 / #12190 / #12191)
+
+The registries above (#12155 module selection, #12184 provider selection) define
+*typed* config records but no on-disk source. The v0.9.1 batch adds the
+repo-local YAML source and connects it to the CLI, in three staged lanes that
+keep the existing fail-closed boundaries:
+
+- **#12189 — schema.** `src/mozyo_bridge/domain/repo_local_config.py` defines the
+  closed top-level record for `.mozyo-bridge/config.yaml`: `version`, `cli`,
+  `providers`, `presentation` only. `cli` -> `CliCompositionConfig` (#12155),
+  `providers` -> `ProviderSelectionConfig` (#12184), `presentation` ->
+  `PresentationSelectionConfig` (projection-surface selection only:
+  `tmux_user_option` default, `text` optional). It does no file IO; an unknown
+  key, unsupported version, non-mapping record, or any module / callable / entry
+  point / authority / target / pane / credential-shaped field fails closed
+  through `RepoLocalConfigError`.
+- **#12190 — loader.** `src/mozyo_bridge/application/repo_local_config_loader.py`
+  is the thin file-IO/parse layer: it resolves `.mozyo-bridge/config.yaml` under
+  the standard repo root, reads it with `yaml.safe_load` only, and hands the
+  parsed mapping to the schema. A missing or empty file is the
+  behavior-preserving default; a malformed document or unreadable present file is
+  re-raised as `RepoLocalConfigLoadError` (a `RepoLocalConfigError` subclass), so
+  one `except RepoLocalConfigError` at the call site catches every
+  repo-local-config failure — parse, IO, and schema.
+
+### #12191 — CLI composition entrypoint wiring
+
+`main()` (in `src/mozyo_bridge/application/cli.py`) reads the repo-local config
+through the #12190 loader and composes the parser from it. The contract:
+
+- `build_parser(config=None)` now takes an optional `RepoLocalConfig`. With
+  `config is None` — the default, and every direct `build_parser()` caller in the
+  codebase and tests — it composes the full CLI exactly as before, so the change
+  is transparent to existing callers. With a config it threads `config.cli` into
+  `compose_parser(sub, config.cli)`; `main()` is the only caller that supplies one.
+- **Config source honors the root-level `--repo`.** Composition must be decided
+  before argparse parses the real arguments, yet the config lives under the repo
+  root that the documented root-level `--repo` may override. `main()` resolves
+  that override first (`_root_repo_override`, a tiny pre-parser that reads only
+  the root-level `--repo` and routes everything from the subcommand onward into a
+  REMAINDER tail), then loads the config from that root. So
+  `mozyo-bridge --repo <target>` reads `<target>/.mozyo-bridge/config.yaml`,
+  preserving the `--repo` contract; a *subcommand-local* `--repo` applies to that
+  command and never changes which families compose.
+- **Config-absent is unchanged.** A repo with no `.mozyo-bridge/config.yaml`
+  resolves to `RepoLocalConfig.default()`, whose `cli` disables nothing, so the
+  top-level help / subcommand tree is byte-identical to the pre-#12191 CLI.
+- **Config-present may disable only a non-mandatory CLI family.** Disabling an
+  optional family drops exactly its subcommands; the registry's `resolve_enabled`
+  still rejects disabling a mandatory (core / authority-bearing) family, so owner
+  approval / review / close / send safety stay non-configurable.
+- **Fail-closed with actionable text.** A parse / schema / family-resolution
+  failure (`RepoLocalConfigError` or `ModuleRegistryError`) is converted by
+  `main()` into a single actionable stderr line (what failed, the config path,
+  how to recover) and exit code `2` — never a raw traceback and never a silent
+  fall-through to the default CLI. Fail-closed is global: a broken config blocks
+  even `--version`, so a misconfigured repo cannot run any subset of the CLI as
+  if the config were valid.
+- **Staged scope.** Only the `cli` family composition is wired at the parser
+  entrypoint, because that is the surface with a live composition seam.
+  `providers` and `presentation` are read and validated by the loader, but they
+  have no runtime resolution seam yet (the provider registry is not consumed at
+  runtime and the presentation providers hardcode their surface); wiring their
+  selection into runtime resolution is a later stage. No dynamic import, entry
+  point, callable, module path, or external plugin API is introduced — the same
+  non-goal the registries already enforce.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

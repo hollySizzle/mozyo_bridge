@@ -135,6 +135,17 @@ Operators routinely name a handoff target by natural language rather than a tmux
 - **Discovery is not a durable record.** `agents targets` output, like `status` / `doctor` / scrollback, is an operator/debug aid. The durable source of truth for the handoff request stays on Redmine / Asana; the resolved pane send is only the pointer.
 - **Keep operator-specific identity out of distributed defaults.** When documenting or scripting this flow, do not bake a private path, host, session nickname, or operator-specific lane policy into the OSS skill / preset defaults. The procedure is the portable part; concrete workspace identifiers belong in the operator's own runtime, not in the distributed body.
 
+## Same-Lane Claude Dispatch
+
+When a target-lane Codex routes an implementation / review request to the Claude implementer in **its own lane** — the same-lane `--to claude` hop that `## Cross-Workspace Handoff` and `Cross-lane handoff routes through the target lane's Codex` reserve as the only sanctioned way work reaches a lane's Claude — that dispatch is a **standard handoff and must complete the submit**. It does not stop at a typed-but-unsubmitted prompt. A same-lane dispatch left as pending input forces the operator / coordinator to press Enter by hand, which is the stall this section exists to prevent (Redmine #12207 j#60741: a same-lane Codex→Claude dispatch reported `blocked` while the notification sat staged in the Claude pane until the coordinator pressed Enter).
+
+1. **Record the durable anchor first, then submit-complete the send.** Run `mozyo-bridge handoff send --to claude --source redmine --issue <issue_id> --journal <journal_id> --kind <implementation_request|review_request|...>`. The default `queue-enter` rail presses Enter with no `--mode` needed when the Claude pane is the active split of its window.
+2. **Inactive-split Claude pane uses marker-observed `--mode standard`.** In the common cockpit-grid case the Codex pane is the active split and the Claude pane is an inactive sibling, so the default `queue-enter` rail is fail-closed on the active-split gate (`blocked` / `invalid_args`) and types nothing. Re-dispatch on the strict-but-submitting rail with `--mode standard --target <claude_%pane> --target-repo auto`, exactly as the inactive-split block's emitted recovery command instructs. `--mode standard` observes the landing marker and then presses Enter, so it submit-completes against the inactive same-identity pane **without** weakening the active-split guard — the same `--mode standard` choice `### Callback procedure` step 4 makes for the (also typically inactive) coordinator pane.
+3. **`--no-submit` / `--mode pending` is not the standard dispatch path.** It types the notification and intentionally leaves the input pending for an operator to submit — an explicit operator / debug fallback (and the per-preset `marker_timeout` retry path in `references/safety.md`), never the default route for routing work to a same-lane Claude. Selecting it for a standard dispatch is the regression #12207 fixes: the dispatch looks delivered while the implementer never receives the turn.
+4. **Record the dispatch outcome** (sent / blocked-with-reason plus the replayable `--mode standard` retry command) on the durable record, the same way `### Callback procedure` records a callback outcome. A `blocked` outcome carrying its recovery command keeps the dispatch replayable; a dispatch silently left pending is not a delivered handoff.
+
+The submit rails themselves are fixed by `vibes/docs/logics/tmux-send-safety-contract.md` (`queue-enter` default, `standard` strict explicit fallback, `pending` operator-submit path) and `references/safety.md`; this section only fixes *which* rail a same-lane dispatch uses so it reaches submit instead of stalling pending. It does not relax the active-split / receiver-binding / per-receiver process gates, and it does not introduce a blind Enter (Redmine #12207 non-goals).
+
 ## Sublane Coordinator Callback
 
 Some operating models run a **coordinator lane** (a main Codex lane that owns project management, audit, release, and lightweight verification) alongside one or more **sublanes** (implementation lanes, each with its own Codex gateway and Claude implementer). Work is dispatched from the coordinator into a sublane through the target lane's Codex gateway (see `## Natural-Name Target Handoff`), after which the durable Redmine / Asana state advances *inside* the sublane. Unless the sublane reports back, the coordinator cannot see that progress: the work looks stalled from the coordinator cockpit even though the durable record has already moved forward — for example to review-approved or owner-close-approval-waiting (Redmine #11850 j#57274, surfaced while running #11812).
@@ -352,6 +363,151 @@ A routing callback can be missing not because a lane is idle but because the lan
 - **Detection is not re-dispatch of completed work.** Before re-notifying, the coordinator reads the issue to separate `progress_without_callback` (pick up the done state) from `no_progress_after_handoff` (genuinely waiting); it does not blindly resend work the durable record shows as already advanced.
 - **It does not bypass the stop / aggregation standards.** A detected stall resolves through the same `## Coordinator Stop And Next-Action Standard` next-action proposal and, for owner-waiting states, the same single aggregation point in `## Owner Approval Aggregation`. Stall detection finds the state; it does not self-authorize a close, a carve-out, or an owner decision.
 - **Keep operator-specific policy out of OSS defaults.** The concrete tolerance window (how long is "too long"), the Redmine saved query / filter used to enumerate stall candidates, and any private re-notification cadence or escalation order are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a stall candidate is defined as "delivered dispatch journal + missing expected durable journal", is classified into the four durable states, and that every stall check and re-notification is itself recorded on the issue*; the operator's concrete timeout and query belong in their own runbook, not in the distributed skill or preset body.
+
+## Sublane Completion Guardrails
+
+`## Sublane Coordinator Callback`, `## Coordinator Stop And Next-Action Standard`, and `## Stall And No-Progress Detection Standard` each describe one rail of multi-lane operation. Running several sublanes at once on a single version surfaced a recurring gap they leave implicit: the durable Redmine state advances, but the *completion condition* is read as "the gate journal landed" rather than "the coordinator can actually see and resume from it", so a sublane looks done while the coordinator is still blind (Redmine #12213, generalizing the v0.9.1 sublane PoC #12189 / #12190 / #12191 / #12207). This standard redefines the completion condition for the handoff-worthy states so the gap is closed by definition, not by after-the-fact detection. It adds no new CLI checker or drain command; it fixes *when a state counts as complete* and *who owns the resume*, in a fixed-field shape a future checker can read.
+
+The four guardrails below share one **fixed-field shape** so the same fields appear on every sublane state journal and stay machine-readable: `state`, `durable_anchor`, `callback_result`, `blocked_by`, `resume_condition`, `resume_owner`, `origin_reachable`. Each guardrail uses the subset that applies to its state; the full template is in `### Fixed-field journal shape` below.
+
+### A handoff-worthy state is not complete until its callback outcome journal lands
+
+The completion condition for a sublane state is not "the gate journal exists" — it is "the gate journal exists **and** a callback outcome journal points the coordinator at it". Concretely, **`implementation_done`, `review_request`, `review_result`, `owner_close_approval_waiting`, and `blocked` are not complete until their callback outcome journal is recorded.** Until then the state is in-flight, regardless of how finished the work feels inside the sublane.
+
+- This hardens `### Completion checklist (run before treating a handoff-worthy state as done)` from a checklist into a definition: the `callback_result` field (`sent` / `blocked` / `not-attempted`, never silence) is part of what makes the state complete, not a step that can be deferred. A sublane that recorded `implementation_done` and notified only its own same-lane Codex has *not* completed `implementation_done`; the cross-lane callback outcome journal is still owed. This is the `progress_without_callback` failure (#12189 j-series: implementation / approval landed but the callback / downstream resume was never drained to the coordinator), promoted from a stall *detection* to a completion *precondition*.
+- The callback outcome journal carries at least `state`, `durable_anchor` (`#<issue_id> j#<gate_journal_id>`), and `callback_result`. A `blocked` `callback_result` still completes the recording duty as long as it carries the replayable retry command (`### Callback procedure` step 4); what is prohibited is treating the state as done with no callback journal at all.
+
+### A dependency hold parks on the durable record; it does not wait on a go-ahead
+
+When a sublane cannot proceed because it depends on another issue, it **records a durable parked state and stops there — it does not stop on an operator / go-ahead question.** Pausing to ask "may I start?" leaves no durable trace, so the coordinator cannot see the dependency and cannot own the resume (Redmine #12191: a dependency hold waited on an operator go-ahead before it was ever recorded in Redmine; #12190: `blocked_by #12189` waited correctly but the resume duty was never anchored).
+
+- The parked-state journal records the fixed fields `state: blocked`, `blocked_by` (the issue id whose completion unblocks this one), `resume_condition` (the durable event that lets work resume — for example "blocked_by reaches its callback outcome journal"), `resume_owner` (who re-dispatches — the coordinator, per the next guardrail), and `callback_result` (the parked state is itself a handoff-worthy `blocked` state and is callbacked like any other).
+- Parking is not a question and not a stall. The sublane does not idle waiting for a human to say "go"; it writes the parked state, callbacks it, and yields. Resumption is triggered by the `resume_condition` becoming true on the durable record, not by an operator nudging the pane.
+
+### The coordinator owns callback drain and downstream resume
+
+A sublane reporting a state is necessary but not sufficient — someone must *consume* the callbacks and *restart* the work that was waiting. That duty sits on the coordinator lane, explicitly: **the coordinator owns callback drain (reading the accumulated callback outcome journals and acting on them) and downstream resume (re-dispatching a parked dependent once its `resume_condition` is met).** Leaving this implicit is what stalled #12189 → #12190: #12189 reached approval but its callbacks and the downstream resume of #12190 were never drained, so #12190 sat parked with no actor responsible for restarting it.
+
+- **Callback drain.** The coordinator periodically derives the outstanding set from the durable record (per `## Owner Approval Aggregation` and `## Stall And No-Progress Detection Standard` — enumerated from journals, not panes) and clears each callback by taking its next action (audit, owner-approval collection, close, or re-dispatch). A callback outcome journal that names the coordinator but is never drained is the coordinator's backlog item, not the sublane's.
+- **Downstream resume.** When a `blocked_by` issue reaches *its* callback outcome journal (so it is complete by the first guardrail), the coordinator is the `resume_owner` that re-dispatches the parked dependent into a lane, recording the resume as a routing / Progress Log journal on the dependent issue. The parked sublane does not self-resume by polling; it is restarted from the durable record by the coordinator.
+- This is the coordinator-side complement of the first two guardrails, exactly as `## Coordinator Stop And Next-Action Standard` is the coordinator-side complement of `## Sublane Coordinator Callback`. It does not let the coordinator self-authorize an owner decision; draining a callback whose next action is owner-gated still routes through `## Owner Approval Aggregation`.
+
+### Origin reachability preflight before recording a commit hash in a gate
+
+A commit hash written into an `implementation_done` or `review_request` gate is only useful if the reviewer can fetch the commit. **Before recording a commit hash in a gate journal, verify the commit is reachable from `origin` and record the result as `origin_reachable`.** A hash that is local-only (unpushed, or orphaned by a later rebase) makes the Review Gate block on an anchor the auditor cannot reach (Redmine #12207: a Review Request was posted before the commit reached origin, so the Review Gate blocked on reachability; compare the rebase-anchor failure mode where a coordinator rebase makes a recorded hash origin-unreachable).
+
+- The preflight is concrete: push the lane branch, then confirm the hash is on the remote — for example `git rev-parse HEAD` for the hash and `git branch -r --contains <hash>` (or `git ls-remote origin` / a fetch) showing it on an `origin/...` ref. Record `origin_reachable: true` in the gate journal next to the hash; if it is not yet reachable, the gate is not ready and the hash is not recorded.
+- This is a precondition on `implementation_done` / `review_request`, upstream of the `Audit-Owned Commit Authority` step 6 hash recording. It does not replace that step; it ensures the hash that flows into the review and into the audit-owned commit record was reachable when it was written. If a later coordinator rebase invalidates the recorded hash, the fix is a re-anchoring correction journal (re-point to the rebased, byte-identical commit), not a silent edit — but the preflight stops the *initial* record from being unreachable.
+
+### Fixed-field journal shape
+
+Record the applicable subset on the state's gate / callback journal (or fold the fields into the gate journal) so every sublane state is auditable and a future checker can read it without parsing prose:
+
+```markdown
+## sublane state
+- state: implementation_done | review_request | review_result | owner_close_approval_waiting | blocked
+- durable_anchor: #<issue_id> j#<gate_journal_id>
+- callback_result: sent | blocked | not-attempted
+- blocked_by: #<issue_id> (dependency hold only; omit when not blocked)
+- resume_condition: <durable event that unblocks> (dependency hold only)
+- resume_owner: coordinator (dependency hold only)
+- origin_reachable: true | false (implementation_done / review_request carrying a commit hash)
+- commit_hash: <hash> (when the state carries one; record only with origin_reachable: true)
+```
+
+### Boundaries this standard does not relax
+
+- **It redefines completion, it does not add a checker.** No new drain CLI, no Redmine automation, no schema change (Redmine #12213 non-goals). The fixed-field shape only makes the existing durable journals machine-readable for a future checker; the enforcement today is the definition that a state is incomplete without its callback outcome journal.
+- **Durable record stays the source of truth.** Every guardrail anchors on Redmine journals; the callback, the parked state, the resume, and the reachability result are all read from and recorded on the issue, never from pane scrollback / `status` / `doctor`.
+- **It does not relax the stop / aggregation / role boundaries.** Coordinator drain and resume still route owner-gated next actions through `## Owner Approval Aggregation`, still present stops per `## Coordinator Stop And Next-Action Standard`, and still keep cross-lane routing Codex-to-Codex. The coordinator owning resume does not let it self-authorize a close or a carve-out.
+- **Keep operator-specific policy out of OSS defaults.** The concrete drain cadence, how often the coordinator sweeps the callback set, and any private resume prioritization are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a handoff-worthy state is incomplete until its callback outcome journal lands, that a dependency hold parks on the durable record instead of waiting on a go-ahead, that the coordinator owns callback drain and downstream resume, and that a commit hash is origin-reachability-checked before it is recorded in a gate* — all in the fixed-field shape above.
+
+## Sublane Retirement Drain
+
+`## Sublane Completion Guardrails` closes the front of a sublane's life: a handoff-worthy state is not complete until its callback outcome journal lands, and the coordinator owns callback drain and downstream resume. It leaves the *back* of the life implicit. Running several sublanes at once on Version #222 surfaced the gap: after a lane's issue is closed, the lane / worktree / cockpit pane keep living indefinitely, so a single version accumulates many Redmine-closed-but-still-resident lanes (Redmine #12214, generalizing the v0.9.1 sublane PoC; successor to #12213). This is not just operator cleanup laziness — the workflow never treated *retirement* as an explicit completion stage, so nothing owns it and nothing makes it safe. This standard defines sublane retirement as a **coordinator-owned drain that runs after the callback drain**, in the same fixed-field shape a future checker can read. It adds no automated retire CLI or checker and does not itself kill any existing lane / worktree (Redmine #12214 non-goals); it fixes *which lanes are retire candidates*, *what forbids retirement*, *what safety preflight a destructive pane-kill / worktree-remove requires*, and *which journals bracket the retire*.
+
+Retirement touches destructive operations (pane kill, worktree remove), so it is gated harder than the completion states. The fields below share the checker-friendly shape: `retirement_state`, `lane`, `worktree`, `pane`, `redmine_issue_state`, `retain_reason`, `downstream_consumed`, `retire_blockers`, `safety_preflight`, `durable_anchor`. Each state uses the subset that applies; the full template is in `### retire_ready and retired journal shape` below.
+
+### A closed lane is the default retire candidate
+
+When a lane's Redmine issue (the UserStory or standalone issue the lane was dispatched for) is **closed**, the lane is by default a `retire_candidate`: its worktree and cockpit pane are slated for removal. Closure here means the durable close, not `implementation_done` and not a Review Gate approval — `implementation_done` is not completion (base preset), and a Review Gate approval is not a close. A lane whose issue is merely at `implementation_done` or `owner_close_approval_waiting` is **not** a retire candidate; it is still in-flight per `## Sublane Completion Guardrails`.
+
+- `retirement_state: retire_candidate` records that the lane is eligible *in principle*; it does not authorize the destructive op. Retirement only proceeds after the prohibitions below are all clear and the safety preflight is green (`retirement_state: retire_ready`), and the kill / remove itself is recorded as `retirement_state: retired`.
+- The candidate set is derived from the durable record — the lane's issue state on Redmine — not from pane scrollback / `status` / `doctor`. A pane that *looks* idle is not a retire candidate unless its issue is closed; an issue that is closed makes its lane a candidate even if the pane was never visited again.
+
+### A dependency ancestor lane is retained until downstream consumed
+
+A closed lane is not always safe to retire immediately: a lane whose branch is an **ancestor that a downstream lane still has to merge or rebase onto** must survive until that downstream consumption completes, or the downstream rebase loses its base. Such a lane records `retirement_state: retain_until_downstream_consumed` instead of `retire_candidate`, with `retain_reason` (which downstream issue / lane still depends on this branch) and `downstream_consumed: false`.
+
+- This is the retirement-side mirror of the `## Sublane Completion Guardrails` dependency hold: there a *dependent* parks on `blocked_by` until its ancestor completes; here the *ancestor* is held from retirement until the dependent has consumed it. The hold is anchored on the durable record, not on an operator remembering the dependency.
+- The retain is released — `downstream_consumed: true`, and the lane becomes a `retire_candidate` — when the downstream lane has merged or rebased onto the ancestor commit and that consumption is itself recorded (the downstream lane's merge / rebase journal). The coordinator owns this transition as part of the retirement drain; the ancestor lane does not self-release by polling.
+
+### Retirement is prohibited while any hold condition is open
+
+A closed-issue lane is a candidate, but retirement is **forbidden** while any of the following is open. Each is a `retire_blockers` entry; a non-empty `retire_blockers` list means `retirement_state: retire_blocked`, never `retire_ready`:
+
+- **active lane** — the lane is still doing work (any state other than a closed issue with no outstanding gate).
+- **review pending** — a Review Request is outstanding with no Review Gate result.
+- **owner approval pending** — `owner_close_approval_waiting` with no owner_close_approval journal yet (the close is not real, so the lane is not closed).
+- **unresolved callback** — a handoff-worthy state whose callback outcome journal has not landed (`## Sublane Completion Guardrails` first guardrail). Retirement after the callback drain means the callbacks are already drained.
+- **dirty worktree** — uncommitted or untracked changes in the lane's worktree; removing it would discard them.
+- **pending prompt** — a queued / unsubmitted prompt on the lane's pane; killing it would drop in-flight input (`## Same-Lane Claude Dispatch` submit-completion concerns).
+- **unpushed commit** — a commit on the lane branch not reachable from `origin`; removing the worktree could orphan it (the `origin_reachable` preflight from `## Sublane Completion Guardrails`, applied to *every* lane commit, not just a recorded gate hash).
+- **unknown target identity** — the lane / worktree / pane identity is not resolved from the durable record / resolver; a destructive op against an unverified target is prohibited (do not kill a pane you cannot positively identify).
+
+### Destructive-operation safety preflight
+
+Before the destructive pane-kill / worktree-remove, the coordinator runs and records a `safety_preflight` whose every field must be true; a green preflight is exactly what moves a lane from `retire_candidate` to `retirement_state: retire_ready`:
+
+- `redmine_closed: true` — the lane's issue is durably closed (not `implementation_done`, not Review-approved-only).
+- `worktree_clean: true` — `git status` in the worktree shows no uncommitted / untracked changes.
+- `origin_reachable: true` — every commit on the lane branch is reachable from `origin` (push the branch, then confirm — for example `git branch -r --contains <hash>` / `git ls-remote origin` for the branch tip), so worktree removal loses no work.
+- `pending_prompt_absent: true` — no queued / unsubmitted prompt on the pane.
+- `callback_drained: true` — the coordinator callback drain for this lane is complete; no outstanding callback outcome journal is owed.
+- `target_identity_known: true` — the pane id / worktree path / lane branch are positively resolved from the durable record / resolver before any kill or remove.
+
+If any field is false the lane stays `retire_blocked`; the destructive op does not run, and the open field is the `retire_blockers` entry to clear first.
+
+### retire_ready and retired journal shape
+
+Bracket the destructive op with two durable journals on the lane's issue: `retire_ready` (preflight green, about to retire) and `retired` (pane killed / worktree removed). Record the applicable subset so a future checker can read it without parsing prose:
+
+```markdown
+## retire_ready
+- retirement_state: retire_ready
+- lane: <lane id / branch name>
+- worktree: <worktree path>
+- pane: <pane id>
+- redmine_issue_state: closed
+- retain_reason: none | <downstream issue still consuming this ancestor>
+- downstream_consumed: true | n/a
+- retire_blockers: []  (must be empty to be retire_ready)
+- safety_preflight: redmine_closed=true worktree_clean=true origin_reachable=true pending_prompt_absent=true callback_drained=true target_identity_known=true
+- durable_anchor: #<issue_id> j#<close_journal_id>
+
+## retired
+- retirement_state: retired
+- lane: <lane id / branch name>
+- worktree: <worktree path> (removed)
+- pane: <pane id> (killed)
+- durable_anchor: #<issue_id> j#<retire_ready_journal_id>
+```
+
+### The coordinator owns the retirement drain, after the callback drain
+
+Retirement is a coordinator duty, sequenced explicitly: **the coordinator runs the retirement drain after the callback drain.** The callback drain (`## Sublane Completion Guardrails`) clears outstanding callbacks and downstream resumes; only once a lane's callbacks are drained and its issue is closed does the coordinator evaluate it for retirement. The order matters — retiring a lane whose callbacks are still owed would drop a handoff-worthy state on the floor.
+
+- **Derive the candidate set from the durable record.** The coordinator enumerates closed-issue lanes from Redmine (per the pane-count-independent enumeration in `## Owner Approval Aggregation` / `## Stall And No-Progress Detection Standard`), not from pane inventory. A `retain_until_downstream_consumed` lane stays out of the retire set until its `downstream_consumed` flips.
+- **Run the preflight, then retire.** For each candidate the coordinator clears `retire_blockers`, records `retire_ready` with the green `safety_preflight`, performs the destructive op, and records `retired`. A lane that cannot reach `retire_ready` stays `retire_blocked` and is the coordinator's backlog item, exactly like an undrained callback.
+- **Retirement does not self-authorize a close.** The drain retires lanes whose issues are *already* closed; it never closes an issue to make a lane retireable. If a lane looks done but its issue is not closed, that routes through the normal close path (US-level audit → `## Owner Approval Aggregation` → owner_close_approval), not through retirement.
+
+### Boundaries this standard does not relax
+
+- **It defines a stage, it does not add a checker.** No automated retire CLI, no Redmine automation, no schema change (Redmine #12214 non-goals). The fixed-field shape only makes the retire journals machine-readable for a future checker; the enforcement today is the definition that retirement is coordinator-owned, candidate-gated, prohibition-gated, and preflight-gated.
+- **It retires nothing existing.** This standard does not kill the resident Version #222 lanes / worktrees / panes (Redmine #12214 non-goal — actual kill / remove is out of scope); it defines how retirement is done going forward.
+- **Durable record stays the source of truth.** The candidate set, the retain hold, the blockers, the preflight, and the retire bracket are all read from and recorded on the issue, never from pane scrollback / `status` / `doctor`. A pane looking idle is not a retire signal; a closed issue is.
+- **Destructive ops stay gated and identified.** A pane-kill / worktree-remove runs only with a green `safety_preflight` and a positively identified target; an unverified target identity is itself a `retire_blockers` entry. The standard never authorizes a destructive op on an unclosed issue, a dirty worktree, an unpushed commit, or an unknown target.
+- **Keep operator-specific policy out of OSS defaults.** The concrete retirement cadence, the Redmine saved query used to enumerate closed-lane candidates, and any private grace window before a closed lane is retired are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a closed lane is a retire candidate, that a dependency ancestor is retained until downstream consumed, that an open hold condition forbids retirement, that a destructive op requires a green safety preflight, and that the coordinator owns the retirement drain after the callback drain* — all in the fixed-field shape above, bracketed by `retire_ready` and `retired`.
 
 ## Main-Unit Claude Safe-Use Boundary
 

@@ -88,6 +88,28 @@ class MessageContractTest(unittest.TestCase):
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
 
+    def test_message_no_submit_help_frames_it_as_operator_debug_fallback(self) -> None:
+        # Redmine #12207: the `message --no-submit` help must read as an explicit
+        # operator/debug fallback, not as a neutral / standard option. A future
+        # edit that softens it back to a plain "type but don't submit" gloss —
+        # which is what let same-lane dispatch agents treat pending as a normal
+        # path — must fail here.
+        parser = build_parser()
+        subparsers_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        # argparse hard-wraps help to the terminal width, so collapse runs of
+        # whitespace before matching phrases that may straddle a wrap boundary.
+        help_text = " ".join(
+            subparsers_action.choices["message"].format_help().split()
+        )
+
+        self.assertIn("Operator/debug fallback", help_text)
+        self.assertIn("NOT the standard handoff path", help_text)
+        self.assertIn("#12207", help_text)
+
     def test_message_rolls_back_when_marker_is_not_observed(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             result, sent, _pane_text, _sleep = self.run_message_with_fake_tmux(

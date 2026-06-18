@@ -112,11 +112,14 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Ticket System Conventions",
         "## Handoff Lifecycle",
         "## Cross-Workspace Handoff",
+        "## Same-Lane Claude Dispatch",
         "## Sublane Coordinator Callback",
         "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
         "## Coordinator Stop And Next-Action Standard",
         "## Owner Approval Aggregation",
         "## Stall And No-Progress Detection Standard",
+        "## Sublane Completion Guardrails",
+        "## Sublane Retirement Drain",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -166,6 +169,15 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "send a concise callback to the coordinator lane",
         "owner close approval requested",
         "The sublane's Codex owns the cross-lane callback",
+        # Same-lane Claude dispatch submit-completion (Redmine #12207). A
+        # same-lane Codex→Claude dispatch is a standard handoff that must reach
+        # submit (queue-enter on an active split, marker-observed `--mode
+        # standard` on an inactive cockpit-grid split); `--no-submit` /
+        # `--mode pending` stays an explicit operator/debug fallback, not the
+        # standard dispatch path.
+        "that dispatch is a **standard handoff and must complete the submit**",
+        "Inactive-split Claude pane uses marker-observed `--mode standard`",
+        "`--no-submit` / `--mode pending` is not the standard dispatch path",
         # Named cockpit groups — grouping vs identity separation
         # (Redmine #11853). A multi-cockpit layout must not become an
         # implicit cross-group send shortcut, and the cross-group rail
@@ -203,6 +215,41 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "Stale CLI is a distinct stall mode during a handoff or callback",
         "it records that fact on the issue",
         "Detection is not re-dispatch of completed work",
+        # Sublane completion guardrails (Redmine #12213). A handoff-worthy
+        # state is incomplete until its callback outcome journal lands, a
+        # dependency hold parks on the durable record instead of waiting on a
+        # go-ahead, the coordinator owns callback drain and downstream resume,
+        # and a commit hash is origin-reachability-checked before it is recorded
+        # in a gate — all carried in a fixed-field shape a checker can read.
+        "### A handoff-worthy state is not complete until its callback outcome journal lands",
+        "are not complete until their callback outcome journal is recorded",
+        "### A dependency hold parks on the durable record; it does not wait on a go-ahead",
+        "it does not stop on an operator / go-ahead question",
+        "### The coordinator owns callback drain and downstream resume",
+        "the coordinator owns callback drain",
+        "downstream resume",
+        "### Origin reachability preflight before recording a commit hash in a gate",
+        "verify the commit is reachable from `origin` and record the result as `origin_reachable`",
+        "### Fixed-field journal shape",
+        "`resume_condition`, `resume_owner`, `origin_reachable`",
+        # Sublane retirement drain (Redmine #12214). A closed lane is the
+        # default retire candidate, a dependency ancestor is retained until
+        # downstream consumed, an open hold condition forbids retirement, a
+        # destructive op requires a green safety preflight, and the coordinator
+        # owns the retirement drain after the callback drain — bracketed by
+        # retire_ready / retired journals in a checker-readable fixed-field
+        # shape.
+        "### A closed lane is the default retire candidate",
+        "the lane is by default a `retire_candidate`",
+        "### A dependency ancestor lane is retained until downstream consumed",
+        "`retirement_state: retain_until_downstream_consumed`",
+        "### Retirement is prohibited while any hold condition is open",
+        "a non-empty `retire_blockers` list means `retirement_state: retire_blocked`",
+        "### Destructive-operation safety preflight",
+        "moves a lane from `retire_candidate` to `retirement_state: retire_ready`",
+        "### retire_ready and retired journal shape",
+        "### The coordinator owns the retirement drain, after the callback drain",
+        "the coordinator runs the retirement drain after the callback drain",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
@@ -260,6 +307,171 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
             self._body(*self.PLUGIN_MIRROR_PATH),
             label="plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md",
         )
+
+
+class SameLaneDispatchDurableDocTest(unittest.TestCase):
+    """Pin the same-lane dispatch submit-completion contract in the durable
+    operating-model doc (Redmine #12207).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth (a Repo-Local Guardrail Autonomous Lane
+    doc). It must carry the same submit-completion contract the skill body
+    pins, so an agent reading the operating model — not just the skill — learns
+    that a same-lane dispatch reaches submit and does not rest at a pending
+    prompt. A future edit that drops the section fails here loudly rather than
+    silently reopening the #12207 stall.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## Same-Lane Claude Dispatch の Submit 完結",
+        "標準 handoff であり、submit まで完結する",
+        # The inactive-split case routes to the submit-completing standard rail.
+        "recovery command どおり `--mode standard --target",
+        # The pending fallbacks are explicitly not the standard dispatch path.
+        "`--no-submit` / `--mode pending` は標準 dispatch 経路ではない",
+        # The non-goals are spelled out: no gate relaxation, no blind Enter.
+        "blind Enter も導入しない",
+        # The reproduction anchor stays cited.
+        "#12207",
+    )
+
+    def test_operating_model_doc_carries_same_lane_dispatch_contract(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12207 same-lane dispatch marker {marker!r}; "
+                        "the submit-completion contract regressed or this anchor "
+                        "list needs an intentional update in the same commit."
+                    ),
+                )
+
+
+class SublaneCompletionGuardrailsDocTest(unittest.TestCase):
+    """Pin the sublane completion guardrails in the durable operating-model doc
+    (Redmine #12213).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth. It must carry the four #12213 guardrails —
+    a handoff-worthy state is incomplete until its callback outcome journal
+    lands, a dependency hold parks on the durable record instead of waiting on a
+    go-ahead, the coordinator owns callback drain / downstream resume, and a
+    commit hash is origin-reachability-checked before it is recorded in a gate —
+    in the fixed-field shape a future checker can read. A future edit that drops
+    the section fails here loudly rather than silently reopening the
+    #12189-#12191 / #12207 gaps.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## サブレーン完了条件と coordinator drain (#12213)",
+        # Guardrail 1: completion requires the callback outcome journal.
+        "handoff-worthy state は callback outcome journal まで未完了",
+        # Guardrail 2: dependency hold parks rather than waiting on a go-ahead.
+        "dependency hold は go-ahead 待ちにせず durable parked state を記録して",
+        # Guardrail 3: coordinator owns callback drain / downstream resume.
+        "coordinator は callback drain / downstream resume の責務を持つ",
+        # Guardrail 4: origin reachability preflight before recording a hash.
+        "commit hash を gate に記録する前に origin reachability preflight を必須化",
+        # The fixed-field shape stays explicit so a checker can read it.
+        "`resume_condition`, `resume_owner`, `origin_reachable`",
+        # The reproduction anchors stay cited.
+        "#12189 / #12190 / #12191 / #12207",
+    )
+
+    def test_operating_model_doc_carries_completion_guardrails(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12213 sublane completion guardrail marker "
+                        f"{marker!r}; the completion-condition redefinition "
+                        "regressed or this anchor list needs an intentional "
+                        "update in the same commit."
+                    ),
+                )
+
+
+class SublaneRetirementDrainDocTest(unittest.TestCase):
+    """Pin the sublane retirement drain in the durable operating-model doc
+    (Redmine #12214).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth. #12213 defined the front of a sublane's
+    life (completion / callback drain); #12214 defines the back (retirement).
+    The doc must carry the five #12214 guardrails — a closed lane is the default
+    retire candidate, a dependency ancestor is retained until downstream
+    consumed, an open hold condition forbids retirement, a destructive op
+    requires a green safety preflight, and the coordinator owns the retirement
+    drain after the callback drain — in the checker-readable fixed-field shape
+    bracketed by retire_ready / retired journals. A future edit that drops the
+    section fails here loudly rather than silently reopening the Version #222
+    resident-closed-lane accumulation gap.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## サブレーン retirement drain (#12214)",
+        # Guardrail 1: a closed lane is the default retire candidate.
+        "closed lane は default retire candidate",
+        # Guardrail 2: a dependency ancestor is retained until downstream
+        # consumed.
+        "dependency ancestor lane は downstream consumed まで retain",
+        # Guardrail 3: an open hold condition forbids retirement.
+        "retire 禁止条件 (どれか open なら `retire_blocked`、`retire_ready` にしない)",
+        # Guardrail 4: destructive op requires a green safety preflight.
+        "destructive 操作前の safety preflight を必須化",
+        # Guardrail 5: coordinator owns the retirement drain after the callback
+        # drain.
+        "coordinator は callback drain の次に retirement drain を owns",
+        # The retire is bracketed by retire_ready / retired journals.
+        "retire 前後を journal で bracket する",
+        # The fixed-field shape stays explicit so a checker can read it.
+        "`retire_blockers`, `safety_preflight`, `durable_anchor`",
+    )
+
+    def test_operating_model_doc_carries_retirement_drain(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12214 sublane retirement drain marker "
+                        f"{marker!r}; the retirement-stage definition regressed "
+                        "or this anchor list needs an intentional update in the "
+                        "same commit."
+                    ),
+                )
 
 
 if __name__ == "__main__":
