@@ -23,6 +23,7 @@ sequence exactly, so default composition is byte-compatible with the prior CLI.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Callable, Optional
 
 from mozyo_bridge.application import (
@@ -195,6 +196,31 @@ _REGISTRARS: dict[str, Callable[[object], None]] = {
 }
 
 
+def load_composition_config(
+    record: "Optional[Mapping[str, object]]" = None,
+) -> CliCompositionConfig:
+    """Resolve a repo-local config record into a validated CliCompositionConfig.
+
+    Two-stage fail-closed read layer: ``CliCompositionConfig.from_record``
+    validates the record *shape* (closed schema, typed values, no
+    module/callable/authority/secret fields), then the built-in registry
+    validates its *meaning* — an unknown or mandatory family fails closed here,
+    not only later at compose time. ``None``/empty resolves to the
+    behavior-preserving full composition, so a missing config never changes the
+    default ``mozyo-bridge`` CLI.
+
+    This is a read/normalize layer only: it never loads, imports, or executes a
+    family, and the config it returns can only select built-in families — it
+    cannot reorder, add, supply a registrar, or grant authority.
+    """
+    config = CliCompositionConfig.from_record(record)
+    # Validate against the families this build actually ships now (fail-closed
+    # early on unknown / mandatory family names), then discard the result — we
+    # only want the validation side effect; compose_parser re-resolves at use.
+    BUILTIN_CLI_MODULE_REGISTRY.resolve_enabled(config)
+    return config
+
+
 def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
     """Compose the top-level subparsers from the registry, in order.
 
@@ -214,4 +240,5 @@ def compose_parser(sub, config: Optional[CliCompositionConfig] = None) -> None:
 __all__ = (
     "BUILTIN_CLI_MODULE_REGISTRY",
     "compose_parser",
+    "load_composition_config",
 )

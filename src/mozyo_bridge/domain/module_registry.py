@@ -38,6 +38,8 @@ application -> domain, exactly like ``provider_registry``.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
@@ -155,6 +157,73 @@ class CliFamily:
         return self.core or bool(self.authorities)
 
 
+# --- Repo-local composition config record schema (internal-only) -----------
+#
+# A *composition config record* is the YAML/TOML-equivalent typed mapping a repo
+# may carry to select built-in CLI families. It is intentionally tiny: the only
+# behavior config may express is disabling non-mandatory families. The schema is
+# closed (unknown keys fail closed), values are typed, and the record may never
+# name a module path, a callable, an authority, or a credential — those are not
+# "unknown future options", they are boundaries this surface must never cross, so
+# a key that even looks like one is rejected with a boundary-specific message.
+# ``CliCompositionConfig.from_record`` validates record *shape*; the registry's
+# ``resolve_enabled`` validates record *meaning* (unknown / mandatory families).
+
+#: Top-level keys a composition config record may contain. Anything else fails
+#: closed (typo protection + closed schema).
+COMPOSITION_RECORD_KEYS: frozenset[str] = frozenset({"version", "disabled"})
+
+#: The only record schema version understood today. A record may omit it; if
+#: present it must equal this. The version is bumped by a deliberate code + doc
+#: change, never selected from config to unlock new behavior.
+COMPOSITION_RECORD_VERSION: int = 1
+
+#: A valid built-in family identifier: lowercase, digits, hyphens (e.g.
+#: ``"runtime-config"``). A ``disabled`` entry must match this, so a dotted
+#: module path, a filesystem path, or a secret-shaped token is rejected at the
+#: record boundary, before it could ever reach family resolution.
+_FAMILY_ID_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
+
+#: Substrings in a record key that signal an attempt to cross a boundary this
+#: surface owns: load/execute code, name a module/callable, grant or alter
+#: authority/approval/routing, or carry a credential/secret. Such a key is
+#: rejected with a boundary-specific message rather than the generic unknown-key
+#: error, so the rejection reads as deliberate in an audit.
+_FORBIDDEN_RECORD_KEY_PARTS: tuple[str, ...] = (
+    "import",
+    "module",
+    "path",
+    "registrar",
+    "callable",
+    "entry",
+    "plugin",
+    "exec",
+    "eval",
+    "script",
+    "load",
+    "authority",
+    "authorities",
+    "approval",
+    "approve",
+    "grant",
+    "owner",
+    "review",
+    "close",
+    "routing",
+    "send_safety",
+    "role",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "credential",
+    "auth",
+    "billing",
+)
+
+
 @dataclass(frozen=True)
 class CliCompositionConfig:
     """The configuration-aware composition surface — module selection only.
@@ -181,6 +250,100 @@ class CliCompositionConfig:
     def default(cls) -> "CliCompositionConfig":
         """The behavior-preserving default: nothing disabled, full composition."""
         return cls()
+
+    @classmethod
+    def from_record(
+        cls, record: "Optional[Mapping[str, object]]" = None
+    ) -> "CliCompositionConfig":
+        """Normalize a repo-local config *record* into a CliCompositionConfig.
+
+        ``record`` is the in-memory mapping a YAML/TOML repo-local config would
+        parse to; this layer does no file IO and no parsing — it normalizes an
+        already-parsed typed record. ``None`` or an empty record yields the
+        behavior-preserving default (full composition), so a missing config can
+        never change the default ``mozyo-bridge`` CLI.
+
+        Fail-closed, in order:
+
+        - a non-mapping record is rejected (it is not a config record);
+        - a key naming a module/callable/authority/credential boundary is
+          rejected with a boundary-specific message — config may not load code,
+          grant authority, or carry a secret;
+        - any other unknown top-level key is rejected (closed schema / typo
+          protection);
+        - ``version``, if present, must be the supported integer version;
+        - ``disabled``, if present, must be a list/tuple of family identifiers
+          (lowercase letters, digits, hyphens). A bare string, a mapping, or a
+          value not shaped like a family id — a module path or a secret-shaped
+          token — is rejected before it could reach family resolution.
+
+        Whether the named families actually exist and are non-mandatory is
+        enforced separately by :meth:`BuiltinCliModuleRegistry.resolve_enabled`,
+        which fails closed on unknown or mandatory families. This method
+        validates record *shape*; the registry validates record *meaning*.
+        """
+        if record is None:
+            return cls.default()
+        if not isinstance(record, Mapping):
+            raise ModuleRegistryError(
+                "composition config record must be a mapping (a YAML/TOML table), "
+                f"got {type(record).__name__}"
+            )
+        for key in record:
+            if not isinstance(key, str) or not key:
+                raise ModuleRegistryError(
+                    "composition config record keys must be non-empty strings; "
+                    f"got {key!r}"
+                )
+            lowered = key.lower()
+            for part in _FORBIDDEN_RECORD_KEY_PARTS:
+                if part in lowered:
+                    raise ModuleRegistryError(
+                        f"composition config record may not carry a {key!r} field: "
+                        f"this surface selects built-in families only and may never "
+                        f"load code, name a module/callable, grant authority, or carry "
+                        f"a credential (matched forbidden token {part!r})."
+                    )
+            if key not in COMPOSITION_RECORD_KEYS:
+                raise ModuleRegistryError(
+                    f"composition config record has unknown key {key!r}; "
+                    f"allowed keys: {sorted(COMPOSITION_RECORD_KEYS)}"
+                )
+
+        version = record.get("version", COMPOSITION_RECORD_VERSION)
+        # ``bool`` is an ``int`` subclass — reject it so ``version: true`` does
+        # not silently read as version 1.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ModuleRegistryError(
+                "composition config record 'version' must be an integer, got "
+                f"{version!r}"
+            )
+        if version != COMPOSITION_RECORD_VERSION:
+            raise ModuleRegistryError(
+                f"unsupported composition config record version {version!r}; this "
+                f"build understands version {COMPOSITION_RECORD_VERSION}"
+            )
+
+        raw_disabled = record.get("disabled", ())
+        # A bare string is iterable (char-by-char) and a mapping iterates its
+        # keys; both would silently normalize into the wrong set, so require an
+        # explicit YAML/TOML array (list/tuple).
+        if isinstance(raw_disabled, (str, bytes)) or not isinstance(
+            raw_disabled, (list, tuple)
+        ):
+            raise ModuleRegistryError(
+                "composition config record 'disabled' must be a list of family "
+                f"identifiers, got {type(raw_disabled).__name__}"
+            )
+        for entry in raw_disabled:
+            if not isinstance(entry, str) or not _FAMILY_ID_RE.match(entry):
+                raise ModuleRegistryError(
+                    f"composition config 'disabled' entry {entry!r} is not a valid "
+                    f"family identifier (lowercase letters, digits, hyphens); a "
+                    f"module path, filesystem path, or secret-shaped value is "
+                    f"rejected here."
+                )
+        return cls(disabled=frozenset(raw_disabled))
 
 
 class BuiltinCliModuleRegistry:
@@ -268,6 +431,8 @@ class BuiltinCliModuleRegistry:
 
 __all__ = (
     "CORE_OWNED_AUTHORITIES",
+    "COMPOSITION_RECORD_KEYS",
+    "COMPOSITION_RECORD_VERSION",
     "BuiltinCliModuleRegistry",
     "CliCompositionConfig",
     "CliFamily",
