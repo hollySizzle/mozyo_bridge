@@ -797,7 +797,9 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
     if reason == "marker_timeout":
         return (
             "Landing marker was not observed in the target pane before timeout; "
-            "input was cleared via C-u and Enter was not pressed."
+            "a C-u rollback was issued and Enter was not pressed. The sender "
+            "cannot verify from tmux capture that the receiver composer was "
+            "cleared."
         )
     if reason == "target_unavailable":
         return (

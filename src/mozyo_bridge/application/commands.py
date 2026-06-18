@@ -732,7 +732,7 @@ def cmd_message(args: argparse.Namespace) -> int:
             clear_read(target)
             _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
             die(
-                "message marker was not observed in target pane; input was cleared and Enter was not pressed. "
+                "message marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
                 f"target={target} marker={header}"
             )
         submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
@@ -3378,7 +3378,7 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     if not wait_for_text(target, marker, landing_lines, args.landing_timeout):
         rollback_unsubmitted_input(target)
         die(
-            "notification marker was not observed in target pane; input was cleared and Enter was not pressed. "
+            "notification marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
             f"target={target} marker={marker}"
         )
     submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.0) or 0.0))
@@ -4242,7 +4242,7 @@ def orchestrate_handoff(
         _emit_outcome(outcome, record_format=record_format, command=record_command)
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
-            "handoff marker was not observed in target pane; input was cleared and Enter was not pressed. "
+            "handoff marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
             f"target={target} marker={marker}"
         )
         raise AssertionError("unreachable")

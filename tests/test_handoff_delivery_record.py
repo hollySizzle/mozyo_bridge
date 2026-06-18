@@ -330,8 +330,13 @@ class DeliveryRecordTest(unittest.TestCase):
         record = build_delivery_record(outcome)
 
         self.assertIn("Delivery result — not delivered (marker_timeout)", record)
-        self.assertIn("input was cleared via C-u", record)
+        # #12188: the narrative claims only that a C-u rollback was issued, not
+        # that the receiver composer was verified cleared (a sender cannot
+        # confirm composer state from tmux capture).
+        self.assertIn("C-u rollback was issued", record)
         self.assertIn("Enter was not pressed", record)
+        self.assertIn("cannot verify", record)
+        self.assertNotIn("input was cleared via C-u", record)
         self.assertIn("Receiver-side contract", record)
         self.assertIn("manually if action is still required", record)
         self.assertIn("Next action owner: `sender`", record)
@@ -746,7 +751,10 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIsInstance(result, SystemExit)
         self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
         self.assertIn("Delivery result — not delivered (marker_timeout)", stdout)
-        self.assertIn("input was cleared via C-u", stdout)
+        # #12188: rollback issued, composer clearing not verified.
+        self.assertIn("C-u rollback was issued", stdout)
+        self.assertIn("cannot verify", stdout)
+        self.assertNotIn("input was cleared via C-u", stdout)
         self.assertIn("Next action owner: `sender`", stdout)
 
     def test_invalid_anchor_emits_record_preserving_source(self) -> None:

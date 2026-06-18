@@ -15,10 +15,12 @@ transcript an operator sees can never silently contradict the durable journal:
   fire before any typing, and the marker-timeout rollback presses no Enter.
 
 This module changes no behavior; it locks the existing contract. The deeper
-"C-u rollback may not clear a TUI composer" observation from #12193 j#61041 is
-a send-safety-contract concern carried to #12188, not reworded here (the
-``rolled_back`` narrative is aligned with the block-severity
-``tmux-send-safety-contract.md``).
+"C-u rollback may not clear a TUI composer" observation from #12193 j#61041 was
+carried to #12188, which reworded the marker_timeout diagnostics so they claim
+only that a ``C-u`` rollback was issued and Enter was not pressed — never that
+the receiver composer was verified cleared. This module pins that wording on
+the stderr ``die()`` line (the ``rolled_back`` narrative stays aligned with the
+block-severity ``tmux-send-safety-contract.md``).
 """
 
 from __future__ import annotations
@@ -196,6 +198,19 @@ class MarkerTimeoutDiagnosticsTest(_HandoffFailureHarness):
             any(call == ("send-keys", "-t", "%2", "Enter") for call in sent),
             msg=f"Enter pressed on marker_timeout: {sent!r}",
         )
+        # #12188: the die() error line claims only that a C-u rollback was
+        # issued and Enter was not pressed — never that the receiver composer
+        # was verified cleared (a sender cannot confirm composer state from
+        # tmux capture).
+        self.assertIn("a C-u rollback was issued and Enter was not pressed", stderr)
+        self.assertIn("receiver composer state was not verified", stderr)
+        self.assertNotIn("input was cleared and Enter was not pressed", stderr)
+
+        # The durable delivery record on stdout carries the same distinction.
+        self.assertIn("C-u rollback was issued", stdout)
+        self.assertIn("cannot verify", stdout)
+        self.assertNotIn("input was cleared via C-u", stdout)
+
         # stderr trailer surfaces the bounded --no-submit fallback budget.
         self.assertIn("hint: fallback path:", stderr)
         self.assertIn("mozyo-bridge read claude", stderr)
