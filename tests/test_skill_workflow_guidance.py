@@ -118,6 +118,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Coordinator Stop And Next-Action Standard",
         "## Owner Approval Aggregation",
         "## Stall And No-Progress Detection Standard",
+        "## Sublane Completion Guardrails",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -213,6 +214,23 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "Stale CLI is a distinct stall mode during a handoff or callback",
         "it records that fact on the issue",
         "Detection is not re-dispatch of completed work",
+        # Sublane completion guardrails (Redmine #12213). A handoff-worthy
+        # state is incomplete until its callback outcome journal lands, a
+        # dependency hold parks on the durable record instead of waiting on a
+        # go-ahead, the coordinator owns callback drain and downstream resume,
+        # and a commit hash is origin-reachability-checked before it is recorded
+        # in a gate — all carried in a fixed-field shape a checker can read.
+        "### A handoff-worthy state is not complete until its callback outcome journal lands",
+        "are not complete until their callback outcome journal is recorded",
+        "### A dependency hold parks on the durable record; it does not wait on a go-ahead",
+        "it does not stop on an operator / go-ahead question",
+        "### The coordinator owns callback drain and downstream resume",
+        "the coordinator owns callback drain",
+        "downstream resume",
+        "### Origin reachability preflight before recording a commit hash in a gate",
+        "verify the commit is reachable from `origin` and record the result as `origin_reachable`",
+        "### Fixed-field journal shape",
+        "`resume_condition`, `resume_owner`, `origin_reachable`",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
@@ -317,6 +335,61 @@ class SameLaneDispatchDurableDocTest(unittest.TestCase):
                         f"missing #12207 same-lane dispatch marker {marker!r}; "
                         "the submit-completion contract regressed or this anchor "
                         "list needs an intentional update in the same commit."
+                    ),
+                )
+
+
+class SublaneCompletionGuardrailsDocTest(unittest.TestCase):
+    """Pin the sublane completion guardrails in the durable operating-model doc
+    (Redmine #12213).
+
+    `vibes/docs/logics/cockpit-sublane-operating-model.md` is the durable
+    operating-model source of truth. It must carry the four #12213 guardrails —
+    a handoff-worthy state is incomplete until its callback outcome journal
+    lands, a dependency hold parks on the durable record instead of waiting on a
+    go-ahead, the coordinator owns callback drain / downstream resume, and a
+    commit hash is origin-reachability-checked before it is recorded in a gate —
+    in the fixed-field shape a future checker can read. A future edit that drops
+    the section fails here loudly rather than silently reopening the
+    #12189-#12191 / #12207 gaps.
+    """
+
+    DOC_PATH = (
+        "vibes",
+        "docs",
+        "logics",
+        "cockpit-sublane-operating-model.md",
+    )
+
+    REQUIRED_MARKERS: tuple[str, ...] = (
+        "## サブレーン完了条件と coordinator drain (#12213)",
+        # Guardrail 1: completion requires the callback outcome journal.
+        "handoff-worthy state は callback outcome journal まで未完了",
+        # Guardrail 2: dependency hold parks rather than waiting on a go-ahead.
+        "dependency hold は go-ahead 待ちにせず durable parked state を記録して",
+        # Guardrail 3: coordinator owns callback drain / downstream resume.
+        "coordinator は callback drain / downstream resume の責務を持つ",
+        # Guardrail 4: origin reachability preflight before recording a hash.
+        "commit hash を gate に記録する前に origin reachability preflight を必須化",
+        # The fixed-field shape stays explicit so a checker can read it.
+        "`resume_condition`, `resume_owner`, `origin_reachable`",
+        # The reproduction anchors stay cited.
+        "#12189 / #12190 / #12191 / #12207",
+    )
+
+    def test_operating_model_doc_carries_completion_guardrails(self) -> None:
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        for marker in self.REQUIRED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        "vibes/docs/logics/cockpit-sublane-operating-model.md is "
+                        f"missing #12213 sublane completion guardrail marker "
+                        f"{marker!r}; the completion-condition redefinition "
+                        "regressed or this anchor list needs an intentional "
+                        "update in the same commit."
                     ),
                 )
 
