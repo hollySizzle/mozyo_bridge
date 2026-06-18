@@ -132,6 +132,30 @@ class RepoLocalConfigError(ValueError):
     """
 
 
+def _reject_boundary_token(token: object, *, source: str, role: str) -> None:
+    """Fail closed on a repo-local config string that crosses an owned boundary.
+
+    ``token`` is something the YAML names — a top-level key, a provider-selection
+    category, or a selected provider id. A non-string token is left for the
+    downstream record to type-check; a string whose name contains a
+    :data:`_FORBIDDEN_KEY_PARTS` token (code loading, module / callable / entry
+    point, authority / approval / routing, target / pane / route / send, or a
+    credential) is rejected here with a boundary-specific message so the
+    rejection reads as deliberate in an audit.
+    """
+    if not isinstance(token, str):
+        return
+    lowered = token.lower()
+    for part in _FORBIDDEN_KEY_PARTS:
+        if part in lowered:
+            raise RepoLocalConfigError(
+                f"{source} {role} {token!r} may not carry a boundary token: this "
+                f"surface is config-only and may never load code, name a module / "
+                f"callable / entry point, grant authority, address a target / pane "
+                f"/ route, or carry a credential (matched forbidden token {part!r})."
+            )
+
+
 def _reject_boundary_and_unknown_keys(
     record: "Mapping[object, object]",
     *,
@@ -151,21 +175,52 @@ def _reject_boundary_and_unknown_keys(
             raise RepoLocalConfigError(
                 f"{source} record keys must be non-empty strings; got {key!r}"
             )
-        lowered = key.lower()
-        for part in _FORBIDDEN_KEY_PARTS:
-            if part in lowered:
-                raise RepoLocalConfigError(
-                    f"{source} record may not carry a {key!r} field: this surface "
-                    f"is config-only and may never load code, name a module / "
-                    f"callable / entry point, grant authority, address a target / "
-                    f"pane / route, or carry a credential (matched forbidden token "
-                    f"{part!r})."
-                )
+        _reject_boundary_token(key, source=source, role="record key")
         if key not in allowed:
             raise RepoLocalConfigError(
                 f"{source} record has unknown key {key!r}; allowed keys: "
                 f"{sorted(allowed)}"
             )
+
+
+def _reject_provider_selection_boundary_tokens(
+    providers_block: object, *, source: str
+) -> None:
+    """Fail closed on a boundary-shaped provider-selection category / id.
+
+    :class:`~mozyo_bridge.domain.provider_registry.ProviderSelectionConfig`
+    rejects only the *exact* core-owned authority names
+    (``workflow_authority`` / ``owner_approval`` / ``close_approval`` /
+    ``routing_authority``); the repo-local YAML schema boundary additionally
+    rejects module / callable / entry point / target / pane / route / send /
+    credential-shaped tokens appearing as a selection category key or a selected
+    provider id, matching the same closed rule applied to top-level keys. This
+    runs *before* delegation; structural validation (mapping vs pairs,
+    duplicates, types, version, category/provider existence) stays with
+    ``ProviderSelectionConfig`` and its registry.
+
+    A non-mapping ``providers`` block, or a ``selections`` value of an
+    unexpected shape, is left untouched so ``ProviderSelectionConfig.from_record``
+    raises the precise structural error.
+    """
+    if not isinstance(providers_block, Mapping):
+        return
+    selections = providers_block.get("selections")
+    if isinstance(selections, Mapping):
+        pairs = list(selections.items())
+    elif isinstance(selections, (list, tuple)):
+        pairs = [
+            (pair[0], pair[1])
+            for pair in selections
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        ]
+    else:
+        return
+    for category, provider_id in pairs:
+        _reject_boundary_token(category, source=source, role="selection category")
+        _reject_boundary_token(
+            provider_id, source=source, role="selection provider id"
+        )
 
 
 def _checked_version(record: "Mapping[object, object]", *, source: str) -> int:
@@ -295,7 +350,11 @@ class RepoLocalConfig:
         - any other unknown top-level key is rejected (closed schema);
         - ``version``, if present, must be the supported integer version;
         - ``cli`` / ``providers`` / ``presentation`` each delegate to their own
-          sub-record :meth:`from_record`, which fail closed on their own shapes.
+          sub-record :meth:`from_record`, which fail closed on their own shapes;
+          ``providers`` selection categories / ids are additionally screened for
+          module / callable / entry point / authority / routing / target / pane /
+          send / credential-shaped tokens here, since the provider record itself
+          rejects only the exact core-owned authority names.
 
         Whether a selected CLI family / provider actually exists is validated by
         the respective registry at resolution time (a later lane), not here; this
@@ -317,11 +376,17 @@ class RepoLocalConfig:
         # ProviderSelectionConfig.from_record requires a mapping (it has no
         # ``None`` default), so an absent ``providers`` block resolves to the
         # behavior-preserving default here rather than being forwarded as None.
-        providers = (
-            ProviderSelectionConfig.from_record(record["providers"])
-            if "providers" in record
-            else ProviderSelectionConfig.default()
-        )
+        # The schema boundary additionally screens selection category/id tokens
+        # for module / callable / target / credential shapes before delegating —
+        # the provider record itself only rejects the exact core-owned authority
+        # names, so this is where the repo-local YAML closed rule is enforced.
+        if "providers" in record:
+            _reject_provider_selection_boundary_tokens(
+                record["providers"], source="provider selection config"
+            )
+            providers = ProviderSelectionConfig.from_record(record["providers"])
+        else:
+            providers = ProviderSelectionConfig.default()
         presentation = PresentationSelectionConfig.from_record(
             record.get("presentation")
         )

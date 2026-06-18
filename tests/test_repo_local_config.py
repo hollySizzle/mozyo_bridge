@@ -178,15 +178,68 @@ class DelegatedSubRecordFailClosedTest(unittest.TestCase):
         with self.assertRaises(ProviderRegistryError):
             RepoLocalConfig.from_record({"providers": {"selectionz": {}}})
 
-    def test_providers_sub_record_authority_value_fails_closed(self) -> None:
+    def test_providers_sub_record_must_be_mapping(self) -> None:
         with self.assertRaises(ProviderRegistryError):
+            RepoLocalConfig.from_record({"providers": "redmine"})
+
+
+class ProviderSelectionBoundaryTokenTest(unittest.TestCase):
+    """The schema boundary screens provider-selection categories / ids for
+    module / callable / authority / target / credential shapes — the provider
+    record itself only rejects the exact core-owned authority names (j#60754).
+    """
+
+    def test_credential_shaped_category_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"providers": {"selections": {"api_key": "x"}}})
+
+    def test_credential_shaped_provider_id_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"providers": {"selections": {"ticket": "api_key"}}}
+            )
+
+    def test_target_shaped_category_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"providers": {"selections": {"target_pane": "x"}}}
+            )
+
+    def test_module_shaped_provider_id_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"providers": {"selections": {"ticket": "module_path"}}}
+            )
+
+    def test_authority_shaped_category_rejected_at_boundary(self) -> None:
+        # Caught by the boundary screen before the provider record's own exact
+        # authority check; both fail closed, the boundary error fires first.
+        with self.assertRaises(RepoLocalConfigError):
             RepoLocalConfig.from_record(
                 {"providers": {"selections": {"owner_approval": "x"}}}
             )
 
-    def test_providers_sub_record_must_be_mapping(self) -> None:
-        with self.assertRaises(ProviderRegistryError):
-            RepoLocalConfig.from_record({"providers": "redmine"})
+    def test_boundary_shaped_tokens_rejected(self) -> None:
+        for category, provider_id in (
+            ("ticket", "callable_lookup"),
+            ("ticket", "entry_point"),
+            ("ticket", "send_default"),
+            ("routing", "redmine"),
+            ("close", "redmine"),
+            ("plugin", "redmine"),
+            ("ticket", "credential"),
+        ):
+            with self.subTest(category=category, provider_id=provider_id):
+                with self.assertRaises(RepoLocalConfigError):
+                    RepoLocalConfig.from_record(
+                        {"providers": {"selections": {category: provider_id}}}
+                    )
+
+    def test_legitimate_selection_still_accepted(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"providers": {"selections": {"ticket": "redmine"}}}
+        )
+        self.assertEqual(config.providers.selections, (("ticket", "redmine"),))
 
 
 class PresentationSelectionTest(unittest.TestCase):
