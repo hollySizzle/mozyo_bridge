@@ -829,6 +829,29 @@ file_conventions:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: fc-cockpit-grouped-projection-source
+    name: cockpit grouped projection and display source
+    patterns:
+      - src/mozyo_bridge/domain/presentation_grouping.py
+      - src/mozyo_bridge/domain/grouped_read_model.py
+      - src/mozyo_bridge/domain/grouped_reload_view.py
+      - src/mozyo_bridge/domain/grouped_action.py
+      - src/mozyo_bridge/domain/grouped_display.py
+      - tests/test_presentation_grouping.py
+      - tests/test_grouped_read_model.py
+      - tests/test_grouped_reload_view.py
+      - tests/test_cockpit_grouped_action.py
+      - tests/test_grouped_display.py
+    severity: block
+    document_refs:
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-pane-centric-cockpit-semantics
+      - logic-managed-state-model
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-project-map
+
   - id: fc-handoff-notification-source
     name: handoff notification and tmux transport source
     patterns:

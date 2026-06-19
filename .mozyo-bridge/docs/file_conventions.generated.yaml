@@ -123,6 +123,26 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: cockpit grouped projection and display source
+  patterns:
+  - src/mozyo_bridge/domain/presentation_grouping.py
+  - src/mozyo_bridge/domain/grouped_read_model.py
+  - src/mozyo_bridge/domain/grouped_reload_view.py
+  - src/mozyo_bridge/domain/grouped_action.py
+  - src/mozyo_bridge/domain/grouped_display.py
+  - tests/test_presentation_grouping.py
+  - tests/test_grouped_read_model.py
+  - tests/test_grouped_reload_view.py
+  - tests/test_cockpit_grouped_action.py
+  - tests/test_grouped_display.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/unit-target-model.md と @vibes/docs/logics/unit-presentation-state-db.md と @vibes/docs/logics/pane-centric-cockpit-semantics.md
+    と @vibes/docs/logics/managed-state-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: handoff notification and tmux transport source
   patterns:
   - src/mozyo_bridge/domain/handoff.py
