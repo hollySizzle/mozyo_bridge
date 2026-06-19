@@ -116,6 +116,30 @@ runtime state の集約点である。workspace / project ごとに独立した 
 desired presentation config など、repo とともに portability / reviewability を持つべき小さな static
 artifact である。user runtime state や cross-workspace read model は home-scoped DB を原則にする。
 
+### repo-local artifact boundary (#12259)
+
+Repo-local `.mozyo-bridge/**` は、checkout と一緒に review / copy / scaffold される static artifact の
+置き場である。runtime DB や cross-workspace read model の default 置き場にしない。
+
+Repo-local に残す:
+
+- workspace anchor (`workspace-anchor.json`)。identity 復元の種であり、runtime listing や cache ではない。
+- scaffold metadata、rules、docs catalog、generated conventions の source / output。
+- portable project defaults と desired presentation config。private operator policy や live target state は入れない。
+- human-readable docs / runbook。実行時の liveness、activity、handoff delivery、review/close truth は入れない。
+
+Home-scoped DB に置く:
+
+- workspace registry と state schema metadata。
+- managed event / desired-state history。
+- inventory / target observation / activity timeline などの rebuildable projection。
+- cockpit grouping / unit desired current state など、operator が mutable に管理する presentation state。
+
+Docker / devcontainer / ephemeral home では、home scope 自体が消えることを前提にする。消えても repo-local
+anchor / scaffold / docs から workspace identity を再登録できるようにし、runtime projection は rebuildable
+cache として扱う。逆に、home が消えるからといって repo-local runtime DB を default にしない。必要な場合は
+explicit import / export / backup command を設計し、tracked repo artifact へ暗黙に runtime state を漏らさない。
+
 ## 現行 SQLite 棚卸し (#12257)
 
 2026-06-19 時点の runtime SQLite はすべて `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 配下に置かれる。
