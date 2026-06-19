@@ -347,6 +347,9 @@ documents:
       - logic-session-inventory
       - logic-workspace-registry
       - logic-otel-event-store
+      - logic-runtime-observability-boundary
+      - logic-unit-presentation-state-db
+      - rule-public-private-boundary
       - spec-project-map
 
   - id: logic-session-boundary
@@ -763,6 +766,8 @@ file_conventions:
       - logic-scaffold-rules
       - logic-release-helper-contract
       - logic-tmux-send-safety-contract
+      - logic-managed-state-model
+      - logic-runtime-observability-boundary
 
   - id: fc-workspace-registry-source
     name: workspace registry and identity resolution source
@@ -862,6 +867,8 @@ file_conventions:
       - logic-canonical-renderer
       - logic-bootstrap
       - rule-docs-catalog-governance
+      - logic-managed-state-model
+      - logic-runtime-observability-boundary
 
   - id: fc-docs-tools-source
     name: docs catalog tooling source
