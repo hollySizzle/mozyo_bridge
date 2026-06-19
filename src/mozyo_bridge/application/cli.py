@@ -44,6 +44,10 @@ from mozyo_bridge.domain.sublane_callback import (
     CALLBACK_CHOICES,
 )
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.application.presentation_runtime import (
+    PresentationRuntimeError,
+    resolve_presentation_provider,
+)
 from mozyo_bridge.application.provider_runtime import resolve_builtin_providers
 from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
@@ -350,7 +354,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         # provider dispatch path consumes the resolved mapping yet, so this is
         # the fail-closed validation seam and adds no dynamic import or ABI.
         resolve_builtin_providers(config.providers)
-    except (RepoLocalConfigError, ModuleRegistryError, ProviderRegistryError) as exc:
+        # Connect the repo-local presentation-surface selection to runtime
+        # resolution (Redmine #12251): resolve ``config.presentation`` to the
+        # built-in projection provider that owns the selected surface, so a
+        # present-but-unrealizable selection — a core-recognized surface with no
+        # built-in provider — fails closed here, exactly as the provider
+        # selection does above. The default surface (``tmux_user_option``)
+        # resolves to the tmux provider, so a missing/default config is
+        # behavior-preserving; no projection dispatch path consumes the resolved
+        # provider yet, so this is the fail-closed validation seam and adds no
+        # dynamic import, public ABI, or projection authority. Unknown / target /
+        # credential-shaped surfaces already fail at PresentationSelectionConfig
+        # construction (surfaced as RepoLocalConfigError).
+        resolve_presentation_provider(config.presentation)
+    except (
+        RepoLocalConfigError,
+        ModuleRegistryError,
+        ProviderRegistryError,
+        PresentationRuntimeError,
+    ) as exc:
         return _exit_on_repo_local_config_error(exc)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):

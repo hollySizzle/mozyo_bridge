@@ -782,12 +782,55 @@ closing the staged gap above. This is the first time
   connection introduces no dynamic import, no public extension ABI, and no
   delegation of `workflow_authority` / `owner_approval` / `close_approval` /
   `routing_authority` — the same boundary the provider registry already enforces.
-- **Still-staged.** `presentation` selection remains read-and-validated only;
-  its providers hardcode their surface and have no runtime resolution seam yet.
-  The `terminal_runtime` and `ticket` providers are resolvable through the same
+- **Still-staged.** `presentation` selection remains read-and-validated only at
+  #12249; its runtime resolution lands next in #12251 (below). The
+  `terminal_runtime` and `ticket` providers are resolvable through the same
   registry call but are still consumed at their existing call sites
   (`REDMINE_TICKET_PROVIDER`, direct `run_tmux`); routing those call sites
   through the resolved provider is a later stage, out of #12249 scope.
+
+### #12251 — presentation selection runtime resolution
+
+`main()` (in `src/mozyo_bridge/application/cli.py`) now also resolves the
+repo-local `presentation` selection to the built-in projection provider that
+owns the selected surface, closing the last staged gap above. The contract is
+the presentation analogue of the #12249 provider resolution:
+
+- **The resolution seam.** A thin application module,
+  `src/mozyo_bridge/application/presentation_runtime.py`, exposes
+  `resolve_presentation_provider(config)`, which maps the configured surface to
+  the built-in `PresentationProvider` that already projects onto it. The
+  surface -> provider table is built from the providers' own `surface`
+  attributes (`tmux_user_option` -> `tmux-presentation`, `text` ->
+  `text-presentation`), so the resolution and the providers can never drift
+  apart. `main()` calls it on `config.presentation` inside the same try-block
+  that composes the parser and resolves provider selection, from the same
+  `--repo`-honoring config source.
+- **Config-absent / default is unchanged.** The default surface
+  (`tmux_user_option`) resolves to the tmux presentation provider, so a repo
+  with no `.mozyo-bridge/config.yaml`, or one whose `presentation` block is
+  absent, projects byte-identically to before. A realizable non-default
+  selection (`text`) resolves to the existing text provider — not a new one. No
+  projection dispatch path consumes the resolved provider yet; the connection is
+  the fail-closed *resolution* seam, exactly like the provider resolution.
+- **Config-present fails closed on an unrealizable selection.** Schema
+  validation (`PresentationSelectionConfig`) already rejects any surface outside
+  the core-owned `PRESENTATION_SURFACES` vocabulary, plus target / pane / route /
+  send / approve / credential-shaped keys, so an unknown or authority-shaped
+  surface never reaches runtime resolution (it surfaces as
+  `RepoLocalConfigError`). Runtime resolution additionally fails closed on what
+  shape-only validation cannot see — a core-recognized surface with no built-in
+  provider — raising `PresentationRuntimeError`, which `main()` converts
+  (alongside the other repo-local config errors) into the same single actionable
+  stderr line and exit code `2`, never a raw traceback and never a silent
+  fall-through.
+- **No new machinery, projection-first.** The providers are imported built-in
+  singletons, never a module path / callable / entry point, so the connection
+  introduces no dynamic import, no public extension ABI, and no delegation of
+  workflow / owner approval / close / routing authority. A presentation selection
+  can only choose *how* core records are displayed, never *what* is true — the
+  read / projection-first boundary the presentation adapter has enforced since
+  #12156.
 
 ## Static Plugin Manifest Schema / Validator (Redmine #12250)
 
