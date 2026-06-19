@@ -170,6 +170,62 @@ class NoExecutionBoundaryTest(unittest.TestCase):
                 {"plugin_id": "p", "capabilities": [{"entry_point": "pkg:main"}]}
             )
 
+    def test_executable_capability_labels_are_rejected(self) -> None:
+        # Regression for #12250 review j#61753: a capability *label value* (not
+        # just a key) that names executable behavior must fail closed — these
+        # fields are exactly where declarative behavior labels live.
+        for label in (
+            "dynamic_import",
+            "entry_point_loader",
+            "shell_exec",
+            "run_install_command",
+            "post_install_hook",
+            "spawn_subprocess",
+            "eval_expression",
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(PluginManifestError):
+                    validate_plugin_manifest(
+                        {"plugin_id": "p", "capabilities": [label]}
+                    )
+
+    def test_executable_safety_constraint_labels_are_rejected(self) -> None:
+        for label in ("runs_install_hook", "loads_module", "dynamic_import_allowed"):
+            with self.subTest(label=label):
+                with self.assertRaises(PluginManifestError):
+                    validate_plugin_manifest(
+                        {"plugin_id": "p", "safety_constraints": [label]}
+                    )
+
+    def test_executable_permission_labels_are_rejected(self) -> None:
+        for label in ("dynamic_import", "load_module", "entry_point_loader"):
+            with self.subTest(label=label):
+                with self.assertRaises(PluginManifestError):
+                    validate_plugin_manifest(
+                        {"plugin_id": "p", "declared_permissions": [label]}
+                    )
+
+    def test_executable_label_rejected_via_direct_constructor(self) -> None:
+        # The fail-closed guard lives in __post_init__, so direct construction is
+        # screened identically to from_record (review j#61753 reproduction).
+        with self.assertRaises(PluginManifestError):
+            PluginManifest(plugin_id="p", capabilities={"dynamic_import"})
+
+    def test_descriptive_labels_remain_allowed(self) -> None:
+        # Ordinary non-executable descriptive labels are still accepted.
+        manifest = validate_plugin_manifest(
+            {
+                "plugin_id": "p",
+                "capabilities": ["normalize_issue", "project_attention"],
+                "safety_constraints": [
+                    "no_network_in_normalization",
+                    "projection_only",
+                ],
+            }
+        )
+        self.assertIn("normalize_issue", manifest.capabilities)
+        self.assertIn("projection_only", manifest.safety_constraints)
+
 
 class BoundaryValueTest(unittest.TestCase):
     """private path / secret-shaped value fail closed wherever they appear."""

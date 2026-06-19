@@ -103,14 +103,16 @@ PACKAGING_METADATA_FIELDS: frozenset[str] = frozenset(
     }
 )
 
-#: Substrings in a manifest *key* that signal an attempt to make the manifest do
-#: something — load / execute code, name a module / callable / entry point, run an
-#: install / build / shell command or a lifecycle hook, grant or alter authority /
-#: approval / routing / send, address a target / pane, or carry a credential. Such
-#: a key is rejected with a boundary-specific message. Keys are identifiers (not
-#: prose), so this list is aggressive on purpose; none of :data:`PLUGIN_MANIFEST_KEYS`
-#: contains any of these tokens.
-_FORBIDDEN_KEY_PARTS: tuple[str, ...] = (
+#: Substrings that signal **executable behavior** — dynamic import / entry point
+#: / callable / code loading, or a shell / install / build / run command or
+#: lifecycle hook. A static review manifest is declarative-only, so these are
+#: forbidden not just as keys but as *label values* too: ``capabilities`` and
+#: ``safety_constraints`` are exactly where a plugin would otherwise spell
+#: executable behavior as a string (e.g. ``"dynamic_import"`` / ``"shell_exec"``),
+#: and ``declared_permissions`` likewise. A label is expressed by the *absence* of
+#: such a capability, never by a behavior-token string, so fail closed on it
+#: regardless of polarity (the validator cannot reliably parse a ``no_`` negation).
+_EXECUTABLE_BEHAVIOR_PARTS: tuple[str, ...] = (
     # dynamic import / entry point / callable / code loading
     "import",
     "module",
@@ -122,6 +124,7 @@ _FORBIDDEN_KEY_PARTS: tuple[str, ...] = (
     "load",
     "dynamic",
     "sys_path",
+    "compile",
     # shell / install / run / lifecycle behavior
     "shell",
     "command",
@@ -132,13 +135,21 @@ _FORBIDDEN_KEY_PARTS: tuple[str, ...] = (
     "uninstall",
     "setup",
     "build",
-    "compile",
     "run",
     "launch",
     "start",
     "activate",
     "bootstrap",
     "hook",
+)
+
+#: Substrings in a manifest *key* that signal an attempt to make the manifest do
+#: something — execute code (:data:`_EXECUTABLE_BEHAVIOR_PARTS`), grant or alter
+#: authority / approval / routing / send, address a target / pane, or carry a
+#: credential. Such a key is rejected with a boundary-specific message. Keys are
+#: identifiers (not prose), so this list is aggressive on purpose; none of
+#: :data:`PLUGIN_MANIFEST_KEYS` contains any of these tokens.
+_FORBIDDEN_KEY_PARTS: tuple[str, ...] = _EXECUTABLE_BEHAVIOR_PARTS + (
     # authority / approval / routing / send (core-owned)
     "authority",
     "authorities",
@@ -262,6 +273,28 @@ def _reject_string_value(value: str, *, where: str) -> None:
             f"manifest may never carry a token / secret / password / api key / "
             f"credential value (fail-closed)."
         )
+
+
+def _reject_executable_label(label: str, *, field_name: str) -> None:
+    """Fail closed on a label value that declares executable behavior.
+
+    Applied to ``capabilities`` / ``safety_constraints`` / ``declared_permissions``
+    entries: a label naming dynamic import / entry point / callable / code loading
+    or a shell / install / build / run command or lifecycle hook
+    (:data:`_EXECUTABLE_BEHAVIOR_PARTS`) is rejected. These fields hold *declarative*
+    labels only; executable behavior is expressed by the absence of such a
+    capability, never by a behavior-token string (fail-closed regardless of a
+    ``no_`` prefix, which the validator does not interpret).
+    """
+    lowered = label.lower()
+    for part in _EXECUTABLE_BEHAVIOR_PARTS:
+        if part in lowered:
+            raise PluginManifestError(
+                f"{field_name} label {label!r} names executable behavior "
+                f"(matched forbidden token {part!r}); a static review manifest is "
+                f"declarative-only and may not declare dynamic import / entry point "
+                f"/ callable / shell / install-run behavior in a label."
+            )
 
 
 def _reject_boundary_key(key: str, *, where: str) -> None:
@@ -481,15 +514,18 @@ class PluginManifest:
         capabilities = _label_set(self.capabilities, field_name="capabilities")
         for cap in capabilities:
             _reject_string_value(cap, where="capability")
+            _reject_executable_label(cap, field_name="capabilities")
         permissions = _label_set(
             self.declared_permissions, field_name="declared_permissions"
         )
         for perm in permissions:
             _reject_string_value(perm, where="declared permission")
+            _reject_executable_label(perm, field_name="declared_permissions")
             _reject_authority_permission(perm)
         safety = _label_set(self.safety_constraints, field_name="safety_constraints")
         for constraint in safety:
             _reject_string_value(constraint, where="safety constraint")
+            _reject_executable_label(constraint, field_name="safety_constraints")
 
         object.__setattr__(self, "categories", categories)
         object.__setattr__(self, "capabilities", capabilities)

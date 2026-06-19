@@ -818,8 +818,14 @@ runtime loading exists. It is review metadata, not a plugin loader.
   like one (`import` / `module` / `entry_point` / `callable` / `exec` / `eval` /
   `script` / `shell` / `command` / `subprocess` / `spawn` / `install` /
   `uninstall` / `build` / `run` / `hook` …) is rejected at validation, at any
-  nesting depth, through `PluginManifestError`. This is the explicit non-goal of
-  the design doc made into a checked invariant.
+  nesting depth, through `PluginManifestError`. The same executable-behavior token
+  set is also rejected as a *label value* in `capabilities`,
+  `safety_constraints`, and `declared_permissions` — these fields are exactly
+  where a plugin would otherwise spell executable behavior as a string (e.g.
+  `"dynamic_import"` / `"shell_exec"` / `"entry_point_loader"`), so a behavior
+  label fails closed there too (fail-closed regardless of a `no_` prefix, which
+  the validator does not interpret). This is the explicit non-goal of the design
+  doc made into a checked invariant.
 - **No invented categories.** A claimed `category` must be a known core-owned
   `ProviderCategory` value; the category vocabulary stays core-owned exactly as
   for the provider registry.
