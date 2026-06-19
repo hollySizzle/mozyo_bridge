@@ -166,6 +166,106 @@ Split をそのまま継ぐ。
   - sidecar はより強い runtime / receiver-state signal を持てるが、workflow truth / task completion は持たない
 ```
 
+## Action-Time Live Preflight Boundary
+
+Redmine #12226 (parent #11825 Plugin / Adapter 境界設計, version #228 `v0.9.4 runtime
+observation reload / freshness`)。`## Runtime Observation Snapshot Contract` の snapshot 意味契約を
+**side-effecting command の実行境界** に落とす節。設計経緯は #12196 journal #61156 / #12223
+journal #61159。
+
+本節は **新しい runtime 挙動を導入しない**。既存実装は既に「side-effecting command は実行時に
+live runtime observation を行い、保存済み / 表示済み snapshot を行動許可にしない」を満たしている
+(下記 inventory はその事実の棚卸し)。本節はその不変条件を docs に固定し、後続の reload (#12224) /
+cockpit UI (#12225) / future sidecar (#12227) が snapshot を side-effect 許可に昇格させないための
+境界を pin する。runtime code の挙動変更は本節の非目標であり、実装が本節と乖離した場合は実装側を
+correction する。
+
+### Core rule
+
+- side-effecting command は **実行時 (action time) に live runtime observation** を行う。保存済み /
+  表示済み snapshot (inventory.sqlite / managed-events / tmux user option projection / cockpit
+  表示 / reload 出力) は「どこを見るか」を示すだけで、**行動許可ではない**。
+- stale / unreadable / contradictory snapshot は side effect を authorize しない。command は
+  **fail closed** するか、live preflight / reload を要求する。snapshot age から `healthy` /
+  `current` を導出しない (`### Freshness / fail-safe semantics` と同じ姿勢)。
+- snapshot freshness は side-effecting routing の要件を満たさない。snapshot が fresh でも、
+  action-time の live preflight を別途行う (snapshot contract で明記済みの境界をそのまま継ぐ)。
+- live observation が読めない / 矛盾する場合は `unknown` / `reload_required` を導出し、`healthy` を
+  仮定して side effect を進めない。
+
+### Side-effecting command inventory
+
+side-effecting surface の棚卸し (2026-06-19 時点)。各 surface は mutate (keystroke 送出 / pane
+kill / pane 移動 / window 作成 / user option 書込) の **前に** live tmux を再観測する。下表は
+観測時点の事実であり、実装変更時は本表と実装を同期する (`src/mozyo_bridge/application/commands.py`
+中心、`domain/pane_resolver.py` / `infrastructure/tmux_client.py` の primitive 経由)。
+
+```yaml
+keystroke / text entry:
+  surfaces: [read, type, keys, message]
+  action_time_live_observation:
+    - resolve_target -> pane_lines (live list-panes でターゲット pane を解決)
+    - require_read (直近 capture-pane 観測 = read marker 取得を keystroke の必要条件にする)
+    - message: wait_for_text(marker) で capture_pane を polling し landing を観測 (未観測時 C-u rollback)
+session / window create / rename:
+  surfaces: [mozyo (bare), init]
+  action_time_live_observation:
+    - session_exists / list_session_windows / find_agent_window (live tmux) で create/adopt を決める
+    - ensure_agent_target / wait_for_agent_terminal_pane で foreground process を live 確認
+    - init: pane_location / pane_lines / session_exists の guard をすべて mutation の前に通す
+cockpit layout actions:
+  surfaces: [layout apply cockpit, cockpit (create/append/adopt/reset/rebuild/peer-adopt/rebalance/reconcile)]
+  action_time_live_observation:
+    - _read_cockpit_columns / _read_cockpit_geometry / _cockpit_session_present (live list-panes / has-session)
+    - kill / join-pane / resize-pane / swap-pane の前に identity (managed marker) と geometry を live 確認
+    - --confirm を要する破壊的 action は live preflight 後にのみ plan を execute する
+handoff / notify:
+  surfaces: [handoff send, handoff reply, handoff cross-workspace-consult, notify-*]
+  action_time_live_observation:
+    - pane_info -> resolve_target (live) + project_preflight_target で canonical identity に写像
+    - tmux-send-safety-contract.md の Layer B deterministic preflight (window / session / active-split / foreground process)
+    - wait_for_text(marker) による landing 観測 (strict standard では未観測時 C-u rollback / marker_timeout)
+attention projection (write user option):
+  surfaces: [agents attention-project --apply]
+  action_time_live_observation:
+    - discover_agents -> pane_lines (live) で対象 pane を列挙してから set-option を best-effort 書込
+    - 書込先は projection cache (`@mozyo_attention_*`) であり workflow truth ではない
+```
+
+read-only diagnostic (例: `cockpit doctor-geometry`、`agents targets`、`doctor`、reload 出力) は
+side effect を持たないため本境界の対象外だが、その出力 snapshot を別 command の side-effect 許可
+として転用しない (snapshot は pointer)。
+
+### Source boundary consistency (既存 contract を弱化しない)
+
+本節は既存の send-safety / target preflight を **強化も弱化もしない**。それらを action-time live
+preflight の構成要素として再宣言するだけである。
+
+- **send-safety**: handoff / message / notify-* の Enter 発行条件は
+  `vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` /
+  `## Queue-Enter Default Rail` が正本。queue-enter の Layer B deterministic preflight 強度、strict
+  standard fallback の marker 観測必須、blind Enter 禁止条件は本節で一切弱めない。default rail 化を
+  根拠に preflight を緩めない。
+- **target preflight**: pane existence / session / active-split / foreground process / cwd は
+  `vibes/docs/logics/managed-state-model.md` の通り **live tmux 正本**。snapshot / projection から
+  代替しない。これは #11666 の stale 誤判定を安全事故にしないための不変条件と同型。
+- **desired managed state**: managed-events は「mozyo が X した / X しようとした」の事実であって
+  current liveness ではない (`managed-state-model.md`)。side-effecting command の target liveness 判定に
+  managed-events を liveness 正本として使わない。
+- **durable workflow truth**: review / close / owner approval / routing decision は Redmine durable
+  record の所管 (`## Responsibility Split`)。side-effecting command の preflight が live runtime を
+  満たしても、それは workflow gate を満たさない (両者は別境界)。
+
+### Non-goals
+
+本節は次を許可しない (issue #12226 非目標と一致)。
+
+- queue-enter safety の弱体化、または preflight signal の削減。
+- inactive pane を default rail で side effect 対象に許可すること。
+- snapshot を workflow truth / side-effect 許可に昇格させること。
+- continuous polling / push / sidecar を action 前提にすること (explicit reload + action-time live
+  preflight を v1 の前提とする。push / sidecar formalization は #12227 future scope)。
+
 ## Decision
 
 v0.8 では OTel を **formal source of truth** にしない。OTel は experimental /
