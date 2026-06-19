@@ -365,6 +365,25 @@ private policy で黙って補正しない。
 > 結線では #12263 から引き継いだ `presentation:` namespace (surface selection vs grouping)
 > の確定が必要。
 
+> 実装メモ (#12266): 本 Project Group read model に対する **reload / freshness UX**
+> projection は `src/mozyo_bridge/domain/grouped_reload_view.py` に実装済み
+> (`build_grouped_reload_view`)。flat pane cockpit の #12225 (observation line +
+> Reload button) の grouped-view 対応で、`GroupedReadModel` から display-only の
+> `GroupedReloadView` を導出する: whole-projection の `observed_at` / `freshness` /
+> `display_state` と、read model が payload に出さない `reload_required` を view /
+> group / Unit の各層で明示し、manual reload の affordance semantics
+> (`ReloadAffordance`: 常時 available・auto 不発・display-only) を data として持つ。
+> freshness 事実は read model から読むだけで新たな authority を作らず、
+> stale/unreadable/contradicted/unobserved は `reload_required` に倒して `healthy` /
+> current を導出しない (`runtime-observability-boundary.md` の fail-safe semantics と
+> `### Contract handoff to follow-up issues` `#12225` 準拠)。v1 = explicit reload +
+> action-time live preflight を維持し、polling / push / sidecar / background observer
+> を増やさない (`## Future Push / Sidecar Observer Scope Split`)。reload は表示中
+> snapshot を refresh するだけで workflow gate を動かさず side effect を authorize せず、
+> grouped action は #12265 の action-time live preflight が決める。#12264 と同じく
+> object-to-object slice で、served endpoint / HTML page (grouped page は未存在) は
+> 結線しない。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord
