@@ -224,8 +224,8 @@ Runtime / registry から導出する値:
 
 #### conceptual schema
 
-Exact parser / migration implementation is a follow-up (#12262), but the design
-shape is:
+Parser / migration implementation remains a later code task, but #12262 fixes
+the schema field contract that implementation must preserve:
 
 ```yaml
 presentation:
@@ -251,6 +251,67 @@ presentation:
 
 This shape is declarative metadata. It is not a plugin manifest, not an install
 surface, and not a dynamic predicate language.
+
+#### schema field contract (#12262)
+
+`presentation.version`
+: Integer schema version. Missing means `1` only if the implementation is still
+  pre-version; once writer support exists, writers must emit it. Unsupported
+  newer version is fail-closed for config application.
+
+`presentation.project_groups[]`
+: Declares known Project Groups. Allowed fields:
+  `group_id` (required, stable portable key), `label` (required public-safe
+  display label), `sort_key` (optional integer / string for display order),
+  `collapsed` (optional bool default), `description` (optional public-safe text).
+  It must not include target, pane, route, owner, review, close, credential, path,
+  color theme, or private layout policy.
+
+`presentation.grouping.membership_rules[]`
+: Declarative display grouping rules. Allowed `when` predicates are public-safe
+  facts that can be derived from registry / repo-local metadata without reading
+  live pane identity: `workspace_id`, `repo_label`, `project_id`,
+  `fixed_version_id`, `lane_id`, and `lane_prefix`. A rule result may set
+  `group_id`, `position`, `pinned`, `hidden`, and `preferred_projection`. A rule
+  must not name Python modules, callables, shell commands, dynamic predicates,
+  target panes, or send routes.
+
+`presentation.grouping.unit_overrides[]`
+: Explicit desired display override for a known Unit. The selector is limited to
+  `workspace_id` + `lane_id` (+ optional `host_id` for future host-aware
+  projection). Allowed desired fields are `preferred_group`, `position`, `pinned`,
+  `hidden`, `preferred_projection`, and `label_override` (public-safe only).
+  `role_set` / `target` / `pane_id` / `session` / `window` are not configurable;
+  they are runtime / registry facts.
+
+`presentation.grouping.defaults`
+: Display fallback only. Allowed fields are `missing_group`, `unknown_unit_group`,
+  `collapsed`, `preferred_projection`, and `degraded_display`. Defaults must not
+  invent workspace identity, lane identity, routing target, or workflow state.
+
+Field ownership:
+
+| field family | owner | notes |
+| --- | --- | --- |
+| group ids / labels / sort preferences | repo-local desired config | public-safe display only |
+| workspace_id / repo_label / canonical session | registry / workspace anchor | config may reference, not define |
+| lane_id / role set / pane availability | runtime observation / managed lane state | config may prefer display, not assert liveness |
+| pane_id / tmux session / window / cwd / branch | TargetRecord / live tmux / inventory projection | never config truth |
+| review / owner approval / close / completion | Redmine governed workflow | never config truth |
+
+#### fallback matrix (#12262)
+
+| condition | result |
+| --- | --- |
+| config missing | use implementation default grouping (`default` / repo label) and preserve routing behavior |
+| `project_groups` empty | show ungrouped/default group; do not fail target discovery |
+| unknown top-level field or unsupported version | ignore config and surface invalid config diagnostic |
+| duplicate group id | invalid config |
+| membership rule references unknown group | invalid config, unless implementation has explicit `unknown_group` degraded display |
+| unit override references unknown workspace/lane | degraded display `desired_unit_missing` |
+| live TargetRecord conflicts with override selector | degraded display `identity_conflict`; action preflight still decides |
+| group has no live targets | display empty/stale group; do not fabricate targets |
+| config wants hidden Unit with active target | display hidden preference and live availability separately; do not kill / detach / reroute |
 
 #### validation / degraded display
 
