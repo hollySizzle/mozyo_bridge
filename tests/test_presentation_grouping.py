@@ -465,6 +465,99 @@ class NoRoutingAuthorityLeakageTest(unittest.TestCase):
                 {"grouping": {"defaults": {"api_token": "x"}}}
             )
 
+    # --- boundary-shaped VALUES, not just keys (review of #12263) ---
+
+    def test_target_shaped_group_id_value_rejected(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {"project_groups": [{"group_id": "target:%3", "label": "X"}]}
+            )
+
+    def test_credential_shaped_group_id_value_rejected(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {"project_groups": [{"group_id": "secret:token", "label": "X"}]}
+            )
+
+    def test_route_shaped_membership_rule_group_id_value_rejected(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {
+                    "project_groups": [{"group_id": "project:x", "label": "X"}],
+                    "grouping": {
+                        "membership_rules": [
+                            {"when": {"repo_label": "x"}, "group_id": "route:codex"}
+                        ]
+                    },
+                }
+            )
+
+    def test_target_shaped_preferred_group_value_rejected(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {
+                    "project_groups": [{"group_id": "project:x", "label": "X"}],
+                    "grouping": {
+                        "unit_overrides": [
+                            {
+                                "workspace_id": "w",
+                                "lane_id": "default",
+                                "preferred_group": "pane:%2",
+                            }
+                        ]
+                    },
+                }
+            )
+
+    def test_boundary_shaped_default_group_value_rejected(self) -> None:
+        for field_name, value in (
+            ("missing_group", "credential:x"),
+            ("unknown_unit_group", "send:codex"),
+        ):
+            with self.subTest(field=field_name):
+                with self.assertRaises(PresentationGroupingConfigError):
+                    PresentationGroupingConfig.from_record(
+                        {"grouping": {"defaults": {field_name: value}}}
+                    )
+
+    def test_boundary_shaped_degraded_display_value_rejected(self) -> None:
+        # degraded_display is operator-facing diagnostic text -> token-guarded.
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {"grouping": {"defaults": {"degraded_display": "owner approval needed"}}}
+            )
+
+    def test_free_display_label_with_common_word_is_allowed(self) -> None:
+        # Documented carve-out: label / description / label_override are public-safe
+        # free prose and are NOT token-scanned, so a legitimate "Code Review" label
+        # is preserved rather than rejected as boundary-shaped.
+        config = PresentationGroupingConfig.from_record(
+            {
+                "project_groups": [
+                    {
+                        "group_id": "project:x",
+                        "label": "Code Review",
+                        "description": "Closed and owner-pending items",
+                    }
+                ],
+                "grouping": {
+                    "unit_overrides": [
+                        {
+                            "workspace_id": "w",
+                            "lane_id": "default",
+                            "preferred_group": "project:x",
+                            "label_override": "Review queue",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertEqual(config.project_groups[0].label, "Code Review")
+        self.assertEqual(
+            config.project_groups[0].description, "Closed and owner-pending items"
+        )
+        self.assertEqual(config.unit_overrides[0].label_override, "Review queue")
+
 
 if __name__ == "__main__":
     unittest.main()

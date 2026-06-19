@@ -334,6 +334,14 @@ drift:
 - `target`, `pane`, `route`, `send`, `approval`, `review`, `close`, `owner`,
   `credential`, `secret`, `token`, `command`, `script`, `module`, `callable`,
   `import`, or similar boundary-shaped key/value: invalid config.
+  - 値側の token scan 対象 (#12263 実装): identity / pointer key と diagnostic
+    text、すなわち `group_id`、group 参照 (`preferred_group` / `missing_group` /
+    `unknown_unit_group`)、`degraded_display`。これらは stable join key または
+    operator 向け status channel に流れるため、上記 boundary token を値に持てない。
+  - token scan しない public-safe free display prose: `label` / `description` /
+    `label_override`。これらは author が public-safe と保証する表示用 prose であり、
+    "Code Review" / "Closed projects" のような正当な語を含み得るため値側 token scan
+    の対象外とする (key としては closed schema で依然 reject される)。
 - duplicate `group_id`: invalid config.
 - unknown `group_id` referenced by a rule/override: invalid config unless the
   implementation explicitly supports `unknown_group` degraded display.

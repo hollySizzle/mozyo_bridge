@@ -33,9 +33,13 @@ Boundary, kept enforced in code:
   grouping config never changes how a sublane is placed.
 - **Closed schema, fail-closed on authority leaks.** Unknown keys, an unsupported
   version, a duplicate / dangling group reference, an unknown projection, or a
-  key shaped like a target / pane / route / send / approval / credential / module
-  is rejected through :class:`PresentationGroupingConfigError` (a
-  :class:`ValueError`) — never a silent normalization.
+  *key* — or an identity / diagnostic *value* (``group_id`` / the group
+  references / ``degraded_display``) — shaped like a target / pane / route / send
+  / approval / credential / module is rejected through
+  :class:`PresentationGroupingConfigError` (a :class:`ValueError`) — never a
+  silent normalization. Free public display prose (``label`` / ``description`` /
+  ``label_override``) is author-asserted public-safe and not token-scanned, so a
+  legitimate label such as "Code Review" is preserved.
 - **Degraded display, not silent reroute, for runtime drift.** An override that
   names a Unit that is not live, or a live identity that contradicts the launch
   context, resolves to a *visible* degraded placement status
@@ -215,6 +219,51 @@ def _reject_unknown_keys(
         )
 
 
+def _reject_boundary_value(value: object, *, source: str, field_name: str) -> None:
+    """Fail closed on a boundary-shaped string *value* in an identity / diagnostic field.
+
+    ``unit-presentation-state-db.md`` validation marks a boundary-shaped
+    *key/value* — not only a key — invalid config. The portable group keys
+    (``group_id`` / ``preferred_group`` / ``missing_group`` /
+    ``unknown_unit_group``) are stable join / pointer keys, and
+    ``degraded_display`` is operator-facing diagnostic text; like a key, none of
+    them may name a ``target`` / ``pane`` / ``route`` / ``send`` / ``approval`` /
+    ``credential`` / ``module`` boundary (the same :data:`_FORBIDDEN_KEY_PARTS`
+    vocabulary). A non-string value is ignored (the field's own type check
+    handles it). Free public display text — ``label`` / ``description`` /
+    ``label_override`` — is deliberately *not* scanned here: it is inert prose,
+    not an identity or diagnostic key, and legitimately contains words such as
+    "review" or "closed".
+    """
+    if not isinstance(value, str):
+        return
+    lowered = value.lower()
+    for part in _FORBIDDEN_KEY_PARTS:
+        if part in lowered:
+            raise PresentationGroupingConfigError(
+                f"{source} '{field_name}' value {value!r} may not carry a boundary "
+                f"token: a grouping key / diagnostic is display-only and may never "
+                f"name a target / pane / route, grant authority, or carry a "
+                f"credential (matched forbidden token {part!r})."
+            )
+
+
+def _optional_guarded_str(
+    value: object, *, source: str, field_name: str
+) -> Optional[str]:
+    """An optional non-empty string that is also boundary-token guarded.
+
+    For identity / pointer keys (``group_id`` and the group references) and
+    operator-facing diagnostic text (``degraded_display``): the value must be a
+    public-safe display string carrying no boundary token. Free naming prose
+    (``label`` / ``description`` / ``label_override``) uses the plain
+    :func:`_optional_str` instead — see :func:`_reject_boundary_value`.
+    """
+    text = _optional_str(value, source=source, field_name=field_name)
+    _reject_boundary_value(text, source=source, field_name=field_name)
+    return text
+
+
 def _require_mapping(value: object, *, source: str) -> "Mapping[object, object]":
     if not isinstance(value, Mapping):
         raise PresentationGroupingConfigError(
@@ -315,6 +364,12 @@ class ProjectGroup:
         group_id = _required_str(
             mapping.get("group_id"), source=source, field_name="group_id"
         )
+        # group_id is a stable portable join / pointer key, so a target / pane /
+        # route / credential-shaped value is a boundary leak (a key that may not
+        # carry a boundary token, per unit-presentation-state-db.md validation).
+        # ``label`` / ``description`` are free public display prose and are not
+        # token-scanned (see _reject_boundary_value).
+        _reject_boundary_value(group_id, source=source, field_name="group_id")
         label = _required_str(mapping.get("label"), source=source, field_name="label")
         sort_key = mapping.get("sort_key")
         if sort_key is not None and (
@@ -369,7 +424,7 @@ class MembershipRule:
             )
         return cls(
             when=tuple(predicates),
-            group_id=_optional_str(
+            group_id=_optional_guarded_str(
                 mapping.get("group_id"), source=source, field_name="group_id"
             ),
             position=_optional_int(
@@ -435,7 +490,7 @@ class UnitOverride:
             host_id=_optional_str(
                 mapping.get("host_id"), source=source, field_name="host_id"
             ),
-            preferred_group=_optional_str(
+            preferred_group=_optional_guarded_str(
                 mapping.get("preferred_group"),
                 source=source,
                 field_name="preferred_group",
@@ -491,10 +546,10 @@ class GroupingDefaults:
         mapping = _require_mapping(record, source=source)
         _reject_unknown_keys(mapping, allowed=GROUPING_DEFAULTS_KEYS, source=source)
         return cls(
-            missing_group=_optional_str(
+            missing_group=_optional_guarded_str(
                 mapping.get("missing_group"), source=source, field_name="missing_group"
             ),
-            unknown_unit_group=_optional_str(
+            unknown_unit_group=_optional_guarded_str(
                 mapping.get("unknown_unit_group"),
                 source=source,
                 field_name="unknown_unit_group",
@@ -507,7 +562,10 @@ class GroupingDefaults:
                 source=source,
                 field_name="preferred_projection",
             ),
-            degraded_display=_optional_str(
+            # degraded_display is operator-facing diagnostic text surfaced in the
+            # read-model status channel, so it is boundary-token guarded too (per
+            # the review of #12263).
+            degraded_display=_optional_guarded_str(
                 mapping.get("degraded_display"),
                 source=source,
                 field_name="degraded_display",
