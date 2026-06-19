@@ -1157,6 +1157,14 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
 
 STATE_STORE_SINGLE_DB_FILENAME = "state.sqlite"
 
+# Container `PRAGMA user_version` layout this build understands. managed-state-model.md
+# `### schema version / migration` makes the container version identify the layout and
+# the presence of `state_schema_components`. The concrete number is provisional — the
+# future single-DB writer is a later slice — but read-only doctor must fail closed on
+# any version it does not understand: a newer container is reported unsupported and
+# left untouched (downgrade-safe), never `ok` (Redmine #12273 j#61689 Finding 1).
+STATE_STORE_SINGLE_DB_CONTAINER_VERSION = 1
+
 # recovery-policy vocabulary (managed-state-model.md `### recovery policy vocabulary`)
 _RECOVERY_AUTHORITATIVE = "authoritative"
 _RECOVERY_APPEND_ONLY = "append_only_lossy"
@@ -1253,32 +1261,39 @@ def _probe_sqlite_ro(path: Path) -> dict[str, Any]:
     return info
 
 
-def _read_state_schema_components(path: Path) -> list[dict[str, Any]]:
-    """Read ``state_schema_components`` rows read-only (best-effort, never raises)."""
-    out: list[dict[str, Any]] = []
+def _read_state_schema_components(path: Path) -> list[dict[str, Any]] | None:
+    """Read ``state_schema_components`` rows read-only; never raises.
+
+    Returns the parsed rows on success — possibly an empty list, which is a
+    legitimate state (a metadata table with no component rows yet is an empty /
+    partial migration). Returns ``None`` when the table cannot be read at all
+    (malformed schema / unreadable), so the caller can distinguish a malformed
+    metadata schema from a genuine partial migration. The review (#12273
+    j#61689 Finding 1) flagged that both used to collapse to ``[]`` and were
+    reported identically as a migratable partial state.
+    """
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     except sqlite3.DatabaseError:
-        return out
+        return None
     try:
         rows = conn.execute(
             "SELECT component, schema_version, recovery_policy, migrated_from "
             "FROM state_schema_components ORDER BY component"
         ).fetchall()
-        for component, schema_version, recovery_policy, migrated_from in rows:
-            out.append(
-                {
-                    "component": component,
-                    "schema_version": schema_version,
-                    "recovery_policy": recovery_policy,
-                    "migrated_from": migrated_from,
-                }
-            )
     except sqlite3.DatabaseError:
-        return []
+        return None
     finally:
         conn.close()
-    return out
+    return [
+        {
+            "component": component,
+            "schema_version": schema_version,
+            "recovery_policy": recovery_policy,
+            "migrated_from": migrated_from,
+        }
+        for component, schema_version, recovery_policy, migrated_from in rows
+    ]
 
 
 def _inspect_legacy_component(spec: dict[str, Any], home: Path) -> dict[str, Any]:
@@ -1428,9 +1443,28 @@ def _inspect_single_db(home: Path) -> dict[str, Any]:
         entry["notes"].append("PRAGMA integrity_check did not return ok (corrupt)")
         return entry
 
+    # Validate the container layout version BEFORE trusting component metadata.
+    # An unsupported container (typically a newer one this build does not
+    # understand) must be reported unsupported and left untouched — never `ok`
+    # even when component rows look complete (#12273 j#61689 Finding 1).
+    container_version = probe["user_version"]
+    if container_version != STATE_STORE_SINGLE_DB_CONTAINER_VERSION:
+        newer = (
+            isinstance(container_version, int)
+            and container_version > STATE_STORE_SINGLE_DB_CONTAINER_VERSION
+        )
+        entry["status"] = "invalid"
+        entry["next_action"] = "leave_untouched"
+        entry["notes"].append(
+            f"unsupported container schema version {container_version} (this build "
+            f"understands {STATE_STORE_SINGLE_DB_CONTAINER_VERSION}); "
+            + ("newer DB left untouched (downgrade-safe)" if newer else "left untouched")
+        )
+        return entry
+
     if "state_schema_components" not in probe["tables"]:
-        # A container `user_version` without the component metadata table is an
-        # unknown / unsupported layout. Read-only doctor leaves it untouched.
+        # A supported container `user_version` without the component metadata
+        # table is an unknown / unsupported layout. Leave it untouched.
         entry["status"] = "invalid"
         entry["next_action"] = "leave_untouched"
         entry["notes"].append(
@@ -1440,6 +1474,20 @@ def _inspect_single_db(home: Path) -> dict[str, Any]:
         return entry
 
     components = _read_state_schema_components(path)
+    if components is None:
+        # The metadata table exists but its schema is malformed / unreadable.
+        # This is NOT a partial migration: report it invalid and leave it
+        # untouched rather than suggesting a dry-run migrate (#12273 j#61689
+        # Finding 1) — a malformed schema is not a migratable subset.
+        entry["status"] = "invalid"
+        entry["readability"] = "partial"
+        entry["next_action"] = "leave_untouched"
+        entry["notes"].append(
+            "state_schema_components present but unreadable / malformed schema; "
+            "left untouched (not treated as partial migration)"
+        )
+        return entry
+
     entry["components"] = components
     present = {c["component"] for c in components}
     missing = sorted(_SINGLE_DB_EXPECTED_COMPONENTS - present)

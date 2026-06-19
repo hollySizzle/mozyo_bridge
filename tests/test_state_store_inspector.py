@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 from mozyo_bridge.application.doctor import (
+    STATE_STORE_SINGLE_DB_CONTAINER_VERSION,
     STATE_STORE_SINGLE_DB_FILENAME,
     collect_state_store,
     doctor_state_store_section,
@@ -149,11 +150,13 @@ class StateStoreInspectorTest(unittest.TestCase):
         self.assertEqual(by["registry"]["status"], "invalid")
 
     # --- future single DB ---------------------------------------------------
-    def _make_single_db(self, components: list[str]) -> Path:
+    def _make_single_db(
+        self, components: list[str], *, user_version: int = STATE_STORE_SINGLE_DB_CONTAINER_VERSION
+    ) -> Path:
         self.home.mkdir(parents=True, exist_ok=True)
         path = self.home / STATE_STORE_SINGLE_DB_FILENAME
         conn = sqlite3.connect(path)
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute(f"PRAGMA user_version = {user_version}")
         conn.execute(
             "CREATE TABLE state_schema_components ("
             "component TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, "
@@ -188,6 +191,43 @@ class StateStoreInspectorTest(unittest.TestCase):
         sdb = _by_component(result)["single_db"]
         self.assertEqual(sdb["status"], "ok")
         self.assertEqual(sdb["next_action"], "inspect")
+
+    def test_single_db_newer_container_schema_is_invalid_not_ok(self) -> None:
+        # Even with a complete component set, an unsupported (newer) container
+        # version must be reported invalid + left untouched, never ok
+        # (#12273 j#61689 Finding 1a).
+        self._make_single_db(list(LEGACY_COMPONENTS), user_version=999)
+        sdb = _by_component(collect_state_store(home=self.home))["single_db"]
+        self.assertEqual(sdb["schema_version"], 999)
+        self.assertEqual(sdb["status"], "invalid")
+        self.assertEqual(sdb["next_action"], "leave_untouched")
+
+    def test_single_db_malformed_metadata_table_is_invalid_not_partial(self) -> None:
+        # A state_schema_components table whose schema is malformed (the SELECT
+        # fails) must be invalid + left untouched, not warning/migrate_dry_run
+        # (#12273 j#61689 Finding 1b) — it is not a migratable partial subset.
+        self.home.mkdir(parents=True, exist_ok=True)
+        path = self.home / STATE_STORE_SINGLE_DB_FILENAME
+        conn = sqlite3.connect(path)
+        conn.execute(
+            f"PRAGMA user_version = {STATE_STORE_SINGLE_DB_CONTAINER_VERSION}"
+        )
+        conn.execute("CREATE TABLE state_schema_components (component TEXT PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        sdb = _by_component(collect_state_store(home=self.home))["single_db"]
+        self.assertEqual(sdb["status"], "invalid")
+        self.assertEqual(sdb["next_action"], "leave_untouched")
+        self.assertEqual(sdb["components"], [])
+
+    def test_single_db_empty_metadata_table_is_partial_not_invalid(self) -> None:
+        # An empty but well-formed metadata table is a legitimate (empty)
+        # partial migration — distinct from the malformed case above.
+        self._make_single_db([])
+        sdb = _by_component(collect_state_store(home=self.home))["single_db"]
+        self.assertEqual(sdb["status"], "warning")
+        self.assertEqual(sdb["next_action"], "migrate_dry_run")
+        self.assertEqual(sdb["components"], [])
 
     def test_single_db_without_metadata_table_is_invalid(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
