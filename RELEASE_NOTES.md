@@ -4,6 +4,27 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.9.0 - 2026-06-19
+
+`0.9.0a1` の TestPyPI beta ラインから **production `0.9.0`** へ進めるための release notes です。`0.9.0a1` で配布した v0.9 baseline を production PyPI へ promotion する前段として、release preflight を blocker にしていた 2 件(#12235)を解消し、version mirror を `0.9.0` に確定(#12236)しています。`src/**` / `tests/**` の挙動本体は変更しておらず、既存 CLI の JSON / text 出力互換も壊していません。**tag / GitHub Release / production PyPI publish は本メモでは行わず**、親 #12192 の明示承認と別 gate のもとで beta acceptance 後に判断します。
+
+### release blocker 解消(#12235)
+
+production release gate(#12192)を止めていた 2 つの blocker を、version bump とは分離した standalone commit(`ba8442d`)で解消しました。
+
+- **scaffold worktree-runbook の drift / source cleanup**: governed preset が byte mirror として同梱する `vibes/docs/logics/worktree-lifecycle-boundary.md` の packaged copy が、authored source(#12215 で更新済み)と乖離して旧 logic doc リンクを指したままだったため再同期しました。あわせて、#12215 で authored source を `coordinator-sublane-development-flow.md` へ統合・物理削除済みだった `sublane-worktree-operating-runbook.md` の **stale な packaged mirror copy を退役**し、opt-in 配布(`--with-worktree-runbook`)の手動 catalog 登録 note と drift sync-check test の対象集合からも外しました。scaffold byte-sync / drift 契約に沿った source-of-truth 一貫の cleanup です(Codex review 承認、Option A: retire-from-scaffold)。
+- **home-path 形状 fixture の neutralize**: durable record の絶対パス秘匿(public-private boundary)を検証する test fixture が release tree scanner に引っかかる home-path 形状の literal を使っていたため、test 意図(絶対パス断片が durable row に出ないこと)を保ったまま **中立な合成絶対パス**へ置き換えました。
+- **artifact hygiene**: build 可能環境で `release check artifact` を実行し clean を確認、GitHub Actions の Test workflow も全 Python target(3.10 / 3.11 / 3.12 / 3.13)で wheel build 成功を確認しています。production publish 前には引き続き build 可能環境で artifact hygiene を実行する前提です。
+
+### production version mirror を `0.9.0` に確定(#12236)
+
+release helper `release bump --to 0.9.0` で version mirror のみ(`pyproject.toml` `[project].version` と `src/mozyo_bridge/__init__.py` `__version__`)を `0.9.0a1` → `0.9.0` に更新し、実装本体と分離した standalone commit(`21f6a13`)としています。`release bump --check` と version helper test(`tests.test_release_helpers`)は green です。
+
+### リリース状況メモ
+
+- **配布実績**: `0.9.0a1` の TestPyPI beta ラインまで。production `0.9.0` の tag / GitHub Release / PyPI publish は **未実施**。
+- **production PyPI**: `skills/mozyo-bridge-agent/references/release.md` の Distribution Gates / Trusted Publishing に従い、beta acceptance 後の別 gate と owner 明示承認(親 #12192)のもとで実施します。本メモでは production publish を行いません。
+
 ## v0.8.1 - 2026-06-18
 
 `0.8.0` からの **patch release** で、v0.8 modular core baseline を **TestPyPI へ beta 配布**したライン(#12175)と、その実装結果に合わせた **release guardrail docs alignment**(#12176)をまとめています。配布対象は TestPyPI beta までで、**production PyPI publish は本メモでは行わず、別 gate と owner 承認のもとで beta acceptance 後に判断します**。release scanner / version mirror 以外の `src/**` / `tests/**` 挙動は変更しておらず、既存 CLI の JSON / text 出力互換も壊していません。
