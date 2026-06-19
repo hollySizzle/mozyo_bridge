@@ -384,6 +384,28 @@ private policy で黙って補正しない。
 > object-to-object slice で、served endpoint / HTML page (grouped page は未存在) は
 > 結線しない。
 
+> 実装メモ (#12255): 本 Project Group read model の **display / render projection** は
+> `src/mozyo_bridge/domain/grouped_display.py` に実装済み
+> (`build_grouped_display_view`)。#12264 の `GroupedReadModel` (group placement /
+> lane label / issue label / role-pane presence) と #12266 の `GroupedReloadView`
+> (freshness label / `reload_required`) を join し、grouped cockpit が描画する単一の
+> renderable structure (`GroupedDisplayView` -> `GroupDisplaySection` ->
+> `UnitDisplayRow`) に projection する。受入条件の "Project Group header を表示する" /
+> "Unit ごとに lane label / issue label / Codex・Claude role panes が判別できる" を、
+> header (`header_label` / `source` / `managed`) と Unit row (`lane_label` /
+> `issue_label` / `roles` / `role_label`) として満たす。Codex・Claude role panes は
+> `ObservedUnit` / `UnitView` に追加した display-safe な `roles` (観測された agent role
+> 名のみ; pane id / session / target を持たない、`active` の presence refinement) を
+> carry して表示し、`unit-target-model.md` の Project Group -> Unit -> Target が
+> *display* 階層である境界を守る (pane id は action-time live preflight が持つ routing
+> authority のまま)。stale / unknown / unmanaged は隠さない: degraded な
+> `status` / `freshness_label` / `reload_required` を surface し、default / ungrouped
+> bucket は `managed=False` (unmanaged) として区別し、no-live-target group は `stale`
+> のまま残す。display は routing / approval / review / close / completion authority を
+> 持たず (`GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE`)、grouped action は #12265 の
+> action-time live preflight が決める。#12264 / #12266 と同じく object-to-object slice
+> で、served endpoint / HTML page は結線しない。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord

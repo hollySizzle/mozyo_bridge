@@ -190,9 +190,17 @@ class ObservedUnit:
     observations that, when they contradict the launch identity, surface a visible
     ``identity_conflict``. ``active`` is the observed liveness fact (a live Target
     exists for this Unit) — a runtime observation, kept separate from the desired
-    ``hidden`` preference that the config resolves. ``observation`` is the per-Unit
-    freshness envelope (the latest target-observation cache); when omitted the
-    Unit reads as never-observed (:data:`UNKNOWN_OBSERVATION`).
+    ``hidden`` preference that the config resolves. ``roles`` is the observed set of
+    *agent role names* (``codex`` / ``claude``) that currently have a live pane for
+    this Unit — a display-safe presence refinement of ``active`` (``active`` =
+    "at least one live Target"; ``roles`` = "which roles are live"). It carries
+    **role names only**, never a pane id / session / target, so a consumer can show
+    "this Unit has a Codex and a Claude pane" without the row becoming a routing
+    endpoint (``unit-target-model.md`` Project Group -> Unit -> Target is a *display*
+    hierarchy; the pane id stays routing authority resolved live at action time).
+    ``observation`` is the per-Unit freshness envelope (the latest
+    target-observation cache); when omitted the Unit reads as never-observed
+    (:data:`UNKNOWN_OBSERVATION`).
     """
 
     workspace_id: str
@@ -204,6 +212,7 @@ class ObservedUnit:
     observed_workspace_id: Optional[str] = None
     observed_lane_id: Optional[str] = None
     active: bool = False
+    roles: "tuple[str, ...]" = ()
     observation: RuntimeObservationSnapshot = UNKNOWN_OBSERVATION
 
     def unit_id(self) -> str:
@@ -239,7 +248,10 @@ class UnitView:
     The carried fields and the JSON payload deliberately contain **no** routing /
     authority vocabulary (``target`` / ``pane`` / ``route`` / ``send`` /
     ``approval`` / ``credential`` …) — a side effect's permission is not on this
-    row. ``active`` names the observed liveness boolean, not a delivery endpoint.
+    row. ``active`` names the observed liveness boolean, not a delivery endpoint;
+    ``roles`` names the observed agent-role *presence* (role names only, no pane id
+    / target), so the display can distinguish a Unit's Codex / Claude panes without
+    carrying a deliverable endpoint.
     """
 
     unit_id: str
@@ -253,6 +265,7 @@ class UnitView:
     pinned: bool = False
     hidden: bool = False
     active: bool = False
+    roles: "tuple[str, ...]" = ()
     preferred_projection: Optional[str] = None
     observed_at: Optional[str] = None
     freshness: str = FRESHNESS_UNKNOWN
@@ -284,6 +297,7 @@ class UnitView:
             "pinned": self.pinned,
             "hidden": self.hidden,
             "active": self.active,
+            "roles": list(self.roles),
             "preferred_projection": self.preferred_projection,
             "observed_at": self.observed_at,
             "freshness": self.freshness,
@@ -400,6 +414,7 @@ def _unit_view_from_observed(
         pinned=placement.pinned,
         hidden=placement.hidden,
         active=observed.active,
+        roles=observed.roles,
         preferred_projection=placement.preferred_projection,
         observed_at=observation.observed_at,
         freshness=observation.freshness,
