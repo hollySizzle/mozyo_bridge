@@ -93,8 +93,12 @@ CONTRADICTION_INTERNAL_INCONSISTENCY = "internal_inconsistency"
 # ``display_state``: derived observation-quality projection for a display
 # consumer. It is NOT an attention / workflow state; it only answers "can this
 # snapshot be shown as current, or must it be reloaded / treated as unknown?".
+# It is deliberately fail-closed and has no soft "stale" value: a stale
+# observation derives ``reload_required`` (see :func:`derive_display_state`).
+# The visible "this is stale" diagnostic label is carried by the separate
+# ``freshness`` field, so a stale snapshot can still be shown — it just never
+# reads as current/healthy from ``display_state`` or the exit status.
 DISPLAY_STATE_HEALTHY = "healthy"
-DISPLAY_STATE_STALE = "stale"
 DISPLAY_STATE_RELOAD_REQUIRED = "reload_required"
 DISPLAY_STATE_UNKNOWN = "unknown"
 
@@ -176,24 +180,32 @@ def derive_display_state(
 ) -> str:
     """Derive the display-quality state, fail-closed.
 
-    The single invariant this function exists to guarantee: a stale /
-    unreadable / contradictory snapshot is **never** ``healthy``. ``healthy``
-    requires a readable source AND a fresh observation AND no contradiction;
-    everything else degrades to ``stale`` (shown, but labeled), or to the
-    fail-closed ``reload_required`` / ``unknown``.
+    The invariant this function guarantees (#12224 acceptance; contract
+    ``runtime-observability-boundary.md`` ``### Freshness / fail-safe
+    semantics``): a stale / unreadable / contradictory snapshot is **never**
+    ``healthy``, and it never derives a soft state that a caller could read as
+    "current". ``healthy`` requires a readable source AND a fresh observation
+    AND no contradiction. Everything else is fail-closed:
+
+    - contradiction, unknown freshness -> ``unknown`` (cannot determine age).
+    - stale / expired observation, partial or unreadable source ->
+      ``reload_required`` (readable enough to show, but must be reloaded /
+      live-preflighted before it is trusted as current).
+
+    A stale snapshot may still be *displayed* for diagnostics — the visible
+    "stale" label lives in the ``freshness`` field; only this derived
+    fail-safe state refuses to call it current.
     """
     if contradiction is not None:
         return DISPLAY_STATE_UNKNOWN
     if readability == READABILITY_UNREADABLE:
         return DISPLAY_STATE_RELOAD_REQUIRED
-    if freshness == FRESHNESS_EXPIRED:
-        return DISPLAY_STATE_RELOAD_REQUIRED
     if freshness == FRESHNESS_UNKNOWN:
         return DISPLAY_STATE_UNKNOWN
-    if freshness == FRESHNESS_STALE:
-        return DISPLAY_STATE_STALE
+    if freshness in (FRESHNESS_STALE, FRESHNESS_EXPIRED):
+        return DISPLAY_STATE_RELOAD_REQUIRED
     if readability == READABILITY_PARTIAL:
-        return DISPLAY_STATE_STALE
+        return DISPLAY_STATE_RELOAD_REQUIRED
     if freshness == FRESHNESS_FRESH and readability == READABILITY_READABLE:
         return DISPLAY_STATE_HEALTHY
     return DISPLAY_STATE_UNKNOWN
@@ -250,8 +262,11 @@ class RuntimeObservationSnapshot:
     def needs_reload(self) -> bool:
         """True when the snapshot is fail-closed (unknown / reload_required).
 
-        A merely ``stale`` snapshot may still be shown for diagnostics (the
-        contract allows it when visibly labeled), so it is not counted here.
+        This is every snapshot except a fresh, readable, uncontradicted one —
+        a stale / expired / partial / unreadable / contradictory snapshot all
+        count. The snapshot may still be *shown* (its ``freshness`` field
+        carries the visible label); ``needs_reload`` only reports that it must
+        not be trusted as current without a reload / live preflight.
         """
         return self.display_state in (
             DISPLAY_STATE_RELOAD_REQUIRED,

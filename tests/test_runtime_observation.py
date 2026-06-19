@@ -100,14 +100,26 @@ class DisplayStateFailClosedTest(unittest.TestCase):
             ro.DISPLAY_STATE_HEALTHY,
         )
 
-    def test_stale_is_shown_but_labeled(self) -> None:
+    def test_stale_is_fail_closed_not_soft(self) -> None:
+        # A stale (but not expired) readable observation must derive
+        # reload_required, never a soft state that reads as current (j#61240).
         self.assertEqual(
             ro.derive_display_state(
                 freshness=ro.FRESHNESS_STALE,
                 readability=ro.READABILITY_READABLE,
                 contradiction=None,
             ),
-            ro.DISPLAY_STATE_STALE,
+            ro.DISPLAY_STATE_RELOAD_REQUIRED,
+        )
+
+    def test_partial_readability_is_fail_closed_even_when_fresh(self) -> None:
+        self.assertEqual(
+            ro.derive_display_state(
+                freshness=ro.FRESHNESS_FRESH,
+                readability=ro.READABILITY_PARTIAL,
+                contradiction=None,
+            ),
+            ro.DISPLAY_STATE_RELOAD_REQUIRED,
         )
 
     def test_expired_requires_reload(self) -> None:
@@ -181,6 +193,25 @@ class SnapshotEnvelopeTest(unittest.TestCase):
             "source_refs",
         ):
             self.assertIn(key, payload)
+
+    def test_stale_snapshot_keeps_label_but_fails_closed(self) -> None:
+        # -120s with max_age 30 / expired_after 300 => stale (not expired).
+        snap = ro.make_snapshot(
+            source=ro.SOURCE_CACHE,
+            method=ro.METHOD_PROJECTION_READ,
+            observed_at=_iso(-120),
+            readability=ro.READABILITY_READABLE,
+            strength=ro.STRENGTH_PROJECTION_ONLY,
+            now=NOW,
+            max_age_seconds=30,
+            expired_after_seconds=300,
+        )
+        # The "stale" diagnostic label survives in the freshness field ...
+        self.assertEqual(snap.freshness, ro.FRESHNESS_STALE)
+        self.assertEqual(snap.stale_reason, ro.STALE_REASON_AGE_EXCEEDED)
+        # ... but the derived state is fail-closed and is counted for reload.
+        self.assertEqual(snap.display_state, ro.DISPLAY_STATE_RELOAD_REQUIRED)
+        self.assertTrue(snap.needs_reload)
 
     def test_expired_snapshot_reason_and_needs_reload(self) -> None:
         snap = ro.make_snapshot(
@@ -327,6 +358,19 @@ class OtelMappingTest(unittest.TestCase):
         )
         self.assertEqual(snap.display_state, ro.DISPLAY_STATE_HEALTHY)
         self.assertFalse(snap.needs_reload)
+
+    def test_stale_store_is_fail_closed(self) -> None:
+        snap = cro._otel_snapshot(
+            store_exists=True,
+            last_write=_iso(-120),
+            total=12,
+            now=NOW,
+            max_age_seconds=30,
+            expired_after_seconds=300,
+        )
+        self.assertEqual(snap.freshness, ro.FRESHNESS_STALE)
+        self.assertEqual(snap.display_state, ro.DISPLAY_STATE_RELOAD_REQUIRED)
+        self.assertTrue(snap.needs_reload)
 
 
 def _run(argv: list[str]) -> tuple[int, str]:
