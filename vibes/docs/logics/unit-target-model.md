@@ -339,6 +339,27 @@ Project Group read model は次の入力を合成してよい:
 stale / unreadable / contradictory な入力がある場合は group の表示状態へ残し、
 private policy で黙って補正しない。
 
+> 実装メモ (#12264): 本 Project Group read model の **生成 (home-state projection)** は
+> `src/mozyo_bridge/domain/grouped_read_model.py` に実装済み
+> (`build_grouped_read_model`)。入力は #12263 の desired presentation config /
+> launch-placement resolver (`presentation_grouping.resolve_launch_placement` /
+> `diagnose_unit_overrides`)、#12224 の runtime observation envelope
+> (`runtime_observation.RuntimeObservationSnapshot` の `observed_at` / `freshness` /
+> `stale_reason` / `contradiction`)、および home-scoped な観測 Unit
+> (`ObservedUnit`、観測 liveness = `active`) の **object** であり、on-disk loader /
+> DB current table migration はまだ結線しない (object-to-object の最小 slice)。
+> 出力 (`ProjectGroupView` / `UnitView` / `GroupedReadModel`) は display-only の
+> projection であり、Target / pane / route / approval を一切持たない (`*View` 命名で
+> canonical `TargetRecord` / `UnitRecord` と区別する)。config と runtime observation の
+> 矛盾は visible degraded status (`identity_conflict` / `desired_unit_missing` /
+> `stale` / `unreadable` / `contradicted`) として残し、hidden(desired) と active(observed)
+> を別 bucket で分離し、stale/unreadable/contradictory は `healthy` を導出せず
+> reload/live preflight を要求する (上記 fallback matrix と
+> `runtime-observability-boundary.md` の fail-safe semantics 準拠)。action permission は
+> side-effecting command の action-time live preflight が決める。残作業の on-disk loader
+> 結線では #12263 から引き継いだ `presentation:` namespace (surface selection vs grouping)
+> の確定が必要。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord
