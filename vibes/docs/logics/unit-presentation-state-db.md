@@ -147,6 +147,64 @@ CREATE INDEX idx_cockpit_group_position
 `group_id` は display grouping であり、routing identity ではない。cross-project
 cockpit でも Redmine governance / project ownership は各 Unit 側に残る。
 
+Project Group は `unit-target-model.md` の Project Group と同じ projection-only
+概念である。`cockpit_group_membership` は Project Group -> Unit の membership /
+position / view preference を持つが、次を持たない:
+
+- role-specific delivery target。
+- owner approval / review / close / workflow completion。
+- Redmine project ownership の二重正本。
+- private project path、private host topology、operator 固有 color / layout default。
+
+`group_id` は portable display key として扱う。Redmine project id、repo absolute
+path、tmux session name、window nameをそのまま identity authority にしない。必要なら
+別 layer が public-safe label / external pointer を join するが、handoff resolver は
+group ではなく Unit -> Target preflight を使う。
+
+### desired presentation config
+
+Repo-local config に置いてよいのは、portable で review 可能な desired presentation
+preference だけである。
+
+許可:
+
+- known Project Group の default display label / sort key。
+- workspace / repo label から group membership を導く public-safe rule。
+- pinned / hidden / preferred projection の初期値。
+
+禁止:
+
+- handoff target resolution。
+- owner approval / review / close / workflow truth。
+- live pane id / session geometry / active split。
+- private absolute path、private host name、operator 固有 group policy。
+
+config は current state の seed / desired declaration であり、runtime truth ではない。
+config と live observation が矛盾した場合、read model は `desired_but_missing` /
+`observed_elsewhere` / `stale` のような表示状態へ倒す。action permission は
+side-effecting command の live preflight が決める。
+
+### live geometry boundary
+
+tmux session / window / split tree は observed runtime geometry である。Project
+Group / Unit の durable membership を live geometry から逆算して保存正本にしない。
+
+扱ってよいもの:
+
+- pane coordinate / column grouping / width。
+- observed top-to-bottom / left-to-right order。
+- drift diagnostics and repair preview。
+
+扱ってはいけないもの:
+
+- Unit がどの Project Group に属するかの正本。
+- role / workspace / lane identity。
+- routing / approval / close authority。
+
+reconcile / rebalance / move のような future command は、desired presentation state
+と live TargetRecord を照合して plan を出す。実行は preview / confirm gate を持ち、
+private operator layout を OSS default にしない。
+
 ### projection_preferences
 
 Unit ごとの preferred projection。`cockpit_pane` を primary としつつ、
