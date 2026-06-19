@@ -12,6 +12,7 @@ import argparse
 from mozyo_bridge.application.commands import (
     cmd_events_query,
     cmd_events_tail,
+    cmd_observe_reload,
     cmd_otel_activity,
     cmd_otel_events,
     cmd_otel_launchd,
@@ -251,3 +252,75 @@ def register(sub) -> None:
         ),
     )
     launchd_restart.set_defaults(func=cmd_otel_launchd)
+
+    observe = sub.add_parser(
+        "observe",
+        help=(
+            "Runtime observation snapshots (Redmine #12224): explicitly "
+            "refresh a diagnostic/display view of runtime state and see how "
+            "old it is. A snapshot is a timestamped observation, never "
+            "workflow truth: it does not move any Redmine gate and does not "
+            "authorize action (side-effecting commands run their own "
+            "action-time live preflight). Stale/unreadable sources derive "
+            "`unknown` / `reload_required`, never `healthy`."
+        ),
+    )
+    observe_sub = observe.add_subparsers(dest="observe_command", required=True)
+    observe_reload = observe_sub.add_parser(
+        "reload",
+        help=(
+            "Re-capture runtime observation snapshots for the chosen "
+            "source(s) and print their observed_at / source / method / "
+            "freshness / readability envelope. Read-only; exit code is "
+            "non-zero when any requested snapshot is fail-closed "
+            "(`unknown` / `reload_required`), so a stale snapshot is never "
+            "reported as healthy. This refreshes display/diagnostic state "
+            "only — it never updates workflow truth, approval, routing, "
+            "close, or completion."
+        ),
+    )
+    observe_reload.add_argument(
+        "--source",
+        choices=["tmux", "otel", "all"],
+        default="all",
+        help=(
+            "Which observation source to reload: `tmux` (live runtime "
+            "liveness, degrading to the inventory cache), `otel` (the "
+            "best-effort OTel event store cache), or `all` (default)."
+        ),
+    )
+    observe_reload.add_argument(
+        "--max-age",
+        dest="max_age",
+        help=(
+            "Seconds before an observation is considered no longer `fresh` "
+            "(default 30)."
+        ),
+    )
+    observe_reload.add_argument(
+        "--expired-after",
+        dest="expired_after",
+        help=(
+            "Seconds before a stale observation becomes `expired` / "
+            "`reload_required` (default 300)."
+        ),
+    )
+    observe_reload.add_argument(
+        "--db",
+        help=(
+            "OTel event store path override. Default: "
+            "`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/otel-events.sqlite`."
+        ),
+    )
+    observe_reload.add_argument(
+        "--home",
+        help=(
+            "mozyo-bridge home override (inventory cache / store location). "
+            "Default: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`."
+        ),
+    )
+    observe_reload.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the snapshots as the JSON runtime observation envelope.",
+    )
+    observe_reload.set_defaults(func=cmd_observe_reload)

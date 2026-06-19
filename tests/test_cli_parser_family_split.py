@@ -75,6 +75,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "docs",
     "events",
     "otel",
+    "observe",
     "session",
     "workspace",
     "workspace-defaults",
@@ -149,6 +150,10 @@ class MovedCommandFuncBindingTest(unittest.TestCase):
         self.assertEqual(
             _bound_func_name(self.parser, ["otel", "launchd", "status"]),
             "cmd_otel_launchd",
+        )
+        self.assertEqual(
+            _bound_func_name(self.parser, ["observe", "reload"]),
+            "cmd_observe_reload",
         )
 
     def test_session_bindings(self) -> None:

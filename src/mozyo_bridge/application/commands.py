@@ -5159,6 +5159,9 @@ from mozyo_bridge.application.commands_otel import (  # noqa: E402
     cmd_otel_serve,
     cmd_otel_status,
 )
+from mozyo_bridge.application.commands_runtime_observation import (  # noqa: E402
+    cmd_observe_reload,
+)
 from mozyo_bridge.application.commands_docs_scaffold import (  # noqa: E402
     cmd_docs_audit_impact,
     cmd_docs_generate,
