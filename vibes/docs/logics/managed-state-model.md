@@ -282,164 +282,95 @@ Single file raises the blast radius, so recovery policy must be component-aware:
 
 ## migration / doctor / integrity check 方針 (#12260)
 
-Migration は **read-only inspector first** と **write migration later** に分ける。#12260 では runtime migration
-実装を行わず、後続実装が従う command / status / repair 語彙を固定する。
+Migration は **read-only inspector first** と **write migration later** に分ける。#12260 は runtime migration
+実装ではなく、後続実装が守る不変条件を固定する task である。CLI 名、JSON field の完全形、backup directory
+名は後続実装 issue で確定する。
 
-### legacy import strategy
+### legacy import
 
-Legacy file から single DB への移行は component 単位の copy/import であり、legacy file を in-place mutate
-しない。
+Legacy file から single DB への移行は component 単位の copy/import とし、legacy file を in-place mutate
+しない。移行後もしばらく legacy file は rollback / downgrade input として残し、cleanup は別 issue で扱う。
 
-```yaml
-migration_inputs:
-  registry:
-    legacy_file: registry.sqlite
-    source_tables: [workspaces, workspace_activity]
-    target_namespace: registry_*
-    recovery_policy: authoritative
-  managed_events:
-    legacy_file: managed-events.sqlite
-    source_tables: [managed_events]
-    target_namespace: managed_events
-    recovery_policy: append_only_lossy
-  inventory:
-    legacy_file: inventory.sqlite
-    source_tables: [panes, inventory_meta]
-    target_namespace: inventory_*
-    recovery_policy: rebuildable_cache
-  otel:
-    legacy_file: otel-events.sqlite
-    source_tables: [otel_events, otel_meta]
-    target_namespace: otel_*
-    recovery_policy: rebuildable_cache
-```
+| legacy file | target namespace | recovery policy |
+| --- | --- | --- |
+| `registry.sqlite` | `registry_*` | `authoritative` |
+| `managed-events.sqlite` | `managed_events` | `append_only_lossy` |
+| `inventory.sqlite` | `inventory_*` | `rebuildable_cache` |
+| `otel-events.sqlite` | `otel_*` | `rebuildable_cache` |
 
-Rules:
+Import rules:
 
-- Import is idempotent per component. A component is complete only when its target tables, row-shape probes, source
-  schema version, and `state_schema_components` metadata agree.
-- Each migrated component records `migrated_from`, source schema version, imported row count, imported timestamp, and
-  backup id in component metadata or an adjacent migration ledger.
-- The new DB may exist in partial state. Partial import is not success; doctor reports `partial` with the exact component
-  and next action.
-- Legacy files remain rollback / downgrade input until all components are verified and a later cleanup command explicitly
-  retires them. Cleanup is outside initial migration.
-- Cross-component references are validated best-effort. A missing `workspace_id` referenced by cache/history is a component
-  warning, not an automatic reason to rewrite authoritative registry rows.
-- Migration never derives `side_effect_permission`, `runtime_current_fact`, workflow completion, owner approval, or Redmine
-  gate state from imported projection / activity / history rows.
+- component ごとに idempotent にする。target table、source schema version、row-shape probe、
+  `state_schema_components` が揃って初めて complete と扱う。
+- component metadata には `migrated_from`、source schema version、import timestamp、backup id を残す。
+- partial migration は成功扱いしない。doctor は component 単位で `partial` と next action を出す。
+- cross-component reference は best-effort integrity check に留める。cache/history 側の不整合を理由に
+  authoritative な registry row を自動修正しない。
+- migration は projection / activity / history から `side_effect_permission`、`runtime_current_fact`、
+  workflow completion、owner approval、Redmine gate state を導出しない。
 
 ### backup / downgrade / partial migration
 
-Backup is mandatory before any write migration or destructive repair.
+Write migration と destructive repair は、必ず事前 backup を作る。backup は home scope に置き、single DB
+が既にあればそれも含め、存在する legacy file を component ごとに退避する。backup failure 時は write
+migration / repair を進めない。
 
-- Write migration creates a timestamped backup under home, e.g. `${MOZYO_BRIDGE_HOME}/backups/state-migration-<timestamp>/`.
-  It copies the new single DB if present and every legacy file that exists. Backup failure stops migration.
-- Backup metadata records CLI version, source paths, source schema versions, target DB path, component list, and whether the
-  operation was dry-run or write.
-- Migration writes target data to a temporary DB or temporary component tables first, validates integrity, then atomically
-  publishes the target DB / component state. If atomic publish is not available on the platform, the command must report
-  the weaker guarantee in dry-run output before write mode is enabled.
-- Older CLI downgrade behavior is non-destructive. If it sees a newer container `user_version` or newer component schema,
-  it reports `unsupported_schema` and leaves the DB untouched. Cache readers may fall back to legacy files if present.
-  Registry identity writers fail closed rather than rewriting unknown state.
-- Partial migration is resumable only by component. A rerun may skip verified complete components, retry incomplete ones,
-  or explicitly rebuild cache components. It must not silently overwrite authoritative registry rows that already imported.
+Downgrade は非破壊にする。古い CLI が新しい container `user_version` または新しい component schema を見た場合、
+`unsupported_schema` として報告し、DB を書き換えない。cache reader は legacy file が残っていれば fallback
+してよいが、registry identity writer は unknown state を rewrite せず fail closed する。
 
-### corruption quarantine / component-level repair
+Partial migration は component 単位で resumable にする。rerun は complete 済み component を skip してよいが、
+authoritative component を黙って上書きしない。
 
-Doctor and repair commands operate at the smallest affected component. "Delete the whole state DB" is not the default repair.
+### corruption quarantine / component repair
 
-| component | corruption status | default next action | destructive repair allowed |
-| --- | --- | --- | --- |
-| `registry` | `corrupt_authoritative` / `missing_authoritative` | backup, stop identity writes, restore from backup or re-register from workspace anchor | only explicit operator command after backup |
-| `managed_events` | `corrupt_history` / `history_gap` | backup, quarantine unreadable rows/file, append a gap marker, resume future append | quarantine history only; never rewrite identity/liveness |
-| `inventory` | `corrupt_cache` / `stale_cache` | backup if dropping persisted rows, drop/rebuild namespace from live tmux reload | yes, namespace drop/rebuild |
-| `otel` | `corrupt_cache` / `receiver_down` | backup if dropping persisted rows, restart receiver or recreate namespace | yes, namespace drop/rebuild/prune |
-| `presentation` / `unit` | `operator_state_incomplete` | backup restore or explicit re-declare by operator | only explicit operator command |
+Doctor / repair は最小 component 単位で動く。single DB 全体の削除を default repair にしない。
 
-Quarantine policy:
+- `authoritative`: 自動 drop/rebuild 禁止。backup restore、workspace anchor import、明示的な re-register を促す。
+- `append_only_lossy`: unreadable history を quarantine し、gap marker を残して future append を再開できる。
+  identity / liveness / handoff は block しない。
+- `rebuildable_cache`: backup 後に namespace drop/rebuild してよい。rebuild は owning reload / receiver command
+  に任せる。
+- `operator_current_state`: backup restore または operator の explicit re-declare を要求する。destructive
+  auto reconcile はしない。
 
-- Quarantine moves the affected legacy file, target DB copy, table dump, or unreadable row set into a timestamped backup /
-  quarantine location under home. It records the source path and component, but not prompt text, credentials, or private
-  payload content.
-- For `append_only_lossy`, quarantine may leave a history gap. The gap is visible to doctor / inspector, but it does not
-  block live tmux preflight, handoff, or workspace identity resolution.
-- For `rebuildable_cache`, repair may drop only the component namespace after backup and then ask the owning reload /
-  receiver command to rebuild it.
-- For `authoritative`, automatic drop/rebuild is prohibited. The safe route is restore, workspace anchor import, or an
-  explicit re-registration command.
+Quarantine は affected file / table dump / unreadable row set を timestamped backup/quarantine location へ移す。
+source path と component は記録するが、prompt text、credential、private payload content は記録しない。
 
-### doctor / inspector component status
+### doctor / inspector output
 
-Read-only inspector output is the first implementation target. It reads legacy files and the future single DB side by side,
-but it does not create, migrate, drop, or repair anything.
+Read-only inspector が最初の実装 target である。legacy files と future single DB を side-by-side に読むが、
+create / migrate / drop / repair はしない。
 
-Each component report should include:
+Doctor は component ごとに最低限次を出す。
 
-```yaml
-component_status:
-  component: registry | managed_events | inventory | otel | presentation | unit
-  legacy_file: present | missing | unreadable | unsupported_schema | corrupt
-  single_db: absent | present | unsupported_container | corrupt | readable
-  component_schema: absent | current | older | newer | unsupported | inconsistent
-  import_state: not_started | dry_run_ok | partial | complete | blocked | not_applicable
-  integrity: ok | warning | error | unknown
-  freshness: fresh | stale | expired | unknown | not_applicable
-  repairability: authoritative_restore | quarantine_and_resume | rebuildable | explicit_redeclare | none
-  next_action: inspect | backup | migrate_dry_run | migrate_write | repair_component | restore_backup | re_register | reload | restart_receiver | leave_untouched
-  source_refs: [legacy_path, state_db_path, backup_id, journal_or_command_ref]
-```
+- component name (`registry`, `managed_events`, `inventory`, `otel`, future `presentation` / `unit`)
+- legacy file state: `present` / `missing` / `unreadable` / `unsupported_schema` / `corrupt`
+- single DB / component schema state: `absent` / `readable` / `partial` / `complete` / `unsupported`
+- integrity: `ok` / `warning` / `error` / `unknown`
+- next action: `inspect` / `backup` / `migrate_dry_run` / `migrate_write` / `repair_component` /
+  `restore_backup` / `re_register` / `reload` / `restart_receiver` / `leave_untouched`
 
-Status semantics:
+`ok` はその component が state kind の範囲で読めるという意味に限る。workflow complete、owner-approved、
+action allowed を意味しない。`freshness` は projection / activity component にだけ使い、registry identity
+を `fresh` / `current` と表現しない。
 
-- `ok` means the component is internally readable for its state kind. It does not mean workflow complete, owner-approved, or
-  safe to perform side effects.
-- `warning` means degraded but usable for display/diagnostics, e.g. stale projection, missing OTel receiver, or legacy cache
-  fallback.
-- `error` means the component owner must not write until the next action is performed.
-- `unsupported_schema` / `newer` is not corruption. The command leaves data untouched and reports upgrade/downgrade guidance.
-- `freshness` applies only to projection / activity components. Registry identity has `not_applicable` freshness rather than
-  `fresh` / `current`.
-
-Doctor text should be action-oriented and component-scoped:
-
-- "registry: authoritative identity unreadable; writes blocked; restore backup or run workspace register from anchors"
-- "inventory: cache corrupt; live tmux reload can rebuild after backup"
-- "otel: receiver down; activity unknown by design; handoff/liveness falls back to tmux"
-- "managed_events: history gap quarantined; future command-boundary append can continue"
-
-Doctor must not print "healthy/current" from a fresh cache alone. It reports `readable`, `stale`, `partial`, `unknown`,
-or `next_action`, and leaves action permission to command-time preflight.
+Doctor wording は component-scoped next action を中心にする。fresh cache だけから `healthy` / `current` を
+出さない。side-effecting action の許可は doctor ではなく command-time live preflight が判定する。
 
 ### implementation order
 
 後続実装は次の順序に分ける。
 
-1. Read-only inspector / doctor:
-   - detect legacy files and future single DB;
-   - run `PRAGMA quick_check` / `integrity_check` where safe;
-   - read `user_version` and component schema metadata;
-   - report component statuses and next actions;
-   - produce JSON that tests can pin.
-2. Dry-run migration planner:
-   - compute component import plan, backup plan, row counts, unsupported schemas, and partial-state handling;
-   - write nothing.
-3. Write migration:
-   - require explicit command flag;
-   - create backup first;
-   - import component by component;
-   - verify and record metadata;
-   - leave legacy files in place.
-4. Component repair commands:
-   - separate authoritative restore/re-register, append-only quarantine, and rebuildable cache drop/reload;
-   - require backup before destructive action.
-5. Legacy cleanup / retirement:
-   - only after doctor reports complete migration and downgrade window is intentionally closed by a later issue.
+1. read-only inspector / doctor
+2. dry-run migration planner
+3. write migration
+4. component repair commands
+5. legacy cleanup / retirement
 
-Write migration remains blocked until read-only inspector output is stable, component status vocabulary is test-pinned, and
-backup/quarantine behavior has explicit tests. This prevents a migration command from being the first tool to discover
-corrupt or unsupported state.
+Write migration は、read-only inspector output、component status vocabulary、backup/quarantine behavior が
+test-pinned されるまで始めない。migration command が corrupt / unsupported state を初めて発見する設計に
+しない。
 
 ### access boundary
 
