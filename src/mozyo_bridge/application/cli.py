@@ -44,11 +44,13 @@ from mozyo_bridge.domain.sublane_callback import (
     CALLBACK_CHOICES,
 )
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.application.provider_runtime import resolve_builtin_providers
 from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
 )
 from mozyo_bridge.domain.module_registry import ModuleRegistryError
+from mozyo_bridge.domain.provider_registry import ProviderRegistryError
 from mozyo_bridge.domain.repo_local_config import (
     RepoLocalConfig,
     RepoLocalConfigError,
@@ -337,7 +339,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         config = load_repo_local_config(_root_repo_override(argv))
         parser = build_parser(config)
-    except (RepoLocalConfigError, ModuleRegistryError) as exc:
+        # Connect the repo-local provider selection to runtime resolution
+        # (Redmine #12249): resolve ``config.providers`` against the live
+        # built-in provider registry so a present-but-invalid selection — an
+        # unknown provider id, an unknown category, or a category/provider
+        # mismatch — fails closed at the entrypoint, exactly as the CLI family
+        # selection is resolved during ``build_parser``. The default (no
+        # selection) resolves every populated category to its current built-in
+        # default, so a missing/default config is behavior-preserving; no
+        # provider dispatch path consumes the resolved mapping yet, so this is
+        # the fail-closed validation seam and adds no dynamic import or ABI.
+        resolve_builtin_providers(config.providers)
+    except (RepoLocalConfigError, ModuleRegistryError, ProviderRegistryError) as exc:
         return _exit_on_repo_local_config_error(exc)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):

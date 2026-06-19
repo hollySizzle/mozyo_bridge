@@ -676,7 +676,7 @@ no selection — no implicit default). Authority stays core-owned: this is
 selection of classified providers, never a grant of `workflow_authority`,
 `owner_approval`, `close_approval`, or `routing_authority`.
 
-## Repo-Local YAML Config Wiring (Redmine #12189 / #12190 / #12191)
+## Repo-Local YAML Config Wiring (Redmine #12189 / #12190 / #12191 / #12249)
 
 The registries above (#12155 module selection, #12184 provider selection) define
 *typed* config records but no on-disk source. The v0.9.1 batch adds the
@@ -734,14 +734,60 @@ through the #12190 loader and composes the parser from it. The contract:
   fall-through to the default CLI. Fail-closed is global: a broken config blocks
   even `--version`, so a misconfigured repo cannot run any subset of the CLI as
   if the config were valid.
-- **Staged scope.** Only the `cli` family composition is wired at the parser
-  entrypoint, because that is the surface with a live composition seam.
-  `providers` and `presentation` are read and validated by the loader, but they
-  have no runtime resolution seam yet (the provider registry is not consumed at
+- **Staged scope.** At #12191 only the `cli` family composition is wired at the
+  parser entrypoint, because that is the surface with a live composition seam.
+  `providers` and `presentation` are read and validated by the loader, but have
+  no runtime resolution seam yet (the provider registry is not consumed at
   runtime and the presentation providers hardcode their surface); wiring their
-  selection into runtime resolution is a later stage. No dynamic import, entry
-  point, callable, module path, or external plugin API is introduced — the same
-  non-goal the registries already enforce.
+  selection into runtime resolution is a later stage (`providers` lands in
+  #12249, below). No dynamic import, entry point, callable, module path, or
+  external plugin API is introduced — the same non-goal the registries already
+  enforce.
+
+### #12249 — provider selection runtime resolution
+
+`main()` (in `src/mozyo_bridge/application/cli.py`) now also resolves the
+repo-local `providers` selection against the live built-in provider registry,
+closing the staged gap above. This is the first time
+`BUILTIN_PROVIDER_REGISTRY` is consumed at runtime. The contract mirrors the
+#12191 CLI family resolution:
+
+- **The resolution seam.** A thin application module,
+  `src/mozyo_bridge/application/provider_runtime.py`, exposes
+  `resolve_builtin_providers(config)`, which delegates to
+  `BUILTIN_PROVIDER_REGISTRY.resolve_selection`. `main()` calls it on
+  `config.providers` inside the same try-block that composes the parser, so the
+  provider selection is resolved at the same entrypoint and from the same
+  `--repo`-honoring config source as the CLI family selection.
+- **Config-absent / default is unchanged.** The default (empty) selection
+  resolves every populated category to its current built-in default
+  (`ticket` -> `redmine`, `terminal_runtime` -> `tmux`, `presentation` ->
+  `tmux-presentation`), so a repo with no `.mozyo-bridge/config.yaml`, or one
+  whose `providers` block is absent, runs byte-identically to before. No
+  provider dispatch path consumes the resolved mapping yet; the connection is
+  the fail-closed *resolution* seam, the provider analogue of how the read layer
+  resolves CLI families purely for the validation side effect.
+- **Config-present fails closed on an unrealizable selection.** Schema
+  validation (`ProviderSelectionConfig`) already rejects the exact core-owned
+  authority names and module / callable / target-shaped tokens; runtime
+  resolution additionally rejects what shape-only validation cannot see — a
+  selection naming an unknown provider id, an unknown category, or a registered
+  provider in a different category than the one selecting it. Each raises
+  `ProviderRegistryError`, which `main()` converts (alongside
+  `RepoLocalConfigError` / `ModuleRegistryError`) into the same single actionable
+  stderr line and exit code `2`, never a raw traceback and never a silent
+  fall-through.
+- **No new machinery.** The registry maps ids to pure `BuiltinProvider`
+  *descriptions*, never to a module path, callable, or entry point, so the
+  connection introduces no dynamic import, no public extension ABI, and no
+  delegation of `workflow_authority` / `owner_approval` / `close_approval` /
+  `routing_authority` — the same boundary the provider registry already enforces.
+- **Still-staged.** `presentation` selection remains read-and-validated only;
+  its providers hardcode their surface and have no runtime resolution seam yet.
+  The `terminal_runtime` and `ticket` providers are resolvable through the same
+  registry call but are still consumed at their existing call sites
+  (`REDMINE_TICKET_PROVIDER`, direct `run_tmux`); routing those call sites
+  through the resolved provider is a later stage, out of #12249 scope.
 
 ## Follow-up Split
 
