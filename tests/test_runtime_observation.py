@@ -322,6 +322,46 @@ class TmuxMappingTest(unittest.TestCase):
         self.assertEqual(snap.display_state, ro.DISPLAY_STATE_RELOAD_REQUIRED)
 
 
+class _FakeInventory:
+    """Minimal stand-in for an InventorySnapshot (source/collected_at/records/notes)."""
+
+    def __init__(self, *, source, collected_at, record_count, notes=()):
+        self.source = source
+        self.collected_at = collected_at
+        self.records = [object()] * record_count
+        self.notes = notes
+
+
+class SnapshotFromInventoryTest(unittest.TestCase):
+    """The public inventory -> envelope wrapper shared by the CLI and cockpit (#12225)."""
+
+    def test_live_inventory_maps_to_healthy_tmux_snapshot(self) -> None:
+        from mozyo_bridge.session_inventory import SOURCE_RUNTIME
+
+        snap = cro.snapshot_from_inventory(
+            _FakeInventory(
+                source=SOURCE_RUNTIME, collected_at=_iso(0), record_count=2
+            ),
+            now=NOW,
+        )
+        self.assertEqual(snap.source, ro.SOURCE_TMUX)
+        self.assertEqual(snap.method, ro.METHOD_LIVE_QUERY)
+        self.assertEqual(snap.display_state, ro.DISPLAY_STATE_HEALTHY)
+
+    def test_stale_cache_inventory_is_fail_closed(self) -> None:
+        from mozyo_bridge.session_inventory import SOURCE_CACHE
+
+        snap = cro.snapshot_from_inventory(
+            _FakeInventory(
+                source=SOURCE_CACHE, collected_at=_iso(-600), record_count=1
+            ),
+            now=NOW,
+        )
+        self.assertEqual(snap.source, ro.SOURCE_CACHE)
+        self.assertEqual(snap.display_state, ro.DISPLAY_STATE_RELOAD_REQUIRED)
+        self.assertTrue(snap.needs_reload)
+
+
 class OtelMappingTest(unittest.TestCase):
     def test_missing_store_is_unreadable(self) -> None:
         snap = cro._otel_snapshot(

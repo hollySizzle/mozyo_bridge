@@ -144,17 +144,43 @@ def _otel_snapshot(
     )
 
 
+def snapshot_from_inventory(
+    snapshot,
+    *,
+    now: datetime,
+    max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
+    expired_after_seconds: float = DEFAULT_EXPIRED_AFTER_SECONDS,
+) -> ro.RuntimeObservationSnapshot:
+    """Map a session-inventory snapshot to a runtime observation envelope.
+
+    The single inventory -> envelope mapping, shared by the ``observe reload``
+    CLI (#12224, via :func:`_capture_tmux`) and the cockpit Web UI (#12225, via
+    :func:`mozyo_bridge.application.cockpit_ui.attach_observation`). Both faces
+    derive ``observed_at`` / ``freshness`` / ``readability`` / ``display_state``
+    from the same logic, so the CLI and the GUI never disagree about whether the
+    displayed runtime view is fresh or must be reloaded. The caller supplies the
+    already-captured ``snapshot`` so the envelope describes exactly the rows it
+    is shown alongside.
+    """
+    return _tmux_snapshot(
+        inv_source=snapshot.source,
+        collected_at=snapshot.collected_at,
+        record_count=len(snapshot.records),
+        notes=tuple(snapshot.notes),
+        now=now,
+        max_age_seconds=max_age_seconds,
+        expired_after_seconds=expired_after_seconds,
+    )
+
+
 def _capture_tmux(
     *, home: Optional[Path], now: datetime, max_age: float, expired_after: float
 ) -> ro.RuntimeObservationSnapshot:
     from mozyo_bridge.session_inventory import take_inventory
 
     snapshot = take_inventory(home=home, persist=True)
-    return _tmux_snapshot(
-        inv_source=snapshot.source,
-        collected_at=snapshot.collected_at,
-        record_count=len(snapshot.records),
-        notes=tuple(snapshot.notes),
+    return snapshot_from_inventory(
+        snapshot,
         now=now,
         max_age_seconds=max_age,
         expired_after_seconds=expired_after,

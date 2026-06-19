@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application.cockpit_ui import (
     CockpitActionError,
     attach_attention,
+    attach_observation,
     jump_to_unit,
     reveal_in_finder,
 )
@@ -320,6 +321,120 @@ class CockpitHttpTest(unittest.TestCase):
         attention = payload["panes"][0]["attention"]
         self.assertEqual("unknown", attention["attention_state"])
         self.assertEqual("source_unreadable", attention["reason_code"])
+
+    def test_units_endpoint_attaches_observation_envelope(self) -> None:
+        # Redmine #12225: an additive top-level `observation` envelope carries
+        # the runtime observation snapshot freshness (observed_at / source /
+        # method / freshness / readability / display_state) for the displayed
+        # snapshot. A live snapshot is fresh + readable + healthy.
+        from mozyo_bridge.domain import runtime_observation as ro
+
+        panes = [pane("%1", "mozyo-demo", "claude")]
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=panes,
+        ):
+            status, body = self._get("/api/units")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        # Additive: the existing layers are untouched.
+        self.assertFalse(payload["stale"])
+        self.assertIn("activity", payload["panes"][0])
+        obs = payload["observation"]
+        self.assertEqual(ro.SOURCE_TMUX, obs["source"])
+        self.assertEqual(ro.METHOD_LIVE_QUERY, obs["method"])
+        self.assertEqual(ro.FRESHNESS_FRESH, obs["freshness"])
+        self.assertEqual(ro.READABILITY_READABLE, obs["readability"])
+        self.assertEqual(ro.DISPLAY_STATE_HEALTHY, obs["display_state"])
+        self.assertIsNotNone(obs["observed_at"])
+        # The required envelope fields the UI renders are all present.
+        for key in (
+            "observed_at",
+            "source",
+            "method",
+            "freshness",
+            "readability",
+            "strength",
+            "stale_reason",
+            "display_state",
+        ):
+            self.assertIn(key, obs)
+        # No truth-like generic field leaks into the observation envelope.
+        self.assertEqual([], ro.forbidden_generic_fields(obs))
+
+    def test_units_observation_stale_is_fail_closed(self) -> None:
+        # End-to-end: a stale cache snapshot must never read as healthy. The
+        # observation envelope derives reload_required (readability is partial
+        # for a cache projection), the visible "this is cached" label stays in
+        # the snapshot, and no truth-like field appears
+        # (runtime-observability-boundary.md fail-safe semantics).
+        from mozyo_bridge.domain import runtime_observation as ro
+
+        panes = [pane("%1", "mozyo-demo", "claude")]
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=panes,
+        ):
+            self._get("/api/units")  # seed the cache from a live snapshot
+        with patch(
+            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            return_value=None,  # tmux unavailable -> stale cache snapshot
+        ):
+            status, body = self._get("/api/units")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        self.assertTrue(payload["stale"])
+        obs = payload["observation"]
+        self.assertNotEqual(ro.DISPLAY_STATE_HEALTHY, obs["display_state"])
+        self.assertEqual(ro.DISPLAY_STATE_RELOAD_REQUIRED, obs["display_state"])
+        self.assertEqual(ro.SOURCE_CACHE, obs["source"])
+        self.assertEqual(ro.READABILITY_PARTIAL, obs["readability"])
+        self.assertEqual([], ro.forbidden_generic_fields(obs))
+
+    def test_attach_observation_is_additive(self) -> None:
+        # Pure-join unit test: `attach_observation` adds only the top-level
+        # `observation` key and never disturbs the panes / stale / attention
+        # layers already on the payload.
+        from datetime import datetime, timezone
+
+        snapshot = take_inventory(
+            home=self.home, panes=[pane("%1", "mozyo-demo", "claude")]
+        )
+        payload = snapshot.as_payload()
+        payload["panes"][0]["attention"] = {"attention_state": "healthy"}
+        before = json.dumps(payload, sort_keys=True)
+        out = attach_observation(
+            payload, snapshot, now=datetime.now(timezone.utc)
+        )
+        self.assertIs(out, payload)
+        self.assertIn("observation", out)
+        # Existing layers preserved (additive only).
+        self.assertEqual("%1", out["panes"][0]["pane_id"])
+        self.assertEqual(
+            "healthy", out["panes"][0]["attention"]["attention_state"]
+        )
+        # Removing the added key restores the original payload exactly.
+        out.pop("observation")
+        self.assertEqual(before, json.dumps(out, sort_keys=True))
+
+    def test_index_has_reload_button_and_freshness_display(self) -> None:
+        # Redmine #12225: the page exposes a manual Reload affordance and a
+        # freshness line, rendered via DOM APIs (whitelisted display-state
+        # class), never innerHTML.
+        from mozyo_bridge.application.cockpit_ui import INDEX_HTML_TEMPLATE
+
+        self.assertIn('id="reload"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="observation"', INDEX_HTML_TEMPLATE)
+        self.assertIn("renderObservation", INDEX_HTML_TEMPLATE)
+        self.assertIn("KNOWN_DISPLAY_STATES", INDEX_HTML_TEMPLATE)
+        self.assertIn("data.observation", INDEX_HTML_TEMPLATE)
+        # The reload button drives an explicit re-fetch.
+        self.assertIn(
+            "getElementById('reload').addEventListener('click', refresh)",
+            INDEX_HTML_TEMPLATE,
+        )
+        # Still DOM-API only (no HTML injection sink introduced).
+        self.assertNotIn("innerHTML", INDEX_HTML_TEMPLATE)
 
     def test_transitions_endpoint_reports_observed_changes(self) -> None:
         # First poll establishes baseline (unknown), second poll after an

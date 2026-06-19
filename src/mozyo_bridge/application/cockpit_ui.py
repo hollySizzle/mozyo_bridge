@@ -130,6 +130,50 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
     return payload
 
 
+def attach_observation(payload: dict, snapshot, *, now) -> dict:
+    """Attach the runtime observation freshness envelope to a units payload (#12225).
+
+    A fifth, read-only projection layer over the inventory snapshot — after the
+    tmux liveness, OTel ``activity``, Redmine gate, and ``attention`` layers: the
+    #12224 runtime observation snapshot envelope (``observed_at`` / ``source`` /
+    ``method`` / ``freshness`` / ``readability`` / ``strength`` / ``stale_reason``
+    / ``display_state``) describing how fresh the *displayed* inventory snapshot
+    itself is. The cockpit UI renders it as a "last refreshed / observed_at"
+    freshness line plus a manual **Reload** affordance, so an operator sees the
+    runtime view is a timestamped snapshot — not live truth — and can refresh it
+    on demand (v1 = explicit reload, no background polling/push added here).
+
+    The envelope is derived from the same inventory snapshot the rows are built
+    from (``snapshot``), via the one mapping
+    :func:`~mozyo_bridge.application.commands_runtime_observation.snapshot_from_inventory`
+    the ``observe reload`` CLI uses, so the GUI and CLI never disagree about
+    freshness.
+
+    Boundary (``runtime-observability-boundary.md`` ``### Contract handoff to
+    follow-up issues`` / ``### Freshness / fail-safe semantics``): this is
+    diagnostic / display only. It never updates workflow truth, owner approval,
+    review, routing, close, or completion (those stay with the Redmine durable
+    record); it never authorizes a side-effecting action (those run their own
+    action-time live preflight in :func:`_resolve_record`); and a stale /
+    unreadable snapshot derives ``reload_required`` / ``unknown``, never
+    ``healthy``. The visible "stale" label rides in ``freshness``, so the
+    snapshot can still be shown without reading as current.
+
+    Additive and public-safe: it adds one top-level ``observation`` key, never
+    altering the panes or the tmux / OTel / Redmine / attention layers, and the
+    envelope's ``source_refs`` carry only a tmux/cache tag plus the snapshot
+    time, no path / secret. Cockpit-layer only, like the Redmine and attention
+    joins — the ``session list`` CLI payload stays observation-free.
+    """
+    from mozyo_bridge.application.commands_runtime_observation import (
+        snapshot_from_inventory,
+    )
+
+    snap = snapshot_from_inventory(snapshot, now=now)
+    payload["observation"] = snap.as_payload()
+    return payload
+
+
 def _resolve_record(
     pane_id: str, *, home: Path | None = None
 ) -> InventoryRecord:
@@ -274,10 +318,18 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   button { font-size: 12px; }
   #transitions li { color: #555; }
   .muted { color: #999; font-size: 11px; }
+  #controls { margin: 4px 0; display: flex; align-items: center; gap: 8px; }
+  .obs-healthy { color: #2e7d32; }
+  .obs-reload_required { color: #ef6c00; font-weight: 600; }
+  .obs-unknown { color: #b71c1c; font-weight: 600; }
 </style>
 </head>
 <body>
 <h2>mozyo cockpit</h2>
+<div id="controls">
+<button id="reload" type="button">Reload</button>
+<span id="observation" class="muted">observation: loading…</span>
+</div>
 <div id="stale" class="stale-banner">tmux runtime unavailable — showing the
 last cached snapshot; activity may be outdated and actions are disabled.</div>
 <table id="units"><thead><tr>
@@ -295,6 +347,27 @@ Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
 const COCKPIT_TOKEN = "__COCKPIT_TOKEN__";
 const KNOWN_STATES = ["active", "idle", "unknown"];
 const KNOWN_RM_STATES = ["available", "unconfigured", "unavailable"];
+// #12225: the runtime observation snapshot's fail-closed display states. A
+// stale / unreadable snapshot derives reload_required / unknown, never healthy
+// (runtime-observability-boundary.md). The class is whitelisted from this list,
+// so the (local but untrusted) payload can never inject a class name.
+const KNOWN_DISPLAY_STATES = ["healthy", "reload_required", "unknown"];
+function renderObservation(obs) {
+  // The runtime view is a timestamped snapshot, not live truth. Surface its
+  // observed_at / freshness / display_state so a stale or unreadable snapshot
+  // reads as such instead of as current. Diagnostic only — it authorizes no
+  // action (those re-preflight live) and moves no Redmine gate.
+  const el = document.getElementById('observation');
+  if (!obs) { el.className = 'muted'; el.textContent = 'observation: unavailable'; return; }
+  const ds = KNOWN_DISPLAY_STATES.includes(obs.display_state)
+    ? obs.display_state : 'unknown';
+  let text = 'observed_at ' + (obs.observed_at || '-') +
+    ' · freshness ' + (obs.freshness || 'unknown') +
+    ' · ' + ds;
+  if (obs.stale_reason) text += ' (' + obs.stale_reason + ')';
+  el.className = 'obs-' + ds;
+  el.textContent = text;
+}
 function redmineText(rm) {
   if (!rm || !KNOWN_RM_STATES.includes(rm.state)) return "unknown";
   if (rm.state !== "available") return rm.state;
@@ -335,6 +408,7 @@ async function refresh() {
     const data = await res.json();
     document.getElementById('stale').style.display =
       data.stale ? 'block' : 'none';
+    renderObservation(data.observation);
     const tbody = document.querySelector('#units tbody');
     tbody.replaceChildren();
     for (const p of (data.panes || [])) {
@@ -371,6 +445,10 @@ async function refresh() {
     }
   } catch (e) { /* daemon restarting; next poll recovers */ }
 }
+// Explicit operator reload (v1 freshness model = explicit reload + action-time
+// live preflight): re-fetch the snapshot on demand. Refreshing the display moves
+// no workflow gate and authorizes no action.
+document.getElementById('reload').addEventListener('click', refresh);
 refresh();
 setInterval(refresh, 5000);
 </script>

@@ -363,14 +363,24 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             # network); the observation clock is stamped here at the I/O layer.
             from datetime import datetime, timezone
 
-            from mozyo_bridge.application.cockpit_ui import attach_attention
+            from mozyo_bridge.application.cockpit_ui import (
+                attach_attention,
+                attach_observation,
+            )
 
+            now = datetime.now(timezone.utc)
             payload = attach_attention(
                 payload,
-                observed_at=datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
+                observed_at=now.isoformat(timespec="seconds"),
             )
+            # Fifth join layer (Redmine #12225): the runtime observation
+            # freshness envelope for the displayed snapshot itself (observed_at /
+            # freshness / readability / display_state), so the cockpit can show
+            # "last refreshed" and surface stale / unreadable / unknown rather
+            # than letting a cached view read as current. Derived from the same
+            # `snapshot` as the rows, via the `observe reload` mapping. Diagnostic
+            # only: it moves no gate and authorizes no action.
+            payload = attach_observation(payload, snapshot, now=now)
             self._respond_json(200, payload)
             return
         if self.path == "/api/transitions":

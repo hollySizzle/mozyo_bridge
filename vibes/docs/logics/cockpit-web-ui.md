@@ -11,7 +11,7 @@ Redmine #11639 (#11679/#11680/#11681/#11682)。コックピット表示面の設
   host非依存: 既定 host は iTerm2 Toolbelt webview。任意ブラウザで同一 UI (iTerm2 専用 code を UI に入れない)
 endpoints:
   "GET /": 単一 self-contained HTML (外部 asset / CDN なし — 持ち出し経路を作らない)
-  "GET /api/units": session inventory snapshot (四層: tmux=行の存在+stale / OTel=activity / Redmine=段階4 join / attention=#12007 派生 projection)
+  "GET /api/units": session inventory snapshot (五層: tmux=行の存在+stale / OTel=activity / Redmine=段階4 join / attention=#12007 派生 projection / observation=#12225 runtime observation freshness envelope)
   "GET /api/transitions": activity 遷移の ring buffer (memory のみ、daemon 再起動で消える = best-effort 整合)
   "POST /api/actions/reveal": repo_root を macOS `open` で開く
   "POST /api/actions/jump": attach client を `tmux switch-client -c <client> -t <session>:<window>` で移動
@@ -44,6 +44,17 @@ endpoints:
 - **public-safe**: `source_refs` は tmux pane id のみで、private path / secret を出さない。
 - **cockpit 層限定 + 制限**: `redmine` join と同様 `/api/units` でのみ付与し、`session list` CLI payload は attention-free。inventory 層は `@mozyo_lane_id` を解決しないため projected `lane_id` は `default`、per-pane の role-ambiguity flag も持たない (`agents targets` は `ambiguous` を持つ)。`unit_id` は opaque provenance であり routing key ではない。
 - UI: built-in HTML は本 join を必須描画しない (indicator surface であり app platform ではない)。private consumer / 外部 frontend が `attention` field を読んで独自 view を組む。
+
+## Runtime observation reload / freshness 表示 (#12225)
+
+cockpit / GUI で runtime observation が **timestamped snapshot** であることを明示し、operator が手動 reload できるようにする US。正本契約は `runtime-observability-boundary.md` の `## Runtime Observation Snapshot Contract` (#12223) と `### Contract handoff to follow-up issues` の `"#12225 cockpit UI"`、reload CLI は #12224。
+
+- **additive な第五 join 層**: `/api/units` payload に top-level `observation` field を付与する。中身は #12224 の runtime observation snapshot envelope (`observed_at` / `source` / `method` / `freshness` / `readability` / `strength` / `stale_reason` / `display_state`)。実装は `cockpit_ui.py` `attach_observation` が、表示中の inventory snapshot **と同じ snapshot** から `commands_runtime_observation.snapshot_from_inventory` (= `observe reload` CLI が使う唯一の inventory→envelope 写像) で導出する。CLI と GUI が freshness 判定で drift しない。tmux / OTel / Redmine / attention 層と `pane_id` identity は変更しない (純粋に追加)。
+- **UI: Reload button + freshness 行**: built-in HTML に手動 **Reload** ボタンと `observed_at / freshness / display_state (stale_reason)` を表示する 1 行を持つ。描画は phase 3 と同じ DOM API (`textContent` / `createElement`) のみで、display_state の class は whitelist (`obs-healthy` / `obs-reload_required` / `obs-unknown`) から選ぶ (untrusted payload が class を inject できない)。
+- **fail-closed freshness (stale / unreadable / unknown を隠さない)**: stale / unreadable / contradictory snapshot は `display_state` を `reload_required` / `unknown` に倒し、決して `healthy` にしない (`runtime-observability-boundary.md` `### Freshness / fail-safe semantics`)。cache projection は `readability=partial` のため fresh-age でも `reload_required`。visible な「これは stale / cache 由来」ラベルは `freshness` field に残るので、snapshot は表示しつつ current とは読ませない。`completed` / `approved` / `current_status` / `delivered` / `accepted` 等の truth-like generic field は envelope に出さない (test で pin)。
+- **diagnostic / display only**: `observation` 層も reload button も workflow truth / owner approval / review / routing / close / completion を更新しない。表示 snapshot は action 許可ではなく、side-effecting action (reveal / jump) は従来どおり実行時に live runtime で pane を再解決する action-time live preflight (`_resolve_record`、`action-time-live-preflight` 境界) を行う。表示 snapshot の鮮度を action 許可に昇格させない。
+- **v1 freshness モデル = explicit reload + action-time preflight**: 本 US は polling / WebSocket / sidecar push を追加しない。既存の自動 poll (`setInterval`、#11679) は据え置きで、手動 Reload が explicit-reload affordance を担う。継続観測の formalization は #12227 future scope。
+- **cockpit 層限定**: `redmine` / `attention` join と同様 `/api/units` でのみ付与し、`session list` CLI payload は observation-free。
 
 ## 遷移フィード (#11681)
 
