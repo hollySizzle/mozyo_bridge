@@ -6,7 +6,7 @@ Redmine #11889。git worktree の生成・削除・命名・並列運用 policy 
 
 ## 背景
 
-`#11850` の cockpit サブレーン PoC では、issue ごとに git worktree を作り、lane / pane / branch / Redmine gate を対応させる運用が有効だった (運用哲学は [[logic-cockpit-sublane-operating-model]]、bandwidth/admission は [[logic-sublane-bandwidth-policy]])。
+`#11850` の cockpit サブレーン PoC では、issue ごとに git worktree を作り、lane / pane / branch / Redmine gate を対応させる運用が有効だった (運用哲学は [[logic-coordinator-sublane-development-flow]]、bandwidth/admission は [[logic-sublane-bandwidth-policy]])。
 
 一方で `git worktree add/remove`、issue 番号からの branch/path 強制生成、削除 policy、N 本並列運用 policy まで mozyo-bridge core に取り込むと、core が **agent / session / handoff の identity・discovery・safety primitive** から **Git workflow manager** へ肥大する。`#11889` はこの肥大を避ける境界を固定する。
 

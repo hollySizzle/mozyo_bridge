@@ -1741,7 +1741,6 @@ class ScaffoldRulesTest(unittest.TestCase):
     # ------------------------------------------------------------------
     WORKTREE_RUNBOOK_PATHS = (
         "vibes/docs/logics/worktree-lifecycle-boundary.md",
-        "vibes/docs/logics/sublane-worktree-operating-runbook.md",
         "vibes/docs/logics/worktree-runbook-catalog-registration.md",
     )
 
@@ -1865,19 +1864,20 @@ class ScaffoldRulesTest(unittest.TestCase):
     def test_worktree_runbook_packaged_docs_match_authored_sources(self) -> None:
         """Sync-check: packaged runbook copies == authored repo sources.
 
-        The scaffold ships byte copies of this repo's authored
-        `vibes/docs/logics/worktree-lifecycle-boundary.md` and
-        `sublane-worktree-operating-runbook.md`. This drift test fails if
-        a packaged copy diverges from the source-of-truth doc; regenerate
-        the copies (re-copy from `vibes/docs/logics/`) when the authored
-        docs change. The catalog-registration note is scaffold-only and
-        intentionally NOT part of this pair.
+        The scaffold ships a byte copy of this repo's authored
+        `vibes/docs/logics/worktree-lifecycle-boundary.md`. This drift
+        test fails if a packaged copy diverges from the source-of-truth
+        doc; regenerate the copies (re-copy from `vibes/docs/logics/`)
+        when the authored doc changes. The catalog-registration note is
+        scaffold-only and intentionally NOT part of this pair.
+
+        `sublane-worktree-operating-runbook.md` was consolidated into
+        `coordinator-sublane-development-flow.md` and physically removed
+        in Redmine #12215; the packaged copies were retired with it
+        (Redmine #12235), so it is no longer a synced doc here.
         """
         repo_root = Path(__file__).resolve().parents[1]
-        synced_docs = (
-            "worktree-lifecycle-boundary.md",
-            "sublane-worktree-operating-runbook.md",
-        )
+        synced_docs = ("worktree-lifecycle-boundary.md",)
         for preset in ("redmine-governed", "redmine-rails-governed"):
             for doc in synced_docs:
                 with self.subTest(preset=preset, doc=doc):

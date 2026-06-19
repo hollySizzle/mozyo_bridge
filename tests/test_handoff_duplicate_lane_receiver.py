@@ -188,15 +188,16 @@ class SameLaneReceiverDuplicatesUnitTest(unittest.TestCase):
             lane_id="lane-369a873af1b2",
             lane_label="issue_12226",
             command="claude",
-            cwd="/Users/somebody/secret/checkout",
+            cwd="/workspace/project-alpha/private/checkout",
             pane_active="0",
         )
         row = duplicate_pane_record_row(secret)
         self.assertIn("%16", row)
         self.assertIn("inactive", row)
         self.assertIn("issue_12226", row)
-        self.assertNotIn("/Users/", row)
-        self.assertNotIn("/secret/", row)
+        self.assertNotIn("/workspace/", row)
+        self.assertNotIn("project-alpha", row)
+        self.assertNotIn("/private/", row)
 
 
 class BuildDeliveryRecordDuplicateAdvisoryTest(unittest.TestCase):
