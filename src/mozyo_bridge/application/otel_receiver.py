@@ -396,6 +396,12 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         if self.path in ("/api/actions/reveal", "/api/actions/jump"):
             self._handle_action(self.path.rsplit("/", 1)[1])
             return
+        if self.path in (
+            "/api/actions/grouped-reveal",
+            "/api/actions/grouped-jump",
+        ):
+            self._handle_grouped_action(self.path.rsplit("/", 1)[1])
+            return
         signal = _SIGNAL_PATHS.get(self.path)
         if signal is None:
             self._respond_json(404, {"error": "unknown path"})
@@ -527,6 +533,52 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
                 result = reveal_in_finder(pane_id, home=home)
             else:
                 result = jump_to_unit(pane_id, home=home)
+        except CockpitActionError as exc:
+            self._respond_json(409, {"error": str(exc)})
+            return
+        self._respond_json(200, result)
+
+    def _handle_grouped_action(self, kind: str) -> None:
+        """Grouped cockpit Unit actions (Redmine #12265).
+
+        Same explicit-click security gate as :meth:`_handle_action`
+        (:meth:`_action_intent_rejected`). The request body carries only a
+        grouped read-model *candidate* Unit identity (``workspace_id`` /
+        ``role`` / optional ``lane_id`` / ``host_id``) — never a pane id baked
+        into the displayed projection. The action re-resolves that identity
+        against a fresh live inventory and fails closed (409) on a stale /
+        ambiguous / missing / remote / non-default-lane target, so the grouped
+        projection can only *name* a candidate, never authorize a side effect.
+        """
+        from mozyo_bridge.application.cockpit_ui import (
+            CockpitActionError,
+            grouped_jump,
+            grouped_reveal,
+        )
+
+        if self._action_intent_rejected():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._respond_json(400, {"error": "request body must be JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._respond_json(
+                400, {"error": "request body must be a JSON object"}
+            )
+            return
+        home = getattr(self.server, "home", None)
+        action = grouped_reveal if kind == "grouped-reveal" else grouped_jump
+        try:
+            result = action(
+                workspace_id=payload.get("workspace_id"),
+                role=payload.get("role"),
+                lane_id=payload.get("lane_id") or "default",
+                host_id=payload.get("host_id") or "local",
+                home=home,
+            )
         except CockpitActionError as exc:
             self._respond_json(409, {"error": str(exc)})
             return

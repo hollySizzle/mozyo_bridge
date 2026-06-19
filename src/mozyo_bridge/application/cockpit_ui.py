@@ -283,6 +283,193 @@ def jump_to_unit(pane_id: str, *, home: Path | None = None) -> dict:
     }
 
 
+# --- grouped cockpit Unit actions (Redmine #12265) ---------------------------
+#
+# A grouped cockpit UI (the Project Group -> Unit view the #12264 grouped read
+# model projects) lets the operator act on a *Unit row*, which carries no pane /
+# Target — only the Unit's public-safe identity (workspace_id / lane_id /
+# host_id). The grouped read model is a display projection and NEVER a routing
+# authority: its group membership, position, ``active`` flag and freshness are
+# display state, not a permission (``unit-target-model.md`` "Target resolver は
+# Project Group を authority として使わない"; ``runtime-observability-boundary.md``
+# ``## Action-Time Live Preflight Boundary``).
+#
+# So a grouped action takes only the candidate Unit identity and re-resolves it
+# to exactly one live pane against a FRESH inventory at action time, failing
+# closed on every uncertainty, then delegates the side effect to the existing
+# pane-centric ``reveal_in_finder`` / ``jump_to_unit`` — action permission stays
+# with the established live-preflight surface, never with the displayed snapshot.
+
+DEFAULT_LANE: str = "default"
+DEFAULT_HOST: str = "local"
+
+
+def candidate_unit_selector(unit_view) -> dict:
+    """The identity selector a grouped action may carry from a read-model row.
+
+    A :class:`~mozyo_bridge.domain.grouped_read_model.UnitView` is display state.
+    Only its public-safe *identity* (``workspace_id`` / ``lane_id`` / ``host_id``)
+    may seed an action; the row's ``group_id`` / ``active`` / ``position`` /
+    freshness are display facts, never routing authority. A degraded row — one
+    that ``needs_reload`` (stale / unreadable / contradicted / identity_conflict /
+    desired_unit_missing / partial / unknown) — yields no selector at all: it
+    fails closed so the operator must reload and live-preflight first.
+
+    This helper may consult the snapshot's status only to *refuse* (fail closed),
+    never to *permit*: a fresh row contributes identity only, and the side
+    effect's permission is still decided by the action-time live preflight in
+    :func:`_resolve_unit_target`, not by this row.
+    """
+    if getattr(unit_view, "needs_reload", True):
+        raise CockpitActionError(
+            "the displayed unit row is not current (status="
+            f"{getattr(unit_view, 'status', 'unknown')!r}); reload and "
+            "live-preflight before acting on it."
+        )
+    return {
+        "workspace_id": unit_view.workspace_id,
+        "lane_id": unit_view.lane_id,
+        "host_id": unit_view.host_id,
+    }
+
+
+def _resolve_unit_target(
+    *,
+    workspace_id: str,
+    role: str,
+    lane_id: str = DEFAULT_LANE,
+    host_id: str = DEFAULT_HOST,
+    home: Path | None = None,
+) -> InventoryRecord:
+    """Action-time live preflight for a grouped read-model *candidate* Unit.
+
+    Maps a candidate Unit identity (the only thing a grouped read-model row may
+    contribute) to exactly one live pane, ignoring the displayed projection
+    entirely and re-querying a fresh inventory. Fails closed on every
+    uncertainty so a grouped projection can only *name* a candidate, never
+    authorize a side effect:
+
+    - a missing / empty ``workspace_id`` or a non-agent ``role`` is rejected;
+    - a non-local ``host_id`` or a non-``default`` ``lane_id`` is rejected — the
+      cockpit inventory observes the local tmux server only and does not resolve
+      the ``@mozyo_lane_id`` pane option (every pane projects to the ``default``
+      lane), so such a candidate cannot be faithfully resolved here and must use
+      an explicit live target rather than risk acting on a same-named pane
+      (``local-remote-cockpit-host-boundary.md`` / ``unit-target-model.md``);
+    - a stale snapshot (tmux runtime unreadable) is rejected;
+    - zero live panes matching the identity is rejected (the Unit may have
+      exited); and
+    - more than one matching live pane is *ambiguous* and rejected (a contradicted
+      / drifted projection never picks one silently).
+    """
+    from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
+
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise CockpitActionError(
+            "grouped action requires a workspace_id from the candidate unit."
+        )
+    if role not in (ROLE_CLAUDE, ROLE_CODEX):
+        raise CockpitActionError(
+            "grouped action requires an agent role (claude/codex); got "
+            f"{role!r}."
+        )
+    if host_id != DEFAULT_HOST:
+        raise CockpitActionError(
+            f"grouped action cannot resolve a non-local host ({host_id!r}); the "
+            "cockpit inventory observes the local tmux server only. Use an "
+            "explicit live target."
+        )
+    if lane_id != DEFAULT_LANE:
+        raise CockpitActionError(
+            f"grouped action cannot resolve a non-default lane ({lane_id!r}) "
+            "from the cockpit inventory, which does not read @mozyo_lane_id. "
+            "Use an explicit live pane target."
+        )
+    snapshot = take_inventory(home=home)
+    if snapshot.stale:
+        raise CockpitActionError(
+            "tmux runtime is unavailable (snapshot is stale); cannot act on "
+            "panes right now. Check the tmux server and refresh."
+        )
+    matches = [
+        record
+        for record in snapshot.records
+        if record.agent_kind == role
+        and record.workspace is not None
+        and record.workspace.workspace_id == workspace_id
+    ]
+    if not matches:
+        raise CockpitActionError(
+            f"no live {role} pane for workspace {workspace_id!r} is in the "
+            "runtime inventory (the unit may have exited). Refresh the unit "
+            "list."
+        )
+    if len(matches) > 1:
+        candidates = ", ".join(sorted(record.pane_id for record in matches))
+        raise CockpitActionError(
+            f"grouped target is ambiguous: {len(matches)} live {role} panes "
+            f"match workspace {workspace_id!r} ({candidates}). Use an explicit "
+            "pane target."
+        )
+    return matches[0]
+
+
+def grouped_reveal(
+    *,
+    workspace_id: str,
+    role: str,
+    lane_id: str = DEFAULT_LANE,
+    host_id: str = DEFAULT_HOST,
+    home: Path | None = None,
+) -> dict:
+    """Reveal a grouped *candidate* Unit's repo root, resolved live at action time.
+
+    The candidate identity is re-resolved to a single live pane via
+    :func:`_resolve_unit_target` (fail-closed), then the side effect runs through
+    the existing pane-centric :func:`reveal_in_finder` — so action permission
+    stays with the established live-preflight surface, never with the grouped
+    read model.
+    """
+    record = _resolve_unit_target(
+        workspace_id=workspace_id,
+        role=role,
+        lane_id=lane_id,
+        host_id=host_id,
+        home=home,
+    )
+    result = reveal_in_finder(record.pane_id, home=home)
+    result["workspace_id"] = workspace_id
+    result["role"] = role
+    return result
+
+
+def grouped_jump(
+    *,
+    workspace_id: str,
+    role: str,
+    lane_id: str = DEFAULT_LANE,
+    host_id: str = DEFAULT_HOST,
+    home: Path | None = None,
+) -> dict:
+    """Jump to a grouped *candidate* Unit's window, resolved live at action time.
+
+    Like :func:`grouped_reveal`: the candidate identity is re-resolved to a
+    single live pane via :func:`_resolve_unit_target` (fail-closed), then the
+    side effect runs through the existing pane-centric :func:`jump_to_unit`.
+    """
+    record = _resolve_unit_target(
+        workspace_id=workspace_id,
+        role=role,
+        lane_id=lane_id,
+        host_id=host_id,
+        home=home,
+    )
+    result = jump_to_unit(record.pane_id, home=home)
+    result["workspace_id"] = workspace_id
+    result["role"] = role
+    return result
+
+
 # The page is a single self-contained document: no external assets, no
 # CDN, nothing fetched off-host — consistent with the loopback-only and
 # no-exfiltration posture. Kept intentionally small; it is an indicator
