@@ -352,8 +352,13 @@ private policy で黙って補正しない。
 > projection であり、Target / pane / route / approval を一切持たない (`*View` 命名で
 > canonical `TargetRecord` / `UnitRecord` と区別する)。config と runtime observation の
 > 矛盾は visible degraded status (`identity_conflict` / `desired_unit_missing` /
-> `stale` / `unreadable` / `contradicted`) として残し、hidden(desired) と active(observed)
-> を別 bucket で分離し、stale/unreadable/contradictory は `healthy` を導出せず
+> `stale` / `partial` / `unreadable` / `contradicted` / `unknown`) として残し、
+> partial/reload_required な observation も `observed` にせず needs_reload に倒す。
+> `desired_unit_missing` 判定は override の host-aware selector (`UnitOverride.selects`)
+> で行い host-specific override を別 host で隠さない。config 不在時は repo/workspace
+> label ごとの default group に分け、distinct project を混ぜない。
+> hidden(desired) と active(observed) を別 bucket で分離し、
+> stale/unreadable/contradictory は `healthy` を導出せず
 > reload/live preflight を要求する (上記 fallback matrix と
 > `runtime-observability-boundary.md` の fail-safe semantics 準拠)。action permission は
 > side-effecting command の action-time live preflight が決める。残作業の on-disk loader

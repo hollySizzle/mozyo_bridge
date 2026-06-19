@@ -34,6 +34,7 @@ from mozyo_bridge.domain.grouped_read_model import (
     GROUPED_READ_MODEL_DIAGNOSTIC_ONLY_NOTE,
     UNIT_STATUS_CONTRADICTED,
     UNIT_STATUS_OBSERVED,
+    UNIT_STATUS_PARTIAL,
     UNIT_STATUS_STALE,
     UNIT_STATUS_UNKNOWN,
     UNIT_STATUS_UNREADABLE,
@@ -59,6 +60,7 @@ from mozyo_bridge.domain.runtime_observation import (
     FRESHNESS_FRESH,
     FRESHNESS_STALE,
     FRESHNESS_UNKNOWN,
+    READABILITY_PARTIAL,
     READABILITY_READABLE,
     READABILITY_UNREADABLE,
     SOURCE_TMUX,
@@ -488,6 +490,224 @@ class NoActionPermissionLeakageTests(unittest.TestCase):
         forbidden = {"completed", "approved", "current_status", "delivered", "accepted"}
         unit_payload = model.as_payload()["groups"][0]["units"][0]
         self.assertEqual(set(unit_payload) & forbidden, set())
+
+
+def _partial_observation() -> RuntimeObservationSnapshot:
+    # freshness=fresh but the source was only partially readable -> reload_required.
+    return RuntimeObservationSnapshot(
+        observed_at="2026-06-19T14:00:00Z",
+        source=SOURCE_TMUX,
+        method="live_query",
+        freshness=FRESHNESS_FRESH,
+        readability=READABILITY_PARTIAL,
+        strength=STRENGTH_STRONG_RUNTIME_SIGNAL,
+        stale_reason="reload_required",
+        contradiction=None,
+        display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+    )
+
+
+def _fresh_but_reload_required_observation() -> RuntimeObservationSnapshot:
+    # A defensively inconsistent snapshot: fresh + readable fields, yet
+    # display_state demands reload. It must still never read as observed.
+    return RuntimeObservationSnapshot(
+        observed_at="2026-06-19T14:00:00Z",
+        source=SOURCE_TMUX,
+        method="live_query",
+        freshness=FRESHNESS_FRESH,
+        readability=READABILITY_READABLE,
+        strength=STRENGTH_STRONG_RUNTIME_SIGNAL,
+        stale_reason="reload_required",
+        contradiction=None,
+        display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+    )
+
+
+class PartialReloadRequiredTests(unittest.TestCase):
+    """Review j#61833/j#61835 finding 1: partial / reload_required is not observed."""
+
+    def test_partial_readability_is_degraded_not_observed(self) -> None:
+        units = [
+            ObservedUnit(
+                workspace_id="ws-a",
+                repo_label="alpha",
+                active=True,
+                observation=_partial_observation(),
+            )
+        ]
+        model = build_grouped_read_model(None, units)
+        unit = model.all_units()[0]
+        self.assertNotEqual(unit.status, UNIT_STATUS_OBSERVED)
+        self.assertEqual(unit.status, UNIT_STATUS_PARTIAL)
+        self.assertTrue(unit.needs_reload)
+
+    def test_reload_required_display_state_is_never_observed(self) -> None:
+        units = [
+            ObservedUnit(
+                workspace_id="ws-a",
+                repo_label="alpha",
+                active=True,
+                observation=_fresh_but_reload_required_observation(),
+            )
+        ]
+        model = build_grouped_read_model(None, units)
+        unit = model.all_units()[0]
+        self.assertNotEqual(unit.status, UNIT_STATUS_OBSERVED)
+        self.assertTrue(unit.needs_reload)
+
+
+class DefaultLabelGroupingTests(unittest.TestCase):
+    """Review j#61835 finding 1: config-absent default groups by repo/workspace label."""
+
+    def test_distinct_repo_labels_form_distinct_default_groups(self) -> None:
+        units = [
+            ObservedUnit(
+                workspace_id="ws-a",
+                repo_label="alpha",
+                active=True,
+                observation=_fresh_observation(),
+            ),
+            ObservedUnit(
+                workspace_id="ws-b",
+                repo_label="bravo",
+                active=True,
+                observation=_fresh_observation(),
+            ),
+        ]
+        model = build_grouped_read_model(None, units)
+        # Two distinct labeled default groups, not one mixed unlabeled bucket.
+        self.assertEqual(len(model.groups), 2)
+        labels = sorted(group.label for group in model.groups)
+        self.assertEqual(labels, ["alpha", "bravo"])
+        for group in model.groups:
+            self.assertEqual(group.source, GROUP_SOURCE_DEFAULT)
+            self.assertIsNone(group.group_id)
+            self.assertEqual(len(group.all_units()), 1)
+
+    def test_same_label_units_share_one_default_group(self) -> None:
+        units = [
+            ObservedUnit(
+                workspace_id="ws-a",
+                lane_id="default",
+                repo_label="alpha",
+                active=True,
+                observation=_fresh_observation(),
+            ),
+            ObservedUnit(
+                workspace_id="ws-a",
+                lane_id="issue-1",
+                repo_label="alpha",
+                active=True,
+                observation=_fresh_observation(),
+            ),
+        ]
+        model = build_grouped_read_model(None, units)
+        self.assertEqual(len(model.groups), 1)
+        (group,) = model.groups
+        self.assertEqual(group.label, "alpha")
+        self.assertEqual(len(group.all_units()), 2)
+
+
+class HostAwareMissingOverrideTests(unittest.TestCase):
+    """Review j#61833/j#61835 finding 2: missing-override detection respects host_id."""
+
+    def _config(self) -> PresentationGroupingConfig:
+        return PresentationGroupingConfig.from_record(
+            {
+                "version": 1,
+                "project_groups": [{"group_id": "project:x", "label": "X"}],
+                "grouping": {
+                    "unit_overrides": [
+                        {
+                            "host_id": "remote",
+                            "workspace_id": "ws-a",
+                            "lane_id": "default",
+                            "preferred_group": "project:x",
+                        }
+                    ]
+                },
+            }
+        )
+
+    def test_host_specific_override_not_masked_by_other_host(self) -> None:
+        # Override targets host=remote; only a host=local Unit on the same
+        # workspace/lane is observed -> the remote desired Unit must still surface.
+        model = build_grouped_read_model(
+            self._config(),
+            [
+                ObservedUnit(
+                    workspace_id="ws-a",
+                    lane_id="default",
+                    host_id="local",
+                    active=True,
+                    observation=_fresh_observation(),
+                )
+            ],
+        )
+        missing = [
+            unit
+            for unit in model.all_units()
+            if unit.status == STATUS_DESIRED_UNIT_MISSING
+        ]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].host_id, "remote")
+        self.assertTrue(any("host remote" in note for note in model.diagnostics))
+
+    def test_host_specific_override_present_when_host_matches(self) -> None:
+        model = build_grouped_read_model(
+            self._config(),
+            [
+                ObservedUnit(
+                    workspace_id="ws-a",
+                    lane_id="default",
+                    host_id="remote",
+                    active=True,
+                    observation=_fresh_observation(),
+                )
+            ],
+        )
+        self.assertFalse(
+            any(
+                unit.status == STATUS_DESIRED_UNIT_MISSING
+                for unit in model.all_units()
+            )
+        )
+
+    def test_host_unspecified_override_is_any_host(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {
+                "version": 1,
+                "project_groups": [{"group_id": "project:x", "label": "X"}],
+                "grouping": {
+                    "unit_overrides": [
+                        {
+                            "workspace_id": "ws-a",
+                            "lane_id": "default",
+                            "preferred_group": "project:x",
+                        }
+                    ]
+                },
+            }
+        )
+        # A host-unspecified override matches any host -> not missing.
+        model = build_grouped_read_model(
+            config,
+            [
+                ObservedUnit(
+                    workspace_id="ws-a",
+                    lane_id="default",
+                    host_id="local",
+                    active=True,
+                    observation=_fresh_observation(),
+                )
+            ],
+        )
+        self.assertFalse(
+            any(
+                unit.status == STATUS_DESIRED_UNIT_MISSING
+                for unit in model.all_units()
+            )
+        )
 
 
 class EmptyInputTests(unittest.TestCase):

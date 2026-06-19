@@ -50,9 +50,9 @@ Boundary, kept enforced in code (the read model is a **projection only**):
   shown in a separate hidden bucket with ``active=True`` — never dropped, killed,
   detached, or rerouted (fallback matrix: "display hidden preference and live
   availability separately").
-- **Behavior-preserving default.** With no grouping config every Unit falls into
-  the ungrouped / default bucket keyed on its public repo / workspace label, the
-  current behavior.
+- **Behavior-preserving default.** With no grouping config each Unit falls into a
+  default group keyed on its public repo / workspace label, so distinct projects
+  stay in distinct labeled default groups — the current behavior.
 
 On-disk config loading (``.mozyo-bridge/config.yaml``) and DB current-table
 migration are deliberately **out of scope** here: this slice consumes config /
@@ -80,16 +80,15 @@ from mozyo_bridge.domain.presentation_grouping import (
     PresentationGroupingConfig,
     ProjectGroup,
     UnitOverride,
-    diagnose_unit_overrides,
     resolve_launch_placement,
 )
 from mozyo_bridge.domain.runtime_observation import (
-    DISPLAY_STATE_RELOAD_REQUIRED,
     DISPLAY_STATE_UNKNOWN,
     FRESHNESS_EXPIRED,
     FRESHNESS_STALE,
     FRESHNESS_UNKNOWN,
     METHOD_PROJECTION_READ,
+    READABILITY_PARTIAL,
     READABILITY_READABLE,
     READABILITY_UNREADABLE,
     SOURCE_CACHE,
@@ -105,6 +104,7 @@ from mozyo_bridge.domain.runtime_observation import (
 #: layer and the read-model layer speak one status vocabulary.
 UNIT_STATUS_OBSERVED: str = "observed"
 UNIT_STATUS_STALE: str = "stale"
+UNIT_STATUS_PARTIAL: str = "partial"
 UNIT_STATUS_UNREADABLE: str = "unreadable"
 UNIT_STATUS_CONTRADICTED: str = "contradicted"
 UNIT_STATUS_UNKNOWN: str = "unknown"
@@ -150,15 +150,21 @@ def _unit_status_from_observation(
 
     Precedence is most-severe-first (the attention-derivation posture: a stronger
     degraded signal beats a weaker one). A degraded observation never resolves to
-    ``observed``; ``observed`` requires a fresh, readable, uncontradicted snapshot.
-    Identity conflict and desired-unit-missing are decided by the caller (they are
-    config-vs-runtime facts, not observation-quality facts) and take precedence
-    over anything derived here.
+    ``observed``; ``observed`` requires a fully readable, fresh, uncontradicted
+    snapshot — equivalently, ``not observation.needs_reload``. A ``partial``
+    readability or a ``reload_required`` display_state is fail-closed to a visible
+    degraded status (never ``observed``), matching ``runtime_observation`` and the
+    fail-safe semantics of ``runtime-observability-boundary.md``. Identity conflict
+    and desired-unit-missing are decided by the caller (they are config-vs-runtime
+    facts, not observation-quality facts) and take precedence over anything derived
+    here.
     """
     if observation.contradiction is not None:
         return UNIT_STATUS_CONTRADICTED
     if observation.readability == READABILITY_UNREADABLE:
         return UNIT_STATUS_UNREADABLE
+    if observation.readability == READABILITY_PARTIAL:
+        return UNIT_STATUS_PARTIAL
     if observation.freshness in (FRESHNESS_STALE, FRESHNESS_EXPIRED):
         return UNIT_STATUS_STALE
     if (
@@ -166,6 +172,11 @@ def _unit_status_from_observation(
         or observation.display_state == DISPLAY_STATE_UNKNOWN
     ):
         return UNIT_STATUS_UNKNOWN
+    # Final fail-safe: any snapshot still flagged for reload (e.g. a
+    # reload_required display_state with otherwise-fresh fields) is never
+    # ``observed``.
+    if observation.needs_reload:
+        return UNIT_STATUS_STALE
     return UNIT_STATUS_OBSERVED
 
 
@@ -471,8 +482,9 @@ def build_grouped_read_model(
     Group) with the #12224 observation envelope (freshness / contradiction), then
     buckets the resulting rows into Project Group views.
 
-    - ``config`` ``None`` / empty -> the behavior-preserving default: every Unit
-      lands in the ungrouped / default bucket keyed on its repo / workspace label.
+    - ``config`` ``None`` / empty -> the behavior-preserving default: each Unit
+      lands in a default group keyed on its public repo / workspace label, so
+      distinct projects / sublanes stay in distinct (labeled) default groups.
     - A config override that names a Unit not in ``observed_units`` becomes a
       visible ``desired_unit_missing`` row in its desired group (config/runtime
       contradiction), never a fabricated live Unit.
@@ -494,18 +506,27 @@ def build_grouped_read_model(
         placement = resolve_launch_placement(config, observed.launch_context())
         rows.append(_unit_view_from_observed(observed, placement))
 
-    # Surface config overrides whose Unit is not in the observed set as visible
-    # desired_unit_missing rows (config/runtime contradiction).
-    known_units = frozenset(
-        (observed.workspace_id, observed.lane_id) for observed in observed_units
-    )
+    # Surface config overrides that select no observed Unit as visible
+    # desired_unit_missing rows (config/runtime contradiction). Detection uses the
+    # override's own host-aware selector (``UnitOverride.selects`` — the same
+    # selector ``resolve_launch_placement`` applies), so it is the exact
+    # complement of the present-override path and a host-specific override
+    # (``host_id`` set) is NOT masked by another host's same workspace/lane. A
+    # host-unspecified override stays an any-host selector. This deliberately
+    # supersedes the coarser ``presentation_grouping.diagnose_unit_overrides``
+    # (workspace/lane-keyed), which is blind to ``host_id``.
+    contexts = [observed.launch_context() for observed in observed_units]
     diagnostics: list[str] = []
-    for override, _status in diagnose_unit_overrides(config, known_units):
+    for override in config.unit_overrides:
+        if any(override.selects(context) for context in contexts):
+            continue
         group = config.group(override.preferred_group)
         rows.append(_unit_view_from_missing_override(override, group))
+        host_note = f", host {override.host_id}" if override.host_id else ""
         diagnostics.append(
             f"desired_unit_missing: override for "
-            f"({override.workspace_id}, {override.lane_id}) has no observed Unit"
+            f"({override.workspace_id}, {override.lane_id}{host_note}) "
+            f"has no observed Unit"
         )
 
     # Bucket rows by group_id. ``None`` is the ungrouped / default bucket.
@@ -536,20 +557,30 @@ def build_grouped_read_model(
             )
         )
 
-    # The ungrouped / default bucket (group_id None), keyed per Unit on its own
-    # repo / workspace label — the behavior-preserving default placement.
-    ungrouped = rows_by_group.get(None, [])
-    if ungrouped:
+    # The default / ungrouped rows (group_id None) are the behavior-preserving
+    # default: bucket them by their public-safe repo / workspace label so distinct
+    # projects / sublanes form distinct, labeled default groups rather than one
+    # mixed unlabeled bucket (#12264: the cockpit reads a grouped view; the
+    # fallback matrix keys the config-absent default on repo / workspace label).
+    # group_id stays ``None`` because no config declared these groups; the group's
+    # display identity is its label.
+    default_collapsed = (
+        bool(config.defaults.collapsed)
+        if config.defaults.collapsed is not None
+        else False
+    )
+    default_buckets: dict[Optional[str], list[UnitView]] = {}
+    for row in rows_by_group.get(None, []):
+        default_buckets.setdefault(row.label, []).append(row)
+    for label in sorted(default_buckets, key=lambda text: (text is None, text or "")):
         groups.append(
             _build_group_view(
                 group_id=None,
-                label=None,
+                label=label,
                 source=GROUP_SOURCE_DEFAULT,
-                members=ungrouped,
+                members=default_buckets[label],
                 position=None,
-                collapsed=bool(config.defaults.collapsed)
-                if config.defaults.collapsed is not None
-                else False,
+                collapsed=default_collapsed,
             )
         )
 
@@ -624,6 +655,7 @@ def _build_group_view(
 __all__ = (
     "UNIT_STATUS_OBSERVED",
     "UNIT_STATUS_STALE",
+    "UNIT_STATUS_PARTIAL",
     "UNIT_STATUS_UNREADABLE",
     "UNIT_STATUS_CONTRADICTED",
     "UNIT_STATUS_UNKNOWN",
