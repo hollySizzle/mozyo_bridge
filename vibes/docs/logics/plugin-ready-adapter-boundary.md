@@ -177,7 +177,8 @@ Provider owns:
 Boundary:
 
 - runtime adapter may observe liveness but must not become durable identity.
-- completion truth should move toward machine-readable receiver signal when available.
+- receiver / assistant-turn observability should move toward machine-readable runtime
+  signal when available; task completion truth remains the ticket workflow record.
 
 First-candidate score: medium. The payoff is high, but send safety is risk-heavy. Do not
 start v0.8 here unless ticket adapter / presentation boundary work exposes a small pure

@@ -2,10 +2,11 @@
 
 ## Status
 
-- Draft: `v0.1`
+- Draft: `v0.2`
 - Scope: 現行 `mozyo-bridge` の tmux runtime において、`delivery ACK` / `task completion` / `receiver-state observability` を別概念として固定し、長期 PTY runtime (`mozyo_bridge_pty`) との接続を明示する doctrine
 - Decision level: architecture / doctrine boundary。CLI / preset / skill 実装の挙動変更は本 doc の射程外
 - 関連 task: Asana `1214767912195770` (handoff ack / receiver state observability 議論を vibes/docs/logics に反映する)
+- Redmine #12194: receiver ACK / completion signal groundwork。#12223 runtime observation snapshot、#12224 reload、#12226 action-time preflight、#12227 future sidecar split、#12229 duplicate receiver advisory の close/integration 後に、本 doc へ signal layer 境界を追記する
 - 上流 contract (前提): `mozyo_bridge_pty/vibes/docs/specs/transport-agnostic-ack-state-contract.md`、`mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md`
 
 ## この文書の目的
@@ -41,8 +42,10 @@
 
 - **delivery ACK** — sender 側から見た「receiver runtime へ input を staged / submitted した」事実。`mozyo_bridge_pty/vibes/docs/specs/transport-agnostic-ack-state-contract.md` の 7 state (`staging` / `submitted` / `acknowledged` / `pending_submit` / `rolled_back` / `delivery_failed` / `stage_failed`) を扱う。prompt-turn-level。`mozyo-bridge` 側の `DeliveryOutcome` taxonomy はこの上流 ACK contract への射影として `vibes/docs/logics/tmux-send-safety-contract.md` で固定済み。
 - **runtime input ack** — receiver runtime 内部から見た「stdin / structured input を受理した」signal。PTY sidecar の `runtime.input.ack`。低レベル signal であり durable に書く粒度ではない。
+- **runtime control event** — sidecar / PTY runtime / provider normalizer が emit する machine-readable event。例: `runtime.input.ack`、`runtime.process.exited`、`runtime.output.eof`。receiver-state observability の source にはなり得るが、workflow gate / owner approval / task completion ではない。
 - **receiver-state observability** — sender から見て「receiver runtime が今どうなっているか」を read-only に問い合わせるための surface。session-level の弱い projection を扱う。詳細は `mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md`。
 - **assistant turn completion** — provider が応答ターンを終えた事実。`mozyo_bridge_pty/vibes/docs/specs/pty-event-normalization.md` が `prompt.assistant_turn_finished` (confidence high) として扱う。本 doc の対象外。
+- **workflow truth** — Redmine / Asana 等の ticket system に残る issue / journal / comment / status / owner approval。実装完了、review、owner close approval、close 判断の source of truth。
 - **task completion** — ticket system 側の acceptance criteria。Asana / Redmine の durable record (task description + comment + state) が正本。本 doc の対象外。
 
 key boundary:
@@ -52,6 +55,144 @@ key boundary:
 - task completion は durable record が正本であり、上の二つから derive できない
 
 三者は同じ pipeline (agentd / sidecar、もしくは現状 tmux 経路) から養分を取るが、契約は別である。inspector が ACK の代替にはならないし、ACK が inspector の代替にもならないし、どちらも task completion の代替にはならない。
+
+## Receiver Signal Layer Model (Redmine #12194)
+
+#12194 では、#12223〜#12229 で確定した runtime observation / reload / action-time preflight /
+future sidecar / duplicate receiver advisory の成果を受け、receiver ACK / completion signal の
+groundwork を次の **signal layer** として固定する。layer を分ける目的は、stronger runtime
+signal が入ってきた時に、それを workflow truth や task completion へ誤昇格させないことである。
+
+```yaml
+receiver_signal_layers:
+  layer_0_sender_delivery_ack:
+    owns:
+      - DeliveryOutcome.status / reason / mode
+      - submitted_at 相当の sender-side事実
+      - pending_submit / rolled_back / stage_failed の durable wording
+    does_not_own:
+      - receiver runtime 内部の受理確認
+      - assistant turn completion
+      - workflow gate / task completion
+  layer_1_runtime_receiver_signal:
+    owns:
+      - runtime.input.ack
+      - runtime.process.exited
+      - runtime.output.eof
+      - last_input.ack_status / last_output_at / operator_action_required 等の inspector projection
+    source:
+      - future sidecar / control event / provider normalizer
+    does_not_own:
+      - review verdict
+      - owner close approval
+      - issue close / acceptance criteria
+  layer_2_provider_turn_signal:
+    owns:
+      - prompt.assistant_turn_finished
+      - provider-specific turn boundary normalization
+    source:
+      - provider normalizer / event classifier
+    does_not_own:
+      - task completion
+      - ticket-system status
+  layer_3_workflow_truth:
+    owns:
+      - Redmine issue / journal / status
+      - implementation_done / review_request / review / owner_close_approval / close
+      - acceptance criteria disposition
+    source:
+      - ticket provider adapter
+```
+
+禁止する shortcut:
+
+- `runtime.input.ack` を `implementation_done` と読むこと。
+- `runtime.output.eof` / `runtime.process.exited` を task completion と読むこと。
+- provider の `assistant_turn_finished` を Redmine close / owner approval と読むこと。
+- Redmine journal の存在を receiver runtime ACK と読むこと。
+
+許可する接続:
+
+- layer 0 の `DeliveryOutcome` は layer 1 の `last_input` projection へ部分写像できる。ただし tmux
+  runtime では `acknowledged_at` を持てないため、`submitted_at` 以上の receiver-side ACK を仮装しない。
+- layer 1 の runtime receiver signal は runtime observation snapshot の `source: sidecar` /
+  `method: live_query | poll | imported_event` として表示・診断できる。ただし `strength:
+  strong_runtime_signal` は workflow truth を意味しない。
+- layer 3 の workflow truth は ticket provider adapter 経由で normalized record として読める。
+  provider が API / URL / status update mechanics を所有しても、approval / close semantics は core /
+  governed workflow が所有する。
+
+### Minimal future runtime event vocabulary
+
+本 doc は実装 wire format を定義しないが、将来 `mozyo_bridge_pty` / sidecar / provider normalizer
+と接続する時の **意味語彙** を予約する。
+
+```yaml
+runtime_receiver_events:
+  runtime.input.ack:
+    meaning: receiver runtime が input を受理した
+    layer: runtime_receiver_signal
+    can_update:
+      - last_input.ack_status
+      - last_input.acknowledged_at
+    cannot_update:
+      - implementation_done
+      - review_request
+      - task_completion
+  runtime.process.exited:
+    meaning: receiver process が終了した
+    layer: runtime_receiver_signal
+    can_update:
+      - runtime_liveness
+      - receiver_state: exited | unknown
+    cannot_update:
+      - issue_status
+      - close_decision
+    fail_safe:
+      - unexpected exit => unknown / operator_action_required
+  runtime.output.eof:
+    meaning: observed output stream が EOF に到達した
+    layer: runtime_receiver_signal
+    can_update:
+      - output_stream_state
+      - last_output_at
+    cannot_update:
+      - assistant_turn_completion unless provider normalizer separately classifies it
+      - task_completion
+  prompt.assistant_turn_finished:
+    meaning: provider normalizer が assistant turn boundary を高信頼で分類した
+    layer: provider_turn_signal
+    can_update:
+      - assistant_turn_state
+    cannot_update:
+      - Redmine implementation_done / close
+```
+
+これらは `runtime-observability-boundary.md` の snapshot envelope に入る場合でも、`completed` /
+`approved` / `current_status` / `delivered` / `accepted` の generic field に変換しない。必要なら
+`runtime_liveness`、`delivery_ack_status`、`assistant_turn_state`、`workflow_gate` のように source
+を scope した field 名で扱う。
+
+### Ticket-system signal / provider boundary
+
+Redmine / Asana / future tracker の signal は terminal runtime adapter ではなく **ticket provider
+adapter** の責務で扱う。これは `plugin-ready-adapter-boundary.md` の `Ticket adapter` と
+`src/mozyo_bridge/domain/ticket_adapter.py` の境界に従う。
+
+- provider owns: API calls、issue / journal / comment fetch、status update mechanics、URL formatting。
+- core / governed workflow owns: gate vocabulary、owner approval separation、close prerequisites、
+  role boundary、secret / private data rule。
+- provider output は `IssueRef` / `JournalRef` / `CommentRef` / `WorkflowGate` /
+  `OwnerApproval` のような normalized record に畳む。provider 固有 API response を runtime
+  receiver-state と混ぜない。
+- `WorkflowGate` は provider-observable な durable journal fact であって、receiver process が input
+  を受理した事実ではない。
+- `OwnerApproval` は provider が「取得」できる record だが、approval が close 条件を満たすかは
+  core / governed workflow の decision である。provider が close authority を持たない。
+
+この境界により、将来 WebSocket / webhook / Redmine API polling / Asana event stream のような
+ticket-system signal が増えても、それは layer 3 workflow truth の freshness / projection を強くする
+だけであり、layer 1 receiver runtime ACK や layer 2 assistant turn completion にはならない。
 
 ## なぜ pane text / stdout silence を completion truth に昇格させてはいけないか
 
@@ -127,12 +268,17 @@ doctrine としての position:
 - **段階 1**: sidecar control event を subscribe して `last_input.ack_status` などの receiver-side signal を inspector に増やす。`mozyo-bridge` 側は projection 形を維持し、新 field の意味付けは inspector contract が所有する。
 - **段階 2**: provider normalizer / event classifier 経由で `runtime.session.busy` / `runtime.session.idle_likely` などの semantic event が classifier から流れ込む。`mozyo-bridge` の `DeliveryOutcome` taxonomy 自体は変更しない。
 - **段階 3**: application policy 層が `operator_action_required` / `heartbeat_stale` などの policy decision を inspector 経由で問い合わせる。`mozyo-bridge` 経路はここまで来ても completion judging には関与しない。
+- **段階 4**: ticket provider adapter が Redmine / Asana / future tracker の gate / approval / status
+  records を normalized workflow records として読む。これは receiver runtime signal の上位互換ではなく
+  別 layer の workflow truth である。terminal runtime adapter や sidecar は ticket-system truth を所有しない。
 
 現行 `mozyo-bridge` で意識すべき不変条件:
 
 - `DeliveryOutcome` taxonomy (`Status` / `Reason` / `AckStatus` / `next_action_owner`) は本 bridge 経路でも勝手に拡張しない。新 receiver-state vocabulary は inspector contract 側で扱う。
 - `tmux capture-pane` からの sentinel 検出を増やして completion を推定する方向には倒さない (`mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md` `## Anti-Patterns`)。
 - `--no-submit` legacy fallback、`notify-*-legacy-task`、non-agent pane 送信は queue-enter default 射程外であり、receiver-state observability の対象でもない (それらは pane 上の operator-driven 経路として独立に扱う)。
+- ticket provider / Redmine API / journal polling 由来の signal を terminal receiver-state と混ぜない。
+  workflow truth は workflow truth として読み、runtime ACK / assistant turn completion へ backfill しない。
 
 ## 運用への帰結 (現行 `mozyo-bridge` の挙動規範)
 
@@ -144,12 +290,16 @@ doctrine としての position:
 4. **rendered text 観測の弱さを完了判定の強さで埋めない**。`marker_timeout` / `--no-submit` retry / wrap shape 補修は ACK 経路の改修であり、completion detector ではない。
 5. **receiver-state observability が必要になった場合、`mozyo-bridge` 内に独自 detector を生やさない**。`mozyo_bridge_pty` の inspector contract に follow-up task を切り、本 repo の `DeliveryOutcome` taxonomy はそのまま維持する。
 6. **handoff の durable wording は ACK 層の正本**として書く。completion / processing の含意を持たせない。受領契約は引き続き「receiver は durable anchor を読む」であり、pane の rendered text に依存させない。
+7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
+8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
 
 ## Cross-References
 
 - Repo-local 関連 doctrine:
   - `vibes/docs/logics/tmux-send-safety-contract.md` (現行 tmux runtime の send safety / queue-enter rail / `DeliveryOutcome` 射影の正本)
   - `vibes/docs/logics/autonomous-ticket-entrypoint.md` (ticket-ID 経由 entrypoint と pane / chat を source of truth から外す規範)
+  - `vibes/docs/logics/runtime-observability-boundary.md` (snapshot envelope / reload / action-time preflight / future sidecar scope)
+  - `vibes/docs/logics/plugin-ready-adapter-boundary.md` (ticket provider / terminal runtime provider / workflow authority 境界)
 - 上流 PTY runtime / inspector contract (`mozyo_bridge_pty` worktree):
   - `mozyo_bridge_pty/vibes/docs/specs/pty-first-agent-runtime.md`
   - `mozyo_bridge_pty/vibes/docs/specs/transport-agnostic-ack-state-contract.md`

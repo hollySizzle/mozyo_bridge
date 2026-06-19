@@ -529,7 +529,7 @@ Formal adoption conditions:
 Owns, if implemented:
 
 - receiver prompt / queue / acknowledgement state
-- machine-readable completion or pickup signal
+- machine-readable receiver pickup / assistant-turn boundary signal
 - terminal runtime state that tmux rendered text cannot reliably express
 
 Does not own:
