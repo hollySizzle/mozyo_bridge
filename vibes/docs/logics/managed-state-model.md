@@ -116,6 +116,125 @@ runtime state の集約点である。workspace / project ごとに独立した 
 desired presentation config など、repo とともに portability / reviewability を持つべき小さな static
 artifact である。user runtime state や cross-workspace read model は home-scoped DB を原則にする。
 
+## 現行 SQLite 棚卸し (#12257)
+
+2026-06-19 時点の runtime SQLite はすべて `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` 配下に置かれる。
+repo-local `.mozyo-bridge/**` に置かない。各 file は導入時の blast radius を小さくするため分かれているが、
+state kind は既に分離済みであり、single SQLite 統合時もこの分離を table namespace と recovery policy に
+移す。
+
+| legacy file | schema | owner / writer | state kind | loss / corruption policy |
+| --- | --- | --- | --- | --- |
+| `registry.sqlite` | v1 | `workspace_registry.register_workspace()` / guarded `init` | `workspace_identity` 正本。`workspaces` と `workspace_activity` | identity 正本なので write path は corrupt / unknown schema で die。operator が退避し、workspace anchor から再登録する。read path は anchor / derivation へ degrade |
+| `managed-events.sqlite` | v1 | mozyo command boundary best-effort append | `desired_state` event log。`managed_events` append-only | loss は desired history loss として許容。identity / liveness / handoff は壊れない。append 失敗は caller を壊さない |
+| `inventory.sqlite` | v2 | runtime inventory listing の snapshot replace | `last_observed_projection` cache。`panes` と `inventory_meta` | regenerable。corrupt は write path が recreate。newer schema は downgrade CLI が壊さず write skip。read path は cache なし扱い |
+| `otel-events.sqlite` | v1 | loopback OTLP receiver single writer | activity / timeline cache。`otel_events` と `otel_meta` | regenerable / best-effort。receiver 停止中の event loss を許容。prompt / secret shaped attrs は保存しない。corrupt は operator が退避して receiver restart |
+
+責務上の注意:
+
+- `workspace_activity.last_seen` は registry file 内にあるが、identity table とは別の cache table である。
+  single SQLite では `registry_workspaces` と `registry_workspace_activity` のように namespace を分け、
+  activity cache を identity row に吸収しない。
+- `inventory.panes` は process / cwd / pane state を持つが、これは stale 表示用 snapshot であり
+  target existence や action permission ではない。side-effecting command は実行時に live tmux
+  preflight を行う。
+- `otel_events.cwd` は allowlist 通過後の minimal telemetry hint であり、prompt / message / token /
+  secret / personal data を入れる経路を作らない。single SQLite 統合で attrs allowlist / deny list を
+  弱めない。
+- `managed_events.workspace_id` は registry identity への参照であり、workspace identity の二重正本ではない。
+
+## home-scoped single SQLite 統合方針 (#12257)
+
+長期の統合先は 1 file、例: `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/state.sqlite` とする。名前は実装 task で
+確定するが、scope は home で固定する。repo-local DB を default にしない。
+
+### namespace / table ownership
+
+single DB 内では table prefix で ownership を分ける。SQLite `user_version` だけに全責務を載せず、
+`state_schema_components` で component ごとの schema version / owner / migrator / recovery policy を持つ。
+
+```sql
+CREATE TABLE state_schema_components (
+    component TEXT PRIMARY KEY,          -- registry | managed_events | inventory | otel | presentation
+    schema_version INTEGER NOT NULL,
+    owner TEXT NOT NULL,                 -- implementation module / command family
+    recovery_policy TEXT NOT NULL,       -- authoritative | append_only_lossy | regenerable_cache
+    migrated_from TEXT,
+    updated_at TEXT NOT NULL
+);
+```
+
+Table naming:
+
+- `registry_workspaces`, `registry_workspace_activity`
+- `managed_events`
+- `inventory_panes`, `inventory_meta`
+- `otel_events`, `otel_meta`
+- future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
+
+Ownership rules:
+
+- A component migrator owns only its namespace. Registry migration must not rewrite inventory / otel rows as a side effect.
+- Cross-component reference is by value (`workspace_id`, `pane_id`, `target_key`, `source_event_id`) plus best-effort
+  integrity checks. Do not require hard FK from regenerable cache tables into authoritative identity tables when that would
+  make cache rebuild impossible after partial loss.
+- `state_schema_components` is metadata, not workflow truth. Redmine / owner approval / review / completion remain outside DB.
+
+### schema version / migration
+
+Use a two-level version model:
+
+1. SQLite `PRAGMA user_version` identifies the container layout and presence of `state_schema_components`.
+2. `state_schema_components.schema_version` identifies each component's readable / writable shape.
+
+Migration stance:
+
+- Initial implementation should be read-only inspector / doctor first. Do not move writes before doctor can report old/new
+  state side by side.
+- Migration from legacy files is copy/import, not in-place mutation. Legacy files remain as rollback input until the new DB is
+  verified.
+- Each imported component records `migrated_from` and source schema version. Import is idempotent by component.
+- A mixed state (new DB partially imported) is not silently treated as complete. Doctor must show component-level status and
+  next action.
+- Downgrade must not destroy newer DBs. An older CLI that sees a newer container or component schema reports unsupported and
+  leaves the DB untouched. For caches, it may continue using legacy files if present; for registry identity, it must fail closed
+  rather than rewrite unknown state.
+
+### corruption blast radius / backup
+
+Single file raises the blast radius, so recovery policy must be component-aware:
+
+- Registry tables are authoritative. Corruption affecting registry tables blocks identity writes until operator backup /
+  restore / anchor re-register is chosen.
+- Cache tables (`inventory_*`, `otel_*`) are regenerable. Corruption limited to those tables can be repaired by dropping only
+  that namespace after backup, never by deleting the whole DB by default.
+- `managed_events` history is lossy append-only. Corruption limited to event history may be quarantined to a backup and append
+  can resume with a gap marker; it must not block liveness / handoff.
+- Before any destructive repair, create a timestamped backup copy under home (for example `backups/state-<timestamp>.sqlite`).
+  Backup failure means repair does not proceed automatically.
+- Doctor should run `PRAGMA integrity_check` / `quick_check`, component metadata checks, expected table checks, and minimal
+  row-shape probes. It should report the smallest affected component and the safest repair route.
+
+### access boundary
+
+All read/write access should go through mozyo command / documented API boundaries. UI / private consumer / WebViewer may read
+public-safe projections produced by mozyo, but must not open the DB and infer action permission from raw tables. Side-effecting
+actions continue to call mozyo commands, which combine persisted desired state, durable workflow gates, and action-time live
+preflight.
+
+## 実装分割 (#12257 -> #12258-#12261)
+
+本 issue で即時に実装する範囲は docs / design record のみとする。runtime migration は行わない。
+
+- #12258: state kind ごとの table ownership / recovery policy を詳細化する。上記 namespace 案を入力に、
+  component ごとの migrator owner、FK 方針、drop/rebuild 可否、history gap marker を決める。
+- #12259: global runtime DB と repo-local artifact の境界を固定する。repo-local static artifact と
+  home runtime DB の例外 / 禁止事項 / public-private boundary を整理する。
+- #12260: migration / doctor / integrity check を設計する。legacy import、backup、downgrade、partial
+  migration、corruption quarantine の CLI / test 方針を決める。
+- #12261: command-mediated state access boundary を実装する。raw DB access を避け、read model / doctor /
+  action-time preflight の command surface へ寄せる。
+
 ## schema 案 (event log v1, append-only)
 
 ```sql
