@@ -227,6 +227,17 @@ Runtime / registry から導出する値:
 Parser / migration implementation remains a later code task, but #12262 fixes
 the schema field contract that implementation must preserve:
 
+> 実装メモ (#12263): 本 schema の **parser + sublane launch placement resolver** は
+> `src/mozyo_bridge/domain/presentation_grouping.py` に実装済み
+> (`PresentationGroupingConfig.from_record` / `resolve_launch_placement`)。
+> launch context (workspace / project / lane facts) を desired Project Group へ
+> 解決する display-only layer であり、handoff target / liveness / approval を持た
+> ない。default / missing config は behavior-preserving、unknown group / unsupported
+> version / authority-shaped key は fail-closed、identity conflict / desired-unit
+> missing は visible degraded status へ倒す (下記 fallback matrix 準拠)。
+> 残りの code task は on-disk config (`.mozyo-bridge/config.yaml`) loader への結線と
+> current table への migration で、`#12264` 以降で扱う。
+
 ```yaml
 presentation:
   version: 1
