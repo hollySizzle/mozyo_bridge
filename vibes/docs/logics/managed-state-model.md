@@ -398,10 +398,33 @@ test-pinned されるまで始めない。migration command が corrupt / unsupp
 
 ### access boundary
 
-All read/write access should go through mozyo command / documented API boundaries. UI / private consumer / WebViewer may read
-public-safe projections produced by mozyo, but must not open the DB and infer action permission from raw tables. Side-effecting
-actions continue to call mozyo commands, which combine persisted desired state, durable workflow gates, and action-time live
-preflight.
+Persisted state は raw DB/file として外部へ広げず、mozyo command / documented API 境界で扱う。これは
+third-party plugin API 公開を意味しない。まず built-in command surface と内部 access helper の責務分離を
+固定する。
+
+Command-mediated access の分担:
+
+- state store facade / helper は component owner、schema version、recovery policy を知る。caller が任意 table
+  を直接 JOIN して "current truth" を作らない。
+- read model surface は用途別に分ける。doctor は component status / next action、UI / cockpit は
+  public-safe projection、migration planner は component import plan を読む。
+- write surface は component owner に限定する。registry writer、managed event appender、inventory reload、
+  OTel receiver、future presentation command は互いの namespace を修復・更新しない。
+- side-effecting command は read model を行動許可にしない。persisted desired state、durable workflow gate、
+  action-time live preflight を command 境界で照合して毎回 `side_effect_permission` を計算する。
+
+UI / private consumer / WebViewer は mozyo が出した read model / projection を読める。ただし raw DB table を
+直接開いて action permission、workflow completion、owner approval、live target existence を推測してはならない。
+UI action は mozyo command へ戻し、`runtime-observability-boundary.md` の Action-Time Live Preflight Boundary を
+通す。
+
+後続実装で必要な surface は、raw DB path の公開ではなく次の形へ寄せる:
+
+- `inspect` / `doctor`: read-only。component status と next action を返す。
+- `list` / `query` / `reload`: projection を更新または取得する。stale / observed_at / source を出す。
+- `migrate --dry-run`: write せず import plan と backup plan を返す。
+- `migrate --write` / `repair`: explicit operator command と backup を要求する。
+- side-effecting commands: 実行直前に live tmux / future sidecar live query を読む。
 
 ## 実装分割 (#12257 -> #12258-#12261)
 
