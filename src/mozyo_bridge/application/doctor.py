@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,15 @@ from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.infrastructure.tmux_client import run_tmux
+from mozyo_bridge.managed_events import (
+    MANAGED_EVENTS_FILENAME,
+    MANAGED_EVENTS_SCHEMA_VERSION,
+)
+from mozyo_bridge.otel_store import OTEL_STORE_FILENAME, OTEL_STORE_SCHEMA_VERSION
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
+from mozyo_bridge.session_inventory import INVENTORY_FILENAME, INVENTORY_SCHEMA_VERSION
+from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.workspace_registry import REGISTRY_FILENAME, REGISTRY_SCHEMA_VERSION
 
 
 REQUIRED_SKILL_FILE = "SKILL.md"
@@ -1123,6 +1132,383 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
     }
 
 
+# ---------------------------------------------------------------------------
+# state store inspector / doctor (Redmine #12273)
+# ---------------------------------------------------------------------------
+# Read-only side-by-side detection of the legacy per-kind SQLite files and the
+# future home-scoped single DB, designed against
+# `vibes/docs/logics/managed-state-model.md` (state-kind / recovery-policy
+# vocabulary, single-DB `state_schema_components` layout) and
+# `vibes/docs/logics/runtime-observability-boundary.md` (component status is a
+# read-only projection, never workflow truth or a side-effect permission).
+#
+# Invariants this surface MUST keep (j#61668 implementation slice):
+#   - read-only only: every probe opens SQLite through a `file:...?mode=ro`
+#     URI, which refuses to create the file, and is limited to
+#     `PRAGMA user_version`, `PRAGMA integrity_check`, and `sqlite_master`.
+#   - no parent-dir creation, no schema initialization, no migration, no
+#     repair. It deliberately does NOT reuse the existing store classes
+#     (OtelEventStore / ManagedEventLog / inventory / registry writers) whose
+#     constructors create the home dir and initialize schema.
+#   - the `status` vocabulary stays small (missing / ok / warning / invalid /
+#     error). `ok` means only "readable at the expected shape for this state
+#     kind" — never complete / approved / action-allowed. An absent legacy file
+#     and an absent single DB are NORMAL states, not failures.
+
+STATE_STORE_SINGLE_DB_FILENAME = "state.sqlite"
+
+# recovery-policy vocabulary (managed-state-model.md `### recovery policy vocabulary`)
+_RECOVERY_AUTHORITATIVE = "authoritative"
+_RECOVERY_APPEND_ONLY = "append_only_lossy"
+_RECOVERY_REBUILDABLE = "rebuildable_cache"
+
+# Legacy per-kind files, in `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`. `repair_action`
+# is the component-scoped next-action token a damaged store should suggest; it is
+# advice, not something this read-only surface performs.
+_LEGACY_COMPONENTS: tuple[dict[str, Any], ...] = (
+    {
+        "component": "registry",
+        "filename": REGISTRY_FILENAME,
+        "schema_version": REGISTRY_SCHEMA_VERSION,
+        "tables": ("workspaces", "workspace_activity"),
+        "recovery_policy": _RECOVERY_AUTHORITATIVE,
+        "repair_action": "re_register",
+    },
+    {
+        "component": "managed_events",
+        "filename": MANAGED_EVENTS_FILENAME,
+        "schema_version": MANAGED_EVENTS_SCHEMA_VERSION,
+        "tables": ("managed_events",),
+        "recovery_policy": _RECOVERY_APPEND_ONLY,
+        "repair_action": "restore_backup",
+    },
+    {
+        "component": "inventory",
+        "filename": INVENTORY_FILENAME,
+        "schema_version": INVENTORY_SCHEMA_VERSION,
+        "tables": ("panes", "inventory_meta"),
+        "recovery_policy": _RECOVERY_REBUILDABLE,
+        "repair_action": "reload",
+    },
+    {
+        "component": "otel",
+        "filename": OTEL_STORE_FILENAME,
+        "schema_version": OTEL_STORE_SCHEMA_VERSION,
+        "tables": ("otel_events", "otel_meta"),
+        "recovery_policy": _RECOVERY_REBUILDABLE,
+        "repair_action": "restart_receiver",
+    },
+)
+
+# Component names the future single DB is expected to absorb from the legacy
+# files (managed-state-model.md `### legacy import`). A single DB that carries a
+# strict subset is a partial migration, not a complete one.
+_SINGLE_DB_EXPECTED_COMPONENTS = frozenset(
+    spec["component"] for spec in _LEGACY_COMPONENTS
+)
+
+
+def _probe_sqlite_ro(path: Path) -> dict[str, Any]:
+    """Open ``path`` read-only and report user_version / tables / integrity.
+
+    Never creates or writes: the ``file:...?mode=ro`` URI errors if the file is
+    absent rather than creating it, and only ``PRAGMA user_version``,
+    ``sqlite_master``, and ``PRAGMA integrity_check`` are issued. A non-SQLite
+    or truncated file opens lazily but fails the first query; that collapses to
+    ``integrity='error'`` so a corrupt store is reported, not raised.
+    """
+    info: dict[str, Any] = {
+        "opened": False,
+        "user_version": None,
+        "tables": [],
+        "integrity": "unknown",
+        "error": None,
+    }
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError as exc:
+        info["error"] = str(exc)
+        return info
+    try:
+        info["opened"] = True
+        try:
+            row = conn.execute("PRAGMA user_version").fetchone()
+            info["user_version"] = int(row[0]) if row is not None else None
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            info["integrity"] = "error"
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            info["tables"] = [r[0] for r in rows]
+        except sqlite3.DatabaseError:
+            info["integrity"] = "error"
+        try:
+            check = conn.execute("PRAGMA integrity_check").fetchone()
+            info["integrity"] = "ok" if check is not None and check[0] == "ok" else "error"
+        except sqlite3.DatabaseError:
+            info["integrity"] = "error"
+    finally:
+        conn.close()
+    return info
+
+
+def _read_state_schema_components(path: Path) -> list[dict[str, Any]]:
+    """Read ``state_schema_components`` rows read-only (best-effort, never raises)."""
+    out: list[dict[str, Any]] = []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT component, schema_version, recovery_policy, migrated_from "
+            "FROM state_schema_components ORDER BY component"
+        ).fetchall()
+        for component, schema_version, recovery_policy, migrated_from in rows:
+            out.append(
+                {
+                    "component": component,
+                    "schema_version": schema_version,
+                    "recovery_policy": recovery_policy,
+                    "migrated_from": migrated_from,
+                }
+            )
+    except sqlite3.DatabaseError:
+        return []
+    finally:
+        conn.close()
+    return out
+
+
+def _inspect_legacy_component(spec: dict[str, Any], home: Path) -> dict[str, Any]:
+    path = home / spec["filename"]
+    entry: dict[str, Any] = {
+        "component": spec["component"],
+        "path": str(path),
+        "kind": "legacy",
+        "recovery_policy": spec["recovery_policy"],
+        "exists": False,
+        "schema_version": None,
+        "status": "missing",
+        "readability": "absent",
+        "integrity": "unknown",
+        "tables": [],
+        "next_action": "leave_untouched",
+        "notes": [],
+    }
+    if not path.exists():
+        entry["notes"].append(
+            "legacy file absent (normal before first use or after migration)"
+        )
+        return entry
+
+    entry["exists"] = True
+    probe = _probe_sqlite_ro(path)
+    entry["schema_version"] = probe["user_version"]
+    entry["tables"] = probe["tables"]
+
+    if not probe["opened"]:
+        entry["status"] = "error"
+        entry["readability"] = "unreadable"
+        entry["integrity"] = "error"
+        entry["next_action"] = spec["repair_action"]
+        entry["notes"].append(
+            f"unreadable: {probe['error'] or 'cannot open read-only'}"
+        )
+        return entry
+
+    entry["readability"] = "readable"
+    entry["integrity"] = probe["integrity"]
+
+    if probe["integrity"] != "ok":
+        entry["status"] = "error"
+        entry["readability"] = "partial"
+        entry["next_action"] = spec["repair_action"]
+        entry["notes"].append("PRAGMA integrity_check did not return ok (corrupt)")
+        return entry
+
+    expected_version = spec["schema_version"]
+    actual_version = probe["user_version"]
+    if actual_version != expected_version:
+        newer = isinstance(actual_version, int) and actual_version > expected_version
+        if spec["recovery_policy"] == _RECOVERY_AUTHORITATIVE:
+            # Authoritative identity is fail-closed on unknown schema: report
+            # unsupported and leave the DB untouched (downgrade must not rewrite
+            # newer identity state).
+            entry["status"] = "invalid"
+            entry["next_action"] = "leave_untouched"
+            entry["notes"].append(
+                f"unsupported schema_version {actual_version} (this build expects "
+                f"{expected_version}); authoritative store left untouched"
+            )
+        else:
+            # Caches/history degrade rather than fail: a newer DB is left
+            # untouched (downgrade-safe), an older shape is rebuildable.
+            entry["status"] = "warning"
+            entry["next_action"] = (
+                "leave_untouched" if newer else spec["repair_action"]
+            )
+            entry["notes"].append(
+                f"schema_version {actual_version} != expected {expected_version}; "
+                + (
+                    "newer DB left untouched (downgrade-safe)"
+                    if newer
+                    else "older cache/history shape; rebuildable"
+                )
+            )
+        return entry
+
+    missing_tables = [t for t in spec["tables"] if t not in probe["tables"]]
+    if missing_tables:
+        entry["status"] = "invalid"
+        entry["readability"] = "partial"
+        entry["next_action"] = (
+            "leave_untouched"
+            if spec["recovery_policy"] == _RECOVERY_AUTHORITATIVE
+            else spec["repair_action"]
+        )
+        entry["notes"].append(
+            "expected tables missing: " + ", ".join(missing_tables)
+        )
+        return entry
+
+    entry["status"] = "ok"
+    entry["next_action"] = "leave_untouched"
+    entry["notes"].append("readable at expected schema; no migration in this build")
+    return entry
+
+
+def _inspect_single_db(home: Path) -> dict[str, Any]:
+    path = home / STATE_STORE_SINGLE_DB_FILENAME
+    entry: dict[str, Any] = {
+        "component": "single_db",
+        "path": str(path),
+        "kind": "single_db",
+        "recovery_policy": "mixed",
+        "exists": False,
+        "schema_version": None,
+        "status": "missing",
+        "readability": "absent",
+        "integrity": "unknown",
+        "tables": [],
+        "components": [],
+        "next_action": "leave_untouched",
+        "notes": [],
+    }
+    if not path.exists():
+        entry["notes"].append(
+            "future single DB absent (no migration has run; legacy files remain "
+            "the source of state)"
+        )
+        return entry
+
+    entry["exists"] = True
+    probe = _probe_sqlite_ro(path)
+    entry["schema_version"] = probe["user_version"]
+    entry["tables"] = probe["tables"]
+
+    if not probe["opened"]:
+        entry["status"] = "error"
+        entry["readability"] = "unreadable"
+        entry["integrity"] = "error"
+        entry["next_action"] = "restore_backup"
+        entry["notes"].append(
+            f"unreadable: {probe['error'] or 'cannot open read-only'}"
+        )
+        return entry
+
+    entry["readability"] = "readable"
+    entry["integrity"] = probe["integrity"]
+
+    if probe["integrity"] != "ok":
+        entry["status"] = "error"
+        entry["readability"] = "partial"
+        entry["next_action"] = "restore_backup"
+        entry["notes"].append("PRAGMA integrity_check did not return ok (corrupt)")
+        return entry
+
+    if "state_schema_components" not in probe["tables"]:
+        # A container `user_version` without the component metadata table is an
+        # unknown / unsupported layout. Read-only doctor leaves it untouched.
+        entry["status"] = "invalid"
+        entry["next_action"] = "leave_untouched"
+        entry["notes"].append(
+            "container present but state_schema_components metadata table is "
+            "missing; unsupported / unknown layout left untouched"
+        )
+        return entry
+
+    components = _read_state_schema_components(path)
+    entry["components"] = components
+    present = {c["component"] for c in components}
+    missing = sorted(_SINGLE_DB_EXPECTED_COMPONENTS - present)
+    if missing:
+        entry["status"] = "warning"
+        entry["readability"] = "partial"
+        entry["next_action"] = "migrate_dry_run"
+        entry["notes"].append(
+            "partial migration: state_schema_components carries "
+            f"{sorted(present) or 'no'} component(s); not yet migrated: {missing}"
+        )
+    else:
+        entry["status"] = "ok"
+        entry["next_action"] = "inspect"
+        entry["notes"].append(
+            "all expected components present in state_schema_components"
+        )
+    return entry
+
+
+# Section roll-up rank. `missing` is treated as `ok` (0): an absent legacy file
+# or absent single DB is a normal state, so it must not flip doctor red.
+_STATE_STORE_STATUS_RANK = {"ok": 0, "missing": 0, "warning": 1, "invalid": 2, "error": 3}
+_STATE_STORE_RANK_STATUS = {0: "ok", 1: "warning", 2: "invalid", 3: "error"}
+
+
+def _state_store_section_status(components: list[dict[str, Any]]) -> str:
+    worst = 0
+    for component in components:
+        worst = max(worst, _STATE_STORE_STATUS_RANK.get(component["status"], 0))
+    return _STATE_STORE_RANK_STATUS[worst]
+
+
+def _state_store_next_actions(components: list[dict[str, Any]]) -> list[str]:
+    actions: list[str] = []
+    for component in components:
+        if component["status"] in ("warning", "invalid", "error"):
+            detail = component["notes"][0] if component["notes"] else component["status"]
+            actions.append(
+                f"{component['component']}: {component['next_action']} ({detail})"
+            )
+    return actions
+
+
+def collect_state_store(home: Path | None = None) -> dict[str, Any]:
+    """Read-only state-store component report (Redmine #12273).
+
+    Detects the legacy per-kind SQLite files and the future single DB
+    side-by-side under the resolved home, reporting per-component status and a
+    next-action token. Creates nothing and writes nothing. The result is a
+    component projection, not workflow truth or a side-effect permission.
+    """
+    resolved_home = home or mozyo_bridge_home()
+    components = [
+        _inspect_legacy_component(spec, resolved_home) for spec in _LEGACY_COMPONENTS
+    ]
+    components.append(_inspect_single_db(resolved_home))
+    return {
+        "status": _state_store_section_status(components),
+        "home": str(resolved_home),
+        "components": components,
+        "next_action": _state_store_next_actions(components),
+    }
+
+
+def doctor_state_store_section(args: argparse.Namespace) -> dict[str, Any]:
+    return collect_state_store(doctor_home(args))
+
+
 def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
     tmux_section = doctor_tmux_section(args)
     # Attach the governed-preset tmux-ui artifact state to the existing
@@ -1138,6 +1524,7 @@ def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "claude_skill": doctor_claude_skill_section(args),
         "scaffold": doctor_scaffold_section(args),
         "workspace_registry": doctor_workspace_registry_section(args),
+        "state_store": doctor_state_store_section(args),
         "claude_nagger": doctor_claude_nagger_section(args),
         "claude_launch_policy": doctor_claude_launch_policy_section(),
         "tmux": tmux_section,
@@ -1301,6 +1688,28 @@ def format_doctor_text(result: dict[str, Any]) -> str:
                 f"({runtime.get('reason', '-')})"
             )
         for action in registry.get("next_action", []):
+            lines.append(f"  -> {action}")
+
+    state_store = sections.get("state_store") or {}
+    if state_store:
+        lines.append(
+            f"state_store: {state_store.get('status', 'unknown')} "
+            f"home={state_store.get('home', '-')}"
+        )
+        for component in state_store.get("components", []):
+            schema = component.get("schema_version")
+            lines.append(
+                f"  {component.get('component', '-')}: {component.get('status', 'unknown')} "
+                f"kind={component.get('kind', '-')} exists={component.get('exists')} "
+                f"schema={schema if schema is not None else '-'} "
+                f"integrity={component.get('integrity', '-')} "
+                f"recovery={component.get('recovery_policy', '-')} "
+                f"-> {component.get('next_action', '-')}"
+            )
+            notes = component.get("notes") or []
+            if notes:
+                lines.append(f"    note: {notes[0]}")
+        for action in state_store.get("next_action", []):
             lines.append(f"  -> {action}")
 
     nagger = sections.get("claude_nagger") or {}
