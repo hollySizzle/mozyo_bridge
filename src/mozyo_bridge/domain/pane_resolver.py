@@ -321,6 +321,90 @@ def _ambiguous_agent_targets_message(
     )
 
 
+def same_lane_receiver_duplicates(
+    target: dict[str, str],
+    snapshot: list[dict[str, str]],
+    receiver: str,
+) -> list[dict[str, str]]:
+    """Other live panes in the resolved target's lane that also are ``receiver`` (#12229).
+
+    A cockpit repair (Redmine #12226 j#61213: ``mozyo cockpit append`` after a
+    missing-Codex gateway) can leave **two** same-lane Claude panes alive. A
+    handoff is then addressed by an explicit ``--target %pane`` to one of them
+    (``%14``), but the operator may be watching — and the implementation actor
+    may report from — the duplicate (``%16``). Worse, an earlier failed
+    ``--mode standard`` send leaves residual prompt text in a duplicate (the
+    strict rail issues ``C-u`` but cannot verify the receiver composer cleared,
+    ``vibes/docs/logics/tmux-send-safety-contract.md``). The durable record then
+    diverges: the delivery record names ``%14`` as receiver while the
+    Implementation Done journal names ``%16`` as actor (#12226 j#61224 vs
+    j#61228).
+
+    This returns the OTHER same-``(workspace, lane)`` panes that resolve to the
+    same ``receiver`` role, so the caller can surface them in the durable
+    delivery record and keep the receiver pane and any stale-input duplicate
+    both visible. It does NOT block: an explicit ``--target %pane`` is the
+    documented escape hatch and the queue-enter Step 11 active-split gate already
+    fail-closes the inactive duplicate; this is a diagnostic surface only.
+
+    Only meaningful when the target carries a concrete ``(workspace, lane)``
+    identity (:func:`_has_concrete_lane_identity`); a ``default``-lane /
+    no-workspace target has nothing to disambiguate against and yields ``[]``.
+    The target pane itself is always excluded. Role identity comes from
+    :func:`resolve_agent_role` over the live tmux ``@mozyo_*`` pane options /
+    window name / process in the snapshot, never a pane title — so a same-lane
+    Codex gateway pane (role=codex) is not mistaken for a duplicate Claude
+    receiver.
+    """
+    if receiver not in AGENT_LABELS:
+        return []
+    target_id = target.get("id")
+    target_identity = _pane_lane_identity(target)
+    if not _has_concrete_lane_identity(*target_identity):
+        return []
+    duplicates: list[dict[str, str]] = []
+    for pane in snapshot:
+        if pane.get("id") == target_id:
+            continue
+        if _pane_lane_identity(pane) != target_identity:
+            continue
+        resolution = resolve_agent_role(
+            pane_option_role=pane.get("agent_role"),
+            window_name=pane.get("window_name"),
+            process=pane.get("command"),
+        )
+        if resolution.role != receiver:
+            continue
+        duplicates.append(pane)
+    return duplicates
+
+
+def duplicate_pane_record_row(pane: dict[str, str]) -> str:
+    """One durable-record-safe identity row for a same-lane duplicate (#12229).
+
+    A redacted sibling of :func:`_format_agent_candidate`: it carries the same
+    disambiguating identity (pane id, ``(workspace, lane)``, role source, active
+    split) but deliberately omits the absolute ``cwd`` / ``repo_root`` so the row
+    is safe to paste into a Redmine journal or Asana comment
+    (``vibes/docs/rules/public-private-boundary.md``; auto-memory
+    ``feedback_pasteable_records_redact_abs_paths``). Identity comes from the
+    live tmux ``@mozyo_*`` pane options, never a pane title.
+    """
+    workspace_id, lane_id = _pane_lane_identity(pane)
+    lane_label = (pane.get("lane_label") or "").strip() or lane_id
+    pane_id = pane.get("id") or pane.get("location") or "?"
+    role_source = resolve_agent_role(
+        pane_option_role=pane.get("agent_role"),
+        window_name=pane.get("window_name"),
+        process=pane.get("command"),
+    ).role_source
+    active = "active" if pane.get("pane_active") == "1" else "inactive"
+    return (
+        f"{pane_id} (workspace={workspace_id or '<none>'}, "
+        f"lane={lane_label}, role_source={role_source}, {active})"
+    )
+
+
 def _is_strong_codex(pane: dict[str, str]) -> bool:
     """True when ``pane`` strongly, non-ambiguously resolves to the Codex role."""
     resolution = resolve_agent_role(
