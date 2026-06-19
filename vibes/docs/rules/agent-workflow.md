@@ -24,6 +24,11 @@
   に進む場合は、該当 issue の journal を更新する。
 - chat message を durable な作業ログとして扱わない。
 - issue scope が膨らんだ場合は、黙って削らず follow-up issue に分割する。
+- owner intent、future scope、non-goal、later-stage、decision pending は、close /
+  Version readiness / session retrospective 前に
+  `vibes/docs/logics/coordinator-sublane-development-flow.md` の
+  backlog reconciliation gate で棚卸しし、new issue / existing issue /
+  explicit no-op / owner decision pending のいずれかに分類する。
 - Claude の通常開発完了 journal には、次の最小証跡を短く残す。
   - `mozyo-bridge-agent` skill を loaded したこと。
   - active Redmine issue / journal と relevant project docs を確認したこと。

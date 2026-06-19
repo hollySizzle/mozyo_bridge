@@ -162,8 +162,15 @@ $record("callback sweep classification");
 $validate("Review approval と owner close approval を分離");
 $validate("commit-bearing work に integration disposition がある");
 !endprocedure
+!procedure $backlog_reconciliation()
+:collect owner intent / non-goal / future scope / later-stage / decision pending / private-consumer pressure;
+:classify each residual = new issue / existing issue / explicit no-op / owner decision pending;
+$validate("未分類の owner intent / deferred decision を残したまま全部完了と言わない");
+$record("backlog reconciliation disposition");
+!endprocedure
 !procedure $followup_contract()
 :drain callback / review / owner / integration / close / retirement;
+:run backlog reconciliation before declaring the workstream complete;
 :evaluate guardrail update;
 :propose Version / US -> Owner approval -> create Version / US;
 $record("follow-up planning decision");
@@ -226,6 +233,7 @@ if (Review approved?) then (yes)
     $retirement_contract()
     :sublane を退役;
   endif
+  $backlog_reconciliation()
   $followup_contract()
   |Owner|
   :後続 Version / US 提案を承認または差し戻す;
@@ -248,6 +256,25 @@ stop
 ## US close と Version close
 
 US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。
+
+US close / Version readiness / session retrospective の前に、管制塔は `$backlog_reconciliation()` を実行する。目的は backlog を綺麗に保つことではなく、owner intent が durable record から消えないことを優先することである。特に、owner が将来機能、未決判断、標準化、配布形態、責務境界について述べた場合、実装しない判断でも未記録のまま scope 外として閉じない。
+
+棚卸し対象は、Redmine journal、review notes、docs diff、owner chat から観測された次の語彙・論点である。
+
+- `non-goal` / `非目標`
+- `future scope` / `later-stage` / `deferred`
+- `owner decision pending` / 意思決定待ち
+- 標準化、標準プラグイン、配布形態、public/private boundary
+- private consumer 側に置くか、`mozyo-bridge` の reusable primitive に切り出すかで迷った論点
+
+各項目は、次のいずれかに分類して Redmine に残す。
+
+- new issue: UserStory / inquiry / decision issue として起票する。
+- existing issue: 既存 issue に relation / journal で紐づける。
+- explicit no-op: 採用しない理由と再評価条件の有無を記録する。
+- owner decision pending: 実装せず、owner 判断待ちとして残す。
+
+未分類の owner intent / deferred decision が残る場合、管制塔は「全部完了」「残 scope なし」と表現しない。backlog が一時的に粗くなることより、owner intent が消えることを重い失敗として扱う。重複や不要 issue は後で close / `不要` / 統合できるが、未記録の intent は次セッションで検出できないためである。
 
 Version close 前に open issue が残っている場合、管制塔は「未完のまま黙って無視」しない。各 issue について次のいずれかを durable record に残す。
 
