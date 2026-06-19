@@ -184,6 +184,115 @@ config と live observation が矛盾した場合、read model は `desired_but_
 `observed_elsewhere` / `stale` のような表示状態へ倒す。action permission は
 side-effecting command の live preflight が決める。
 
+#### repo-local config boundary (#12254)
+
+Project Group / sublane placement の repo-local config は、runtime state の保存先では
+なく **desired presentation declaration** である。config は review 可能な default /
+preference を与え、current table / read model はそれを registry / runtime observation
+と照合して projection を作る。
+
+Config が管理してよい値:
+
+- `groups`: public-safe `group_id`, display `label`, optional `sort_key`。
+- `membership_rules`: workspace / repo label / lane pattern から group を選ぶ
+  declarative rule。rule は built-in predicate 語彙だけを使い、module path /
+  callable / script を持たない。
+- `unit_overrides`: known workspace/lane の `preferred_group`, `position`,
+  `pinned`, `hidden`, `preferred_projection`。
+- `defaults`: unknown / missing group の display fallback、collapsed 初期値、
+  degraded display wording。
+
+Config が管理してはいけない値:
+
+- target pane id / tmux session / live window geometry。
+- role binding / workspace identity / lane identity の正本。
+- handoff route / target resolver / direct send policy。
+- owner approval / review / close / completion state。
+- private project absolute path、private host name、operator 固有 color / layout
+  default。
+
+Runtime / registry から導出する値:
+
+- workspace existence, workspace_id, canonical session, repo label:
+  registry / workspace anchor。
+- lane existence, role set, target availability, pane id, branch, cwd:
+  live tmux / inventory / TargetRecord projection。
+- observed freshness, stale reason, contradiction:
+  runtime observation envelope / target observation cache。
+- workflow / review / close status:
+  Redmine durable records only。
+
+#### conceptual schema
+
+Exact parser / migration implementation is a follow-up (#12262), but the design
+shape is:
+
+```yaml
+presentation:
+  version: 1
+  project_groups:
+    - group_id: "project:<public-label>"
+      label: "<public display label>"
+      sort_key: 10
+  grouping:
+    membership_rules:
+      - when:
+          repo_label: "<public repo label>"
+        group_id: "project:<public-label>"
+    unit_overrides:
+      - workspace_id: "<workspace-id>"
+        lane_id: "default"
+        preferred_group: "project:<public-label>"
+        position: 10
+        pinned: false
+        hidden: false
+        preferred_projection: "cockpit_pane"
+```
+
+This shape is declarative metadata. It is not a plugin manifest, not an install
+surface, and not a dynamic predicate language.
+
+#### validation / degraded display
+
+Validation is fail-closed for authority leaks and degraded for ordinary display
+drift:
+
+- unknown top-level key / unknown field / unsupported version: invalid config,
+  do not apply it.
+- `target`, `pane`, `route`, `send`, `approval`, `review`, `close`, `owner`,
+  `credential`, `secret`, `token`, `command`, `script`, `module`, `callable`,
+  `import`, or similar boundary-shaped key/value: invalid config.
+- duplicate `group_id`: invalid config.
+- unknown `group_id` referenced by a rule/override: invalid config unless the
+  implementation explicitly supports `unknown_group` degraded display.
+- unknown workspace_id / lane_id in an override: degraded display
+  (`desired_unit_missing`), not handoff failure by itself.
+- workspace/lane identity conflict between config and live TargetRecord:
+  degraded display (`identity_conflict`) and action-time preflight still decides
+  any side effect.
+- group membership derived from live geometry only: never accepted as config
+  truth; show `observed_elsewhere` / `stale` instead.
+
+Degraded display must be visible in the read model. It must not silently route
+to another Unit or auto-create private grouping defaults.
+
+#### migration stance
+
+- Missing config preserves current behavior: group by public repo/workspace label
+  as an implementation fallback, or show an ungrouped/default group. No routing
+  behavior changes.
+- Existing repo-local config versions are read with explicit `version` checks.
+  Unsupported newer versions fail closed and leave live target discovery usable.
+- Current tables (`cockpit_group_membership`, `projection_preferences`) may be
+  seeded from config by an explicit command / migration, not by reading live
+  geometry as truth.
+- Migration from static config to home-scoped desired presentation current tables
+  must be idempotent and non-destructive. It records source config version and
+  does not write private path / host topology to public docs or scaffold.
+- Public scaffold may include only generic example groups / schema comments.
+  Project-specific default grouping belongs in the consuming repo or private
+  operator config, not in `mozyo_bridge` defaults.
+
 ### live geometry boundary
 
 tmux session / window / split tree は observed runtime geometry である。Project
