@@ -789,6 +789,79 @@ closing the staged gap above. This is the first time
   (`REDMINE_TICKET_PROVIDER`, direct `run_tmux`); routing those call sites
   through the resolved provider is a later stage, out of #12249 scope.
 
+## Static Plugin Manifest Schema / Validator (Redmine #12250)
+
+The registries and config records above classify and select *built-in* providers.
+#12250 adds the first piece aimed at a *future external* plugin: a static,
+non-executable **plugin manifest schema / validator** that lets the codebase
+*describe and review* a candidate plugin as declarative metadata, long before any
+runtime loading exists. It is review metadata, not a plugin loader.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/plugin_manifest.py` — **core**, pure. It defines the
+  closed `PluginManifest` record (`plugin_id`, `summary`, `categories`,
+  `capabilities`, `declared_permissions`, `safety_constraints`, `experimental`,
+  `manifest_version`), the `PluginManifestError` fail-closed error, and the
+  validator entry point `validate_plugin_manifest(record)` /
+  `PluginManifest.from_record(record)`. It imports only the sibling
+  provider-registry vocabulary (`ProviderCategory`,
+  `FORBIDDEN_PROVIDER_AUTHORITIES`), so the dependency only points within the
+  domain layer. It does **no** file IO and runs **no** manifest code — the
+  validator reads an already-parsed mapping.
+
+### Declarative-only, by construction
+
+- **No execution, ever — and not merely by omission.** The manifest carries
+  declarative metadata only; there is no dynamic import, entry point, callable,
+  shell command, install / build / run hook, or runtime loading. Any *key* shaped
+  like one (`import` / `module` / `entry_point` / `callable` / `exec` / `eval` /
+  `script` / `shell` / `command` / `subprocess` / `spawn` / `install` /
+  `uninstall` / `build` / `run` / `hook` …) is rejected at validation, at any
+  nesting depth, through `PluginManifestError`. This is the explicit non-goal of
+  the design doc made into a checked invariant.
+- **No invented categories.** A claimed `category` must be a known core-owned
+  `ProviderCategory` value; the category vocabulary stays core-owned exactly as
+  for the provider registry.
+- **No public ABI / compatibility promise.** The closed key set, the category
+  vocabulary, and the record shapes are internal and may change with no
+  deprecation window.
+
+### Fail-closed boundary surface
+
+- **Private path / secret value.** Any string — key or value, at any depth — that
+  looks like an absolute / home / drive filesystem path, or that names a
+  credential (token / secret / password / api key / credential …), is rejected. A
+  static review manifest declares no paths and carries no secrets.
+- **Authority-shaped permission.** A `declared_permission` that names a core-owned
+  authority — workflow / owner / close / review / routing / send — or a
+  destructive / install / shell behavior is rejected. The exact forbidden set is
+  sourced from the provider registry's `FORBIDDEN_PROVIDER_AUTHORITIES`, so a
+  manifest permission and a registered provider are screened against the same
+  core-owned list and cannot drift. Authority stays core-owned; the manifest can
+  describe a plugin, never grant it authority.
+
+### No second source of truth for packaging metadata
+
+A plugin's packaging identity (`name` / `version` / `description` / `author` /
+`owner` / `license` / `homepage` / `repository` / `keywords` / `source` /
+`category`) already has a source of truth in `.claude-plugin/marketplace.json`
+and `plugins/*/.claude-plugin/plugin.json` (covered by
+`tests/test_plugin_marketplace.py`). This review manifest stores **none** of
+them: such a key is rejected with a dedicated "duplicate packaging metadata"
+message, so there is no duplicated field and no sync obligation. `plugin_id` is a
+free correlation handle for review, deliberately *not* bound to the packaging
+`name`, so it introduces no drift risk either — satisfying the acceptance rule
+"no duplicate field without a sync/check story" by simply not duplicating.
+
+### Non-goals (unchanged, restated for the implementation)
+
+- No plugin install command, no runtime loading, no dynamic provider
+  registration — the manifest is inert metadata.
+- No stable public API / ABI promise for the record shapes.
+- No second packaging-metadata source; no workflow / owner / close / routing /
+  send authority granted to a manifest.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
