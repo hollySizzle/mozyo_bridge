@@ -85,13 +85,36 @@ permission ではなく、UI action は command 境界へ戻して action-time p
 continuous polling / push observer / manual reload の採否は freshness UX の問題であり、この正本境界を
 変更しない。
 
-### storage topology と正本境界
+### storage scope 方針
 
-単一 SQLite か複数 SQLite かは storage topology の判断であり、正本境界そのものではない。複数 file は
-lifecycle / rebuildability / writer / loss recovery が異なる state を物理的に分けるために許容される。
-一方で、将来 1 DB に統合すること自体は禁じない。統合する場合も、table / namespace / owner / recovery
-policy ごとに上記 state kind を保ち、`projection` を `runtime_current_fact` や
-`side_effect_permission` に昇格させないことが条件である。
+SQLite state は原則として **global home scope** に置く。
+ここでいう global home は `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}` であり、user ごとの mozyo-bridge
+runtime state の集約点である。workspace / project ごとに独立した SQLite を増やす方針は default に
+しない。
+
+理由:
+
+- cockpit / cross-project / multi-lane / coordinator は複数 workspace を横断して読むため、repo-local
+  DB を横断 scan する設計にすると discovery / recovery / permission 境界が散る。
+- Docker / devcontainer / ephemeral checkout では repo-local state が container lifecycle や mount
+  policy に巻き込まれやすい。home scope に置けば user runtime として扱える。
+- workspace identity、managed event、inventory projection は相互参照される。物理 DB が分かれていると、
+  schema migration、backup、doctor、integrity check が複数 surface に散る。
+- repo-local `.mozyo-bridge/**` は public / portable な scaffold・rules・anchor・config の置き場であり、
+  user runtime DB の置き場とは性格が違う。
+
+したがって長期推奨は、`registry.sqlite` / `managed-events.sqlite` / `inventory.sqlite` 等を
+**1 つの home-scoped SQLite に統合する方向**である。ただしこれは正本境界を混ぜる意味ではない。
+統合する場合も table / namespace / owner / recovery policy ごとに上記 state kind を保ち、
+`projection` を `runtime_current_fact` や `side_effect_permission` に昇格させない。
+
+現行の複数 SQLite は、段階実装で lifecycle / loss recovery を分けて安全に導入した結果であり、
+永続的な理想形として固定しない。統合は migration / compatibility / downgrade / corruption blast radius
+を伴うため、plugin foundation hardening の後続設計 task として扱い、既存 DB を即時に手動統合しない。
+
+例外として repo-local に置いてよいものは、workspace anchor、scaffold / rules / docs catalog、project-local
+desired presentation config など、repo とともに portability / reviewability を持つべき小さな static
+artifact である。user runtime state や cross-workspace read model は home-scoped DB を原則にする。
 
 ## schema 案 (event log v1, append-only)
 
