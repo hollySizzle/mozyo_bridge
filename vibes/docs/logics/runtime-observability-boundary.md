@@ -13,6 +13,13 @@ follow-up issue への引き継ぎは `## Runtime Observation Snapshot Contract`
 **置き換えず、observation 品質の語彙層として上乗せする**。設計経緯は #12223 journal #61159
 (Design Consultation) / #61162 (Implementation Request)。
 
+Redmine #12227 (v0.9.4) で、continuous polling / push / sidecar / OTel formalization を v1 runtime
+observation freshness scope から **分離** し、future workstream と接続条件を明確にした。v1 は
+explicit reload (#12224) + action-time live preflight (#12226) を基本とし、polling / push / sidecar /
+OTel formal adoption は future scope に置く。詳細・接続点・接続条件・方向制約は
+`## Future Push / Sidecar Observer Scope Split` に集約する。設計経緯は #12227 journal #61218
+(Start / Dispatch Decision) / #61220 (Implementation Request)、源流は #12196 journal #61156。
+
 ## Current Observation
 
 2026-06-15 に repo-local `doctor --json` で確認した現状:
@@ -164,7 +171,136 @@ Split をそのまま継ぐ。
   - v1 は explicit reload + action-time live preflight を使う
   - polling / push / sidecar / OTel formalization は future scope
   - sidecar はより強い runtime / receiver-state signal を持てるが、workflow truth / task completion は持たない
+  - 正本は本 doc `## Future Push / Sidecar Observer Scope Split` (#12227 で codify)
 ```
+
+## Future Push / Sidecar Observer Scope Split
+
+Redmine #12227 (parent #11825 Plugin / Adapter 境界設計, version #228 `v0.9.4 runtime
+observation reload / freshness`)。runtime observation freshness v1 から **continuous polling /
+push / sidecar / OTel formalization を分離** し、将来 workstream と接続条件を明確にする scope
+契約。源流は #12196 j#61156 の split decision、前提は本 doc `## Runtime Observation Snapshot
+Contract`。本節は docs-only の scope 固定であり、sidecar / OTel の実装採用や runtime code の
+挙動変更を確約しない (非目標は末尾に再掲)。
+
+### v1 採用範囲 (explicit reload + action-time preflight)
+
+v1 runtime observation freshness は次の 2 機構を基本とする。継続的な背景観測 (polling / push /
+sidecar / OTel formalization) を v1 の前提に **しない**。
+
+```yaml
+v1_baseline:
+  explicit_reload:                # #12224 reload command
+    動作: operator/UI が明示的に diagnostic / display snapshot を refresh する
+    出力: observed_at / freshness / readability / source / method を含む (snapshot envelope)
+    境界: workflow truth を更新せず、action safety を含意しない
+  action_time_live_preflight:     # #12226 action-time preflight
+    動作: side-effecting command は実行時に live runtime observation を行う
+    境界: snapshot は「どこを見るか」を示すだけで行動許可ではない。stale / unreadable /
+          contradictory snapshot は fail closed するか reload / live preflight を要求する
+```
+
+判断原則: **freshness は「明示 reload で取り直す」+「行動直前に live で確かめる」で担保し、
+背景で常時 push してくる observer を v1 の必須 source にしない**。これは `## Decision` の
+「OTel を formal source of truth にしない」「best-effort observer input のまま扱う」姿勢と同じ
+延長線上にある。
+
+### Future scope に分離する範囲
+
+次は v1 の prerequisite ではなく、独立 workstream の future scope に置く。
+
+```yaml
+future_scope:
+  continuous_polling:
+    強化点: snapshot を定期取得し freshness 劣化を自動で縮める
+    v1_に不要な理由: explicit reload + action-time preflight で freshness 要件は満たせる。
+                     polling 常時化は cost と stale-as-healthy 誤判定 risk を増やす
+  push_observer:
+    強化点: source 側から変化を push し reload 待ちの latency を縮める
+    v1_に不要な理由: push 経路は best-effort で受信漏れ = unknown。v1 は受信漏れ時に
+                     reload_required / unknown へ縮退できれば足り、push は freshness の
+                     必須前提にならない (`managed-state-model.md` の OTel push と同型)
+  sidecar_observer:
+    強化点: agent process を外側から包み、rendered text に依存しない machine-readable な
+            receiver runtime signal (runtime.input.ack / process.exited / output.eof 等) を持つ
+    v1_に不要な理由: sidecar は `mozyo_bridge_pty` worktree の独立 workstream。現行
+                     `mozyo-bridge` codebase に sidecar 実装は存在しない。v1 は tmux + durable
+                     record で動く (`ack-completion-receiver-state.md`)
+  otel_formal_adoption:
+    強化点: OTel を stable required runtime source に昇格する
+    v1_に不要な理由: `## OTel Formalization Decision` の通り best-effort observer input のまま。
+                     formal adoption は同節の 6 条件を満たしてから
+```
+
+snapshot envelope (`## Runtime Observation Snapshot Contract`) は既にこの future scope を
+受け止める語彙を予約済みである: `source: otel | sidecar`、`method: poll | imported_event` は
+future observer が入ってきたときの分類先として定義されているが、v1 の主経路は
+`method: reload | live_query | command_boundary_event` である。
+
+### `mozyo_bridge_pty` inspector / sidecar contract との接続点
+
+receiver-state observability の本命経路は、現行 `mozyo-bridge` 内に detector を生やすことでは
+なく、`mozyo_bridge_pty` worktree の sidecar / inspector workstream に接続することである。
+local docs では `vibes/docs/logics/ack-completion-receiver-state.md` が canonical な doctrine /
+段階分け / 上流 contract への接続を所有しており、本節はその境界をそのまま継ぐ。
+
+```yaml
+connection_points:
+  canonical_local_doctrine: vibes/docs/logics/ack-completion-receiver-state.md
+  upstream_contracts:       # mozyo_bridge_pty worktree (独立 workstream)
+    - mozyo_bridge_pty/vibes/docs/specs/receiver-state-inspector-contract.md  # read-only inspector surface
+    - mozyo_bridge_pty/vibes/docs/specs/agentd-sidecar-ipc.md                 # sidecar control-event IPC
+    - mozyo_bridge_pty/vibes/docs/specs/pty-event-normalization.md            # event 正規化
+  staged_bridge:            # ack-completion-receiver-state.md `## Bridge ...` が正本
+    - 段階 1: sidecar control event を subscribe し receiver-side signal を inspector に増やす。
+              `mozyo-bridge` 側は DeliveryOutcome projection 形を維持する
+  envelope_mapping:         # future sidecar signal が来たときの snapshot envelope への対応
+    - source: sidecar
+    - method: live_query (sidecar 直問い合わせ) | poll | imported_event
+    - strength: strong_runtime_signal (workflow truth ではない)
+```
+
+sidecar が提供できるのは receiver runtime state / acknowledgement signal であり、owner approval /
+review verdict / task completion ではない (`## Responsibility Split` の `### future sidecar /
+receiver signal` と同じ境界)。接続段階を進める場合も、`mozyo-bridge` 内に独自 completion
+detector を生やさず、`mozyo_bridge_pty` の inspector contract に follow-up task を切る
+(`ack-completion-receiver-state.md` の doctrine)。
+
+### 方向制約: receiver-state observability であって completion detection ではない
+
+本 scope の方向は **receiver-state observability の強化** であり、**automatic completion
+detection ではない**。
+
+- sidecar / push / polling が増やすのは「receiver runtime が今どうなっているか」の read-only な
+  弱い signal であって、「task が完了したか」の判定ではない。
+- snapshot / sidecar signal を `completed` / `approved` / `current_status` / `delivered` /
+  `accepted` の正本に昇格させない (`### Term restrictions` と同じ境界)。
+- `tmux capture-pane` / rendered-text の sentinel 検出を増やして completion を推定する方向には
+  倒さない (`ack-completion-receiver-state.md` `## Anti-Patterns`)。pane / stdout silence を
+  completion truth にしない境界を sidecar 経路でも守る。
+- contradiction / unreadable / stale は `unknown` / `reload_required` を導出し、`healthy` /
+  `completed` を導出しない (`### Freshness / fail-safe semantics`)。
+
+### 接続条件 (future scope を v1 へ取り込む gate)
+
+future scope を v1 baseline に昇格させてよい条件。1 つでも欠ければ best-effort enrichment の
+ままにとどめ、explicit reload + action-time preflight を必須経路として維持する。
+
+1. missing observer (receiver down / sidecar unavailable / push 受信漏れ) が graceful に
+   degrade し、既存の tmux + durable record 挙動へ縮退する。
+2. contradiction が `unknown` を導出し `healthy` を導出しない fail-safe が保たれている。
+3. observer signal が prompt body / private content を構造的に含まない
+   (`### future sidecar / receiver signal` の Failure posture)。
+4. OTel formal adoption は `## OTel Formalization Decision` の 6 条件を別途満たす。
+5. cockpit UI / consumer は raw observer internals ではなく stable envelope を消費する。
+
+### 非目標 (本 scope で実装しないこと)
+
+- sidecar 実装そのもの (現行 `mozyo-bridge` codebase に sidecar は存在しない。
+  `mozyo_bridge_pty` workstream が所有)。
+- OTel を workflow truth に昇格すること。
+- completion 判定の自動化 (completion detector を作らない)。
+- snapshot / sidecar / OTel signal を close / approval / routing の正本にすること。
 
 ## Decision
 
@@ -400,3 +536,8 @@ Forbidden:
   cockpit UI reload / stale display (#12225)、action-time live preflight (#12226)、future
   sidecar scope (#12227)。各 issue への引き継ぎ条件は `## Runtime Observation Snapshot
   Contract` の `### Contract handoff to follow-up issues` を正本とする。
+- Future push / sidecar observer scope split (#12227) の正本は `## Future Push / Sidecar Observer
+  Scope Split`。v1 = explicit reload + action-time preflight、polling / push / sidecar / OTel
+  formal adoption = future scope、接続点は `ack-completion-receiver-state.md` 経由の
+  `mozyo_bridge_pty` inspector / sidecar contract。方向は receiver-state observability であって
+  automatic completion detection ではない。
