@@ -3479,6 +3479,7 @@ def _emit_outcome(
     record_format: str = RECORD_FORMAT_BOTH,
     command: str | None = None,
     recovery_command: str | None = None,
+    duplicate_lane_panes: list[str] | None = None,
 ) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -3495,11 +3496,23 @@ def _emit_outcome(
     ``build_delivery_record`` (e.g. the queue-enter inactive-split block, which
     emits the shared ``blocked / invalid_args`` reason). It does not affect the
     ``json`` outcome shape that scripts scrape.
+
+    ``duplicate_lane_panes`` (Redmine #12229) is an optional list of redacted
+    identity rows for live same-lane duplicate receiver panes; it renders a
+    diagnostic advisory in the markdown record and likewise does not affect the
+    ``json`` outcome shape.
     """
     if record_format not in RECORD_FORMATS:
         die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {record_format!r}")
     if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
-        print(build_delivery_record(outcome, command=command, recovery_command=recovery_command))
+        print(
+            build_delivery_record(
+                outcome,
+                command=command,
+                recovery_command=recovery_command,
+                duplicate_lane_panes=duplicate_lane_panes,
+            )
+        )
         if record_format == RECORD_FORMAT_BOTH:
             print("")
     if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
@@ -3696,6 +3709,30 @@ def orchestrate_handoff(
         raise
 
     target = target_info["id"]
+
+    # Redmine #12229: surface duplicate same-lane receiver panes in the durable
+    # record so the receiver pane and any stale-input duplicate stay both
+    # visible and the receiver/actor record cannot silently diverge (a cockpit
+    # gateway repair can leave two same-lane Claude panes, #12226 j#61213). This
+    # reads a LIVE tmux snapshot at action time
+    # (`vibes/docs/logics/runtime-observability-boundary.md`), never a stored
+    # projection. It is strictly diagnostic and best-effort: it never blocks the
+    # send and never replaces an outcome (an explicit `--target %pane` is the
+    # documented escape hatch, and queue-enter's Step 11 active-split gate
+    # already fail-closes the inactive duplicate). A snapshot read failure must
+    # not change delivery, so swallow any error.
+    from mozyo_bridge.domain import pane_resolver as _pr
+
+    duplicate_lane_panes: list[str] = []
+    try:
+        duplicate_lane_panes = [
+            _pr.duplicate_pane_record_row(pane)
+            for pane in _pr.same_lane_receiver_duplicates(
+                target_info, _pr.pane_lines(), receiver
+            )
+        ]
+    except (Exception, SystemExit):
+        duplicate_lane_panes = []
 
     # `--target-repo auto` (Redmine #11778): resolve the cross-workspace
     # identity gate from the explicitly-named pane's own cwd so the operator
@@ -4219,7 +4256,12 @@ def orchestrate_handoff(
             notification_marker=marker,
             execution_root=execution_root,
         )
-        _emit_outcome(outcome, record_format=record_format, command=record_command)
+        _emit_outcome(
+            outcome,
+            record_format=record_format,
+            command=record_command,
+            duplicate_lane_panes=duplicate_lane_panes or None,
+        )
         return 0
 
     landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
@@ -4239,7 +4281,12 @@ def orchestrate_handoff(
             notification_marker=marker,
             execution_root=execution_root,
         )
-        _emit_outcome(outcome, record_format=record_format, command=record_command)
+        _emit_outcome(
+            outcome,
+            record_format=record_format,
+            command=record_command,
+            duplicate_lane_panes=duplicate_lane_panes or None,
+        )
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
             "handoff marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
@@ -4269,7 +4316,12 @@ def orchestrate_handoff(
         notification_marker=marker,
         execution_root=execution_root,
     )
-    _emit_outcome(outcome, record_format=record_format, command=record_command)
+    _emit_outcome(
+        outcome,
+        record_format=record_format,
+        command=record_command,
+        duplicate_lane_panes=duplicate_lane_panes or None,
+    )
     return 0
 
 

@@ -890,6 +890,7 @@ def build_delivery_record(
     *,
     command: Optional[str] = None,
     recovery_command: Optional[str] = None,
+    duplicate_lane_panes: Optional[Sequence[str]] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -903,6 +904,15 @@ def build_delivery_record(
     The structured outcome carries everything the record needs after the
     source-preservation fix from the previous task, so this function is pure
     and deterministic over the outcome dataclass.
+
+    ``duplicate_lane_panes`` (Redmine #12229) is an optional list of
+    already-redacted identity rows for OTHER live same-lane panes that resolve
+    to the same receiver role. The caller computes them from a live snapshot
+    (``pane_resolver.same_lane_receiver_duplicates`` →
+    ``duplicate_pane_record_row``); when present they render a diagnostic
+    advisory so the receiver pane and any stale-input duplicate stay both
+    visible and the receiver/actor record cannot silently diverge. Like
+    ``recovery_command`` it does not affect the ``json`` outcome shape.
     """
     header = f"Delivery result — {_header_label(outcome.status, outcome.reason, outcome.mode)}"
     lines = [
@@ -937,6 +947,26 @@ def build_delivery_record(
             "the landing marker instead of requiring the active split, so it "
             "reaches the resolved inactive same-identity pane without weakening "
             "the queue-enter guard."
+        )
+    if duplicate_lane_panes:
+        # Redmine #12229: duplicate same-lane receiver panes were live at send
+        # time (a cockpit gateway repair can leave two same-lane Claude panes,
+        # #12226 j#61213). Name them so the durable record keeps the receiver
+        # pane and any stale-input duplicate both visible: the receiver/actor
+        # record must not silently diverge (delivery record named `%14` while
+        # Implementation Done named `%16`, #12226 j#61224 vs j#61228). This is a
+        # diagnostic surface, not a block — the receiver of THIS send is the
+        # `Target pane` above; the actor recorded downstream must match it.
+        rows = "; ".join(duplicate_lane_panes)
+        lines.append(
+            "- Duplicate same-lane pane(s): "
+            f"{rows}. These are NOT the receiver of this send (the receiver is "
+            f"`{outcome.target or '—'}`). A prior failed `--mode standard` send "
+            "can leave residual prompt text in a duplicate — a `C-u` rollback is "
+            "issued but composer clearing is not verifiable from tmux capture — "
+            "so read each duplicate before reusing it, and record the "
+            "implementation actor as the target pane above (not a duplicate) so "
+            "the receiver and actor records do not diverge."
         )
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
