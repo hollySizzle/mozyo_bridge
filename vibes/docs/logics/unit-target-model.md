@@ -478,6 +478,56 @@ TargetRecord の preflight で配送先を決める。
 > 非目標どおり tmux window / iTerm tab を identity authority にせず、public extension API /
 > dynamic plugin loading も開かない。
 
+> 実装メモ (#12296): 本 Project Group read model に対する **detail / command preview**
+> projection は `src/mozyo_bridge/application/grouped_detail.py` に実装済み
+> (`build_grouped_unit_detail`)。operator が grouped cockpit で Unit / Target を選んだ
+> とき、その Unit の public-safe identity / state と「次に実行できる安全な action」を
+> 一画面で見せるための display 投影で、#12264 の `UnitView` 一行から
+> `GroupedUnitDetailView` (+ 行ごとの `CommandPreview`) を導出する: 観測された
+> agent role pane (`codex` / `claude`) ごと x cockpit action (`reveal` / `jump`) ごとに
+> 1 件の command preview を出す。preview は **情報であって権限ではない**:
+> `live_preflight_required=True` を常に立て、実行は #12265 の action-time live preflight
+> (`cockpit_ui.grouped_reveal` / `grouped_jump` -> `_resolve_unit_target`) を必ず通す。
+> availability は表示行だけから fail-closed に導出し (`candidate_unit_selector` /
+> `_resolve_unit_target` の refusal gate を preview として写す): degraded
+> (`needs_reload`) 行 / 非 local host / 非 default lane / live target 未観測 の行は
+> available な command を一切出さず、各 action を可視の reason 付き unavailable として
+> 残す (silently drop しない)。stale / contradictory / ambiguous が action unavailable
+> として現れる受入のうち、ambiguous (同一 identity に複数 live pane) は表示投影からは
+> 見えないため、live runtime を read-only で再観測する非破壊の counterpart
+> `cockpit_ui.grouped_action_preview` を追加した: 既存の `_resolve_unit_target` をそのまま
+> 走らせ side effect は出さずに `{available, reason}` を返す (stale / ambiguous / missing /
+> remote / 非 default lane を live に検出)。これを served の `POST /api/actions/grouped-preview`
+> (#12265 と同じ token gate、常に 200、非変更) に結線し、grouped cockpit detail 画面が
+> 副作用なしに現在の availability を確認できるようにした。detail payload は public-safe な
+> identity (`workspace_id` / `lane_id` / `host_id`) / display label / status・freshness token /
+> 観測 role 名 / 公開済み action endpoint と selector のみを持ち、pane id / repo path /
+> credential / prompt body を UI JSON / HTML に出さない
+> (`GROUPED_DETAIL_DIAGNOSTIC_ONLY_NOTE`、`public-private-boundary.md`)。detail 投影は pure
+> (`grouped_detail.py`) で、preview / served wiring は application 層に置く。
+
+> 実装メモ (#12297): Project Group header の **attention / freshness summary** を
+> `src/mozyo_bridge/domain/grouped_display.py` に追加した
+> (`GroupAttentionSummary` / `GroupDisplaySection.summary` /
+> `GroupedDisplayView.summary`)。受入条件の "group header に active lanes /
+> stale・reload-required / blocked・attention candidate の summary を表示する" を、
+> display row 上に既にある事実だけから導出する projection-only な 3 つの独立 count
+> として満たす: `active_lanes` (live Target を持つ row = active lanes)、
+> `reload_required` (snapshot が current でない row; 各 row の `reload_required` flag
+> をそのまま数える)、`attention` (contradiction-class の attention candidate =
+> `ATTENTION_CANDIDATE_STATUSES` = `contradicted` / `identity_conflict` /
+> `desired_unit_missing`; reload では解消しない、operator が *resolve* すべき row)。
+> count は partition ではなく独立 projection で、`attention` ⊆ `reload_required`。
+> summary は group header (どの group / Unit を先に見るか) と whole-projection
+> roll-up の両層で持ち、hidden member も含めて数える。**projection-only**: Redmine
+> journal 本文 / owner approval / review state / governance `blocked` truth を一切
+> 読まず (それは durable record の正本; UI への複製は #12297 の非目標)、
+> `cockpit-attention-state.md` の governance `attention_state` (owner_waiting /
+> review_waiting / blocked 等、Redmine 由来) とは別物の表示派生値である。routing /
+> approval / review / close authority を持たない
+> (`GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE`)。#12255 / #12264 / #12266 と同じく
+> object-to-object slice で、served endpoint / HTML page は結線しない。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord

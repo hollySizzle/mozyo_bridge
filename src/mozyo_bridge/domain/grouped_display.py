@@ -16,7 +16,12 @@ into a single :class:`GroupedDisplayView` whose rows carry exactly what the
 acceptance criteria (Redmine #12255) ask a grouped cockpit to *show*:
 
 - a **Project Group header** (:attr:`GroupDisplaySection.header_label` /
-  :attr:`~GroupDisplaySection.source` / :attr:`~GroupDisplaySection.managed`);
+  :attr:`~GroupDisplaySection.source` / :attr:`~GroupDisplaySection.managed`)
+  carrying a projection-only **attention / freshness summary**
+  (:attr:`~GroupDisplaySection.summary`, Redmine #12297): the header's
+  active-lane / reload-required / attention-candidate counts so an operator can
+  tell which group / Unit to look at first, with the whole-projection roll-up on
+  :attr:`GroupedDisplayView.summary`;
 - per Unit, a distinguishable **lane label** (:attr:`UnitDisplayRow.lane_label`),
   **issue label** (:attr:`~UnitDisplayRow.issue_label`), and **Codex / Claude
   role panes** (:attr:`~UnitDisplayRow.roles` / :attr:`~UnitDisplayRow.role_label`
@@ -62,12 +67,15 @@ from typing import Optional
 
 from mozyo_bridge.domain.grouped_read_model import (
     GROUP_SOURCE_DESIRED,
+    UNIT_STATUS_CONTRADICTED,
     GroupedReadModel,
     ProjectGroupView,
     UnitView,
 )
 from mozyo_bridge.domain.presentation_grouping import (
     DEFAULT_PROJECT_GROUP_PRESENTATION,
+    STATUS_DESIRED_UNIT_MISSING,
+    STATUS_IDENTITY_CONFLICT,
 )
 from mozyo_bridge.domain.grouped_reload_view import (
     GROUPED_RELOAD_DIAGNOSTIC_ONLY_NOTE,
@@ -102,6 +110,33 @@ _STATE_LABELS: "dict[str, str]" = {
     "identity_conflict": "identity conflict",
     "desired_unit_missing": "desired unit missing",
 }
+
+#: Read-model ``status`` values that make a Unit row an *attention candidate* in
+#: the header summary: a config-vs-runtime contradiction the operator must
+#: *resolve* (not a mere staleness a reload fixes). These are the
+#: contradiction-class statuses — ``contradicted`` (live identity contradicts the
+#: launch identity), ``identity_conflict``, ``desired_unit_missing``. They are
+#: deliberately NOT the governance ``blocked`` state of
+#: ``cockpit-attention-state.md`` (which is derived from the Redmine durable
+#: record): this summary is a projection over the display rows only and never
+#: reads governance truth, so it surfaces *attention candidates*, never an
+#: authoritative blocked / owner-waiting / review-waiting verdict.
+ATTENTION_CANDIDATE_STATUSES: "frozenset[str]" = frozenset(
+    (UNIT_STATUS_CONTRADICTED, STATUS_IDENTITY_CONFLICT, STATUS_DESIRED_UNIT_MISSING)
+)
+
+#: The boundary statement the attention / freshness summary carries: it is a
+#: projection over the display rows' observation facts, never a duplication of
+#: Redmine governance truth and never an action permission.
+GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE: str = (
+    "Group header attention / freshness summary is a projection over the "
+    "displayed rows only: its active-lane / reload-required / attention-candidate "
+    "counts are derived from observed liveness and freshness, never from a Redmine "
+    "journal body, owner approval, review state, or governance blocked truth (that "
+    "stays with the durable record). It grants no routing / approval / review / "
+    "close authority and helps an operator pick which group / Unit to look at "
+    "first, nothing more."
+)
 
 #: The boundary statement the display view carries: drawing the grouped cockpit is
 #: a display act only — it moves no workflow gate and authorizes no side effect
@@ -152,6 +187,80 @@ def _role_label(roles: "tuple[str, ...]") -> str:
 def _state_label(status: str) -> str:
     """A public-safe human label for a Unit's read-model status."""
     return _STATE_LABELS.get(status, status)
+
+
+@dataclass(frozen=True)
+class GroupAttentionSummary:
+    """A projection-only attention / freshness summary for a header (Redmine #12297).
+
+    The header-level roll-up an operator reads to decide *which group / Unit to
+    look at first*, as three independent counts over a set of Unit rows:
+
+    - :attr:`active_lanes` — rows with a live Target (observed liveness);
+    - :attr:`reload_required` — rows whose snapshot is not current (stale /
+      partial / unreadable / unknown / contradicted), i.e. a reload / live
+      preflight is needed before trusting the row — taken straight from each
+      row's already-tested ``reload_required`` flag;
+    - :attr:`attention` — *attention candidates*: the contradiction-class subset
+      (``contradicted`` / ``identity_conflict`` / ``desired_unit_missing``) the
+      operator must *resolve* rather than merely reload.
+
+    The counts are independent projections, not a partition: a Unit may be both
+    active and reload-required, and every attention candidate is also
+    reload-required (``attention`` narrows :attr:`reload_required` to the rows a
+    reload will not fix). :attr:`total` is the member count they range over.
+
+    **Projection only, never governance truth or action permission.** Every count
+    is derived from a display fact already on the row (``active`` / observation
+    freshness / read-model ``status``); the summary reads no Redmine journal body,
+    owner approval, review state, or governance ``blocked`` truth — duplicating
+    that into the UI is the explicit non-goal of #12297. It carries no
+    ``target`` / ``pane`` / ``route`` / ``send`` / ``approval`` / ``credential``
+    field and grants no routing / approval / review / close authority
+    (:data:`GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE`).
+    """
+
+    total: int = 0
+    active_lanes: int = 0
+    reload_required: int = 0
+    attention: int = 0
+
+    @property
+    def needs_attention(self) -> bool:
+        """True when any member is reload-required or an attention candidate.
+
+        A fail-safe single "look here" flag; it authorizes nothing.
+        """
+        return self.reload_required > 0 or self.attention > 0
+
+    def as_payload(self) -> dict:
+        return {
+            "total": self.total,
+            "active_lanes": self.active_lanes,
+            "reload_required": self.reload_required,
+            "attention": self.attention,
+            "needs_attention": self.needs_attention,
+        }
+
+
+def _summarize(rows: "tuple[UnitDisplayRow, ...]") -> GroupAttentionSummary:
+    """Roll member rows up into a projection-only attention / freshness summary.
+
+    Counts over *every* member row passed in (callers include both visible and
+    hidden rows) so a hidden-but-active or hidden-degraded Unit still registers.
+    Each count is an independent projection of a fact already on the row —
+    ``active`` (live Target), ``reload_required`` (snapshot not current), and a
+    contradiction-class ``status`` (:data:`ATTENTION_CANDIDATE_STATUSES`) — never
+    a re-read of governance truth.
+    """
+    return GroupAttentionSummary(
+        total=len(rows),
+        active_lanes=sum(1 for row in rows if row.active),
+        reload_required=sum(1 for row in rows if row.reload_required),
+        attention=sum(
+            1 for row in rows if row.status in ATTENTION_CANDIDATE_STATUSES
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -242,6 +351,11 @@ class GroupDisplaySection:
     group reads stale, never dropped); :attr:`reload_required` is True when any
     member row is not current. ``units`` are the visible rows, ``hidden_units`` the
     config-hidden rows (shown separately, never collapsed away).
+
+    :attr:`summary` is the projection-only attention / freshness roll-up the
+    Project Group header shows (Redmine #12297) — active-lane / reload-required /
+    attention-candidate counts over *all* member rows (visible and hidden) so an
+    operator can tell from the header which group to look at first.
     """
 
     group_id: Optional[str]
@@ -252,6 +366,7 @@ class GroupDisplaySection:
     collapsed: bool
     position: Optional[int]
     reload_required: bool
+    summary: GroupAttentionSummary
     units: "tuple[UnitDisplayRow, ...]" = ()
     hidden_units: "tuple[UnitDisplayRow, ...]" = ()
 
@@ -269,6 +384,7 @@ class GroupDisplaySection:
             "collapsed": self.collapsed,
             "position": self.position,
             "reload_required": self.reload_required,
+            "summary": self.summary.as_payload(),
             "units": [unit.as_payload() for unit in self.units],
             "hidden_units": [unit.as_payload() for unit in self.hidden_units],
         }
@@ -284,6 +400,11 @@ class GroupedDisplayView:
     :attr:`reload` affordance, then each :class:`GroupDisplaySection` as a Project
     Group header with its :class:`UnitDisplayRow` rows. It is not workflow truth
     and not action permission (:data:`GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE`).
+
+    :attr:`summary` is the whole-projection attention / freshness roll-up over
+    every member Unit (Redmine #12297) — the same projection-only counts each
+    :class:`GroupDisplaySection` carries, aggregated, so an operator can read the
+    overall active-lane / reload-required / attention-candidate load at a glance.
     """
 
     observed_at: Optional[str]
@@ -292,6 +413,7 @@ class GroupedDisplayView:
     display_state: str
     reload_required: bool
     needs_attention: bool
+    summary: GroupAttentionSummary = GroupAttentionSummary()
     reload: ReloadAffordance = ReloadAffordance()
     groups: "tuple[GroupDisplaySection, ...]" = ()
     diagnostics: "tuple[str, ...]" = ()
@@ -315,6 +437,7 @@ class GroupedDisplayView:
             "display_state": self.display_state,
             "reload_required": self.reload_required,
             "needs_attention": self.needs_attention,
+            "summary": self.summary.as_payload(),
             "reload": self.reload.as_payload(),
             "groups": [group.as_payload() for group in self.groups],
             "diagnostics": list(self.diagnostics),
@@ -386,9 +509,8 @@ def _group_section(
     hidden = tuple(
         _unit_row(unit, managed, freshness_index) for unit in group.hidden_units
     )
-    reload_required = any(
-        row.reload_required for row in units + hidden
-    )
+    members = units + hidden
+    reload_required = any(row.reload_required for row in members)
     return GroupDisplaySection(
         group_id=group.group_id,
         header_label=group.label,
@@ -398,6 +520,7 @@ def _group_section(
         collapsed=group.collapsed,
         position=group.position,
         reload_required=reload_required,
+        summary=_summarize(members),
         units=units,
         hidden_units=hidden,
     )
@@ -427,6 +550,10 @@ def build_grouped_display_view(
         unit.unit_id: unit for unit in reload.all_units()
     }
     groups = tuple(_group_section(group, freshness_index) for group in model.groups)
+    # Whole-projection roll-up: summarize every member row across all groups so
+    # the overall active-lane / reload-required / attention-candidate load is
+    # readable at the top, mirroring each group header's own summary.
+    all_rows = tuple(row for group in groups for row in group.all_units())
     return GroupedDisplayView(
         observed_at=reload.observed_at,
         freshness=reload.freshness,
@@ -434,6 +561,7 @@ def build_grouped_display_view(
         display_state=reload.display_state,
         reload_required=reload.reload_required,
         needs_attention=reload.needs_attention,
+        summary=_summarize(all_rows),
         reload=reload.reload,
         groups=groups,
         diagnostics=model.diagnostics,
@@ -444,7 +572,10 @@ def build_grouped_display_view(
 __all__ = (
     "ROLE_DISPLAY_ORDER",
     "NO_ROLES_LABEL",
+    "ATTENTION_CANDIDATE_STATUSES",
+    "GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE",
     "GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE",
+    "GroupAttentionSummary",
     "UnitDisplayRow",
     "GroupDisplaySection",
     "GroupedDisplayView",
