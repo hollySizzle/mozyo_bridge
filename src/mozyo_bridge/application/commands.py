@@ -2951,6 +2951,9 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     import json as _json
     import shlex as _shlex
 
+    from mozyo_bridge.application.repo_local_config_loader import (
+        load_repo_local_config,
+    )
     from mozyo_bridge.domain.cockpit_layout import (
         COCKPIT_SESSION_DEFAULT,
         CockpitWorkspace,
@@ -2959,6 +2962,12 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         build_cockpit_plan,
         normalize_lane,
     )
+    from mozyo_bridge.domain.presentation_grouping import (
+        LaunchContext,
+        resolve_group_window_placement,
+        resolve_launch_placement,
+    )
+    from mozyo_bridge.domain.repo_local_config import RepoLocalConfigError
 
     session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
     codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
@@ -3106,6 +3115,38 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         _cockpit_adopt_advisory(workspace, session) if same is None else None
     )
 
+    # Desired Project-Group presentation placement (Redmine #12302). The cockpit
+    # launcher / append path reads `.mozyo-bridge/config.yaml`
+    # `presentation.project_group_presentation` and resolves the desired display
+    # placement for THIS workspace. `same_cockpit_column` (the default / a missing
+    # config) preserves current behavior exactly; the opt-in surfaces
+    # (`project_group_tmux_window` / `normal_window`) are recorded as the *desired*
+    # presentation but visibly degrade to the shared cockpit column, because
+    # executing a separate tmux window from this single-window append surface would
+    # bypass the duplicate-detection / pane-identity gate. An invalid placement
+    # config fails closed (reported under --json/--dry-run, fatal on a real run) —
+    # never a silent reroute. Display-only: never a routing / approval / close
+    # authority, and never a guaranteed tmux window / iTerm tab.
+    presentation_decision = None
+    presentation_blocked = None
+    try:
+        grouping = load_repo_local_config(repo_root).presentation.grouping
+        placement = resolve_launch_placement(
+            grouping,
+            LaunchContext(
+                workspace_id=workspace.workspace_id,
+                lane_id=target_lane,
+                repo_label=workspace.label,
+            ),
+        )
+        presentation_decision = resolve_group_window_placement(
+            grouping.project_group_presentation, placement
+        )
+    except RepoLocalConfigError as exc:
+        presentation_blocked = (
+            f"invalid .mozyo-bridge/config.yaml presentation config: {exc}"
+        )
+
     # `plan is None` marks a blocked action (stale cockpit) — fail-closed on a
     # real run, reported (not aborted) under --dry-run / --json.
     plan = None
@@ -3163,6 +3204,12 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         payload["adopt_advisory"] = (
             adopt_advisory.as_dict() if adopt_advisory is not None else None
         )
+        payload["presentation"] = (
+            presentation_decision.as_dict()
+            if presentation_decision is not None
+            else None
+        )
+        payload["presentation_blocked"] = presentation_blocked
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if dry_run:
@@ -3176,9 +3223,18 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         else:
             for cmd in plan.commands:
                 print("  tmux " + " ".join(_shlex.quote(token) for token in cmd.argv))
+        if presentation_blocked:
+            print(f"  (presentation blocked: {presentation_blocked})")
+        elif presentation_decision is not None and presentation_decision.degraded:
+            print(f"  presentation: {presentation_decision.diagnostic}")
         if adopt_advisory is not None and adopt_advisory.message:
             print(f"  {adopt_advisory.message}")
         return 0
+
+    if presentation_blocked:
+        # Fail closed on a real run: an invalid presentation config never silently
+        # changes (or silently keeps) the placement.
+        die(presentation_blocked)
 
     if blocked_reason:
         die(blocked_reason)
@@ -3193,6 +3249,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         print(f"cockpit created: session={session} workspace={workspace.label}")
         if adopt_advisory is not None and adopt_advisory.message:
             print(f"  {adopt_advisory.message}")
+        if presentation_decision is not None and presentation_decision.degraded:
+            print(f"  presentation: {presentation_decision.diagnostic}")
         if no_attach:
             print(f"attach: tmux -CC attach -t {session}")
             return 0
@@ -3220,6 +3278,8 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     )
     if adopt_advisory is not None and adopt_advisory.message:
         print(f"  {adopt_advisory.message}")
+    if presentation_decision is not None and presentation_decision.degraded:
+        print(f"  presentation: {presentation_decision.diagnostic}")
     return 0
 
 

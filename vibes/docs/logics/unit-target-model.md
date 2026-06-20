@@ -534,6 +534,29 @@ TargetRecord の preflight で配送先を決める。
 > (`GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE`)。#12255 / #12264 / #12266 と同じく
 > object-to-object slice で、served endpoint / HTML page は結線しない。
 
+> 実装メモ (#12302): `project_group_presentation` を **sublane launcher /
+> cockpit append placement** に結線した。`cmd_cockpit` (`commands.py`) が
+> `load_repo_local_config(repo_root).presentation.grouping` を読み、当該 workspace の
+> `resolve_launch_placement` 結果と新規 pure 関数
+> `presentation_grouping.resolve_group_window_placement(mode, placement)` から
+> desired placement decision (`GroupWindowDecision`) を導出する。`same_cockpit_column`
+> (既定 / config 不在) は現行 column append/create を一切変えない (behavior-preserving)。
+> opt-in surface (`project_group_tmux_window` / `normal_window`) は **desired
+> presentation として記録**するが、`executed_surface` は `cockpit_column` のままで
+> **visible degrade** する (json `presentation` payload / dry-run / 実行ログに diagnostic
+> を surface; routing を黙って変えない)。理由は、現 cockpit の append/create/focus/
+> duplicate-detection/reset/rebalance/daemon が単一 `cockpit` window 固定であり、単一-window
+> append 経路から別 tmux window を spawn すると duplicate-detection / pane-identity gate を
+> 回避してしまうため。したがって本 slice は #12290 の tmux-window 表示を *desired* metadata
+> として launcher に通すが、tmux window / iTerm tab / OS window は保証せず、placement を
+> routing / approval / review / close authority にもしない。不正 placement config は
+> `RepoLocalConfigError` で fail-closed (real run は die、`--json` / `--dry-run` は report)。
+> Target resolution と side-effecting action は引き続き action-time live preflight /
+> pane identity gate が決める (`runtime-observability-boundary.md`
+> `## Action-Time Live Preflight Boundary`)。real な multi-window cockpit surface 管理
+> (per-group window を duplicate-detection / focus / reset まで faithful に追跡する) は
+> follow-up scope。public extension API / dynamic plugin loading は開かない。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord
