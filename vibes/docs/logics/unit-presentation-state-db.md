@@ -222,6 +222,82 @@ Runtime / registry から導出する値:
 - workflow / review / close status:
   Redmine durable records only。
 
+#### config namespace / path / ownership (#12287)
+
+desired presentation grouping config の on-disk 置き場・namespace・ownership を
+確定し、#12263 から引き継いだ「`presentation:` namespace を surface selection と
+共有するか分離するか」の open design note (`grouped_read_model.py` の docstring と
+`unit-target-model.md` #12264 実装メモが carry) を解決する。本節は namespace の
+contract のみを固定する。on-disk loader への結線は後続の code task である。
+
+**Path.** repo-local config file は `.mozyo-bridge/config.yaml` 一つだけ。repo-root
+相対で、repo root は他の surface と同じ `mozyo_bridge.shared.paths.resolve_repo_root`
+で解決する (`repo_local_config_loader.CONFIG_FILE_RELPATH` が単一定義)。grouping
+専用の別 file (`grouping.yaml` 等) は作らず、新規 config path を増やさない。file
+不在は behavior-preserving default。
+
+**Namespace.** grouping config は既存の top-level `presentation:` block に同居する。
+`presentation:` は presentation 一式の単一 namespace であり、内訳は:
+
+- `presentation.version`: presentation schema version (現在 `1`)。surface / grouping
+  で共有する単一 version。
+- `presentation.surface`: projection surface selection
+  (#12189 `PresentationSelectionConfig`; `tmux_user_option` default / `text`)。
+- `presentation.project_groups[]` + `presentation.grouping`: desired presentation
+  grouping (#12262 / #12263 `PresentationGroupingConfig`)。
+
+これは #12262 が「実装が保つべき schema field contract」として既に固定した field
+path (`presentation.project_groups` / `presentation.grouping.*`) と、#12189 が既に
+出荷した `presentation.surface` の両方を変えずに両立させる形である。grouping を別
+top-level key (`cockpit:` / `presentation_grouping:` 等) へ移すと #12262 の固定
+contract を破るため採らない。
+
+**Loader split contract (on-disk 結線 = 後続 code task).** loader は単一の
+`presentation` block を読み、key を所有 record へ振り分ける:
+
+- `surface` (+ `version`) -> `PresentationSelectionConfig.from_record`。
+- `project_groups` + `grouping` (+ `version`) -> `PresentationGroupingConfig.from_record`。
+
+各 record は自分の所有 key だけの closed sub-schema を保つ。現状 `PRESENTATION_SELECTION_KEYS`
+({`version`, `surface`}) と `GROUPING_CONFIG_KEYS` ({`version`, `project_groups`,
+`grouping`}) は disjoint なので、結線時に `RepoLocalConfig` の `presentation` block
+allowed-key を両者の union へ広げ、各 record には自分の view だけを渡す。`version`
+は presentation namespace で一度だけ検証する。この union 拡張と振り分けが結線 code
+task の責務であり、本 #12287 は record の closed sub-schema を変更しない。
+
+**Ownership.** `.mozyo-bridge/config.yaml` は consuming repo / operator が手で編集する
+repo-local declaration である。
+
+- generated file ではない。`file_conventions.generated.yaml` のような generator
+  出力と区別し、`mozyo-bridge docs generate-*` で再生成しない。
+- schema と validation は `mozyo_bridge` core が所有する (closed schema / fail-closed)。
+  config author は public-safe な display preference のみを宣言できる。
+- public scaffold が同梱してよいのは generic な example group / schema comment だけ。
+  project 固有の default grouping や private layout は consuming repo か private
+  operator config に置き、`mozyo_bridge` の OSS default に入れない
+  (desired presentation config 節 / `rule-public-private-boundary` 準拠)。
+
+**Projection input only.** この namespace は projection input に限定され、routing /
+approval / close / liveness authority を持たない (#12263 で code 強制済み; desired
+presentation config 節の禁止値と boundary-token reject を参照)。config と live
+observation が矛盾しても side effect は action-time live preflight が決める。
+
+**Missing / invalid fallback + doctor / validation policy.**
+
+- missing / empty config -> behavior-preserving default (repo / workspace label
+  ごとの default group)。routing 挙動は変えない。
+- invalid config (unknown top-level / unknown field / unsupported version /
+  duplicate `group_id` / dangling group reference / authority・target・route・
+  credential 形の key|value) -> fail-closed で適用せず、invalid config diagnostic
+  を surface する。
+- runtime drift (override が指す Unit が live でない / live identity が launch
+  identity と矛盾) -> visible degraded display (`desired_unit_missing` /
+  `identity_conflict`)。silent reroute しない。
+- doctor / validation は上記を読み取り用に surface する (fallback matrix 節 /
+  validation / degraded display 節 準拠)。doctor は invalid config を可視化する
+  だけで config を runtime truth に昇格させず、live geometry から group membership
+  を逆算しない。
+
 #### conceptual schema
 
 Parser / migration implementation remains a later code task, but #12262 fixes
@@ -241,6 +317,9 @@ the schema field contract that implementation must preserve:
 ```yaml
 presentation:
   version: 1
+  # surface: projection surface selection (#12189); coexists in this one
+  # `presentation:` namespace — see "config namespace / path / ownership (#12287)".
+  surface: "tmux_user_option"
   project_groups:
     - group_id: "project:<public-label>"
       label: "<public display label>"

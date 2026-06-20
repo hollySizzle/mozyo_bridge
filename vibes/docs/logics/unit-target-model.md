@@ -362,8 +362,10 @@ private policy で黙って補正しない。
 > reload/live preflight を要求する (上記 fallback matrix と
 > `runtime-observability-boundary.md` の fail-safe semantics 準拠)。action permission は
 > side-effecting command の action-time live preflight が決める。残作業の on-disk loader
-> 結線では #12263 から引き継いだ `presentation:` namespace (surface selection vs grouping)
-> の確定が必要。
+> 結線で必要だった #12263 由来の `presentation:` namespace (surface selection vs grouping)
+> は #12287 が `unit-presentation-state-db.md` の `config namespace / path / ownership`
+> で確定済み (grouping は #12189 surface selection と同じ単一 `presentation:` namespace に
+> 同居)。block 振り分けは後続 code task。
 
 > 実装メモ (#12266): 本 Project Group read model に対する **reload / freshness UX**
 > projection は `src/mozyo_bridge/domain/grouped_reload_view.py` に実装済み
