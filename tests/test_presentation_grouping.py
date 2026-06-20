@@ -29,6 +29,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.presentation_grouping import (
     ALLOWED_PROJECTIONS,
+    DEFAULT_PROJECT_GROUP_PRESENTATION,
+    PROJECT_GROUP_PRESENTATION_MODES,
+    PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
+    PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+    PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
     STATUS_CONFIGURED,
     STATUS_DEFAULT,
     STATUS_DESIRED_UNIT_MISSING,
@@ -557,6 +562,76 @@ class NoRoutingAuthorityLeakageTest(unittest.TestCase):
             config.project_groups[0].description, "Closed and owner-pending items"
         )
         self.assertEqual(config.unit_overrides[0].label_override, "Review queue")
+
+
+class ProjectGroupPresentationTest(unittest.TestCase):
+    """The #12286 display-placement mode: default / opt-in / fail-closed."""
+
+    def test_missing_field_defaults_to_same_cockpit_column(self) -> None:
+        # Missing config preserves current behavior exactly.
+        self.assertEqual(
+            DEFAULT_PROJECT_GROUP_PRESENTATION,
+            PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+        )
+        self.assertEqual(
+            PresentationGroupingConfig.default().project_group_presentation,
+            PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+        )
+        self.assertEqual(
+            PresentationGroupingConfig.from_record(
+                {"project_groups": [{"group_id": "g", "label": "G"}]}
+            ).project_group_presentation,
+            PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+        )
+
+    def test_opt_in_modes_round_trip(self) -> None:
+        for mode in (
+            PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+            PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+            PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
+        ):
+            config = PresentationGroupingConfig.from_record(
+                {"project_group_presentation": mode}
+            )
+            self.assertEqual(config.project_group_presentation, mode)
+
+    def test_only_placement_field_with_no_groups_is_valid(self) -> None:
+        # A placement preference with no groups is the ungrouped default layout.
+        config = PresentationGroupingConfig.from_record(
+            {"project_group_presentation": PROJECT_GROUP_PRESENTATION_TMUX_WINDOW}
+        )
+        self.assertEqual(config.project_groups, ())
+        self.assertEqual(
+            config.project_group_presentation,
+            PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+        )
+
+    def test_invalid_value_fails_closed(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {"project_group_presentation": "iterm_tab"}
+            )
+
+    def test_authority_shaped_value_fails_closed(self) -> None:
+        # An authority / routing-shaped value is not a known mode -> rejected; the
+        # placement mode can never become a routing / approval target.
+        for value in ("route_to_owner", "approve", "%5", True, 1):
+            with self.assertRaises(PresentationGroupingConfigError):
+                PresentationGroupingConfig.from_record(
+                    {"project_group_presentation": value}
+                )
+
+    def test_mode_set_is_exactly_the_three_documented_modes(self) -> None:
+        self.assertEqual(
+            PROJECT_GROUP_PRESENTATION_MODES,
+            frozenset(
+                {
+                    PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+                    PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+                    PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
+                }
+            ),
+        )
 
 
 if __name__ == "__main__":

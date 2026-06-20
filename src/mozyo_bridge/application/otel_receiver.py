@@ -383,6 +383,33 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             payload = attach_observation(payload, snapshot, now=now)
             self._respond_json(200, payload)
             return
+        if self.path == "/api/grouped-units":
+            # Served grouped cockpit read model (Redmine #12286): the Project
+            # Group -> Unit -> Target display view, built from the repo-local
+            # desired grouping config and the live tmux inventory snapshot. A
+            # display projection only — no row carries a pane / target, and an
+            # action re-resolves its candidate Unit live (grouped-reveal /
+            # grouped-jump). An invalid repo-local config fails closed (400) so a
+            # broken grouping config is visible, never silently defaulted.
+            from datetime import datetime, timezone
+
+            from mozyo_bridge.application.cockpit_ui import grouped_units_payload
+            from mozyo_bridge.domain.repo_local_config import (
+                RepoLocalConfigError,
+            )
+
+            home = getattr(self.server, "home", None)
+            now = datetime.now(timezone.utc)
+            try:
+                payload = grouped_units_payload(home=home, now=now)
+            except RepoLocalConfigError as exc:
+                self._respond_json(
+                    400,
+                    {"error": f"repo-local grouping config is invalid: {exc}"},
+                )
+                return
+            self._respond_json(200, payload)
+            return
         if self.path == "/api/transitions":
             tracker = getattr(self.server, "transitions", None)
             transitions = (

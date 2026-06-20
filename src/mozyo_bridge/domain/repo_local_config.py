@@ -55,6 +55,10 @@ from mozyo_bridge.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
     SURFACE_TMUX_USER_OPTION,
 )
+from mozyo_bridge.domain.presentation_grouping import (
+    PresentationGroupingConfig,
+    PresentationGroupingConfigError,
+)
 from mozyo_bridge.domain.provider_registry import ProviderSelectionConfig
 
 #: The supported repo-local config record version. ``version`` is optional in a
@@ -68,7 +72,27 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
 )
 
 #: The closed set of recognized keys inside the ``presentation`` sub-record.
-PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset({"version", "surface"})
+#: ``version`` / ``surface`` select the projection *surface* (#12189); the three
+#: grouping keys (#12286) carry the desired presentation *grouping* config — the
+#: Project Group layer (``project_groups`` / ``grouping``) and the whole-view
+#: display-placement mode (``project_group_presentation``) — delegated to
+#: :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`.
+PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
+    {
+        "version",
+        "surface",
+        "project_groups",
+        "grouping",
+        "project_group_presentation",
+    }
+)
+
+#: The ``presentation`` sub-keys that belong to the grouping config (forwarded to
+#: :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`).
+#: A separate set so the surface-selection keys and the grouping keys never blur.
+PRESENTATION_GROUPING_SUBKEYS: frozenset[str] = frozenset(
+    {"project_groups", "grouping", "project_group_presentation"}
+)
 
 #: The default projection surface — the current built-in behavior. Selecting no
 #: surface (or no ``presentation`` block at all) keeps tmux user-option output.
@@ -245,20 +269,31 @@ def _checked_version(record: "Mapping[object, object]", *, source: str) -> int:
 
 @dataclass(frozen=True)
 class PresentationSelectionConfig:
-    """Projection-only selection of a built-in presentation surface.
+    """Projection-only selection of a built-in surface + desired grouping.
 
-    The *only* thing config may do is name which built-in projection
-    :data:`~mozyo_bridge.domain.presentation_adapter.PRESENTATION_SURFACES`
-    surface to use — ``tmux_user_option`` (default) or ``text``. It cannot add a
-    surface, supply a renderer / module / callable, address a target / pane /
-    route, send / approve / close anything, or grant authority. An unrecognized
-    surface is rejected at construction.
+    Two display-only concerns live under one ``presentation`` block:
 
-    The default (``tmux_user_option``) is the current built-in behavior, so a
-    missing ``presentation`` block never changes how attention is projected.
+    - :attr:`surface` names which built-in projection
+      :data:`~mozyo_bridge.domain.presentation_adapter.PRESENTATION_SURFACES`
+      surface to use — ``tmux_user_option`` (default) or ``text`` (#12189). It
+      cannot add a surface, supply a renderer / module / callable, address a
+      target / pane / route, send / approve / close anything, or grant authority.
+    - :attr:`grouping` carries the desired presentation *grouping* config — the
+      Project Group layer (``project_groups`` / ``grouping``) and the whole-view
+      ``project_group_presentation`` display-placement mode (#12286) — parsed by
+      :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`,
+      itself display-only and fail-closed (no routing / approval / window
+      guarantee).
+
+    The default (``tmux_user_option`` surface + an empty grouping config) is the
+    current built-in behavior, so a missing ``presentation`` block — or one with
+    no grouping keys — never changes how attention is projected or grouped.
     """
 
     surface: str = DEFAULT_PRESENTATION_SURFACE
+    grouping: PresentationGroupingConfig = field(
+        default_factory=PresentationGroupingConfig.default
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.surface, str) or self.surface not in PRESENTATION_SURFACES:
@@ -269,7 +304,7 @@ class PresentationSelectionConfig:
 
     @classmethod
     def default(cls) -> "PresentationSelectionConfig":
-        """The behavior-preserving default: the tmux user-option surface."""
+        """The behavior-preserving default: tmux surface + empty grouping."""
         return cls()
 
     @classmethod
@@ -278,9 +313,16 @@ class PresentationSelectionConfig:
     ) -> "PresentationSelectionConfig":
         """Normalize a ``presentation`` sub-record into a typed selection.
 
-        ``None`` or an empty mapping yields the default surface. A non-mapping
-        record, a boundary-crossing / unknown key, an unsupported version, or a
-        non-string / unrecognized surface fails closed.
+        ``None`` or an empty mapping yields the default surface and an empty
+        grouping config. A non-mapping record, a boundary-crossing / unknown key,
+        an unsupported version, or a non-string / unrecognized surface fails
+        closed. The grouping sub-keys (``project_groups`` / ``grouping`` /
+        ``project_group_presentation``) are forwarded to
+        :meth:`PresentationGroupingConfig.from_record`, whose own
+        :class:`PresentationGroupingConfigError` (an undeclared group, an invalid
+        placement mode, a boundary-shaped grouping key, …) is re-raised as a
+        :class:`RepoLocalConfigError` so the loader's single-``except`` boundary
+        still catches every repo-local-config failure.
         """
         if record is None:
             return cls.default()
@@ -299,7 +341,23 @@ class PresentationSelectionConfig:
                 f"presentation config 'surface' must be a string naming a built-in "
                 f"projection surface, got {type(surface).__name__}"
             )
-        return cls(surface=surface)
+        # Forward only the grouping sub-keys to the grouping schema, so the
+        # surface-selection keys (version / surface) never reach — and are never
+        # rejected as unknown by — the grouping record, and vice versa.
+        grouping_record = {
+            key: record[key]
+            for key in PRESENTATION_GROUPING_SUBKEYS
+            if key in record
+        }
+        try:
+            grouping = PresentationGroupingConfig.from_record(
+                grouping_record or None
+            )
+        except PresentationGroupingConfigError as exc:
+            raise RepoLocalConfigError(
+                f"presentation config grouping is invalid: {exc}"
+            ) from exc
+        return cls(surface=surface, grouping=grouping)
 
 
 @dataclass(frozen=True)
@@ -397,6 +455,7 @@ __all__ = (
     "REPO_LOCAL_CONFIG_VERSION",
     "REPO_LOCAL_CONFIG_KEYS",
     "PRESENTATION_SELECTION_KEYS",
+    "PRESENTATION_GROUPING_SUBKEYS",
     "DEFAULT_PRESENTATION_SURFACE",
     "RepoLocalConfigError",
     "PresentationSelectionConfig",

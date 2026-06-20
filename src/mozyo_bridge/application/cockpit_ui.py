@@ -470,6 +470,178 @@ def grouped_jump(
     return result
 
 
+# --- served grouped cockpit read-model wiring (Redmine #12286) ----------------
+#
+# The predecessors (#12263 schema/resolver, #12264 read model, #12266 reload
+# view, #12255 display view) are all pure object-to-object slices that never read
+# the live runtime or the on-disk grouping config. #12286 is the *live wiring*:
+# it builds the grouped display view a cockpit renders from (a) the repo-local
+# desired grouping config loaded from `.mozyo-bridge/config.yaml` and (b) the
+# live tmux inventory snapshot, so the Project Group -> Unit -> Target view is
+# served from real data and its reload / freshness line matches the same snapshot
+# the rows are built from.
+#
+# It stays a *display projection*: it resolves no handoff target and grants no
+# authority. Acting on a grouped row still goes through the candidate-Unit
+# selector + action-time live preflight (`grouped_reveal` / `grouped_jump`), so
+# the served projection can only NAME a candidate, never authorize a side effect.
+
+
+def observed_units_from_inventory(snapshot, *, observation):
+    """Aggregate a live inventory snapshot into grouped read-model ``ObservedUnit``s.
+
+    The flat inventory is pane-centric (one row per agent pane); the grouped read
+    model is Unit-centric (one row per ``workspace_id`` / lane / host, carrying the
+    set of agent *roles* that have a live pane). This maps the former to the
+    latter:
+
+    - only agent panes (``claude`` / ``codex``) with a resolved ``workspace_id``
+      become Units; a pane with no workspace identity cannot form a routable /
+      groupable Unit and is skipped (it still shows in the flat table);
+    - panes are aggregated by ``workspace_id`` into one Unit whose ``roles`` is the
+      observed role set and whose ``repo_label`` is the workspace's public-safe
+      display label (project name / canonical session);
+    - ``lane_id`` / ``host_id`` are the cockpit inventory's only faithful values —
+      ``default`` / ``local`` — because the inventory observes the local tmux
+      server and does not read the ``@mozyo_lane_id`` pane option (the same
+      limitation ``attach_attention`` / ``_resolve_unit_target`` document); a
+      non-default lane / remote host therefore cannot be fabricated here;
+    - ``active`` is the observed liveness fact: a Unit has a live Target only when
+      the runtime is actually readable, so a **stale** snapshot yields
+      ``active=False`` (the fail-safe posture — no live Target is asserted from a
+      cache) and the per-Unit ``observation`` envelope carries the staleness;
+    - every Unit shares the whole-projection ``observation`` envelope so the
+      grouped reload / freshness line never contradicts the per-row freshness
+      (both derive from the one snapshot) — **except** a lane-ambiguous Unit (see
+      below), whose envelope carries a visible contradiction.
+
+    Lane-ambiguous degrade (Redmine #12286 review j#61995). A faithful Unit is one
+    ``(workspace_id, lane_id, host_id)`` with at most one live pane per role.
+    Because the inventory projects every pane to lane ``default``, one repo with
+    several live lanes / worktrees sharing a ``workspace_id`` (the cockpit +
+    sublane dogfood shape) produces *more than one* live pane for a role under the
+    same projected Unit. Without a lane discriminator we cannot faithfully split
+    that into distinct lane Units, so collapsing it into one healthy ``default``
+    Unit would serve enabled action buttons whose candidate then resolves
+    *ambiguous* at action time. Instead the Unit is degraded to a **visible
+    contradicted** row (``live_runtime_conflict``): it is shown but reads
+    ``needs_reload`` / unactionable, so its action affordances are disabled and the
+    operator must use an explicit pane target. ``_resolve_unit_target`` still fails
+    closed on the same ambiguity, so this is defense in depth, not the only guard.
+
+    Pure aggregation: it carries identity + role *presence* only, never a
+    pane id / target, so the result is display state, not a routing endpoint.
+    """
+    from dataclasses import replace
+
+    from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
+    from mozyo_bridge.domain.grouped_read_model import ObservedUnit
+    from mozyo_bridge.domain.runtime_observation import (
+        CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+        DISPLAY_STATE_RELOAD_REQUIRED,
+    )
+
+    live = not snapshot.stale
+    by_workspace: dict[str, dict] = {}
+    for record in snapshot.records:
+        if record.agent_kind not in (ROLE_CLAUDE, ROLE_CODEX):
+            continue
+        workspace = record.workspace
+        workspace_id = workspace.workspace_id if workspace is not None else None
+        if not workspace_id:
+            continue
+        entry = by_workspace.setdefault(
+            workspace_id, {"role_counts": {}, "label": None}
+        )
+        entry["role_counts"][record.agent_kind] = (
+            entry["role_counts"].get(record.agent_kind, 0) + 1
+        )
+        if entry["label"] is None and workspace is not None:
+            entry["label"] = (
+                workspace.project_name
+                or workspace.canonical_session
+                or workspace_id
+            )
+    units: list = []
+    for workspace_id in sorted(by_workspace):
+        entry = by_workspace[workspace_id]
+        role_counts = entry["role_counts"]
+        roles = tuple(
+            role for role in (ROLE_CODEX, ROLE_CLAUDE) if role in role_counts
+        )
+        # >1 live pane for any role under the same projected (workspace, lane,
+        # host) means multiple lanes / worktrees collapse onto one Unit; degrade
+        # it to a visible contradicted row rather than a healthy actionable one.
+        ambiguous = any(count > 1 for count in role_counts.values())
+        unit_observation = observation
+        if ambiguous:
+            unit_observation = replace(
+                observation,
+                contradiction=CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+                display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+            )
+        units.append(
+            ObservedUnit(
+                workspace_id=workspace_id,
+                lane_id=DEFAULT_LANE,
+                host_id=DEFAULT_HOST,
+                repo_label=entry["label"],
+                active=live,
+                roles=roles,
+                observation=unit_observation,
+            )
+        )
+    return units
+
+
+def grouped_units_payload(
+    *,
+    home: Path | None = None,
+    now=None,
+    repo_root: Path | None = None,
+) -> dict:
+    """Build the served grouped cockpit display payload from live data (#12286).
+
+    Composes the desired grouping config (loaded from the repo-local
+    ``.mozyo-bridge/config.yaml`` — a missing / empty config is the
+    behavior-preserving default) with the live tmux inventory snapshot, into the
+    #12255 grouped display view a cockpit renders: Project Group headers, their
+    Unit rows (lane / issue labels + Codex / Claude role presence), and the
+    whole-view freshness / reload line plus the desired
+    ``project_group_presentation`` display-placement mode.
+
+    Boundary: this is a display projection. The freshness envelope is derived from
+    the same ``snapshot`` the rows are built from (via ``snapshot_from_inventory``,
+    the one mapping the ``observe reload`` CLI and ``attach_observation`` share),
+    so the served reload / freshness display never contradicts the projection
+    snapshot. No row carries a pane / target; acting on a grouped row re-resolves
+    its candidate identity live through ``grouped_reveal`` / ``grouped_jump``.
+    """
+    from datetime import datetime, timezone
+
+    from mozyo_bridge.application.commands_runtime_observation import (
+        snapshot_from_inventory,
+    )
+    from mozyo_bridge.application.repo_local_config_loader import (
+        load_repo_local_config,
+    )
+    from mozyo_bridge.domain.grouped_display import build_grouped_display_view
+    from mozyo_bridge.domain.grouped_read_model import build_grouped_read_model
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    config = load_repo_local_config(repo_root).presentation.grouping
+    snapshot = take_inventory(home=home)
+    observation = snapshot_from_inventory(snapshot, now=now)
+    observed_units = observed_units_from_inventory(
+        snapshot, observation=observation
+    )
+    model = build_grouped_read_model(
+        config, observed_units, observation=observation
+    )
+    return build_grouped_display_view(model).as_payload()
+
+
 # The page is a single self-contained document: no external assets, no
 # CDN, nothing fetched off-host — consistent with the loopback-only and
 # no-exfiltration posture. Kept intentionally small; it is an indicator
@@ -509,6 +681,16 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .obs-healthy { color: #2e7d32; }
   .obs-reload_required { color: #ef6c00; font-weight: 600; }
   .obs-unknown { color: #b71c1c; font-weight: 600; }
+  .group { margin: 8px 0; border: 1px solid #e0e0e0; border-radius: 4px; }
+  .group-header { background: #f5f5f5; padding: 4px 8px; font-weight: 600; }
+  .group-header .tag { font-weight: 400; font-size: 11px; color: #757575; margin-left: 6px; }
+  .group-header .stale { color: #b71c1c; }
+  .group-header .reload { color: #ef6c00; }
+  .unit-row { padding: 3px 8px; border-top: 1px solid #f0f0f0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .unit-row.hidden-unit { opacity: 0.65; }
+  .fresh-fresh { color: #2e7d32; }
+  .fresh-stale, .fresh-expired { color: #ef6c00; font-weight: 600; }
+  .fresh-unknown { color: #b71c1c; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -528,6 +710,15 @@ unknown — never "dead"); tmux liveness is the row's presence itself;
 redmine is read-only gate context (latest open issue), degrading to
 unconfigured / unavailable without affecting the other layers.
 Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
+<h3>grouped (Project Group &#8594; Unit &#8594; Target)</h3>
+<div id="grouped-meta" class="muted">grouped: loading…</div>
+<div id="grouped"></div>
+<p class="muted">grouped read model (#12286): Project Group headers, each Unit's
+lane / issue and its Codex / Claude role panes (the Target layer). Display only —
+group membership and freshness are a projection, never routing authority; an
+action re-resolves its candidate Unit live before acting. project_group_presentation
+is a desired display-placement request (same_cockpit_column default), never a
+guaranteed window / tab.</p>
 <h3>recent transitions</h3>
 <ul id="transitions"></ul>
 <script>
@@ -581,6 +772,119 @@ async function act(kind, pane) {
   const body = await res.json();
   if (!res.ok) alert(body.error || 'action failed');
 }
+// #12286 grouped action: the request carries only the candidate Unit identity
+// (workspace_id / role / lane_id / host_id) the displayed row exposes — never a
+// pane id. The server re-resolves it live and fails closed; this is the same
+// explicit-click + token-gated path as `act`.
+const KNOWN_FRESHNESS = ["fresh", "stale", "expired", "unknown"];
+async function actGrouped(kind, unit, role) {
+  const res = await fetch('/api/actions/grouped-' + kind, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
+    },
+    body: JSON.stringify({
+      workspace_id: unit.workspace_id,
+      role: role,
+      lane_id: unit.lane_id,
+      host_id: unit.host_id
+    })
+  });
+  const body = await res.json();
+  if (!res.ok) alert(body.error || 'action failed');
+}
+// Render the grouped read model (Project Group -> Unit -> Target). DOM APIs only;
+// every label lands via textContent, and the freshness/display-state class names
+// are whitelisted, so the (local but untrusted) payload can never inject markup
+// or a class. The grouped view is display only: a degraded (reload_required) row
+// disables its action buttons, and the server re-preflights regardless.
+function unitRow(unit, hidden) {
+  const row = document.createElement('div');
+  row.className = hidden ? 'unit-row hidden-unit' : 'unit-row';
+  const lane = document.createElement('span');
+  lane.textContent = (unit.lane_label || '-') +
+    (unit.issue_label ? ' · ' + unit.issue_label : '');
+  row.appendChild(lane);
+  const fresh = KNOWN_FRESHNESS.includes(unit.freshness) ? unit.freshness : 'unknown';
+  const state = document.createElement('span');
+  state.className = 'fresh-' + fresh;
+  state.textContent = (unit.state_label || unit.status || 'unknown') +
+    ' / ' + (unit.freshness_label || fresh);
+  row.appendChild(state);
+  if (hidden) {
+    const tag = document.createElement('span');
+    tag.className = 'muted';
+    tag.textContent = '(hidden)';
+    row.appendChild(tag);
+  }
+  // The Target layer: one action affordance per observed role pane. Disabled
+  // when the row is not current (reload_required) — the candidate selector would
+  // fail closed anyway.
+  for (const role of (unit.roles || [])) {
+    for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
+      const button = document.createElement('button');
+      button.textContent = role + ':' + label;
+      button.disabled = !!unit.reload_required;
+      button.addEventListener('click', () => actGrouped(kind, unit, role));
+      row.appendChild(button);
+    }
+  }
+  if (!(unit.roles || []).length) {
+    const none = document.createElement('span');
+    none.className = 'muted';
+    none.textContent = 'no live role pane';
+    row.appendChild(none);
+  }
+  return row;
+}
+function renderGrouped(data) {
+  const meta = document.getElementById('grouped-meta');
+  const container = document.getElementById('grouped');
+  container.replaceChildren();
+  if (!data || !Array.isArray(data.groups)) {
+    meta.textContent = 'grouped: unavailable';
+    return;
+  }
+  meta.textContent = 'placement: ' + (data.project_group_presentation || 'unknown') +
+    ' · ' + (data.freshness_label || 'unknown') +
+    (data.needs_attention ? ' · reload recommended' : '');
+  for (const g of data.groups) {
+    const box = document.createElement('div');
+    box.className = 'group';
+    const header = document.createElement('div');
+    header.className = 'group-header';
+    const title = document.createElement('span');
+    title.textContent = g.header_label || '(ungrouped)';
+    header.appendChild(title);
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    let tagText = g.source;
+    if (g.stale) tagText += ' · stale';
+    if (g.reload_required) tagText += ' · reload';
+    tag.textContent = tagText;
+    if (g.stale) tag.classList.add('stale');
+    else if (g.reload_required) tag.classList.add('reload');
+    header.appendChild(tag);
+    box.appendChild(header);
+    for (const u of (g.units || [])) box.appendChild(unitRow(u, false));
+    for (const u of (g.hidden_units || [])) box.appendChild(unitRow(u, true));
+    container.appendChild(box);
+  }
+}
+async function refreshGrouped() {
+  try {
+    const res = await fetch('/api/grouped-units');
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById('grouped-meta').textContent =
+        'grouped: ' + (body.error || 'unavailable');
+      document.getElementById('grouped').replaceChildren();
+      return;
+    }
+    renderGrouped(await res.json());
+  } catch (e) { /* daemon restarting; next poll recovers */ }
+}
 // DOM construction only: every payload string lands via textContent, so
 // workspace / session names with HTML metacharacters render as text.
 function cell(row, text, cls) {
@@ -631,6 +935,9 @@ async function refresh() {
       list.appendChild(item);
     }
   } catch (e) { /* daemon restarting; next poll recovers */ }
+  // The grouped read model is served from its own endpoint; refresh it on the
+  // same cadence so its freshness line tracks the flat view.
+  refreshGrouped();
 }
 // Explicit operator reload (v1 freshness model = explicit reload + action-time
 // live preflight): re-fetch the snapshot on demand. Refreshing the display moves
