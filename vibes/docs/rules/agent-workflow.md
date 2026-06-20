@@ -29,6 +29,9 @@
   `vibes/docs/logics/coordinator-sublane-development-flow.md` の
   backlog reconciliation gate で棚卸しし、new issue / existing issue /
   explicit no-op / owner decision pending のいずれかに分類する。
+- cockpit / sublane 運用で agent が「後で」「別 Version」「follow-up」
+  「later-stage」と提案した場合は、同 doc の immediate durable classification
+  を正とし、会話だけに残さない。
 - Claude の通常開発完了 journal には、次の最小証跡を短く残す。
   - `mozyo-bridge-agent` skill を loaded したこと。
   - active Redmine issue / journal と relevant project docs を確認したこと。
