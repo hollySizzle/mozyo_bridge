@@ -1,205 +1,159 @@
-# Sublane Bandwidth / Admission Policy
+# サブレーン帯域 / admission policy
 
-## Purpose
+## 目的
 
-This document defines the repo-local policy for deciding when the coordinator
-should open another sublane, when it must stop dispatching and drain existing
-lanes, and how lane retirement interacts with cockpit throughput.
+この文書は、管制塔が追加 sublane を開くべき時、既存 lane の drain を優先して
+dispatch を止めるべき時、そして lane retirement が cockpit throughput にどう影響
+するかを定義する repo-local policy である。
 
-It complements [[logic-coordinator-sublane-development-flow]] and
-[[logic-worktree-lifecycle-boundary]]. Those documents define lane roles,
-sequencing, and retirement authority. This document defines coordinator
-bandwidth.
+本 doc は [[logic-coordinator-sublane-development-flow]] と
+[[logic-worktree-lifecycle-boundary]] を補完する。これらの文書は lane の役割、
+順序、retirement authority を定義する。本 doc は **管制塔の帯域判断**だけを扱う。
 
-## Principle
+## 原則
 
-Sublane bandwidth is coordinator attention, not CPU capacity. The useful
-default is pipeline-first: keep independent implementation work moving while
-the coordinator has no coordinator-owned queue to drain.
+sublane bandwidth は CPU capacity ではなく、管制塔の注意力である。実用上の default
+は pipeline-first であり、管制塔が drain すべき coordinator-owned queue を持たない
+間は、独立した実装 work を止めずに進める。
 
-A lane consumes bandwidth whenever the coordinator may need to read durable
-state, route a decision, audit a result, collect owner approval, or retire local
-state. A lane that is "waiting" can be more expensive than a lane that is still
-implementing, because it can block review, close, release, or retirement.
+lane は、管制塔が durable state を読み、仕様判断を route し、audit し、owner approval
+を集め、local state を retire する必要がある時に bandwidth を消費する。単に
+`implementing` の lane よりも、待機中 lane の方が review / close / release /
+retirement を止めるため高コストになることがある。
 
-Efficient parallel development is an explicit goal. The coordinator should use
-sublanes aggressively when the durable state shows ready implementation work and
-the admission checks below pass. Serializing all work into the main lane wastes
-the cockpit model and should be treated as a throughput smell, not the default.
-An already-running `implementing` lane is positive pipeline occupancy, not a
-reason to idle the coordinator. The coordinator should dispatch the next
-independent ready work when lane capacity remains, unless it records a concrete
-serialization reason such as file / invariant overlap, merge-order dependency,
-release gate, owner decision, or a coordinator-blocking queue.
+効率的な並列開発は明示的な目標である。durable state 上 ready な implementation work
+があり、下記 admission check を満たすなら、管制塔は sublane を積極的に使う。
+すべての work を main lane に直列化することは cockpit model を無駄にするため、
+default ではなく throughput smell として扱う。既に `implementing` の lane がある
+ことは positive pipeline occupancy であり、管制塔が idle になる理由ではない。
 
-The coordinator still must not open work only because a pane or worktree can be
-created. It may dispatch only when it can also receive callbacks, perform the
-required audit, and retire completed lanes without losing durable state.
+一方で、pane や worktree を作れるというだけで work を開いてはならない。管制塔は
+callback を受け、必要な audit を実施し、完了 lane を durable state を失わず retire
+できる場合に限って dispatch する。
 
-Conversely, the coordinator should intentionally serialize when parallel work
-would increase total latency or risk. Examples include a blocking design
-decision, overlapping files or invariants, pending review / owner decisions that
-only the coordinator can drain, release / credential / destructive-operation
-gates, or a callback backlog that would make another lane invisible.
+また、並列化が総 latency や risk を増やす場合は意図的に直列化する。例は、未決の
+design decision、file / invariant overlap、管制塔だけが drain できる review /
+owner decision、release / credential / destructive-operation gate、別 lane を見えなく
+する callback backlog である。
 
 ## Lane State Classes
 
-For bandwidth decisions, classify every lane into one of these classes from the
-durable record. Do not infer state from pane layout alone.
+bandwidth 判断では、すべての lane を durable record から次のいずれかに分類する。
+pane layout だけから状態を推測しない。
 
-- `implementing`: local Claude is working under a durable issue / journal.
-- `callback_due`: dispatch occurred, but an expected callback or durable gate is
-  missing.
-- `review_waiting`: implementation_done / review_request exists and Codex audit
-  is needed.
-- `owner_waiting`: review or close flow needs owner approval through the main
-  coordinator Codex.
-- `close_waiting`: review / owner close approval / integration disposition
-  or explicit no-integration decision is recorded, but the Redmine issue status
-  is still open.
-- `integration_waiting`: review / owner close approval may be satisfied, but a
-  commit-bearing implementation has no durable disposition yet: merged to the
-  target branch, pushed for CI / merge, patch-equivalent to the target branch,
-  or explicitly deferred with a branch / commit owner.
-- `blocked`: the lane recorded a blocker, design consultation, failed handoff, or
-  unresolved dependency.
-- `retire_ready`: work is integrated or patch-equivalent, issue scope is done,
-  and no active gate is pending.
-- `idle`: lane has no active durable work and can be reused or retired.
+- `implementing`: local Claude が durable issue / journal に基づいて実装中。
+- `callback_due`: dispatch は行われたが、期待される callback または durable gate が無い。
+- `review_waiting`: implementation_done / review_request があり Codex audit が必要。
+- `owner_waiting`: review / close flow が main coordinator Codex 経由の owner approval を必要とする。
+- `close_waiting`: review / owner close approval / integration disposition または明示的 no-integration 判断は記録済みだが、Redmine issue status がまだ open。
+- `integration_waiting`: review / owner close approval は満たされ得るが、commit-bearing implementation について target branch merge、CI / merge 用 push、target branch との patch-equivalent、または branch / commit owner 付き explicit deferral が未記録。
+- `blocked`: blocker、design consultation、failed handoff、未解決 dependency が記録されている。
+- `retire_ready`: work は integrated または patch-equivalent、issue scope は完了、active gate は残っていない。
+- `idle`: active durable work が無く、reuse または retire できる。
 
-`callback_due`, `review_waiting`, `owner_waiting`, `integration_waiting`,
-`close_waiting`, and `blocked` all count as coordinator-blocking states. They
-must be drained before opening optional new work. A close-ready issue left in
-`着手中` is not harmless bookkeeping: it keeps the durable state inconsistent
-and can hide whether a sublane is still active or ready to retire. Likewise, a
-closed issue with only an unmerged local sublane commit is not a complete drain:
-the implementation exists, but the target branch / CI / release path cannot be
-reconstructed from the issue alone.
+`callback_due`、`review_waiting`、`owner_waiting`、`integration_waiting`、
+`close_waiting`、`blocked` は coordinator-blocking state である。optional new work を
+開く前に drain する。close-ready issue が `着手中` のまま残る状態は harmless な
+bookkeeping ではなく、durable state の不整合であり、sublane が active なのか retire
+ready なのかを隠す。同様に、closed issue に unmerged local sublane commit しか無い
+状態は drain 完了ではない。実装は存在するが、target branch / CI / release path を
+issue から再構築できない。
 
-`implementing` does not count as a coordinator-blocking state. It is counted for
-the local soft profile lane limit, but it does not by itself block another
-dispatch. If the active set is only `implementing` lanes plus the coordinator,
-the expected coordinator action is to look for independent ready work and
-pipeline it. Serial execution in that state needs an explicit durable reason.
+`implementing` は coordinator-blocking state ではない。local soft profile の lane
+count には数えるが、それだけでは次の dispatch を止めない。active set が
+`implementing` lanes と coordinator だけなら、管制塔の期待 action は独立した ready
+work を探して pipeline に載せることである。この状態で直列実行を選ぶなら、具体的な
+durable reason が必要である。
 
 ## Admission Rule
 
-Before any implementation-shaped work receives an Implementation Request, the
-coordinator records a dispatch decision. This applies even when the receiver
-would be the already-open main-unit Claude. Skipping this decision is a process
-gap, because it silently turns the coordinator lane into an implementation lane.
+implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch
+decision を記録する。受信者が既に開いている main-unit Claude であっても同じである。
+この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため
+process gap になる。
 
-The decision records:
+decision には次を記録する。
 
-- whether the work is implementation-shaped or coordinator-only;
-- whether sublane dispatch is the default route;
-- if sublane dispatch is not used, the concrete exception that makes
-  main-lane / default-lane work safer or faster;
-- current active lane count and any coordinator-blocking queue;
-- the next drain action if dispatch is stopped.
+- work が implementation-shaped か coordinator-only か。
+- sublane dispatch が default route か。
+- sublane dispatch を使わない場合、main-lane / default-lane work の方が安全または速い具体例外。
+- current active lane count と coordinator-blocking queue。
+- dispatch を止める場合の次 drain action。
 
-For implementation-shaped work, sublane dispatch is the default. Main-unit
-Claude is an exception for read-only investigation, summary/draft work, design
-consultation preparation, urgent minimal correction with a durable reason, or an
-explicit owner/operator decision. "The pane is already open" is not a reason.
+implementation-shaped work では sublane dispatch が default である。Main-unit Claude
+は read-only investigation、summary / draft、design consultation preparation、
+durable reason 付き urgent minimal correction、または明示的 owner / operator decision
+の例外に限る。「pane が既に開いている」は理由にならない。
 
-Before dispatching a new sublane, the coordinator records or verifies:
+新しい sublane を dispatch する前に、管制塔は次を記録または確認する。
 
-- target issue, target lane, branch/worktree identity, and durable dispatch
-  anchor are known;
-- the work is implementation-shaped and should not be performed by the main
-  coordinator lane or main-unit Claude;
-- no unread `review_request`, `owner_waiting`, `integration_waiting`,
-  `close_waiting`, `blocked`, or `callback_delivery_failed` item is waiting for
-  coordinator action;
-- the coordinator can perform the expected next review / owner aggregation /
-  retirement step for the lane it is about to open;
-- the work does not overlap materially with another active sublane's files,
-  invariants, or release-critical surface unless the ordering / merge plan is
-  recorded;
-- the new work is not a lower-priority optional item while a production,
-  release, credential, destructive-operation, or owner decision gate is active;
-- any existing `retire_ready` lane above the local soft profile has been retired
-  or a reason for keeping it is recorded.
+- target issue、target lane、branch / worktree identity、durable dispatch anchor が既知。
+- work が implementation-shaped であり、main coordinator lane / main-unit Claude が担うべきではない。
+- 未読の `review_request`、`owner_waiting`、`integration_waiting`、`close_waiting`、`blocked`、`callback_delivery_failed` が coordinator action を待っていない。
+- 開く lane について、次に必要な review / owner aggregation / retirement を管制塔が実施できる。
+- 別 active sublane と file、invariant、release-critical surface が実質的に重ならない。重なる場合は ordering / merge plan が記録済み。
+- production、release、credential、destructive-operation、owner decision gate が active な時に lower-priority optional item を開いていない。
+- local soft profile を超える `retire_ready` lane がある場合、退役済みまたは保持理由が記録済み。
 
-If any check fails, do not dispatch another sublane. Record the blocking state
-and drain it first.
+いずれかが満たせない場合は、追加 sublane を開かない。blocking state を記録し、先に
+drain する。
 
-If all checks pass and there is ready implementation work, dispatch is the
-preferred action. A coordinator stop that leaves ready work undispatched, or a
-direct default-lane Claude handoff, must record why serial execution is more
-efficient or safer for that specific state.
+すべて満たし ready implementation work がある場合、dispatch が preferred action である。
+ready work を残して管制塔が止まる場合、または default-lane Claude に直接渡す場合は、
+その状態で直列実行の方が効率的または安全である理由を記録する。
 
 ### Pipeline Dispatch Check
 
-Use this quick classification before deciding to wait:
+待つかどうかを決める前に、次の quick classification を使う。
 
-- If there is `review_waiting`, `owner_waiting`, `integration_waiting`,
-  `close_waiting`, `blocked`, `callback_due`, or `callback_delivery_failed`,
-  drain that coordinator-owned queue first.
-- If existing active lanes are only `implementing` and the new work is
-  independent, dispatch another sublane within the local soft profile.
-- If independence is uncertain, record the suspected overlap and choose either
-  a bounded read-only investigation or an explicit serialization decision. Do
-  not silently wait.
-- If waiting is chosen while the coordinator is otherwise idle, the journal must
-  say what condition will unblock dispatch.
+- `review_waiting`、`owner_waiting`、`integration_waiting`、`close_waiting`、`blocked`、`callback_due`、`callback_delivery_failed` があれば、まず coordinator-owned queue を drain する。
+- 既存 active lanes が `implementing` のみで、新しい work が独立しているなら、local soft profile 内で別 sublane を dispatch する。
+- 独立性が不明なら、疑われる overlap を記録し、bounded read-only investigation または明示的 serialization decision のどちらかを選ぶ。黙って待たない。
+- 管制塔が otherwise idle なのに待つ場合、journal に dispatch を unblock する条件を書く。
 
 ## Drain Order
 
-When multiple lanes require attention, use this order unless the durable issue
-records a stronger dependency:
+複数 lane が attention を必要とする場合、durable issue により強い依存が無ければ次の順に扱う。
 
-1. production / release / credential / destructive-operation blockers;
-2. `owner_waiting` items that only the coordinator can aggregate;
-3. `review_waiting` items;
-4. `integration_waiting` items where a commit exists but merge / push /
-   patch-equivalence / explicit deferral is not yet recorded;
-5. `close_waiting` items whose durable close gates are already satisfied;
-6. `blocked` or `callback_due` items, including callback delivery failures;
-7. `retire_ready` lanes that consume cockpit or worktree attention;
-8. new dispatch.
+1. production / release / credential / destructive-operation blockers。
+2. 管制塔だけが集約できる `owner_waiting`。
+3. `review_waiting`。
+4. commit はあるが merge / push / patch-equivalence / explicit deferral が未記録の `integration_waiting`。
+5. durable close gates が満たされた `close_waiting`。
+6. `blocked` または `callback_due`。callback delivery failure を含む。
+7. cockpit / worktree attention を消費する `retire_ready` lane。
+8. new dispatch。
 
-This order is about coordinator bandwidth. It does not change Redmine gate
-requirements, review quality, or owner close approval separation.
+この順序は coordinator bandwidth のためのものであり、Redmine gate、review quality、
+owner close approval separation を変更しない。
 
 ## Local Soft Profile
 
-mozyo_bridge dogfooding uses the following repo-local soft profile:
+mozyo_bridge dogfooding では次の repo-local soft profile を使う。
 
-- target: three active implementation sublanes plus the main coordinator;
-- burst: a fourth active implementation sublane is allowed only when the
-  coordinator records why existing review / owner / blocker / retirement queues
-  will not be starved;
-- stop: do not open a fifth active implementation sublane without explicit
-  owner/operator decision recorded in the durable issue;
-- cleanup: when the lane count is above target, retire `retire_ready` lanes
-  before the next optional dispatch batch.
+- target: main coordinator に加えて active implementation sublane 3 本。
+- burst: active implementation sublane 4 本目は、既存 review / owner / blocker / retirement queue を飢えさせない理由を管制塔が記録した場合のみ許容。
+- stop: 5 本目以降の active implementation sublane は、explicit owner / operator decision を durable issue に記録せず開かない。
+- cleanup: lane count が target を超える場合、次の optional dispatch batch の前に `retire_ready` lane を退役する。
 
-These numbers are not a portable mozyo-bridge core default. Downstream projects
-may define a different private operating profile. The portable rule is the
-admission / drain model above, plus the requirement to record any burst decision
-in the durable ticket system.
+これらの数字は portable な mozyo-bridge core default ではない。downstream project は別の
+private operating profile を定義してよい。portable rule は上記 admission / drain model
+と、burst decision を durable ticket system に記録する requirement である。
 
 ## Retirement Cadence
 
-Routine retirement remains coordinator-owned under
-[[logic-worktree-lifecycle-boundary]].
+routine retirement は [[logic-worktree-lifecycle-boundary]] に従い coordinator-owned である。
 
-For bandwidth control:
+bandwidth control としては次を守る。
 
-- retire a `retire_ready` lane immediately after close when lane count is above
-  the local target;
-- otherwise retire `retire_ready` lanes before opening the next dispatch batch;
-- do not leave closed lanes in cockpit merely because the owner did not
-  explicitly ask for cleanup, provided the lifecycle checks pass;
-- do not retire lanes with unknown dirty state, unresolved callback, active
-  review, owner wait, blocker, or identity ambiguity.
+- lane count が local target を超えている場合、close 後すぐ `retire_ready` lane を退役する。
+- それ以外でも、次の dispatch batch を開く前に `retire_ready` lane を退役する。
+- lifecycle checks が通るなら、owner が明示的に cleanup を頼んでいなくても closed lane を cockpit に残し続けない。
+- dirty state unknown、unresolved callback、active review、owner wait、blocker、identity ambiguity がある lane は retire しない。
 
 ## Durable Record Template
 
-When dispatching above target or stopping dispatch because bandwidth is full,
-record a short journal:
+target 超過 dispatch または bandwidth full による dispatch stop では、短い journal を記録する。
 
 ```markdown
 ## Sublane dispatch decision
@@ -214,23 +168,20 @@ record a short journal:
 - next_drain_action: <review | owner aggregation | blocker | retirement | none>
 ```
 
-The journal should contain issue IDs and state classes, not private paths or
-operator-specific cockpit details.
+journal には issue ID と state class を書き、private path や operator-specific cockpit
+details は書かない。
 
 ## Non-Goals
 
-- Do not add `git worktree add/remove` orchestration to mozyo-bridge core.
-- Do not encode private cockpit layout, personal paths, or operator-specific
-  staffing assumptions in OSS defaults.
-- Do not let a bandwidth decision waive Redmine gates, Codex review, owner close
-  approval, or the Codex gateway rule.
-- Do not use the main coordinator lane or main-unit Claude as a substitute
-  implementation lane merely because it is already open.
+- `git worktree add/remove` orchestration を mozyo-bridge core に追加しない。
+- private cockpit layout、personal path、operator-specific staffing assumption を OSS default に焼かない。
+- bandwidth decision を理由に Redmine gates、Codex review、owner close approval、Codex gateway rule を免除しない。
+- main coordinator lane または main-unit Claude を、既に開いているという理由で substitute implementation lane にしない。
 
 ## Verification
 
-- `mozyo-bridge docs validate --repo .`.
-- `mozyo-bridge docs validate --check-file-coverage --repo .`.
-- `mozyo-bridge docs generate-file-conventions --check --repo .`.
-- `mozyo-bridge docs audit-impact --all-changed --check-generated --repo .`.
-- `mozyo-bridge docs resolve vibes/docs/logics/sublane-bandwidth-policy.md --repo . --format text`.
+- `mozyo-bridge docs validate --repo .`
+- `mozyo-bridge docs validate --check-file-coverage --repo .`
+- `mozyo-bridge docs generate-file-conventions --check --repo .`
+- `mozyo-bridge docs audit-impact --all-changed --check-generated --repo .`
+- `mozyo-bridge docs resolve vibes/docs/logics/sublane-bandwidth-policy.md --repo . --format text`
