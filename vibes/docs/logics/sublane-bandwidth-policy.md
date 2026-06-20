@@ -13,7 +13,9 @@ bandwidth.
 
 ## Principle
 
-Sublane bandwidth is coordinator attention, not CPU capacity.
+Sublane bandwidth is coordinator attention, not CPU capacity. The useful
+default is pipeline-first: keep independent implementation work moving while
+the coordinator has no coordinator-owned queue to drain.
 
 A lane consumes bandwidth whenever the coordinator may need to read durable
 state, route a decision, audit a result, collect owner approval, or retire local
@@ -24,6 +26,11 @@ Efficient parallel development is an explicit goal. The coordinator should use
 sublanes aggressively when the durable state shows ready implementation work and
 the admission checks below pass. Serializing all work into the main lane wastes
 the cockpit model and should be treated as a throughput smell, not the default.
+An already-running `implementing` lane is positive pipeline occupancy, not a
+reason to idle the coordinator. The coordinator should dispatch the next
+independent ready work when lane capacity remains, unless it records a concrete
+serialization reason such as file / invariant overlap, merge-order dependency,
+release gate, owner decision, or a coordinator-blocking queue.
 
 The coordinator still must not open work only because a pane or worktree can be
 created. It may dispatch only when it can also receive callbacks, perform the
@@ -68,6 +75,12 @@ and can hide whether a sublane is still active or ready to retire. Likewise, a
 closed issue with only an unmerged local sublane commit is not a complete drain:
 the implementation exists, but the target branch / CI / release path cannot be
 reconstructed from the issue alone.
+
+`implementing` does not count as a coordinator-blocking state. It is counted for
+the local soft profile lane limit, but it does not by itself block another
+dispatch. If the active set is only `implementing` lanes plus the coordinator,
+the expected coordinator action is to look for independent ready work and
+pipeline it. Serial execution in that state needs an explicit durable reason.
 
 ## Admission Rule
 
@@ -116,6 +129,21 @@ If all checks pass and there is ready implementation work, dispatch is the
 preferred action. A coordinator stop that leaves ready work undispatched, or a
 direct default-lane Claude handoff, must record why serial execution is more
 efficient or safer for that specific state.
+
+### Pipeline Dispatch Check
+
+Use this quick classification before deciding to wait:
+
+- If there is `review_waiting`, `owner_waiting`, `integration_waiting`,
+  `close_waiting`, `blocked`, `callback_due`, or `callback_delivery_failed`,
+  drain that coordinator-owned queue first.
+- If existing active lanes are only `implementing` and the new work is
+  independent, dispatch another sublane within the local soft profile.
+- If independence is uncertain, record the suspected overlap and choose either
+  a bounded read-only investigation or an explicit serialization decision. Do
+  not silently wait.
+- If waiting is chosen while the coordinator is otherwise idle, the journal must
+  say what condition will unblock dispatch.
 
 ## Drain Order
 
@@ -179,9 +207,10 @@ record a short journal:
 - current_lanes:
   - <issue>: <state>
 - coordinator_blocking_states: <none | list>
+- active_implementing_lanes: <none | list>
 - work_shape: <implementation | coordinator_only | read_only | design_consultation>
 - admission_decision: <dispatch_sublane | stop_and_drain | burst_dispatch | main_lane_exception>
-- reason: <why this decision is safe>
+- reason: <why this decision is safe; if serializing, the concrete dependency or overlap>
 - next_drain_action: <review | owner aggregation | blocker | retirement | none>
 ```
 

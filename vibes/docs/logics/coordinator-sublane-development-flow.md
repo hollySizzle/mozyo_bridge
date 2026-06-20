@@ -79,14 +79,15 @@ mozyo-bridge agents targets --session <cockpit-session>
 
 1. Redmine issue / journal / parent / Version / 参照 docs を読む。
 2. work unit と branch / worktree / lane / pane の対応を Redmine に記録する。
-3. dispatch 前に bandwidth admission を確認する。未読 review_request、owner_waiting、blocked callback、retire_ready lane が残る場合は先に drain する。
-4. cross-lane handoff は target-lane Codex gateway へ送る。Claude への direct delivery は same-lane addressing に限定する。
-5. target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す。`--no-submit` / `--mode pending` は operator / debug fallback であり標準 dispatch default にしない。
-6. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
-7. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
-8. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
-9. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
-10. callback / review / owner / integration / close / retirement を drain してから、後続 Version / US 提案へ進む。
+3. dispatch 前に bandwidth admission を確認する。未読 review_request、owner_waiting、close_waiting、integration_waiting、blocked、callback_due / callback_delivery_failed は coordinator-blocking state として先に drain する。
+4. 既存 lane が `implementing` のみで、coordinator が review / owner / close / callback / blocker を待っていない場合は、新しい independent ready work を止めない。`implementing` lane は coordinator-blocking state ではなく、pipeline dispatch の対象である。止める場合は、file / invariant overlap、merge order、release gate、owner decision など具体的な直列化理由を Redmine dispatch decision に残す。
+5. cross-lane handoff は target-lane Codex gateway へ送る。Claude への direct delivery は same-lane addressing に限定する。
+6. target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す。`--no-submit` / `--mode pending` は operator / debug fallback であり標準 dispatch default にしない。
+7. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
+8. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
+9. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
+10. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
+11. callback / review / owner / integration / close / retirement を drain してから、後続 Version / US 提案へ進む。
 
 ### callback 欠落時の sweep
 
@@ -150,6 +151,16 @@ $forbid("入口文書 / router / skill reference へ詳細本文を複製");
 :classify missing callback = progress_without_callback / no_progress_after_handoff / callback_delivery_failed / callback_not_attempted;
 $record("callback sweep classification");
 !endprocedure
+!procedure $pipeline_admission()
+:classify active lanes = implementing / coordinator-blocking / retire_ready / idle;
+if (coordinator-blocking exists?) then (yes)
+  :drain coordinator-owned queue before optional dispatch;
+else (no)
+  :dispatch independent ready work when lane capacity remains;
+endif
+$validate("implementing lane alone does not serialize the coordinator");
+$record("pipeline dispatch or explicit serialization reason");
+!endprocedure
 !procedure $retirement_contract()
 :retirement_state = retire_candidate / retire_ready / retain_until_downstream_consumed / retire_blocked / retired;
 :fields = retirement_state, lane, worktree, pane, redmine_issue_state, retain_reason, downstream_consumed, retire_blockers, safety_preflight, durable_anchor;
@@ -193,7 +204,7 @@ endif
 if (実装型?) then (yes)
   $forbid("管制塔 Codex が通常実装 diff を直接作る");
   $forbid("main lane Claude へ実装型 work を直接渡す");
-  :blocking queue を drain;
+  $pipeline_admission()
   $work_unit()
   :sublane admission を判定;
   if (dispatch 可能?) then (yes)
