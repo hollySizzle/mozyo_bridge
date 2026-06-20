@@ -368,9 +368,7 @@ class NoAuthorityColumnsTest(PresentationStateStoreBase):
 
 
 class SchemaVersionFailClosedTest(PresentationStateStoreBase):
-    def test_unknown_schema_version_fails_closed(self) -> None:
-        # Create the DB, then bump user_version beyond what this build knows.
-        self.store.seed_from_grouping_config(_config([]), source_config_version=1)
+    def _bump_version(self) -> None:
         conn = sqlite3.connect(self.store.path)
         try:
             conn.execute(
@@ -379,10 +377,54 @@ class SchemaVersionFailClosedTest(PresentationStateStoreBase):
             conn.commit()
         finally:
             conn.close()
+
+    def test_write_path_unknown_schema_version_fails_closed(self) -> None:
+        # Create the DB, then bump user_version beyond what this build knows.
+        self.store.seed_from_grouping_config(_config([]), source_config_version=1)
+        self._bump_version()
         with self.assertRaises(PresentationStateError):
             self.store.seed_from_grouping_config(
                 _config([]), source_config_version=1
             )
+
+    def test_read_path_unknown_schema_version_fails_closed(self) -> None:
+        # Regression for #12304 review j#62220: the read-only path must NOT read
+        # an unknown-schema desired-state DB as an empty result.
+        self.store.seed_from_grouping_config(
+            _config(
+                [
+                    {
+                        "workspace_id": "ws-a",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                        "preferred_projection": "cockpit_pane",
+                    }
+                ]
+            ),
+            source_config_version=1,
+        )
+        self._bump_version()
+        with self.assertRaises(PresentationStateError):
+            self.store.list_group_membership()
+        with self.assertRaises(PresentationStateError):
+            self.store.list_projection_preferences()
+        with self.assertRaises(PresentationStateError):
+            self.store.get_provenance()
+
+    def test_corrupt_db_is_not_treated_as_missing(self) -> None:
+        # A corrupt (non-sqlite) file must fail closed, distinct from a missing
+        # file (which is a legitimate empty result).
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.path.write_bytes(b"this is definitely not a sqlite database\n" * 8)
+        with self.assertRaises(PresentationStateError):
+            self.store.list_group_membership()
+
+    def test_missing_db_reads_empty(self) -> None:
+        # No file at all -> legitimate empty result, never an error.
+        self.assertFalse(self.store.path.exists())
+        self.assertEqual(self.store.list_group_membership(), ())
+        self.assertEqual(self.store.list_projection_preferences(), ())
+        self.assertIsNone(self.store.get_provenance())
 
 
 class CliHandlerTest(unittest.TestCase):
@@ -470,6 +512,58 @@ class CliHandlerTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("no changes", out)
+
+    def _corrupt_home_db(self) -> None:
+        """Seed a DB under the temp home, then bump its schema version."""
+        self._write_config(
+            "presentation:\n"
+            "  project_groups:\n"
+            "    - group_id: \"project:alpha\"\n"
+            "      label: \"Alpha\"\n"
+            "  grouping:\n"
+            "    unit_overrides:\n"
+            "      - workspace_id: \"ws-alpha\"\n"
+            "        lane_id: \"default\"\n"
+            "        preferred_group: \"project:alpha\"\n"
+        )
+        from mozyo_bridge.application.commands_presentation import (
+            cmd_presentation_seed,
+        )
+
+        self._run(cmd_presentation_seed, as_json=False, dry_run=False)
+        db = self.home / "presentation.sqlite"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                f"PRAGMA user_version = {PRESENTATION_STATE_SCHEMA_VERSION + 1}"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_show_fails_closed_on_unknown_schema(self) -> None:
+        # Regression for #12304 review j#62220: `presentation show` must not
+        # print an unknown-schema desired-state DB as empty + success.
+        from mozyo_bridge.application.commands_presentation import (
+            cmd_presentation_show,
+        )
+
+        self._corrupt_home_db()
+        code, _out, err = self._run(cmd_presentation_show, as_json=False)
+        self.assertEqual(code, 1)
+        self.assertIn("presentation state unreadable", err)
+
+    def test_seed_fails_closed_on_unknown_schema(self) -> None:
+        from mozyo_bridge.application.commands_presentation import (
+            cmd_presentation_seed,
+        )
+
+        self._corrupt_home_db()
+        code, _out, err = self._run(
+            cmd_presentation_seed, as_json=False, dry_run=False
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("presentation state unwritable", err)
 
 
 if __name__ == "__main__":

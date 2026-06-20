@@ -539,9 +539,11 @@ first slice を `src/mozyo_bridge/presentation_state.py` に実装した
 - read model: `classify_membership` が desired row を観測集合と突き合わせて
   `present` / `stale` / `desired_but_missing` の **表示状態** に倒す pure projection。
   routing / action 可否は決めない。
-- fail-closed: 壊れた config は seed せず非 0 終了。未知 schema version は
-  `PresentationStateError` で停止し、operator-managed desired state を auto-drop しない
-  (regenerable cache と異なる扱い)。
+- fail-closed: 壊れた config は seed せず非 0 終了。未知 schema version / 壊れた DB は
+  write path だけでなく **read path でも** `PresentationStateError` で停止する。`inventory`
+  cache と異なり desired state を「空」とは読まず、auto-drop もしない (regenerable cache と
+  異なる扱い)。`presentation show` / `seed` は例外を捕捉して非 0 + 明示 error を返す。
+  存在しない DB file のみが正当な空 (未 seed) として扱われる。
 - CLI: `mozyo-bridge presentation seed` (write、`--dry-run` で preview) と
   `presentation show` (read-only inspector)。
 

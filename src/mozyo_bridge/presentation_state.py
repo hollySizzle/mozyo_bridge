@@ -436,16 +436,56 @@ class PresentationStateStore:
             )
         return conn
 
-    def _read_rows(self, sql: str, params: tuple = ()) -> "list[tuple]":
-        """Run a read-only query; return ``[]`` when the file does not exist yet."""
-        if not self.path.exists():
-            return []
+    def _connect_ro_checked(self) -> sqlite3.Connection:
+        """Open a read-only connection, validating the schema; fail closed otherwise.
+
+        The caller guarantees the file exists. Unlike a regenerable cache, the
+        desired presentation state DB must **never** read an unknown-schema or
+        corrupt file as an empty result — that would hide seeded membership /
+        projection rows and mislead ``doctor`` / the operator (Redmine #12304
+        review j#62220). So an unsupported ``user_version``, or a sqlite
+        corruption error, fails closed with :class:`PresentationStateError`
+        rather than degrading to ``[]``. (A *missing* file is a different, benign
+        case the caller handles as a legitimate empty result.)
+        """
         uri = f"file:{self.path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         try:
-            return list(conn.execute(sql, params).fetchall())
-        except sqlite3.DatabaseError:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            raise PresentationStateError(
+                f"presentation-state DB {self.path} is unreadable or corrupt: {exc}"
+            ) from exc
+        if version != PRESENTATION_STATE_SCHEMA_VERSION:
+            conn.close()
+            raise PresentationStateError(
+                f"presentation-state DB {self.path} has unsupported schema version "
+                f"{version}; this build understands "
+                f"{PRESENTATION_STATE_SCHEMA_VERSION}. Desired presentation state is "
+                f"operator-managed and is not read as empty on a schema mismatch; "
+                f"migrate or move the file aside deliberately."
+            )
+        return conn
+
+    def _read_rows(self, sql: str, params: tuple = ()) -> "list[tuple]":
+        """Run a read-only query, failing closed on a present-but-broken DB.
+
+        A *non-existent* DB file is a legitimate empty result (nothing has been
+        seeded yet) and returns ``[]``. An *existing* file is opened through the
+        schema-checked read-only connection, so an unknown schema version or a
+        corrupt file raises :class:`PresentationStateError` rather than
+        masquerading as empty.
+        """
+        if not self.path.exists():
             return []
+        conn = self._connect_ro_checked()
+        try:
+            return list(conn.execute(sql, params).fetchall())
+        except sqlite3.DatabaseError as exc:
+            raise PresentationStateError(
+                f"presentation-state DB {self.path} read failed: {exc}"
+            ) from exc
         finally:
             conn.close()
 
