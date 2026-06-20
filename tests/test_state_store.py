@@ -30,6 +30,7 @@ from mozyo_bridge.otel_store import OtelEvent, OtelEventStore
 from mozyo_bridge.session_inventory import save_snapshot
 from mozyo_bridge.state_store import (
     ACTION_BLOCKED_CORRUPT,
+    ACTION_BLOCKED_INCOMPLETE,
     ACTION_BLOCKED_UNSUPPORTED,
     ACTION_MIGRATE,
     ACTION_SKIP_ABSENT,
@@ -335,6 +336,64 @@ class StateStoreCleanupTest(unittest.TestCase):
         self.assertFalse((self.home / LEGACY_FILES["registry"]).exists())
         self.assertTrue((self.home / LEGACY_FILES["otel"]).exists())
         self.assertTrue((self.home / LEGACY_FILES["managed_events"]).exists())
+
+
+class StateStorePartialLegacyTest(unittest.TestCase):
+    """A legacy DB with the right version + integrity but a missing expected table
+    must NOT migrate, must NOT be recorded complete, and must NOT become
+    cleanup-eligible (Redmine #12305 review j#62394 data-loss finding)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "home"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _make_registry_missing_activity(self) -> None:
+        """registry.sqlite at v1, integrity ok, but without ``workspace_activity``."""
+        register_workspace(self.home / "repo", home=self.home)
+        path = self.home / LEGACY_FILES["registry"]
+        conn = sqlite3.connect(path)
+        conn.execute("DROP TABLE workspace_activity")
+        conn.commit()
+        conn.close()
+
+    def test_plan_marks_missing_table_blocked_incomplete(self) -> None:
+        (self.home / "repo").mkdir(parents=True, exist_ok=True)
+        self._make_registry_missing_activity()
+        plan = StateStore(home=self.home).plan_migration(components=("registry",))
+        registry = _by_component(plan)["registry"]
+        self.assertEqual(registry.action, ACTION_BLOCKED_INCOMPLETE)
+        self.assertIn("workspace_activity", registry.reason)
+        self.assertEqual(plan.migratable, ())
+
+    def test_migrate_does_not_record_incomplete_component(self) -> None:
+        (self.home / "repo").mkdir(parents=True, exist_ok=True)
+        self._make_registry_missing_activity()
+        store = StateStore(home=self.home)
+        result = store.migrate(components=("registry",))
+        self.assertTrue(result.performed)
+        # nothing migratable -> no DB, no recorded component, no backup.
+        self.assertEqual({r.component for r in store.read_components()}, set())
+        self.assertIsNone(result.backup_dir)
+        self.assertFalse((self.home / STATE_STORE_FILENAME).exists())
+
+    def test_incomplete_legacy_not_cleanup_eligible(self) -> None:
+        (self.home / "repo").mkdir(parents=True, exist_ok=True)
+        self._make_registry_missing_activity()
+        # other components are valid and present.
+        save_snapshot([], home=self.home)
+        record_managed_event(command="mozyo", event_kind="created", home=self.home)
+        store = StateStore(home=self.home)
+        store.migrate()  # registry blocked_incomplete; others migrate
+        self.assertNotIn("registry", {r.component for r in store.read_components()})
+        cleanup = store.plan_cleanup()
+        registry = {c.component: c for c in cleanup.components}["registry"]
+        self.assertFalse(registry.eligible)
+        # a confirmed destructive cleanup must leave the incomplete legacy file.
+        store.cleanup(confirm_destroy=True)
+        self.assertTrue((self.home / LEGACY_FILES["registry"]).exists())
 
 
 class StateStoreDoctorRoundTripTest(unittest.TestCase):

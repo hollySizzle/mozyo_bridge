@@ -179,6 +179,7 @@ ACTION_SKIP_COMPLETE = "skip_complete"  # already in state_schema_components
 ACTION_SKIP_ABSENT = "skip_absent"  # legacy file missing -> nothing to import
 ACTION_BLOCKED_CORRUPT = "blocked_corrupt"  # unreadable / integrity error
 ACTION_BLOCKED_UNSUPPORTED = "blocked_unsupported"  # schema version mismatch
+ACTION_BLOCKED_INCOMPLETE = "blocked_incomplete"  # correct version/integrity but expected table(s) missing
 
 _STATE_SCHEMA_COMPONENTS_SQL = """
 CREATE TABLE IF NOT EXISTS state_schema_components (
@@ -355,14 +356,25 @@ class CleanupPlan:
         }
 
 
-def _probe_legacy(path: Path, expected_version: int) -> tuple[str, Optional[int], Optional[str]]:
+def _probe_legacy(
+    path: Path, expected_version: int, expected_tables: tuple[str, ...]
+) -> tuple[str, Optional[int], Optional[str]]:
     """Read-only probe of a legacy file: ``(state, user_version, error)``.
 
-    ``state`` is ``absent`` / ``ok`` / ``corrupt`` / ``unsupported``. Opens the
-    file through a ``mode=ro`` URI (never creating it), runs ``PRAGMA
-    user_version`` + ``integrity_check``, and classifies the result. A version
-    mismatch is ``unsupported`` (the migrator leaves it untouched); an unreadable
-    or non-``ok`` integrity result is ``corrupt``.
+    ``state`` is ``absent`` / ``ok`` / ``corrupt`` / ``unsupported`` /
+    ``incomplete``. Opens the file through a ``mode=ro`` URI (never creating it),
+    runs ``PRAGMA user_version`` + ``integrity_check``, then checks that every
+    ``expected_tables`` entry is present. Classification:
+
+    - ``corrupt`` — unreadable or ``integrity_check`` not ``ok``;
+    - ``unsupported`` — version mismatch (the migrator leaves it untouched);
+    - ``incomplete`` — correct version, integrity ``ok``, but an expected table is
+      missing. The doc's import rule requires the *row-shape* (expected tables) to
+      be present before a component counts as complete; importing a shape-missing
+      file would record a complete component and make an incompletely-migrated
+      authoritative legacy file cleanup-eligible (data-loss risk, #12305 review
+      j#62394). ``error`` carries the missing table names;
+    - ``ok`` — correct version, integrity ``ok``, all expected tables present.
     """
     if not path.exists():
         return "absent", None, None
@@ -383,6 +395,18 @@ def _probe_legacy(path: Path, expected_version: int) -> tuple[str, Optional[int]
             return "corrupt", version, "integrity_check did not return ok"
         if version != expected_version:
             return "unsupported", version, None
+        try:
+            present = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        except sqlite3.DatabaseError as exc:
+            return "corrupt", version, str(exc)
+        missing = [t for t in expected_tables if t not in present]
+        if missing:
+            return "incomplete", version, ", ".join(missing)
         return "ok", version, None
     finally:
         conn.close()
@@ -550,8 +574,9 @@ class StateStore:
         For each requested component (default: all), probe the legacy file and the
         recorded ``state_schema_components`` to classify the action a write
         migration would take (:data:`ACTION_MIGRATE` / ``skip_complete`` /
-        ``skip_absent`` / ``blocked_corrupt`` / ``blocked_unsupported``) and count
-        the source rows. The single DB and home dir are never created here.
+        ``skip_absent`` / ``blocked_corrupt`` / ``blocked_unsupported`` /
+        ``blocked_incomplete``) and count the source rows. The single DB and home
+        dir are never created here.
         """
         home = self._resolved_home()
         selected = self._select_components(components)
@@ -596,7 +621,9 @@ class StateStore:
                 source_rows=None,
                 reason="already recorded in state_schema_components; idempotent skip",
             )
-        state, version, error = _probe_legacy(legacy_path, spec.legacy_schema_version)
+        state, version, error = _probe_legacy(
+            legacy_path, spec.legacy_schema_version, spec.legacy_tables
+        )
         if state == "absent":
             return ComponentPlan(
                 component=spec.component,
@@ -634,6 +661,24 @@ class StateStore:
                 source_rows=None,
                 reason=f"legacy schema_version {version} != expected "
                 f"{spec.legacy_schema_version}; left untouched (downgrade-safe)",
+            )
+        if state == "incomplete":
+            # Correct version + integrity but the expected row-shape is missing.
+            # Do NOT migrate: importing would record a complete component and make
+            # an incompletely-migrated authoritative legacy file cleanup-eligible
+            # (#12305 review j#62394 data-loss finding).
+            return ComponentPlan(
+                component=spec.component,
+                action=ACTION_BLOCKED_INCOMPLETE,
+                recovery_policy=spec.recovery_policy,
+                legacy_path=str(legacy_path),
+                legacy_present=True,
+                legacy_schema_version=version,
+                target_tables=spec.target_tables,
+                source_rows=None,
+                reason=f"legacy file is missing expected table(s) ({error}); "
+                f"not migrated (would be an incomplete/partial import); "
+                f"resolve with `{spec.repair_action}` before migrating",
             )
         return ComponentPlan(
             component=spec.component,
@@ -756,16 +801,23 @@ class StateStore:
                     "SELECT name FROM legacy.sqlite_master WHERE type='table'"
                 ).fetchall()
             }
+            missing = [t for t, _ in spec.table_map if t not in legacy_tables]
+            if missing:
+                # Defense-in-depth: the planner already classifies a shape-missing
+                # legacy file as ``blocked_incomplete`` and never routes it here, so
+                # this is a TOCTOU guard. Fail closed rather than record a complete
+                # component for a partial import (#12305 review j#62394).
+                raise StateStoreError(
+                    f"legacy file {legacy_path} for component '{spec.component}' is "
+                    f"missing expected table(s): {', '.join(missing)}; refusing to "
+                    f"record an incomplete migration"
+                )
             for legacy_table, target_table in spec.table_map:
                 # All target operations are schema-qualified ``main.`` — an
                 # unqualified ``DROP``/``CREATE`` would resolve to a same-named
                 # attached ``legacy`` table when ``main`` has none yet, dropping the
                 # legacy data and breaking non-destructiveness.
                 conn.execute(f'DROP TABLE IF EXISTS main."{target_table}"')
-                if legacy_table not in legacy_tables:
-                    # A valid-version legacy file missing an expected table: create
-                    # the target empty rather than failing the whole component.
-                    continue
                 # Parameterized table-valued form (schema as 2nd arg): unambiguous
                 # even when the target table shadows the legacy table name, unlike
                 # the schema-qualified ``PRAGMA legacy.table_info(name)`` form.
@@ -907,6 +959,7 @@ __all__ = (
     "ACTION_SKIP_ABSENT",
     "ACTION_BLOCKED_CORRUPT",
     "ACTION_BLOCKED_UNSUPPORTED",
+    "ACTION_BLOCKED_INCOMPLETE",
     "ComponentSpec",
     "COMPONENTS",
     "COMPONENTS_BY_NAME",
