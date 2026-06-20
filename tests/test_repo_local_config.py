@@ -320,5 +320,105 @@ class PresentationSelectionTest(unittest.TestCase):
             RepoLocalConfig.from_record({"presentation": {"surface": "nope"}})
 
 
+class PresentationGroupingWiringTest(unittest.TestCase):
+    """#12286: the presentation block carries the desired grouping config too."""
+
+    def test_missing_grouping_is_behavior_preserving_default(self) -> None:
+        # A presentation block with only a surface keeps an empty grouping config
+        # and the default placement mode (no behavior change).
+        config = RepoLocalConfig.from_record({"presentation": {"surface": "text"}})
+        grouping = config.presentation.grouping
+        self.assertEqual(grouping.project_groups, ())
+        self.assertEqual(grouping.membership_rules, ())
+        self.assertEqual(grouping.unit_overrides, ())
+        self.assertEqual(
+            grouping.project_group_presentation, "same_cockpit_column"
+        )
+
+    def test_grouping_and_placement_parse_under_presentation(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {
+                "presentation": {
+                    "surface": "text",
+                    "project_group_presentation": "project_group_tmux_window",
+                    "project_groups": [
+                        {"group_id": "project:alpha", "label": "Alpha"}
+                    ],
+                    "grouping": {
+                        "membership_rules": [
+                            {
+                                "when": {"repo_label": "alpha"},
+                                "group_id": "project:alpha",
+                            }
+                        ]
+                    },
+                }
+            }
+        )
+        self.assertEqual(config.presentation.surface, "text")
+        grouping = config.presentation.grouping
+        self.assertEqual(len(grouping.project_groups), 1)
+        self.assertEqual(grouping.project_groups[0].group_id, "project:alpha")
+        self.assertEqual(len(grouping.membership_rules), 1)
+        self.assertEqual(
+            grouping.project_group_presentation, "project_group_tmux_window"
+        )
+
+    def test_surface_default_holds_with_grouping_present(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"presentation": {"project_group_presentation": "normal_window"}}
+        )
+        self.assertEqual(
+            config.presentation.surface, DEFAULT_PRESENTATION_SURFACE
+        )
+        self.assertEqual(
+            config.presentation.grouping.project_group_presentation,
+            "normal_window",
+        )
+
+    def test_invalid_placement_fails_closed_as_repo_local_error(self) -> None:
+        # The grouping schema's PresentationGroupingConfigError is re-raised as a
+        # RepoLocalConfigError so the loader's single-except boundary catches it.
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"presentation": {"project_group_presentation": "iterm_tab"}}
+            )
+
+    def test_dangling_group_reference_fails_closed_as_repo_local_error(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {
+                    "presentation": {
+                        "grouping": {
+                            "membership_rules": [
+                                {
+                                    "when": {"repo_label": "x"},
+                                    "group_id": "project:undeclared",
+                                }
+                            ]
+                        }
+                    }
+                }
+            )
+
+    def test_authority_shaped_grouping_key_fails_closed(self) -> None:
+        # A boundary-shaped key inside grouping is rejected (no routing / approval
+        # leaks into the presentation grouping config).
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {
+                    "presentation": {
+                        "project_groups": [
+                            {
+                                "group_id": "g",
+                                "label": "G",
+                                "route_target": "%5",
+                            }
+                        ]
+                    }
+                }
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

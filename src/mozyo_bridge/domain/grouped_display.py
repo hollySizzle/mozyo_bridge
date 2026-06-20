@@ -66,6 +66,9 @@ from mozyo_bridge.domain.grouped_read_model import (
     ProjectGroupView,
     UnitView,
 )
+from mozyo_bridge.domain.presentation_grouping import (
+    DEFAULT_PROJECT_GROUP_PRESENTATION,
+)
 from mozyo_bridge.domain.grouped_reload_view import (
     GROUPED_RELOAD_DIAGNOSTIC_ONLY_NOTE,
     GroupedReloadView,
@@ -167,9 +170,21 @@ class UnitDisplayRow:
     Display only: it carries **no** ``target`` / ``pane`` / ``route`` / ``send`` /
     ``approval`` / ``credential`` field. ``roles`` is role-name presence, not a
     delivery endpoint; ``active`` is the observed liveness boolean.
+
+    :attr:`workspace_id` / :attr:`lane_id` / :attr:`host_id` are the Unit's
+    public-safe *identity* facts (the same identity the read model's ``UnitView``
+    carries), surfaced so a grouped cockpit action can seed the candidate-Unit
+    selector (``cockpit_ui.candidate_unit_selector`` / the ``grouped-reveal`` /
+    ``grouped-jump`` endpoints). They are an identity selector, **not** a routing
+    target: the side effect still re-resolves them to a single live pane through
+    the action-time live preflight (``cockpit_ui._resolve_unit_target``), which
+    fails closed on a stale / ambiguous / non-local / non-default-lane candidate.
     """
 
     unit_id: str
+    workspace_id: str
+    lane_id: str
+    host_id: str
     lane_label: str
     issue_label: Optional[str]
     roles: "tuple[str, ...]"
@@ -191,6 +206,9 @@ class UnitDisplayRow:
     def as_payload(self) -> dict:
         return {
             "unit_id": self.unit_id,
+            "workspace_id": self.workspace_id,
+            "lane_id": self.lane_id,
+            "host_id": self.host_id,
             "lane_label": self.lane_label,
             "issue_label": self.issue_label,
             "roles": list(self.roles),
@@ -277,6 +295,11 @@ class GroupedDisplayView:
     reload: ReloadAffordance = ReloadAffordance()
     groups: "tuple[GroupDisplaySection, ...]" = ()
     diagnostics: "tuple[str, ...]" = ()
+    #: The desired Project-Group display-placement mode (#12286), carried verbatim
+    #: from the read model. Display-only metadata a cockpit may render (e.g. "this
+    #: view requests project_group_tmux_window"); it requests a layout, never a
+    #: routing target or a guaranteed window / tab.
+    project_group_presentation: str = DEFAULT_PROJECT_GROUP_PRESENTATION
 
     def all_units(self) -> "tuple[UnitDisplayRow, ...]":
         units: "list[UnitDisplayRow]" = []
@@ -295,6 +318,7 @@ class GroupedDisplayView:
             "reload": self.reload.as_payload(),
             "groups": [group.as_payload() for group in self.groups],
             "diagnostics": list(self.diagnostics),
+            "project_group_presentation": self.project_group_presentation,
             "boundary_note": GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE,
         }
 
@@ -322,6 +346,9 @@ def _unit_row(
     roles = _canonical_roles(unit.roles)
     return UnitDisplayRow(
         unit_id=unit.unit_id,
+        workspace_id=unit.workspace_id,
+        lane_id=unit.lane_id,
+        host_id=unit.host_id,
         lane_label=unit.lane_id,
         issue_label=unit.label,
         roles=roles,
@@ -410,6 +437,7 @@ def build_grouped_display_view(
         reload=reload.reload,
         groups=groups,
         diagnostics=model.diagnostics,
+        project_group_presentation=model.project_group_presentation,
     )
 
 

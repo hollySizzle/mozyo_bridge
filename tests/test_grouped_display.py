@@ -506,5 +506,59 @@ class NoActionPermissionLeakageTests(unittest.TestCase):
         self.assertNotIn("target", unit_payload)
 
 
+class DisplayViewPlacementAndIdentityTest(unittest.TestCase):
+    """#12286: the display view carries the placement mode + Unit identity facts."""
+
+    def _view(self, config, observed):
+        model = build_grouped_read_model(
+            config, observed, observation=_fresh_observation()
+        )
+        return build_grouped_display_view(model)
+
+    def test_placement_mode_flows_to_display_payload(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {"project_group_presentation": "project_group_tmux_window"}
+        )
+        view = self._view(config, [])
+        self.assertEqual(
+            view.project_group_presentation, "project_group_tmux_window"
+        )
+        self.assertEqual(
+            view.as_payload()["project_group_presentation"],
+            "project_group_tmux_window",
+        )
+
+    def test_default_placement_is_same_cockpit_column(self) -> None:
+        view = self._view(None, [])
+        self.assertEqual(
+            view.project_group_presentation, "same_cockpit_column"
+        )
+
+    def test_unit_row_carries_identity_for_action_wiring(self) -> None:
+        observed = [
+            ObservedUnit(
+                workspace_id="ws-a",
+                lane_id="default",
+                host_id="local",
+                repo_label="Alpha",
+                active=True,
+                roles=("codex", "claude"),
+                observation=_fresh_observation(),
+            )
+        ]
+        view = self._view(None, observed)
+        row = view.all_units()[0]
+        self.assertEqual(row.workspace_id, "ws-a")
+        self.assertEqual(row.lane_id, "default")
+        self.assertEqual(row.host_id, "local")
+        payload = row.as_payload()
+        self.assertEqual(payload["workspace_id"], "ws-a")
+        self.assertEqual(payload["lane_id"], "default")
+        self.assertEqual(payload["host_id"], "local")
+        # Identity only — still no routing endpoint on the row.
+        for forbidden in ("pane", "target", "route", "send", "approval"):
+            self.assertNotIn(forbidden, payload)
+
+
 if __name__ == "__main__":
     unittest.main()
