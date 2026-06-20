@@ -176,6 +176,27 @@ STATUS_UNGROUPED: str = "ungrouped"
 STATUS_DESIRED_UNIT_MISSING: str = "desired_unit_missing"
 STATUS_IDENTITY_CONFLICT: str = "identity_conflict"
 
+#: The launcher / cockpit-append placement *surface* a desired
+#: ``project_group_presentation`` mode maps to (Redmine #12302). These name *how*
+#: a launching sublane is laid out, never a routing / approval target:
+#:
+#: - ``cockpit_column`` — the behavior-preserving single shared cockpit column
+#:   (the only surface the current single-window cockpit append executes);
+#: - ``group_tmux_window`` — the desired per-Project-Group tmux window (#12290);
+#:   a *desired* presentation only, never a guaranteed window / iTerm tab;
+#: - ``normal_window`` — the retained compatibility projection (a normal,
+#:   non-cockpit window).
+GROUP_WINDOW_SURFACE_COCKPIT_COLUMN: str = "cockpit_column"
+GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW: str = "group_tmux_window"
+GROUP_WINDOW_SURFACE_NORMAL_WINDOW: str = "normal_window"
+
+#: Map each desired ``project_group_presentation`` mode to its placement surface.
+_PRESENTATION_MODE_TO_SURFACE: "dict[str, str]" = {
+    PROJECT_GROUP_PRESENTATION_SAME_COLUMN: GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+    PROJECT_GROUP_PRESENTATION_TMUX_WINDOW: GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+    PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW: GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
+}
+
 #: Substrings in a config key that signal an attempt to cross a boundary this
 #: surface does not own: load / execute code, name a module / callable / entry
 #: point, grant or alter authority / approval / routing / send safety, address a
@@ -991,6 +1012,135 @@ def resolve_launch_placement(
     )
 
 
+@dataclass(frozen=True)
+class GroupWindowDecision:
+    """The desired launcher / cockpit-append placement for a launching sublane.
+
+    Resolved from the configured ``project_group_presentation`` mode plus the
+    Unit's resolved :class:`GroupPlacement`. Display-only: it describes *where*
+    the operator desires the sublane laid out and which surface the launcher will
+    actually use, and is never a routing / approval / close authority and never a
+    guaranteed tmux window / iTerm tab / OS window.
+
+    - :attr:`presentation_mode` is the configured (desired) mode.
+    - :attr:`desired_surface` is the surface the mode asks for (one of the
+      ``GROUP_WINDOW_SURFACE_*`` values).
+    - :attr:`executed_surface` is the surface the launcher actually uses now. The
+      current single-window cockpit append only executes ``cockpit_column``; the
+      opt-in surfaces (``group_tmux_window`` / ``normal_window``) record the
+      *desired* placement but :attr:`degraded` to ``cockpit_column`` rather than
+      silently spawning a second window that would bypass the duplicate-detection
+      / pane-identity gate (acceptance: visible degrade, never silent reroute).
+    - :attr:`desired_window_name` is the public-safe display name of the desired
+      per-group window (``group_tmux_window`` only), or ``None``.
+    - :attr:`diagnostic` carries the human-facing degrade wording when
+      :attr:`degraded`.
+    """
+
+    presentation_mode: str
+    desired_surface: str
+    executed_surface: str
+    group_id: Optional[str] = None
+    label: Optional[str] = None
+    desired_window_name: Optional[str] = None
+    degraded: bool = False
+    diagnostic: Optional[str] = None
+
+    def as_dict(self) -> "dict[str, object]":
+        return {
+            "presentation_mode": self.presentation_mode,
+            "desired_surface": self.desired_surface,
+            "executed_surface": self.executed_surface,
+            "group_id": self.group_id,
+            "label": self.label,
+            "desired_window_name": self.desired_window_name,
+            "degraded": self.degraded,
+            "diagnostic": self.diagnostic,
+        }
+
+
+def resolve_group_window_placement(
+    presentation_mode: str,
+    placement: GroupPlacement,
+) -> GroupWindowDecision:
+    """Resolve the desired launcher / cockpit-append placement (Redmine #12302).
+
+    Maps the configured ``project_group_presentation`` mode + the resolved
+    :class:`GroupPlacement` to a :class:`GroupWindowDecision` the cockpit
+    launcher / append path reads. Fail-closed and never a silent reroute:
+
+    - ``same_cockpit_column`` (the default) -> the behavior-preserving shared
+      cockpit column; not degraded.
+    - ``project_group_tmux_window`` -> the *desired* per-Project-Group tmux window
+      (#12290), but :attr:`executed_surface` stays ``cockpit_column`` and the
+      decision is :attr:`degraded` with a visible diagnostic: the single-window
+      cockpit append cannot spawn a separate window without bypassing the
+      duplicate-detection / pane-identity gate, and a tmux window / iTerm tab is
+      never guaranteed.
+    - ``normal_window`` -> the retained compatibility projection; likewise
+      recorded as desired and degraded to the cockpit column.
+    - any other value fails closed (:class:`PresentationGroupingConfigError`),
+      mirroring the closed display-only vocabulary; never normalized silently.
+    """
+    if presentation_mode not in PROJECT_GROUP_PRESENTATION_MODES:
+        raise PresentationGroupingConfigError(
+            f"project_group_presentation must be one of "
+            f"{sorted(PROJECT_GROUP_PRESENTATION_MODES)}, got {presentation_mode!r}"
+        )
+    desired_surface = _PRESENTATION_MODE_TO_SURFACE[presentation_mode]
+
+    if presentation_mode == PROJECT_GROUP_PRESENTATION_SAME_COLUMN:
+        # Behavior-preserving default: the launcher uses the shared cockpit column
+        # exactly as before. group_id / label are carried for display only.
+        return GroupWindowDecision(
+            presentation_mode=presentation_mode,
+            desired_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+            executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+            group_id=placement.group_id,
+            label=placement.label,
+        )
+
+    if presentation_mode == PROJECT_GROUP_PRESENTATION_TMUX_WINDOW:
+        # Desired per-Project-Group tmux window. The public-safe window name is the
+        # group's display label (its portable group_id when unlabeled, the
+        # repo/workspace label for the implicit per-repo default group).
+        window_name = placement.label or placement.group_id
+        diagnostic = (
+            "project_group_tmux_window is a desired per-Project-Group tmux window; "
+            "this build keeps the sublane in the shared cockpit column to preserve "
+            "the duplicate-detection / pane-identity gate and never guarantees a "
+            "tmux window / iTerm tab."
+        )
+        return GroupWindowDecision(
+            presentation_mode=presentation_mode,
+            desired_surface=GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+            executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+            group_id=placement.group_id,
+            label=placement.label,
+            desired_window_name=window_name,
+            degraded=True,
+            diagnostic=diagnostic,
+        )
+
+    # normal_window: the retained compatibility projection. `mozyo cockpit` keeps
+    # the sublane as a cockpit column rather than relaunching it as a normal
+    # window — recorded as desired, visibly degraded.
+    diagnostic = (
+        "normal_window is the retained compatibility projection; `mozyo cockpit` "
+        "keeps the sublane as a cockpit column and does not relaunch it as a "
+        "normal window."
+    )
+    return GroupWindowDecision(
+        presentation_mode=presentation_mode,
+        desired_surface=GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
+        executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+        group_id=placement.group_id,
+        label=placement.label,
+        degraded=True,
+        diagnostic=diagnostic,
+    )
+
+
 def diagnose_unit_overrides(
     config: PresentationGroupingConfig,
     known_units: "frozenset[tuple[str, str]]",
@@ -1030,6 +1180,9 @@ __all__ = (
     "STATUS_UNGROUPED",
     "STATUS_DESIRED_UNIT_MISSING",
     "STATUS_IDENTITY_CONFLICT",
+    "GROUP_WINDOW_SURFACE_COCKPIT_COLUMN",
+    "GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW",
+    "GROUP_WINDOW_SURFACE_NORMAL_WINDOW",
     "PresentationGroupingConfigError",
     "ProjectGroup",
     "MembershipRule",
@@ -1037,7 +1190,9 @@ __all__ = (
     "GroupingDefaults",
     "LaunchContext",
     "GroupPlacement",
+    "GroupWindowDecision",
     "PresentationGroupingConfig",
     "resolve_launch_placement",
+    "resolve_group_window_placement",
     "diagnose_unit_overrides",
 )

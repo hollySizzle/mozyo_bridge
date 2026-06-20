@@ -30,6 +30,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.domain.presentation_grouping import (
     ALLOWED_PROJECTIONS,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
+    GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+    GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+    GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_MODES,
     PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
@@ -40,10 +43,13 @@ from mozyo_bridge.domain.presentation_grouping import (
     STATUS_IDENTITY_CONFLICT,
     STATUS_UNGROUPED,
     GroupingDefaults,
+    GroupPlacement,
+    GroupWindowDecision,
     LaunchContext,
     PresentationGroupingConfig,
     PresentationGroupingConfigError,
     diagnose_unit_overrides,
+    resolve_group_window_placement,
     resolve_launch_placement,
 )
 
@@ -632,6 +638,97 @@ class ProjectGroupPresentationTest(unittest.TestCase):
                 }
             ),
         )
+
+
+class ResolveGroupWindowPlacementTest(unittest.TestCase):
+    """The launcher / cockpit-append placement decision resolver (#12302).
+
+    Maps a configured ``project_group_presentation`` mode + a resolved
+    ``GroupPlacement`` to the desired/executed surface the cockpit launcher reads.
+    Pure: no tmux, no IO. ``same_cockpit_column`` is behavior-preserving; the
+    opt-in surfaces record the *desired* placement but visibly degrade to the
+    shared cockpit column (never a silent reroute); an unknown mode fails closed.
+    """
+
+    def _placement(self, **over) -> GroupPlacement:
+        base = dict(status=STATUS_CONFIGURED, group_id="project:alpha", label="Alpha")
+        base.update(over)
+        return GroupPlacement(**base)
+
+    def test_same_cockpit_column_is_behavior_preserving(self) -> None:
+        decision = resolve_group_window_placement(
+            PROJECT_GROUP_PRESENTATION_SAME_COLUMN, self._placement()
+        )
+        self.assertIsInstance(decision, GroupWindowDecision)
+        self.assertEqual(decision.desired_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN)
+        self.assertEqual(decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN)
+        self.assertFalse(decision.degraded)
+        self.assertIsNone(decision.diagnostic)
+        # group identity is carried for display only.
+        self.assertEqual(decision.group_id, "project:alpha")
+        self.assertEqual(decision.label, "Alpha")
+        self.assertIsNone(decision.desired_window_name)
+
+    def test_tmux_window_records_desired_but_degrades_to_column(self) -> None:
+        decision = resolve_group_window_placement(
+            PROJECT_GROUP_PRESENTATION_TMUX_WINDOW, self._placement()
+        )
+        self.assertEqual(
+            decision.desired_surface, GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW
+        )
+        # Visibly degraded: the executed surface stays the shared cockpit column so
+        # the duplicate-detection / pane-identity gate is preserved.
+        self.assertEqual(decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN)
+        self.assertTrue(decision.degraded)
+        self.assertIsNotNone(decision.diagnostic)
+        # public-safe desired window name = the group's display label.
+        self.assertEqual(decision.desired_window_name, "Alpha")
+
+    def test_tmux_window_default_group_uses_repo_label_window_name(self) -> None:
+        # No configured group (default placement) -> the implicit per-repo group;
+        # the window name falls back to the repo/workspace label, never None-erased.
+        decision = resolve_group_window_placement(
+            PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+            GroupPlacement(status=STATUS_DEFAULT, group_id=None, label="mozyo_bridge"),
+        )
+        self.assertTrue(decision.degraded)
+        self.assertEqual(decision.desired_window_name, "mozyo_bridge")
+
+    def test_normal_window_records_desired_but_degrades_to_column(self) -> None:
+        decision = resolve_group_window_placement(
+            PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW, self._placement()
+        )
+        self.assertEqual(decision.desired_surface, GROUP_WINDOW_SURFACE_NORMAL_WINDOW)
+        self.assertEqual(decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN)
+        self.assertTrue(decision.degraded)
+        self.assertIsNotNone(decision.diagnostic)
+        self.assertIsNone(decision.desired_window_name)
+
+    def test_unknown_mode_fails_closed(self) -> None:
+        for value in ("iterm_tab", "route_to_owner", "", "cockpit_column"):
+            with self.assertRaises(PresentationGroupingConfigError):
+                resolve_group_window_placement(value, self._placement())
+
+    def test_decision_as_dict_is_public_safe_display_only(self) -> None:
+        payload = resolve_group_window_placement(
+            PROJECT_GROUP_PRESENTATION_TMUX_WINDOW, self._placement()
+        ).as_dict()
+        self.assertEqual(
+            set(payload),
+            {
+                "presentation_mode",
+                "desired_surface",
+                "executed_surface",
+                "group_id",
+                "label",
+                "desired_window_name",
+                "degraded",
+                "diagnostic",
+            },
+        )
+        # No routing / pane / target keys leak into the display payload.
+        for forbidden in ("pane", "target", "route", "pane_id", "command"):
+            self.assertNotIn(forbidden, payload)
 
 
 if __name__ == "__main__":
