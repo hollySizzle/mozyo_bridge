@@ -287,7 +287,9 @@ class UnitDisplayRow:
     ``grouped-jump`` endpoints). They are an identity selector, **not** a routing
     target: the side effect still re-resolves them to a single live pane through
     the action-time live preflight (``cockpit_ui._resolve_unit_target``), which
-    fails closed on a stale / ambiguous / non-local / non-default-lane candidate.
+    narrows the live match by ``lane_id`` (a first-class selector since Redmine
+    #12293) and fails closed on a stale / ambiguous / non-local / missing
+    candidate.
     """
 
     unit_id: str

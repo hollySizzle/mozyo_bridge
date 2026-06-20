@@ -6,14 +6,15 @@ fail-closed and a previewed action still routes through the action-time live
 preflight before any side effect. Covers three surfaces:
 
 - the pure detail projection (``build_grouped_unit_detail``): an observed / active
-  row lists available commands per actionable role pane; a degraded
-  (``needs_reload``) / non-local-host / non-default-lane / no-live-target row lists
-  the actions as *unavailable* with a visible reason; the payload is public-safe
-  (no pane id / path / credential / prompt);
+  row lists available commands per actionable role pane (including a non-default
+  lane row — a first-class identity selector since Redmine #12293); a degraded
+  (``needs_reload``) / non-local-host / no-live-target row lists the actions as
+  *unavailable* with a visible reason; the payload is public-safe (no pane id /
+  path / credential / prompt);
 - the non-mutating live preview (``grouped_action_preview``): runs the same live
   preflight as the real actions but performs no side effect, reporting
-  stale / ambiguous / missing / remote / non-default-lane candidates as
-  ``available: False`` with the preflight reason; and
+  stale / ambiguous / missing / remote candidates as ``available: False`` with the
+  preflight reason; and
 - the served ``/api/actions/grouped-preview`` endpoint: token-gated, always 200,
   never mutates.
 
@@ -224,12 +225,21 @@ class BuildDetailTest(unittest.TestCase):
         self.assertFalse(detail.actions_available)
         self.assertIn("non-local host", detail.unavailable_reason)
 
-    def test_non_default_lane_is_unavailable(self) -> None:
+    def test_non_default_lane_is_actionable(self) -> None:
+        # Redmine #12293: the inventory now reads @mozyo_lane_id and splits a
+        # workspace's lanes into faithful, distinct Units, so a non-default lane
+        # is a first-class identity selector — not a capability gap. The detail
+        # projection previews its commands as available (still candidates,
+        # re-checked by the live preflight), and each command's selector carries
+        # the row's lane_id so the action re-resolves against the same lane.
         detail = build_grouped_unit_detail(
             _row(UNIT_STATUS_OBSERVED, lane_id="issue_123")
         )
-        self.assertFalse(detail.actions_available)
-        self.assertIn("non-default lane", detail.unavailable_reason)
+        self.assertTrue(detail.actions_available)
+        self.assertIsNone(detail.unavailable_reason)
+        self.assertTrue(all(c.available for c in detail.commands))
+        for command in detail.commands:
+            self.assertEqual("issue_123", command.selector["lane_id"])
 
     def test_observed_but_inactive_is_unavailable(self) -> None:
         # Fresh / readable row, but no live Target observed (active False): there
@@ -372,10 +382,13 @@ class GroupedActionPreviewTest(unittest.TestCase):
         def boom(**_):
             raise AssertionError("inventory must not be read for a bad candidate")
 
+        # Redmine #12293: a non-default lane is NOT a pre-inventory fail-closed
+        # condition anymore — the live preflight reads the inventory to narrow by
+        # @mozyo_lane_id (covered by test_non_default_lane_resolves_matching_lane_pane
+        # in test_cockpit_grouped_action.py). The remaining guards below still fail
+        # closed before any inventory read.
         with patch(f"{COCKPIT_UI}.take_inventory", boom):
             for kwargs, needle in (
-                ({"workspace_id": "ws-a", "role": "claude", "lane_id": "issue_1"},
-                 "non-default lane"),
                 ({"workspace_id": "ws-a", "role": "claude", "host_id": "remote"},
                  "non-local host"),
                 ({"workspace_id": "ws-a", "role": None}, "agent role"),

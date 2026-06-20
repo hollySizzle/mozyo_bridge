@@ -490,14 +490,20 @@ TargetRecord の preflight で配送先を決める。
 > (`cockpit_ui.grouped_reveal` / `grouped_jump` -> `_resolve_unit_target`) を必ず通す。
 > availability は表示行だけから fail-closed に導出し (`candidate_unit_selector` /
 > `_resolve_unit_target` の refusal gate を preview として写す): degraded
-> (`needs_reload`) 行 / 非 local host / 非 default lane / live target 未観測 の行は
+> (`needs_reload`) 行 / 非 local host / live target 未観測 の行は
 > available な command を一切出さず、各 action を可視の reason 付き unavailable として
-> 残す (silently drop しない)。stale / contradictory / ambiguous が action unavailable
+> 残す (silently drop しない)。非 default lane は #12293 で `@mozyo_lane_id` を読む
+> faithful な lane 分割が入ったため、もはや projection の block 条件ではなく first-class な
+> identity selector である (#12303 統合: `grouped_detail._blocking_reason` の非 default
+> lane 拒否を撤廃し、command preview の selector が行の `lane_id` を載せて live preflight が
+> 同一 lane で再解決する)。stale / contradictory / ambiguous が action unavailable
 > として現れる受入のうち、ambiguous (同一 identity に複数 live pane) は表示投影からは
 > 見えないため、live runtime を read-only で再観測する非破壊の counterpart
 > `cockpit_ui.grouped_action_preview` を追加した: 既存の `_resolve_unit_target` をそのまま
 > 走らせ side effect は出さずに `{available, reason}` を返す (stale / ambiguous / missing /
-> remote / 非 default lane を live に検出)。これを served の `POST /api/actions/grouped-preview`
+> remote を live に検出; 非 default lane は #12293 以降 narrowing 用の identity selector で、
+> 該当 lane の pane が無い場合のみ missing として unavailable)。これを served の
+> `POST /api/actions/grouped-preview`
 > (#12265 と同じ token gate、常に 200、非変更) に結線し、grouped cockpit detail 画面が
 > 副作用なしに現在の availability を確認できるようにした。detail payload は public-safe な
 > identity (`workspace_id` / `lane_id` / `host_id`) / display label / status・freshness token /

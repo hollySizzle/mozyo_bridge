@@ -577,8 +577,11 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         ``role`` / optional ``lane_id`` / ``host_id``) — never a pane id baked
         into the displayed projection. The action re-resolves that identity
         against a fresh live inventory and fails closed (409) on a stale /
-        ambiguous / missing / remote / non-default-lane target, so the grouped
-        projection can only *name* a candidate, never authorize a side effect.
+        ambiguous / missing / remote target, so the grouped projection can only
+        *name* a candidate, never authorize a side effect. A non-default
+        ``lane_id`` is a first-class identity selector (Redmine #12293): the
+        preflight narrows the live match by it and only fails closed when no pane
+        carries that lane (a *missing* target).
         """
         from mozyo_bridge.application.cockpit_ui import (
             CockpitActionError,
@@ -624,8 +627,10 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         live preflight read-only and reports whether the safe actions would
         currently resolve, so the Unit detail screen can show availability without
         performing a side effect. It always answers 200 — a stale / ambiguous /
-        missing / remote / non-default-lane candidate is reported as
-        ``available: False`` with the preflight reason, never an executed action.
+        missing / remote candidate is reported as ``available: False`` with the
+        preflight reason, never an executed action. A non-default ``lane_id`` is a
+        first-class identity selector (Redmine #12293), resolved by narrowing the
+        live match and only unavailable when no pane carries that lane.
         """
         from mozyo_bridge.application.cockpit_ui import grouped_action_preview
 

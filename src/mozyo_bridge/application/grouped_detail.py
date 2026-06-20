@@ -57,7 +57,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.application.cockpit_ui import DEFAULT_HOST, DEFAULT_LANE
+from mozyo_bridge.application.cockpit_ui import DEFAULT_HOST
 from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
 from mozyo_bridge.domain.grouped_display import ROLE_DISPLAY_ORDER
 from mozyo_bridge.domain.grouped_read_model import UnitView
@@ -209,9 +209,17 @@ def _blocking_reason(unit: UnitView, roles: "tuple[str, ...]") -> Optional[str]:
 
     Mirrors, as a *preview*, the refusal gates of ``candidate_unit_selector`` and
     ``_resolve_unit_target`` (most-blocking first): a degraded (``needs_reload``)
-    row, a non-local host, a non-default lane, or a row with no observed live agent
-    role pane. ``None`` means a command may be previewed as available — still a
-    candidate only, re-checked by the live preflight before any side effect.
+    row, a non-local host, or a row with no observed live agent role pane.
+    ``None`` means a command may be previewed as available — still a candidate
+    only, re-checked by the live preflight before any side effect.
+
+    The Unit ``lane_id`` is **not** a blocking condition (Redmine #12293): the
+    cockpit inventory now reads each pane's ``@mozyo_lane_id`` and splits a
+    workspace's lanes into faithful, distinct Units, so a non-default lane is a
+    first-class identity selector the live preflight (``_resolve_unit_target``)
+    narrows the match set by — never a capability gap. The previewed command's
+    selector carries the row's ``lane_id`` so the action re-resolves against the
+    same lane live.
     """
     if unit.needs_reload:
         return (
@@ -223,12 +231,6 @@ def _blocking_reason(unit: UnitView, roles: "tuple[str, ...]") -> Optional[str]:
             f"grouped action cannot resolve a non-local host ({unit.host_id!r}); "
             "the cockpit inventory observes the local tmux server only. Use an "
             "explicit live target."
-        )
-    if unit.lane_id != DEFAULT_LANE:
-        return (
-            f"grouped action cannot resolve a non-default lane ({unit.lane_id!r}) "
-            "from the cockpit inventory, which does not read @mozyo_lane_id. Use "
-            "an explicit live pane target."
         )
     if not unit.active or not roles:
         return (
@@ -248,7 +250,7 @@ def build_grouped_unit_detail(unit: UnitView) -> GroupedUnitDetailView:
     :func:`_blocking_reason` when it is not.
 
     Availability is a *preview hint* only and fail-closed: a degraded / remote /
-    non-default-lane / no-live-target row yields no available command. Even an
+    no-live-target row yields no available command. Even an
     available command stays a candidate (``live_preflight_required``): the named
     action re-resolves the identity through the action-time live preflight before
     any side effect, which may still reject it as ambiguous / missing / stale. No
