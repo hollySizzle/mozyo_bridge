@@ -423,6 +423,34 @@ TargetRecord の preflight で配送先を決める。
 > action-time live preflight が決める。#12264 / #12266 と同じく object-to-object slice
 > で、served endpoint / HTML page は結線しない。
 
+> 実装メモ (#12296): 本 Project Group read model に対する **detail / command preview**
+> projection は `src/mozyo_bridge/application/grouped_detail.py` に実装済み
+> (`build_grouped_unit_detail`)。operator が grouped cockpit で Unit / Target を選んだ
+> とき、その Unit の public-safe identity / state と「次に実行できる安全な action」を
+> 一画面で見せるための display 投影で、#12264 の `UnitView` 一行から
+> `GroupedUnitDetailView` (+ 行ごとの `CommandPreview`) を導出する: 観測された
+> agent role pane (`codex` / `claude`) ごと x cockpit action (`reveal` / `jump`) ごとに
+> 1 件の command preview を出す。preview は **情報であって権限ではない**:
+> `live_preflight_required=True` を常に立て、実行は #12265 の action-time live preflight
+> (`cockpit_ui.grouped_reveal` / `grouped_jump` -> `_resolve_unit_target`) を必ず通す。
+> availability は表示行だけから fail-closed に導出し (`candidate_unit_selector` /
+> `_resolve_unit_target` の refusal gate を preview として写す): degraded
+> (`needs_reload`) 行 / 非 local host / 非 default lane / live target 未観測 の行は
+> available な command を一切出さず、各 action を可視の reason 付き unavailable として
+> 残す (silently drop しない)。stale / contradictory / ambiguous が action unavailable
+> として現れる受入のうち、ambiguous (同一 identity に複数 live pane) は表示投影からは
+> 見えないため、live runtime を read-only で再観測する非破壊の counterpart
+> `cockpit_ui.grouped_action_preview` を追加した: 既存の `_resolve_unit_target` をそのまま
+> 走らせ side effect は出さずに `{available, reason}` を返す (stale / ambiguous / missing /
+> remote / 非 default lane を live に検出)。これを served の `POST /api/actions/grouped-preview`
+> (#12265 と同じ token gate、常に 200、非変更) に結線し、grouped cockpit detail 画面が
+> 副作用なしに現在の availability を確認できるようにした。detail payload は public-safe な
+> identity (`workspace_id` / `lane_id` / `host_id`) / display label / status・freshness token /
+> 観測 role 名 / 公開済み action endpoint と selector のみを持ち、pane id / repo path /
+> credential / prompt body を UI JSON / HTML に出さない
+> (`GROUPED_DETAIL_DIAGNOSTIC_ONLY_NOTE`、`public-private-boundary.md`)。detail 投影は pure
+> (`grouped_detail.py`) で、preview / served wiring は application 層に置く。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord
