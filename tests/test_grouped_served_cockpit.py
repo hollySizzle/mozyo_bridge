@@ -78,6 +78,7 @@ def _record(
     *,
     project_name: str | None = None,
     session: str = "mozyo-demo",
+    lane_id: str = "default",
 ) -> InventoryRecord:
     workspace = (
         WorkspaceIdentity(
@@ -100,6 +101,7 @@ def _record(
         cwd="/tmp",
         repo_root="/tmp",
         agent_kind=role,
+        lane_id=lane_id,
         workspace=workspace,
     )
 
@@ -237,14 +239,17 @@ class GroupedUnitsPayloadTest(unittest.TestCase):
 
 
 class SameWorkspaceMultiLaneTest(unittest.TestCase):
-    """Regression for #12286 review j#61995: two Codex/Claude pairs sharing one
-    workspace_id but representing distinct lanes/worktrees must not collapse into
-    a single healthy actionable Unit."""
+    """Fail-closed fallback when the lane discriminator is unreadable (#12286
+    review j#61995, preserved by #12293): Codex/Claude pairs sharing one
+    workspace_id AND one lane (no readable @mozyo_lane_id) must not collapse into a
+    single healthy actionable Unit — they degrade to a visible contradicted row."""
 
     def _multi_lane_snapshot(self) -> InventorySnapshot:
-        # Two lanes/worktrees of one repo: both project to the same workspace_id
-        # (the cockpit inventory does not read @mozyo_lane_id), so each role has
-        # two live panes under one projected Unit.
+        # Two worktrees of one repo whose panes carry NO @mozyo_lane_id option, so
+        # they all project to the same (workspace_id, default lane): each role then
+        # has two live panes under one projected Unit and cannot be faithfully
+        # split. (The distinct-lane-id case that DOES split is in
+        # LaneIdentitySplitTest below.)
         return _snapshot(
             [
                 _record("%0", "codex", "ws-shared", project_name="Shared",
@@ -322,6 +327,113 @@ class SameWorkspaceMultiLaneTest(unittest.TestCase):
         self.assertEqual(len(shared), 1)
         self.assertEqual(shared[0]["status"], "contradicted")
         self.assertTrue(shared[0]["reload_required"])
+
+
+class LaneIdentitySplitTest(unittest.TestCase):
+    """Redmine #12293: same-workspace panes carrying distinct @mozyo_lane_id values
+    split into distinct, faithful ``Unit = workspace + lane + role set`` rows — each
+    a healthy actionable Unit, never collapsed and never degraded to contradicted."""
+
+    def _distinct_lane_snapshot(self) -> InventorySnapshot:
+        # One repo (ws-shared) running two lanes/worktrees, each pane tagged with
+        # its checkout-local @mozyo_lane_id, one Codex+Claude pair per lane.
+        return _snapshot(
+            [
+                _record("%0", "codex", "ws-shared", project_name="Shared",
+                        session="main", lane_id="lane-main"),
+                _record("%1", "claude", "ws-shared", project_name="Shared",
+                        session="main", lane_id="lane-main"),
+                _record("%52", "codex", "ws-shared", project_name="Shared",
+                        session="sub", lane_id="issue_12293"),
+                _record("%53", "claude", "ws-shared", project_name="Shared",
+                        session="sub", lane_id="issue_12293"),
+            ]
+        )
+
+    def test_distinct_lanes_split_into_faithful_units(self) -> None:
+        units = observed_units_from_inventory(
+            self._distinct_lane_snapshot(), observation=_fresh_observation()
+        )
+        # Two distinct Units, one per lane, each carrying the full role set.
+        self.assertEqual(
+            sorted(u.lane_id for u in units), ["issue_12293", "lane-main"]
+        )
+        for unit in units:
+            self.assertEqual(unit.workspace_id, "ws-shared")
+            self.assertEqual(set(unit.roles), {"codex", "claude"})
+            # Faithful split → no contradiction, stays actionable.
+            self.assertIsNone(unit.observation.contradiction)
+
+    def test_split_units_are_healthy_and_actionable(self) -> None:
+        units = observed_units_from_inventory(
+            self._distinct_lane_snapshot(), observation=_fresh_observation()
+        )
+        model = build_grouped_read_model(
+            None, units, observation=_fresh_observation()
+        )
+        rows = model.all_units()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertFalse(row.needs_reload)
+            # Each row yields a candidate selector carrying its own lane.
+            selector = candidate_unit_selector(row)
+            self.assertEqual(selector["workspace_id"], "ws-shared")
+            self.assertIn(selector["lane_id"], ("lane-main", "issue_12293"))
+
+    def test_served_payload_shows_two_actionable_lane_rows(self) -> None:
+        from datetime import datetime, timezone
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        (repo / ".git").mkdir()
+        # The served path derives freshness from the snapshot's collected_at, so
+        # give the runtime snapshot a fresh collection time relative to ``now`` to
+        # exercise the healthy (observed) path end to end.
+        now = datetime(2026, 6, 20, 12, 0, 0, tzinfo=timezone.utc)
+        snapshot = InventorySnapshot(
+            records=self._distinct_lane_snapshot().records,
+            collected_at="2026-06-20T12:00:00+00:00",
+            source="runtime",
+            stale=False,
+            inventory_path=Path("/tmp/inv.sqlite"),
+        )
+        with patch(
+            f"{COCKPIT_UI}.take_inventory",
+            lambda **_: snapshot,
+        ):
+            payload = grouped_units_payload(repo_root=repo, now=now)
+        rows = [u for g in payload["groups"] for u in g["units"]]
+        shared = [r for r in rows if r["workspace_id"] == "ws-shared"]
+        self.assertEqual(
+            sorted(r["lane_id"] for r in shared), ["issue_12293", "lane-main"]
+        )
+        for row in shared:
+            self.assertEqual(row["status"], "observed")
+            self.assertFalse(row["reload_required"])
+            # The lane is surfaced as the row's distinguishing lane label.
+            self.assertEqual(row["lane_label"], row["lane_id"])
+
+    def test_mixed_readable_and_unreadable_lanes(self) -> None:
+        # One faithful lane (distinct id) plus two panes that share the default
+        # lane: the faithful lane stays a healthy Unit while the unreadable-lane
+        # collision degrades to contradicted — the fallback is per-lane, not all
+        # or nothing.
+        snapshot = _snapshot(
+            [
+                _record("%0", "codex", "ws-shared", project_name="Shared",
+                        lane_id="issue_12293"),
+                _record("%10", "codex", "ws-shared", project_name="Shared"),
+                _record("%11", "codex", "ws-shared", project_name="Shared"),
+            ]
+        )
+        units = observed_units_from_inventory(
+            snapshot, observation=_fresh_observation()
+        )
+        by_lane = {u.lane_id: u for u in units}
+        self.assertIsNone(by_lane["issue_12293"].observation.contradiction)
+        self.assertIsNotNone(by_lane["default"].observation.contradiction)
 
 
 class GroupedUnitsHttpTest(unittest.TestCase):

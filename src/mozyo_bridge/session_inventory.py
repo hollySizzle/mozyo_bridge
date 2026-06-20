@@ -70,11 +70,20 @@ from mozyo_bridge.workspace_registry import (
 )
 
 INVENTORY_FILENAME = "inventory.sqlite"
-# v2 (Redmine #11822): adds role_source / confidence columns. The cache is a
-# regenerable index, so an older v1 cache is dropped and rebuilt at v2 on the
-# next write rather than migrated in place; a newer-than-current cache is left
-# untouched so a downgraded CLI never destroys it.
-INVENTORY_SCHEMA_VERSION = 2
+# v2 (Redmine #11822): adds role_source / confidence columns.
+# v3 (Redmine #12293): adds lane_id / lane_label columns so the inventory carries
+# each pane's checkout-local lane identity (the ``@mozyo_lane_id`` /
+# ``@mozyo_lane_label`` pane options the tmux layer already reads), letting the
+# grouped cockpit projection split same-workspace multi-lane Units faithfully.
+# The cache is a regenerable index, so an older v1/v2 cache is dropped and rebuilt
+# at the current version on the next write rather than migrated in place; a
+# newer-than-current cache is left untouched so a downgraded CLI never destroys it.
+INVENTORY_SCHEMA_VERSION = 3
+
+# The backward-compatible lane a pane carries when it has no ``@mozyo_lane_id``
+# option (a normal ``mozyo`` pane): the inventory normalizes an empty lane to
+# ``default`` so the lane is always a concrete display value, never blank.
+DEFAULT_LANE = "default"
 
 # How the snapshot handed to the caller was produced.
 SOURCE_RUNTIME = "runtime"
@@ -98,7 +107,9 @@ CREATE TABLE IF NOT EXISTS panes (
     identity_source TEXT,
     views_json TEXT NOT NULL,
     role_source TEXT,
-    confidence TEXT
+    confidence TEXT,
+    lane_id TEXT,
+    lane_label TEXT
 )
 """
 
@@ -112,9 +123,10 @@ CREATE TABLE IF NOT EXISTS inventory_meta (
 _PANE_COLUMNS = (
     "pane_id, session, window_index, window_name, pane_index, pane_active, "
     "process, cwd, repo_root, agent_kind, workspace_id, canonical_session, "
-    "project_name, identity_source, views_json, role_source, confidence"
+    "project_name, identity_source, views_json, role_source, confidence, "
+    "lane_id, lane_label"
 )
-_PANE_COLUMN_COUNT = 17
+_PANE_COLUMN_COUNT = 19
 
 
 def inventory_path(home: Path | None = None) -> Path:
@@ -172,6 +184,16 @@ class InventoryRecord:
     # working and make a cache miss / older payload degrade to "unknown/none".
     role_source: str = ROLE_SOURCE_UNKNOWN
     confidence: str = CONFIDENCE_NONE
+    # Checkout-local lane identity (Redmine #12293), folded from the pane's
+    # ``@mozyo_lane_id`` / ``@mozyo_lane_label`` options (read by the tmux layer
+    # and carried through ``agent_discovery``). ``lane_id`` is the backward-
+    # compatible :data:`DEFAULT_LANE` for a normal ``mozyo`` pane that carries no
+    # lane option; ``lane_label`` is an optional public-safe display name. The
+    # grouped cockpit projection uses this to split same-workspace multi-lane
+    # Units faithfully instead of collapsing them; it stays an identity /
+    # display fact, never a routing or approval authority.
+    lane_id: str = DEFAULT_LANE
+    lane_label: str | None = None
     workspace: WorkspaceIdentity | None = None
     views: tuple[PaneView, ...] = ()
     # OTel activity join (Redmine #11675). Computed at query time from the
@@ -195,6 +217,8 @@ class InventoryRecord:
             "agent_kind": self.agent_kind,
             "role_source": self.role_source,
             "confidence": self.confidence,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
             "workspace": self.workspace.as_payload() if self.workspace else None,
             "views": [view.as_payload() for view in self.views],
             "activity": self.activity
@@ -339,6 +363,8 @@ def collect_runtime_inventory(
             agent_kind=agent.agent_kind,
             role_source=agent.role_source,
             confidence=agent.confidence,
+            lane_id=(agent.lane_id or "").strip() or DEFAULT_LANE,
+            lane_label=agent.lane_label,
             workspace=identity_for(agent.repo_root) if agent.repo_root else None,
             views=agent.views,
         )
@@ -370,6 +396,8 @@ def _record_to_row(record: InventoryRecord) -> tuple:
         ),
         record.role_source,
         record.confidence,
+        record.lane_id,
+        record.lane_label,
     )
 
 
@@ -407,6 +435,8 @@ def _row_to_record(row: tuple) -> InventoryRecord:
         agent_kind=row[9],
         role_source=row[15] or ROLE_SOURCE_UNKNOWN,
         confidence=row[16] or CONFIDENCE_NONE,
+        lane_id=row[17] or DEFAULT_LANE,
+        lane_label=row[18],
         workspace=workspace,
         views=views,
     )

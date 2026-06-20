@@ -440,7 +440,10 @@ TargetRecord の preflight で配送先を決める。
 > workspace_id に複数 lane/worktree が projection されて 1 role に live pane が複数付く
 > 場合は faithful な lane 分割ができないため、healthy な actionable Unit に collapse せず
 > visible contradicted (`live_runtime_conflict`) row へ degrade し needs_reload/
-> unactionable にする — #12286 review j#61995) に集約し、
+> unactionable にする — #12286 review j#61995。この lane `default` 固定の制約は #12293 で
+> 解消し、inventory が `@mozyo_lane_id` を読んで faithful な lane 分割を行う; degrade は
+> lane discriminator が読めない collision の fail-closed fallback として残る — 下記
+> #12293 実装メモ) に集約し、
 > `grouped_units_payload` が repo-local grouping config + live snapshot から
 > `build_grouped_read_model` -> `build_grouped_display_view` を構築する。freshness
 > envelope は rows と同じ snapshot から `snapshot_from_inventory` で導出し、reload /
@@ -452,6 +455,28 @@ TargetRecord の preflight で配送先を決める。
 > pane / target は持たず、grouped action は引き続き #12265 の candidate selector +
 > action-time live preflight (`grouped-reveal` / `grouped-jump`) を通る。public plugin
 > API / VS Code Agent Pane へは拡張しない。
+
+> 実装メモ (#12293): grouped Unit projection に **lane identity を結線**した。(1)
+> inventory が lane を読む: `session_inventory.InventoryRecord` に `lane_id` /
+> `lane_label` を追加し (cache schema v2 -> v3)、`collect_runtime_inventory` が
+> `agent_discovery` 経由で pane の `@mozyo_lane_id` / `@mozyo_lane_label` (tmux layer が
+> 既に読む pane option) を fold する。lane option を持たない通常 `mozyo` pane は
+> backward-compatible な `default` lane に正規化する。(2) faithful split:
+> `cockpit_ui.observed_units_from_inventory` の集約 key を `workspace_id` から
+> `(workspace_id, lane_id)` に変更し、同一 repo の複数 lane/worktree が distinct lane id
+> を持てば distinct な `ObservedUnit` (= `Unit = workspace + lane + role set`) に分割される。
+> 1 つの healthy actionable row への collapse はしない。lane discriminator が読めない
+> (lane option 不在で複数 pane が同一 `(workspace_id, default)` に collision する) 場合は
+> 従来どおり visible contradicted (`live_runtime_conflict`) へ degrade する
+> fail-closed fallback を per-lane に維持する (#12286 の degrade は廃止せず保持)。(3)
+> action 解決: `cockpit_ui._resolve_unit_target` の非 default lane 拒否を撤廃し、fresh
+> inventory を再 query して候補集合を `(workspace_id, lane_id, role)` で絞る。lane は
+> identity selector にすぎず、表示中 projection の値ではなく action 時に live で読み直した
+> lane と照合し、0 件 / 複数件は引き続き fail closed する。lane / group display metadata は
+> routing / approval / review / close authority にならず、Target live preflight 境界
+> (`runtime-observability-boundary.md` `## Action-Time Live Preflight Boundary`) を維持する。
+> 非目標どおり tmux window / iTerm tab を identity authority にせず、public extension API /
+> dynamic plugin loading も開かない。
 
 ## TargetRecord / UnitRecord
 

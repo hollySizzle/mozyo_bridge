@@ -81,9 +81,11 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
     consumer must not read a runtime-unreadable pane as healthy from the
     attention field even when the top-level ``stale`` flag is set.
 
-    Limitation: the inventory layer does not resolve the ``@mozyo_lane_id`` pane
-    option, so the projected ``lane_id`` is the ``default`` lane and there is no
-    per-pane role-ambiguity flag here (``agents targets`` carries ``ambiguous``);
+    Limitation: this attention projection keys on ``workspace_id`` and does not
+    consume the per-pane lane identity (the inventory now folds ``@mozyo_lane_id``
+    into each record's ``lane_id`` for the grouped Unit projection, Redmine #12293,
+    but the flat attention layer ignores it) and carries no per-pane
+    role-ambiguity flag here (``agents targets`` carries ``ambiguous``);
     ``unit_id`` is opaque provenance, never a routing key.
     """
     from mozyo_bridge.domain.agent_discovery import (
@@ -345,22 +347,24 @@ def _resolve_unit_target(
 
     Maps a candidate Unit identity (the only thing a grouped read-model row may
     contribute) to exactly one live pane, ignoring the displayed projection
-    entirely and re-querying a fresh inventory. Fails closed on every
-    uncertainty so a grouped projection can only *name* a candidate, never
-    authorize a side effect:
+    entirely and re-querying a fresh inventory. The candidate's ``lane_id`` only
+    *narrows* the live match set against the lane the fresh inventory reads from
+    each pane's ``@mozyo_lane_id`` option (Redmine #12293) — it is an identity
+    selector, never routing / approval / close authority, and the truth is always
+    re-read live. Fails closed on every uncertainty so a grouped projection can
+    only *name* a candidate, never authorize a side effect:
 
     - a missing / empty ``workspace_id`` or a non-agent ``role`` is rejected;
-    - a non-local ``host_id`` or a non-``default`` ``lane_id`` is rejected — the
-      cockpit inventory observes the local tmux server only and does not resolve
-      the ``@mozyo_lane_id`` pane option (every pane projects to the ``default``
-      lane), so such a candidate cannot be faithfully resolved here and must use
-      an explicit live target rather than risk acting on a same-named pane
+    - a non-local ``host_id`` is rejected — the cockpit inventory observes the
+      local tmux server only, so a remote candidate cannot be faithfully resolved
+      here and must use an explicit live target
       (``local-remote-cockpit-host-boundary.md`` / ``unit-target-model.md``);
     - a stale snapshot (tmux runtime unreadable) is rejected;
-    - zero live panes matching the identity is rejected (the Unit may have
-      exited); and
-    - more than one matching live pane is *ambiguous* and rejected (a contradicted
-      / drifted projection never picks one silently).
+    - zero live panes matching the ``(workspace_id, lane_id, role)`` identity is
+      rejected (the Unit / lane may have exited); and
+    - more than one matching live pane is *ambiguous* and rejected — the lane
+      discriminator did not faithfully separate them, so a contradicted / drifted
+      projection never picks one silently.
     """
     from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
 
@@ -379,12 +383,7 @@ def _resolve_unit_target(
             "cockpit inventory observes the local tmux server only. Use an "
             "explicit live target."
         )
-    if lane_id != DEFAULT_LANE:
-        raise CockpitActionError(
-            f"grouped action cannot resolve a non-default lane ({lane_id!r}) "
-            "from the cockpit inventory, which does not read @mozyo_lane_id. "
-            "Use an explicit live pane target."
-        )
+    lane_id = (lane_id or "").strip() or DEFAULT_LANE
     snapshot = take_inventory(home=home)
     if snapshot.stale:
         raise CockpitActionError(
@@ -397,19 +396,20 @@ def _resolve_unit_target(
         if record.agent_kind == role
         and record.workspace is not None
         and record.workspace.workspace_id == workspace_id
+        and ((record.lane_id or "").strip() or DEFAULT_LANE) == lane_id
     ]
     if not matches:
         raise CockpitActionError(
-            f"no live {role} pane for workspace {workspace_id!r} is in the "
-            "runtime inventory (the unit may have exited). Refresh the unit "
-            "list."
+            f"no live {role} pane for workspace {workspace_id!r} / lane "
+            f"{lane_id!r} is in the runtime inventory (the unit may have "
+            "exited). Refresh the unit list."
         )
     if len(matches) > 1:
         candidates = ", ".join(sorted(record.pane_id for record in matches))
         raise CockpitActionError(
             f"grouped target is ambiguous: {len(matches)} live {role} panes "
-            f"match workspace {workspace_id!r} ({candidates}). Use an explicit "
-            "pane target."
+            f"match workspace {workspace_id!r} / lane {lane_id!r} "
+            f"({candidates}). Use an explicit pane target."
         )
     return matches[0]
 
@@ -498,14 +498,17 @@ def observed_units_from_inventory(snapshot, *, observation):
     - only agent panes (``claude`` / ``codex``) with a resolved ``workspace_id``
       become Units; a pane with no workspace identity cannot form a routable /
       groupable Unit and is skipped (it still shows in the flat table);
-    - panes are aggregated by ``workspace_id`` into one Unit whose ``roles`` is the
-      observed role set and whose ``repo_label`` is the workspace's public-safe
-      display label (project name / canonical session);
-    - ``lane_id`` / ``host_id`` are the cockpit inventory's only faithful values —
-      ``default`` / ``local`` — because the inventory observes the local tmux
-      server and does not read the ``@mozyo_lane_id`` pane option (the same
-      limitation ``attach_attention`` / ``_resolve_unit_target`` document); a
-      non-default lane / remote host therefore cannot be fabricated here;
+    - panes are aggregated by ``(workspace_id, lane_id)`` into one Unit per lane
+      whose ``roles`` is the observed role set and whose ``repo_label`` is the
+      workspace's public-safe display label (project name / canonical session).
+      ``lane_id`` is the pane's checkout-local lane identity (Redmine #12293): the
+      ``@mozyo_lane_id`` pane option the inventory now folds (the
+      :data:`~mozyo_bridge.session_inventory.DEFAULT_LANE` for a normal ``mozyo``
+      pane with no lane option). So one repo running several lanes / worktrees with
+      distinct lane ids splits into **distinct** Units — a faithful
+      ``Unit = workspace + lane + role set`` — instead of collapsing into one row;
+    - ``host_id`` is ``local`` because the cockpit inventory observes the local
+      tmux server only; a remote host cannot be fabricated here;
     - ``active`` is the observed liveness fact: a Unit has a live Target only when
       the runtime is actually readable, so a **stale** snapshot yields
       ``active=False`` (the fail-safe posture — no live Target is asserted from a
@@ -515,19 +518,22 @@ def observed_units_from_inventory(snapshot, *, observation):
       (both derive from the one snapshot) — **except** a lane-ambiguous Unit (see
       below), whose envelope carries a visible contradiction.
 
-    Lane-ambiguous degrade (Redmine #12286 review j#61995). A faithful Unit is one
-    ``(workspace_id, lane_id, host_id)`` with at most one live pane per role.
-    Because the inventory projects every pane to lane ``default``, one repo with
-    several live lanes / worktrees sharing a ``workspace_id`` (the cockpit +
-    sublane dogfood shape) produces *more than one* live pane for a role under the
-    same projected Unit. Without a lane discriminator we cannot faithfully split
-    that into distinct lane Units, so collapsing it into one healthy ``default``
+    Lane-ambiguous fail-closed fallback (Redmine #12286 review j#61995, preserved
+    by #12293). A faithful Unit is one ``(workspace_id, lane_id, host_id)`` with at
+    most one live pane per role. Reading ``@mozyo_lane_id`` makes the common
+    multi-lane case faithful (distinct lanes → distinct Units), but the lane
+    discriminator can still be **unreadable**: several panes that carry no lane
+    option (or the same lane id) collapse onto the same ``(workspace_id, lane_id)``
+    bucket and produce *more than one* live pane for a role. Without a faithful
+    discriminator we cannot split them, so collapsing into one healthy actionable
     Unit would serve enabled action buttons whose candidate then resolves
     *ambiguous* at action time. Instead the Unit is degraded to a **visible
     contradicted** row (``live_runtime_conflict``): it is shown but reads
     ``needs_reload`` / unactionable, so its action affordances are disabled and the
     operator must use an explicit pane target. ``_resolve_unit_target`` still fails
-    closed on the same ambiguity, so this is defense in depth, not the only guard.
+    closed on the same per-lane ambiguity, so this is defense in depth, not the
+    only guard. The lane identity is a display / split fact only; it never becomes
+    routing, approval, or close authority.
 
     Pure aggregation: it carries identity + role *presence* only, never a
     pane id / target, so the result is display state, not a routing endpoint.
@@ -542,7 +548,10 @@ def observed_units_from_inventory(snapshot, *, observation):
     )
 
     live = not snapshot.stale
-    by_workspace: dict[str, dict] = {}
+    # Aggregate by (workspace_id, lane_id): one Unit per lane within a workspace,
+    # so distinct lanes of one repo stay distinct Units (faithful split) and only a
+    # genuinely unreadable lane discriminator collapses panes onto one bucket.
+    by_unit: dict[tuple[str, str], dict] = {}
     for record in snapshot.records:
         if record.agent_kind not in (ROLE_CLAUDE, ROLE_CODEX):
             continue
@@ -550,8 +559,10 @@ def observed_units_from_inventory(snapshot, *, observation):
         workspace_id = workspace.workspace_id if workspace is not None else None
         if not workspace_id:
             continue
-        entry = by_workspace.setdefault(
-            workspace_id, {"role_counts": {}, "label": None}
+        lane_id = (record.lane_id or "").strip() or DEFAULT_LANE
+        key = (workspace_id, lane_id)
+        entry = by_unit.setdefault(
+            key, {"role_counts": {}, "label": None}
         )
         entry["role_counts"][record.agent_kind] = (
             entry["role_counts"].get(record.agent_kind, 0) + 1
@@ -563,15 +574,15 @@ def observed_units_from_inventory(snapshot, *, observation):
                 or workspace_id
             )
     units: list = []
-    for workspace_id in sorted(by_workspace):
-        entry = by_workspace[workspace_id]
+    for workspace_id, lane_id in sorted(by_unit):
+        entry = by_unit[(workspace_id, lane_id)]
         role_counts = entry["role_counts"]
         roles = tuple(
             role for role in (ROLE_CODEX, ROLE_CLAUDE) if role in role_counts
         )
-        # >1 live pane for any role under the same projected (workspace, lane,
-        # host) means multiple lanes / worktrees collapse onto one Unit; degrade
-        # it to a visible contradicted row rather than a healthy actionable one.
+        # >1 live pane for any role under the same (workspace, lane, host) means
+        # the lane discriminator did not faithfully separate them; degrade to a
+        # visible contradicted row rather than a healthy actionable one.
         ambiguous = any(count > 1 for count in role_counts.values())
         unit_observation = observation
         if ambiguous:
@@ -583,7 +594,7 @@ def observed_units_from_inventory(snapshot, *, observation):
         units.append(
             ObservedUnit(
                 workspace_id=workspace_id,
-                lane_id=DEFAULT_LANE,
+                lane_id=lane_id,
                 host_id=DEFAULT_HOST,
                 repo_label=entry["label"],
                 active=live,

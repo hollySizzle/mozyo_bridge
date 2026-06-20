@@ -34,10 +34,10 @@ inventory_layers:
 - **path 同一性は Unicode 正規化差を吸収する** (Redmine #11625)。registry の `canonical_path` と pane 由来の repo root は `shared/paths.py` の `normalize_path_unicode()` (NFD 固定) を通してから比較する。macOS readdir は NFD、文書 / agent 経由の path は NFC で、raw byte 比較は同一 workspace を取り逃す。session 名 hash 導出 (`domain/session_naming.py`) と handoff `--target-repo` gate も同じ helper を通る (#11625 で修正済み。NFD 固定の理由は helper docstring を正本とする)。
 - **home 消失 fallback は identity 層が担う。** home registry / inventory cache が消えても、runtime listing は各 workspace の local anchor (`.mozyo-bridge/workspace.json`) または path derivation から同じ identity を再構築する。inventory 自体の復元手順は不要 (cache は regenerable)。
 
-## SQLite schema (inventory v1)
+## SQLite schema (inventory v3)
 
 ```sql
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;
 CREATE TABLE panes (
     pane_id TEXT PRIMARY KEY,
     session TEXT NOT NULL,          -- 正準 view の session
@@ -53,19 +53,24 @@ CREATE TABLE panes (
     canonical_session TEXT,
     project_name TEXT,
     identity_source TEXT,           -- home-registry / workspace-anchor / derivation markers
-    views_json TEXT NOT NULL        -- PaneView 配列 (canonical flag 含む)
+    views_json TEXT NOT NULL,       -- PaneView 配列 (canonical flag 含む)
+    role_source TEXT,               -- v2 (#11822): role resolver provenance
+    confidence TEXT,                -- v2 (#11822): role 分類の強さ
+    lane_id TEXT,                   -- v3 (#12293): @mozyo_lane_id (空欄 -> default)
+    lane_label TEXT                 -- v3 (#12293): @mozyo_lane_label (任意 display 名)
 );
 CREATE TABLE inventory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- inventory_meta('collected_at') = snapshot UTC ISO8601
 ```
 
-- cache は regenerable なので、registry と違い corrupt file は write 側が退避 (削除) して再作成する。ただし **未知の (新しい) schema version は壊さず write を skip** し note を返す。read 側は missing / corrupt / version 不一致をすべて「cache なし」として degrade する。
+- schema version 履歴: v1 初版 / v2 (#11822) role_source・confidence 追加 / v3 (#12293) lane_id・lane_label 追加。`lane_id` は pane の checkout-local lane identity (tmux layer が読む `@mozyo_lane_id`; 通常 `mozyo` pane は空欄 -> backward-compatible な `default` に正規化)。grouped cockpit projection が同一 workspace の multi-lane Unit を faithful に分割するために使う identity / display 値で、routing / approval / close authority にはならない。
+- cache は regenerable なので、registry と違い corrupt file は write 側が退避 (削除) して再作成する。version 不一致 (古い v1/v2 含む) は read 側で「cache なし」として degrade し、次の runtime listing が現行 schema で全置換再構築する。**未知の (より新しい) schema version は壊さず write を skip** し note を返す (downgrade 保護)。
 - snapshot は全置換 (DELETE + INSERT, 単一 transaction)。部分更新はしない。
 
 ## CLI surface
 
 - `mozyo-bridge session list [--json]` — 既存 `session` サブコマンド体系 (issue #11422 指定) に追加。runtime 収集成功時は cache を更新して `source: runtime` / `stale: false`。tmux 不在時は cache から `source: cache` / `stale: true` (text 出力では stderr に stale 警告)。cache も無ければ空の stale snapshot を返す (exit 0)。
-- JSON payload: `schema_version` / `collected_at` / `source` / `stale` / `inventory_path` / `notes` / `panes[]`。pane は `pane_id` / 正準 view の `session`・`window_*`・`pane_*` / `process` / `cwd` / `repo_root` / `agent_kind` / `workspace{workspace_id, canonical_session, project_name, source}` / `views[]` / `activity{state, last_event_at, source}` (#11675 追加。OTel store からの query 時 join で、inventory cache には保存しない。詳細は `otel-event-store.md` 段階2)。
+- JSON payload: `schema_version` / `collected_at` / `source` / `stale` / `inventory_path` / `notes` / `panes[]`。pane は `pane_id` / 正準 view の `session`・`window_*`・`pane_*` / `process` / `cwd` / `repo_root` / `agent_kind` / `role_source` / `confidence` / `lane_id` / `lane_label` (#12293 追加) / `workspace{workspace_id, canonical_session, project_name, source}` / `views[]` / `activity{state, last_event_at, source}` (#11675 追加。OTel store からの query 時 join で、inventory cache には保存しない。詳細は `otel-event-store.md` 段階2)。
 - `agents list` (#10332) も #11628 で同じ identity model に統一済み: 1 行 = 1 `pane_id`、grouped 所属は `views` 配列、text 出力は末尾 `OTHER_VIEWS` 列。**folding の実装は `domain/agent_discovery.fold_agents_by_pane()` を両 surface で共有**し、`session list` は workspace identity 層 (registry → anchor → derivation) をその上に重ねる。`agents list --json` の既存 field は正準 view の値として意味を維持し、`views` が追加 (grouped pane の重複行は廃止 = #11628 が修正した bug)。`--session` filter は正準 / grouped どちらの所属でも match する。
 
 ## 検証
