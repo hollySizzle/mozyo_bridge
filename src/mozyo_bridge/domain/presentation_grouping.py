@@ -1062,8 +1062,10 @@ class GroupWindowDecision:
 def resolve_group_window_placement(
     presentation_mode: str,
     placement: GroupPlacement,
+    *,
+    execute_group_window: bool = False,
 ) -> GroupWindowDecision:
-    """Resolve the desired launcher / cockpit-append placement (Redmine #12302).
+    """Resolve the desired launcher / cockpit-append placement (Redmine #12302, #12330).
 
     Maps the configured ``project_group_presentation`` mode + the resolved
     :class:`GroupPlacement` to a :class:`GroupWindowDecision` the cockpit
@@ -1071,14 +1073,25 @@ def resolve_group_window_placement(
 
     - ``same_cockpit_column`` (the default) -> the behavior-preserving shared
       cockpit column; not degraded.
-    - ``project_group_tmux_window`` -> the *desired* per-Project-Group tmux window
-      (#12290), but :attr:`executed_surface` stays ``cockpit_column`` and the
-      decision is :attr:`degraded` with a visible diagnostic: the single-window
-      cockpit append cannot spawn a separate window without bypassing the
-      duplicate-detection / pane-identity gate, and a tmux window / iTerm tab is
-      never guaranteed.
-    - ``normal_window`` -> the retained compatibility projection; likewise
-      recorded as desired and degraded to the cockpit column.
+    - ``project_group_tmux_window`` -> the per-Project-Group tmux window (#12290).
+      Whether it actually *executes* is gated by ``execute_group_window``:
+
+      * ``execute_group_window=False`` (the default, behavior-preserving for
+        callers that only project the *desired* placement) keeps
+        :attr:`executed_surface` at ``cockpit_column`` and the decision
+        :attr:`degraded` with a visible diagnostic — the single-window degrade
+        path #12302 shipped.
+      * ``execute_group_window=True`` (the cockpit launcher when it can faithfully
+        place per-group windows, #12330) sets :attr:`executed_surface` to
+        ``group_tmux_window`` and is **not** degraded: the launcher creates /
+        appends / focuses the group's own tmux window while keeping the same
+        ``workspace + lane`` duplicate gate and pane-identity stamping. A tmux
+        window / iTerm tab is still never *guaranteed* — it is a tmux-layer
+        request only and never routing / approval / close authority.
+
+    - ``normal_window`` -> the retained compatibility projection; always recorded
+      as desired and degraded to the cockpit column (``execute_group_window`` does
+      not relaunch a normal window — that is out of this surface's scope).
     - any other value fails closed (:class:`PresentationGroupingConfigError`),
       mirroring the closed display-only vocabulary; never normalized silently.
     """
@@ -1101,13 +1114,30 @@ def resolve_group_window_placement(
         )
 
     if presentation_mode == PROJECT_GROUP_PRESENTATION_TMUX_WINDOW:
-        # Desired per-Project-Group tmux window. The public-safe window name is the
+        # Per-Project-Group tmux window. The public-safe window name is the
         # group's display label (its portable group_id when unlabeled, the
         # repo/workspace label for the implicit per-repo default group).
         window_name = placement.label or placement.group_id
+        if execute_group_window:
+            # Faithful execution (#12330): the launcher places the sublane in the
+            # group's own tmux window. Not degraded — the duplicate-detection /
+            # pane-identity gate is preserved across windows by the launcher, not by
+            # collapsing back to the shared column. Still display-only: a tmux
+            # window / iTerm tab is requested, never guaranteed, and never routing /
+            # approval / close authority.
+            return GroupWindowDecision(
+                presentation_mode=presentation_mode,
+                desired_surface=GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+                executed_surface=GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+                group_id=placement.group_id,
+                label=placement.label,
+                desired_window_name=window_name,
+                degraded=False,
+                diagnostic=None,
+            )
         diagnostic = (
             "project_group_tmux_window is a desired per-Project-Group tmux window; "
-            "this build keeps the sublane in the shared cockpit column to preserve "
+            "this caller keeps the sublane in the shared cockpit column to preserve "
             "the duplicate-detection / pane-identity gate and never guarantees a "
             "tmux window / iTerm tab."
         )

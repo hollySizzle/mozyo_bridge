@@ -1,15 +1,19 @@
-"""`mozyo cockpit` reads `project_group_presentation` for launch/append (#12302).
+"""`mozyo cockpit` reads `project_group_presentation` for launch/append (#12302, #12330).
 
-The cockpit launcher / append path now resolves the desired Project-Group
-presentation placement from `.mozyo-bridge/config.yaml`
+The cockpit launcher / append path resolves the Project-Group presentation
+placement from `.mozyo-bridge/config.yaml`
 `presentation.project_group_presentation`:
 
 - `same_cockpit_column` (the default / a missing config) preserves the current
   column append/create behavior exactly;
-- the opt-in surfaces (`project_group_tmux_window` / `normal_window`) record the
-  *desired* placement but visibly degrade to the shared cockpit column (a
-  diagnostic, never a silent reroute) so the duplicate-detection / pane-identity
-  gate is preserved and a tmux window / iTerm tab is never guaranteed;
+- `project_group_tmux_window` now *faithfully executes* (#12330): the launcher
+  places the sublane in the Project Group's own tmux window. With no managed
+  windows discoverable (the minimal stub here) that is a `group_create`; the
+  cross-window focus / append cases are covered in
+  `test_cockpit_group_window.py`. It is not degraded and never spawns a fresh
+  iTerm window — the operator switches tmux windows;
+- `normal_window` still records the *desired* placement and visibly degrades to
+  the shared cockpit column (relaunching a normal window is out of scope);
 - an invalid placement config fails closed (reported under --json, fatal on a
   real run).
 
@@ -125,34 +129,37 @@ class CockpitPresentationPlacementTest(unittest.TestCase):
         self.assertFalse(payload["presentation"]["degraded"])
         self.assertIsNone(payload["presentation_blocked"])
 
-    # --- opt-in surfaces: desired placement recorded, visibly degraded ---
+    # --- project_group_tmux_window: faithful execution (#12330) ---
 
-    def test_tmux_window_json_records_desired_and_degrades(self) -> None:
+    def test_tmux_window_json_records_faithful_execution(self) -> None:
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
         out, _rc, _r, _e = self._run(
             self._args(dry_run=False, json_output=True), cols,
             load_return=_config_for("project_group_tmux_window"),
         )
         payload = json.loads(out)
-        # The placement decision never changes the chosen cockpit action.
-        self.assertEqual("append", payload["action"])
+        # With no managed windows discoverable in this minimal stub the faithful
+        # path creates the group's own window — not the shared column.
+        self.assertEqual("group_create", payload["action"])
         pres = payload["presentation"]
         self.assertEqual("group_tmux_window", pres["desired_surface"])
-        self.assertEqual("cockpit_column", pres["executed_surface"])
-        self.assertTrue(pres["degraded"])
-        self.assertTrue(pres["diagnostic"])
+        self.assertEqual("group_tmux_window", pres["executed_surface"])
+        self.assertFalse(pres["degraded"])
+        self.assertIsNone(pres["diagnostic"])
+        self.assertEqual("sessX", payload["group_window"])
 
-    def test_tmux_window_dry_run_prints_degrade_notice(self) -> None:
+    def test_tmux_window_dry_run_prints_faithful_notice(self) -> None:
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
         out, _rc, _r, _e = self._run(
             self._args(), cols,
             load_return=_config_for("project_group_tmux_window"),
         )
-        self.assertIn("action=append", out)
-        self.assertIn("presentation:", out)
-        self.assertIn("never guarantees a tmux window", out)
+        self.assertIn("action=group_create", out)
+        self.assertIn("Project Group window", out)
+        # Faithful, not degraded: the #12302 degrade wording must be gone.
+        self.assertNotIn("never guarantees a tmux window", out)
 
-    def test_tmux_window_real_append_prints_notice_and_still_appends(self) -> None:
+    def test_tmux_window_real_run_creates_group_window_no_attach(self) -> None:
         from mozyo_bridge.application.commands import cmd_cockpit
 
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]
@@ -163,9 +170,8 @@ class CockpitPresentationPlacementTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 rc = cmd_cockpit(self._args(dry_run=False))
         self.assertEqual(0, rc)
-        execvp.assert_not_called()  # still a column, no new iTerm window
-        self.assertIn("appended", out.getvalue())
-        self.assertIn("presentation:", out.getvalue())
+        execvp.assert_not_called()  # group window, no new iTerm window
+        self.assertIn("created Project Group window", out.getvalue())
 
     def test_normal_window_degrades_to_column(self) -> None:
         cols = [{"pane_id": "%1", "workspace_id": "wsA", "role": "codex"}]

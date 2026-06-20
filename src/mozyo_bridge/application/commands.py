@@ -1601,18 +1601,33 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
     raise AssertionError("unreachable")
 
 
-def _read_cockpit_columns(session: str):
-    """Read the cockpit window's panes with their workspace+lane identity (#11803, #11820).
+def _read_cockpit_columns(session: str, window: str | None = None):
+    """Read a cockpit window's panes with their workspace+lane identity (#11803, #11820).
 
     Returns a list of ``{pane_id, workspace_id, role, lane_id, pane_left,
     pane_width}`` (one per pane carrying the `@mozyo_workspace_id` user option),
-    or ``None`` when the cockpit window does not exist. Identity is read from the
-    tmux user options, not the title. ``lane_id`` is absent (empty) on pre-#11820
-    panes and normalizes to the ``default`` lane at comparison time. The
-    ``pane_left`` / ``pane_width`` geometry (Redmine #11849) lets append pick the
-    visually rightmost column instead of trusting list-panes order.
+    or ``None`` when the window does not exist. ``window`` defaults to the shared
+    `cockpit` window. Pass an explicit window to read a Project Group window
+    (#12330): a tmux **window id** (``@N``, server-globally unique) targets that
+    exact window unambiguously and is used directly; any other value is taken as a
+    window name under ``session`` (``session:name``). Discovery passes the window
+    id so a duplicate display name can never make the *name* a routing dependency
+    (#12330 review j#62380). Identity is read from the tmux user options, not the
+    title. ``lane_id`` is absent (empty) on pre-#11820 panes and normalizes to the
+    ``default`` lane at comparison time. The ``pane_left`` / ``pane_width``
+    geometry (Redmine #11849) lets append pick the visually rightmost column
+    instead of trusting list-panes order.
     """
     from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    target_window = COCKPIT_WINDOW if window is None else window
+    # A window id (`@N`) is unique across the whole tmux server, so it targets the
+    # window on its own; only a window *name* needs the `session:` qualifier.
+    target = (
+        target_window
+        if target_window.startswith("@")
+        else f"{session}:{target_window}"
+    )
 
     def _as_int(value: str) -> int:
         try:
@@ -1627,7 +1642,7 @@ def _read_cockpit_columns(session: str):
         result = run_tmux(
             "list-panes",
             "-t",
-            f"{session}:{COCKPIT_WINDOW}",
+            target,
             "-F",
             "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
             "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}",
@@ -1652,6 +1667,70 @@ def _read_cockpit_columns(session: str):
                 }
             )
     return columns
+
+
+def _read_managed_cockpit_windows(session: str):
+    """Read every cockpit-session window that holds a mozyo-managed pane (#12330).
+
+    Faithful multi-window discovery for per-Project-Group windows: lists the
+    session's windows by their stable ``#{window_id}`` (plus the display name and
+    the mozyo-written ``@mozyo_group_id`` marker), reads each one's panes by that
+    **window id**, and returns a list of
+    ``{"window_id": <@N>, "window": <name>, "group_id": <hint or "">,
+    "columns": [<column>, ...]}`` for every window that carries at least one
+    ``@mozyo_workspace_id`` pane — the shared `cockpit` window AND any Project
+    Group window.
+
+    The window id is the identifier everything keys on, so a duplicate display
+    name (two groups whose labels sanitize to the same string) can never collapse
+    or hide a window or make the name a routing dependency (#12330 review j#62380).
+    UNIT identity stays on the pane options in ``columns``; ``group_id`` is the
+    mozyo-stamped window-level marker the launcher uses to locate a group's
+    existing window; ``window`` is display only.
+
+    Read-only and tolerant: a missing tmux binary / server, or an unreadable
+    window list, degrades to ``[]`` (no managed windows) rather than raising, so
+    `--dry-run` / `--json` stay non-mutating. A window whose pane read fails or
+    carries no managed pane is simply omitted.
+    """
+    from mozyo_bridge.domain.cockpit_layout import GROUP_WINDOW_OPTION
+
+    try:
+        result = run_tmux(
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_id}\t#{window_name}\t#{" + GROUP_WINDOW_OPTION + "}",
+            check=False,
+        )
+    except (Exception, SystemExit):
+        return []
+    if getattr(result, "returncode", 1) != 0:
+        return []
+    managed = []
+    for line in (getattr(result, "stdout", "") or "").splitlines():
+        parts = line.split("\t")
+        window_id = parts[0] if parts else ""
+        if not window_id:
+            continue
+        window_name = parts[1] if len(parts) >= 2 else ""
+        group_hint = parts[2] if len(parts) >= 3 else ""
+        # Read panes by the unambiguous window id, never the (possibly duplicate)
+        # name.
+        columns = _read_cockpit_columns(session, window_id)
+        if not columns:
+            continue
+        if any((c.get("workspace_id") or "") for c in columns):
+            managed.append(
+                {
+                    "window_id": window_id,
+                    "window": window_name,
+                    "group_id": group_hint,
+                    "columns": columns,
+                }
+            )
+    return managed
 
 
 def _read_cockpit_geometry(session: str):
@@ -2224,10 +2303,30 @@ def _assess_cockpit_reset(session, *, columns, session_present):
     )
 
 
+def _cockpit_extra_windows(target):
+    """Managed-session windows a reset's `kill-session` destroys beyond `cockpit` (#12330).
+
+    Faithful per-Project-Group windows live in the SAME session as the `cockpit`
+    home window, so the reset teardown (`kill-session`) destroys them too. Return
+    the window names other than the `cockpit` home window so reset can make that
+    multi-window destruction visible before the confirm-gated kill (Unit 5).
+    """
+    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+
+    return [w for w in target.windows if w and w != COCKPIT_WINDOW]
+
+
 def _print_cockpit_reset_inventory(target):
     """Print the session / window / pane inventory a reset/rebuild would act on."""
     print(f"  attached clients: {', '.join(target.attached_clients) or 'none'}")
     print(f"  windows: {', '.join(target.windows) or 'none'}")
+    extra = _cockpit_extra_windows(target)
+    if extra:
+        print(
+            f"  warning: `kill-session` also destroys {len(extra)} other window(s) "
+            f"in this session, including any Project Group window(s): "
+            f"{', '.join(extra)}"
+        )
     for pane in target.managed_panes:
         print(
             f"  pane {pane.pane_id}: workspace={pane.workspace_id} "
@@ -2364,10 +2463,16 @@ def _handle_cockpit_reset(
 
     require_tmux()
     if would_kill and reset_plan is not None:
+        extra = _cockpit_extra_windows(target)
         print(
             f"cockpit {action}: tearing down mozyo cockpit session {session!r} "
             f"({len(target.managed_panes)} managed pane(s))"
         )
+        if extra:
+            print(
+                f"  note: this also destroys {len(extra)} other window(s) in the "
+                f"session, including any Project Group window(s): {', '.join(extra)}"
+            )
         execute_cockpit_reset_plan(reset_plan, run_tmux)
         print(f"  reset: cockpit session {session!r} killed.")
     if not rebuild:
@@ -2938,6 +3043,121 @@ def _handle_cockpit_reconcile(
     return 0
 
 
+# Faithful `project_group_tmux_window` action names (#12330). Distinct from the
+# shared-cockpit `create` / `focus` / `append` so the executor never confuses a
+# group-window placement (which mutates a live session without a fresh attach)
+# with the single-window create (which attaches a new -CC session).
+GROUP_ACTION_FOCUS = "group_focus"
+GROUP_ACTION_APPEND = "group_append"
+GROUP_ACTION_CREATE = "group_create"
+GROUP_ACTIONS = (GROUP_ACTION_FOCUS, GROUP_ACTION_APPEND, GROUP_ACTION_CREATE)
+
+
+def _cockpit_group_window_action(
+    workspace, session, *, decision, codex_ratio, launch
+):
+    """Resolve the faithful per-Project-Group tmux-window action (#12330).
+
+    Returns ``(action, plan, blocked_reason, window_name)`` for a workspace whose
+    desired presentation faithfully executes ``project_group_tmux_window`` (the
+    ``decision.executed_surface == group_tmux_window`` case). The caller has
+    already confirmed the cockpit ``session`` exists with a `cockpit` home window.
+
+    Fail-closed and identity-safe:
+
+    - Duplicate detection is **cross-window**: if this ``workspace_id + lane_id``
+      already has a Codex pane in ANY managed window (the `cockpit` home window or
+      a group window), the action is :data:`GROUP_ACTION_FOCUS` of that exact pane
+      — never a second placement. Identity is read off the pane options, so the
+      window the pane lives in is irrelevant.
+    - Otherwise the group's existing window is located by the mozyo-written
+      ``@mozyo_group_id`` window marker (deterministic, never the window name).
+      A non-empty match -> :data:`GROUP_ACTION_APPEND` a column beside that
+      window's rightmost Codex pane (same fair-share split + identity stamping the
+      shared cockpit uses). No match (or an ungrouped Unit, ``group_id`` empty) ->
+      :data:`GROUP_ACTION_CREATE` a fresh group window.
+
+    Pure-ish: it reads live tmux (multi-window discovery) but mutates nothing; the
+    returned plan is executed (with rollback) only on a real run.
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        build_cockpit_append_plan,
+        build_group_window_create_plan,
+        build_group_window_focus_plan,
+        normalize_lane,
+        sanitize_group_window_name,
+    )
+
+    target_lane = normalize_lane(workspace.lane_id)
+    managed = _read_managed_cockpit_windows(session)
+
+    # Cross-window duplicate detection (focus priority): a Codex pane carrying the
+    # same workspace+lane in any window means the Unit is already laid out.
+    for win in managed:
+        for col in win.get("columns") or []:
+            if (
+                col.get("role") == "codex"
+                and col.get("workspace_id") == workspace.workspace_id
+                and normalize_lane(col.get("lane_id")) == target_lane
+            ):
+                return (
+                    GROUP_ACTION_FOCUS,
+                    build_group_window_focus_plan(col["pane_id"], session=session),
+                    None,
+                    win.get("window") or "",
+                )
+
+    group_id = decision.group_id
+    window_name = sanitize_group_window_name(decision.desired_window_name)
+
+    # Locate the group's existing window by the deterministic group marker (never
+    # the window name). Only a non-empty group id can share a window; an ungrouped
+    # Unit (empty group id) always gets its own fresh window.
+    host = None
+    if group_id:
+        for win in managed:
+            if (win.get("group_id") or "") == group_id:
+                host = win
+                break
+
+    if host is not None:
+        codex_cols = [
+            c for c in (host.get("columns") or []) if c.get("role") == "codex"
+        ]
+        anchor = _rightmost_codex_anchor(codex_cols)
+        if not anchor:
+            return (
+                GROUP_ACTION_APPEND,
+                None,
+                (
+                    f"Project Group window {host.get('window')!r} exists but carries "
+                    "no mozyo-identified codex column to append beside; rebuild the "
+                    "cockpit or remove the stale window."
+                ),
+                host.get("window") or window_name,
+            )
+        plan = build_cockpit_append_plan(
+            workspace,
+            anchor_pane=anchor,
+            column_index=len(codex_cols),
+            codex_ratio=codex_ratio,
+            session=session,
+            window=host.get("window") or window_name,
+            launch=launch,
+        )
+        return (GROUP_ACTION_APPEND, plan, None, host.get("window") or window_name)
+
+    plan = build_group_window_create_plan(
+        workspace,
+        group_id=group_id,
+        window_name=window_name,
+        codex_ratio=codex_ratio,
+        session=session,
+        launch=launch,
+    )
+    return (GROUP_ACTION_CREATE, plan, None, window_name)
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -2963,6 +3183,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         normalize_lane,
     )
     from mozyo_bridge.domain.presentation_grouping import (
+        GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
         LaunchContext,
         resolve_group_window_placement,
         resolve_launch_placement,
@@ -3115,18 +3336,20 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         _cockpit_adopt_advisory(workspace, session) if same is None else None
     )
 
-    # Desired Project-Group presentation placement (Redmine #12302). The cockpit
-    # launcher / append path reads `.mozyo-bridge/config.yaml`
-    # `presentation.project_group_presentation` and resolves the desired display
-    # placement for THIS workspace. `same_cockpit_column` (the default / a missing
-    # config) preserves current behavior exactly; the opt-in surfaces
-    # (`project_group_tmux_window` / `normal_window`) are recorded as the *desired*
-    # presentation but visibly degrade to the shared cockpit column, because
-    # executing a separate tmux window from this single-window append surface would
-    # bypass the duplicate-detection / pane-identity gate. An invalid placement
-    # config fails closed (reported under --json/--dry-run, fatal on a real run) —
-    # never a silent reroute. Display-only: never a routing / approval / close
-    # authority, and never a guaranteed tmux window / iTerm tab.
+    # Desired Project-Group presentation placement (Redmine #12302 / #12330). The
+    # cockpit launcher / append path reads `.mozyo-bridge/config.yaml`
+    # `presentation.project_group_presentation` and resolves the placement for THIS
+    # workspace. `same_cockpit_column` (the default / a missing config) preserves
+    # current behavior exactly. `project_group_tmux_window` now *faithfully
+    # executes* (`execute_group_window=True`): the launcher places the sublane in
+    # the Project Group's own tmux window (create / append / cross-window focus)
+    # while keeping the same workspace+lane duplicate gate and pane-identity
+    # stamping — see `_cockpit_group_window_action`. `normal_window` still records
+    # the desired placement and visibly degrades to the shared column (relaunching
+    # a normal window is out of this surface's scope). An invalid placement config
+    # fails closed (reported under --json/--dry-run, fatal on a real run) — never a
+    # silent reroute. Display-only: never a routing / approval / close authority,
+    # and never a guaranteed tmux window / iTerm tab.
     presentation_decision = None
     presentation_blocked = None
     try:
@@ -3140,18 +3363,44 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             ),
         )
         presentation_decision = resolve_group_window_placement(
-            grouping.project_group_presentation, placement
+            grouping.project_group_presentation,
+            placement,
+            execute_group_window=True,
         )
     except RepoLocalConfigError as exc:
         presentation_blocked = (
             f"invalid .mozyo-bridge/config.yaml presentation config: {exc}"
         )
 
+    # Faithful per-Project-Group tmux window (#12330): when the config opts into
+    # `project_group_tmux_window` AND the cockpit session already has its `cockpit`
+    # home window, route to a group-window create / append / cross-window focus
+    # instead of the shared-column flow. Session bootstrap (no cockpit window yet)
+    # stays behavior-preserving below: the first Unit seeds the `cockpit` home
+    # window, and group windows are additive on subsequent launches — this keeps
+    # reset / rebalance / reconcile / doctor's `cockpit`-window identity model
+    # intact (re-evaluation note in `unit-target-model.md` #12330).
+    faithful_group = (
+        presentation_decision is not None
+        and presentation_blocked is None
+        and presentation_decision.executed_surface
+        == GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW
+    )
+
     # `plan is None` marks a blocked action (stale cockpit) — fail-closed on a
     # real run, reported (not aborted) under --dry-run / --json.
     plan = None
     blocked_reason = None
-    if columns is None and session_present:
+    group_window = None
+    if faithful_group and columns is not None:
+        action, plan, blocked_reason, group_window = _cockpit_group_window_action(
+            workspace,
+            session,
+            decision=presentation_decision,
+            codex_ratio=codex_ratio,
+            launch=launch,
+        )
+    elif columns is None and session_present:
         # The `mozyo-cockpit` session exists but has no usable cockpit window.
         # Treating this as "create" would run `new-session` against an existing
         # session (failing) and the cleanup could then kill that pre-existing
@@ -3210,6 +3459,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             else None
         )
         payload["presentation_blocked"] = presentation_blocked
+        payload["group_window"] = group_window
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if dry_run:
@@ -3227,6 +3477,12 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
             print(f"  (presentation blocked: {presentation_blocked})")
         elif presentation_decision is not None and presentation_decision.degraded:
             print(f"  presentation: {presentation_decision.diagnostic}")
+        if group_window is not None:
+            print(
+                f"  presentation: project_group_tmux_window -> Project Group window "
+                f"{group_window!r} (tmux window requested, never guaranteed; "
+                "display only)"
+            )
         if adopt_advisory is not None and adopt_advisory.message:
             print(f"  {adopt_advisory.message}")
         return 0
@@ -3238,6 +3494,37 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
 
     if blocked_reason:
         die(blocked_reason)
+
+    if action in GROUP_ACTIONS:
+        # Faithful per-Project-Group tmux window (#12330). All three actions mutate
+        # the LIVE cockpit session and never spawn a fresh -CC attach (the operator
+        # switches tmux windows). create / append use cleanup_captured so a
+        # mid-build failure kills only the panes this attempt created — and because
+        # tmux drops a window with no panes, a failed group-window create leaves no
+        # orphan window (rollback boundary, acceptance #12330).
+        if action == GROUP_ACTION_FOCUS:
+            execute_cockpit_plan(plan, run_tmux)
+            print(
+                f"workspace {workspace.label!r} already in cockpit {session!r} "
+                f"(window {group_window!r}); focused it."
+            )
+            return 0
+        execute_cockpit_plan(plan, run_tmux, cleanup_captured=True)
+        if action == GROUP_ACTION_CREATE:
+            print(
+                f"created Project Group window {group_window!r} in cockpit "
+                f"{session!r} for {workspace.label!r}; switch to it with your tmux "
+                "window keys (no new iTerm window opened)."
+            )
+        else:
+            print(
+                f"appended {workspace.label!r} as a new column to Project Group "
+                f"window {group_window!r} in cockpit {session!r}; switch to it with "
+                "your tmux window keys (no new iTerm window opened)."
+            )
+        if adopt_advisory is not None and adopt_advisory.message:
+            print(f"  {adopt_advisory.message}")
+        return 0
 
     if action == "create":
         # cleanup_captured kills only the panes THIS attempt created (closing

@@ -874,14 +874,19 @@ def build_cockpit_append_plan(
     column_index: int,
     codex_ratio: int = DEFAULT_CODEX_RATIO,
     session: str = COCKPIT_SESSION_DEFAULT,
+    window: str = COCKPIT_WINDOW,
     launch: Optional[Callable[[str, CockpitWorkspace], Optional[str]]] = None,
 ) -> CockpitPlan:
-    """Plan appending ONE new column to an existing cockpit (Redmine #11803).
+    """Plan appending ONE new column beside an existing cockpit column (Redmine #11803).
 
     ``anchor_pane`` is the real ``%pane`` id of the rightmost existing column's
     Codex pane; the new column is split to its right and widths re-equalized.
     ``column_index`` is the 0-based position of the new column (used only for
-    the logical token names so they cannot collide with existing panes). Pure.
+    the logical token names so they cannot collide with existing panes). The
+    split targets ``anchor_pane`` directly, so the new column lands in whatever
+    window holds the anchor — the shared `cockpit` window by default, or a
+    Project Group window (#12330) when the anchor is a group-window pane;
+    ``window`` is a display-only label for the returned plan. Pure.
     """
     if not anchor_pane:
         raise ValueError("append needs the anchor pane id of an existing column")
@@ -968,7 +973,7 @@ def build_cockpit_append_plan(
 
     return CockpitPlan(
         session=session,
-        window=COCKPIT_WINDOW,
+        window=window,
         codex_ratio=codex_ratio,
         claude_ratio=claude_ratio,
         columns=1,
@@ -1001,6 +1006,208 @@ def build_cockpit_focus_plan(
     return CockpitPlan(
         session=session,
         window=COCKPIT_WINDOW,
+        codex_ratio=0,
+        claude_ratio=0,
+        columns=0,
+        panes=(),
+        commands=commands,
+    )
+
+
+# --- Per-Project-Group tmux window (Redmine #12330) ---------------------------
+#
+# Faithful execution of the `project_group_tmux_window` desired presentation
+# (#12290 / #12302 visible-degrade follow-up): a Project Group can be laid out in
+# its OWN tmux window in the cockpit session instead of a column in the shared
+# `cockpit` window. The window is a *display* surface only — its NAME is never
+# identity. Two distinct kinds of marker keep this faithful:
+#
+# - UNIT identity stays on the PANE options every cockpit construction stamps
+#   (`@mozyo_workspace_id` / `@mozyo_agent_role` / `@mozyo_lane_id`), unchanged by
+#   this feature. Duplicate detection / focus / target resolution read
+#   `workspace_id + lane_id` off the pane options regardless of which window holds
+#   the pane (the application layer scans every managed window). Daemon /
+#   `agents targets` / pane-identity gate semantics are therefore unchanged —
+#   the window is display metadata only.
+# - GROUP membership of a window rides on a *window-level* `@mozyo_group_id`
+#   option that the create plan stamps deterministically from the resolved
+#   group id. The launcher locates a group's existing window by this mozyo-written
+#   marker — NOT by the window name (names are never trusted as identity) and not
+#   by a pane identity option (the group is display grouping, not Unit identity).
+#
+# The window / iTerm tab / OS window is never routing / approval / review / close
+# authority (`unit-target-model.md` `#### Project Group tmux-window presentation`).
+
+# Window-level marker naming the Project Group a managed cockpit window was
+# created for. Mozyo-written and deterministic, so the launcher may locate a
+# group's window by it; it is NOT Unit identity (that stays on pane options) and
+# NOT the window name (never trusted).
+GROUP_WINDOW_OPTION = "@mozyo_group_id"
+
+# tmux window names are a flat display string; a name carrying control / quoting
+# characters (newline, tab, `:` window-target separator, `.` pane separator,
+# quotes) can confuse `list-windows -F` parsing and target resolution. Group
+# labels come from a closed display-only config, but sanitize defensively so a
+# window name can never inject a target separator.
+_WINDOW_NAME_UNSAFE = set("\r\n\t:.\"'`$")
+
+
+def sanitize_group_window_name(name: Optional[str]) -> str:
+    """A public-safe tmux window name for a Project Group window (#12330, pure).
+
+    Collapses whitespace, strips characters that could break a `session:window`
+    target or `list-windows -F` parsing, and falls back to ``group`` when the
+    result is empty. Display only — the name is never identity: discovery lists
+    and reads windows by their tmux ``#{window_id}`` (see
+    :func:`mozyo_bridge.application.commands._read_managed_cockpit_windows`), so a
+    collision between two groups' sanitized names is harmless — two windows named
+    the same stay distinct by id and each keeps its own ``@mozyo_group_id`` marker
+    (#12330 review j#62380).
+    """
+    raw = (name or "").strip()
+    cleaned = "".join(
+        (" " if ch.isspace() else ch) for ch in raw if ch not in _WINDOW_NAME_UNSAFE
+    )
+    cleaned = " ".join(cleaned.split())  # collapse internal whitespace runs
+    return cleaned or "group"
+
+
+def build_group_window_create_plan(
+    workspace: CockpitWorkspace,
+    *,
+    group_id: Optional[str],
+    window_name: str,
+    codex_ratio: int = DEFAULT_CODEX_RATIO,
+    session: str = COCKPIT_SESSION_DEFAULT,
+    launch: Optional[Callable[[str, CockpitWorkspace], Optional[str]]] = None,
+) -> CockpitPlan:
+    """Plan a NEW per-Project-Group tmux window seeded with ``workspace`` (#12330).
+
+    Adds one window (named ``window_name``, a display-only label) to the existing
+    cockpit ``session`` and lays the workspace's Codex-top / Claude-bottom pair in
+    it, with the identical identity stamping the shared cockpit uses. The caller
+    must have confirmed the cockpit ``session`` already exists (group windows are
+    additive to a live session; session bootstrap stays the behavior-preserving
+    `cockpit` window). Pure: returns a :class:`CockpitPlan`, runs no tmux.
+
+    Rollback is the caller's `execute_cockpit_plan(..., cleanup_captured=True)`:
+    killing every captured pane empties the fresh window, and tmux drops a window
+    with no panes — so a mid-create failure never orphans a half-built window.
+    """
+    if not window_name:
+        raise ValueError("group window create needs a window name")
+
+    codex_ratio = normalize_ratio(codex_ratio)
+    claude_ratio = 100 - codex_ratio
+    codex_token = "@grp_codex"
+    claude_token = "@grp_claude"
+    commands: list[CockpitCommand] = []
+
+    def _launch(role: str) -> Optional[str]:
+        return launch(role, workspace) if launch is not None else None
+
+    codex_argv = ["new-window", "-t", session, "-n", window_name]
+    if workspace.repo_root:
+        codex_argv += ["-c", workspace.repo_root]
+    codex_argv += ["-P", "-F", "#{pane_id}"]
+    cmd = _launch(ROLE_CODEX)
+    if cmd:
+        codex_argv.append(cmd)
+    commands.append(
+        CockpitCommand(
+            argv=tuple(codex_argv),
+            captures=codex_token,
+            purpose=f"create group window {window_name!r} codex ({workspace.label})",
+        )
+    )
+    claude_argv = ["split-window", "-v", "-t", codex_token, "-l", f"{claude_ratio}%"]
+    if workspace.repo_root:
+        claude_argv += ["-c", workspace.repo_root]
+    claude_argv += ["-P", "-F", "#{pane_id}"]
+    cmd = _launch(ROLE_CLAUDE)
+    if cmd:
+        claude_argv.append(cmd)
+    commands.append(
+        CockpitCommand(
+            argv=tuple(claude_argv),
+            captures=claude_token,
+            purpose=f"create group window {window_name!r} claude ({workspace.label})",
+        )
+    )
+
+    panes = (
+        CockpitPane(
+            token=codex_token, column=0, role=ROLE_CODEX,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
+            height_pct=codex_ratio, anchor=workspace.codex_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+        ),
+        CockpitPane(
+            token=claude_token, column=0, role=ROLE_CLAUDE,
+            workspace_id=workspace.workspace_id, label=workspace.label,
+            repo_root=workspace.repo_root,
+            title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
+            height_pct=claude_ratio, anchor=workspace.claude_anchor,
+            lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+        ),
+    )
+    for pane in panes:
+        commands.extend(_pane_identity_commands(pane))
+
+    # Display-only window hint (group id). Stamped on the codex pane's WINDOW, not
+    # the pane identity option set — discovery never trusts it. Skipped when there
+    # is no group id (the implicit per-repo default group).
+    if group_id:
+        commands.append(
+            CockpitCommand(
+                argv=("set-option", "-w", "-t", codex_token, GROUP_WINDOW_OPTION, group_id),
+                captures=None,
+                purpose=f"hint group window {window_name!r} -> group {group_id}",
+            )
+        )
+
+    return CockpitPlan(
+        session=session,
+        window=window_name,
+        codex_ratio=codex_ratio,
+        claude_ratio=claude_ratio,
+        columns=1,
+        panes=panes,
+        commands=tuple(commands),
+    )
+
+
+def build_group_window_focus_plan(
+    target_pane: str, *, session: str = COCKPIT_SESSION_DEFAULT
+) -> CockpitPlan:
+    """Plan focusing an already-present pane in ANY cockpit-session window (#12330).
+
+    Unlike :func:`build_cockpit_focus_plan` (which selects the fixed `cockpit`
+    window), this selects the window that *contains* ``target_pane`` — a pane id
+    is an unambiguous tmux target that resolves to its own window — so a duplicate
+    already laid out in a Project Group window is focused there instead of being
+    re-appended. No panes are created. ``session`` is accepted for parity / display
+    but the pane id alone targets the right window.
+    """
+    if not target_pane:
+        raise ValueError("focus needs the target pane id")
+    commands = (
+        CockpitCommand(
+            argv=("select-window", "-t", target_pane),
+            captures=None,
+            purpose=f"focus window containing pane {target_pane}",
+        ),
+        CockpitCommand(
+            argv=("select-pane", "-t", target_pane),
+            captures=None,
+            purpose=f"focus existing pane {target_pane}",
+        ),
+    )
+    return CockpitPlan(
+        session=session,
+        window="",
         codex_ratio=0,
         claude_ratio=0,
         columns=0,

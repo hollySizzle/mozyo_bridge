@@ -555,7 +555,56 @@ TargetRecord の preflight で配送先を決める。
 > pane identity gate が決める (`runtime-observability-boundary.md`
 > `## Action-Time Live Preflight Boundary`)。real な multi-window cockpit surface 管理
 > (per-group window を duplicate-detection / focus / reset まで faithful に追跡する) は
-> follow-up scope。public extension API / dynamic plugin loading は開かない。
+> follow-up scope (#12330 で実装)。public extension API / dynamic plugin loading は開かない。
+
+> 実装メモ (#12330): `project_group_tmux_window` を **faithful に execute** するよう
+> #12302 の visible-degrade を昇格した。`cmd_cockpit` は
+> `resolve_group_window_placement(mode, placement, execute_group_window=True)` を呼び、
+> `project_group_tmux_window` のとき `executed_surface=group_tmux_window` (degrade なし) を
+> 得る。faithful path は cockpit session 内に Project Group ごとの **専用 tmux window** を
+> create / append / cross-window focus する (`commands._cockpit_group_window_action`)。
+> 維持する不変条件:
+>
+> - **identity は pane option のまま**。group window の pane も
+>   `pane_identity_commands` で `@mozyo_workspace_id` / `@mozyo_agent_role` /
+>   `@mozyo_lane_id` を従来どおり stamp する。duplicate detection は **cross-window** で、
+>   同一 `workspace_id + lane_id` の codex pane が **どの window** にあっても focus 優先 (新規
+>   placement を二重に作らない)。`pane_lines()` は `list-panes -a` で session 全体を読むため、
+>   group window の pane も target resolution / daemon / `agents targets` から従来どおり見える。
+>   daemon / `agents targets` / pane-identity gate は無変更。
+> - **window NAME は identity でない**。group の既存 window の特定は mozyo が deterministic に
+>   stamp する **window-level** option `@mozyo_group_id` (display hint) で行い、window 名や
+>   pane identity option では行わない。window 名は public-safe に sanitize した display label
+>   (`sanitize_group_window_name`) のみ。
+> - **discovery は multi-window かつ window-id keyed**。`commands._read_managed_cockpit_windows`
+>   が session の各 window を stable な `#{window_id}` で列挙・pane 読み取りし
+>   (`#{window_name}` は display のみ)、`@mozyo_workspace_id` を持つ pane を carry する window
+>   (`cockpit` home + group windows) を返す。`@mozyo_group_id` を append target の locator に
+>   使う。window 名が衝突しても (label が同一文字列に sanitize される 2 group) window-id で
+>   distinct なため collapse / hide されず、名前は routing 依存にならない (#12330 review j#62380)。
+>   group_id が空 (ungrouped) の Unit は window を共有せず常に専用 window を作る。
+> - **preview / dry-run / visible diagnostic / rollback**。`--json` は `action`
+>   (`group_create` / `group_append` / `group_focus`) と `group_window` を、`--dry-run` は
+>   plan command と group window 注記を出す。create / append は
+>   `execute_cockpit_plan(..., cleanup_captured=True)` で rollback し、captured pane を
+>   kill すると tmux が空 window を drop するため、失敗した group-window 生成は orphan window を
+>   残さない。
+> - **session bootstrap は behavior-preserving**。cockpit session 未作成の初回 `mozyo cockpit`
+>   は従来どおり `cockpit` home window に Unit を seed し、group window は次回以降の launch で
+>   additive に作る。これにより reset / rebalance / reconcile / doctor-geometry が依拠する
+>   `cockpit`-window identity model を壊さない。**再評価条件**: 初回起動から即 group window を
+>   開きたい需要、または既存 Unit を group window へ migrate する需要が出た場合に bootstrap 境界を
+>   見直す。
+> - **whole-cockpit op の multi-window 安全性 (Unit 5)**。`reset` の `kill-session` は同一 session の
+>   group window も破壊するため、preview / 実行ログに「他 window も破壊する」warning を可視化する
+>   (confirm gate は維持)。`rebalance` / `reconcile` / `doctor-geometry` は `session:cockpit`
+>   window のみを対象とし group window を read も mutate もしない (構造上 multi-window 安全;
+>   blast radius を cockpit home window に限定する)。
+>
+> 非目標は #12330 どおり: iTerm 固有 tab / OS window の product guarantee なし、private operator
+> layout policy の OSS default 化なし、public extension API / dynamic plugin loading なし、
+> release / publish / tag なし。tmux window / iTerm tab / OS window は依然 routing / review /
+> approval / close authority ではない。
 
 ## TargetRecord / UnitRecord
 
