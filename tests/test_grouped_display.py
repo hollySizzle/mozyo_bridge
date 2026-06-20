@@ -31,8 +31,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.grouped_display import (
+    ATTENTION_CANDIDATE_STATUSES,
     GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE,
+    GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE,
     NO_ROLES_LABEL,
+    GroupAttentionSummary,
     GroupDisplaySection,
     GroupedDisplayView,
     UnitDisplayRow,
@@ -455,7 +458,12 @@ class NoActionPermissionLeakageTests(unittest.TestCase):
                 )
 
     def test_dataclass_fields_carry_no_routing_or_authority_token(self) -> None:
-        for cls in (UnitDisplayRow, GroupDisplaySection, GroupedDisplayView):
+        for cls in (
+            UnitDisplayRow,
+            GroupDisplaySection,
+            GroupedDisplayView,
+            GroupAttentionSummary,
+        ):
             self._assert_no_boundary_tokens(cls.__dataclass_fields__.keys())
 
     def test_payload_keys_carry_no_routing_or_authority_token(self) -> None:
@@ -504,6 +512,196 @@ class NoActionPermissionLeakageTests(unittest.TestCase):
         self.assertEqual(unit_payload["roles"], ["codex", "claude"])
         self.assertNotIn("pane", unit_payload)
         self.assertNotIn("target", unit_payload)
+
+
+class GroupHeaderSummaryTests(unittest.TestCase):
+    """Redmine #12297: the Project Group header attention / freshness summary."""
+
+    def _mixed_alpha_view(self) -> GroupedDisplayView:
+        # Four Units in the declared "alpha" group spanning the summary axes:
+        #   a1 fresh+active            -> observed, active, not reload
+        #   a2 stale+active            -> reload_required (not an attention candidate)
+        #   a3 contradicted+inactive   -> attention candidate + reload_required
+        #   a4 identity-conflict+active-> attention candidate + reload_required + active
+        return _view_from(
+            [
+                ObservedUnit(
+                    workspace_id="ws-a1", repo_label="alpha", active=True,
+                    roles=("codex", "claude"), observation=_fresh_observation(),
+                ),
+                ObservedUnit(
+                    workspace_id="ws-a2", repo_label="alpha", active=True,
+                    roles=("codex",), observation=_stale_observation(),
+                ),
+                ObservedUnit(
+                    workspace_id="ws-a3", repo_label="alpha", active=False,
+                    observation=_contradicted_observation(),
+                ),
+                ObservedUnit(
+                    workspace_id="ws-a4", repo_label="alpha", active=True,
+                    observed_workspace_id="ws-other",
+                    observation=_fresh_observation(),
+                ),
+            ],
+            config=_config(),
+            observation=_fresh_observation(),
+        )
+
+    def test_header_summary_counts_active_reload_and_attention(self) -> None:
+        view = self._mixed_alpha_view()
+        alpha = next(g for g in view.groups if g.group_id == "project:alpha")
+        summary = alpha.summary
+        self.assertEqual(summary.total, 4)
+        self.assertEqual(summary.active_lanes, 3)  # a1, a2, a4
+        self.assertEqual(summary.reload_required, 3)  # a2, a3, a4
+        self.assertEqual(summary.attention, 2)  # a3 contradicted, a4 identity conflict
+        self.assertTrue(summary.needs_attention)
+
+    def test_attention_candidate_statuses_are_the_contradiction_class(self) -> None:
+        # The attention count is the contradiction-class subset only, never a mere
+        # staleness; it is exactly the documented status set.
+        self.assertEqual(
+            ATTENTION_CANDIDATE_STATUSES,
+            frozenset({"contradicted", "identity_conflict", "desired_unit_missing"}),
+        )
+
+    def test_desired_unit_missing_counts_as_attention_candidate(self) -> None:
+        record = {
+            "version": 1,
+            "project_groups": [
+                {"group_id": "project:alpha", "label": "Alpha", "sort_key": 10},
+            ],
+            "grouping": {
+                "membership_rules": [
+                    {"when": {"repo_label": "alpha"}, "group_id": "project:alpha"},
+                ],
+                "unit_overrides": [
+                    {
+                        "workspace_id": "ws-ghost",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                    }
+                ],
+            },
+        }
+        config = PresentationGroupingConfig.from_record(record)
+        view = _view_from(
+            [
+                ObservedUnit(
+                    workspace_id="ws-a", repo_label="alpha", active=True,
+                    roles=("codex",), observation=_fresh_observation(),
+                )
+            ],
+            config=config,
+            observation=_fresh_observation(),
+        )
+        alpha = next(g for g in view.groups if g.group_id == "project:alpha")
+        # The override names a Unit not in the observed set -> a desired_unit_missing
+        # row that counts as an attention candidate (and reload_required).
+        self.assertEqual(alpha.summary.attention, 1)
+        self.assertEqual(alpha.summary.reload_required, 1)
+        self.assertEqual(alpha.summary.active_lanes, 1)
+
+    def test_summary_counts_hidden_members_too(self) -> None:
+        record = {
+            "version": 1,
+            "project_groups": [
+                {"group_id": "project:alpha", "label": "Alpha", "sort_key": 10},
+            ],
+            "grouping": {
+                "membership_rules": [
+                    {"when": {"repo_label": "alpha"}, "group_id": "project:alpha"},
+                ],
+                "unit_overrides": [
+                    {
+                        "workspace_id": "ws-hidden",
+                        "lane_id": "default",
+                        "preferred_group": "project:alpha",
+                        "hidden": True,
+                    }
+                ],
+            },
+        }
+        config = PresentationGroupingConfig.from_record(record)
+        view = _view_from(
+            [
+                ObservedUnit(
+                    workspace_id="ws-a", repo_label="alpha", active=True,
+                    roles=("codex",), observation=_fresh_observation(),
+                ),
+                ObservedUnit(
+                    workspace_id="ws-hidden", repo_label="alpha", active=True,
+                    roles=("claude",), observation=_fresh_observation(),
+                ),
+            ],
+            config=config,
+            observation=_fresh_observation(),
+        )
+        alpha = next(g for g in view.groups if g.group_id == "project:alpha")
+        # One visible + one hidden, both active: the hidden member is counted.
+        self.assertEqual(alpha.summary.total, 2)
+        self.assertEqual(alpha.summary.active_lanes, 2)
+
+    def test_empty_declared_group_summary_is_all_zero(self) -> None:
+        view = self._mixed_alpha_view()
+        bravo = next(g for g in view.groups if g.group_id == "project:bravo")
+        self.assertEqual(bravo.summary, GroupAttentionSummary())
+        self.assertFalse(bravo.summary.needs_attention)
+
+    def test_whole_view_summary_aggregates_every_member(self) -> None:
+        view = self._mixed_alpha_view()
+        # Only the alpha group has members, so the roll-up equals its summary.
+        self.assertEqual(view.summary.total, 4)
+        self.assertEqual(view.summary.active_lanes, 3)
+        self.assertEqual(view.summary.reload_required, 3)
+        self.assertEqual(view.summary.attention, 2)
+        self.assertTrue(view.summary.needs_attention)
+
+    def test_healthy_view_summary_has_no_attention(self) -> None:
+        view = _view_from(
+            [
+                ObservedUnit(
+                    workspace_id="ws-a", repo_label="alpha", active=True,
+                    roles=("codex", "claude"), observation=_fresh_observation(),
+                )
+            ],
+            config=_config(),
+            observation=_fresh_observation(),
+        )
+        self.assertEqual(view.summary.active_lanes, 1)
+        self.assertEqual(view.summary.reload_required, 0)
+        self.assertEqual(view.summary.attention, 0)
+        self.assertFalse(view.summary.needs_attention)
+
+    def test_summary_payload_keys_are_projection_only(self) -> None:
+        view = self._mixed_alpha_view()
+        alpha = next(
+            g for g in view.as_payload()["groups"]
+            if g["group_id"] == "project:alpha"
+        )
+        self.assertEqual(
+            set(alpha["summary"].keys()),
+            {"total", "active_lanes", "reload_required", "attention", "needs_attention"},
+        )
+        self.assertEqual(
+            set(view.as_payload()["summary"].keys()),
+            {"total", "active_lanes", "reload_required", "attention", "needs_attention"},
+        )
+
+    def test_summary_carries_no_governance_or_routing_vocabulary(self) -> None:
+        # The summary is a projection: its field names name counts, never a
+        # Redmine journal / owner-approval / review / blocked / routing concept.
+        forbidden = (
+            "journal", "owner", "approval", "review", "blocked", "close",
+            "target", "pane", "route", "send", "credential", "secret",
+        )
+        for name in GroupAttentionSummary.__dataclass_fields__:
+            lowered = name.lower()
+            for token in forbidden:
+                self.assertNotIn(token, lowered)
+        # The boundary note pins the projection-only contract.
+        self.assertIn("projection", GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE.lower())
+        self.assertIn("governance", GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE.lower())
 
 
 if __name__ == "__main__":

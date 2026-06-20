@@ -423,6 +423,28 @@ TargetRecord の preflight で配送先を決める。
 > action-time live preflight が決める。#12264 / #12266 と同じく object-to-object slice
 > で、served endpoint / HTML page は結線しない。
 
+> 実装メモ (#12297): Project Group header の **attention / freshness summary** を
+> `src/mozyo_bridge/domain/grouped_display.py` に追加した
+> (`GroupAttentionSummary` / `GroupDisplaySection.summary` /
+> `GroupedDisplayView.summary`)。受入条件の "group header に active lanes /
+> stale・reload-required / blocked・attention candidate の summary を表示する" を、
+> display row 上に既にある事実だけから導出する projection-only な 3 つの独立 count
+> として満たす: `active_lanes` (live Target を持つ row = active lanes)、
+> `reload_required` (snapshot が current でない row; 各 row の `reload_required` flag
+> をそのまま数える)、`attention` (contradiction-class の attention candidate =
+> `ATTENTION_CANDIDATE_STATUSES` = `contradicted` / `identity_conflict` /
+> `desired_unit_missing`; reload では解消しない、operator が *resolve* すべき row)。
+> count は partition ではなく独立 projection で、`attention` ⊆ `reload_required`。
+> summary は group header (どの group / Unit を先に見るか) と whole-projection
+> roll-up の両層で持ち、hidden member も含めて数える。**projection-only**: Redmine
+> journal 本文 / owner approval / review state / governance `blocked` truth を一切
+> 読まず (それは durable record の正本; UI への複製は #12297 の非目標)、
+> `cockpit-attention-state.md` の governance `attention_state` (owner_waiting /
+> review_waiting / blocked 等、Redmine 由来) とは別物の表示派生値である。routing /
+> approval / review / close authority を持たない
+> (`GROUPED_SUMMARY_DIAGNOSTIC_ONLY_NOTE`)。#12255 / #12264 / #12266 と同じく
+> object-to-object slice で、served endpoint / HTML page は結線しない。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord
