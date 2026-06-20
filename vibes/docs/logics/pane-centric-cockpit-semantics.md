@@ -79,6 +79,27 @@ cockpit では window name は layout attribute であり、role identity では
 prefix があるだけで managed / safe / targetable と判定してはならない。prefix が
 無いだけで unmanaged と断定してもならない。
 
+### iTerm2 tmux control-mode projection (#12290)
+
+Redmine #12290 の実機確認では、iTerm2 3.6.11 / tmux 3.6b / 既存
+`mozyo-cockpit` control-mode session において、`tmux new-window` は次のように
+投影された。
+
+```text
+before: tmux windows = 1, iTerm2 OS windows = 3, mozyo-cockpit tabs = 1
+after:  tmux windows = 2, iTerm2 OS windows = 3, mozyo-cockpit tabs = 2
+```
+
+つまり、この環境では **tmux window は iTerm2 の native tab として表示される**。
+新しい OS window ではなく、同一 tmux window 内の pane / column でもない。
+
+この観測は presentation layer の挙動であり、mozyo-bridge の identity /
+routing / workflow authority ではない。mozyo 側で安全に扱える契約は
+`project_group_tmux_window` のような desired presentation request までであり、
+iTerm2 がそれを tab / OS window / その他の形に投影するかは iTerm2 側の責務と
+operator preference に残す。product contract として「OS window を開く」または
+「native tab を必ず開く」と書かない。
+
 ## Desired Presentation Contract
 
 operator が意図する cockpit composition は live split tree ではなく desired

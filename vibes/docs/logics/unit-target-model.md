@@ -339,6 +339,23 @@ Project Group read model は次の入力を合成してよい:
 stale / unreadable / contradictory な入力がある場合は group の表示状態へ残し、
 private policy で黙って補正しない。
 
+#### Project Group tmux-window presentation (#12290)
+
+Project Group ごとの分離を表す desired presentation option は、iTerm2 固有の
+`tab` / `OS window` を直接 contract にせず、tmux レイヤの
+`project_group_tmux_window` として扱う。
+
+Redmine #12290 の実測では、現在の iTerm2 control-mode 環境で
+`tmux new-window` が iTerm2 native tab として表示された。これは crowded な
+cockpit で Project Group を切り替えやすくする opt-in 表示として有用だが、
+iTerm2 の version / preference に依存する presentation result である。
+
+したがって fast path default は引き続き `same_cockpit_column` とする。
+`project_group_tmux_window` は、Project Group を同一 OS window 内の native tab
+として分離できる環境では有用な opt-in だが、routing / approval / close authority
+には一切使わない。Target resolver は Project Group tab ではなく、Unit -> role ->
+TargetRecord の preflight で配送先を決める。
+
 > 実装メモ (#12264): 本 Project Group read model の **生成 (home-state projection)** は
 > `src/mozyo_bridge/domain/grouped_read_model.py` に実装済み
 > (`build_grouped_read_model`)。入力は #12263 の desired presentation config /
