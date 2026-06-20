@@ -436,7 +436,11 @@ TargetRecord の preflight で配送先を決める。
 > 別 field とし routing / approval / window 保証を持たない。missing config は
 > behavior-preserving。(2) live wiring: `cockpit_ui.observed_units_from_inventory` が
 > pane-centric inventory を workspace 単位の `ObservedUnit` (role presence 集約; lane
-> `default` / host `local`; stale snapshot は `active=False` の fail-safe) に集約し、
+> `default` / host `local`; stale snapshot は `active=False` の fail-safe; 同一
+> workspace_id に複数 lane/worktree が projection されて 1 role に live pane が複数付く
+> 場合は faithful な lane 分割ができないため、healthy な actionable Unit に collapse せず
+> visible contradicted (`live_runtime_conflict`) row へ degrade し needs_reload/
+> unactionable にする — #12286 review j#61995) に集約し、
 > `grouped_units_payload` が repo-local grouping config + live snapshot から
 > `build_grouped_read_model` -> `build_grouped_display_view` を構築する。freshness
 > envelope は rows と同じ snapshot から `snapshot_from_inventory` で導出し、reload /

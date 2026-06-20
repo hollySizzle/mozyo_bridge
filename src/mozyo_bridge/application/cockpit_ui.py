@@ -512,13 +512,34 @@ def observed_units_from_inventory(snapshot, *, observation):
       cache) and the per-Unit ``observation`` envelope carries the staleness;
     - every Unit shares the whole-projection ``observation`` envelope so the
       grouped reload / freshness line never contradicts the per-row freshness
-      (both derive from the one snapshot).
+      (both derive from the one snapshot) — **except** a lane-ambiguous Unit (see
+      below), whose envelope carries a visible contradiction.
+
+    Lane-ambiguous degrade (Redmine #12286 review j#61995). A faithful Unit is one
+    ``(workspace_id, lane_id, host_id)`` with at most one live pane per role.
+    Because the inventory projects every pane to lane ``default``, one repo with
+    several live lanes / worktrees sharing a ``workspace_id`` (the cockpit +
+    sublane dogfood shape) produces *more than one* live pane for a role under the
+    same projected Unit. Without a lane discriminator we cannot faithfully split
+    that into distinct lane Units, so collapsing it into one healthy ``default``
+    Unit would serve enabled action buttons whose candidate then resolves
+    *ambiguous* at action time. Instead the Unit is degraded to a **visible
+    contradicted** row (``live_runtime_conflict``): it is shown but reads
+    ``needs_reload`` / unactionable, so its action affordances are disabled and the
+    operator must use an explicit pane target. ``_resolve_unit_target`` still fails
+    closed on the same ambiguity, so this is defense in depth, not the only guard.
 
     Pure aggregation: it carries identity + role *presence* only, never a
     pane id / target, so the result is display state, not a routing endpoint.
     """
+    from dataclasses import replace
+
     from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
     from mozyo_bridge.domain.grouped_read_model import ObservedUnit
+    from mozyo_bridge.domain.runtime_observation import (
+        CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+        DISPLAY_STATE_RELOAD_REQUIRED,
+    )
 
     live = not snapshot.stale
     by_workspace: dict[str, dict] = {}
@@ -530,10 +551,11 @@ def observed_units_from_inventory(snapshot, *, observation):
         if not workspace_id:
             continue
         entry = by_workspace.setdefault(
-            workspace_id, {"roles": [], "label": None}
+            workspace_id, {"role_counts": {}, "label": None}
         )
-        if record.agent_kind not in entry["roles"]:
-            entry["roles"].append(record.agent_kind)
+        entry["role_counts"][record.agent_kind] = (
+            entry["role_counts"].get(record.agent_kind, 0) + 1
+        )
         if entry["label"] is None and workspace is not None:
             entry["label"] = (
                 workspace.project_name
@@ -543,6 +565,21 @@ def observed_units_from_inventory(snapshot, *, observation):
     units: list = []
     for workspace_id in sorted(by_workspace):
         entry = by_workspace[workspace_id]
+        role_counts = entry["role_counts"]
+        roles = tuple(
+            role for role in (ROLE_CODEX, ROLE_CLAUDE) if role in role_counts
+        )
+        # >1 live pane for any role under the same projected (workspace, lane,
+        # host) means multiple lanes / worktrees collapse onto one Unit; degrade
+        # it to a visible contradicted row rather than a healthy actionable one.
+        ambiguous = any(count > 1 for count in role_counts.values())
+        unit_observation = observation
+        if ambiguous:
+            unit_observation = replace(
+                observation,
+                contradiction=CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+                display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+            )
         units.append(
             ObservedUnit(
                 workspace_id=workspace_id,
@@ -550,8 +587,8 @@ def observed_units_from_inventory(snapshot, *, observation):
                 host_id=DEFAULT_HOST,
                 repo_label=entry["label"],
                 active=live,
-                roles=tuple(entry["roles"]),
-                observation=observation,
+                roles=roles,
+                observation=unit_observation,
             )
         )
     return units

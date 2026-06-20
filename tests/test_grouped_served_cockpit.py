@@ -30,10 +30,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cockpit_ui import (
+    CockpitActionError,
+    candidate_unit_selector,
     grouped_units_payload,
     observed_units_from_inventory,
 )
 from mozyo_bridge.application.otel_receiver import build_server
+from mozyo_bridge.domain.grouped_read_model import (
+    UNIT_STATUS_CONTRADICTED,
+    build_grouped_read_model,
+)
 from mozyo_bridge.domain.runtime_observation import (
     DISPLAY_STATE_HEALTHY,
     FRESHNESS_FRESH,
@@ -228,6 +234,94 @@ class GroupedUnitsPayloadTest(unittest.TestCase):
         with patch(f"{COCKPIT_UI}.take_inventory", lambda **_: snapshot):
             with self.assertRaises(RepoLocalConfigError):
                 grouped_units_payload(repo_root=self.repo)
+
+
+class SameWorkspaceMultiLaneTest(unittest.TestCase):
+    """Regression for #12286 review j#61995: two Codex/Claude pairs sharing one
+    workspace_id but representing distinct lanes/worktrees must not collapse into
+    a single healthy actionable Unit."""
+
+    def _multi_lane_snapshot(self) -> InventorySnapshot:
+        # Two lanes/worktrees of one repo: both project to the same workspace_id
+        # (the cockpit inventory does not read @mozyo_lane_id), so each role has
+        # two live panes under one projected Unit.
+        return _snapshot(
+            [
+                _record("%0", "codex", "ws-shared", project_name="Shared",
+                        session="main-lane"),
+                _record("%1", "claude", "ws-shared", project_name="Shared",
+                        session="main-lane"),
+                _record("%52", "codex", "ws-shared", project_name="Shared",
+                        session="sublane"),
+                _record("%53", "claude", "ws-shared", project_name="Shared",
+                        session="sublane"),
+            ]
+        )
+
+    def test_aggregation_degrades_to_contradicted_not_collapsed_healthy(self) -> None:
+        units = observed_units_from_inventory(
+            self._multi_lane_snapshot(), observation=_fresh_observation()
+        )
+        # Still one projected Unit (no faithful lane discriminator to split on)…
+        self.assertEqual(len(units), 1)
+        # …but it is NOT a healthy actionable Unit: its observation carries a
+        # visible contradiction so it reads needs_reload / unactionable.
+        self.assertIsNotNone(units[0].observation.contradiction)
+
+    def test_read_model_marks_unit_contradicted_and_unactionable(self) -> None:
+        units = observed_units_from_inventory(
+            self._multi_lane_snapshot(), observation=_fresh_observation()
+        )
+        model = build_grouped_read_model(
+            None, units, observation=_fresh_observation()
+        )
+        row = model.all_units()[0]
+        self.assertEqual(row.status, UNIT_STATUS_CONTRADICTED)
+        self.assertTrue(row.needs_reload)
+        # The candidate selector fails closed on the degraded row: the served UI
+        # cannot seed a grouped action from it.
+        with self.assertRaises(CockpitActionError):
+            candidate_unit_selector(row)
+
+    def test_single_pair_stays_healthy_and_actionable(self) -> None:
+        # Control: one pane per role under one workspace is still a healthy Unit.
+        units = observed_units_from_inventory(
+            _snapshot(
+                [
+                    _record("%0", "codex", "ws-solo", project_name="Solo"),
+                    _record("%1", "claude", "ws-solo", project_name="Solo"),
+                ]
+            ),
+            observation=_fresh_observation(),
+        )
+        self.assertEqual(len(units), 1)
+        self.assertIsNone(units[0].observation.contradiction)
+        model = build_grouped_read_model(
+            None, units, observation=_fresh_observation()
+        )
+        row = model.all_units()[0]
+        self.assertFalse(row.needs_reload)
+        # A healthy row yields an identity selector (actionable).
+        self.assertEqual(
+            candidate_unit_selector(row)["workspace_id"], "ws-solo"
+        )
+
+    def test_served_payload_row_is_unactionable(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name) / "repo"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        (repo / ".git").mkdir()
+        with patch(
+            f"{COCKPIT_UI}.take_inventory",
+            lambda **_: self._multi_lane_snapshot(),
+        ):
+            payload = grouped_units_payload(repo_root=repo)
+        rows = [u for g in payload["groups"] for u in g["units"]]
+        shared = [r for r in rows if r["workspace_id"] == "ws-shared"]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0]["status"], "contradicted")
+        self.assertTrue(shared[0]["reload_required"])
 
 
 class GroupedUnitsHttpTest(unittest.TestCase):
