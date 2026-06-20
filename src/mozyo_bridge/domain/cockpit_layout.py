@@ -1057,9 +1057,12 @@ def sanitize_group_window_name(name: Optional[str]) -> str:
 
     Collapses whitespace, strips characters that could break a `session:window`
     target or `list-windows -F` parsing, and falls back to ``group`` when the
-    result is empty. Display only — the name is never identity, so a collision
-    between two groups' sanitized names is harmless (discovery reads pane options
-    / config, not the name).
+    result is empty. Display only — the name is never identity: discovery lists
+    and reads windows by their tmux ``#{window_id}`` (see
+    :func:`mozyo_bridge.application.commands._read_managed_cockpit_windows`), so a
+    collision between two groups' sanitized names is harmless — two windows named
+    the same stay distinct by id and each keeps its own ``@mozyo_group_id`` marker
+    (#12330 review j#62380).
     """
     raw = (name or "").strip()
     cleaned = "".join(

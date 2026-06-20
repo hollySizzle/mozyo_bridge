@@ -576,10 +576,13 @@ TargetRecord の preflight で配送先を決める。
 >   stamp する **window-level** option `@mozyo_group_id` (display hint) で行い、window 名や
 >   pane identity option では行わない。window 名は public-safe に sanitize した display label
 >   (`sanitize_group_window_name`) のみ。
-> - **discovery は multi-window**。`commands._read_managed_cockpit_windows` が session の各
->   window を列挙し、`@mozyo_workspace_id` を持つ pane を carry する window
+> - **discovery は multi-window かつ window-id keyed**。`commands._read_managed_cockpit_windows`
+>   が session の各 window を stable な `#{window_id}` で列挙・pane 読み取りし
+>   (`#{window_name}` は display のみ)、`@mozyo_workspace_id` を持つ pane を carry する window
 >   (`cockpit` home + group windows) を返す。`@mozyo_group_id` を append target の locator に
->   使う。group_id が空 (ungrouped) の Unit は window を共有せず常に専用 window を作る。
+>   使う。window 名が衝突しても (label が同一文字列に sanitize される 2 group) window-id で
+>   distinct なため collapse / hide されず、名前は routing 依存にならない (#12330 review j#62380)。
+>   group_id が空 (ungrouped) の Unit は window を共有せず常に専用 window を作る。
 > - **preview / dry-run / visible diagnostic / rollback**。`--json` は `action`
 >   (`group_create` / `group_append` / `group_focus`) と `group_window` を、`--dry-run` は
 >   plan command と group window 注記を出す。create / append は

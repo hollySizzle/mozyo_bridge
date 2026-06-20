@@ -1607,9 +1607,13 @@ def _read_cockpit_columns(session: str, window: str | None = None):
     Returns a list of ``{pane_id, workspace_id, role, lane_id, pane_left,
     pane_width}`` (one per pane carrying the `@mozyo_workspace_id` user option),
     or ``None`` when the window does not exist. ``window`` defaults to the shared
-    `cockpit` window; pass an explicit window name to read a Project Group window
-    (#12330). Identity is read from the tmux user options, not the title.
-    ``lane_id`` is absent (empty) on pre-#11820 panes and normalizes to the
+    `cockpit` window. Pass an explicit window to read a Project Group window
+    (#12330): a tmux **window id** (``@N``, server-globally unique) targets that
+    exact window unambiguously and is used directly; any other value is taken as a
+    window name under ``session`` (``session:name``). Discovery passes the window
+    id so a duplicate display name can never make the *name* a routing dependency
+    (#12330 review j#62380). Identity is read from the tmux user options, not the
+    title. ``lane_id`` is absent (empty) on pre-#11820 panes and normalizes to the
     ``default`` lane at comparison time. The ``pane_left`` / ``pane_width``
     geometry (Redmine #11849) lets append pick the visually rightmost column
     instead of trusting list-panes order.
@@ -1617,6 +1621,13 @@ def _read_cockpit_columns(session: str, window: str | None = None):
     from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
 
     target_window = COCKPIT_WINDOW if window is None else window
+    # A window id (`@N`) is unique across the whole tmux server, so it targets the
+    # window on its own; only a window *name* needs the `session:` qualifier.
+    target = (
+        target_window
+        if target_window.startswith("@")
+        else f"{session}:{target_window}"
+    )
 
     def _as_int(value: str) -> int:
         try:
@@ -1631,7 +1642,7 @@ def _read_cockpit_columns(session: str, window: str | None = None):
         result = run_tmux(
             "list-panes",
             "-t",
-            f"{session}:{target_window}",
+            target,
             "-F",
             "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
             "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}",
@@ -1662,16 +1673,20 @@ def _read_managed_cockpit_windows(session: str):
     """Read every cockpit-session window that holds a mozyo-managed pane (#12330).
 
     Faithful multi-window discovery for per-Project-Group windows: lists the
-    session's windows (with their mozyo-written ``@mozyo_group_id`` marker), reads
-    each one's panes' identity options, and returns a list of
-    ``{"window": <name>, "group_id": <hint or "">, "columns": [<column>, ...]}``
-    for every window that carries at least one ``@mozyo_workspace_id`` pane — the
-    shared `cockpit` window AND any Project Group window.
+    session's windows by their stable ``#{window_id}`` (plus the display name and
+    the mozyo-written ``@mozyo_group_id`` marker), reads each one's panes by that
+    **window id**, and returns a list of
+    ``{"window_id": <@N>, "window": <name>, "group_id": <hint or "">,
+    "columns": [<column>, ...]}`` for every window that carries at least one
+    ``@mozyo_workspace_id`` pane — the shared `cockpit` window AND any Project
+    Group window.
 
-    UNIT identity stays on the pane options in ``columns``; the window NAME is
-    display only and never trusted. ``group_id`` is the mozyo-stamped window-level
-    marker the launcher uses to locate a group's existing window (deterministic,
-    not the name).
+    The window id is the identifier everything keys on, so a duplicate display
+    name (two groups whose labels sanitize to the same string) can never collapse
+    or hide a window or make the name a routing dependency (#12330 review j#62380).
+    UNIT identity stays on the pane options in ``columns``; ``group_id`` is the
+    mozyo-stamped window-level marker the launcher uses to locate a group's
+    existing window; ``window`` is display only.
 
     Read-only and tolerant: a missing tmux binary / server, or an unreadable
     window list, degrades to ``[]`` (no managed windows) rather than raising, so
@@ -1686,7 +1701,7 @@ def _read_managed_cockpit_windows(session: str):
             "-t",
             session,
             "-F",
-            "#{window_name}\t#{" + GROUP_WINDOW_OPTION + "}",
+            "#{window_id}\t#{window_name}\t#{" + GROUP_WINDOW_OPTION + "}",
             check=False,
         )
     except (Exception, SystemExit):
@@ -1696,16 +1711,24 @@ def _read_managed_cockpit_windows(session: str):
     managed = []
     for line in (getattr(result, "stdout", "") or "").splitlines():
         parts = line.split("\t")
-        window = parts[0] if parts else ""
-        if not window:
+        window_id = parts[0] if parts else ""
+        if not window_id:
             continue
-        group_hint = parts[1] if len(parts) >= 2 else ""
-        columns = _read_cockpit_columns(session, window)
+        window_name = parts[1] if len(parts) >= 2 else ""
+        group_hint = parts[2] if len(parts) >= 3 else ""
+        # Read panes by the unambiguous window id, never the (possibly duplicate)
+        # name.
+        columns = _read_cockpit_columns(session, window_id)
         if not columns:
             continue
         if any((c.get("workspace_id") or "") for c in columns):
             managed.append(
-                {"window": window, "group_id": group_hint, "columns": columns}
+                {
+                    "window_id": window_id,
+                    "window": window_name,
+                    "group_id": group_hint,
+                    "columns": columns,
+                }
             )
     return managed
 

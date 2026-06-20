@@ -331,6 +331,39 @@ class GroupWindowActionTest(unittest.TestCase):
         action, _plan, _blocked, _window = self._action(managed, group_id=None)
         self.assertEqual(GROUP_ACTION_CREATE, action)
 
+    def test_colliding_window_names_route_by_group_marker_not_name(self) -> None:
+        # Regression for #12330 review j#62380: two windows share the sanitized
+        # display name "ab" but carry distinct group markers. A unit in group
+        # "beta" must append into the beta window (by marker), never create a third
+        # window because the name matched the wrong one.
+        from mozyo_bridge.application.commands import GROUP_ACTION_APPEND
+
+        managed = [
+            {
+                "window_id": "@1", "window": "ab", "group_id": "alpha",
+                "columns": [
+                    {"pane_id": "%5", "workspace_id": "wsA", "role": "codex",
+                     "lane_id": "default", "pane_left": 0, "pane_width": 80},
+                ],
+            },
+            {
+                "window_id": "@2", "window": "ab", "group_id": "beta",
+                "columns": [
+                    {"pane_id": "%6", "workspace_id": "wsB", "role": "codex",
+                     "lane_id": "default", "pane_left": 0, "pane_width": 80},
+                ],
+            },
+        ]
+        # A fresh unit (not yet placed) in group "beta".
+        action, plan, blocked, window = self._action(
+            managed, group_id="beta", ws_id="wsNew"
+        )
+        self.assertEqual(GROUP_ACTION_APPEND, action)
+        self.assertIsNone(blocked)
+        # Anchored on the BETA window's pane (%6), not the alpha window's (%5).
+        self.assertIn("%6", plan.commands[0].argv)
+        self.assertNotIn("%5", plan.commands[0].argv)
+
     def test_different_lane_is_not_a_duplicate(self) -> None:
         from mozyo_bridge.application.commands import GROUP_ACTION_APPEND
 
@@ -354,26 +387,28 @@ class GroupWindowActionTest(unittest.TestCase):
 
 
 class ReadManagedWindowsTest(unittest.TestCase):
-    def test_reads_each_window_group_marker_and_managed_panes(self) -> None:
+    def test_reads_each_window_by_id_with_group_marker_and_panes(self) -> None:
         from mozyo_bridge.application import commands
 
+        # list-windows is read as `window_id \t window_name \t @mozyo_group_id`.
         list_windows = argparse.Namespace(
             returncode=0,
-            stdout="cockpit\t\nAlpha\talpha\nstray\t\n",
+            stdout="@0\tcockpit\t\n@1\tAlpha\talpha\n@2\tstray\t\n",
             stderr="",
         )
 
         def fake_columns(session, window):
+            # Panes are read by the unambiguous WINDOW ID, never the name.
             return {
-                "cockpit": [
+                "@0": [
                     {"pane_id": "%1", "workspace_id": "wsZ", "role": "codex",
                      "lane_id": "default"},
                 ],
-                "Alpha": [
+                "@1": [
                     {"pane_id": "%5", "workspace_id": "wsA", "role": "codex",
                      "lane_id": "default"},
                 ],
-                "stray": [
+                "@2": [
                     {"pane_id": "%9", "workspace_id": "", "role": "", "lane_id": ""},
                 ],
             }[window]
@@ -382,11 +417,49 @@ class ReadManagedWindowsTest(unittest.TestCase):
             patch.object(commands, "_read_cockpit_columns", side_effect=fake_columns):
             managed = commands._read_managed_cockpit_windows("mozyo-cockpit")
 
-        windows = {m["window"]: m for m in managed}
-        # `stray` carries no managed pane -> omitted.
-        self.assertEqual({"cockpit", "Alpha"}, set(windows))
-        self.assertEqual("alpha", windows["Alpha"]["group_id"])
-        self.assertEqual("", windows["cockpit"]["group_id"])
+        by_id = {m["window_id"]: m for m in managed}
+        # `@2` (stray) carries no managed pane -> omitted.
+        self.assertEqual({"@0", "@1"}, set(by_id))
+        self.assertEqual("alpha", by_id["@1"]["group_id"])
+        self.assertEqual("Alpha", by_id["@1"]["window"])
+        self.assertEqual("", by_id["@0"]["group_id"])
+
+    def test_duplicate_window_names_are_not_collapsed(self) -> None:
+        # Regression for #12330 review j#62380: two distinct Project Groups whose
+        # labels sanitize to the SAME display name must still be discovered as two
+        # separate windows (keyed by window id), each with its own group marker —
+        # the name is never the identity / routing key.
+        from mozyo_bridge.application import commands
+
+        list_windows = argparse.Namespace(
+            returncode=0,
+            stdout="@1\tab\talpha\n@2\tab\tbeta\n",
+            stderr="",
+        )
+
+        def fake_columns(session, window):
+            return {
+                "@1": [
+                    {"pane_id": "%5", "workspace_id": "wsA", "role": "codex",
+                     "lane_id": "default"},
+                ],
+                "@2": [
+                    {"pane_id": "%6", "workspace_id": "wsB", "role": "codex",
+                     "lane_id": "default"},
+                ],
+            }[window]
+
+        with patch.object(commands, "run_tmux", return_value=list_windows), \
+            patch.object(commands, "_read_cockpit_columns", side_effect=fake_columns):
+            managed = commands._read_managed_cockpit_windows("mozyo-cockpit")
+
+        self.assertEqual(2, len(managed))
+        by_id = {m["window_id"]: m for m in managed}
+        self.assertEqual("alpha", by_id["@1"]["group_id"])
+        self.assertEqual("beta", by_id["@2"]["group_id"])
+        # Both carry the same display name but stay distinct entries.
+        self.assertEqual("ab", by_id["@1"]["window"])
+        self.assertEqual("ab", by_id["@2"]["window"])
 
     def test_unreadable_window_list_degrades_to_empty(self) -> None:
         from mozyo_bridge.application import commands
