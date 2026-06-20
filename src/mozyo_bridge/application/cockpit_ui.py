@@ -486,15 +486,32 @@ def grouped_jump(
 #   in a custom header, which the action endpoints require. A custom
 #   header also forces a CORS preflight, so a cross-site simple request
 #   can never express action intent.
+#
+# Visual-fit posture (Redmine #12298): the page must stay readable when an
+# operator opens it in a narrow (mobile-ish) browser viewport, not only the
+# desktop iTerm2 webview. Two CSS properties are load-bearing for that and are
+# pinned by the served-cockpit browser smoke (``test_grouped_served_cockpit``):
+#
+# - the responsive ``<meta name="viewport">`` so a phone browser lays the page
+#   out at device width instead of an emulated 980px desktop canvas; and
+# - overflow containment — the unit table scrolls horizontally inside its own
+#   wrapper, long workspace / session / path strings wrap instead of forcing the
+#   body wider than the viewport, and the controls row wraps — so freshness /
+#   unavailable text and unit rows never overlap or overflow off-screen. This is
+#   a fit affordance, not a layout policy: no marketing chrome, no private
+#   operator layout baked into the OSS default.
 INDEX_HTML_TEMPLATE = """<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mozyo cockpit</title>
 <style>
   body { font: 13px/1.5 -apple-system, sans-serif; margin: 1rem; }
+  #units-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 2px 8px; border-bottom: 1px solid #ddd; }
+  td { overflow-wrap: anywhere; word-break: break-word; }
   .active  { color: #2e7d32; font-weight: 600; }
   .idle    { color: #ef6c00; font-weight: 600; }
   .unknown { color: #757575; }
@@ -502,10 +519,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .rm-unconfigured { color: #9e9e9e; }
   .rm-unavailable  { color: #b71c1c; }
   .stale-banner { background: #fff3e0; padding: 4px 8px; display: none; }
-  button { font-size: 12px; }
-  #transitions li { color: #555; }
+  button { font-size: 12px; white-space: nowrap; }
+  #transitions { padding-left: 1.2rem; }
+  #transitions li { color: #555; overflow-wrap: anywhere; }
   .muted { color: #999; font-size: 11px; }
-  #controls { margin: 4px 0; display: flex; align-items: center; gap: 8px; }
+  #controls { margin: 4px 0; display: flex; align-items: center;
+              gap: 8px; flex-wrap: wrap; }
   .obs-healthy { color: #2e7d32; }
   .obs-reload_required { color: #ef6c00; font-weight: 600; }
   .obs-unknown { color: #b71c1c; font-weight: 600; }
@@ -519,10 +538,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 </div>
 <div id="stale" class="stale-banner">tmux runtime unavailable — showing the
 last cached snapshot; activity may be outdated and actions are disabled.</div>
+<div id="units-wrap">
 <table id="units"><thead><tr>
 <th>state</th><th>agent</th><th>session</th><th>workspace</th>
 <th>redmine</th><th>actions</th>
 </tr></thead><tbody></tbody></table>
+</div>
 <p class="muted">three layers: state is OTel activity (active / idle /
 unknown — never "dead"); tmux liveness is the row's presence itself;
 redmine is read-only gate context (latest open issue), degrading to
