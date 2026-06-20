@@ -33,13 +33,18 @@ Boundary, kept enforced in code and pinned by tests
   :func:`~mozyo_bridge.application.cockpit_ui.candidate_unit_selector` /
   ``_resolve_unit_target`` as a preview: a degraded row (``needs_reload`` — stale /
   unreadable / contradicted / identity_conflict / desired_unit_missing / partial /
-  unknown), a non-local ``host_id``, a non-``default`` ``lane_id``, or a row with
-  no observed live role pane yields **no available command**, each with a visible
-  reason. A row that *looks* available stays a candidate only: the live preflight
-  may still reject it as ambiguous (more than one live pane) / missing / stale at
-  action time, which is why ``live_preflight_required`` is always set. The live,
-  non-mutating counterpart that actually re-queries the inventory (and so can
-  observe ambiguity) is
+  unknown), a non-local ``host_id``, or a row with no observed live role pane
+  yields **no available command**, each with a visible reason. A non-``default``
+  ``lane_id`` is **not** a blocking condition (Redmine #12293): the cockpit
+  inventory now reads each pane's ``@mozyo_lane_id`` and splits a workspace's lanes
+  into faithful, distinct Units, so a non-default lane is a first-class identity
+  selector the previewed command carries (and the live preflight narrows its match
+  set by), never a capability gap. A row that *looks* available stays a candidate
+  only: the live preflight may still reject it as ambiguous (more than one live
+  pane) / missing / stale at action time — including a missing or ambiguous lane —
+  which is why ``live_preflight_required`` is always set. The live, non-mutating
+  counterpart that actually re-queries the inventory (and so can observe
+  ambiguity) is
   :func:`~mozyo_bridge.application.cockpit_ui.grouped_action_preview`.
 - **Public-safe only.** The detail carries the row's public-safe identity
   (``workspace_id`` / ``lane_id`` / ``host_id``), display label, status /
