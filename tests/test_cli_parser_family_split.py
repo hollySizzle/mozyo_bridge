@@ -80,6 +80,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "session",
     "workspace",
     "workspace-defaults",
+    "state",
     "release",
 ]
 

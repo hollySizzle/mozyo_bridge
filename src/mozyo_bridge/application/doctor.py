@@ -24,15 +24,16 @@ from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.infrastructure.tmux_client import run_tmux
-from mozyo_bridge.managed_events import (
-    MANAGED_EVENTS_FILENAME,
-    MANAGED_EVENTS_SCHEMA_VERSION,
-)
-from mozyo_bridge.otel_store import OTEL_STORE_FILENAME, OTEL_STORE_SCHEMA_VERSION
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
-from mozyo_bridge.session_inventory import INVENTORY_FILENAME, INVENTORY_SCHEMA_VERSION
 from mozyo_bridge.shared.paths import mozyo_bridge_home
-from mozyo_bridge.workspace_registry import REGISTRY_FILENAME, REGISTRY_SCHEMA_VERSION
+from mozyo_bridge.state_store import (
+    COMPONENTS as _STATE_COMPONENTS,
+    RECOVERY_APPEND_ONLY as _RECOVERY_APPEND_ONLY,
+    RECOVERY_AUTHORITATIVE as _RECOVERY_AUTHORITATIVE,
+    RECOVERY_REBUILDABLE as _RECOVERY_REBUILDABLE,
+    STATE_CONTAINER_VERSION as STATE_STORE_SINGLE_DB_CONTAINER_VERSION,
+    STATE_STORE_FILENAME as STATE_STORE_SINGLE_DB_FILENAME,
+)
 
 
 REQUIRED_SKILL_FILE = "SKILL.md"
@@ -1155,57 +1156,28 @@ def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any
 #     kind" — never complete / approved / action-allowed. An absent legacy file
 #     and an absent single DB are NORMAL states, not failures.
 
-STATE_STORE_SINGLE_DB_FILENAME = "state.sqlite"
-
-# Container `PRAGMA user_version` layout this build understands. managed-state-model.md
-# `### schema version / migration` makes the container version identify the layout and
-# the presence of `state_schema_components`. The concrete number is provisional — the
-# future single-DB writer is a later slice — but read-only doctor must fail closed on
-# any version it does not understand: a newer container is reported unsupported and
-# left untouched (downgrade-safe), never `ok` (Redmine #12273 j#61689 Finding 1).
-STATE_STORE_SINGLE_DB_CONTAINER_VERSION = 1
-
-# recovery-policy vocabulary (managed-state-model.md `### recovery policy vocabulary`)
-_RECOVERY_AUTHORITATIVE = "authoritative"
-_RECOVERY_APPEND_ONLY = "append_only_lossy"
-_RECOVERY_REBUILDABLE = "rebuildable_cache"
-
+# The container layout constants (`STATE_STORE_SINGLE_DB_FILENAME`,
+# `STATE_STORE_SINGLE_DB_CONTAINER_VERSION`), the recovery-policy vocabulary, and
+# the per-component registry are owned by :mod:`mozyo_bridge.state_store` — the
+# single source of truth shared with the #12305 migrator — and imported above.
+# The read-only doctor must still fail closed on any container version it does not
+# understand: a newer container is reported unsupported and left untouched
+# (downgrade-safe), never `ok` (Redmine #12273 j#61689 Finding 1).
+#
 # Legacy per-kind files, in `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}`. `repair_action`
 # is the component-scoped next-action token a damaged store should suggest; it is
-# advice, not something this read-only surface performs.
-_LEGACY_COMPONENTS: tuple[dict[str, Any], ...] = (
+# advice, not something this read-only surface performs. Derived from the shared
+# state_store registry so the inspector (#12273) and migrator (#12305) cannot drift.
+_LEGACY_COMPONENTS: tuple[dict[str, Any], ...] = tuple(
     {
-        "component": "registry",
-        "filename": REGISTRY_FILENAME,
-        "schema_version": REGISTRY_SCHEMA_VERSION,
-        "tables": ("workspaces", "workspace_activity"),
-        "recovery_policy": _RECOVERY_AUTHORITATIVE,
-        "repair_action": "re_register",
-    },
-    {
-        "component": "managed_events",
-        "filename": MANAGED_EVENTS_FILENAME,
-        "schema_version": MANAGED_EVENTS_SCHEMA_VERSION,
-        "tables": ("managed_events",),
-        "recovery_policy": _RECOVERY_APPEND_ONLY,
-        "repair_action": "restore_backup",
-    },
-    {
-        "component": "inventory",
-        "filename": INVENTORY_FILENAME,
-        "schema_version": INVENTORY_SCHEMA_VERSION,
-        "tables": ("panes", "inventory_meta"),
-        "recovery_policy": _RECOVERY_REBUILDABLE,
-        "repair_action": "reload",
-    },
-    {
-        "component": "otel",
-        "filename": OTEL_STORE_FILENAME,
-        "schema_version": OTEL_STORE_SCHEMA_VERSION,
-        "tables": ("otel_events", "otel_meta"),
-        "recovery_policy": _RECOVERY_REBUILDABLE,
-        "repair_action": "restart_receiver",
-    },
+        "component": spec.component,
+        "filename": spec.legacy_filename,
+        "schema_version": spec.legacy_schema_version,
+        "tables": spec.legacy_tables,
+        "recovery_policy": spec.recovery_policy,
+        "repair_action": spec.repair_action,
+    }
+    for spec in _STATE_COMPONENTS
 )
 
 # Component names the future single DB is expected to absorb from the legacy
