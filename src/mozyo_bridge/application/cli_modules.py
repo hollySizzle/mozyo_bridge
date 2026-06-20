@@ -33,6 +33,7 @@ from mozyo_bridge.application import (
     cli_docs_scaffold,
     cli_handoff,
     cli_observability,
+    cli_presentation,
     cli_release,
     cli_runtime_config,
     cli_session,
@@ -75,6 +76,16 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             summary="Cross-workspace agent discovery (read-only structured surface).",
         ),
         cli_agents.register,
+    ),
+    (
+        CliFamily(
+            name="presentation",
+            summary=(
+                "Desired presentation current-table seed/inspect family "
+                "(home-scoped DB; display-only, no routing/approval authority)."
+            ),
+        ),
+        cli_presentation.register,
     ),
     (
         CliFamily(

@@ -146,6 +146,20 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: home-scoped desired presentation current-table store and seed source
+  patterns:
+  - src/mozyo_bridge/presentation_state.py
+  - src/mozyo_bridge/application/cli_presentation.py
+  - src/mozyo_bridge/application/commands_presentation.py
+  - tests/test_presentation_state.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/unit-presentation-state-db.md と @vibes/docs/logics/managed-state-model.md と
+    @vibes/docs/logics/workspace-registry.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/specs/project-map.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: handoff notification and tmux transport source
   patterns:
   - src/mozyo_bridge/domain/handoff.py

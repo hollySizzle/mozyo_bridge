@@ -49,6 +49,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "layout",
     "cockpit",
     "agents",
+    "presentation",
     "tmux-ui-config",
     "tmux-ui",
     "id",

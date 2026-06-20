@@ -855,6 +855,21 @@ file_conventions:
       - rule-project-agent-workflow
       - spec-project-map
 
+  - id: fc-presentation-state-db-source
+    name: home-scoped desired presentation current-table store and seed source
+    patterns:
+      - src/mozyo_bridge/presentation_state.py
+      - src/mozyo_bridge/application/cli_presentation.py
+      - src/mozyo_bridge/application/commands_presentation.py
+      - tests/test_presentation_state.py
+    severity: block
+    document_refs:
+      - logic-unit-presentation-state-db
+      - logic-managed-state-model
+      - logic-workspace-registry
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: fc-handoff-notification-source
     name: handoff notification and tmux transport source
     patterns:

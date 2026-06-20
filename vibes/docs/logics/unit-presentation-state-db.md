@@ -4,8 +4,9 @@ Redmine #11905 / #11909。`UnitRecord` / `TargetRecord` を cockpit や
 future projection で扱うときの **desired / presentation state** を、tracked
 static file ではなく DB current table として扱うための To-Be schema 境界。
 
-本 doc は schema design であり、runtime 実装ではない。実装時は別 task で migration、
-CLI/API、tests を切る。
+本 doc は schema design の正本である。runtime 実装の first slice は Redmine #12304 で
+着手済み (下記 `## 実装状況 (#12304)`)。残りの table / write path は引き続き別 task で
+migration、CLI/API、tests を切る。
 
 ## 結論
 
@@ -235,8 +236,8 @@ the schema field contract that implementation must preserve:
 > ない。default / missing config は behavior-preserving、unknown group / unsupported
 > version / authority-shaped key は fail-closed、identity conflict / desired-unit
 > missing は visible degraded status へ倒す (下記 fallback matrix 準拠)。
-> 残りの code task は on-disk config (`.mozyo-bridge/config.yaml`) loader への結線と
-> current table への migration で、`#12264` 以降で扱う。
+> on-disk config (`.mozyo-bridge/config.yaml`) loader への結線は `#12190` で実装済み。
+> current table への seed / migration は `#12304` で実装済み (`## 実装状況 (#12304)`)。
 
 ```yaml
 presentation:
@@ -509,6 +510,56 @@ tracked file に増やさない:
 3. 既存 `managed-events.sqlite` は即置換しない。
 4. `registry.sqlite` schema に presentation state を追加しない。
 5. private cockpit composition は product default に入れない。
+
+## 実装状況 (#12304)
+
+first slice を `src/mozyo_bridge/presentation_state.py` に実装した
+(`fc-presentation-state-db-source` で本 doc に紐づく)。
+
+実装済み:
+
+- 置き場: `${MOZYO_BRIDGE_HOME}/presentation.sqlite`。`registry.sqlite` /
+  `inventory.sqlite` とは別 DB (sibling store と同じ `*_path(home=None)` /
+  `PRAGMA user_version` 規約)。
+- current tables: `cockpit_group_membership` と `projection_preferences` を本 doc の
+  schema どおり作成。加えて seed provenance を記録する
+  `presentation_seed_provenance` table を持つ。
+- seed / migration: 静的 repo-local `.mozyo-bridge/config.yaml` の `presentation`
+  block (`PresentationGroupingConfig`) の **`unit_overrides` のみ** を current tables へ
+  seed する (`seed_from_grouping_config`)。`preferred_group` (+ `position` / `pinned` /
+  `hidden`) → membership、`preferred_projection` → projection preference。`unit_id` は
+  `(host_id, workspace_id, lane_id)` から決定的に導出する public-safe join key。
+- idempotent: content-comparing upsert。desired 内容が一致する row は `updated_at` も
+  書き換えない。無変更 config の再 seed は完全な no-op。
+- non-destructive: seed は insert / update のみで **delete しない**。config から消えた
+  override の row や operator が手で足した row は残る。destructive auto reconcile は
+  しない。
+- source config version 記録: provenance に `source_config_version` を残す
+  (#12304 受入条件)。
+- read model: `classify_membership` が desired row を観測集合と突き合わせて
+  `present` / `stale` / `desired_but_missing` の **表示状態** に倒す pure projection。
+  routing / action 可否は決めない。
+- fail-closed: 壊れた config は seed せず非 0 終了。未知 schema version は
+  `PresentationStateError` で停止し、operator-managed desired state を auto-drop しない
+  (regenerable cache と異なる扱い)。
+- CLI: `mozyo-bridge presentation seed` (write、`--dry-run` で preview) と
+  `presentation show` (read-only inspector)。
+
+意図的に未実装 (schema design のまま):
+
+- `membership_rules` の seed。rule は launch-time facts から group を導く live 解決で
+  あり、`resolve_launch_placement` が launch 時に評価する。durable membership へ固めない
+  (live geometry boundary)。
+- `unit_desired_state` / `managed_unit_events` / `target_observations` table。adjacent
+  だが本 slice では不要。必要になった時に別 task で切る。
+- live tmux geometry からの membership 復元・reconcile / rebalance / move command。
+  preview / confirm gate 付きの future command として本 doc が留保する。
+
+不変条件 (本 slice で enforce):
+
+- handoff / liveness / approval / close / routing / pane authority を持つ column は
+  current tables に存在せず、seed も書かない。action 可否は action-time live preflight、
+  workflow completion は Redmine 正本。
 
 ## Acceptance mapping
 
