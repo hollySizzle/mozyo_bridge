@@ -1,3 +1,11 @@
 version: 1
 presentation:
   project_group_presentation: project_group_tmux_window
+  project_groups:
+    - group_id: project:mozyo_bridge
+      label: mozyo_bridge
+  grouping:
+    membership_rules:
+      - when:
+          repo_label: mozyo-giken-3800-mozyo-bridge
+        group_id: project:mozyo_bridge
