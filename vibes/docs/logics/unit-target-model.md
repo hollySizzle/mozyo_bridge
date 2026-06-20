@@ -379,8 +379,8 @@ TargetRecord の preflight で配送先を決める。
 > reload/live preflight を要求する (上記 fallback matrix と
 > `runtime-observability-boundary.md` の fail-safe semantics 準拠)。action permission は
 > side-effecting command の action-time live preflight が決める。残作業の on-disk loader
-> 結線では #12263 から引き継いだ `presentation:` namespace (surface selection vs grouping)
-> の確定が必要。
+> 結線 (#12263 から引き継いだ `presentation:` namespace の surface selection vs grouping
+> の確定を含む) は #12286 で完了した (下記 #12286 実装メモ)。
 
 > 実装メモ (#12266): 本 Project Group read model に対する **reload / freshness UX**
 > projection は `src/mozyo_bridge/domain/grouped_reload_view.py` に実装済み
@@ -422,6 +422,32 @@ TargetRecord の preflight で配送先を決める。
 > 持たず (`GROUPED_DISPLAY_DIAGNOSTIC_ONLY_NOTE`)、grouped action は #12265 の
 > action-time live preflight が決める。#12264 / #12266 と同じく object-to-object slice
 > で、served endpoint / HTML page は結線しない。
+
+> 実装メモ (#12286): 上記 object-to-object slice 群の **served grouped cockpit HTML /
+> live wiring** を結線した。(1) `presentation:` namespace の確定: desired grouping
+> config (`project_groups` / `grouping`) と新規の display-placement field
+> `project_group_presentation` を `.mozyo-bridge/config.yaml` の `presentation:` 直下
+> に置き、`repo_local_config.PresentationSelectionConfig` が surface selection と並べて
+> parse する (grouping sub-key のみ `PresentationGroupingConfig.from_record` へ委譲;
+> grouping schema error は `RepoLocalConfigError` に再 raise し loader の単一 except
+> 境界を保つ)。`project_group_presentation` は #12290 の display placement
+> (`same_cockpit_column` default / `project_group_tmux_window` opt-in /
+> `normal_window` 互換) を表す display-only metadata で、`preferred_projection` とは
+> 別 field とし routing / approval / window 保証を持たない。missing config は
+> behavior-preserving。(2) live wiring: `cockpit_ui.observed_units_from_inventory` が
+> pane-centric inventory を workspace 単位の `ObservedUnit` (role presence 集約; lane
+> `default` / host `local`; stale snapshot は `active=False` の fail-safe) に集約し、
+> `grouped_units_payload` が repo-local grouping config + live snapshot から
+> `build_grouped_read_model` -> `build_grouped_display_view` を構築する。freshness
+> envelope は rows と同じ snapshot から `snapshot_from_inventory` で導出し、reload /
+> freshness 表示が projection snapshot と矛盾しないようにする。(3) served surface:
+> daemon の `GET /api/grouped-units` が display payload を返し (invalid repo-local
+> config は 400 で fail-closed)、cockpit HTML に Project Group -> Unit -> Target
+> (role panes) section を DOM-only render で追加した。`UnitDisplayRow` は action 結線
+> 用に public-safe identity (`workspace_id` / `lane_id` / `host_id`) を carry するが
+> pane / target は持たず、grouped action は引き続き #12265 の candidate selector +
+> action-time live preflight (`grouped-reveal` / `grouped-jump`) を通る。public plugin
+> API / VS Code Agent Pane へは拡張しない。
 
 ## TargetRecord / UnitRecord
 

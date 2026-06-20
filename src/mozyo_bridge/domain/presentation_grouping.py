@@ -63,7 +63,7 @@ PRESENTATION_GROUPING_VERSION: int = 1
 
 #: Closed top-level keys of the desired presentation grouping record.
 GROUPING_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"version", "project_groups", "grouping"}
+    {"version", "project_groups", "grouping", "project_group_presentation"}
 )
 
 #: Closed keys of one ``project_groups[]`` entry (#12262 schema field contract).
@@ -127,6 +127,40 @@ GROUPING_DEFAULTS_KEYS: frozenset[str] = frozenset(
 #: (``unit-presentation-state-db.md`` ``projection_preferences``). A config may
 #: *prefer* one of these; it may never invent a new projection.
 ALLOWED_PROJECTIONS: frozenset[str] = frozenset({"cockpit_pane", "normal_window"})
+
+#: Desired *display-placement* modes for a whole Project Group view (Redmine
+#: #12286 / #12290, ``unit-target-model.md`` ``#### Project Group tmux-window
+#: presentation``). This is presentation-only metadata describing *how* the
+#: Project Group layer is desired to be laid out for the operator — it is never
+#: routing / approval / close authority and never a guaranteed window / tab / OS
+#: result:
+#:
+#: - ``same_cockpit_column`` (the default) keeps the current single cockpit
+#:   column — the behavior-preserving placement;
+#: - ``project_group_tmux_window`` is an opt-in request for one tmux window per
+#:   Project Group. In some iTerm2 control-mode builds that renders as a native
+#:   tab, but mozyo never *guarantees* tab / OS-window behavior — it requests a
+#:   tmux-layer window only;
+#: - ``normal_window`` is the retained compatibility projection.
+#:
+#: It is deliberately a *separate* field from a Unit's ``preferred_projection``
+#: (``cockpit_pane`` / ``normal_window``): that selects a Unit projection
+#: *surface*, this selects Project-Group *display placement*. Naming any other
+#: value fails closed.
+PROJECT_GROUP_PRESENTATION_SAME_COLUMN: str = "same_cockpit_column"
+PROJECT_GROUP_PRESENTATION_TMUX_WINDOW: str = "project_group_tmux_window"
+PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW: str = "normal_window"
+PROJECT_GROUP_PRESENTATION_MODES: frozenset[str] = frozenset(
+    {
+        PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
+        PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+        PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
+    }
+)
+
+#: Missing ``project_group_presentation`` preserves current behavior exactly: a
+#: single cockpit column.
+DEFAULT_PROJECT_GROUP_PRESENTATION: str = PROJECT_GROUP_PRESENTATION_SAME_COLUMN
 
 #: The default lane id every non-lane construction lands on (mirrors
 #: :data:`mozyo_bridge.domain.cockpit_layout.DEFAULT_LANE`). Kept as a local
@@ -343,6 +377,29 @@ def _optional_projection(
         raise PresentationGroupingConfigError(
             f"{source} '{field_name}' must be a built-in projection "
             f"{sorted(ALLOWED_PROJECTIONS)} when present, got {value!r}"
+        )
+    return value
+
+
+def _checked_project_group_presentation(
+    record: "Mapping[object, object]", *, source: str
+) -> str:
+    """Return the desired Project-Group display-placement mode, fail-closed.
+
+    ``project_group_presentation`` is optional and defaults to
+    :data:`DEFAULT_PROJECT_GROUP_PRESENTATION` (``same_cockpit_column``), so a
+    missing field preserves current behavior exactly. Any value outside
+    :data:`PROJECT_GROUP_PRESENTATION_MODES` — including a boundary- / authority-
+    shaped string — is rejected rather than silently normalized; the mode is a
+    closed display-only vocabulary, never a routing / approval target.
+    """
+    value = record.get(
+        "project_group_presentation", DEFAULT_PROJECT_GROUP_PRESENTATION
+    )
+    if not isinstance(value, str) or value not in PROJECT_GROUP_PRESENTATION_MODES:
+        raise PresentationGroupingConfigError(
+            f"{source} 'project_group_presentation' must be one of "
+            f"{sorted(PROJECT_GROUP_PRESENTATION_MODES)} when present, got {value!r}"
         )
     return value
 
@@ -656,6 +713,10 @@ class PresentationGroupingConfig:
     membership_rules: "tuple[MembershipRule, ...]" = ()
     unit_overrides: "tuple[UnitOverride, ...]" = ()
     defaults: GroupingDefaults = field(default_factory=GroupingDefaults)
+    #: Desired display-placement of the whole Project Group view (#12286). A
+    #: behavior-preserving ``same_cockpit_column`` by default; display-only
+    #: metadata, never routing / approval / window guarantee.
+    project_group_presentation: str = DEFAULT_PROJECT_GROUP_PRESENTATION
 
     @classmethod
     def default(cls) -> "PresentationGroupingConfig":
@@ -694,6 +755,9 @@ class PresentationGroupingConfig:
             mapping, allowed=GROUPING_CONFIG_KEYS, source="grouping config"
         )
         _checked_version(mapping, source="grouping config")
+        project_group_presentation = _checked_project_group_presentation(
+            mapping, source="grouping config"
+        )
 
         project_groups: list[ProjectGroup] = []
         seen_group_ids: set[str] = set()
@@ -752,6 +816,7 @@ class PresentationGroupingConfig:
             membership_rules=tuple(membership_rules),
             unit_overrides=tuple(unit_overrides),
             defaults=defaults,
+            project_group_presentation=project_group_presentation,
         )
         config._validate_group_references()
         return config
@@ -955,6 +1020,11 @@ __all__ = (
     "UNIT_OVERRIDE_KEYS",
     "GROUPING_DEFAULTS_KEYS",
     "ALLOWED_PROJECTIONS",
+    "PROJECT_GROUP_PRESENTATION_SAME_COLUMN",
+    "PROJECT_GROUP_PRESENTATION_TMUX_WINDOW",
+    "PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW",
+    "PROJECT_GROUP_PRESENTATION_MODES",
+    "DEFAULT_PROJECT_GROUP_PRESENTATION",
     "STATUS_DEFAULT",
     "STATUS_CONFIGURED",
     "STATUS_UNGROUPED",

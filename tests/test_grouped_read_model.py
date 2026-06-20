@@ -718,5 +718,41 @@ class EmptyInputTests(unittest.TestCase):
         self.assertTrue(model.needs_reload)
 
 
+class ProjectGroupPresentationSurfacingTest(unittest.TestCase):
+    """The read model surfaces the desired placement mode as display metadata (#12286)."""
+
+    def test_default_config_surfaces_same_cockpit_column(self) -> None:
+        model = build_grouped_read_model(None, [])
+        self.assertEqual(
+            model.project_group_presentation, "same_cockpit_column"
+        )
+        self.assertEqual(
+            model.as_payload()["project_group_presentation"],
+            "same_cockpit_column",
+        )
+
+    def test_opt_in_mode_flows_from_config_to_payload(self) -> None:
+        config = PresentationGroupingConfig.from_record(
+            {"project_group_presentation": "project_group_tmux_window"}
+        )
+        model = build_grouped_read_model(config, [])
+        self.assertEqual(
+            model.project_group_presentation, "project_group_tmux_window"
+        )
+        self.assertEqual(
+            model.as_payload()["project_group_presentation"],
+            "project_group_tmux_window",
+        )
+
+    def test_placement_mode_carries_no_routing_authority(self) -> None:
+        # The mode is metadata; it adds no target / pane / route / approval field.
+        config = PresentationGroupingConfig.from_record(
+            {"project_group_presentation": "normal_window"}
+        )
+        payload = build_grouped_read_model(config, []).as_payload()
+        for forbidden in ("target", "pane", "route", "send", "approval"):
+            self.assertNotIn(forbidden, payload)
+
+
 if __name__ == "__main__":
     unittest.main()

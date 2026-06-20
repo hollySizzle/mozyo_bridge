@@ -73,6 +73,7 @@ from typing import Optional
 
 from mozyo_bridge.domain.presentation_grouping import (
     DEFAULT_LANE,
+    DEFAULT_PROJECT_GROUP_PRESENTATION,
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
     GroupPlacement,
@@ -361,6 +362,11 @@ class GroupedReadModel:
     groups: "tuple[ProjectGroupView, ...]" = ()
     observation: RuntimeObservationSnapshot = UNKNOWN_OBSERVATION
     diagnostics: "tuple[str, ...]" = ()
+    #: The desired Project-Group display-placement mode resolved from config
+    #: (#12286). Display-only metadata a cockpit surfaces (``same_cockpit_column``
+    #: default / ``project_group_tmux_window`` / ``normal_window``); it requests a
+    #: layout, never a routing target or a guaranteed window / tab.
+    project_group_presentation: str = DEFAULT_PROJECT_GROUP_PRESENTATION
 
     @property
     def needs_reload(self) -> bool:
@@ -383,6 +389,7 @@ class GroupedReadModel:
             "groups": [group.as_payload() for group in self.groups],
             "observation": self.observation.as_payload(),
             "diagnostics": list(self.diagnostics),
+            "project_group_presentation": self.project_group_presentation,
             "boundary_note": GROUPED_READ_MODEL_DIAGNOSTIC_ONLY_NOTE,
         }
 
@@ -625,6 +632,7 @@ def build_grouped_read_model(
         groups=tuple(groups),
         observation=overall_observation,
         diagnostics=tuple(diagnostics),
+        project_group_presentation=config.project_group_presentation,
     )
 
 
