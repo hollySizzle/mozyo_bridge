@@ -870,6 +870,21 @@ file_conventions:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: fc-state-store-source
+    name: home-scoped single state store facade and migration source
+    patterns:
+      - src/mozyo_bridge/state_store.py
+      - src/mozyo_bridge/application/cli_state.py
+      - src/mozyo_bridge/application/commands_state.py
+      - tests/test_state_store.py
+    severity: block
+    document_refs:
+      - logic-managed-state-model
+      - logic-workspace-registry
+      - logic-session-inventory
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: fc-handoff-notification-source
     name: handoff notification and tmux transport source
     patterns:

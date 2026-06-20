@@ -37,6 +37,7 @@ from mozyo_bridge.application import (
     cli_release,
     cli_runtime_config,
     cli_session,
+    cli_state,
     cli_workspace,
 )
 from mozyo_bridge.domain.module_registry import (
@@ -178,6 +179,17 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             summary="workspace register/inspect/defaults family.",
         ),
         cli_workspace.register,
+    ),
+    (
+        CliFamily(
+            name="state",
+            summary=(
+                "home-scoped state store inspect/migrate/cleanup family "
+                "(legacy SQLite consolidation; migration is backup-first / "
+                "non-destructive, cleanup is separately gated)."
+            ),
+        ),
+        cli_state.register,
     ),
     (
         CliFamily(
