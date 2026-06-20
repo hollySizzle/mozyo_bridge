@@ -402,6 +402,9 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         ):
             self._handle_grouped_action(self.path.rsplit("/", 1)[1])
             return
+        if self.path == "/api/actions/grouped-preview":
+            self._handle_grouped_preview()
+            return
         signal = _SIGNAL_PATHS.get(self.path)
         if signal is None:
             self._respond_json(404, {"error": "unknown path"})
@@ -582,6 +585,44 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         except CockpitActionError as exc:
             self._respond_json(409, {"error": str(exc)})
             return
+        self._respond_json(200, result)
+
+    def _handle_grouped_preview(self) -> None:
+        """Grouped cockpit command preview (Redmine #12296).
+
+        Same explicit-click security gate as :meth:`_handle_grouped_action`
+        (:meth:`_action_intent_rejected`) and the same candidate-identity body
+        (``workspace_id`` / ``role`` / optional ``lane_id`` / ``host_id``). Unlike
+        the action endpoints this is **non-mutating**: it runs the action-time
+        live preflight read-only and reports whether the safe actions would
+        currently resolve, so the Unit detail screen can show availability without
+        performing a side effect. It always answers 200 — a stale / ambiguous /
+        missing / remote / non-default-lane candidate is reported as
+        ``available: False`` with the preflight reason, never an executed action.
+        """
+        from mozyo_bridge.application.cockpit_ui import grouped_action_preview
+
+        if self._action_intent_rejected():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._respond_json(400, {"error": "request body must be JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._respond_json(
+                400, {"error": "request body must be a JSON object"}
+            )
+            return
+        home = getattr(self.server, "home", None)
+        result = grouped_action_preview(
+            workspace_id=payload.get("workspace_id"),
+            role=payload.get("role"),
+            lane_id=payload.get("lane_id") or "default",
+            host_id=payload.get("host_id") or "local",
+            home=home,
+        )
         self._respond_json(200, result)
 
 

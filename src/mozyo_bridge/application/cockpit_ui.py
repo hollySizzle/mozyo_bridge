@@ -470,6 +470,64 @@ def grouped_jump(
     return result
 
 
+def grouped_action_preview(
+    *,
+    workspace_id: str,
+    role: str,
+    lane_id: str = DEFAULT_LANE,
+    host_id: str = DEFAULT_HOST,
+    home: Path | None = None,
+) -> dict:
+    """Non-mutating command preview for a grouped *candidate* Unit (Redmine #12296).
+
+    Runs the **same** action-time live preflight as :func:`grouped_reveal` /
+    :func:`grouped_jump` (:func:`_resolve_unit_target`) against a fresh inventory,
+    but performs **no** side effect: it only reports whether the candidate identity
+    would currently resolve to exactly one live pane. So the served grouped cockpit
+    can show, on the Unit detail screen, whether the safe actions look available
+    *right now* — including the cases a pure display projection cannot see, because
+    this re-queries the live runtime: a stale snapshot, a vanished pane, or an
+    **ambiguous** target (more than one live pane for the identity) each report
+    ``available: False`` with the live preflight's own reason.
+
+    This is a preview, never an authorization: ``available: True`` does not act and
+    does not reserve the pane — executing the action still re-resolves the identity
+    through the real preflight. The result carries only the candidate identity and
+    a public-safe reason string (no repo path / credential / prompt body); the
+    preflight's ambiguity reason may name pane ids, which the local inventory
+    already exposes.
+    """
+    try:
+        _resolve_unit_target(
+            workspace_id=workspace_id,
+            role=role,
+            lane_id=lane_id,
+            host_id=host_id,
+            home=home,
+        )
+    except CockpitActionError as exc:
+        return {
+            "action": "preview",
+            "workspace_id": workspace_id,
+            "role": role,
+            "lane_id": lane_id,
+            "host_id": host_id,
+            "available": False,
+            "live_preflight_required": True,
+            "reason": str(exc),
+        }
+    return {
+        "action": "preview",
+        "workspace_id": workspace_id,
+        "role": role,
+        "lane_id": lane_id,
+        "host_id": host_id,
+        "available": True,
+        "live_preflight_required": True,
+        "actions": ["reveal", "jump"],
+    }
+
+
 # The page is a single self-contained document: no external assets, no
 # CDN, nothing fetched off-host — consistent with the loopback-only and
 # no-exfiltration posture. Kept intentionally small; it is an indicator
