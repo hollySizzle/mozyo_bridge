@@ -6,10 +6,12 @@ grouped read model is a display / candidate input only — never a routing
 authority. Covers, at the ``cockpit_ui`` command surface and over the
 ``otel_receiver`` POST path:
 
-- a candidate Unit identity (workspace_id / role) resolves to the live pane via
-  a fresh inventory and routes through the existing pane-centric action;
-- a stale / missing / ambiguous / non-default-lane / non-local-host candidate
-  fails closed (the projection only *names* a candidate, never authorizes);
+- a candidate Unit identity (workspace_id / lane_id / role) resolves to the live
+  pane via a fresh inventory and routes through the existing pane-centric action;
+- a stale / missing / ambiguous / non-local-host candidate fails closed (the
+  projection only *names* a candidate, never authorizes), and a non-default lane
+  resolves the matching lane pane but fails closed when no pane carries that lane
+  (Redmine #12293: the inventory now reads ``@mozyo_lane_id``);
 - the displayed snapshot's ``active`` flag / group geometry cannot bypass live
   resolution (a row that claims ``active`` but has no live pane still fails); and
 - ``candidate_unit_selector`` yields identity only from a fresh row and refuses
@@ -68,6 +70,7 @@ def _record(
     repo_root: str | None = None,
     session: str = "mozyo-demo",
     window_index: str = "1",
+    lane_id: str = "default",
 ) -> InventoryRecord:
     workspace = (
         WorkspaceIdentity(
@@ -90,6 +93,7 @@ def _record(
         cwd=repo_root or "/tmp",
         repo_root=repo_root,
         agent_kind=role,
+        lane_id=lane_id,
         workspace=workspace,
     )
 
@@ -202,11 +206,51 @@ class GroupedActionResolveTest(unittest.TestCase):
         self.assertIn("%7", msg)
         self.assertIn("%9", msg)
 
-    def test_non_default_lane_fails_closed_without_reading_inventory(self) -> None:
-        def boom(**_):
-            raise AssertionError("inventory must not be read for a bad candidate")
+    def test_non_default_lane_resolves_matching_lane_pane(self) -> None:
+        # Redmine #12293: the inventory now reads @mozyo_lane_id, so a non-default
+        # lane candidate resolves the pane carrying that lane (not rejected). Two
+        # panes share workspace_id but carry distinct lanes; the candidate's lane
+        # narrows the live match to exactly one.
+        snapshot = _snapshot(
+            [
+                _record(
+                    "%7", "claude", "ws-a",
+                    repo_root=str(self.repo), lane_id="issue_123",
+                ),
+                _record(
+                    "%9", "claude", "ws-a",
+                    repo_root=str(self.repo), lane_id="default",
+                ),
+            ]
+        )
+        calls: list[list[str]] = []
 
-        with patch(f"{COCKPIT_UI}.take_inventory", boom):
+        def fake_run(argv, capture_output, text, check):
+            calls.append(argv)
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with _patch_inventory(snapshot), patch(
+            f"{COCKPIT_UI}.subprocess.run", side_effect=fake_run
+        ), patch(f"{COCKPIT_UI}.sys.platform", "darwin"):
+            result = grouped_reveal(
+                workspace_id="ws-a",
+                role="claude",
+                lane_id="issue_123",
+                home=self.home,
+            )
+        # The lane discriminator picked %7 (lane issue_123), not the default-lane
+        # %9, proving the lane is part of the live identity selector.
+        self.assertEqual("%7", result["pane_id"])
+        self.assertEqual([["open", str(self.repo)]], calls)
+
+    def test_non_matching_lane_fails_closed(self) -> None:
+        # The candidate lane has no live pane (the only pane is default lane), so
+        # the action fails closed rather than acting on a same-workspace pane in a
+        # different lane.
+        snapshot = _snapshot(
+            [_record("%7", "claude", "ws-a", repo_root=str(self.repo))]
+        )
+        with _patch_inventory(snapshot):
             with self.assertRaises(CockpitActionError) as ctx:
                 grouped_reveal(
                     workspace_id="ws-a",
@@ -214,7 +258,9 @@ class GroupedActionResolveTest(unittest.TestCase):
                     lane_id="issue_123",
                     home=self.home,
                 )
-        self.assertIn("non-default lane", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("no live claude pane", msg)
+        self.assertIn("issue_123", msg)
 
     def test_non_local_host_fails_closed(self) -> None:
         def boom(**_):

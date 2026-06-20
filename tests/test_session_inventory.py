@@ -55,6 +55,8 @@ def pane(
     cwd: str = "",
     window_name: str = "claude",
     pane_active: str = "1",
+    lane_id: str = "",
+    lane_label: str = "",
 ) -> dict[str, str]:
     return {
         "id": pane_id,
@@ -63,6 +65,8 @@ def pane(
         "cwd": cwd,
         "window_name": window_name,
         "pane_active": pane_active,
+        "lane_id": lane_id,
+        "lane_label": lane_label,
     }
 
 
@@ -120,6 +124,31 @@ class CollectRuntimeInventoryTest(SessionInventoryBase):
         self.assertEqual(
             first.workspace.source, derive_session_name(self.repo).source
         )
+
+    def test_lane_identity_is_folded_from_pane_option(self) -> None:
+        # Redmine #12293: the pane's @mozyo_lane_id / @mozyo_lane_label options
+        # flow into the inventory record; an unset lane normalizes to "default".
+        records = collect_runtime_inventory(
+            [
+                pane(
+                    "%1",
+                    "mozyo-demo:1.0",
+                    cwd=str(self.repo),
+                    lane_id="issue_12293",
+                    lane_label="Issue 12293",
+                ),
+                pane("%2", "mozyo-demo:2.0", command="node",
+                     window_name="codex", cwd=str(self.repo)),
+            ],
+            home=self.home,
+        )
+        by_id = {record.pane_id: record for record in records}
+        self.assertEqual(by_id["%1"].lane_id, "issue_12293")
+        self.assertEqual(by_id["%1"].lane_label, "Issue 12293")
+        # No lane option → the backward-compatible default lane, never blank.
+        self.assertEqual(by_id["%2"].lane_id, "default")
+        self.assertIsNone(by_id["%2"].lane_label)
+        self.assertEqual(by_id["%1"].as_payload()["lane_id"], "issue_12293")
 
     def test_lightweight_inventory_skips_unregistered_defaults_derivation(self) -> None:
         with patch.object(
@@ -239,8 +268,10 @@ class SnapshotCacheTest(SessionInventoryBase):
     def _records(self) -> list:
         return collect_runtime_inventory(
             [
-                pane("%1", "mozyo-demo:1.0", cwd=str(self.repo)),
-                pane("%1", "mozyo-view:1.0", cwd=str(self.repo)),
+                pane("%1", "mozyo-demo:1.0", cwd=str(self.repo),
+                     lane_id="issue_12293", lane_label="Issue 12293"),
+                pane("%1", "mozyo-view:1.0", cwd=str(self.repo),
+                     lane_id="issue_12293", lane_label="Issue 12293"),
                 pane("%2", "mozyo-demo:2.0", command="node", window_name="codex"),
             ],
             home=self.home,
@@ -265,6 +296,11 @@ class SnapshotCacheTest(SessionInventoryBase):
         self.assertEqual(len(by_id["%1"].views), 2)
         self.assertEqual(by_id["%1"].workspace, records[0].workspace)
         self.assertIsNone(by_id["%2"].workspace)
+        # Redmine #12293: lane identity round-trips through the cache.
+        self.assertEqual(by_id["%1"].lane_id, "issue_12293")
+        self.assertEqual(by_id["%1"].lane_label, "Issue 12293")
+        self.assertEqual(by_id["%2"].lane_id, "default")
+        self.assertIsNone(by_id["%2"].lane_label)
 
     def test_save_replaces_previous_snapshot(self) -> None:
         save_snapshot(self._records(), home=self.home)
@@ -369,7 +405,7 @@ class SessionListCliTest(SessionInventoryBase):
             )
         self.assertEqual(code, 0)
         payload = json.loads(out)
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(payload["source"], "runtime")
         self.assertFalse(payload["stale"])
         self.assertEqual(payload["inventory_path"], str(inventory_path()))
@@ -382,6 +418,8 @@ class SessionListCliTest(SessionInventoryBase):
                 "agent_kind",
                 "confidence",
                 "cwd",
+                "lane_id",
+                "lane_label",
                 "pane_active",
                 "pane_id",
                 "pane_index",
