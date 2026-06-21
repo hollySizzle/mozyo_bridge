@@ -59,6 +59,7 @@ FINDING_MISSING_CLAUDE = "missing_claude"
 FINDING_ROLE_LESS_PANE = "role_less_pane"
 FINDING_UNIT_COLUMN_SPLIT = "unit_column_split"
 FINDING_MIXED_UNIT_COLUMN = "mixed_unit_column"
+FINDING_DUPLICATE_ROLE = "duplicate_role"
 FINDING_NARROW_PANE = "narrow_pane"
 
 _AGENT_ROLES = (ROLE_CODEX, ROLE_CLAUDE)
@@ -343,6 +344,10 @@ def diagnose_cockpit_geometry(
       not share one vertical column.
     - :data:`FINDING_MIXED_UNIT_COLUMN` — one vertical column carrying panes from
       more than one Unit.
+    - :data:`FINDING_DUPLICATE_ROLE` — a Unit carrying more than one pane for the
+      same role (e.g. two Codex panes); a Unit should hold exactly one Codex and
+      one Claude. This is what ``cockpit reconcile`` fails closed on, surfaced here
+      proactively as a read-only diagnostic (#12310).
     - :data:`FINDING_NARROW_PANE` — a column far narrower than the median column
       (advisory notice; does not flip ``ok``).
     """
@@ -446,6 +451,29 @@ def diagnose_cockpit_geometry(
                     f"column (observed columns {list(unit.columns)}); they should "
                     f"stack in a single x-range column.",
                     pane_ids=tuple(unit.codex_panes) + tuple(unit.claude_panes),
+                    workspace_id=unit.workspace_id,
+                    lane_id=unit.lane_id,
+                )
+            )
+        if len(unit.codex_panes) > 1 or len(unit.claude_panes) > 1:
+            dup_roles = []
+            dup_panes: list[str] = []
+            if len(unit.codex_panes) > 1:
+                dup_roles.append(f"codex ({', '.join(unit.codex_panes)})")
+                dup_panes.extend(unit.codex_panes)
+            if len(unit.claude_panes) > 1:
+                dup_roles.append(f"claude ({', '.join(unit.claude_panes)})")
+                dup_panes.extend(unit.claude_panes)
+            findings.append(
+                GeometryFinding(
+                    FINDING_DUPLICATE_ROLE,
+                    SEVERITY_WARNING,
+                    f"Unit {where} has more than one pane for the same role "
+                    f"({'; '.join(dup_roles)}); a Unit should hold exactly one codex "
+                    f"and one claude pane. Resolve the duplicate before "
+                    f"reconcile / peer-adopt (observed geometry only, not identity "
+                    f"authority).",
+                    pane_ids=tuple(dup_panes),
                     workspace_id=unit.workspace_id,
                     lane_id=unit.lane_id,
                 )

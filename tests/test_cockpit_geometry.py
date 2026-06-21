@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.cockpit_geometry import (
+    FINDING_DUPLICATE_ROLE,
     FINDING_MISSING_CLAUDE,
     FINDING_MISSING_CODEX,
     FINDING_MIXED_UNIT_COLUMN,
@@ -206,6 +207,60 @@ class WidthImbalanceTest(unittest.TestCase):
         panes = _healthy_unit("0", workspace_id="wsA", left=0, width=8)
         diag = diagnose_cockpit_geometry(session="mozyo-cockpit", panes=panes)
         self.assertNotIn(FINDING_NARROW_PANE, _codes(diag))
+
+
+class DuplicateRoleTest(unittest.TestCase):
+    """A Unit must hold exactly one codex + one claude; duplicates are drift.
+
+    `cockpit reconcile` (#12136) fail-closes on a duplicate role per Unit, but the
+    read-only `doctor-geometry` did not surface it proactively until #12310. Two
+    codex panes stamped for one workspace/lane is observed geometry drift, not an
+    identity re-decision.
+    """
+
+    def test_two_codex_in_one_unit_is_a_warning(self) -> None:
+        panes = [
+            _pane("%c1", workspace_id="wsA", role="codex", left=0, top=0, width=40, height=28),
+            _pane("%c2", workspace_id="wsA", role="codex", left=0, top=28, width=40, height=28),
+            _pane("%l", workspace_id="wsA", role="claude", left=40, top=0, width=40, height=56),
+        ]
+        diag = diagnose_cockpit_geometry(session="mozyo-cockpit", panes=panes)
+        self.assertFalse(diag.ok)
+        finding = next(f for f in diag.findings if f.code == FINDING_DUPLICATE_ROLE)
+        self.assertEqual(SEVERITY_WARNING, finding.severity)
+        self.assertEqual("wsA", finding.workspace_id)
+        self.assertEqual({"%c1", "%c2"}, set(finding.pane_ids))
+        self.assertIn("codex", finding.message)
+        self.assertIn("not identity authority", finding.message)
+        # The peer claude is present, so this is not also a missing-role finding.
+        self.assertNotIn(FINDING_MISSING_CLAUDE, _codes(diag))
+        self.assertNotIn(FINDING_MISSING_CODEX, _codes(diag))
+
+    def test_two_claude_in_one_unit_is_a_warning(self) -> None:
+        panes = [
+            _pane("%c", workspace_id="wsA", role="codex", left=0, top=0, width=40, height=56),
+            _pane("%l1", workspace_id="wsA", role="claude", left=40, top=0, width=40, height=28),
+            _pane("%l2", workspace_id="wsA", role="claude", left=40, top=28, width=40, height=28),
+        ]
+        diag = diagnose_cockpit_geometry(session="mozyo-cockpit", panes=panes)
+        finding = next(f for f in diag.findings if f.code == FINDING_DUPLICATE_ROLE)
+        self.assertEqual({"%l1", "%l2"}, set(finding.pane_ids))
+        self.assertIn("claude", finding.message)
+
+    def test_healthy_unit_has_no_duplicate_role_finding(self) -> None:
+        panes = _healthy_unit("0", workspace_id="wsA", left=0, width=40)
+        diag = diagnose_cockpit_geometry(session="mozyo-cockpit", panes=panes)
+        self.assertNotIn(FINDING_DUPLICATE_ROLE, _codes(diag))
+
+    def test_distinct_lanes_under_one_workspace_are_not_duplicates(self) -> None:
+        # Two codex panes that belong to *different* lanes are two Units, not a
+        # duplicate role within one Unit.
+        panes = [
+            _pane("%c1", workspace_id="wsA", role="codex", lane_id="default", left=0, top=0, width=40, height=56),
+            _pane("%c2", workspace_id="wsA", role="codex", lane_id="featureX", left=40, top=0, width=40, height=56),
+        ]
+        diag = diagnose_cockpit_geometry(session="mozyo-cockpit", panes=panes)
+        self.assertNotIn(FINDING_DUPLICATE_ROLE, _codes(diag))
 
 
 class MissingCodexTest(unittest.TestCase):

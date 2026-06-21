@@ -239,6 +239,10 @@ cockpit window から各 pane の identity option (`@mozyo_workspace_id` /
   (#12130 の手動復旧 `%1106` ケース)。
 - `unit_column_split` — 同一 Unit の codex/claude が同じ column に収まらない。
 - `mixed_unit_column` — 一つの vertical column に複数 Unit が同居する。
+- `duplicate_role` — 一つの Unit が同一 role の pane を複数持つ (例: codex 2 枚)。
+  Unit は codex / claude を 1 枚ずつ持つのが正で、`cockpit reconcile` (#12136) が
+  fail-closed で拒否する状態。read-only doctor では従来表面化しなかったため
+  Redmine #12310 で proactive な warning finding として追加した。
 - `narrow_pane` — column 幅が median から極端に外れた width imbalance
   (advisory notice; `ok` を倒さない)。
 
