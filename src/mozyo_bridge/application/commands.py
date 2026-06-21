@@ -2515,16 +2515,43 @@ def _handle_cockpit_doctor_geometry(session: str, *, json_output: bool) -> int:
     return 0 if diagnosis.ok else 1
 
 
-def _membership_observations_from_windows(managed_windows):
-    """Group managed-cockpit-window columns into per-Unit observations (#12341, pure).
+def _cockpit_unit_repo_root(session: str, *pane_ids: str) -> str:
+    """The live checkout root of a cockpit Unit, from its pane cwd (#12341, read-only).
+
+    A worktree / lane shares its workspace id with the main checkout, so the
+    registry's single canonical path mislabels it (review j#62643). The live truth
+    is the pane's working directory, walked up to the repo root — the same signal
+    `agents targets` already uses. Reads the Unit's panes in order (codex first,
+    then claude) and returns the first resolvable repo root, or ``""`` when no
+    pane cwd is readable (the caller then falls back to the registry path).
+    Tolerant: any tmux failure degrades to ``""``.
+    """
+    from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
+    for pane_id in pane_ids:
+        if not pane_id:
+            continue
+        runtime = _read_cockpit_pane_runtime(session, pane_id)
+        cwd = (runtime.get("cwd") or "").strip()
+        if not cwd:
+            continue
+        root = infer_repo_root(cwd)
+        if root:
+            return root
+    return ""
+
+
+def _membership_observations_from_windows(managed_windows, session: str):
+    """Group managed-cockpit-window columns into per-Unit observations (#12341).
 
     Reshapes the :func:`_read_managed_cockpit_windows` output (a list of windows,
     each with its `columns`) into one
     :class:`mozyo_bridge.domain.cockpit_membership.MembershipObservation` per
-    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes.
+    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes
+    and resolving each Unit's live checkout root from its pane cwd (so a worktree /
+    lane reports its own path, not the registry canonical — review j#62643).
     Role-less columns (no ``workspace_id``) are skipped here — they surface as a
-    cockpit-wide warning from the geometry diagnosis instead. No tmux / filesystem
-    access: the live reads happened in the caller.
+    cockpit-wide warning from the geometry diagnosis instead.
     """
     from mozyo_bridge.domain.cockpit_layout import (
         ROLE_CLAUDE,
@@ -2552,15 +2579,20 @@ def _membership_observations_from_windows(managed_windows):
             elif role == ROLE_CLAUDE and not units[key]["claude"]:
                 units[key]["claude"] = pane_id
         for key in order:
+            codex_pane = units[key]["codex"]
+            claude_pane = units[key]["claude"]
             observations.append(
                 MembershipObservation(
                     workspace_id=key[0],
                     lane_id=key[1],
                     lane_label="",
-                    codex_pane=units[key]["codex"],
-                    claude_pane=units[key]["claude"],
+                    codex_pane=codex_pane,
+                    claude_pane=claude_pane,
                     window=window.get("window") or "",
                     window_id=window.get("window_id") or "",
+                    repo_root=_cockpit_unit_repo_root(
+                        session, codex_pane, claude_pane
+                    ),
                 )
             )
     return observations
@@ -2617,7 +2649,7 @@ def _collect_cockpit_membership(session: str):
     geometry = diagnose_cockpit_geometry(
         session=session, panes=_read_cockpit_geometry(session)
     )
-    observations = _membership_observations_from_windows(managed)
+    observations = _membership_observations_from_windows(managed, session)
     cockpit_present = bool(managed) or geometry.cockpit_present
 
     facts: dict[str, object] = {}
@@ -2670,8 +2702,10 @@ def _handle_cockpit_status(
     (absent, missing peer, or a geometry warning) — so a script can branch on the
     code while still parsing the full report from stdout.
     """
+    import dataclasses as _dataclasses
     import json as _json
 
+    from mozyo_bridge.domain.agent_discovery import infer_repo_root
     from mozyo_bridge.domain.cockpit_layout import normalize_lane
     from mozyo_bridge.domain.cockpit_membership import (
         CockpitMembershipReport,
@@ -2681,10 +2715,14 @@ def _handle_cockpit_status(
 
     repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
     repo_root = str(Path(repo).expanduser().resolve())
+    # The operator asked about THIS checkout: report the queried repo root (walked
+    # to its repo top), not the registry canonical / main checkout (review j#62643).
+    queried_root = infer_repo_root(repo_root) or repo_root
     canon = resolve_canonical_session(repo_root)
     workspace_id = getattr(canon, "workspace_id", None) or canon.name
     lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
     target_lane = normalize_lane(lane.lane_id)
+    facts = _resolve_registry_facts(workspace_id)
 
     report = _collect_cockpit_membership(session)
     match = next(
@@ -2697,18 +2735,23 @@ def _handle_cockpit_status(
         None,
     )
     if match is None:
-        facts = _resolve_registry_facts(workspace_id)
         label = facts.label if facts.registry_present else canon.name
         match = absent_membership(
             session=session,
             workspace_id=workspace_id,
             label=label,
-            repo_root=repo_root,
+            repo_root=queried_root,
             lane_id=target_lane,
             lane_label=lane.lane_label,
             registry_present=facts.registry_present,
             anchor_present=facts.anchor_present,
+            registry_canonical_path=facts.repo_root,
         )
+    else:
+        # Pin the matched row's repo root to the queried checkout so a worktree /
+        # lane query echoes the path the operator asked about, never the registry
+        # canonical main checkout (review j#62643).
+        match = _dataclasses.replace(match, repo_root=queried_root)
 
     single = CockpitMembershipReport(
         session=session,
@@ -2721,7 +2764,8 @@ def _handle_cockpit_status(
         payload["query"] = {
             "workspace_id": workspace_id,
             "label": match.label,
-            "repo_root": repo_root,
+            "repo_root": queried_root,
+            "registry_canonical_path": facts.repo_root,
             "lane_id": target_lane,
             "member": match.member,
         }
@@ -2765,17 +2809,20 @@ def _status_repo_cockpit_membership(args: argparse.Namespace):
             None,
         )
         if match is None:
+            from mozyo_bridge.domain.agent_discovery import infer_repo_root
+
             facts = _resolve_registry_facts(workspace_id)
             label = facts.label if facts.registry_present else canon.name
             match = absent_membership(
                 session=COCKPIT_SESSION_DEFAULT,
                 workspace_id=workspace_id,
                 label=label,
-                repo_root=repo_root,
+                repo_root=infer_repo_root(repo_root) or repo_root,
                 lane_id=target_lane,
                 lane_label=lane.lane_label,
                 registry_present=facts.registry_present,
                 anchor_present=facts.anchor_present,
+                registry_canonical_path=facts.repo_root,
             )
         return match
     except (Exception, SystemExit):

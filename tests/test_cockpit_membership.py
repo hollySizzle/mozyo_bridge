@@ -33,7 +33,8 @@ def _facts(label="alpha", repo="/repo/alpha", reg=True, anchor=True):
     )
 
 
-def _obs(ws="wsA", lane="default", codex="%99", claude="%100", window="cockpit", wid="@1"):
+def _obs(ws="wsA", lane="default", codex="%99", claude="%100", window="cockpit",
+         wid="@1", repo_root=""):
     return membership.MembershipObservation(
         workspace_id=ws,
         lane_id=lane,
@@ -42,6 +43,7 @@ def _obs(ws="wsA", lane="default", codex="%99", claude="%100", window="cockpit",
         claude_pane=claude,
         window=window,
         window_id=wid,
+        repo_root=repo_root,
     )
 
 
@@ -99,6 +101,52 @@ class MembershipProjectionTest(unittest.TestCase):
             "registry_present", "anchor_present", "member",
         ):
             self.assertIn(key, ws, key)
+
+    def test_live_repo_root_preferred_over_registry_canonical(self) -> None:
+        # Review j#62643: a worktree / lane shares its workspace id with the main
+        # checkout. The live pane-cwd repo root must win over the registry
+        # canonical path (which only names the main checkout).
+        report = membership.project_membership_report(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[_obs(repo_root="/repo/alpha-worktree")],
+            facts_by_workspace={"wsA": _facts(repo="/repo/alpha-main")},
+            geometry=_healthy_geometry(),
+        )
+        ws = report.workspaces[0]
+        self.assertEqual("/repo/alpha-worktree", ws.repo_root)
+        self.assertEqual("/repo/alpha-main", ws.registry_canonical_path)
+        # The text view surfaces the registry canonical path when it differs.
+        text = membership.format_membership_text(report)
+        self.assertIn("/repo/alpha-worktree", text)
+        self.assertIn("/repo/alpha-main", text)
+
+    def test_repo_root_falls_back_to_registry_when_cwd_unreadable(self) -> None:
+        report = membership.project_membership_report(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[_obs(repo_root="")],  # pane cwd unreadable
+            facts_by_workspace={"wsA": _facts(repo="/repo/alpha-main")},
+            geometry=_healthy_geometry(),
+        )
+        ws = report.workspaces[0]
+        self.assertEqual("/repo/alpha-main", ws.repo_root)
+        self.assertEqual("/repo/alpha-main", ws.registry_canonical_path)
+
+    def test_absent_membership_carries_registry_canonical_path(self) -> None:
+        ws = membership.absent_membership(
+            session="mozyo-cockpit",
+            workspace_id="wsZ",
+            label="zeta",
+            repo_root="/repo/zeta-worktree",
+            lane_id="default",
+            lane_label="",
+            registry_present=True,
+            anchor_present=True,
+            registry_canonical_path="/repo/zeta-main",
+        )
+        self.assertEqual("/repo/zeta-worktree", ws.repo_root)
+        self.assertEqual("/repo/zeta-main", ws.registry_canonical_path)
 
     def test_unregistered_workspace_splits_warnings_but_stays_member(self) -> None:
         report = membership.project_membership_report(
@@ -257,7 +305,7 @@ class CockpitListStatusCliTest(unittest.TestCase):
         return argparse.Namespace(**base)
 
     @contextlib.contextmanager
-    def _patched(self, *, windows, geo_panes, facts):
+    def _patched(self, *, windows, geo_panes, facts, unit_repo_root=""):
         from mozyo_bridge.application import commands
 
         def fake_facts(workspace_id):
@@ -270,7 +318,9 @@ class CockpitListStatusCliTest(unittest.TestCase):
             patch.object(commands, "_read_cockpit_geometry",
                          return_value=geo_panes), \
             patch.object(commands, "_resolve_registry_facts",
-                         side_effect=fake_facts):
+                         side_effect=fake_facts), \
+            patch.object(commands, "_cockpit_unit_repo_root",
+                         return_value=unit_repo_root):
             yield commands
 
     def _cockpit_window(self):
@@ -395,6 +445,43 @@ class CockpitListStatusCliTest(unittest.TestCase):
         self.assertIn("query", payload)
         self.assertEqual("wsA", payload["query"]["workspace_id"])
         self.assertTrue(payload["query"]["member"])
+
+    def test_status_worktree_reports_queried_root_not_registry_canonical(self) -> None:
+        # Review j#62643: querying a worktree/lane whose registry canonical path is
+        # the main checkout must echo the queried worktree root, not the canonical.
+        with self._patched(
+            windows=self._cockpit_window(),
+            geo_panes=self._geo_panes(),
+            facts={"wsA": _facts(label="alpha", repo="/repo/alpha-main")},
+            unit_repo_root="/repo/alpha-main",  # registry-canonical-shaped live cwd
+        ) as commands:
+            with self._status_identity(commands):
+                rc, out = self._run(
+                    commands,
+                    self._status_args(repo="/repo/alpha-worktree", json_output=True),
+                )
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        ws = payload["workspaces"][0]
+        self.assertEqual("/repo/alpha-worktree", ws["repo_root"])
+        self.assertEqual("/repo/alpha-main", ws["registry_canonical_path"])
+        self.assertEqual("/repo/alpha-worktree", payload["query"]["repo_root"])
+        self.assertEqual(
+            "/repo/alpha-main", payload["query"]["registry_canonical_path"]
+        )
+
+    def test_list_uses_live_repo_root(self) -> None:
+        with self._patched(
+            windows=self._cockpit_window(),
+            geo_panes=self._geo_panes(),
+            facts={"wsA": _facts(label="alpha", repo="/repo/alpha-main")},
+            unit_repo_root="/repo/alpha-worktree",
+        ) as commands:
+            rc, out = self._run(commands, self._args(action="list", json_output=True))
+        self.assertEqual(0, rc)
+        ws = json.loads(out)["workspaces"][0]
+        self.assertEqual("/repo/alpha-worktree", ws["repo_root"])
+        self.assertEqual("/repo/alpha-main", ws["registry_canonical_path"])
 
 
 class CockpitMembershipParserTest(unittest.TestCase):

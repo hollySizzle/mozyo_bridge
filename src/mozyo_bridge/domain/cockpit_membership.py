@@ -107,6 +107,10 @@ class MembershipObservation:
     (`_read_managed_cockpit_windows`). ``codex_pane`` / ``claude_pane`` are the
     Unit's pane ids (empty string when that role is absent in the cockpit).
     ``window`` is the tmux window display name; ``window_id`` the stable ``@N``.
+    ``repo_root`` is the Unit's *live* checkout root, derived from the pane cwd
+    (empty when it could not be read) — distinct from the workspace registry's
+    single canonical path, so a worktree / lane reports its own checkout instead
+    of the main checkout (#12341 review j#62643).
     """
 
     workspace_id: str
@@ -116,6 +120,7 @@ class MembershipObservation:
     claude_pane: str
     window: str
     window_id: str
+    repo_root: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,7 @@ class WorkspaceMembership:
     registry_present: bool
     anchor_present: bool
     warnings: tuple[MembershipWarning, ...] = ()
+    registry_canonical_path: str = ""
 
     @property
     def panes_present(self) -> bool:
@@ -159,6 +165,7 @@ class WorkspaceMembership:
             "workspace_id": self.workspace_id,
             "label": self.label,
             "repo_root": self.repo_root,
+            "registry_canonical_path": self.registry_canonical_path,
             "lane_id": self.lane_id,
             "lane_label": self.lane_label,
             "session": self.session,
@@ -307,10 +314,15 @@ def build_membership(
 
     warnings.extend(_registry_warnings(facts))
 
+    # Prefer the Unit's live checkout root (the worktree / lane the panes actually
+    # sit in) over the registry's single canonical path, which only ever names the
+    # main checkout and would mislabel a worktree (#12341 review j#62643). The
+    # registry path is kept alongside for transparency.
+    repo_root = observation.repo_root or facts.repo_root
     return WorkspaceMembership(
         workspace_id=workspace_id,
         label=facts.label,
-        repo_root=facts.repo_root,
+        repo_root=repo_root,
         lane_id=lane_id,
         lane_label=observation.lane_label,
         session=session,
@@ -323,6 +335,7 @@ def build_membership(
         registry_present=facts.registry_present,
         anchor_present=facts.anchor_present,
         warnings=tuple(warnings),
+        registry_canonical_path=facts.repo_root,
     )
 
 
@@ -336,13 +349,15 @@ def absent_membership(
     lane_label: str,
     registry_present: bool,
     anchor_present: bool,
+    registry_canonical_path: str = "",
 ) -> WorkspaceMembership:
     """A :class:`WorkspaceMembership` for a workspace NOT loaded in the cockpit (pure).
 
     `cockpit status --repo <repo>` resolves a workspace's identity even when it is
     absent, so the operator gets an explicit "not loaded" answer (the #12339
     mis-read) instead of silence. ``member`` is ``False`` and ``geometry_status``
-    is :data:`GEOM_ABSENT`.
+    is :data:`GEOM_ABSENT`. ``repo_root`` is the queried checkout (not the registry
+    canonical path), so a worktree query echoes the path the operator asked about.
     """
     warnings = [
         MembershipWarning(
@@ -377,6 +392,7 @@ def absent_membership(
         registry_present=registry_present,
         anchor_present=anchor_present,
         warnings=tuple(warnings),
+        registry_canonical_path=registry_canonical_path,
     )
 
 
@@ -474,6 +490,14 @@ def format_membership_text(
             )
             if ws.repo_root:
                 lines.append(f"  repo: {ws.repo_root}")
+            if (
+                ws.registry_canonical_path
+                and ws.registry_canonical_path != ws.repo_root
+            ):
+                lines.append(
+                    f"  registry canonical: {ws.registry_canonical_path} "
+                    "(workspace main checkout)"
+                )
             for warning in ws.warnings:
                 lines.append(f"  [warning] {warning.code}: {warning.message}")
 
