@@ -29,11 +29,13 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5720
+    lines: 6072
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
-      here. Largest decomposition target.
+      here. Largest decomposition target. Baseline raised 5720 -> 6072 on
+      integrating already-reviewed #12341 cockpit membership list/status CLI
+      handlers into this module (#12321 j#62683).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
 
