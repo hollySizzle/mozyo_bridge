@@ -123,11 +123,11 @@ material な退役では、対象 issue に以下を記録する。
 
 - **`#11813` event/timeline backend**: handoff / event の timeline を扱う際も、worktree の作成・削除を backend の責務に取り込まない。timeline は lane / pane / gate の **事実の記録** に留め、worktree lifecycle manager 化しない。
 - **`#11887` overlay scaffold / governance 配布**: overlay 配布に worktree lifecycle orchestration を混ぜない。overlay は配布物の scope であり、worktree 運用は runbook scope。両者を混同しない (本 issue では `#11887` を混ぜない)。
-- 配布物最小化の方針は [[logic-scaffold-distribution-minimization]] と整合させる。worktree runbook は repo-local docs であり、配布される shared skill / preset 本体には入れない。
+- 配布物最小化の方針(配布する artifact を最小に保ち、worktree runbook のような repo-local docs は配布される shared skill / preset 本体に入れず repo-local docs に置く)に整合させる。この方針の正本は mozyo_bridge repo-local の [[logic-scaffold-distribution-minimization]] (配布されない repo-local logic) であり、adopter 側の依存 doc ではない。配布先では本段落の plain text 指針で足り、この repo-local doc を読みに行く必要はない。
 
 ## private / operator policy 分離
 
-- runbook 例は generic に保つ。personal な絶対 path・private repo 名・operator 固有の並列 lane policy を OSS default に混入させない ([[rule-public-private-boundary]])。
+- runbook 例は generic に保つ。personal な絶対 path・private repo 名・operator 固有の並列 lane policy を OSS default に混入させない。この public/private 境界の正本は mozyo_bridge repo-local の [[rule-public-private-boundary]] (配布されない repo-local rule) であり、adopter 側の依存 doc ではない。配布先では同等の guardrail が配布済み `mozyo-bridge-agent` skill safety reference (`skills/mozyo-bridge-agent/references/safety.md`) の `## Secret Handling` および central preset `agent-workflow.md` の credential / secret 制約として読めるため、本段落の plain text 指針で足りる。
 - 社内固有の削除条件・並列上限・命名規約は private operating policy 側に置く。mozyo_bridge dogfood の local soft profile は mozyo_bridge repo-local の [[logic-coordinator-sublane-development-flow]] (配布されない repo-local spine) に記録してよいが、portable core default ではないと明示する。adopter 向けの portable な sublane 規律は配布済み `mozyo-bridge-agent` skill workflow reference を読む。
 - shared skill (`skills/mozyo-bridge-agent/**`) は全 downstream に配布されるため、worktree サブレーン runbook を shared skill 本体へ入れない。repo-local logic doc (本 doc) に置く。
 
