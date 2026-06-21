@@ -900,16 +900,16 @@ curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scrip
 MOZYO_BRIDGE_CLAUDE_SCOPE=global sh /tmp/install_mozyo_bridge_claude_skill.sh
 ```
 
-`MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` の形は env var が `curl` にしか渡らないため、pipe の右側で `sh` の直前に env を置く形を使ってください。両方に配布したい場合は、明確な意図のもとで script を二度実行します (`scope=project` と `scope=global` を順に)。
+この script の default scope は `global` です (#12360 で `project` から変更)。env 未設定の bare invocation は legacy personal skill (`~/.claude/skills/`) を書き、project mirror は明示的に `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を渡した時だけ書きます。`VAR=... curl ... | sh` の形は env var が `curl` にしか渡らず script が default scope (`global`) で走るため、`project` など非 default scope を選ぶには pipe の右側で `sh` の直前に env を置く形を使ってください。両方の destination に配布したい場合は、明確な意図のもとで script を二度実行します (`scope=global` と `scope=project` を順に)。
 
 **Claude Code は同名 skill について personal/user skill (`~/.claude/skills/`) を project skill (`<project>/.claude/skills/`) より優先します** (公式 docs: <https://code.claude.com/docs/en/skills>)。多くの開発ツールと逆向きの慣習なので注意してください。Plugin skills は `plugin-name:skill-name` で namespace 分離されるため、personal / project skill とは衝突しません。
 
 Install destinations (fallback scripts):
 
 - `${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/` (Codex user-global)
-- `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/` (Claude user/personal, scope=global)
-- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/mozyo-bridge-agent/` (Claude project adapter, scope=project)
-- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/skills/mozyo-bridge-agent/` (Claude project shared body, scope=project)
+- `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/` (Claude user/personal, scope=global — default)
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/mozyo-bridge-agent/` (Claude project adapter, scope=project — legacy opt-in)
+- `${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}/skills/mozyo-bridge-agent/` (Claude project shared body, scope=project — legacy opt-in)
 
 Both fallback scripts fetch `hollySizzle/mozyo_bridge` `main` by default. Override the source with `MOZYO_BRIDGE_SKILL_REPO`, `MOZYO_BRIDGE_SKILL_REF`, or `MOZYO_BRIDGE_SKILL_ARCHIVE_URL` (the last accepts any tarball URL, including `file:///...` for local-checkout install).
 

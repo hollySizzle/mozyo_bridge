@@ -33,13 +33,13 @@ Grace period 中の運用:
 
 - `.claude/skills/mozyo-bridge-agent/` 配下の tracked file (SKILL.md, references/project-map.md, references/release.md, references/safety.md, references/workflow.md) は当面残す。canonical 本体は `skills/mozyo-bridge-agent/` のまま。
 - 新規 install では plugin marketplace 経由を推奨し、project-scope install は legacy fallback として扱う (本文書の `## Legacy Global Claude Skill Deprecation` 節と同じ位置づけ)。
-- `scripts/install_claude_skill.sh` の `MOZYO_BRIDGE_CLAUDE_SCOPE=project` 動作は **当面残置** する。`MOZYO_BRIDGE_CLAUDE_SCOPE=global` と同様、deprecation 通知 (script header の DEPRECATED block) で警告する。即時の warn-and-exit / 失敗化は行わない。
+- `scripts/install_claude_skill.sh` の default scope は `global` に移し、`MOZYO_BRIDGE_CLAUDE_SCOPE=project` は **明示 opt-in** とする (#12360)。bare invocation (env 未設定) は project scope を選ばなくなり、project mirror を書くのは明示的に `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を渡した場合だけになる。project scope 動作自体は **当面残置** し、script header の DEPRECATED block + project 分岐の非致命的 stderr note で legacy/offline/internal opt-in であることを案内する。即時の warn-and-exit / 失敗化は行わない。
 - `references/safety.md` 等の project-scope mirror が canonical (`skills/mozyo-bridge-agent/references/safety.md`) からドリフトしないよう、mirror は手動更新時に canonical を先に編集し、その content を写す運用とする (`PluginMarketplaceTest` が plugin mirror のドリフトを検出するのと同じ思想)。project-scope mirror については現時点で自動 drift test は無いが、本節の grace-period が終わるまでに doc-regression test を追加するか撤去するかを判断する。
 
 Removal criteria (本 grace period を解除する条件):
 
 - 次の release line で project-scope install を相談される事例が無くなったとき。
-- かつ `scripts/install_claude_skill.sh` の caller / smoke で `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を使う経路が無いことが確認できたとき (`grep -rn "MOZYO_BRIDGE_CLAUDE_SCOPE=project"` がない、または fresh-tester acceptance smoke でも plugin path のみ使用に切り替わったとき)。
+- かつ `scripts/install_claude_skill.sh` の caller / smoke で `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を使う経路が無いことが確認できたとき (`grep -rn "MOZYO_BRIDGE_CLAUDE_SCOPE=project"` がない、または fresh-tester acceptance smoke でも plugin path のみ使用に切り替わったとき)。#12360 で default scope を `global` に移したため、残る `MOZYO_BRIDGE_CLAUDE_SCOPE=project` 出現はこの policy / scope 説明と明示 opt-in の案内文だけになり、active な install caller の project default は消えた。turnkey acceptance は plugin marketplace path を primary に据えつつ、release-ref pin が必要な場合だけ legacy script を `MOZYO_BRIDGE_CLAUDE_SCOPE=global` で明示利用する (project scope は使わない)。
 - 上記が満たされたら、別 task として `.claude/skills/mozyo-bridge-agent/` の `git rm` + scaffold/test/doc の整合更新を実施する。本 task ではその follow-up を Open task として残す。
 
 ## Legacy Global Claude Skill Deprecation
@@ -106,10 +106,10 @@ correction (#10699 commit `<this commit>`) で per-doc 出現回数を verbatim 
 
 ## Claude install scope
 
-`scripts/install_claude_skill.sh` は `MOZYO_BRIDGE_CLAUDE_SCOPE` で配布範囲を切り替える。値は `project` (default) または `global`。両方に配布したい場合は二度実行する。
+`scripts/install_claude_skill.sh` は `MOZYO_BRIDGE_CLAUDE_SCOPE` で配布範囲を切り替える。値は `global` (default) または `project` (legacy opt-in)。両方に配布したい場合は二度実行する。#12360 で default を `project` から `global` に移した: bare invocation は legacy personal skill (global) を書き、project mirror は明示的に `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を渡した場合だけ書く。
 
-- `project` (default): 対象 project の `.claude/skills/mozyo-bridge-agent/` (adapter) と `skills/mozyo-bridge-agent/` (shared body) に同期する。Claude Code を当該 project root から起動した時だけ Claude が認識する。既存利用者の挙動を保つため default に置く。**注意**: Claude Code の precedence rule により、同じ name (`mozyo-bridge-agent`) を持つ personal skill が `~/.claude/skills/` にもあると、project copy は shadow されて Claude は personal copy を読む。project scope は (a) personal install を持たない利用者、(b) repo に skill を commit して contributor 全員に配布したい場合、(c) 実行時に personal を一時的に外して project copy を使いたい場合に有効。
-- `global`: shared body を `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/` に同期する。Claude Code の personal skill として全 session で有効。Codex の `${CODEX_HOME:-$HOME/.codex}/skills/` と対称な配置で、personal install は同名 project skill を override する。global scope では adapter は生成しない (Claude Code は user skill 直下の `SKILL.md` を直接読むため)。
+- `global` (default): shared body を `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/` に同期する。Claude Code の personal skill として全 session で有効。Codex の `${CODEX_HOME:-$HOME/.codex}/skills/` と対称な配置で、personal install は同名 project skill を override する。global scope では adapter は生成しない (Claude Code は user skill 直下の `SKILL.md` を直接読むため)。なお新規 install の primary は plugin marketplace path であり、この legacy script は offline / internal mirror / fresh-tester acceptance smoke 用の fallback である。
+- `project` (legacy opt-in): 対象 project の `.claude/skills/mozyo-bridge-agent/` (adapter) と `skills/mozyo-bridge-agent/` (shared body) に同期する。Claude Code を当該 project root から起動した時だけ Claude が認識する。**grace-period deprecation 中で default ではない**: 明示的に `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を渡した時だけ走り、script は project 分岐で非致命的な deprecation note を stderr に出す。**注意**: Claude Code の precedence rule により、同じ name (`mozyo-bridge-agent`) を持つ personal skill が `~/.claude/skills/` にもあると、project copy は shadow されて Claude は personal copy を読む。project scope を明示 opt-in したい正当な場面は (a) personal/global install を持たない利用者、(b) repo に skill を commit して contributor 全員に配布したい場合、(c) 実行時に personal を一時的に外して project copy を使いたい場合に限られる。新規 install では plugin marketplace path を推奨する。
 
 `scope=both` は提供しない。Claude Code の precedence rule で personal が project を上書きするため、両方同名で install すると project copy が常に shadow され混乱を生む。両方の destination を同時に持ちたい場合は、明確な意図のもとで `scope=project` と `scope=global` を順に実行する。
 
@@ -167,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main/scrip
 MOZYO_BRIDGE_CLAUDE_SCOPE=global sh /tmp/install_mozyo_bridge_claude_skill.sh
 ```
 
-`MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` の形は env が `curl` にしか渡らず、script は default の `scope=project` で走るため不可。
+env を pipe の右側 (`sh` の直前) に置くのは、`VAR=... curl ... | sh` の形だと env が `curl` にしか渡らず script は env 未設定で走る (= script の default scope を使う) ためである。default は `global` なので global install ではたまたま正しい結果になるが、`project` など非 default scope を明示したい場合はこの誤形では無視されるので、scope を確実に選ぶには env-before-`sh` 形を使う。
 
 Claude Code は user/personal skill だけで運用する場合、project root から起動する必要はない。project skill を併用する場合は対象 project root から起動する。**personal/user skill (`~/.claude/skills/`) は同名 project skill を override する**ため、project 固有の skill body を使いたい場合は (a) personal install を行わない、(b) project skill の name を変えて衝突を避ける、または (c) plugin marketplace 経由で `mozyo-bridge-agent:mozyo-bridge-agent` namespace を使う。
 
@@ -213,7 +213,7 @@ beta tester が GitHub `main` から CLI を install した後、skill 配布が
 curl/script による install を併用または primary 不可で fallback した場合の検証。
 
 1. Codex: `scripts/install_codex_skill.sh` 実行後、`${CODEX_HOME:-$HOME/.codex}/skills/mozyo-bridge-agent/SKILL.md` が存在する。
-2. Claude: `curl ... -o /tmp/install_mozyo_bridge_claude_skill.sh` → `MOZYO_BRIDGE_CLAUDE_SCOPE=global sh /tmp/install_mozyo_bridge_claude_skill.sh` (env var は pipe の右側で `sh` の直前に置く) で `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` が legacy directory に作られる。`global` scope では `.claude/skills/` 配下に adapter を生成しない。`MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` の形は env が `curl` にしか渡らず、script は default の `scope=project` で走るため不可。
+2. Claude: `curl ... -o /tmp/install_mozyo_bridge_claude_skill.sh` → `MOZYO_BRIDGE_CLAUDE_SCOPE=global sh /tmp/install_mozyo_bridge_claude_skill.sh` (env var は pipe の右側で `sh` の直前に置く) で `${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}/skills/mozyo-bridge-agent/SKILL.md` が legacy directory に作られる。`global` scope では `.claude/skills/` 配下に adapter を生成しない。env を pipe の右側 (`sh` の直前) に置くのは、`VAR=... curl ... | sh` の形だと env が `curl` にしか渡らず script が env 未設定 (= default scope) で走るためで、default が `global` の今は global install ではたまたま一致するが、非 default scope を選ぶには env-before-`sh` 形が必要になる。
 3. fallback path だけ使った場合、`mozyo-bridge doctor` の `codex_skill: ok` / `claude_skill: ok` で 1 と 2 を 1 command で確認できる。primary plugin install と fallback を併用すると plugin skill (`mozyo-bridge-agent:mozyo-bridge-agent`) と legacy skill (`mozyo-bridge-agent`) が両方有効になり、Claude Code 内で 2 つの skill 名として出る (plugin namespace で衝突しない)。
 
 ### PyPI release との見分け

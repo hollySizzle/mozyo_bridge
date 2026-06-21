@@ -59,6 +59,8 @@ Install user-global rules and skills. Because this acceptance test verifies reco
 
 Pin invariant: when the package install is `mozyo-bridge==<X.Y.Z>`, set `MOZYO_BRIDGE_SKILL_REF` to the matching git ref. The standard choice is the release tag `v<X.Y.Z>` for production publishes, the same tag for pre-releases (e.g. `v0.1.0a1`), or a specific commit SHA when the release has no tag yet (rare; record the SHA in the acceptance log).
 
+Claude skill install path. The **documented primary** Claude install is the plugin marketplace path (`claude plugin marketplace add hollySizzle/mozyo_bridge` → `claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user`); that is the path a normal fresh user follows and what `skill-distribution.md` records as primary. This acceptance test deliberately uses the **pinned legacy script** (`install_claude_skill.sh`) instead, because the pin invariant above requires fetching the skill tree at the exact release ref, and `MOZYO_BRIDGE_SKILL_REF` ref-pinning is the legacy script's sanctioned `fresh-tester acceptance smoke` use case (see `skill-distribution.md` `## Legacy Global Claude Skill Deprecation`). The acceptance run uses `MOZYO_BRIDGE_CLAUDE_SCOPE=global` only — it never uses the `project` opt-in. When a future plugin-marketplace install supports equivalent release-ref pinning, switch this step to the marketplace path so the acceptance smoke stops depending on the legacy script entirely.
+
 ```bash
 export MOZYO_BRIDGE_SKILL_REF=v<X.Y.Z>   # matches the installed mozyo-bridge==<X.Y.Z>
 
@@ -71,7 +73,7 @@ curl -fsSL "https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/${MOZYO_B
 curl -fsSL "https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/${MOZYO_BRIDGE_SKILL_REF}/scripts/install_claude_skill.sh" | MOZYO_BRIDGE_CLAUDE_SCOPE=global sh
 ```
 
-The pipe-then-env form is required for the Claude install line. `MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` delivers the env var to `curl`, not to the `sh` that runs the script, and silently falls back to `scope=project`. The `mozyo-bridge doctor` `next_action` enforces the correct form; this doc keeps the same shape.
+The pipe-then-env form is used for the Claude install line. `MOZYO_BRIDGE_CLAUDE_SCOPE=global curl ... | sh` delivers the env var to `curl`, not to the `sh` that runs the script, so the script runs with its default scope. Since #12360 that default is `global`, so the malformed form happens to still install global here — but the explicit `| MOZYO_BRIDGE_CLAUDE_SCOPE=global sh` keeps the intent unambiguous and is required to select any non-default scope. The `mozyo-bridge doctor` `next_action` enforces this form; this doc keeps the same shape.
 
 The install scripts internally use `MOZYO_BRIDGE_SKILL_REF` (per `skill-distribution.md`) to fetch the matching `skills/mozyo-bridge-agent/` tree from the pinned ref. Verify by reading the installed `SKILL.md` after install and confirming its content matches the tag's tree.
 
