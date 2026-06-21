@@ -38,7 +38,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_ui import (
+from mozyo_bridge.application.cockpit_actions import (
     CockpitActionError,  # noqa: F401  (kept for parity / explicit contract)
     grouped_action_preview,
 )
@@ -66,7 +66,7 @@ from mozyo_bridge.session_inventory import (
     WorkspaceIdentity,
 )
 
-COCKPIT_UI = "mozyo_bridge.application.cockpit_ui"
+COCKPIT_UI = "mozyo_bridge.application.cockpit_actions"
 
 # Public-safe keys the detail / command payloads are allowed to carry. The detail
 # is a display projection: it must never surface a pane id, repo path, credential,
