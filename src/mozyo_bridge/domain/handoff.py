@@ -344,9 +344,13 @@ NextActionOwner = Literal["receiver", "sender", "operator"]
 class DeliveryOutcome:
     """Structured result emitted by the new handoff primitive.
 
-    Task 1214760547941073 will turn this into a durable Asana / Redmine
-    delivery record; the primitive itself must not perform that ticket-system
-    persistence.
+    Redmine #12311 adds the durable delivery-record persistence seam over this
+    outcome: :func:`mozyo_bridge.domain.delivery_record_sink.build_delivery_record_note`
+    turns it (plus the redacted ``build_delivery_record`` body) into a persistable
+    ``delivery_notification`` note, persisted opt-in via a fail-closed ticket
+    sink. The persisted record is a delivery pointer only — never a workflow gate
+    or owner approval — and this primitive performs no ticket-system write itself;
+    the live write transport stays a credential-gated follow-up.
     """
 
     status: Status

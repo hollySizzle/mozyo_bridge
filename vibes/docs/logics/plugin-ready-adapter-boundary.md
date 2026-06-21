@@ -911,6 +911,77 @@ free correlation handle for review, deliberately *not* bound to the packaging
 - No second packaging-metadata source; no workflow / owner / close / routing /
   send authority granted to a manifest.
 
+## Implemented Delivery-Record Persistence Seam (Redmine #12311)
+
+The handoff primitive already produced the structured `DeliveryOutcome` and the
+pasteable `build_delivery_record` markdown, but persisting that record into the
+durable ticket system (a Redmine journal note / an Asana comment) was a manual
+paste step left as a follow-up. #12311 adds the *core-owned persistence
+boundary* for it — the smallest fail-closed seam that makes the integration
+explicit while keeping the existing send byte-compatible and writing no ticket.
+
+### Where it lives
+
+- `src/mozyo_bridge/domain/delivery_record_sink.py` — **core**, pure. The
+  record-class constant `RECORD_CLASS_DELIVERY` (`delivery_notification`); the
+  normalized `DeliveryRecordNote` (built from a `DeliveryOutcome` + the redacted
+  record body) and `DeliveryReceipt`; the explicit failure vocabulary
+  (`PERSIST_FAILURE_REASONS`); the `DeliveryRecordSink` protocol and the narrow
+  `RedmineNoteTransport` write seam; the built-in sinks (`Null`, `Unsupported`,
+  `Unwired`, `Redmine`); and the fail-closed `resolve_delivery_record_sink`. It
+  imports no provider implementation and performs no I/O — the dependency only
+  points provider -> core, like `ticket_adapter`.
+- `src/mozyo_bridge/application/commands.py` — `orchestrate_handoff` gains the
+  opt-in `_maybe_persist_delivery_record` call on the typed terminal paths
+  (`pending_input` / `sent`), behind `--persist-delivery`, plus `_emit_receipt`.
+
+### Boundary as enforced in code
+
+- **A delivery record is a notification pointer, never an authority.**
+  `DeliveryRecordNote` fail-closes (`DeliveryRecordError`) on any
+  `record_class` other than `delivery_notification`, so a persisted record can
+  never be smuggled in as a workflow gate (`implementation_done` /
+  `review_request` / `review_result`) or an owner approval — those stay the
+  separate `WorkflowGate` / `OwnerApproval` core constructs. The receipt carries
+  no gate/approval semantics either.
+- **Source semantics are not mixed.** A Redmine note is a journal note; an Asana
+  note is a comment. The Redmine sink refuses a non-Redmine note
+  (`unsupported_source`); resolution maps `source=asana` to the fail-closed
+  `UnsupportedSourceDeliveryRecordSink`. v0.8 keeps Redmine as the only write
+  provider category.
+- **No credential, ever.** Neither the note nor the receipt carries a token, API
+  key, base URL, or any secret; the note body is the already-redacted pasteable
+  record (`build_delivery_record` keeps absolute / private paths out of pasteable
+  text). The seam does no credential handling at all.
+- **Explicit failure.** A transport reports failure through
+  `DeliveryTransportError` with a reason normalized to `PERSIST_FAILURE_REASONS`
+  (`provider_unavailable` / `credential_missing` / `unauthorized` /
+  `unsupported_source` / `no_anchor` / `transport_error`) — never a silent
+  success (Implementation Guardrail #4).
+
+### Staged: live write is a deferred follow-up
+
+Per Implementation Guardrail #6 (any new provider surface that **writes tickets**
+requires per-task review) and `redmine_context`'s read-only-by-design boundary,
+the live, credential-gated Redmine journal-write transport is **not** wired in
+this pass. Production resolves to `UnwiredDeliveryRecordSink`
+(`provider_unavailable`) — the same staged-resolution posture as provider
+selection (#12249/#12251): the boundary is expressible and the note is
+constructed, but no live dispatch path runs yet. The full persisted path is
+exercised in tests through an injected `RedmineNoteTransport` fake, so no network
+runs here. A follow-up issue implements the live transport (reusing the trusted
+`MOZYO_REDMINE_URL` / `MOZYO_REDMINE_API_KEY` base in `redmine_context`) under
+its own per-task review.
+
+### Non-goals (unchanged, restated for the implementation)
+
+- the pane message is never the durable source of truth; persistence is an
+  opt-in, best-effort pointer that never blocks or alters the send;
+- a delivery ACK is never task completion / review / approval;
+- no credential is ever logged, journaled, or carried on a record / receipt;
+- no third-party / arbitrary-code provider loading; no public ABI promise for
+  these record shapes.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core

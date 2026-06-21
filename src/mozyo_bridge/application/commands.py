@@ -3880,6 +3880,98 @@ def _record_command_from_args(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _emit_receipt(receipt, *, record_format: str) -> None:
+    """Emit the durable delivery-record persistence receipt (Redmine #12311).
+
+    Carries no credential by construction — only the provider id, the persisted
+    flag, an explicit reason, an optional ``issue/journal`` location pointer, and
+    the record class. ``text`` / ``both`` print a one-line human summary; ``json``
+    / ``both`` print the receipt JSON last so a script can scrape it.
+    """
+    if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
+        if receipt.persisted:
+            print(
+                f"- Durable delivery record persisted to {receipt.location} "
+                f"(class: {receipt.record_class})"
+            )
+        else:
+            print(
+                "- Durable delivery record not persisted "
+                f"(reason: {receipt.reason})"
+            )
+    if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
+        print(receipt.to_json())
+
+
+def _maybe_persist_delivery_record(
+    args: argparse.Namespace,
+    outcome,
+    *,
+    duplicate_lane_panes: list[str] | None,
+    record_format: str,
+    command: str | None,
+) -> None:
+    """Best-effort durable persistence of the delivery record (Redmine #12311).
+
+    Opt-in via ``--persist-delivery`` and a no-op otherwise, so the default
+    handoff behavior is byte-identical. Called only on the *typed* terminal
+    paths (``pending_input`` / ``sent``): a blocked-before-typing outcome has no
+    delivery to durably record, and its pasteable record already prints to
+    stdout.
+
+    The persisted body is the SAME redacted markdown the CLI prints, so the
+    durable record and the pasted record never diverge. The note records the
+    delivery outcome, the receiver/target identity, and (only when one was live
+    at send time) the duplicate same-lane advisory — the conditions Redmine
+    #12311 fixes in tests.
+
+    This NEVER alters the pane-send outcome: persistence runs after the outcome
+    is emitted and any failure — including an unexpected sink error — is
+    swallowed and reported as a ``transport_error`` receipt. The live Redmine
+    journal-write transport is a credential-gated follow-up under per-task review
+    (``vibes/docs/logics/plugin-ready-adapter-boundary.md`` Implementation
+    Guardrail #6; ``redmine_context`` is read-only by design), so production
+    resolves to a fail-closed ``provider_unavailable`` receipt; the seam, note
+    construction, and persistence conditions are exercised with an injected
+    transport in tests.
+    """
+    if not getattr(args, "persist_delivery", False):
+        return
+    from mozyo_bridge.domain.delivery_record_sink import (
+        DeliveryReceipt,
+        PERSIST_TRANSPORT_ERROR,
+        build_delivery_record_note,
+        resolve_delivery_record_sink,
+    )
+
+    try:
+        record_markdown = build_delivery_record(
+            outcome,
+            command=command,
+            duplicate_lane_panes=duplicate_lane_panes or None,
+        )
+        note = build_delivery_record_note(
+            outcome,
+            record_markdown=record_markdown,
+            has_duplicate_advisory=bool(duplicate_lane_panes),
+        )
+        sink = resolve_delivery_record_sink(
+            enabled=True,
+            source=outcome.source or "",
+        )
+        receipt = sink.persist(note)
+    except Exception:
+        # Best-effort: durable persistence must never break or alter the pane
+        # send (the delivery already happened). Surface an explicit
+        # transport_error receipt instead of raising.
+        receipt = DeliveryReceipt(
+            provider=getattr(outcome, "source", None),
+            persisted=False,
+            reason=PERSIST_TRANSPORT_ERROR,
+        )
+    _emit_receipt(receipt, record_format=record_format)
+
+
 def orchestrate_handoff(
     args: argparse.Namespace,
     *,
@@ -3890,8 +3982,18 @@ def orchestrate_handoff(
 
     Owns: receiver-pane resolution, agent-target validation, internal pane
     snapshot, marker-prefixed type, landing wait, fail-closed C-u rollback,
-    and structured outcome emission. Does NOT touch Asana/Redmine APIs; that
-    durable delivery record integration lives in a follow-up task.
+    and structured outcome emission.
+
+    Durable delivery-record persistence is an explicit, opt-in seam (Redmine
+    #12311): with ``--persist-delivery`` the typed terminal paths
+    (``pending_input`` / ``sent``) hand the redacted record to a fail-closed
+    ticket sink (:mod:`mozyo_bridge.domain.delivery_record_sink`) via
+    :func:`_maybe_persist_delivery_record`. It is best-effort and never alters
+    the send. The live Redmine journal-write transport remains a credential-gated
+    follow-up under per-task review (``redmine_context`` is read-only by design),
+    so by default this primitive still performs no ticket-system API write:
+    production resolves to a ``provider_unavailable`` receipt and ``source=asana``
+    to ``unsupported_source``.
 
     The standard path does its own pre-type capture so callers do not need to
     run ``mozyo-bridge read`` first.
@@ -4609,6 +4711,13 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
         )
+        _maybe_persist_delivery_record(
+            args,
+            outcome,
+            duplicate_lane_panes=duplicate_lane_panes,
+            record_format=record_format,
+            command=record_command,
+        )
         return 0
 
     landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
@@ -4668,6 +4777,13 @@ def orchestrate_handoff(
         record_format=record_format,
         command=record_command,
         duplicate_lane_panes=duplicate_lane_panes or None,
+    )
+    _maybe_persist_delivery_record(
+        args,
+        outcome,
+        duplicate_lane_panes=duplicate_lane_panes,
+        record_format=record_format,
+        command=record_command,
     )
     return 0
 
