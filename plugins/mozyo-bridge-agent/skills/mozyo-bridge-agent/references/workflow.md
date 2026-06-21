@@ -509,6 +509,57 @@ Retirement is a coordinator duty, sequenced explicitly: **the coordinator runs t
 - **Destructive ops stay gated and identified.** A pane-kill / worktree-remove runs only with a green `safety_preflight` and a positively identified target; an unverified target identity is itself a `retire_blockers` entry. The standard never authorizes a destructive op on an unclosed issue, a dirty worktree, an unpushed commit, or an unknown target.
 - **Keep operator-specific policy out of OSS defaults.** The concrete retirement cadence, the Redmine saved query used to enumerate closed-lane candidates, and any private grace window before a closed lane is retired are operator runtime policy (see `vibes/docs/rules/public-private-boundary.md`). The portable part is *that a closed lane is a retire candidate, that a dependency ancestor is retained until downstream consumed, that an open hold condition forbids retirement, that a destructive op requires a green safety preflight, and that the coordinator owns the retirement drain after the callback drain* — all in the fixed-field shape above, bracketed by `retire_ready` and `retired`.
 
+## Post-Dispatch Fill Loop
+
+The sections above define each drain in isolation: `## Sublane Coordinator Callback` (callbacks in), `## Coordinator Stop And Next-Action Standard` (stops out), `## Owner Approval Aggregation` (owner-waiting converges), `## Stall And No-Progress Detection Standard` (missing callbacks), `## Sublane Completion Guardrails` (callback drain + downstream resume), and `## Sublane Retirement Drain` (retirement after the callback drain). What ties them into one coordinator turn is missing here: **a coordinator that dispatches one sublane and then stops, while independent ready work and lane capacity both remain, silently serializes a pipeline that could run in parallel.** This section ports the pipeline-first fill discipline so the drains and the next dispatch read as one loop instead of separate one-shot gates. It is the portable extract of the repo-local spine `vibes/docs/logics/coordinator-sublane-development-flow.md` (the distribution gap identified in Redmine #12353 j#62946 and shipped under #12355); the spine stays the deep first-read, and the operator-specific lane numbers stay out of this distributed body.
+
+### Pipeline-first is the default, serialization is the recorded exception
+
+Sublane bandwidth is the coordinator's attention, not CPU capacity. When durable-record-ready implementation work exists and the admission conditions below hold, dispatching it is the *preferred* action; serializing every unit through one lane wastes the multi-lane model and is a throughput smell, not a safe default. A lane that is already `implementing` is positive pipeline occupancy — it is **not** a reason for the coordinator to idle. Conversely, the coordinator deliberately serializes when parallelism would raise total latency or risk: an undecided design decision, file / invariant / merge-order overlap, a drain only the coordinator can do, a release / credential / destructive-operation gate, or a callback backlog that would hide another lane.
+
+### Minimal coordinator-blocking state vocabulary
+
+Classify every lane from the durable record (not from pane layout) before deciding to fill or stop. The portable distinction is which states block the coordinator:
+
+- **coordinator-blocking** — `callback_due`, `review_waiting`, `owner_waiting`, `integration_waiting`, `close_waiting`, and `blocked` (including `callback_delivery_failed`). Drain these before opening optional new work; a close-ready issue left open or a closed issue with only an unmerged local commit is a durable-state inconsistency, not harmless bookkeeping.
+- **non-blocking** — `implementing` is counted toward lane capacity but does **not** serialize the coordinator on its own; `retire_ready` and `idle` lanes are drained or reused, not treated as active work.
+
+This is the minimal vocabulary the drain sections already imply (the full nine-class taxonomy and the lane bandwidth profile live in the spine); enumeration is from the durable record and is pane-count-independent, exactly as `## Owner Approval Aggregation` requires.
+
+### Drain Order
+
+When several lanes need attention and no stronger durable dependency reorders them, drain in this order, then dispatch, then re-run the loop:
+
+1. production / release / credential / destructive-operation blockers.
+2. `owner_waiting` that only the coordinator can aggregate (`## Owner Approval Aggregation`).
+3. `review_waiting`.
+4. `integration_waiting` — a commit exists but merge / push / patch-equivalence / explicit deferral is unrecorded.
+5. `close_waiting` — durable close gates met but the issue is still open.
+6. `blocked` or `callback_due`, including callback delivery failure (`## Stall And No-Progress Detection Standard`).
+7. `retire_ready` lanes consuming cockpit / worktree attention (`## Sublane Retirement Drain`).
+8. new dispatch.
+
+This order is for coordinator bandwidth only; it does not change any Redmine gate, review quality, or the Close Approval Separation between Review Gate and owner close approval.
+
+### Re-run the loop after every dispatch and every drain
+
+The fill check is not a one-time pre-dispatch admission. The coordinator re-classifies the active lane set and either fills to capacity or records why it stopped at each of these points: right after a sublane dispatch succeeds, right after draining a callback / review / owner / integration / close / retirement, before presenting an owner-facing next action, and before judging "the next task". A single successful dispatch is **not** a coordinator stop condition, and "one lane is already implementing" is **not** a stop reason.
+
+When coordinator-blocking states are clear, only `implementing` lanes are active, independent ready work remains, and lane capacity is left, the coordinator dispatches the next sublane through the target lane's Codex gateway (`## Sublane Coordinator Callback` routing). When it does **not** dispatch despite ready work, it records exactly one durable fill decision — never silent waiting, a pane vibe, or "one is already running":
+
+- `dispatch_next` — capacity and independent ready work remain; the next sublane is dispatched.
+- `stop_no_ready_work` — no durable-record-ready implementation work exists.
+- `stop_overlap` — file / invariant / merge-order conflict makes serialization safer; record the concrete dependency.
+- `stop_coordinator_blocking` — a coordinator-blocking state must be drained first.
+- `stop_soft_profile_full` — the operator's local lane capacity is reached.
+- `stop_owner_or_release_gate` — an owner decision, release, credential, or destructive-operation gate is active.
+
+### Boundaries this standard does not relax
+
+- **Filling the pipeline is not bypassing a gate.** Post-dispatch fill never opens work past an active owner / release / credential / destructive-operation gate, never overrides an overlap that needs serialization, and never relaxes the Drain Order's priority of coordinator-blocking states over new dispatch.
+- **The durable record stays the source of truth.** Lane classification, the fill decision, and the stop reason are all derived from and recorded on Redmine journals, not from pane scrollback / `status` / `doctor`. A bandwidth or stop record names issue ids and state classes only.
+- **Keep operator-specific policy out of OSS defaults.** The concrete lane-count soft profile (target / burst / stop numbers), the private cockpit composition, and the operator's path / branch naming are operator runtime policy that lives in the spine's local profile and the operator's own runbook (see `vibes/docs/rules/public-private-boundary.md`), never in this distributed body. The portable part is *that the coordinator re-runs the fill loop after every dispatch and every drain, classifies lanes by the minimal coordinator-blocking vocabulary, drains in the Drain Order, and records one durable fill decision whenever ready work is not dispatched* — the concrete numbers are the operator's.
+
 ## Main-Unit Claude Safe-Use Boundary
 
 `## Sublane Coordinator Callback` and `## Coordinator Stop And Next-Action Standard` assume the main coordinator lane is a Codex pane. Some cockpit layouts also place a **Claude pane in the main coordinator unit itself**, idle in auto mode beside the coordinator Codex. It is tempting to spend that pane on coordinator work to save the coordinator Codex's context. This section bounds that use so the main-unit Claude saves context without blurring the coordinator's owner-facing / gate-deciding role (Redmine #11858, from the #11850 multi-lane PoC).

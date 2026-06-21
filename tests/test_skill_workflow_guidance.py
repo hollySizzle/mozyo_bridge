@@ -120,6 +120,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Stall And No-Progress Detection Standard",
         "## Sublane Completion Guardrails",
         "## Sublane Retirement Drain",
+        "## Post-Dispatch Fill Loop",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -250,6 +251,21 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "### retire_ready and retired journal shape",
         "### The coordinator owns the retirement drain, after the callback drain",
         "the coordinator runs the retirement drain after the callback drain",
+        # Post-dispatch fill loop (Redmine #12355, portable extract of the
+        # repo-local spine identified by the #12353 inventory). Pipeline-first
+        # is the default and serialization is the recorded exception; a single
+        # successful dispatch is not a coordinator stop; the minimal
+        # coordinator-blocking vocabulary, the Drain Order, and the one durable
+        # fill decision are pinned so the distributed body keeps the loop that
+        # ties the drains to the next dispatch.
+        "### Pipeline-first is the default, serialization is the recorded exception",
+        "### Minimal coordinator-blocking state vocabulary",
+        "### Drain Order",
+        "### Re-run the loop after every dispatch and every drain",
+        "A single successful dispatch is **not** a coordinator stop condition",
+        "`stop_coordinator_blocking`",
+        "`stop_soft_profile_full`",
+        "portable extract of the repo-local spine",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",
