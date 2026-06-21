@@ -5,7 +5,10 @@ import shlex
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Sequence
+
+if TYPE_CHECKING:
+    from mozyo_bridge.domain.role_profile import RoleProfileResolution
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -301,6 +304,7 @@ def build_notification_body(
     summary: Optional[str],
     receiver: str,
     execution_root: Optional["ExecutionRoot"] = None,
+    role_profile: Optional["RoleProfileResolution"] = None,
 ) -> str:
     """Compose the pane text body that follows the landing marker.
 
@@ -309,6 +313,14 @@ def build_notification_body(
     project root is recoverable without pane scrollback. The clause does not
     replace the durable-anchor contract: the receiver still reads the anchor
     from the source-of-truth system before acting.
+
+    When ``role_profile`` is supplied (Redmine #12388), a trailing single-line
+    clause names the receiver's resolved role profile, its source path, and its
+    version so the receiver reads its role contract without guessing a template
+    path. The body stays single-line by construction (it is delivered via one
+    ``tmux send-keys -l`` and the landing-marker gate greps the line), so the
+    fully resolved multi-line contract lives in the durable delivery record, not
+    the pane.
     """
     if kind not in KIND_LABELS:
         raise AnchorError(f"unknown handoff kind: {kind!r}; expected one of {sorted(KIND_LABELS)}")
@@ -322,6 +334,8 @@ def build_notification_body(
     )
     if execution_root is not None:
         body = f"{body} {execution_root.notification_clause()}"
+    if role_profile is not None:
+        body = f"{body} {role_profile.pointer_clause()}."
     return body
 
 
@@ -367,6 +381,13 @@ class DeliveryOutcome:
     # Redmine #12098: receiver target execution root / workdir, when it differs
     # from the pane cwd / repo root. `None` for the common same-root case.
     execution_root: Optional[dict[str, Any]] = None
+    # Redmine #12388: resolved role profile structured pointer fields
+    # (`role_profile` / `profile_source` / `profile_version` /
+    # `unresolved_placeholders`) carried so the receiver reads its role contract
+    # without guessing a template path. Free-text-free and durable-record safe;
+    # the fully resolved contract body stays in the delivery record, not here.
+    # `None` when no `--role-profile` was requested (the explicit fallback).
+    role_profile: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -889,12 +910,32 @@ def _execution_root_pointer_or_dash(execution_root: Optional[dict[str, Any]]) ->
     ).record_pointer()
 
 
+def _role_profile_pointer_or_dash(role_profile: Optional[dict[str, Any]]) -> str:
+    """Render the structured role-profile pointer fields (Redmine #12388).
+
+    Carries only the free-text-free structured fields (role token, source path,
+    version, unresolved placeholder names), so it is durable-record safe and
+    independent of whether the fully resolved contract body is included.
+    """
+    if not role_profile:
+        return "—"
+    token = role_profile.get("role_profile") or "—"
+    source = role_profile.get("profile_source") or "—"
+    version = role_profile.get("profile_version") or "—"
+    pointer = f"`{token}` (source: `{source}`, version: `{version}`)"
+    unresolved = role_profile.get("unresolved_placeholders") or []
+    if unresolved:
+        pointer += f" — unresolved fields: {', '.join(unresolved)}"
+    return pointer
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome",
     *,
     command: Optional[str] = None,
     recovery_command: Optional[str] = None,
     duplicate_lane_panes: Optional[Sequence[str]] = None,
+    role_profile_contract: Optional[str] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -917,6 +958,16 @@ def build_delivery_record(
     advisory so the receiver pane and any stale-input duplicate stay both
     visible and the receiver/actor record cannot silently diverge. Like
     ``recovery_command`` it does not affect the ``json`` outcome shape.
+
+    ``role_profile_contract`` (Redmine #12388) is the optional fully resolved
+    role-profile contract body (the template with structured fields
+    substituted). When present it is appended as a fenced block so the receiver
+    reads its role contract from the durable record without guessing a template
+    path. The structured pointer fields (role token / source / version /
+    unresolved placeholders) always render from ``outcome.role_profile``; this
+    body is rendered only for the stdout / pasteable record because it may embed
+    operator-supplied field values. It does not affect the ``json`` outcome
+    shape.
     """
     header = f"Delivery result — {_header_label(outcome.status, outcome.reason, outcome.mode)}"
     lines = [
@@ -930,6 +981,7 @@ def build_delivery_record(
         f"- Notification marker: `{outcome.notification_marker or '—'}`",
         f"- Durable anchor: {_anchor_pointer_or_dash(outcome.anchor)}",
         f"- Target execution root: {_execution_root_pointer_or_dash(outcome.execution_root)}",
+        f"- Role profile: {_role_profile_pointer_or_dash(outcome.role_profile)}",
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -1001,6 +1053,19 @@ def build_delivery_record(
             "verb (`read target again`, `retry`, `refresh`) should the "
             "preset's `Notification fails` branch fire."
         )
+    if role_profile_contract:
+        # Redmine #12388: the fully resolved role-profile contract body (template
+        # with structured fields substituted). Rendered into the pasteable record
+        # so the receiver reads its role contract from the durable anchor without
+        # guessing a template path. Passed separately (not read off the outcome)
+        # because it may embed operator-supplied `--profile-field` values; the
+        # opt-in auto-persist path omits it, mirroring `--record-command`.
+        lines.append("")
+        lines.append("Resolved role profile contract:")
+        lines.append("")
+        lines.append("```text")
+        lines.extend(role_profile_contract.splitlines())
+        lines.append("```")
     contract = _receiver_contract_line(outcome.status, outcome.reason, outcome.receiver)
     if contract:
         lines.append("")
@@ -1020,6 +1085,7 @@ def make_outcome(
     notification_marker: Optional[str],
     source: Optional[str] = None,
     execution_root: Optional[ExecutionRoot] = None,
+    role_profile: Optional["RoleProfileResolution"] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1042,6 +1108,7 @@ def make_outcome(
         next_action=action,
         notification_marker=notification_marker,
         execution_root=execution_root.to_dict() if execution_root else None,
+        role_profile=role_profile.to_structured_dict() if role_profile else None,
     )
 
 
