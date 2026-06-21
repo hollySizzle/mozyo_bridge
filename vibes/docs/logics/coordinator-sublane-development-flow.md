@@ -81,13 +81,14 @@ mozyo-bridge agents targets --session <cockpit-session>
 2. work unit と branch / worktree / lane / pane の対応を Redmine に記録する。
 3. dispatch 前に bandwidth admission を確認する。未読 review_request、owner_waiting、close_waiting、integration_waiting、blocked、callback_due / callback_delivery_failed は coordinator-blocking state として先に drain する。
 4. 既存 lane が `implementing` のみで、coordinator が review / owner / close / callback / blocker を待っていない場合は、新しい independent ready work を止めない。`implementing` lane は coordinator-blocking state ではなく、pipeline dispatch の対象である。止める場合は、file / invariant overlap、merge order、release gate、owner decision など具体的な直列化理由を Redmine dispatch decision に残す。
-5. cross-lane handoff は target-lane Codex gateway へ送る。Claude への direct delivery は same-lane addressing に限定する。
-6. target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す。`--no-submit` / `--mode pending` は operator / debug fallback であり標準 dispatch default にしない。
-7. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
-8. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
-9. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
-10. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
-11. callback / review / owner / integration / close / retirement を drain してから、後続 Version / US 提案へ進む。
+5. sublane を 1 本 dispatch しただけで管制塔 turn を完了扱いしない。dispatch 成功後、callback / review / owner / integration / close / retirement drain 後、または next-action planning の前に、必ず pipeline fill を再実行する。local soft profile に余力があり、coordinator-blocking state がなく、independent ready work が残るなら次の sublane を dispatch する。止める場合は Redmine に `stop_no_ready_work`、`stop_overlap`、`stop_coordinator_blocking`、`stop_soft_profile_full`、`stop_owner_or_release_gate` のいずれかと根拠を書く。
+6. cross-lane handoff は target-lane Codex gateway へ送る。Claude への direct delivery は same-lane addressing に限定する。
+7. target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す。`--no-submit` / `--mode pending` は operator / debug fallback であり標準 dispatch default にしない。
+8. sublane Claude が implementation_done / review_request を Redmine に記録する。commit hash を gate に書く場合は origin reachability を先に確認する。
+9. sublane は handoff-worthy state で管制塔 Codex へ callback する。callback は Redmine durable anchor への pointer であり、work log ではない。
+10. 管制塔 Codex が review / owner close approval / integration disposition / Close Gate を処理する。
+11. close 後、管制塔 Codex が retirement drain を実行する。retire_ready / retired journal で destructive 操作の前後を bracket する。
+12. callback / review / owner / integration / close / retirement を drain してから、pipeline fill を再実行し、その後に後続 Version / US 提案へ進む。
 
 ### callback 欠落時の sweep
 
@@ -161,6 +162,21 @@ endif
 $validate("implementing lane alone does not serialize the coordinator");
 $record("pipeline dispatch or explicit serialization reason");
 !endprocedure
+!procedure $pipeline_fill_loop()
+:trigger = after dispatch / after callback drain / after review-owner-integration-close drain / after retirement drain / before next-action stop;
+:classify active lanes = implementing / coordinator-blocking / retire_ready / idle;
+if (coordinator-blocking exists?) then (yes)
+  :drain coordinator-owned queue first;
+else (no)
+  while (soft profile has capacity and independent ready work exists?)
+    :record dispatch decision;
+    :dispatch next sublane via target-lane Codex gateway;
+  endwhile
+endif
+$validate("one successful dispatch is not a coordinator stop condition");
+$validate("ready independent work requires dispatch or concrete serialization reason");
+$record("post_dispatch_fill_check / fill_decision");
+!endprocedure
 !procedure $retirement_contract()
 :retirement_state = retire_candidate / retire_ready / retain_until_downstream_consumed / retire_blocked / retired;
 :fields = retirement_state, lane, worktree, pane, redmine_issue_state, retain_reason, downstream_consumed, retire_blockers, safety_preflight, durable_anchor;
@@ -213,6 +229,7 @@ if (実装型?) then (yes)
     :dispatch decision を Redmine に記録;
     $record("dispatch decision");
     :target-lane Codex gateway へ handoff;
+    $pipeline_fill_loop()
     |target-lane Codex|
     $validate("cross-lane は target-lane Codex gateway 経由");
     :target-lane Codex が same-lane Claude へ handoff;
@@ -227,6 +244,7 @@ if (実装型?) then (yes)
     $validate("callback は Redmine durable anchor への pointer");
     $callback_sweep()
     :管制塔が Review Gate を処理;
+    $pipeline_fill_loop()
   else (no)
     |管制塔 Codex|
     :stop_and_drain / blocker / main_lane_exception を記録;
@@ -246,6 +264,7 @@ if (Review approved?) then (yes)
     $retirement_contract()
     :sublane を退役;
   endif
+  $pipeline_fill_loop()
   $backlog_reconciliation()
   $followup_contract()
   |Owner|
