@@ -40,11 +40,14 @@ What core owns here (and never delegates to a provider):
 What a provider owns (the actual ticket-system write) is reached only through
 the narrow :class:`RedmineNoteTransport` seam, which this module *defines* but
 does not *implement*: the live, credential-gated Redmine journal-write transport
-is a deferred follow-up requiring per-task review (boundary doc Implementation
-Guardrail #6; ``redmine_context`` is read-only by design). Production therefore
-resolves to a fail-closed :class:`UnwiredDeliveryRecordSink`
-(``provider_unavailable``); tests drive the full persisted path through an
-injected fake transport, so no network ever runs here.
+lives in ``infrastructure.redmine_note_transport`` (Redmine #12347), keeping the
+dependency provider -> core. This module stays pure and import-free of that
+provider; it owns only source/anchor validation and receipt shaping. When no
+transport is injected (the default, and any caller that has not set the explicit
+``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in) resolution falls back to the
+fail-closed :class:`UnwiredDeliveryRecordSink` (``provider_unavailable``); tests
+drive the full persisted path through an injected fake transport, so no network
+runs here.
 
 Non-goals (kept explicit so the seam does not drift):
 
@@ -264,14 +267,15 @@ class UnsupportedSourceDeliveryRecordSink:
 
 
 class UnwiredDeliveryRecordSink:
-    """Resolution seam for a source whose live write transport is not wired yet.
+    """Resolution seam for a Redmine source with no injected write transport.
 
-    The Redmine journal-write transport is a credential-gated follow-up under
-    per-task review (boundary doc Implementation Guardrail #6; ``redmine_context``
-    is read-only by design). Until it is wired, production resolves here and
-    fails closed with ``provider_unavailable`` — the same staged-seam posture as
-    the provider-selection resolution (Redmine #12249): the boundary is
-    expressible and selectable, but no live dispatch path runs yet.
+    The live Redmine journal-write transport now exists
+    (``infrastructure.redmine_note_transport``, Redmine #12347) but is gated by
+    an explicit ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in: when it is unset no
+    transport is injected and resolution falls back here, failing closed with
+    ``provider_unavailable`` so a plain ``--persist-delivery`` stays
+    byte-compatible. This is the same fail-closed posture as the
+    provider-selection resolution (Redmine #12249).
     """
 
     def __init__(self, source: str):
@@ -387,8 +391,10 @@ def resolve_delivery_record_sink(
     - ``enabled=False`` (the default, opt-out) -> :class:`NullDeliveryRecordSink`,
       so the handoff behavior is byte-identical.
     - ``source=redmine`` with no transport -> :class:`UnwiredDeliveryRecordSink`
-      (``provider_unavailable``): the live write is the deferred follow-up.
-      With an injected transport (tests) -> :class:`RedmineDeliveryRecordSink`.
+      (``provider_unavailable``): the live write is gated by the explicit
+      ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in, so without it no transport is
+      injected. With an injected transport (the env opt-in set, or a test fake)
+      -> :class:`RedmineDeliveryRecordSink`.
     - ``source=asana`` (or any non-Redmine source) ->
       :class:`UnsupportedSourceDeliveryRecordSink` (``unsupported_source``).
     """

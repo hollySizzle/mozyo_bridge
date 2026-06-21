@@ -423,6 +423,85 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         self.assertFalse(receipts[0]["persisted"])
         self.assertEqual(PERSIST_TRANSPORT_ERROR, receipts[0]["reason"])
 
+    def test_live_opt_in_wires_transport_and_persists(self) -> None:
+        # Redmine #12347: with the persistence flag, the CLI builds the live
+        # transport from the env for a Redmine source and injects it into the
+        # sink. Here the factory is patched to a fake transport, so the persisted
+        # receipt reports the real RedmineDeliveryRecordSink success path.
+        transport = _FakeTransport(journal_id="77001")
+        argv = self._base_argv() + ["--persist-delivery"]
+        with patch(
+            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "redmine_delivery_transport_from_env",
+            return_value=transport,
+        ):
+            result, stdout = self._run_send(argv)
+
+        self.assertEqual(0, result)
+        receipts = [
+            json.loads(line)
+            for line in stdout.splitlines()
+            if line.strip().startswith("{") and "persisted" in line
+        ]
+        self.assertEqual(1, len(receipts))
+        self.assertTrue(receipts[0]["persisted"])
+        self.assertEqual(PERSIST_OK, receipts[0]["reason"])
+        self.assertEqual(
+            "redmine:issue=12311:journal=77001", receipts[0]["location"]
+        )
+        # The transport was actually called with the issue anchor.
+        self.assertEqual(1, len(transport.calls))
+        self.assertEqual("12311", transport.calls[0][0])
+
+    def test_live_opt_in_credential_missing_surfaces_through_wiring(self) -> None:
+        # A live transport that fails closed (e.g. no key in the trusted env)
+        # surfaces its explicit reason through the wiring, without breaking send.
+        argv = self._base_argv() + ["--persist-delivery"]
+        with patch(
+            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "redmine_delivery_transport_from_env",
+            return_value=_RaisingTransport(reason=PERSIST_CREDENTIAL_MISSING),
+        ):
+            result, stdout = self._run_send(argv)
+
+        self.assertEqual(0, result)
+        receipts = [
+            json.loads(line)
+            for line in stdout.splitlines()
+            if line.strip().startswith("{") and "persisted" in line
+        ]
+        self.assertEqual(1, len(receipts))
+        self.assertFalse(receipts[0]["persisted"])
+        self.assertEqual(PERSIST_CREDENTIAL_MISSING, receipts[0]["reason"])
+
+    def test_live_opt_in_does_not_auto_journal_record_command(self) -> None:
+        # The #12311 invariant holds through the live #12347 path: the persisted
+        # note body omits the user-supplied free-text --record-command even when
+        # a live transport is wired. Abstract placeholders only.
+        sentinel = "deploy --token DROP-TOKEN-SENTINEL --root /workspace/project-alpha"
+        transport = _FakeTransport(journal_id="77002")
+        argv = self._base_argv() + [
+            "--persist-delivery",
+            "--record-command",
+            sentinel,
+        ]
+        with patch(
+            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "redmine_delivery_transport_from_env",
+            return_value=transport,
+        ):
+            result, stdout = self._run_send(argv)
+
+        self.assertEqual(0, result)
+        # Printed stdout record keeps the command for audit-replay ...
+        self.assertIn(sentinel, stdout)
+        # ... but the body handed to the live transport omits it entirely.
+        self.assertEqual(1, len(transport.calls))
+        persisted_body = transport.calls[0][1]
+        self.assertNotIn(sentinel, persisted_body)
+        self.assertNotIn("DROP-TOKEN-SENTINEL", persisted_body)
+        self.assertNotIn("- Command:", persisted_body)
+
     def test_record_command_not_auto_journaled_but_kept_in_printed_record(self) -> None:
         # Finding 1 (j#62549): user-supplied --record-command can carry a
         # private path / credential-shaped argument. It must stay in the printed

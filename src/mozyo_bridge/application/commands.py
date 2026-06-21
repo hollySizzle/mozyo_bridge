@@ -3932,12 +3932,17 @@ def _maybe_persist_delivery_record(
     This NEVER alters the pane-send outcome: persistence runs after the outcome
     is emitted and any failure — including an unexpected sink error — is
     swallowed and reported as a ``transport_error`` receipt. The live Redmine
-    journal-write transport is a credential-gated follow-up under per-task review
-    (``vibes/docs/logics/plugin-ready-adapter-boundary.md`` Implementation
-    Guardrail #6; ``redmine_context`` is read-only by design), so production
-    resolves to a fail-closed ``provider_unavailable`` receipt; the seam, note
-    construction, and persistence conditions are exercised with an injected
-    transport in tests.
+    journal-write transport (Redmine #12347) is wired behind a second explicit
+    opt-in: ``--persist-delivery`` selects the seam, and the trusted-environment
+    ``MOZYO_REDMINE_DELIVERY_WRITE`` flag enables the live write. Without the env
+    opt-in the transport is ``None`` and resolution stays the byte-compatible
+    staged ``provider_unavailable`` posture; with it the credential-safe
+    transport reads the trusted base URL / API key from the env at write time
+    and fails closed (``credential_missing`` / ``unauthorized`` /
+    ``provider_unavailable`` / ``transport_error``) without ever carrying a
+    credential (``vibes/docs/logics/plugin-ready-adapter-boundary.md``
+    Implementation Guardrail #6; the credential boundary is reused verbatim from
+    ``redmine_context``).
     """
     if not getattr(args, "persist_delivery", False):
         return
@@ -3946,6 +3951,10 @@ def _maybe_persist_delivery_record(
         PERSIST_TRANSPORT_ERROR,
         build_delivery_record_note,
         resolve_delivery_record_sink,
+    )
+    from mozyo_bridge.domain.handoff import SOURCE_REDMINE
+    from mozyo_bridge.infrastructure.redmine_note_transport import (
+        redmine_delivery_transport_from_env,
     )
 
     try:
@@ -3962,9 +3971,20 @@ def _maybe_persist_delivery_record(
             record_markdown=record_markdown,
             has_duplicate_advisory=bool(duplicate_lane_panes),
         )
+        # Live Redmine journal-write transport (Redmine #12347): built only when
+        # the explicit `MOZYO_REDMINE_DELIVERY_WRITE` opt-in is set in the
+        # trusted environment; otherwise `None`, so resolution stays the
+        # byte-compatible staged `provider_unavailable` posture. The transport
+        # reads the trusted base URL / API key from the env at write time and
+        # fails closed (credential_missing / unauthorized / provider_unavailable
+        # / transport_error) without ever carrying a credential.
+        redmine_transport = None
+        if (outcome.source or "") == SOURCE_REDMINE:
+            redmine_transport = redmine_delivery_transport_from_env()
         sink = resolve_delivery_record_sink(
             enabled=True,
             source=outcome.source or "",
+            redmine_transport=redmine_transport,
         )
         receipt = sink.persist(note)
     except Exception:

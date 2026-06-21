@@ -243,10 +243,14 @@ def configure_handoff_parser(
             "so the send is byte-identical without it. The durable record is a "
             "delivery pointer only — never a review / completion / approval — "
             "and persistence is best-effort and never blocks or alters the "
-            "pane send. The live Redmine write transport is a credential-gated "
-            "follow-up under per-task review; until it is wired this resolves "
-            "to a fail-closed `provider_unavailable` receipt, and `source=asana` "
-            "has no write provider in v0.8 (`unsupported_source`)."
+            "pane send. The live Redmine write transport (Redmine #12347) is "
+            "wired behind a second explicit opt-in: set the trusted-environment "
+            "`MOZYO_REDMINE_DELIVERY_WRITE` flag to enable the live journal "
+            "write (it reuses the trusted `MOZYO_REDMINE_URL` / "
+            "`MOZYO_REDMINE_API_KEY` credential boundary and fails closed on "
+            "missing / unauthorized credentials). Without that env opt-in this "
+            "stays a fail-closed `provider_unavailable` receipt, and "
+            "`source=asana` has no write provider in v0.8 (`unsupported_source`)."
         ),
     )
 

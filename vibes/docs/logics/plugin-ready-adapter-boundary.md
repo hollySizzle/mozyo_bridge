@@ -963,24 +963,18 @@ explicit while keeping the existing send byte-compatible and writing no ticket.
   `unsupported_source` / `no_anchor` / `transport_error`) — never a silent
   success (Implementation Guardrail #4).
 
-### Staged: live write is a deferred follow-up
+### Staged: live write was a deferred follow-up (wired in #12347)
 
-Per Implementation Guardrail #6 (any new provider surface that **writes tickets**
-requires per-task review) and `redmine_context`'s read-only-by-design boundary,
-the live, credential-gated Redmine journal-write transport is **not** wired in
-this pass. Production resolves to `UnwiredDeliveryRecordSink`
-(`provider_unavailable`) — the same staged-resolution posture as provider
-selection (#12249/#12251): the boundary is expressible and the note is
-constructed, but no live dispatch path runs yet. The full persisted path is
+At #12311, per Implementation Guardrail #6 (any new provider surface that
+**writes tickets** requires per-task review) and `redmine_context`'s
+read-only-by-design boundary, the live, credential-gated Redmine journal-write
+transport was deliberately **not** wired: production resolved to
+`UnwiredDeliveryRecordSink` (`provider_unavailable`) — the same staged-resolution
+posture as provider selection (#12249/#12251) — and the full persisted path was
 exercised in tests through an injected `RedmineNoteTransport` fake, so no network
-runs here.
-
-The live transport is classified as Redmine #12347, not an implicit later note:
-#12347 wires the real Redmine journal-write transport (reusing the trusted
-`MOZYO_REDMINE_URL` / `MOZYO_REDMINE_API_KEY` base in `redmine_context`) under
-its own per-task review and direct owner close approval. Until #12347 lands,
-`--persist-delivery` remains a staged seam and production resolution continues to
-fail closed with `provider_unavailable`.
+ran. That live transport is now implemented under #12347 (next section); the
+staged fallback remains the byte-compatible default whenever the explicit
+live-write opt-in is unset.
 
 ### Non-goals (unchanged, restated for the implementation)
 
@@ -990,6 +984,80 @@ fail closed with `provider_unavailable`.
 - no credential is ever logged, journaled, or carried on a record / receipt;
 - no third-party / arbitrary-code provider loading; no public ABI promise for
   these record shapes.
+
+## Wired Live Redmine Delivery-Record Transport (Redmine #12347)
+
+#12347 wires the live, credential-safe Redmine journal-write transport the
+#12311 seam left staged, closing the deferred follow-up under its own per-task
+review and direct owner close approval. It is the smallest live write that keeps
+every #12311 invariant: a persisted delivery record stays notification metadata,
+no user-supplied free text is auto-journaled, and no credential reaches a repo
+file, log, or journal.
+
+### Where it lives
+
+- `src/mozyo_bridge/infrastructure/redmine_note_transport.py` — the built-in
+  **Redmine note write provider**, the single concrete `RedmineNoteTransport`
+  implementation (`RedmineNoteHttpTransport`). It performs the
+  provider-owned network write only; core (`delivery_record_sink`) still owns the
+  record class, source semantics, and receipt shaping. The dependency points
+  provider -> core (it imports the core failure vocabulary, never the reverse).
+- `src/mozyo_bridge/application/commands.py` — `_maybe_persist_delivery_record`
+  builds the transport from the environment for a Redmine-sourced outcome and
+  injects it into `resolve_delivery_record_sink`; the persistence call stays
+  best-effort and never alters the pane send.
+
+### Explicit opt-in (the "明示 opt-in")
+
+The live network write is gated **twice**, so it is always a deliberate decision
+and a plain `--persist-delivery` stays byte-compatible:
+
+1. `--persist-delivery` selects the persistence seam (the existing #12311 CLI
+   opt-in).
+2. `MOZYO_REDMINE_DELIVERY_WRITE` (an explicit truthy env value) enables the live
+   write. The second gate lives in the **trusted environment**, not a repo file
+   or CLI argument, so it sits inside the same boundary as the credentials — a
+   hostile checkout can never turn `--persist-delivery` into a live write.
+
+When the env opt-in is unset, `redmine_delivery_transport_from_env()` returns
+`None`, resolution falls back to `UnwiredDeliveryRecordSink`, and the receipt is
+the byte-compatible `provider_unavailable`.
+
+### Credential boundary (reused verbatim from `redmine_context`)
+
+- The trusted base URL comes **only** from `MOZYO_REDMINE_URL` (routed through
+  `normalize_base_url`), so the write destination host is fixed by the daemon
+  environment and nothing else. Only the issue id — the URL path, taken from the
+  durable handoff anchor on that same trusted Redmine — is caller-supplied, and
+  it is percent-quoted so it cannot inject a host/query segment.
+- The API key comes only from `MOZYO_REDMINE_API_KEY`, is sent only in the
+  request header, and is never echoed into a payload, log, receipt, or the
+  `DeliveryTransportError` reason. Credentials are read lazily at write time.
+
+### Fail-closed surface
+
+Every failure is an explicit `DeliveryTransportError` reason
+(`PERSIST_FAILURE_REASONS`), surfaced through the existing
+`RedmineDeliveryRecordSink` reason-mapping, never a silent success:
+
+- no/invalid trusted base URL -> `provider_unavailable`;
+- no API key -> `credential_missing`;
+- HTTP 401 / 403 -> `unauthorized`;
+- any other HTTP status, network error, or unexpected failure -> `transport_error`.
+
+A successful notes-only `PUT /issues/<id>.json` returns `204 No Content` with no
+journal id, so the transport returns the empty id and the sink records a
+`redmine:issue=<id>` location pointer.
+
+### Non-goals (unchanged, restated for the implementation)
+
+- the delivery record is never review / completion / approval / close truth; the
+  transport writes a `delivery_notification` journal note only;
+- Asana live write is out of scope — `source=asana` still fails closed with
+  `unsupported_source` (journal vs comment semantics are not mixed);
+- no third-party / arbitrary-code provider loading; this is the single built-in
+  write provider for v0.8, with no public ABI promise;
+- no release / publish / tag.
 
 ## Follow-up Split
 
