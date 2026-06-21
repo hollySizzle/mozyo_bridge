@@ -100,6 +100,8 @@ def _with_categories_from_args(args: argparse.Namespace) -> set[str]:
     labels: set[str] = set()
     if getattr(args, "with_worktree_runbook", False):
         labels.add("worktree-runbook")
+    if getattr(args, "with_sublane_flow", False):
+        labels.add("sublane-flow")
     return labels
 
 

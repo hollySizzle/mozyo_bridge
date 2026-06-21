@@ -94,9 +94,11 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/scaffold/rules.py
-    lines: 1027
+    lines: 1081
     reason: >-
-      Scaffold preset/rule installation logic. Just over threshold.
+      Scaffold preset/rule installation logic. Just over threshold. Grew in
+      #12363 for the opt-in sublane-flow profile (category registration, the
+      router-variant template selector, and the sublane_flow_enabled toggle).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

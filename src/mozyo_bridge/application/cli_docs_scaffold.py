@@ -167,6 +167,21 @@ def register(sub) -> None:
             "to register the docs by hand."
         ),
     )
+    scaffold_apply.add_argument(
+        "--with-sublane-flow",
+        dest="with_sublane_flow",
+        action="store_true",
+        help=(
+            "Activate the sublane development flow as a runtime-active "
+            "reference. Installs the portable profile doc under "
+            "`vibes/docs/profiles/` AND adds a thin sublane read-route "
+            "section to the generated `AGENTS.md` / `CLAUDE.md`. Opt-in "
+            "(default-off): without this flag the routers carry no sublane "
+            "route and the doc is not written. Private operator policy "
+            "(lane count, cockpit composition, paths, session naming) is "
+            "never shipped; the scaffold never mutates `catalog.yaml`."
+        ),
+    )
     scaffold_apply.set_defaults(func=cmd_scaffold_apply)
 
     scaffold_diff = scaffold_sub.add_parser(
@@ -212,6 +227,16 @@ def register(sub) -> None:
         help=(
             "Preview the diff as if `scaffold apply --with-worktree-runbook` "
             "were run (include the opt-in worktree/sublane runbook docs)."
+        ),
+    )
+    scaffold_diff.add_argument(
+        "--with-sublane-flow",
+        dest="with_sublane_flow",
+        action="store_true",
+        help=(
+            "Preview the diff as if `scaffold apply --with-sublane-flow` were "
+            "run (include the opt-in sublane profile doc and the router "
+            "sublane read-route section)."
         ),
     )
     scaffold_diff.set_defaults(func=cmd_scaffold_diff)
