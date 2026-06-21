@@ -69,6 +69,28 @@ chat_pane通知: 正本ではなく通知のみ
 
 project が実装者 / 監査者 split を採用していない場合は、上記を採用しないでよい。ただし採用したら、本 file の境界を曖昧にしない。
 
+### 応答言語ポリシー
+
+agent の **ユーザー向け応答** (操作説明・進捗報告・handoff narrative・質問・確認) の言語は product 固定値ではなく、運用 workspace / operator の preference として扱う。OSS 配布物には特定言語専用の前提を焼き込まない。
+
+```yaml
+応答言語:
+  既定: ユーザーが使用した言語に追従する
+  project_local_preference: |
+    workspace が project-local language preference を宣言している場合はそれを優先する。
+    宣言先は各 tool router (`AGENTS.md` / `CLAUDE.md`) の project-local-additions block、
+    または project-local docs。preference と user 入力言語が食い違う場合は user 入力を優先する。
+  machine_readable_literal: |
+    言語設定に関わらず literal に保つもの: gate 名 / transport kind / JSON field と値 /
+    CLI command と flag / code 識別子 / commit trailer (`Refs:`, `issue_<id>`, `Co-Authored-By`) /
+    file path。Redmine journal の構造化 field・識別子も literal でよく、散文 narrative の言語のみ
+    本ポリシーに従う。
+  multilingual: |
+    本ポリシーは特定言語を強制しない。多言語 workspace は各自の preference を宣言して拡張できる。
+    preset / skill / scaffold template など OSS 配布物は言語中立を保ち、
+    「常に特定言語で応答する」を product 既定として hard-code しない。
+```
+
 ### US-Level Audit Model
 
 通常開発の標準単位を次のように定める。実装者 = UserStory implementer、監査者 = UserStory auditor、owner = close approver。
