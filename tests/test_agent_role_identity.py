@@ -142,6 +142,47 @@ class DiscoverAgentsRoleTest(unittest.TestCase):
         self.assertEqual(CONFIDENCE_STRONG, recs[0].confidence)
         self.assertFalse(recs[0].ambiguous)
 
+    def test_duplicate_group_window_names_keep_pane_option_unambiguous(self) -> None:
+        # #12336 regression: two Project Group windows in one session share the
+        # same display name (#12330 groups by name on purpose). Every pane carries
+        # a strong `@mozyo_agent_role` and a distinct lane, so duplicate display
+        # names must NOT make any pane ambiguous — pane id + option + lane still
+        # identify the target. Before the fix all four panes were AMBIG=1 /
+        # contradictory_sources despite role_source=pane_option / confidence=strong.
+        recs = discover_agents([
+            _pane("%81", "mozyo-cockpit:2.0", window_name="mozyo_bridge",
+                  agent_role="codex", lane_id="lane-A"),
+            _pane("%82", "mozyo-cockpit:2.1", window_name="mozyo_bridge",
+                  agent_role="claude", lane_id="lane-A"),
+            _pane("%83", "mozyo-cockpit:3.0", window_name="mozyo_bridge",
+                  agent_role="codex", lane_id="lane-B"),
+            _pane("%84", "mozyo-cockpit:3.1", window_name="mozyo_bridge",
+                  agent_role="claude", lane_id="lane-B"),
+        ])
+        self.assertEqual(4, len(recs))
+        for rec in recs:
+            self.assertEqual(ROLE_SOURCE_PANE_OPTION, rec.role_source)
+            self.assertEqual(CONFIDENCE_STRONG, rec.confidence)
+            self.assertFalse(
+                rec.ambiguous,
+                f"{rec.pane_id} should stay unambiguous under a duplicate "
+                "display window name",
+            )
+
+    def test_duplicate_window_names_still_ambiguous_on_window_name_rail(self) -> None:
+        # The legacy window-name rail keeps its fail-closed behavior: two windows
+        # both named `claude` (no pane option) in one session genuinely can not be
+        # told apart by name, so both panes stay ambiguous. The #12336 fix only
+        # exempts panes whose identity authority is the pane option.
+        recs = discover_agents([
+            _pane("%1", "repo:0.0", window_name="claude", command="claude"),
+            _pane("%2", "repo:1.0", window_name="claude", command="claude"),
+        ])
+        self.assertEqual(2, len(recs))
+        for rec in recs:
+            self.assertEqual(ROLE_SOURCE_WINDOW_NAME, rec.role_source)
+            self.assertTrue(rec.ambiguous)
+
 
 class FindAgentWindowRoleTest(unittest.TestCase):
     def _patch(self, panes):

@@ -606,6 +606,29 @@ TargetRecord の preflight で配送先を決める。
 > release / publish / tag なし。tmux window / iTerm tab / OS window は依然 routing / review /
 > approval / close authority ではない。
 
+> 実装メモ (#12336): #12330 が主張する「window NAME は identity でない / `agents targets` は
+> 従来どおり見える」不変条件を、**target inventory の ambiguity 分類**でも貫いた。#12330 の
+> post-close live smoke (j#62426) で、同一 Project Group の sublane を複数 launch し display 名が
+> 衝突する tmux window が複数できると、`agents targets` がそれらの pane を
+> `AMBIG=1` / `attention=unknown` / `reason=contradictory_sources` と誤分類した
+> (`ROLE_SOURCE=pane_option` / `CONF=strong` であっても)。原因は
+> `agent_discovery.discover_agents` が `(session, window_name)` の重複 (= 同一 display 名の
+> 複数 window) を **role 識別の出所に関わらず** `window_ambiguous` として OR していたこと。
+> 修正: duplicate `(session, window_name)` を ambiguity に算入するのは **window 名が role 識別の
+> authority であるとき (`role_source == window_name` の legacy rail) に限定**する。role が pane
+> option から解決した pane では window 名は display-only であり、pane id + option + lane が一意に
+> target を識別するため、display 名の衝突では ambiguous にしない。これにより #12330 が grouping の
+> ために意図的に共有する重複 display 名 (`project:<repo>` group) が strong な pane-option identity を
+> 無効化しなくなる。legacy window-name rail (同一 session に `claude` window が 2 つ等) の
+> fail-closed は不変。`agents targets` の ambiguous → attention `contradictory_sources` 写像
+> (`commands._attention_for_candidate`) 自体は変えず、誤って立っていた `ambiguous` を discovery 層で
+> 立てないようにする最小修正。tmux window 名は引き続き display-only で routing authority ではない。
+> 回帰テスト: `tests/test_agent_role_identity.py`
+> (`test_duplicate_group_window_names_keep_pane_option_unambiguous` /
+> `test_duplicate_window_names_still_ambiguous_on_window_name_rail`)、
+> `tests/test_compact_target_discovery.py`
+> (`test_duplicate_group_window_names_stay_healthy_not_contradictory`)。
+
 ## TargetRecord / UnitRecord
 
 ### TargetRecord

@@ -421,6 +421,31 @@ class AgentsTargetsAttentionTest(unittest.TestCase):
         states = {c["attention"]["attention_state"] for c in json.loads(out)}
         self.assertTrue(states <= {"healthy", "unknown"}, states)
 
+    def test_duplicate_group_window_names_stay_healthy_not_contradictory(self):
+        # #12336 end-to-end: two Project Group windows sharing one display name
+        # (#12330) each hold strong pane-option panes in distinct lanes. The
+        # duplicate display name must not flip them to AMBIG=1 /
+        # contradictory_sources; every pane stays healthy with a clean identity.
+        rc, out = self._run([
+            _pane("%81", "mozyo-cockpit:2.0", window_name="mozyo_bridge",
+                  agent_role="codex", lane_id="lane-A"),
+            _pane("%82", "mozyo-cockpit:2.1", window_name="mozyo_bridge",
+                  agent_role="claude", lane_id="lane-A"),
+            _pane("%83", "mozyo-cockpit:3.0", window_name="mozyo_bridge",
+                  agent_role="codex", lane_id="lane-B"),
+            _pane("%84", "mozyo-cockpit:3.1", window_name="mozyo_bridge",
+                  agent_role="claude", lane_id="lane-B"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        candidates = json.loads(out)
+        self.assertEqual(4, len(candidates))
+        for c in candidates:
+            self.assertFalse(c["identity"]["ambiguous"], c["runtime"]["pane_id"])
+            self.assertEqual("pane_option", c["identity"]["role_source"])
+            self.assertEqual("strong", c["identity"]["confidence"])
+            self.assertEqual("healthy", c["attention"]["attention_state"])
+            self.assertEqual("no_attention_source", c["attention"]["reason_code"])
+
 
 class AttentionForCandidateHelperTest(unittest.TestCase):
     """Conservative extraction mapping for one target (Redmine #11952)."""

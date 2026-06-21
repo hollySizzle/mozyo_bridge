@@ -300,6 +300,16 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
     fail-closed surface ``find_agent_window`` already raises on within a
     single session. Discovery does not raise on the ambiguity; it surfaces
     the flag so callers can decide whether to disambiguate before acting.
+
+    The duplicate-window check only applies when the window name is the
+    pane's **role-identity authority** (the legacy ``window_name`` rail). A
+    pane whose role resolves from the ``@mozyo_agent_role`` option (Redmine
+    #11822 / #57116) is identified by pane id + option + lane, and its window
+    name is a display-only layout attribute. Project Group windows
+    deliberately share one display name per group (Redmine #12330), so two
+    same-named group windows holding strong pane-option panes must stay
+    non-ambiguous (Redmine #12336) — collapsing them by display name would
+    re-create the window-name-as-identity coupling those issues remove.
     """
     raw = list(panes) if panes is not None else pane_lines()
     window_indexes: dict[tuple[str, str], set[str]] = {}
@@ -314,19 +324,30 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
     records: list[AgentRecord] = []
     for pane, session, window_index, pane_index in parsed:
         window_name = pane.get("window_name") or ""
-        ambig_windows = window_indexes.get((session, window_name), set())
-        window_ambiguous = bool(window_name) and len(ambig_windows) > 1
         cwd = pane.get("cwd") or ""
         # Role identity comes from the resolver, not the window name alone, so a
         # cockpit pane (role on `@mozyo_agent_role`, window `cockpit` / a layout
         # name) classifies like a normal-`mozyo` pane (role on the window name).
-        # The pane's duplicate-window ambiguity is OR'd with the resolver's own
-        # `ambiguous` so either one means "do not auto-target". (The resolver no
-        # longer derives ambiguity from a layout window name — see #57116.)
+        # The resolver also reports which signal won (`role_source`), which the
+        # duplicate-window check below reads so a display-only name never
+        # invalidates a strong pane-option identity (see #57116, #12336).
         resolution = resolve_agent_role(
             pane_option_role=pane.get("agent_role"),
             window_name=window_name,
             process=pane.get("command"),
+        )
+        # Duplicate `(session, window_name)` only makes a pane ambiguous when the
+        # window name *is* the role-identity authority (the legacy `window_name`
+        # rail). When the role resolves from the pane option, the window name is
+        # display-only: Project Group windows share one name per group (#12330),
+        # and pane id + option + lane still identify the target unambiguously
+        # (#12336). The pane's duplicate-window ambiguity is OR'd with the
+        # resolver's own `ambiguous` so either one means "do not auto-target".
+        ambig_windows = window_indexes.get((session, window_name), set())
+        window_ambiguous = (
+            resolution.role_source == ROLE_SOURCE_WINDOW_NAME
+            and bool(window_name)
+            and len(ambig_windows) > 1
         )
         # Only a STRONG signal sets the authoritative `agent_kind` (and thus
         # what `agents list` / handoff target on). A weak process hint is still
