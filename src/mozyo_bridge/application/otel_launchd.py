@@ -12,10 +12,13 @@ Safety boundary:
 
 - The plist carries **no EnvironmentVariables block at all**, so no
   credential (``MOZYO_REDMINE_API_KEY`` included) can ever land in it.
-  Consequence, documented rather than hidden: a launchd-managed receiver
-  runs the cockpit's Redmine layer as ``unconfigured`` until a secure
-  key-delivery mechanism is designed (follow-up; the other two layers
-  are unaffected).
+  A launchd-started receiver inherits no shell environment, so the
+  Redmine API key/URL reach it through the home-scoped credential file
+  (``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/redmine-credentials.yaml``,
+  resolved by ``redmine_credentials``; Redmine #12306) — never the plist.
+  Without that file (or shell env, for an interactive ``otel serve``) the
+  cockpit's Redmine layer degrades to ``unconfigured``; the other two
+  layers are unaffected.
 - The receiver keeps its own loopback-only bind gate; the plist's
   ProgramArguments add no ``--host`` so the 127.0.0.1 default applies.
 - All ``launchctl`` invocations are structured argv — no shell strings.

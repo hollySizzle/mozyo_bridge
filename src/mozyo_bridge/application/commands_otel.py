@@ -283,9 +283,14 @@ def cmd_otel_launchd(args: argparse.Namespace) -> int:
         print(f"installed: {result['plist']}")
         print(f"  command: {' '.join(result['command'])}")
         print(
-            "  note: the plist carries no environment variables; the "
-            "cockpit's Redmine layer stays `unconfigured` under launchd "
-            "until a secure key-delivery follow-up lands."
+            "  note: the plist carries no environment variables. To enable "
+            "the cockpit's Redmine layer under launchd, deliver the key/URL "
+            "via the home-scoped credential file:\n"
+            "    umask 077 && $EDITOR ~/.mozyo_bridge/redmine-credentials.yaml\n"
+            "  with `redmine: {url: <https-url>, api_key: <key>}` (chmod 600; "
+            "the file is refused if group/other-readable). Without it the "
+            "Redmine layer stays `unconfigured`; the other two layers are "
+            "unaffected."
         )
         return 0
     if action == "uninstall":

@@ -682,22 +682,28 @@ def build_server(
     # page and required on every action POST, so action intent can only
     # originate from the cockpit UI this daemon itself served.
     server.cockpit_token = secrets.token_hex(16)  # type: ignore[attr-defined]
-    # Read-only Redmine gate context (Redmine #11686). Both the API key
-    # AND the trusted base URL come from the daemon environment only —
-    # repo-local files can never select where the key is sent (review
-    # #56232). Either var absent = `unconfigured` for every unit, and the
-    # cockpit's other two layers stand on their own.
-    import os
+    # Read-only Redmine gate context (Redmine #11686). The API key and the
+    # trusted base URL come from daemon-trusted sources only — the launching
+    # shell's environment, or the home-scoped credential file that delivers
+    # them to a launchd-managed receiver whose plist carries no env block
+    # (Redmine #12306). Repo-local files can never select where the key is
+    # sent (review #56232): the credential file is home-scoped and
+    # user-owned, never repo-local. Either field absent = `unconfigured` for
+    # every unit, and the cockpit's other two layers stand on their own.
+    import sys
 
-    from mozyo_bridge.redmine_context import (
-        API_KEY_ENV,
-        BASE_URL_ENV,
-        RedmineContextCache,
-    )
+    from mozyo_bridge.redmine_context import RedmineContextCache
+    from mozyo_bridge.redmine_credentials import resolve_redmine_credentials
 
+    credentials = resolve_redmine_credentials(home=home)
+    # Surface a misconfigured credential file in the launchd log (the only
+    # place a launchd-started receiver can speak). Warnings are pre-redacted
+    # — they name the path / mode, never the credential value.
+    for warning in credentials.warnings:
+        print(f"mozyo-bridge otel: {warning}", file=sys.stderr)
     server.redmine_context = RedmineContextCache(  # type: ignore[attr-defined]
-        api_key=os.environ.get(API_KEY_ENV) or None,
-        base_url=os.environ.get(BASE_URL_ENV) or None,
+        api_key=credentials.api_key,
+        base_url=credentials.base_url,
     )
     return server
 
