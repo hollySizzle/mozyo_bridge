@@ -310,6 +310,30 @@ class RealRepoRegressionTest(unittest.TestCase):
         # The threshold matches the documented decision.
         self.assertEqual(cfg.max_module_lines, 1000)
 
+    def test_every_entry_records_a_planned_resolution_version(self) -> None:
+        # #12321 acceptance + rework j#62668: each allowlisted oversized module
+        # must record a real planned resolution Version, never a placeholder.
+        cfg = load_config(REPO_ROOT / "module_health.yaml", missing_ok=False)
+        self.assertTrue(cfg.allowlist)
+        placeholders = {"TBD", "TODO", "FIXME", "UNKNOWN", "NONE", "N/A", ""}
+        for entry in cfg.allowlist:
+            self.assertNotIn(
+                entry.resolution_version.strip().upper(),
+                placeholders,
+                f"{entry.path} has a placeholder resolution_version",
+            )
+            self.assertRegex(entry.resolution_version, r"v0\.\d+\.\d+")
+        by_path = {e.path: e for e in cfg.allowlist}
+        self.assertIn(
+            "v0.10.8", by_path["src/mozyo_bridge/domain/presentation_grouping.py"].resolution_version
+        )
+        self.assertIn(
+            "v0.10.9", by_path["src/mozyo_bridge/application/cockpit_ui.py"].resolution_version
+        )
+        self.assertIn(
+            "v0.10.10", by_path["src/mozyo_bridge/application/commands.py"].resolution_version
+        )
+
 
 class CliSmokeTest(unittest.TestCase):
     def test_report_and_check_via_cli(self) -> None:

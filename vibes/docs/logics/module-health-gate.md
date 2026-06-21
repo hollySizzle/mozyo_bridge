@@ -60,7 +60,13 @@ config が不正 (読めない / 型違い / required field 欠落) なら fail 
 
 ## allowlist (`module_health.yaml`)
 
-repo root の `module_health.yaml` が正本。各 entry は `path` / `lines` (baseline) / `reason` / `owner_issue` / `resolution_version` を必須とする。`resolution_version: TBD` は分割 target version 未定を意味する。分割の version 割当は roadmap 判断 (coordinator/owner; #11825 epic 配下) であり、本 gate の責務は新規成長の停止であって分割計画ではない。
+repo root の `module_health.yaml` が正本。各 entry は `path` / `lines` (baseline) / `reason` / `owner_issue` / `resolution_version` を必須とする。`resolution_version` は各 oversized module の解消 (分割) が予定される release を記録する (coordinator 決定、#12321 j#62668)。分割そのものは本 issue の非目標であり、対応 Version 側で行う:
+
+- `presentation_grouping.py` → **v0.10.8** (Version #239, split US #12322)
+- `cockpit_ui.py` → **v0.10.9** (Version #240, split US #12323)
+- 残り 6 module (commands / cockpit_layout / doctor / release / handoff / scaffold.rules) → **v0.10.10** (Version #241 module-health ratchet, US #12324)
+
+本 gate の責務は新規成長の停止であり、分割は上記 Version で実施する。`resolution_version` に `TBD` 等の未定値は使わない (受入条件「解消予定 Version を記録する」を満たすため)。
 
 baseline 更新フロー: 既存 oversized file を意図的に増やす必要があるとき、`module_health.yaml` の該当 `lines` を新しい値へ上げ、journal に理由を残す。silent な肥大化はできない。
 

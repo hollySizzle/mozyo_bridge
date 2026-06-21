@@ -14,10 +14,13 @@
 #   - `lines` is the recorded baseline; lower it (with justification) only when
 #     the module actually shrinks.
 #
-# `resolution_version: TBD` means a decomposition target version is not yet
-# scheduled. Scheduling per-module splits is a roadmap decision for the
-# coordinator/owner (tracked under the #11825 Plugin/Adapter boundary epic);
-# this gate's job is to stop *new* growth, not to plan the splits.
+# `resolution_version` records the planned release each oversized module is
+# scheduled to be reduced in (coordinator decision, #12321 j#62668):
+#   - presentation_grouping.py -> v0.10.8  (Version #239, split US #12322)
+#   - cockpit_ui.py            -> v0.10.9  (Version #240, split US #12323)
+#   - the remaining six        -> v0.10.10 (Version #241 ratchet, US #12324)
+# The splits themselves land in those versions; this gate only stops *new*
+# growth in the meantime.
 
 max_module_lines: 1000
 
@@ -32,7 +35,7 @@ allowlist:
       #12153/#12155) moved registration out but the handler bodies still live
       here. Largest decomposition target.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
 
   - path: src/mozyo_bridge/domain/cockpit_layout.py
     lines: 2344
@@ -40,7 +43,7 @@ allowlist:
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
       to split along geometry vs projection responsibilities.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
 
   - path: src/mozyo_bridge/application/doctor.py
     lines: 1852
@@ -48,7 +51,7 @@ allowlist:
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
 
   - path: src/mozyo_bridge/application/release.py
     lines: 1470
@@ -56,34 +59,35 @@ allowlist:
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
 
   - path: src/mozyo_bridge/domain/presentation_grouping.py
     lines: 1228
     reason: >-
-      Presentation grouping domain explicitly named oversized in #12321.
-      Decomposition target.
-    owner_issue: "#12321"
-    resolution_version: TBD
+      Presentation grouping domain explicitly named oversized in #12321 and in
+      the Version #239 description. Split tracked by US #12322.
+    owner_issue: "#12322"
+    resolution_version: "v0.10.8 (Version #239)"
 
   - path: src/mozyo_bridge/domain/handoff.py
     lines: 1084
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
 
   - path: src/mozyo_bridge/application/cockpit_ui.py
     lines: 1041
     reason: >-
-      Cockpit UI rendering explicitly named oversized in #12321. Low symbol
-      count (18) but long render bodies. Decomposition target.
-    owner_issue: "#12321"
-    resolution_version: TBD
+      Served cockpit UI rendering explicitly named oversized in #12321 and in
+      the Version #240 description. Low symbol count (18) but long render
+      bodies. Split tracked by US #12323.
+    owner_issue: "#12323"
+    resolution_version: "v0.10.9 (Version #240)"
 
   - path: src/mozyo_bridge/scaffold/rules.py
     lines: 1027
     reason: >-
       Scaffold preset/rule installation logic. Just over threshold.
     owner_issue: "#12321"
-    resolution_version: TBD
+    resolution_version: "v0.10.10 (Version #241)"
