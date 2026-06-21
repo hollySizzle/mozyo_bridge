@@ -232,6 +232,23 @@ def configure_handoff_parser(
             "delivery record under `- Command:` for audit replay."
         ),
     )
+    parser_.add_argument(
+        "--persist-delivery",
+        dest="persist_delivery",
+        action="store_true",
+        help=(
+            "Opt-in (Redmine #12311): durably persist the delivery record to "
+            "the anchor's ticket system (a Redmine journal note) in addition "
+            "to printing it, emitting a persistence receipt. Off by default, "
+            "so the send is byte-identical without it. The durable record is a "
+            "delivery pointer only — never a review / completion / approval — "
+            "and persistence is best-effort and never blocks or alters the "
+            "pane send. The live Redmine write transport is a credential-gated "
+            "follow-up under per-task review; until it is wired this resolves "
+            "to a fail-closed `provider_unavailable` receipt, and `source=asana` "
+            "has no write provider in v0.8 (`unsupported_source`)."
+        ),
+    )
 
 
 def register_message(sub) -> None:
