@@ -111,6 +111,23 @@ documents:
     audit_role: delegated_coordinator_role_profile_spec
     related_document_refs:
       - logic-coordinator-sublane-development-flow
+      - spec-delegation-policy-project-config
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: spec-delegation-policy-project-config
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegation-policy-project-config.md
+    purpose: delegated coordinator / grandchild dispatch の project config knob (`enable_delegated_coordinator` / `enable_grandchild_dispatch` / `max_delegation_depth` / `max_active_child_lanes` / window policy / decision record policy) の schema field contract、fail-closed 規約、緩めてよい運用しきい値と固定 safety invariant (owner approval / parent close / durable anchor / hidden subagent 禁止 / callback) の境界、安全側 default の正本。
+    audit_role: delegation_policy_project_config_spec
+    related_document_refs:
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-cockpit-display
+      - logic-unit-presentation-state-db
+      - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
       - spec-project-map
@@ -590,6 +607,7 @@ documents:
       - logic-unit-presentation-state-db
       - logic-unit-target-model
       - logic-worktree-lifecycle-boundary
+      - spec-delegation-policy-project-config
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
