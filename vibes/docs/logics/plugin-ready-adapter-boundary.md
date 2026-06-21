@@ -952,7 +952,11 @@ explicit while keeping the existing send byte-compatible and writing no ticket.
 - **No credential, ever.** Neither the note nor the receipt carries a token, API
   key, base URL, or any secret; the note body is the already-redacted pasteable
   record (`build_delivery_record` keeps absolute / private paths out of pasteable
-  text). The seam does no credential handling at all.
+  text). The opt-in durable sink path additionally renders the body WITHOUT the
+  user-supplied free-text `--record-command` (Finding 1, j#62549) — that field
+  can carry a private path or credential-shaped argument, so it stays in the
+  printed stdout record for human audit-replay but is never auto-journaled. The
+  seam does no credential handling at all.
 - **Explicit failure.** A transport reports failure through
   `DeliveryTransportError` with a reason normalized to `PERSIST_FAILURE_REASONS`
   (`provider_unavailable` / `credential_missing` / `unauthorized` /

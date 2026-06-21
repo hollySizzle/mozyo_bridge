@@ -3909,7 +3909,6 @@ def _maybe_persist_delivery_record(
     *,
     duplicate_lane_panes: list[str] | None,
     record_format: str,
-    command: str | None,
 ) -> None:
     """Best-effort durable persistence of the delivery record (Redmine #12311).
 
@@ -3919,11 +3918,16 @@ def _maybe_persist_delivery_record(
     delivery to durably record, and its pasteable record already prints to
     stdout.
 
-    The persisted body is the SAME redacted markdown the CLI prints, so the
-    durable record and the pasted record never diverge. The note records the
-    delivery outcome, the receiver/target identity, and (only when one was live
-    at send time) the duplicate same-lane advisory — the conditions Redmine
-    #12311 fixes in tests.
+    The persisted body is rendered WITHOUT the free-text ``--record-command``
+    (Finding 1, j#62549): that field is user-supplied and can carry a private
+    path or a credential-shaped argument, so the opt-in durable sink must not
+    auto-journal it. The printed stdout record (via ``_emit_outcome``) still
+    includes ``- Command:`` for human audit-replay; only the auto-persisted body
+    omits it. Every other body field is already redacted (``execution_root`` /
+    duplicate-pane rows carry no absolute paths), so the persisted note carries
+    no unvetted free text. The note records the delivery outcome, the
+    receiver/target identity, and (only when one was live at send time) the
+    duplicate same-lane advisory — the conditions Redmine #12311 fixes in tests.
 
     This NEVER alters the pane-send outcome: persistence runs after the outcome
     is emitted and any failure — including an unexpected sink error — is
@@ -3945,9 +3949,12 @@ def _maybe_persist_delivery_record(
     )
 
     try:
+        # `command=None`: the durable sink path must not auto-journal the
+        # user-supplied free-text `--record-command` (Finding 1, j#62549). The
+        # stdout record built by `_emit_outcome` keeps it for audit-replay.
         record_markdown = build_delivery_record(
             outcome,
-            command=command,
+            command=None,
             duplicate_lane_panes=duplicate_lane_panes or None,
         )
         note = build_delivery_record_note(
@@ -4716,7 +4723,6 @@ def orchestrate_handoff(
             outcome,
             duplicate_lane_panes=duplicate_lane_panes,
             record_format=record_format,
-            command=record_command,
         )
         return 0
 
@@ -4783,7 +4789,6 @@ def orchestrate_handoff(
         outcome,
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
-        command=record_command,
     )
     return 0
 

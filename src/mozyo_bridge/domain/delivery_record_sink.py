@@ -122,10 +122,12 @@ class DeliveryRecordNote:
 
     Built only via :func:`build_delivery_record_note` from a
     :class:`~mozyo_bridge.domain.handoff.DeliveryOutcome`. ``body`` is the
-    already-redacted pasteable markdown from ``build_delivery_record`` — the
-    single source of truth, so what is persisted is byte-identical to what the
-    CLI prints. The record carries durable-anchor ids and the receiver/target
-    identity, never a credential.
+    already-redacted pasteable markdown from ``build_delivery_record``. The
+    caller renders it for the durable sink path WITHOUT the free-text
+    ``--record-command`` (Finding 1, j#62549) so no user-supplied free text is
+    auto-journaled; every other body field is already redacted (no absolute /
+    private paths). The record carries durable-anchor ids and the
+    receiver/target identity, never a credential.
     """
 
     record_class: str

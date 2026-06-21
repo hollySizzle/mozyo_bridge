@@ -423,6 +423,47 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         self.assertFalse(receipts[0]["persisted"])
         self.assertEqual(PERSIST_TRANSPORT_ERROR, receipts[0]["reason"])
 
+    def test_record_command_not_auto_journaled_but_kept_in_printed_record(self) -> None:
+        # Finding 1 (j#62549): user-supplied --record-command can carry a
+        # private path / credential-shaped argument. It must stay in the printed
+        # stdout record for human audit-replay, but the opt-in durable sink must
+        # never auto-journal it. Abstract placeholders only.
+        sentinel = "deploy --token DROP-TOKEN-SENTINEL --root /workspace/project-alpha"
+        captured: dict[str, object] = {}
+
+        class _CapturingSink:
+            name = "capture"
+
+            def persist(self, note):
+                captured["note"] = note
+                return DeliveryReceipt(
+                    provider="capture",
+                    persisted=True,
+                    reason=PERSIST_OK,
+                    location="cap:1",
+                )
+
+        argv = self._base_argv() + [
+            "--persist-delivery",
+            "--record-command",
+            sentinel,
+        ]
+        with patch(
+            "mozyo_bridge.domain.delivery_record_sink.resolve_delivery_record_sink",
+            return_value=_CapturingSink(),
+        ):
+            result, stdout = self._run_send(argv)
+
+        self.assertEqual(0, result)
+        # Printed stdout record keeps the command for audit-replay ...
+        self.assertIn(sentinel, stdout)
+        # ... but the persisted note body omits the free text entirely.
+        note = captured.get("note")
+        self.assertIsNotNone(note)
+        self.assertNotIn(sentinel, note.body)
+        self.assertNotIn("DROP-TOKEN-SENTINEL", note.body)
+        self.assertNotIn("- Command:", note.body)
+
 
 if __name__ == "__main__":
     unittest.main()
