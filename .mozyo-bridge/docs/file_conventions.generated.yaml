@@ -137,14 +137,16 @@ rules:
     '
 - name: cockpit grouped projection and display source
   patterns:
-  - src/mozyo_bridge/domain/presentation_grouping.py
+  - src/mozyo_bridge/domain/presentation_grouping/**
   - src/mozyo_bridge/domain/grouped_read_model.py
   - src/mozyo_bridge/domain/grouped_reload_view.py
   - src/mozyo_bridge/domain/grouped_display.py
   - src/mozyo_bridge/application/grouped_detail.py
   - src/mozyo_bridge/application/cockpit_ui.py
   - src/mozyo_bridge/application/otel_receiver.py
-  - tests/test_presentation_grouping.py
+  - tests/test_presentation_grouping_schema.py
+  - tests/test_presentation_grouping_placement.py
+  - tests/test_presentation_grouping_degraded.py
   - tests/test_grouped_read_model.py
   - tests/test_grouped_reload_view.py
   - tests/test_grouped_detail.py

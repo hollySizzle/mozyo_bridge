@@ -16,7 +16,10 @@
 #
 # `resolution_version` records the planned release each oversized module is
 # scheduled to be reduced in (coordinator decision, #12321 j#62668):
-#   - presentation_grouping.py -> v0.10.8  (Version #239, split US #12322)
+#   - presentation_grouping.py -> v0.10.8  (Version #239, US #12322) — DONE: split
+#     into the `domain/presentation_grouping/` subpackage (config / validation /
+#     authority guard / placement / degraded submodules), so it is no longer
+#     oversized and its allowlist entry has been removed.
 #   - cockpit_ui.py            -> v0.10.9  (Version #240, split US #12323)
 #   - the remaining six        -> v0.10.10 (Version #241 ratchet, US #12324)
 # The splits themselves land in those versions; this gate only stops *new*
@@ -62,14 +65,6 @@ allowlist:
       touches release gates, so it is sequenced carefully.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
-
-  - path: src/mozyo_bridge/domain/presentation_grouping.py
-    lines: 1228
-    reason: >-
-      Presentation grouping domain explicitly named oversized in #12321 and in
-      the Version #239 description. Split tracked by US #12322.
-    owner_issue: "#12322"
-    resolution_version: "v0.10.8 (Version #239)"
 
   - path: src/mozyo_bridge/domain/handoff.py
     lines: 1084

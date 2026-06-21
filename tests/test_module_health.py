@@ -324,8 +324,12 @@ class RealRepoRegressionTest(unittest.TestCase):
             )
             self.assertRegex(entry.resolution_version, r"v0\.\d+\.\d+")
         by_path = {e.path: e for e in cfg.allowlist}
-        self.assertIn(
-            "v0.10.8", by_path["src/mozyo_bridge/domain/presentation_grouping.py"].resolution_version
+        # presentation_grouping.py was the v0.10.8 / Version #239 split target
+        # (US #12322). The split landed (the module became the
+        # ``domain/presentation_grouping/`` subpackage), so the entry is removed
+        # rather than carrying a stale v0.10.8 resolution_version.
+        self.assertNotIn(
+            "src/mozyo_bridge/domain/presentation_grouping.py", by_path
         )
         self.assertIn(
             "v0.10.9", by_path["src/mozyo_bridge/application/cockpit_ui.py"].resolution_version
