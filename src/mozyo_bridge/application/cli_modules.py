@@ -32,6 +32,7 @@ from mozyo_bridge.application import (
     cli_core,
     cli_docs_scaffold,
     cli_handoff,
+    cli_module_health,
     cli_observability,
     cli_presentation,
     cli_release,
@@ -198,6 +199,17 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             authorities=frozenset({"close_approval", "workflow_authority"}),
         ),
         cli_release.register,
+    ),
+    (
+        CliFamily(
+            name="health",
+            summary=(
+                "module-health report + oversized-module gate family "
+                "(read-only LOC/complexity measurement; no routing/approval "
+                "authority)."
+            ),
+        ),
+        cli_module_health.register,
     ),
 )
 

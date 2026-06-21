@@ -23,6 +23,12 @@ jobs:
       - name: Install package
         run: python -m pip install .
 
+      - name: Module-health gate
+        # PyLint-`too-many-lines`-equivalent gate (Redmine #12321): fails a new
+        # oversized module or growth of an allowlisted one past its baseline.
+        # Reads module_health.yaml from the repo root (the checkout cwd).
+        run: mozyo-bridge health check
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 

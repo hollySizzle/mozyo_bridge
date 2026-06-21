@@ -82,6 +82,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "workspace-defaults",
     "state",
     "release",
+    "health",
 ]
 
 

@@ -696,6 +696,15 @@ documents:
       - skill-workflow-reference
       - logic-tmux-send-safety-contract
 
+  - id: logic-module-health-gate
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/module-health-gate.md
+    purpose: module-health 計測 (LOC/近似complexity/symbol) と oversized-module gate (PyLint-too-many-lines equivalent / max_module_lines=1000 / allowlist baseline 成長検知) の設計正本。
+    audit_role: module_health_gate_logic
+    related_document_refs:
+      - spec-project-map
+
 file_conventions:
   - id: fc-agent-routers
     name: agent entrypoint routers
@@ -799,6 +808,18 @@ file_conventions:
     document_refs:
       - logic-managed-state-model
       - logic-workspace-registry
+      - spec-project-map
+
+  - id: fc-module-health-source
+    name: module-health metrics and oversized-module gate source
+    patterns:
+      - src/mozyo_bridge/domain/module_health.py
+      - src/mozyo_bridge/application/commands_module_health.py
+      - src/mozyo_bridge/application/cli_module_health.py
+      - module_health.yaml
+    severity: block
+    document_refs:
+      - logic-module-health-gate
       - spec-project-map
 
   - id: fc-otel-event-store-source
