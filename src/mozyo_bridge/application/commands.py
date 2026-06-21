@@ -2515,6 +2515,273 @@ def _handle_cockpit_doctor_geometry(session: str, *, json_output: bool) -> int:
     return 0 if diagnosis.ok else 1
 
 
+def _membership_observations_from_windows(managed_windows):
+    """Group managed-cockpit-window columns into per-Unit observations (#12341, pure).
+
+    Reshapes the :func:`_read_managed_cockpit_windows` output (a list of windows,
+    each with its `columns`) into one
+    :class:`mozyo_bridge.domain.cockpit_membership.MembershipObservation` per
+    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes.
+    Role-less columns (no ``workspace_id``) are skipped here — they surface as a
+    cockpit-wide warning from the geometry diagnosis instead. No tmux / filesystem
+    access: the live reads happened in the caller.
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        ROLE_CLAUDE,
+        ROLE_CODEX,
+        normalize_lane,
+    )
+    from mozyo_bridge.domain.cockpit_membership import MembershipObservation
+
+    observations = []
+    for window in managed_windows or []:
+        units: dict[tuple[str, str], dict[str, str]] = {}
+        order: list[tuple[str, str]] = []
+        for col in window.get("columns", []) or []:
+            workspace_id = col.get("workspace_id") or ""
+            if not workspace_id:
+                continue
+            key = (workspace_id, normalize_lane(col.get("lane_id")))
+            if key not in units:
+                units[key] = {"codex": "", "claude": ""}
+                order.append(key)
+            role = col.get("role")
+            pane_id = col.get("pane_id") or ""
+            if role == ROLE_CODEX and not units[key]["codex"]:
+                units[key]["codex"] = pane_id
+            elif role == ROLE_CLAUDE and not units[key]["claude"]:
+                units[key]["claude"] = pane_id
+        for key in order:
+            observations.append(
+                MembershipObservation(
+                    workspace_id=key[0],
+                    lane_id=key[1],
+                    lane_label="",
+                    codex_pane=units[key]["codex"],
+                    claude_pane=units[key]["claude"],
+                    window=window.get("window") or "",
+                    window_id=window.get("window_id") or "",
+                )
+            )
+    return observations
+
+
+def _resolve_registry_facts(workspace_id: str):
+    """Resolve a cockpit workspace id's registry / anchor facts (#12341, read-only).
+
+    A cockpit pane carries only its ``@mozyo_workspace_id``; the human label and
+    repo root live in the home registry, and the anchor presence in the workspace
+    itself. Tolerant: a missing / unreadable registry degrades to "unresolved"
+    (label falls back to the id, repo root empty) rather than raising, so the
+    membership view never aborts on a thin identity record.
+    """
+    from mozyo_bridge.domain.cockpit_membership import RegistryFacts
+    from mozyo_bridge.workspace_registry import load_workspace_by_id, read_anchor
+
+    try:
+        record = load_workspace_by_id(workspace_id)
+    except (Exception, SystemExit):
+        record = None
+    if record is None:
+        return RegistryFacts.unresolved(workspace_id)
+    repo_root = getattr(record, "canonical_path", "") or ""
+    anchor_present = False
+    if repo_root:
+        try:
+            anchor_present = read_anchor(Path(repo_root)) is not None
+        except (Exception, SystemExit):
+            anchor_present = False
+    return RegistryFacts(
+        label=getattr(record, "project_name", "") or workspace_id,
+        repo_root=repo_root,
+        registry_present=True,
+        anchor_present=anchor_present,
+    )
+
+
+def _collect_cockpit_membership(session: str):
+    """Project the live cockpit into a membership report (#12341, read-only).
+
+    Reads every managed cockpit window (shared `cockpit` window + #12330 Project
+    Group windows) for the loaded Units, runs the existing read-only geometry
+    diagnosis on the `cockpit` window for drift findings, resolves each Unit's
+    registry / anchor facts, and hands them all to the pure
+    :func:`mozyo_bridge.domain.cockpit_membership.project_membership_report`. All
+    reads are tolerant: a missing tmux / cockpit degrades to an empty report, so
+    `cockpit list` / `status` never abort.
+    """
+    from mozyo_bridge.domain.cockpit_geometry import diagnose_cockpit_geometry
+    from mozyo_bridge.domain.cockpit_membership import project_membership_report
+
+    managed = _read_managed_cockpit_windows(session)
+    geometry = diagnose_cockpit_geometry(
+        session=session, panes=_read_cockpit_geometry(session)
+    )
+    observations = _membership_observations_from_windows(managed)
+    cockpit_present = bool(managed) or geometry.cockpit_present
+
+    facts: dict[str, object] = {}
+    for obs in observations:
+        if obs.workspace_id not in facts:
+            facts[obs.workspace_id] = _resolve_registry_facts(obs.workspace_id)
+
+    return project_membership_report(
+        session=session,
+        cockpit_present=cockpit_present,
+        observations=observations,
+        facts_by_workspace=facts,
+        geometry=geometry,
+    )
+
+
+def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
+    """`mozyo cockpit list` — operator-facing cockpit membership summary (#12341).
+
+    Read-only: enumerates the workspaces loaded in the cockpit, each with its
+    workspace label / id, repo root, window, Codex / Claude pane ids, geometry
+    status, and registry / anchor presence (scaffold / root-hardening notes split
+    into a warning bucket). Always exits ``0`` — an empty cockpit is a valid
+    state, not an error. Cockpit membership is a display / liveness projection,
+    never Redmine workflow truth.
+    """
+    import json as _json
+
+    from mozyo_bridge.domain.cockpit_membership import format_membership_text
+
+    report = _collect_cockpit_membership(session)
+    if json_output:
+        print(_json.dumps(report.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_membership_text(report))
+    return 0
+
+
+def _handle_cockpit_status(
+    args: argparse.Namespace, session: str, *, json_output: bool
+) -> int:
+    """`mozyo cockpit status --repo <repo>` — repo-scoped cockpit membership (#12341).
+
+    Read-only: resolves the repo's workspace identity (registry → anchor →
+    derivation, the same chain the rest of the cockpit uses) and reports whether
+    it is loaded in the cockpit, with its panes / geometry / registry presence.
+    When the workspace is absent it says so explicitly (the #12339 mis-read)
+    instead of staying silent. Mirrors `doctor-geometry`'s exit convention: ``0``
+    when the workspace is a loaded member with healthy geometry, ``1`` otherwise
+    (absent, missing peer, or a geometry warning) — so a script can branch on the
+    code while still parsing the full report from stdout.
+    """
+    import json as _json
+
+    from mozyo_bridge.domain.cockpit_layout import normalize_lane
+    from mozyo_bridge.domain.cockpit_membership import (
+        CockpitMembershipReport,
+        absent_membership,
+        format_membership_text,
+    )
+
+    repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
+    repo_root = str(Path(repo).expanduser().resolve())
+    canon = resolve_canonical_session(repo_root)
+    workspace_id = getattr(canon, "workspace_id", None) or canon.name
+    lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
+    target_lane = normalize_lane(lane.lane_id)
+
+    report = _collect_cockpit_membership(session)
+    match = next(
+        (
+            w
+            for w in report.workspaces
+            if w.workspace_id == workspace_id
+            and normalize_lane(w.lane_id) == target_lane
+        ),
+        None,
+    )
+    if match is None:
+        facts = _resolve_registry_facts(workspace_id)
+        label = facts.label if facts.registry_present else canon.name
+        match = absent_membership(
+            session=session,
+            workspace_id=workspace_id,
+            label=label,
+            repo_root=repo_root,
+            lane_id=target_lane,
+            lane_label=lane.lane_label,
+            registry_present=facts.registry_present,
+            anchor_present=facts.anchor_present,
+        )
+
+    single = CockpitMembershipReport(
+        session=session,
+        cockpit_present=report.cockpit_present,
+        workspaces=(match,),
+        warnings=report.warnings,
+    )
+    if json_output:
+        payload = single.as_dict()
+        payload["query"] = {
+            "workspace_id": workspace_id,
+            "label": match.label,
+            "repo_root": repo_root,
+            "lane_id": target_lane,
+            "member": match.member,
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_membership_text(single, query_label=match.label))
+    return 0 if match.ok else 1
+
+
+def _status_repo_cockpit_membership(args: argparse.Namespace):
+    """This repo's cockpit membership record for `status` (#12341, read-only, tolerant).
+
+    `mozyo-bridge status --repo <repo>` describes a *normal* agent session and
+    historically only warned "agent window missing", which an operator can mis-read
+    as "not in the cockpit either" (#12339). This resolves the repo's workspace
+    identity and looks it up in the shared cockpit session so `status` can state
+    cockpit membership explicitly. Tolerant: any resolution / tmux failure degrades
+    to ``None`` (the caller simply omits the line) so `status` never aborts on it.
+    """
+    from mozyo_bridge.domain.cockpit_layout import (
+        COCKPIT_SESSION_DEFAULT,
+        normalize_lane,
+    )
+    from mozyo_bridge.domain.cockpit_membership import absent_membership
+
+    try:
+        repo = getattr(args, "repo", None) or os.getcwd()
+        repo_root = str(Path(repo).expanduser().resolve())
+        canon = resolve_canonical_session(repo_root)
+        workspace_id = getattr(canon, "workspace_id", None) or canon.name
+        lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
+        target_lane = normalize_lane(lane.lane_id)
+        report = _collect_cockpit_membership(COCKPIT_SESSION_DEFAULT)
+        match = next(
+            (
+                w
+                for w in report.workspaces
+                if w.workspace_id == workspace_id
+                and normalize_lane(w.lane_id) == target_lane
+            ),
+            None,
+        )
+        if match is None:
+            facts = _resolve_registry_facts(workspace_id)
+            label = facts.label if facts.registry_present else canon.name
+            match = absent_membership(
+                session=COCKPIT_SESSION_DEFAULT,
+                workspace_id=workspace_id,
+                label=label,
+                repo_root=repo_root,
+                lane_id=target_lane,
+                lane_label=lane.lane_label,
+                registry_present=facts.registry_present,
+                anchor_present=facts.anchor_present,
+            )
+        return match
+    except (Exception, SystemExit):
+        return None
+
+
 def _read_cockpit_pane_runtime(session: str, pane_id: str) -> dict:
     """Read one cockpit pane's cwd / foreground process / lane label (#12133, read-only).
 
@@ -3201,6 +3468,16 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     # resolution and never gates on tmux being mutable.
     if getattr(args, "action", None) == "doctor-geometry":
         return _handle_cockpit_doctor_geometry(session, json_output=json_output)
+    # `mozyo cockpit list` / `cockpit status --repo` (Redmine #12341) are read-only
+    # operator-facing membership summaries — "is this workspace loaded in the
+    # cockpit, are its Codex/Claude panes present, is the geometry healthy?". Like
+    # doctor-geometry they inspect the live cockpit (never mutate) and short-circuit
+    # before workspace-append resolution; cockpit membership is a display/liveness
+    # projection, never Redmine workflow / approval / close truth.
+    if getattr(args, "action", None) == "list":
+        return _handle_cockpit_list(session, json_output=json_output)
+    if getattr(args, "action", None) == "status":
+        return _handle_cockpit_status(args, session, json_output=json_output)
     # `mozyo cockpit peer-adopt` (Redmine #12133) is a whole-cockpit repair that
     # binds a role-less pane as a Unit's missing peer. Like doctor-geometry it
     # operates on explicit pane / unit selection (never the current workspace), so
@@ -3701,6 +3978,34 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
     else:
         print(f"session: {session} (missing)")
+    # Cockpit membership is a separate axis from this normal session's agent
+    # windows (Redmine #12341): a workspace can be absent here yet loaded as a
+    # cockpit column, so state it explicitly instead of leaving the "agent window
+    # missing" note above to be mis-read as "not in the cockpit either" (#12339).
+    membership = _status_repo_cockpit_membership(args)
+    if membership is not None:
+        from mozyo_bridge.domain.cockpit_layout import COCKPIT_SESSION_DEFAULT
+
+        if membership.member:
+            print(
+                f"cockpit: workspace {membership.label!r} IS loaded in cockpit "
+                f"{COCKPIT_SESSION_DEFAULT!r} (window {membership.window or '-'}, "
+                f"codex={membership.codex_pane or '-'} "
+                f"claude={membership.claude_pane or '-'}, "
+                f"geometry={membership.geometry_status}); see "
+                "`mozyo-bridge cockpit status --repo .`."
+            )
+        else:
+            print(
+                f"cockpit: workspace {membership.label!r} is NOT loaded in cockpit "
+                f"{COCKPIT_SESSION_DEFAULT!r}; any `agent window missing` note above "
+                "is about this normal session, not cockpit membership. Add it with "
+                "`mozyo cockpit`, or inspect with `mozyo-bridge cockpit list`."
+            )
+        print(
+            "  (cockpit membership is a display/liveness projection, not Redmine "
+            "workflow / approval / close truth.)"
+        )
     print("")
     return cmd_doctor(args)
 
