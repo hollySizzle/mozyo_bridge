@@ -3,7 +3,7 @@
 Pins the boundary the US fixes: a grouped cockpit UI action goes through the
 mozyo command boundary and an *action-time live preflight*, and the #12264
 grouped read model is a display / candidate input only — never a routing
-authority. Covers, at the ``cockpit_ui`` command surface and over the
+authority. Covers, at the ``cockpit_actions`` command surface and over the
 ``otel_receiver`` POST path:
 
 - a candidate Unit identity (workspace_id / lane_id / role) resolves to the live
@@ -36,7 +36,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_ui import (
+from mozyo_bridge.application.cockpit_actions import (
     CockpitActionError,
     candidate_unit_selector,
     grouped_jump,
@@ -59,7 +59,7 @@ from mozyo_bridge.session_inventory import (
     WorkspaceIdentity,
 )
 
-COCKPIT_UI = "mozyo_bridge.application.cockpit_ui"
+COCKPIT_UI = "mozyo_bridge.application.cockpit_actions"
 
 
 def _record(

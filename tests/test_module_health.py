@@ -327,8 +327,11 @@ class RealRepoRegressionTest(unittest.TestCase):
         self.assertIn(
             "v0.10.8", by_path["src/mozyo_bridge/domain/presentation_grouping.py"].resolution_version
         )
-        self.assertIn(
-            "v0.10.9", by_path["src/mozyo_bridge/application/cockpit_ui.py"].resolution_version
+        # cockpit_ui.py (v0.10.9 / Version #240, US #12323) has been split into
+        # cockpit_page.py / cockpit_payload.py / cockpit_actions.py and is no
+        # longer an oversized allowlisted module.
+        self.assertNotIn(
+            "src/mozyo_bridge/application/cockpit_ui.py", by_path
         )
         self.assertIn(
             "v0.10.10", by_path["src/mozyo_bridge/application/commands.py"].resolution_version

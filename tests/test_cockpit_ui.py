@@ -1,16 +1,18 @@
-"""Cockpit Web UI tests (Redmine #11679 / #11680 / #11681 / #11683).
+"""Served cockpit HTTP-endpoint wiring tests (Redmine #11679 / #11680 / #11681).
 
-Covers: the daemon-served HTML / units / transitions endpoints, the
-reveal / jump actions (structured argv, stale-safe failure, attached
-client selection with control-mode demotion), and the transition tracker
-(state-change detection, ring buffer bound, no observation on stale
-snapshots). Loopback-only bind is pinned in test_otel_store. Everything
-runs on an ephemeral port with temp homes — no real tmux mutations.
+Focused on the daemon-served HTTP surface (``otel_receiver``): the ``/api/units``
+endpoint and its additive attention / observation join layers, the action intent
+gate (token + origin), the action endpoints' stale-/unknown-pane failures, the
+transitions endpoint, and the transition tracker. After the #12323 cockpit split
+the page rendering lives in ``test_cockpit_page``, the pure served-API payload
+contract in ``test_cockpit_payload``, and the pane-centric action / preflight
+bridge in ``test_cockpit_actions``; this file pins how the receiver wires those
+pieces together over HTTP. Loopback-only bind is pinned in test_otel_store.
+Everything runs on an ephemeral port with temp homes — no real tmux mutations.
 """
 
 from __future__ import annotations
 
-import argparse  # noqa: F401  (kept for parity with sibling test modules)
 import json
 import sys
 import tempfile
@@ -24,13 +26,6 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_ui import (
-    CockpitActionError,
-    attach_attention,
-    attach_observation,
-    jump_to_unit,
-    reveal_in_finder,
-)
 from mozyo_bridge.application.otel_receiver import build_server
 from mozyo_bridge.domain.agent_activity import TransitionTracker
 from mozyo_bridge.session_inventory import take_inventory
@@ -97,31 +92,6 @@ class CockpitHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, json.loads(error.read())
-
-    def test_index_serves_self_contained_html(self) -> None:
-        status, body = self._get("/")
-        self.assertEqual(200, status)
-        text = body.decode("utf-8")
-        self.assertIn("mozyo cockpit", text)
-        # Self-contained: no external asset loads (loopback / no-exfil).
-        self.assertNotIn("http://", text.replace("http://127.0.0.1", ""))
-        self.assertNotIn("https://", text)
-        # The per-process action token is embedded for the action header.
-        self.assertIn(self.server.cockpit_token, text)
-
-    def test_rendering_never_uses_innerhtml(self) -> None:
-        # Review #56197 finding 2: payload strings (workspace / session /
-        # path names) are local but untrusted input; the page must build
-        # DOM via textContent / createElement so HTML metacharacters in
-        # them render as text instead of executing. Pin the approach.
-        from mozyo_bridge.application.cockpit_ui import INDEX_HTML_TEMPLATE
-
-        self.assertNotIn("innerHTML", INDEX_HTML_TEMPLATE)
-        self.assertNotIn("outerHTML", INDEX_HTML_TEMPLATE)
-        self.assertNotIn("insertAdjacentHTML", INDEX_HTML_TEMPLATE)
-        self.assertNotIn("document.write", INDEX_HTML_TEMPLATE)
-        self.assertIn("textContent", INDEX_HTML_TEMPLATE)
-        self.assertIn("createElement", INDEX_HTML_TEMPLATE)
 
     def test_cross_site_simple_request_never_reaches_action_handler(self) -> None:
         # Review #56197 finding 1 reproduction: a browser simple request
@@ -241,64 +211,6 @@ class CockpitHttpTest(unittest.TestCase):
         for ref in attention["source_refs"]:
             self.assertNotIn("/", ref)
 
-    def test_attach_attention_is_additive_and_fails_safe(self) -> None:
-        # Pure-join unit test: a readable identity → healthy; an unreadable
-        # one (role_source unknown) → unknown, never healthy; existing keys
-        # are preserved and only `attention` is added.
-        payload = {
-            "panes": [
-                {
-                    "pane_id": "%7",
-                    "agent_kind": "codex",
-                    "role_source": "pane_option",
-                    "confidence": "strong",
-                    "workspace": {"workspace_id": "ws-codex"},
-                    "activity": {"state": "active"},
-                },
-                {
-                    "pane_id": "%8",
-                    "agent_kind": "claude",
-                    "role_source": "unknown",
-                    "confidence": "none",
-                    "workspace": None,
-                    "activity": {"state": "unknown"},
-                },
-            ]
-        }
-        out = attach_attention(payload, observed_at="2026-06-15T00:00:00+00:00")
-        readable, unreadable = out["panes"]
-        self.assertEqual("healthy", readable["attention"]["attention_state"])
-        self.assertEqual("ws-codex", readable["attention"]["workspace_id"])
-        # Existing layers preserved (additive only).
-        self.assertEqual("active", readable["activity"]["state"])
-        # Fail-safe: unreadable identity is unknown, not healthy.
-        self.assertEqual("unknown", unreadable["attention"]["attention_state"])
-        self.assertEqual(
-            "source_unreadable", unreadable["attention"]["reason_code"]
-        )
-
-    def test_attach_attention_stale_snapshot_degrades_to_unknown(self) -> None:
-        # Review #58888: a stale snapshot (tmux runtime unreadable, cached
-        # rows) cannot honestly assert liveness, so even a strong cached
-        # identity must derive unknown / source_unreadable, never healthy
-        # (cockpit-attention-state.md / runtime-observability-boundary.md).
-        payload = {
-            "stale": True,
-            "panes": [
-                {
-                    "pane_id": "%9",
-                    "agent_kind": "codex",
-                    "role_source": "pane_option",
-                    "confidence": "strong",
-                    "workspace": {"workspace_id": "ws-codex"},
-                }
-            ],
-        }
-        out = attach_attention(payload, observed_at="2026-06-15T00:00:00+00:00")
-        attention = out["panes"][0]["attention"]
-        self.assertEqual("unknown", attention["attention_state"])
-        self.assertEqual("source_unreadable", attention["reason_code"])
-
     def test_units_endpoint_stale_cache_attention_is_unknown(self) -> None:
         # End-to-end: a live poll seeds the inventory cache, then a poll with
         # tmux unavailable serves that cache as stale — the cached claude row's
@@ -391,51 +303,6 @@ class CockpitHttpTest(unittest.TestCase):
         self.assertEqual(ro.READABILITY_PARTIAL, obs["readability"])
         self.assertEqual([], ro.forbidden_generic_fields(obs))
 
-    def test_attach_observation_is_additive(self) -> None:
-        # Pure-join unit test: `attach_observation` adds only the top-level
-        # `observation` key and never disturbs the panes / stale / attention
-        # layers already on the payload.
-        from datetime import datetime, timezone
-
-        snapshot = take_inventory(
-            home=self.home, panes=[pane("%1", "mozyo-demo", "claude")]
-        )
-        payload = snapshot.as_payload()
-        payload["panes"][0]["attention"] = {"attention_state": "healthy"}
-        before = json.dumps(payload, sort_keys=True)
-        out = attach_observation(
-            payload, snapshot, now=datetime.now(timezone.utc)
-        )
-        self.assertIs(out, payload)
-        self.assertIn("observation", out)
-        # Existing layers preserved (additive only).
-        self.assertEqual("%1", out["panes"][0]["pane_id"])
-        self.assertEqual(
-            "healthy", out["panes"][0]["attention"]["attention_state"]
-        )
-        # Removing the added key restores the original payload exactly.
-        out.pop("observation")
-        self.assertEqual(before, json.dumps(out, sort_keys=True))
-
-    def test_index_has_reload_button_and_freshness_display(self) -> None:
-        # Redmine #12225: the page exposes a manual Reload affordance and a
-        # freshness line, rendered via DOM APIs (whitelisted display-state
-        # class), never innerHTML.
-        from mozyo_bridge.application.cockpit_ui import INDEX_HTML_TEMPLATE
-
-        self.assertIn('id="reload"', INDEX_HTML_TEMPLATE)
-        self.assertIn('id="observation"', INDEX_HTML_TEMPLATE)
-        self.assertIn("renderObservation", INDEX_HTML_TEMPLATE)
-        self.assertIn("KNOWN_DISPLAY_STATES", INDEX_HTML_TEMPLATE)
-        self.assertIn("data.observation", INDEX_HTML_TEMPLATE)
-        # The reload button drives an explicit re-fetch.
-        self.assertIn(
-            "getElementById('reload').addEventListener('click', refresh)",
-            INDEX_HTML_TEMPLATE,
-        )
-        # Still DOM-API only (no HTML injection sink introduced).
-        self.assertNotIn("innerHTML", INDEX_HTML_TEMPLATE)
-
     def test_transitions_endpoint_reports_observed_changes(self) -> None:
         # First poll establishes baseline (unknown), second poll after an
         # activity change yields a transition.
@@ -495,109 +362,6 @@ class CockpitHttpTest(unittest.TestCase):
             )
         self.assertEqual(409, status)
         self.assertIn("stale", payload["error"])
-
-
-class CockpitActionTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.home = Path(self._tmp.name) / "home"
-        self.repo = Path(self._tmp.name) / "repo"
-        (self.repo / ".git").mkdir(parents=True)
-
-    def _panes(self) -> list[dict]:
-        return [pane("%1", "mozyo-demo", "claude", cwd=str(self.repo))]
-
-    def test_reveal_runs_structured_open_on_repo_root(self) -> None:
-        calls: list[list[str]] = []
-
-        def fake_run(argv, capture_output, text, check):
-            calls.append(argv)
-            return type(
-                "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
-            )()
-
-        with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
-            return_value=self._panes(),
-        ), patch(
-            "mozyo_bridge.application.cockpit_ui.subprocess.run",
-            side_effect=fake_run,
-        ), patch(
-            "mozyo_bridge.application.cockpit_ui.sys.platform", "darwin"
-        ):
-            result = reveal_in_finder("%1", home=self.home)
-        # Structured argv: the path rides as one argument, never through a
-        # shell string — spaces / Japanese segments cannot inject.
-        self.assertEqual([["open", str(self.repo.resolve())]], calls)
-        self.assertEqual("reveal", result["action"])
-
-    def test_jump_switches_most_recent_regular_client(self) -> None:
-        tmux_calls: list[tuple] = []
-
-        def fake_run_tmux(*args, check: bool = True):
-            tmux_calls.append(args)
-            if args[0] == "list-clients":
-                return type(
-                    "R",
-                    (),
-                    {
-                        "returncode": 0,
-                        # control-mode client is newer but demoted; the
-                        # regular client wins (jump v1 contract).
-                        "stdout": (
-                            "200\t1\t/dev/ttys-cc\n"
-                            "100\t0\t/dev/ttys-old\n"
-                            "150\t0\t/dev/ttys-new\n"
-                        ),
-                        "stderr": "",
-                    },
-                )()
-            return type(
-                "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
-            )()
-
-        with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
-            return_value=self._panes(),
-        ), patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
-            side_effect=fake_run_tmux,
-        ):
-            result = jump_to_unit("%1", home=self.home)
-        self.assertEqual("/dev/ttys-new", result["client"])
-        self.assertEqual("mozyo-demo:1", result["target"])
-        switch = [c for c in tmux_calls if c[0] == "switch-client"]
-        self.assertEqual(
-            [("switch-client", "-c", "/dev/ttys-new", "-t", "mozyo-demo:1")],
-            switch,
-        )
-
-    def test_jump_without_attached_client_fails_safely(self) -> None:
-        def fake_run_tmux(*args, check: bool = True):
-            return type(
-                "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
-            )()
-
-        with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
-            return_value=self._panes(),
-        ), patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
-            side_effect=fake_run_tmux,
-        ):
-            with self.assertRaises(CockpitActionError) as ctx:
-                jump_to_unit("%1", home=self.home)
-        self.assertIn("no attached tmux client", str(ctx.exception))
-
-    def test_reveal_refuses_missing_directory(self) -> None:
-        panes = [pane("%1", "mozyo-demo", "claude", cwd="/no/such/dir")]
-        with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
-            return_value=panes,
-        ):
-            with self.assertRaises(CockpitActionError):
-                reveal_in_finder("%1", home=self.home)
 
 
 class TransitionTrackerTest(unittest.TestCase):

@@ -62,7 +62,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.application.cockpit_ui import DEFAULT_HOST
+from mozyo_bridge.application.cockpit_actions import DEFAULT_HOST
 from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
 from mozyo_bridge.domain.grouped_display import ROLE_DISPLAY_ORDER
 from mozyo_bridge.domain.grouped_read_model import UnitView

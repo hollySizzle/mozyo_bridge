@@ -37,9 +37,10 @@ from typing import Iterable, Optional
 import yaml
 
 # The default oversized-module threshold. 1000 is PyLint's own
-# ``max-module-lines`` default, and it captures exactly the modules #12321
-# names as oversized (``presentation_grouping.py`` / ``cockpit_ui.py``). The
-# value is overridable via the allowlist config's ``max_module_lines`` key.
+# ``max-module-lines`` default, and it captures the modules #12321 named as
+# oversized (e.g. ``presentation_grouping.py``; ``cockpit_ui.py`` was split
+# under US #12323 and is no longer oversized). The value is overridable via the
+# allowlist config's ``max_module_lines`` key.
 DEFAULT_MAX_MODULE_LINES = 1000
 
 # Default analysis scope: the runtime package only. ``tests/`` is intentionally

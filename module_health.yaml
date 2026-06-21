@@ -17,7 +17,9 @@
 # `resolution_version` records the planned release each oversized module is
 # scheduled to be reduced in (coordinator decision, #12321 j#62668):
 #   - presentation_grouping.py -> v0.10.8  (Version #239, split US #12322)
-#   - cockpit_ui.py            -> v0.10.9  (Version #240, split US #12323)
+#   - cockpit_ui.py            -> v0.10.9  (Version #240, split US #12323) DONE:
+#       split into cockpit_page.py / cockpit_payload.py / cockpit_actions.py and
+#       removed from this allowlist; cockpit_ui.py is now a thin facade.
 #   - the remaining six        -> v0.10.10 (Version #241 ratchet, US #12324)
 # The splits themselves land in those versions; this gate only stops *new*
 # growth in the meantime.
@@ -77,15 +79,6 @@ allowlist:
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
-
-  - path: src/mozyo_bridge/application/cockpit_ui.py
-    lines: 1041
-    reason: >-
-      Served cockpit UI rendering explicitly named oversized in #12321 and in
-      the Version #240 description. Low symbol count (18) but long render
-      bodies. Split tracked by US #12323.
-    owner_issue: "#12323"
-    resolution_version: "v0.10.9 (Version #240)"
 
   - path: src/mozyo_bridge/scaffold/rules.py
     lines: 1027
