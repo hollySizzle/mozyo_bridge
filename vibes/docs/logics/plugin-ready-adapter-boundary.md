@@ -973,9 +973,14 @@ this pass. Production resolves to `UnwiredDeliveryRecordSink`
 selection (#12249/#12251): the boundary is expressible and the note is
 constructed, but no live dispatch path runs yet. The full persisted path is
 exercised in tests through an injected `RedmineNoteTransport` fake, so no network
-runs here. A follow-up issue implements the live transport (reusing the trusted
+runs here.
+
+The live transport is classified as Redmine #12347, not an implicit later note:
+#12347 wires the real Redmine journal-write transport (reusing the trusted
 `MOZYO_REDMINE_URL` / `MOZYO_REDMINE_API_KEY` base in `redmine_context`) under
-its own per-task review.
+its own per-task review and direct owner close approval. Until #12347 lands,
+`--persist-delivery` remains a staged seam and production resolution continues to
+fail closed with `provider_unavailable`.
 
 ### Non-goals (unchanged, restated for the implementation)
 
