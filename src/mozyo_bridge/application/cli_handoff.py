@@ -41,6 +41,7 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMATS,
     SOURCES,
 )
+from mozyo_bridge.domain.role_profile import ROLE_PROFILE_TOKENS
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
@@ -170,6 +171,39 @@ def configure_handoff_parser(
             "root from the durable record instead of pane scrollback. This "
             "is record/wording only: it does not change pane selection or "
             "relax any cross-session / cross-lane gate."
+        ),
+    )
+    parser_.add_argument(
+        "--role-profile",
+        dest="role_profile",
+        choices=list(ROLE_PROFILE_TOKENS),
+        help=(
+            "Optional fixed role profile to resolve and expand for the receiver "
+            "(Redmine #12388). Resolves the builtin template from "
+            "`vibes/docs/specs/delegated-coordinator-role-profile.md` (US "
+            "#12387), substitutes `<...>` placeholders from `--profile-field` "
+            "values (and auto-fills `durable_anchor` from the anchor), and "
+            "carries the resolved role contract in the durable delivery record "
+            "plus a compact single-line pointer in the notification body so the "
+            "receiver reads its role contract without guessing a template path. "
+            "Fails closed on an unknown role; omit the flag for the explicit "
+            "fallback of no profile expansion. The role profile is the "
+            "receiver's custom instruction and never enters the routing landing "
+            "marker."
+        ),
+    )
+    parser_.add_argument(
+        "--profile-field",
+        dest="profile_field",
+        action="append",
+        metavar="KEY=VALUE",
+        help=(
+            "Repeatable `KEY=VALUE` substitution for a `--role-profile` "
+            "template placeholder (e.g. `--profile-field parent_project=alpha`). "
+            "`durable_anchor` is auto-filled from the anchor when not supplied. "
+            "Unsupplied placeholders are left as literal `<name>` tokens and "
+            "listed as unresolved in the record. Keep values repo-relative / "
+            "redacted: they may reach the pasteable delivery record."
         ),
     )
     parser_.add_argument(

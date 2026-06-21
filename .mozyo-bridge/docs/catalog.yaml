@@ -111,6 +111,7 @@ documents:
     audit_role: delegated_coordinator_role_profile_spec
     related_document_refs:
       - logic-coordinator-sublane-development-flow
+      - logic-role-profile-handoff-expansion
       - spec-delegated-coordinator-decision-records
       - spec-delegation-policy-project-config
       - rule-project-agent-workflow
@@ -626,6 +627,20 @@ documents:
       - logic-unit-target-model
       - logic-worktree-lifecycle-boundary
       - spec-delegation-policy-project-config
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-role-profile-handoff-expansion
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/role-profile-handoff-expansion.md
+    purpose: handoff send / init 送信側が固定 role profile template を runtime で解決し、structured pointer field (role_profile / profile_source / profile_version) と完全解決 contract を durable delivery record + 単一行 pane pointer として展開する設計正本。template missing は fail-closed、未指定は明示 fallback、routing landing marker は不変。
+    audit_role: role_profile_handoff_expansion_logic
+    related_document_refs:
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference

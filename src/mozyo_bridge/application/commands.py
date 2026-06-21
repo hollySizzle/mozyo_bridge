@@ -54,6 +54,11 @@ from mozyo_bridge.domain.handoff import (
     make_outcome,
     normalize_anchor,
 )
+from mozyo_bridge.domain.role_profile import (
+    RoleProfileError,
+    parse_profile_fields,
+    resolve_role_profile,
+)
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -4179,6 +4184,7 @@ def _emit_outcome(
     command: str | None = None,
     recovery_command: str | None = None,
     duplicate_lane_panes: list[str] | None = None,
+    role_profile_contract: str | None = None,
 ) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -4200,6 +4206,12 @@ def _emit_outcome(
     identity rows for live same-lane duplicate receiver panes; it renders a
     diagnostic advisory in the markdown record and likewise does not affect the
     ``json`` outcome shape.
+
+    ``role_profile_contract`` (Redmine #12388) is the optional fully resolved
+    role-profile contract body appended to the markdown record. Like the others
+    it does not affect the ``json`` outcome shape; it is intentionally kept to
+    the printed (pasteable) record and omitted from the opt-in auto-persist body
+    because it may embed operator-supplied field values.
     """
     if record_format not in RECORD_FORMATS:
         die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {record_format!r}")
@@ -4210,6 +4222,7 @@ def _emit_outcome(
                 command=command,
                 recovery_command=recovery_command,
                 duplicate_lane_panes=duplicate_lane_panes,
+                role_profile_contract=role_profile_contract,
             )
         )
         if record_format == RECORD_FORMAT_BOTH:
@@ -5039,9 +5052,52 @@ def orchestrate_handoff(
             workdir_abs, repo_root_abs=repo_anchor_abs
         )
 
+    # Redmine #12388: resolve the requested fixed role profile before any pane
+    # send. Auto-fill `durable_anchor` from the anchor so the most common
+    # placeholder needs no `--profile-field`. Fail closed (blocked /
+    # invalid_args) on an unknown role or a malformed `--profile-field`; omitting
+    # `--role-profile` is the explicit fallback of no profile expansion.
+    role_profile_resolution = None
+    role_profile_arg = getattr(args, "role_profile", None)
+    if role_profile_arg:
+        try:
+            profile_fields = parse_profile_fields(getattr(args, "profile_field", None))
+            profile_fields.setdefault("durable_anchor", anchor.human_pointer())
+            role_profile_resolution = resolve_role_profile(
+                role_profile_arg, profile_fields
+            )
+        except RoleProfileError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                    execution_root=execution_root,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+
+    role_profile_contract = (
+        role_profile_resolution.resolved_text if role_profile_resolution else None
+    )
+
     try:
         body = build_notification_body(
-            anchor, kind, summary, receiver, execution_root=execution_root
+            anchor,
+            kind,
+            summary,
+            receiver,
+            execution_root=execution_root,
+            role_profile=role_profile_resolution,
         )
     except AnchorError as exc:
         _emit_outcome(
@@ -5056,9 +5112,11 @@ def orchestrate_handoff(
                 notification_marker=None,
                 source=source,
                 execution_root=execution_root,
+                role_profile=role_profile_resolution,
             ),
             record_format=record_format,
             command=record_command,
+            role_profile_contract=role_profile_contract,
         )
         die(str(exc))
         raise AssertionError("unreachable")
@@ -5083,12 +5141,14 @@ def orchestrate_handoff(
             kind=kind,
             notification_marker=marker,
             execution_root=execution_root,
+            role_profile=role_profile_resolution,
         )
         _emit_outcome(
             outcome,
             record_format=record_format,
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
+            role_profile_contract=role_profile_contract,
         )
         _maybe_persist_delivery_record(
             args,
@@ -5114,12 +5174,14 @@ def orchestrate_handoff(
             kind=kind,
             notification_marker=marker,
             execution_root=execution_root,
+            role_profile=role_profile_resolution,
         )
         _emit_outcome(
             outcome,
             record_format=record_format,
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
+            role_profile_contract=role_profile_contract,
         )
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
@@ -5149,12 +5211,14 @@ def orchestrate_handoff(
         kind=kind,
         notification_marker=marker,
         execution_root=execution_root,
+        role_profile=role_profile_resolution,
     )
     _emit_outcome(
         outcome,
         record_format=record_format,
         command=record_command,
         duplicate_lane_panes=duplicate_lane_panes or None,
+        role_profile_contract=role_profile_contract,
     )
     _maybe_persist_delivery_record(
         args,
