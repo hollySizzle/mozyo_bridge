@@ -1,9 +1,9 @@
-# Module-health gate config (Redmine #12321).
+# Module-health gate config (Redmine #12321; ratchet US #12324).
 #
 # Read by `mozyo-bridge health check` / `mozyo-bridge health report`. The gate
 # enforces a PyLint-`too-many-lines`-equivalent threshold over the runtime
 # package and records the existing oversized modules here instead of splitting
-# them (splitting is an explicit #12321 non-goal). See
+# them (full legacy teardown is an explicit non-goal). See
 # vibes/docs/logics/module-health-gate.md for the full contract.
 #
 # Gate behavior:
@@ -11,8 +11,16 @@
 #     (new oversized file);
 #   - a listed module whose current line count exceeds its `lines` baseline
 #     fails the gate (existing oversized file grew);
+#   - a listed, still-oversized module whose `expires` deadline has passed fails
+#     the gate (#12324 expiry ratchet) — the exception cannot live forever;
 #   - `lines` is the recorded baseline; lower it (with justification) only when
 #     the module actually shrinks.
+#
+# Every entry MUST carry a Redmine `owner_issue` AND an `expires` deadline
+# (#12324 acceptance). `expires` is the date the exception lapses; it is set to
+# the planned resolution Version's due date. Within `expiry_warning_days` of the
+# deadline the gate emits a non-fatal "expiring soon" warning so Review Request /
+# Version close readiness sees the impact before the deadline, not only after.
 #
 # `resolution_version` records the planned release each oversized module is
 # scheduled to be reduced in (coordinator decision, #12321 j#62668):
@@ -23,11 +31,16 @@
 #   - cockpit_ui.py            -> v0.10.9  (Version #240, US #12323) — DONE: split
 #       into cockpit_page.py / cockpit_payload.py / cockpit_actions.py and removed
 #       from this allowlist; cockpit_ui.py is now a thin facade.
-#   - the remaining six        -> v0.10.10 (Version #241 ratchet, US #12324)
-# The splits themselves land in those versions; this gate only stops *new*
-# growth in the meantime.
+#   - the remaining six        -> v0.10.10 (Version #241 ratchet, US #12324),
+#       due 2027-11-30 — each `expires` below tracks that Version due date. The
+#       splits themselves are deferred to per-module follow-up issues under that
+#       Version; this gate stops *new* growth and forces resolution by the
+#       deadline in the meantime.
 
 max_module_lines: 1000
+
+# Days before an `expires` deadline at which the gate starts warning (non-fatal).
+expiry_warning_days: 30
 
 include:
   - src/mozyo_bridge
@@ -43,6 +56,7 @@ allowlist:
       handlers into this module (#12321 j#62683).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/cockpit_layout.py
     lines: 2344
@@ -51,6 +65,7 @@ allowlist:
       to split along geometry vs projection responsibilities.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
     lines: 1852
@@ -59,6 +74,7 @@ allowlist:
       with each new diagnostic section.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/release.py
     lines: 1470
@@ -67,6 +83,7 @@ allowlist:
       touches release gates, so it is sequenced carefully.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/handoff.py
     lines: 1084
@@ -74,6 +91,7 @@ allowlist:
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
 
   - path: src/mozyo_bridge/scaffold/rules.py
     lines: 1027
@@ -81,3 +99,4 @@ allowlist:
       Scaffold preset/rule installation logic. Just over threshold.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"

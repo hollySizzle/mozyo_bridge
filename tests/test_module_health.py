@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import date
 from pathlib import Path
 
 from mozyo_bridge.domain.module_health import (
@@ -18,6 +19,8 @@ from mozyo_bridge.domain.module_health import (
     DEFAULT_MAX_MODULE_LINES,
     KIND_BASELINE_BELOW_THRESHOLD,
     KIND_DANGLING,
+    KIND_EXPIRED,
+    KIND_EXPIRING_SOON,
     KIND_GROWTH,
     KIND_NEW_OVERSIZED,
     KIND_RESOLVED,
@@ -125,19 +128,75 @@ class LoadConfigTest(unittest.TestCase):
             path = self._write(
                 Path(tmp),
                 "max_module_lines: 50\n"
+                "expiry_warning_days: 14\n"
                 "include:\n  - pkg\n"
                 "allowlist:\n"
                 "  - path: pkg/big.py\n"
                 "    lines: 120\n"
                 "    reason: legacy\n"
                 "    owner_issue: '#1'\n"
-                "    resolution_version: TBD\n",
+                "    resolution_version: TBD\n"
+                "    expires: '2030-01-01'\n",
             )
             cfg = load_config(path)
             self.assertEqual(cfg.max_module_lines, 50)
+            self.assertEqual(cfg.expiry_warning_days, 14)
             self.assertEqual(cfg.include, ("pkg",))
             self.assertEqual(len(cfg.allowlist), 1)
             self.assertEqual(cfg.allowlist[0].lines, 120)
+            self.assertEqual(cfg.allowlist[0].expires, date(2030, 1, 1))
+
+    def test_unquoted_yaml_date_is_accepted(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # PyYAML parses an unquoted YYYY-MM-DD into a datetime.date; the
+            # loader must accept that as well as the quoted-string form.
+            path = self._write(
+                Path(tmp),
+                "allowlist:\n"
+                "  - path: pkg/big.py\n"
+                "    lines: 120\n"
+                "    reason: legacy\n"
+                "    owner_issue: '#1'\n"
+                "    resolution_version: v0.1.0\n"
+                "    expires: 2030-01-01\n",
+            )
+            cfg = load_config(path)
+            self.assertEqual(cfg.allowlist[0].expires, date(2030, 1, 1))
+
+    def test_bad_expires_raises(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                "allowlist:\n"
+                "  - path: pkg/big.py\n"
+                "    lines: 120\n"
+                "    reason: legacy\n"
+                "    owner_issue: '#1'\n"
+                "    resolution_version: v0.1.0\n"
+                "    expires: 'not-a-date'\n",
+            )
+            with self.assertRaises(ModuleHealthError):
+                load_config(path)
+
+    def test_missing_expires_raises(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                Path(tmp),
+                "allowlist:\n"
+                "  - path: pkg/big.py\n"
+                "    lines: 120\n"
+                "    reason: legacy\n"
+                "    owner_issue: '#1'\n"
+                "    resolution_version: v0.1.0\n",
+            )
+            with self.assertRaises(ModuleHealthError):
+                load_config(path)
 
     def test_bad_top_level(self) -> None:
         import tempfile
@@ -176,6 +235,7 @@ class LoadConfigTest(unittest.TestCase):
                 "    reason: x\n"
                 "    owner_issue: '#1'\n"
                 "    resolution_version: TBD\n"
+                "    expires: '2030-01-01'\n"
             )
             path = self._write(Path(tmp), "allowlist:\n" + entry + entry)
             with self.assertRaises(ModuleHealthError):
@@ -192,13 +252,16 @@ class EvaluateGateTest(unittest.TestCase):
             (pkg / name).write_text("x = 1\n" * n, encoding="utf-8")
         return tmp
 
-    def _entry(self, path: str, lines: int) -> AllowlistEntry:
+    def _entry(
+        self, path: str, lines: int, expires: date = date(2999, 1, 1)
+    ) -> AllowlistEntry:
         return AllowlistEntry(
             path=path,
             lines=lines,
             reason="legacy",
             owner_issue="#1",
             resolution_version="TBD",
+            expires=expires,
         )
 
     def test_new_oversized_fails(self) -> None:
@@ -297,6 +360,70 @@ class EvaluateGateTest(unittest.TestCase):
             kinds = {v.kind for v in result.fatal_violations}
             self.assertIn(KIND_BASELINE_BELOW_THRESHOLD, kinds)
 
+    def test_expired_exception_fails(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(Path(tmp), {"big.py": 10})  # still oversized
+            cfg = ModuleHealthConfig(
+                max_module_lines=5,
+                include=("pkg",),
+                allowlist=(self._entry("pkg/big.py", 10, expires=date(2026, 1, 1)),),
+            )
+            result = evaluate(root, cfg, today=date(2026, 6, 1))
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                [v.kind for v in result.fatal_violations], [KIND_EXPIRED]
+            )
+
+    def test_expiring_soon_is_warning_not_failure(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(Path(tmp), {"big.py": 10})
+            cfg = ModuleHealthConfig(
+                max_module_lines=5,
+                include=("pkg",),
+                allowlist=(self._entry("pkg/big.py", 10, expires=date(2026, 6, 20)),),
+                expiry_warning_days=30,
+            )
+            result = evaluate(root, cfg, today=date(2026, 6, 1))  # 19 days out
+            self.assertTrue(result.ok, [v.message for v in result.violations])
+            self.assertEqual(
+                [v.kind for v in result.warnings], [KIND_EXPIRING_SOON]
+            )
+
+    def test_far_off_deadline_is_silent(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(Path(tmp), {"big.py": 10})
+            cfg = ModuleHealthConfig(
+                max_module_lines=5,
+                include=("pkg",),
+                allowlist=(self._entry("pkg/big.py", 10, expires=date(2027, 1, 1)),),
+                expiry_warning_days=30,
+            )
+            result = evaluate(root, cfg, today=date(2026, 6, 1))
+            self.assertTrue(result.ok)
+            self.assertEqual(result.warnings, [])
+
+    def test_resolved_file_ignores_expiry(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # File now under threshold; an already-past deadline must not turn
+            # into an EXPIRED failure — the entry is simply RESOLVED (removable).
+            root = self._repo(Path(tmp), {"big.py": 3})
+            cfg = ModuleHealthConfig(
+                max_module_lines=5,
+                include=("pkg",),
+                allowlist=(self._entry("pkg/big.py", 10, expires=date(2020, 1, 1)),),
+            )
+            result = evaluate(root, cfg, today=date(2026, 6, 1))
+            self.assertTrue(result.ok)
+            self.assertEqual([v.kind for v in result.warnings], [KIND_RESOLVED])
+
 
 class RealRepoRegressionTest(unittest.TestCase):
     def test_committed_allowlist_keeps_repo_green(self) -> None:
@@ -309,6 +436,25 @@ class RealRepoRegressionTest(unittest.TestCase):
         )
         # The threshold matches the documented decision.
         self.assertEqual(cfg.max_module_lines, 1000)
+
+    def test_every_entry_has_a_future_expiry_deadline(self) -> None:
+        # #12324 acceptance: each remaining exception carries a Redmine owner
+        # issue AND an expiry deadline, and the committed deadlines must still be
+        # in the future (so CI does not start red on a lapsed exception). Pinned
+        # to a reference date for determinism; CI's live `health check` uses the
+        # real today.
+        cfg = load_config(REPO_ROOT / "module_health.yaml", missing_ok=False)
+        self.assertTrue(cfg.allowlist)
+        reference = date(2026, 6, 21)
+        for entry in cfg.allowlist:
+            self.assertTrue(entry.owner_issue.startswith("#"), entry.path)
+            self.assertGreater(
+                entry.expires,
+                reference,
+                f"{entry.path} expiry {entry.expires} is not in the future",
+            )
+        # Green under the gate at the reference date (no EXPIRED, no growth).
+        self.assertTrue(evaluate(REPO_ROOT, cfg, today=reference).ok)
 
     def test_every_entry_records_a_planned_resolution_version(self) -> None:
         # #12321 acceptance + rework j#62668: each allowlisted oversized module

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
+from datetime import date
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable, Optional
@@ -50,6 +51,14 @@ DEFAULT_INCLUDE = ("src/mozyo_bridge",)
 
 # Default location of the allowlist / config document, repo-relative.
 DEFAULT_CONFIG_RELPATH = "module_health.yaml"
+
+# How many days before an allowlist entry's ``expires`` deadline the gate starts
+# emitting a non-fatal "expiring soon" warning. This is the module-health impact
+# surface for Review Request / Version close readiness (#12324): an oversized
+# exception whose resolution Version is approaching shows up before its deadline,
+# not only after it has already lapsed. Overridable via the config's
+# ``expiry_warning_days`` key.
+DEFAULT_EXPIRY_WARNING_DAYS = 30
 
 # AST node types that contribute a decision point to the approximate
 # cyclomatic-complexity signal. This is a coarse health signal, not a precise
@@ -92,13 +101,15 @@ class ModuleMetrics:
 
 @dataclass(frozen=True)
 class AllowlistEntry:
-    """A recorded oversized module: why it is allowed and when it resolves."""
+    """A recorded oversized module: why it is allowed, who owns it, when it
+    resolves, and the hard deadline after which the exception expires."""
 
     path: str
     lines: int  # baseline line count; growth past this fails the gate
     reason: str
     owner_issue: str
     resolution_version: str
+    expires: date  # deadline; past this date the still-oversized entry fails
 
     def as_dict(self) -> dict:
         return {
@@ -107,6 +118,7 @@ class AllowlistEntry:
             "reason": self.reason,
             "owner_issue": self.owner_issue,
             "resolution_version": self.resolution_version,
+            "expires": self.expires.isoformat(),
         }
 
 
@@ -117,6 +129,7 @@ class ModuleHealthConfig:
     max_module_lines: int = DEFAULT_MAX_MODULE_LINES
     include: tuple[str, ...] = DEFAULT_INCLUDE
     allowlist: tuple[AllowlistEntry, ...] = ()
+    expiry_warning_days: int = DEFAULT_EXPIRY_WARNING_DAYS
 
     @property
     def allowlist_by_path(self) -> dict[str, AllowlistEntry]:
@@ -146,8 +159,10 @@ KIND_NEW_OVERSIZED = "new_oversized"  # over threshold, not allowlisted -> fail
 KIND_GROWTH = "growth"  # allowlisted but grew past baseline -> fail
 KIND_DANGLING = "dangling_allowlist"  # allowlist path not found on disk -> fail
 KIND_BASELINE_BELOW_THRESHOLD = "baseline_below_threshold"  # bad config -> fail
+KIND_EXPIRED = "expired"  # still-oversized allowlist entry past its deadline -> fail
 KIND_RESOLVED = "resolved"  # allowlisted file now under threshold -> warn
 KIND_SHRUNK = "shrunk"  # allowlisted file shrank below baseline -> warn
+KIND_EXPIRING_SOON = "expiring_soon"  # oversized entry near its deadline -> warn
 
 
 @dataclass
@@ -313,6 +328,16 @@ def load_config(
         )
     include = tuple(include_raw) if include_raw else DEFAULT_INCLUDE
 
+    warning_days = raw.get("expiry_warning_days", DEFAULT_EXPIRY_WARNING_DAYS)
+    if (
+        not isinstance(warning_days, int)
+        or isinstance(warning_days, bool)
+        or warning_days < 0
+    ):
+        raise ModuleHealthError(
+            f"{config_path}: expiry_warning_days must be a non-negative integer"
+        )
+
     allowlist_raw = raw.get("allowlist", [])
     if not isinstance(allowlist_raw, list):
         raise ModuleHealthError(f"{config_path}: allowlist must be a list")
@@ -336,10 +361,18 @@ def load_config(
         max_module_lines=max_lines,
         include=include,
         allowlist=tuple(entries),
+        expiry_warning_days=warning_days,
     )
 
 
-_REQUIRED_ENTRY_FIELDS = ("path", "lines", "reason", "owner_issue", "resolution_version")
+_REQUIRED_ENTRY_FIELDS = (
+    "path",
+    "lines",
+    "reason",
+    "owner_issue",
+    "resolution_version",
+    "expires",
+)
 
 
 def _parse_entry(item: dict, config_path: Path, index: int) -> AllowlistEntry:
@@ -364,30 +397,69 @@ def _parse_entry(item: dict, config_path: Path, index: int) -> AllowlistEntry:
             raise ModuleHealthError(
                 f"{config_path}: allowlist[{index}].{field_name} must be a non-empty string"
             )
+    expires = _parse_expires(item["expires"], config_path, index)
     return AllowlistEntry(
         path=Path(path).as_posix(),
         lines=lines,
         reason=item["reason"].strip(),
         owner_issue=item["owner_issue"].strip(),
         resolution_version=item["resolution_version"].strip(),
+        expires=expires,
     )
 
 
-def evaluate(repo_root: Path, config: ModuleHealthConfig) -> GateResult:
+def _parse_expires(value, config_path: Path, index: int) -> date:
+    """Coerce an allowlist entry's ``expires`` into a :class:`datetime.date`.
+
+    PyYAML may already parse an unquoted ``2027-11-30`` into a ``date`` (YAML
+    timestamp), or a quoted value stays a string; both are accepted as long as
+    the string is a strict ``YYYY-MM-DD`` ISO date. Anything else fails closed —
+    an exception with no machine-checkable deadline must never weaken the gate.
+    """
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError as exc:
+            raise ModuleHealthError(
+                f"{config_path}: allowlist[{index}].expires must be an ISO date "
+                f"(YYYY-MM-DD): {exc}"
+            ) from exc
+    raise ModuleHealthError(
+        f"{config_path}: allowlist[{index}].expires must be a YYYY-MM-DD date"
+    )
+
+
+def evaluate(
+    repo_root: Path,
+    config: ModuleHealthConfig,
+    *,
+    today: Optional[date] = None,
+) -> GateResult:
     """Measure every in-scope module and apply the oversized-module gate.
 
     Returns a :class:`GateResult` carrying the per-module metrics and any
     violations. Fatal violations: a new oversized module (over threshold, not
     allowlisted), an allowlisted module grown past its baseline, an allowlist
-    entry whose file is missing, and an allowlist baseline that is not actually
-    over the threshold (a misconfigured entry). Non-fatal warnings: an
-    allowlisted module that is now under the threshold (entry can be removed) or
-    that shrank below its baseline (baseline can be tightened).
+    entry whose file is missing, an allowlist baseline that is not actually over
+    the threshold (a misconfigured entry), and a still-oversized allowlist entry
+    whose ``expires`` deadline has passed. Non-fatal warnings: an allowlisted
+    module now under the threshold (entry can be removed), one that shrank below
+    its baseline (baseline can be tightened), and a still-oversized entry whose
+    deadline is within ``expiry_warning_days`` (Version-close readiness signal).
+
+    ``today`` defaults to :func:`datetime.date.today`; it is injectable so the
+    deadline logic is deterministic under test. CI's real ``health check`` is the
+    live expiry enforcement.
     """
+    if today is None:
+        today = date.today()
     result = GateResult()
     files = iter_python_files(repo_root, config.include)
     allowlist = config.allowlist_by_path
     measured_paths: set[str] = set()
+    oversized_allowlisted: set[str] = set()
 
     for file_path in files:
         rel = _relpath(file_path, repo_root)
@@ -398,6 +470,8 @@ def evaluate(repo_root: Path, config: ModuleHealthConfig) -> GateResult:
 
         entry = allowlist.get(rel)
         if metrics.lines > config.max_module_lines:
+            if entry is not None:
+                oversized_allowlisted.add(rel)
             if entry is None:
                 result.violations.append(
                     Violation(
@@ -474,8 +548,45 @@ def evaluate(repo_root: Path, config: ModuleHealthConfig) -> GateResult:
                     ),
                 )
             )
+        # Deadline enforcement only applies while the module is still oversized;
+        # a resolved (now-under-threshold) entry is handled by KIND_RESOLVED.
+        if entry.path in oversized_allowlisted:
+            days_left = (entry.expires - today).days
+            if days_left < 0:
+                result.violations.append(
+                    Violation(
+                        kind=KIND_EXPIRED,
+                        path=entry.path,
+                        message=(
+                            f"allowlist exception for {entry.path} expired on "
+                            f"{entry.expires.isoformat()} ({owner_label(entry)}); "
+                            f"split it into its resolution_version "
+                            f"{entry.resolution_version} or move the deadline with a "
+                            f"recorded reason"
+                        ),
+                    )
+                )
+            elif days_left <= config.expiry_warning_days:
+                result.violations.append(
+                    Violation(
+                        kind=KIND_EXPIRING_SOON,
+                        path=entry.path,
+                        message=(
+                            f"allowlist exception for {entry.path} expires in "
+                            f"{days_left} day(s) on {entry.expires.isoformat()} "
+                            f"({owner_label(entry)}); plan its "
+                            f"{entry.resolution_version} split before then"
+                        ),
+                        fatal=False,
+                    )
+                )
 
     return result
+
+
+def owner_label(entry: AllowlistEntry) -> str:
+    """Short ``owner_issue``-and-version label for expiry violation messages."""
+    return f"owner {entry.owner_issue}, {entry.resolution_version}"
 
 
 def default_config_path(repo_root: Path, override: Optional[str] = None) -> Path:
