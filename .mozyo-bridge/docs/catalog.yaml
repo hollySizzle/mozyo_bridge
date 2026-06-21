@@ -457,7 +457,6 @@ documents:
     related_document_refs:
       - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
-      - logic-sublane-bandwidth-policy
       - rule-public-private-boundary
       - spec-project-map
 
@@ -465,7 +464,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/sublane-bandwidth-policy.md
-    purpose: 効率的な並列開発のため、coordinator が sublane を積極 dispatch すべき条件、serial/drain を選ぶ条件、bandwidth / admission / drain order / routine retirement cadence と mozyo_bridge dogfood soft profile を定義する repo-local policy。
+    purpose: 互換 pointer。サブレーン帯域、admission、pipeline fill、drain order、mozyo_bridge dogfood soft profile の正本は logic-coordinator-sublane-development-flow に統合済み。
     audit_role: sublane_bandwidth_policy_logic
     related_document_refs:
       - logic-coordinator-sublane-development-flow
@@ -478,13 +477,12 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、仕様決定 routing、US close 権限、sublane retirement、後続 Version / US 提案順序を定義する repo-local 開発フロー spine。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、仕様決定 routing、US close 権限、sublane retirement、後続 Version / US 提案順序を定義する repo-local 開発フロー spine。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
-      - logic-sublane-bandwidth-policy
       - logic-worktree-lifecycle-boundary
       - logic-unit-target-model
       - logic-managed-state-model
