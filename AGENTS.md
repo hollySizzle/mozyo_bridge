@@ -30,6 +30,13 @@ Codex セッションの tool-specific 入口。Codex は本ファイルを nati
 
 <!-- mozyo-bridge:project-local-additions:begin -->
 
+## 応答言語 (Workspace Preference)
+
+- この workspace の operator は日本語運用。Claude / Codex の **ユーザー向け応答** (操作説明・進捗報告・handoff narrative・確認・質問) は原則 **日本語** とする。
+- ユーザーが別言語で話した場合はその言語に追従する。preference より user 入力言語を優先する。
+- machine-readable surface は言語に関わらず literal に保つ: gate 名 / transport kind / JSON field と値 / CLI command・flag / code 識別子 / commit trailer (`Refs:`, `issue_<id>`, `Co-Authored-By`) / file path。Redmine journal の構造化 field・識別子も literal でよく、散文 narrative の言語のみ本 preference に従う。
+- 本 preference は **project-local 宣言** であり OSS 既定 (preset / skill / scaffold template) を変更しない。中立ポリシーの正本は中央 preset `### 応答言語ポリシー` を読む。
+
 ## mozyo_bridge Project-Local Rules
 
 - Repository: `mozyo_bridge` Python package / CLI project.
