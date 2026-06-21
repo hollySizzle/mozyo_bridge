@@ -382,6 +382,7 @@ documents:
       - logic-managed-state-model
       - logic-event-timeline-source
       - logic-tmux-send-safety-contract
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -445,6 +446,7 @@ documents:
       - logic-managed-state-model
       - logic-session-inventory
       - logic-workspace-registry
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -457,6 +459,7 @@ documents:
     related_document_refs:
       - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -488,6 +491,7 @@ documents:
       - logic-managed-state-model
       - logic-session-inventory
       - logic-tmux-send-safety-contract
+      - logic-delegated-coordinator-cockpit-display
       - skill-workflow-reference
       - spec-project-map
 
@@ -556,7 +560,26 @@ documents:
       - logic-iterm-webviewer-presentation-boundary
       - logic-cockpit-attention-state
       - logic-cross-project-cockpit-smoke-runbook
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-delegated-coordinator-cockpit-display
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-cockpit-display.md
+    purpose: 親 coordinator → 委譲 (子) coordinator → 孫 implementation lane の shallow delegation における window 分離 (既定 separate / project policy で調整可能)、parent reference display metadata、cockpit 最小追跡 contract、retire owner と ancestor-before-descendant retirement ordering を display 投影として routing/governance から分離して固定する設計正本。
+    audit_role: delegated_coordinator_cockpit_display_logic
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-pane-centric-cockpit-semantics
+      - logic-cockpit-attention-state
+      - logic-unit-presentation-state-db
+      - logic-unit-target-model
+      - logic-worktree-lifecycle-boundary
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
       - spec-project-map
 
   - id: logic-cockpit-web-ui
