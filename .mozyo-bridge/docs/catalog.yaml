@@ -103,6 +103,18 @@ documents:
     related_document_refs:
       - skill-project-map-reference
 
+  - id: spec-delegated-coordinator-role-profile
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegated-coordinator-role-profile.md
+    purpose: coordinator / delegated_coordinator / implementation_gateway / implementation_worker の最小 role 語彙、親 issue close・owner approval・callback・downstream dispatch の責務境界、固定 role profile template の正本。
+    audit_role: delegated_coordinator_role_profile_spec
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-vscode-agent-pane-contract
     type: spec
     status: active
@@ -483,6 +495,7 @@ documents:
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
+      - spec-delegated-coordinator-role-profile
       - logic-worktree-lifecycle-boundary
       - logic-unit-target-model
       - logic-managed-state-model

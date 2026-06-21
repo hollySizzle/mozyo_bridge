@@ -495,6 +495,7 @@ retirement は destructive 寄りの操作なので、pane kill / worktree remov
 ## 参照正本
 
 - `vibes/docs/rules/agent-workflow.md`
+- `vibes/docs/specs/delegated-coordinator-role-profile.md` (親→子委譲時の `coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker` role 語彙と責務境界の正本)
 - `vibes/docs/logics/sublane-bandwidth-policy.md` (互換 pointer。帯域正本は本書)
 - `vibes/docs/logics/worktree-lifecycle-boundary.md`
 - `skills/mozyo-bridge-agent/references/workflow.md`
