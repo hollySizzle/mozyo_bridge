@@ -544,6 +544,24 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-existing-project-sublane-adoption
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/existing-project-sublane-adoption.md
+    purpose: 既存プロジェクトへ governed scaffold と sublane 運用を導入するための runbook。read-only preflight、root adoption、既存 routing / catalog の保持、verification、origin 到達性、callback recovery、Redmine close gate を再現可能な adoption 手順として定義する。
+    audit_role: existing_project_sublane_adoption_logic
+    related_document_refs:
+      - logic-scaffold-rules
+      - logic-bootstrap
+      - logic-coordinator-sublane-development-flow
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-executive-terminal-setup
+      - logic-workspace-registry
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-session-inventory
     type: logic
     status: active
