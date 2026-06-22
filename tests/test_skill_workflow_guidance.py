@@ -121,6 +121,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "## Sublane Completion Guardrails",
         "## Sublane Retirement Drain",
         "## Post-Dispatch Fill Loop",
+        "## Existing-Project Sublane Adoption",
         "## Claude / Codex Role Boundary",
         "## Policy / Skill Authoring Boundary",
         "### Repo-Local Guardrail Autonomous Lane",
@@ -266,6 +267,23 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "`stop_coordinator_blocking`",
         "`stop_soft_profile_full`",
         "portable extract of the repo-local spine",
+        # Existing-project sublane adoption (Redmine #12432, portable extract
+        # of the repo-local runbook vibes/docs/logics/existing-project-sublane-
+        # adoption.md added under #12423). Adopting the governed scaffold + flow
+        # into an existing project preserves its routing, is reachable from the
+        # `--with-sublane-flow` profile, keeps the bootstrap exception from
+        # relaxing any approval gate, and carries the full adoption sequence
+        # (preflight / decomposition / dispatch / scaffold+catalog / verify /
+        # origin-reachable commit / callback recovery / close order).
+        "### When existing-project adoption applies",
+        "### Read-only preflight before any adoption edit",
+        "**Preserve existing routing**",
+        "### Dispatch decision and scaffold / rules / catalog adoption",
+        "### Verification, origin-reachable commit, callback recovery, and close order",
+        "### Boundaries existing-project adoption does not relax",
+        "Adoption is the setup path, not a relaxation of any gate",
+        "bootstrap exception",
+        "A clean `scaffold status` is not workflow adoption",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "Claude implements the normal development task",

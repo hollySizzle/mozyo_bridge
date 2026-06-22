@@ -2039,6 +2039,20 @@ class ScaffoldRulesTest(unittest.TestCase):
                             ),
                         )
 
+                    # Redmine #12432: the opt-in profile must give adopters a
+                    # read-route to the existing-project adoption procedure
+                    # (distilled into the distributed skill workflow reference),
+                    # so `--with-sublane-flow` reaches it without the repo-local
+                    # runbook.
+                    profile_body = (project / self.SUBLANE_PROFILE_PATH).read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertIn(
+                        "## Existing-Project Sublane Adoption",
+                        profile_body,
+                        msg="sublane profile lost the existing-project adoption read-route",
+                    )
+
                     # B1 invariant: scaffold never auto-writes catalog.yaml.
                     self.assertFalse(
                         (project / ".mozyo-bridge/docs/catalog.yaml").exists(),

@@ -19,6 +19,9 @@
   - `## Sublane Completion Guardrails` — downstream resume
   - `## Sublane Retirement Drain` — lane 退役
   - `## Owner Approval Aggregation` — owner 承認の集約点
+  - `## Existing-Project Sublane Adoption` — 既存プロジェクトへこのフローを導入する adopter-facing 手順 (read-only preflight / child 分解 / dispatch / scaffold+rules+catalog adoption / verification / origin-reachable commit / callback recovery / close 順序)
+
+既にあるプロジェクトへ governed scaffold と本フローを **導入する** 手順 (新規 bootstrap ではなく、既存 router / catalog / docs を壊さない adoption) は、上記 `## Existing-Project Sublane Adoption` を正本として読む。private な絶対 path・cockpit 構成・並列 lane 数は配布版に含まれないため、adopter は自身の private operating profile として別途定義する。
 
 git worktree lifecycle (add/remove、branch/path 命名、削除 policy、N-lane 並列 policy の責務境界) を扱う companion doc は `--with-worktree-runbook` で配られる `vibes/docs/logics/worktree-lifecycle-boundary.md` である。両オプションは独立しており、worktree lifecycle の運用 recipe も runtime に置きたい場合は併せて opt-in する。
 
