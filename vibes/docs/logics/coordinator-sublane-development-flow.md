@@ -271,6 +271,25 @@ journal には issue ID と state class を書き、private path や operator-sp
 
 callback は pointer なので、欠けても durable progress は消えない。管制塔は新しい sublane を開く前に active lane の Redmine journal を sweep し、`$callback_sweep()` の 4 状態へ分類して記録する。done な work は再 dispatch しない。この sweep は owner approval や close を self-authorize しない。
 
+### Redmine journal recovery と nagger の位置づけ
+
+handoff-worthy state の欠落検出は、pane 状態や Claude / Codex の自己申告ではなく、
+Redmine issue / journal から復元する。`implementation_done`、`review_request`、
+`review_result`、`owner_close_approval_waiting`、`blocked`、`verification green`
+などの durable gate が進んでいるのに、対応する callback outcome が無い状態は
+`progress_without_callback` として扱い、管制塔が sweep で回収する。
+
+Claude Nagger や類似の機械的 reminder は、品質を上げる補助 tool であって governance
+authority ではない。nagger の通知、pane prompt、local cache、LLM への注意喚起を
+Redmine gate の代替にしない。nagger が callback を促すことは許すが、callback が成立
+したか、どの issue が次 action を待つか、close / owner approval へ進めるかは Redmine
+journal から判定する。
+
+この境界は、LLM に規約遵守を完全に期待しないためのものでもある。Claude が最後に確認
+質問で止まる、pane notification を送り切らない、宛先を取り違える、といった失敗は
+起こり得る前提で設計する。是正は「Claude を機械的に従わせる」方向ではなく、Redmine
+journal を source of truth とした callback sweep / recovery で行う。
+
 ## 仕様決定 routing
 
 管制塔が持つ仕様決定は、後戻りコストが高いもの、横断的なもの、または authority / safety に触れるものである。
