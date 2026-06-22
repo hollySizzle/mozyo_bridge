@@ -122,7 +122,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/delegated-coordinator-decision-records.md
-    purpose: 委譲管制塔 (delegated_coordinator) の child dispatch decision / no-dispatch decision (許容理由 vocabulary) / parent callback (子 dispatch 判断を親が検査できる fields) / process gap correction (parent close・owner approval・release gate bypass の是正経路) の durable record schema 正本。role 語彙は role-profile spec、dispatch / bandwidth / 孫 dispatch policy は coordinator-sublane-development-flow spine を参照し複製しない。
+    purpose: 親 coordinator の parent delegation decision / no-child-delegation reason、委譲管制塔 (delegated_coordinator) の child dispatch decision / no-dispatch decision (許容理由 vocabulary) / parent callback (親→子 delegation 判断と子→孫 dispatch 判断を親が検査できる fields) / process gap correction (parent close・owner approval・release gate bypass の是正経路) の durable record schema 正本。role 語彙は role-profile spec、dispatch / bandwidth / 孫 dispatch policy は coordinator-sublane-development-flow spine を参照し複製しない。
     audit_role: delegated_coordinator_decision_records_spec
     related_document_refs:
       - spec-delegated-coordinator-role-profile

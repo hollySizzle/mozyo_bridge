@@ -2,12 +2,13 @@
 
 Redmine #12398 / US #12392 / Feature #12386 (`Delegated Coordinator / Nested Handoff`)。
 
+親 `coordinator` が子 project / child workspace へ委譲するかどうかを判断し、
 `delegated_coordinator` が子 project 内で dispatch / no-dispatch を判断し、孫
 implementation lane を使うかどうかを決め、handoff-worthy state を親 coordinator
 route へ callback し、安全 invariant が破られた場合に correction を残す。これらの
-判断が durable record に落ちないと、親 coordinator は callback / audit 時に子の
-dispatch 判断を検査できず、parent close / owner approval / release gate の bypass を
-事後に検出・是正できない。
+判断が durable record に落ちないと、親 coordinator は callback / audit 時に親→子
+委譲判断と子→孫 dispatch 判断を検査できず、parent close / owner approval / release
+gate の bypass を事後に検出・是正できない。
 
 本書は委譲管制塔の **decision / callback / correction record schema の正本** である。
 record の固定 fields と許容 vocabulary を定義する。role 語彙・責務境界・実行 spine
@@ -32,14 +33,18 @@ record の固定 fields と許容 vocabulary を定義する。role 語彙・責
   durable record の public/private 境界は `vibes/docs/rules/public-private-boundary.md`
   を正本とする。
 
-本書が足すのは、spine の単一 project bandwidth record に対する **委譲 (delegation)
-識別 fields**、親が子の dispatch 判断を検査するための **parent-inspectable callback
-fields**、安全 invariant bypass の **correction record** である。
+本書が足すのは、親→子委譲の **parent delegation decision fields**、spine の単一
+project bandwidth record に対する **委譲 (delegation) 識別 fields**、親が子の
+dispatch 判断を検査するための **parent-inspectable callback fields**、安全 invariant
+bypass の **correction record** である。
 
 ## 用語
 
 - `parent_coordinator_route`: 委譲元である最上位 `coordinator` (親管制塔) への
   durable callback 経路。anchor pointer であり pane 配置ではない。
+- `child_coordinator_route`: 親 `coordinator` が委譲先として使う子 project /
+  child workspace の `delegated_coordinator` gateway route。anchor pointer であり
+  pane 配置ではない。
 - `delegated_coordinator_lane`: 子 project の `delegated_coordinator` lane identity。
   workspace / lane / role の pointer で表し、private path は書かない。
 - `grandchild lane`: `delegated_coordinator` が downstream dispatch する
@@ -49,7 +54,69 @@ fields**、安全 invariant bypass の **correction record** である。
 token を書き、private path や operator-specific cockpit details は書かない
 (public/private boundary)。
 
-## 1. dispatch decision record (child dispatch decision)
+## 1. parent delegation decision record
+
+親 `coordinator` が子 project / child workspace に implementation-shaped work を委譲
+するか、または委譲せず親 lane / child workspace Claude へ直接流すかを判断したときの
+durable record。目的は、親→子 gateway を使わない判断が bootstrap 例外なのか、単なる
+role bypass なのかを後から検査できるようにすることである。
+
+```markdown
+## Parent delegation decision
+
+- record_kind: parent_delegation_decision
+- parent_coordinator: <親 coordinator route / lane pointer>
+- parent_issue: <親 issue / US id>
+- child_project: <子 project / child workspace identifier>
+- child_issue: <子 project 側 issue id | not_created | not_applicable>
+- child_coordinator_route: <delegated_coordinator route anchor | unavailable | not_adopted>
+- child_delegation: <used | avoided | not_applicable>
+- child_delegation_anchor: <子 coordinator への durable handoff anchor | not_applicable>
+- no_child_delegation_reason: <下表の token | not_applicable>
+- follow_up_validation: <子 route / sublane replay を確認する issue / journal anchor | none>
+- correction_required: <false | true:process_gap_correction_required>
+```
+
+要求粒度:
+
+- **記録不要 (parent-context-neutral default)**: 親 coordinator の read-only 調査、
+  ticket triage、owner-facing explanation、親 project 内だけで完結する判断は、専用の
+  parent delegation decision を要求しない。
+- **記録必須**: 子 project の実装 file / scaffold / runtime entrypoint に影響する
+  work、child workspace Claude への直接 `implementation_request`、子 coordinator
+  gateway を使うべき workflow の bypass、bootstrap / child gateway unavailable /
+  child route not adopted を理由に main/default lane で実装する判断は、実装 handoff
+  前に parent delegation decision を残す。
+- **borderline は具体理由**: 子 project の成果物を変えるか、子 coordinator の authority
+  を迂回するかが曖昧な場合は、`child_delegation: avoided` と具体的な
+  `no_child_delegation_reason` を記録し、監査者が後で妥当性を判定できるようにする。
+
+`no_child_delegation_reason` の許容 vocabulary:
+
+| token | 意味 |
+| --- | --- |
+| `bootstrap_child_route_not_adopted` | 子 project の router / scaffold / delegated coordinator route を整備する前段作業であり、子 gateway がまだ正規入口として成立していない。follow-up validation を必ず書く。 |
+| `child_gateway_unavailable` | 子 coordinator pane / route / identity gate が利用不能。利用不能事実と retry / recovery anchor を併記する。 |
+| `child_scope_not_implementation` | 子 project に関する read-only 調査、ticket 整理、owner-facing explanation であり、実装成果物を変えない。 |
+| `urgent_minimal_correction` | release / CI / publish 等の進行を止めるための最小 correction。緊急性と後続 re-audit anchor を併記する。 |
+| `<具体記述>` | 上記に当てはまらない borderline 判断。なぜ子 coordinator を使わない方が安全かを具体化する。 |
+
+固定境界:
+
+- `child_delegation: avoided` は親が子 close / owner approval / release gate を
+  self-authorize する根拠にならない。close / approval / release authority は
+  role-profile spec と governed preset のまま維持する。
+- `bootstrap_child_route_not_adopted` は一度きりの導入例外であり、同じ child project で
+  繰り返し使う場合は process gap として扱う。bootstrap 後の通常実装は
+  `child_coordinator_route` へ委譲するか、使わない理由を再記録する。
+- 子 workspace Claude へ直接 implementation_request を送る場合でも、pane message は
+  Redmine anchor への pointer であり、Implementation Done / Review Request / callback
+  は durable record に残す。
+- 親→子の delegation decision は、後続の delegated callback または parent audit が
+  検査できる durable anchor に置く。anchor を欠いた child gateway bypass は process
+  gap として §5 correction record の対象になる。
+
+## 2. dispatch decision record (child dispatch decision)
 
 `delegated_coordinator` が子 issue の implementation-shaped work を孫 lane へ
 dispatch すると判断したときの durable record。spine の `## Sublane dispatch decision`
@@ -85,7 +152,7 @@ dispatch decision record は次の追加 fields を持つ。
   親 coordinator が callback / audit 時に子の dispatch 判断を検査できることが要件で
   あり、後述の parent callback record はこの record の anchor を参照する。
 
-## 2. no-dispatch decision record
+## 3. no-dispatch decision record
 
 孫を使わない判断を毎回 journal 化すると durable record の信号対雑音比が下がる。
 記録粒度の base 方針は spine の `#### no-dispatch 記録の粒度` を正本とする。本書は
@@ -118,12 +185,12 @@ dispatch decision record は次の追加 fields を持つ。
 no-dispatch decision は「context を消費し得る work を孫に出さなかった非自明判断」に
 集中させ、context-neutral な default work には記録を課さない。
 
-## 3. parent callback record
+## 4. parent callback record
 
 `delegated_coordinator` が handoff-worthy state を `parent_coordinator_route` へ
 callback するときの durable record。目的は、親 `coordinator` が callback / audit 時に
-**子の dispatch 判断を検査できる**ことである。callback は durable anchor への pointer
-であり work log ではない (spine / role-profile spec)。
+**親→子 delegation 判断と子→孫 dispatch 判断を検査できる**ことである。callback は
+durable anchor への pointer であり work log ではない (spine / role-profile spec)。
 
 ```markdown
 ## Delegated callback
@@ -135,6 +202,7 @@ callback するときの durable record。目的は、親 `coordinator` が call
 - child_issue: <子 issue id>
 - parent_issue: <親 issue / US id>
 - child_dispatch_anchors:
+  - <parent delegation decision anchor（あれば）>
   - <dispatch decision record anchor>
   - <no-dispatch を追記した dispatch decision anchor（あれば）>
 - dispatch_judgment_summary: <子の dispatch / no-dispatch 判断の 1 行 pointer。work log にしない>
@@ -148,16 +216,19 @@ callback するときの durable record。目的は、親 `coordinator` が call
 - `state` の vocabulary は role-profile spec の handoff-worthy state
   (implementation_done / review_request / review_result / owner_close_approval_waiting
   / blocked) に従う。
-- `child_dispatch_anchors` は本書 §1 / §2 の record anchor を列挙する。親 coordinator
-  はこの anchor から子の dispatch / no-dispatch 判断を検査する。anchor を欠いた
-  callback は「子の判断が検査不能」であり、callback として不完全とする。
+- `child_dispatch_anchors` は本書 §1 / §2 / §3 の record anchor を列挙する。親
+  coordinator はこの anchor から親→子 delegation と子→孫 dispatch / no-dispatch
+  判断を検査する。anchor を欠いた callback は「委譲判断が検査不能」であり、
+  callback として不完全とする。ただし §3 の context-neutral default で専用
+  no-dispatch record を要求しない場合は、`dispatch_judgment_summary` に
+  `context-neutral default` を明記して検査可能にする。
 - `owner_approval_waiting: yes` の場合、`delegated_coordinator` は自 lane で owner
   approval を solicit / collect / ratify しない (role-profile spec の安全 invariant)。
   親 coordinator route の単一 aggregation point へ戻す。
 - callback / audit で安全 invariant 違反を観測した場合は `correction_needed` に
-  bypass kind を立て、§4 の correction record を起票する。
+  bypass kind を立て、§5 の correction record を起票する。
 
-## 4. process gap correction record
+## 5. process gap correction record
 
 子 (delegated_coordinator または downstream) が安全 invariant を bypass した場合の
 是正 record。role-profile spec の固定 invariant — owner approval の単一 aggregation
@@ -204,12 +275,14 @@ bypass kind と correction path の対応:
 project policy knob は本書の record fields を省略してよい根拠にならない。
 
 - handoff-worthy state は parent callback record を残す。`child_dispatch_anchors` を
-  欠いた callback は、子の dispatch 判断が検査不能であり完了扱いにしない。
+  欠いた callback は、親→子 / 子→孫の委譲判断が検査不能であり完了扱いにしない。
+  context-neutral default で anchor が無い場合でも、`dispatch_judgment_summary` に
+  その理由を明記する。
 - owner approval は親 coordinator route の単一 aggregation point に戻す。子 lane で
-  ratify した場合は §4 `owner_approval_bypass` の correction を起票する。
-- parent issue close は最上位 `coordinator` のみ。子が close した場合は §4
+  ratify した場合は §5 `owner_approval_bypass` の correction を起票する。
+- parent issue close は最上位 `coordinator` のみ。子が close した場合は §5
   `parent_close_bypass` の correction を起票する。
-- release / publish の owner gate を子が bypass した場合は §4 `release_gate_bypass`
+- release / publish の owner gate を子が bypass した場合は §5 `release_gate_bypass`
   の correction を起票する。
 
 ## 参照正本
