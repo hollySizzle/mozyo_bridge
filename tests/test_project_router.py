@@ -156,6 +156,101 @@ class ResolveDelegationTargetTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, CODE_MALFORMED_CONFIG)
 
 
+# Mirrors the live gk-3500-it-operations `projects.yaml` shape observed in
+# #12439 (#12444 j#63487): a list of entries identified by `redmine_project`
+# (no explicit `id`), classified by `status`, with a `canonical` block that
+# carries upstream identity (git_repo / upstream_url / redmine_project) rather
+# than a local repo root, plus a `relation` mapping. Canonical URL/owner are
+# neutral placeholders — the test pins the schema *shape*, not real upstream.
+LIVE_GK_CONFIG = {
+    "schema_version": 1,
+    "monorepo": {"name": "gk-3500-it-operations"},
+    "projects": [
+        {
+            "redmine_project": "giken-cloud-drive-management",
+            "status": "active",
+            "path": "projects/giken-cloud-drive-management",
+        },
+        {
+            "redmine_project": "giken-3800-mozyo-bridge",
+            "status": "external-submodule",
+            "path": "projects/giken-3800-mozyo-bridge",
+            "metadata": None,
+            "catalog": None,
+            "canonical": {
+                "git_repo": "owner/mozyo_bridge",
+                "redmine_project": "giken-3800-mozyo-bridge",
+                "upstream_url": "https://example.invalid/owner/mozyo_bridge.git",
+            },
+            "relation": {
+                "kind": "external_dependency_reference",
+                "anchor_issue": 12435,
+            },
+        },
+    ],
+}
+
+
+class LiveGkSchemaShapeTest(unittest.TestCase):
+    """Regression for the live gk `projects.yaml` schema shape (Redmine #12444)."""
+
+    def test_entry_identified_by_redmine_project_resolves(self) -> None:
+        target = resolve_delegation_target(LIVE_GK_CONFIG, "giken-3800-mozyo-bridge")
+        # Identity matched via the `redmine_project` fallback (no `id` present).
+        self.assertEqual(target.target_project, "giken-3800-mozyo-bridge")
+        # Classified external-submodule via the live `status` field, not the
+        # `relation` mapping (which must not be coerced to an opaque string).
+        self.assertEqual(target.classification, "external-submodule")
+        self.assertEqual(target.redmine_project, "giken-3800-mozyo-bridge")
+        self.assertEqual(target.child_project, "giken-3800-mozyo-bridge")
+
+    def test_delegated_fields_populated_from_live_entry(self) -> None:
+        target = resolve_delegation_target(LIVE_GK_CONFIG, "giken-3800-mozyo-bridge")
+        fields = delegated_coordinator_profile_fields(target, parent_issue="12437")
+        self.assertEqual(fields["child_project"], "giken-3800-mozyo-bridge")
+        self.assertEqual(fields["redmine_project"], "giken-3800-mozyo-bridge")
+        self.assertEqual(fields["parent_issue"], "12437")
+
+    def test_active_status_entry_is_not_delegable(self) -> None:
+        with self.assertRaises(ProjectRouterError) as ctx:
+            resolve_delegation_target(LIVE_GK_CONFIG, "giken-cloud-drive-management")
+        self.assertEqual(ctx.exception.code, CODE_NOT_EXTERNAL_SUBMODULE)
+
+    def test_explicit_id_still_takes_precedence_over_redmine_project(self) -> None:
+        # When an entry declares an explicit `id`, that is its identity; the
+        # `redmine_project` fallback only applies when no earlier id key exists.
+        config = {
+            "projects": [
+                {
+                    "id": "explicit-id",
+                    "redmine_project": "rp-alias",
+                    "status": "external-submodule",
+                    "canonical": {"repo_root": "/workspace/project-alpha"},
+                }
+            ]
+        }
+        target = resolve_delegation_target(config, "explicit-id")
+        self.assertEqual(target.target_project, "explicit-id")
+        with self.assertRaises(ProjectRouterError):
+            resolve_delegation_target(config, "rp-alias")
+
+    def test_relation_mapping_alone_does_not_misclassify(self) -> None:
+        # A `relation` mapping with no scalar status/classification must not be
+        # coerced into a string classification; it fails closed instead.
+        config = {
+            "projects": [
+                {
+                    "redmine_project": "x",
+                    "relation": {"kind": "external_dependency_reference"},
+                    "canonical": {"repo_root": "/workspace/project-alpha"},
+                }
+            ]
+        }
+        with self.assertRaises(ProjectRouterError) as ctx:
+            resolve_delegation_target(config, "x")
+        self.assertEqual(ctx.exception.code, CODE_NOT_EXTERNAL_SUBMODULE)
+
+
 class SelectDelegationCodexPaneTest(unittest.TestCase):
     CANON = "/workspace/project-alpha"
 

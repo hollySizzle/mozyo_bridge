@@ -83,9 +83,15 @@ CODE_AMBIGUOUS_TARGET = "ambiguous_target"
 # Keys under the top-level config that hold the project map / list.
 _PROJECTS_CONTAINER_KEYS = ("projects", "external_projects", "entries")
 # Keys on a project entry that hold its own identifier (when entries are a list).
-_PROJECT_ID_KEYS = ("id", "name", "project", "key", "slug")
-# Keys whose value classifies the entry.
-_CLASSIFICATION_KEYS = ("classification", "kind", "type", "category", "relation")
+# ``redmine_project`` is the *fallback* identity (Redmine #12444): the live gk
+# `projects.yaml` list entries identify themselves with ``redmine_project`` and
+# carry no explicit ``id``, so an explicit ``id`` (when present) still wins and
+# ``redmine_project`` matches when it is the only identity the entry declares.
+_PROJECT_ID_KEYS = ("id", "name", "project", "key", "slug", "redmine_project")
+# Keys whose value classifies the entry. ``status`` is the live gk classification
+# field (Redmine #12444: ``status: external-submodule``); it is ordered before
+# the legacy ``relation`` key so a scalar status wins over a ``relation`` mapping.
+_CLASSIFICATION_KEYS = ("classification", "status", "kind", "type", "category", "relation")
 # Classification values that mean "external submodule; changes belong upstream".
 _EXTERNAL_SUBMODULE_VALUES = frozenset(
     {
@@ -156,8 +162,13 @@ def _first_present(mapping: Mapping[str, object], keys: Iterable[str]) -> Option
 
 
 def _as_str(value: object) -> Optional[str]:
-    """Coerce a scalar config value to a stripped string, else ``None``."""
-    if value is None:
+    """Coerce a scalar config value to a stripped string, else ``None``.
+
+    Containers (mappings / lists) are rejected (``None``) rather than coerced via
+    ``str(...)`` (Redmine #12444): a ``relation: {kind: ...}`` mapping in a
+    classification slot must not be mis-read as an opaque ``"{...}"`` string.
+    """
+    if value is None or isinstance(value, (Mapping, list, tuple)):
         return None
     text = str(value).strip()
     return text or None
