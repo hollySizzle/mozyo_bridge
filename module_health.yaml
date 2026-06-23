@@ -76,10 +76,18 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1852
+    lines: 1855
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
-      with each new diagnostic section.
+      with each new diagnostic section. Baseline raised 1852 -> 1855 (#12443) to
+      record the +3-line net growth that landed in #12360 (commit 4411778):
+      expanding the `CLAUDE_GLOBAL_SKILL_INSTALL_HINT` comment to explain that
+      the install script now defaults to `global` scope. That growth shipped
+      without a matching baseline bump and was surfaced as a pre-existing
+      module-health red during #12438 verification; #12360's reviewed comment
+      carries the new-default intent, so the honest fix is to record the
+      growth here rather than re-trim the comment. The split owner remains
+      #12321 (v0.10.10 / Version #241).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
