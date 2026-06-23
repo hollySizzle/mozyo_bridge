@@ -58,7 +58,7 @@ Safety invariants this core preserves (it weakens none):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 from mozyo_bridge.domain.project_router import (
     CODE_AMBIGUOUS_TARGET,
@@ -101,6 +101,133 @@ CODE_LAUNCH_IDENTITY_INCOMPLETE = "launch_identity_incomplete"
 DELEGATED_COORDINATOR_DEPTH = 1
 
 
+# --- Multi-recipient callback targets (Redmine #12449) ------------------------
+#
+# #12448 showed a single-``callback_route`` model lets a delegated lane record
+# PASS after notifying only the parent project coordinator while a *separate*
+# owning-US / audit coordinator never received a pointer (cockpit looks stalled
+# for US-level audit). The launch/adopt record therefore models purpose-tagged
+# required callback targets, not one route, and acceptance must check that every
+# required target has a recorded outcome (``delegated-coordinator-decision-records.md``
+# ``Delegated callback targets``; the repo-local spec lands via the guardrail
+# autonomous lane, Redmine #12449 j#63579).
+
+# Callback target purposes.
+CALLBACK_PURPOSE_DELEGATION_PARENT = "delegation_parent"
+"""The parent project coordinator route (close authority / owner-approval aggregation)."""
+CALLBACK_PURPOSE_OWNING_US_COORDINATOR = "owning_us_coordinator"
+"""The child project's US-level audit / child-disposition coordinator route."""
+CALLBACK_PURPOSE_AUDIT_COORDINATOR = "audit_coordinator"
+"""An explicit audit coordinator route, when distinct from the owning US coordinator."""
+
+# Recorded callback outcomes that satisfy a required target. ``pending`` (or any
+# unrecorded route) does NOT satisfy it; same-lane surfacing is not an outcome
+# here. ``not_applicable`` is an *explicit* operator decision, not silent omission.
+CALLBACK_OUTCOME_SENT = "sent"
+CALLBACK_OUTCOME_BLOCKED = "blocked"
+CALLBACK_OUTCOME_NOT_APPLICABLE = "not_applicable"
+CALLBACK_OUTCOME_PENDING = "pending"
+_SATISFYING_OUTCOMES = frozenset(
+    {CALLBACK_OUTCOME_SENT, CALLBACK_OUTCOME_BLOCKED, CALLBACK_OUTCOME_NOT_APPLICABLE}
+)
+
+
+@dataclass(frozen=True)
+class CallbackTarget:
+    """A purpose-tagged required callback route for a delegated lane (#12449).
+
+    ``purposes`` holds every callback purpose this single ``route`` serves. When
+    two purposes (e.g. ``delegation_parent`` and ``owning_us_coordinator``)
+    resolve to the *same* route they collapse into one target carrying both
+    purposes — recorded explicitly rather than silently dropping a purpose.
+    """
+
+    route: str
+    purposes: tuple[str, ...]
+    required: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "route": self.route,
+            "purposes": list(self.purposes),
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True)
+class CallbackCoverage:
+    """Result of checking recorded callback outcomes against required targets."""
+
+    satisfied: bool
+    pending_routes: tuple[str, ...]
+    pending_purposes: tuple[str, ...]
+
+
+def build_required_callback_targets(
+    *,
+    delegation_parent_route: Optional[str],
+    owning_us_coordinator_route: Optional[str] = None,
+    audit_coordinator_route: Optional[str] = None,
+) -> tuple[CallbackTarget, ...]:
+    """Build the purpose-tagged required callback targets for a delegated lane.
+
+    Purposes that resolve to the same route collapse into one target carrying all
+    of them (so a single callback to a shared route satisfies both purposes, and
+    no purpose is silently dropped). Purposes with no route are omitted — a route
+    must be supplied for a purpose to become a required target. Routes are compared
+    literally (``%pane`` / label), not path-normalized.
+    """
+    purpose_routes = (
+        (CALLBACK_PURPOSE_DELEGATION_PARENT, _clean(delegation_parent_route)),
+        (CALLBACK_PURPOSE_OWNING_US_COORDINATOR, _clean(owning_us_coordinator_route)),
+        (CALLBACK_PURPOSE_AUDIT_COORDINATOR, _clean(audit_coordinator_route)),
+    )
+    grouped: dict[str, list[str]] = {}
+    order: list[str] = []
+    for purpose, route in purpose_routes:
+        if not route:
+            continue
+        if route not in grouped:
+            grouped[route] = []
+            order.append(route)
+        if purpose not in grouped[route]:
+            grouped[route].append(purpose)
+    return tuple(
+        CallbackTarget(route=route, purposes=tuple(grouped[route]), required=True)
+        for route in order
+    )
+
+
+def evaluate_callback_coverage(
+    targets: Iterable[CallbackTarget],
+    recorded_outcomes: "Mapping[str, str]",
+) -> CallbackCoverage:
+    """Check whether every required callback target has a satisfying outcome.
+
+    ``recorded_outcomes`` maps a target ``route`` to its recorded callback outcome
+    (``sent`` / ``blocked`` / ``not_applicable``). A required target is satisfied
+    only when its route carries one of those outcomes; ``pending`` or an absent
+    route leaves it unsatisfied. This is what makes "notified only the parent
+    coordinator" fail acceptance when an owning-US coordinator is also required
+    (#12448 / #12449). Same-lane surfacing is not a callback outcome — callers
+    must not feed it here.
+    """
+    pending_routes: list[str] = []
+    pending_purposes: list[str] = []
+    for target in targets:
+        if not target.required:
+            continue
+        outcome = _clean(recorded_outcomes.get(target.route))
+        if outcome not in _SATISFYING_OUTCOMES:
+            pending_routes.append(target.route)
+            pending_purposes.extend(target.purposes)
+    return CallbackCoverage(
+        satisfied=not pending_routes,
+        pending_routes=tuple(pending_routes),
+        pending_purposes=tuple(pending_purposes),
+    )
+
+
 @dataclass(frozen=True)
 class DelegationLaneDecision:
     """A resolved launch/adopt decision for a delegated coordinator lane (#12447).
@@ -115,6 +242,13 @@ class DelegationLaneDecision:
     (the parent coordinator's unit pointer), never routing identity. ``lane_kind``
     is fixed to ``delegated_coordinator`` and ``no_hidden_subagent`` is always
     ``True`` — the decision always names a visible lane.
+
+    ``callback_targets`` is the authoritative set of purpose-tagged required
+    callback routes (Redmine #12449): a delegated lane is not "done" until every
+    required target has a recorded callback outcome, so notifying only the parent
+    coordinator while a distinct owning-US / audit coordinator is also required
+    does not pass. ``parent_callback_target`` is retained as the delegation-parent
+    route (and the ``callback_route`` alias), but it is no longer the sole route.
     """
 
     mode: str
@@ -134,15 +268,17 @@ class DelegationLaneDecision:
     branch: Optional[str]
     worktree: Optional[str]
     lane_id: Optional[str]
+    callback_targets: tuple[CallbackTarget, ...] = ()
     no_hidden_subagent: bool = True
 
     @property
     def callback_route(self) -> Optional[str]:
-        """Where the delegated coordinator returns handoff-worthy state.
+        """The delegation-parent callback route (back-compat alias).
 
-        Alias for ``parent_callback_target`` — the callback route is the parent
-        coordinator route; the delegated lane never aggregates owner approval or
-        closes the parent issue itself.
+        Alias for ``parent_callback_target`` — the parent project coordinator
+        route. This is only *one* of the required callback targets; the
+        authoritative, multi-recipient set is ``callback_targets`` (#12449). The
+        delegated lane never aggregates owner approval or closes the parent issue.
         """
         return self.parent_callback_target
 
@@ -203,6 +339,8 @@ def decide_delegation_lane(
     parent_project: Optional[str] = None,
     parent_issue: Optional[str] = None,
     parent_callback_target: Optional[str] = None,
+    owning_us_coordinator: Optional[str] = None,
+    audit_coordinator: Optional[str] = None,
     delegation_root: Optional[str] = None,
     delegation_parent: Optional[str] = None,
 ) -> DelegationLaneDecision:
@@ -229,6 +367,14 @@ def decide_delegation_lane(
     — a launch needs at least a child issue and a branch or worktree to be
     auditable). The actual worktree / pane creation is an operator/cockpit action,
     verified live in the separate test issue.
+
+    Required callback targets (#12449) are derived from ``parent_callback_target``
+    (the ``delegation_parent`` purpose) plus ``owning_us_coordinator`` /
+    ``audit_coordinator`` when supplied. Purposes that resolve to the same route
+    collapse into one target carrying both purposes (recorded explicitly). The
+    resulting ``callback_targets`` is the authoritative set acceptance checks
+    against — notifying only the parent coordinator does not pass when a distinct
+    owning-US / audit coordinator is also required.
 
     Pure and deterministic: no tmux / git / filesystem access.
     """
@@ -264,6 +410,12 @@ def decide_delegation_lane(
         _clean(delegation_parent) or resolved_root_pointer
     )
 
+    callback_targets = build_required_callback_targets(
+        delegation_parent_route=parent_callback_target,
+        owning_us_coordinator_route=owning_us_coordinator,
+        audit_coordinator_route=audit_coordinator,
+    )
+
     common = dict(
         lane_kind=ROLE_DELEGATED_COORDINATOR,
         target_project=target.target_project,
@@ -276,6 +428,7 @@ def decide_delegation_lane(
         delegation_root=resolved_root_pointer,
         delegation_parent=resolved_parent_pointer,
         delegation_depth=DELEGATED_COORDINATOR_DEPTH,
+        callback_targets=callback_targets,
     )
 
     if decision_mode == LANE_ADOPT:
@@ -350,10 +503,12 @@ def build_delegation_lane_record(decision: DelegationLaneDecision) -> dict:
 
     Carries every field the acceptance requires to replay the route from the
     durable record: the launch/adopt selection, target project, target / parent
-    issue, canonical repo root, lane / worktree identity, callback route, the
-    delegation breadcrumb, and the no-hidden-subagent guarantee. Optional identity
-    fields are omitted when unset so the record stays readable, but the decision
-    mode and boundary markers are always present.
+    issue, canonical repo root, lane / worktree identity, the purpose-tagged
+    required ``callback_targets`` (#12449), the delegation breadcrumb, and the
+    no-hidden-subagent guarantee. Optional identity fields are omitted when unset
+    so the record stays readable, but the decision mode and boundary markers are
+    always present. ``callback_targets`` is included whenever any required target
+    resolved, so a reader can never mistake a single parent route for the full set.
     """
     record: dict = {
         "lane_decision": decision.mode,
@@ -364,11 +519,12 @@ def build_delegation_lane_record(decision: DelegationLaneDecision) -> dict:
         "delegation_depth": decision.delegation_depth,
         "no_hidden_subagent": decision.no_hidden_subagent,
     }
+    if decision.callback_targets:
+        record["callback_targets"] = [t.to_dict() for t in decision.callback_targets]
     optional = {
         "redmine_project": decision.redmine_project,
         "parent_project": decision.parent_project,
         "parent_issue": decision.parent_issue,
-        "callback_route": decision.callback_route,
         "delegation_root": decision.delegation_root,
         "delegation_parent": decision.delegation_parent,
         "adopt_target": decision.adopt_target,
@@ -420,6 +576,17 @@ __all__ = (
     "CODE_LAUNCH_ROOT_ABSENT",
     "CODE_LAUNCH_IDENTITY_INCOMPLETE",
     "DELEGATED_COORDINATOR_DEPTH",
+    "CALLBACK_PURPOSE_DELEGATION_PARENT",
+    "CALLBACK_PURPOSE_OWNING_US_COORDINATOR",
+    "CALLBACK_PURPOSE_AUDIT_COORDINATOR",
+    "CALLBACK_OUTCOME_SENT",
+    "CALLBACK_OUTCOME_BLOCKED",
+    "CALLBACK_OUTCOME_NOT_APPLICABLE",
+    "CALLBACK_OUTCOME_PENDING",
+    "CallbackTarget",
+    "CallbackCoverage",
+    "build_required_callback_targets",
+    "evaluate_callback_coverage",
     "DelegationLaneDecision",
     "decide_delegation_lane",
     "build_delegation_lane_record",

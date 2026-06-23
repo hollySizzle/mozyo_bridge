@@ -30,6 +30,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.delegated_lane import (  # noqa: E402
+    CALLBACK_OUTCOME_BLOCKED,
+    CALLBACK_OUTCOME_NOT_APPLICABLE,
+    CALLBACK_OUTCOME_SENT,
+    CALLBACK_PURPOSE_AUDIT_COORDINATOR,
+    CALLBACK_PURPOSE_DELEGATION_PARENT,
+    CALLBACK_PURPOSE_OWNING_US_COORDINATOR,
     CODE_ADOPT_NO_EXISTING_LANE,
     CODE_ADOPT_TARGET_AMBIGUOUS,
     CODE_DECISION_REQUIRED,
@@ -41,7 +47,9 @@ from mozyo_bridge.domain.delegated_lane import (  # noqa: E402
     DelegationLaneError,
     build_delegation_display_record,
     build_delegation_lane_record,
+    build_required_callback_targets,
     decide_delegation_lane,
+    evaluate_callback_coverage,
 )
 from mozyo_bridge.domain.project_router import DelegationTarget  # noqa: E402
 from mozyo_bridge.domain.role_profile import ROLE_DELEGATED_COORDINATOR  # noqa: E402
@@ -259,6 +267,7 @@ class RecordProjectionTest(unittest.TestCase):
             explicit_adopt_target="%2",
             parent_issue="12437",
             parent_callback_target="%8",
+            owning_us_coordinator="%6",
             lane_id="lane-2123ef563427",
         )
 
@@ -269,10 +278,22 @@ class RecordProjectionTest(unittest.TestCase):
         self.assertEqual(record["target_project"], "giken-3800-mozyo-bridge")
         self.assertEqual(record["canonical_repo_root"], CANON)
         self.assertEqual(record["parent_issue"], "12437")
-        self.assertEqual(record["callback_route"], "%8")
         self.assertEqual(record["adopt_target"], "%2")
         self.assertEqual(record["lane_id"], "lane-2123ef563427")
         self.assertTrue(record["no_hidden_subagent"])
+        # The record carries purpose-tagged callback targets, not one route (#12449).
+        self.assertNotIn("callback_route", record)
+        self.assertEqual(
+            record["callback_targets"],
+            [
+                {"route": "%8", "purposes": ["delegation_parent"], "required": True},
+                {
+                    "route": "%6",
+                    "purposes": ["owning_us_coordinator"],
+                    "required": True,
+                },
+            ],
+        )
 
     def test_lane_record_omits_unset_optionals(self) -> None:
         decision = decide_delegation_lane(
@@ -308,6 +329,98 @@ class RecordProjectionTest(unittest.TestCase):
             record["source_refs"],
             ["redmine:#12447#journal-63531", "tmux:%2@2026-06-23"],
         )
+
+
+class MultiRecipientCallbackTest(unittest.TestCase):
+    """Purpose-tagged required callback targets + coverage (Redmine #12449)."""
+
+    def test_distinct_routes_become_separate_required_targets(self) -> None:
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%6"
+        )
+        self.assertEqual([t.route for t in targets], ["%8", "%6"])
+        self.assertEqual(targets[0].purposes, (CALLBACK_PURPOSE_DELEGATION_PARENT,))
+        self.assertEqual(
+            targets[1].purposes, (CALLBACK_PURPOSE_OWNING_US_COORDINATOR,)
+        )
+        self.assertTrue(all(t.required for t in targets))
+
+    def test_shared_route_records_both_purposes_explicitly(self) -> None:
+        # If both purposes resolve to the same route, neither purpose is dropped.
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%8"
+        )
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].route, "%8")
+        self.assertEqual(
+            targets[0].purposes,
+            (CALLBACK_PURPOSE_DELEGATION_PARENT, CALLBACK_PURPOSE_OWNING_US_COORDINATOR),
+        )
+
+    def test_audit_coordinator_is_a_third_target(self) -> None:
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8",
+            owning_us_coordinator_route="%6",
+            audit_coordinator_route="%4",
+        )
+        self.assertEqual([t.route for t in targets], ["%8", "%6", "%4"])
+        self.assertEqual(targets[2].purposes, (CALLBACK_PURPOSE_AUDIT_COORDINATOR,))
+
+    def test_purpose_without_route_is_omitted(self) -> None:
+        targets = build_required_callback_targets(delegation_parent_route="%8")
+        self.assertEqual([t.route for t in targets], ["%8"])
+
+    def test_decision_carries_callback_targets(self) -> None:
+        decision = decide_delegation_lane(
+            _target(),
+            mode=LANE_ADOPT,
+            explicit_adopt_target="%2",
+            parent_callback_target="%8",
+            owning_us_coordinator="%6",
+        )
+        self.assertEqual([t.route for t in decision.callback_targets], ["%8", "%6"])
+        # The back-compat alias still returns only the delegation-parent route.
+        self.assertEqual(decision.callback_route, "%8")
+
+    def test_parent_only_outcome_does_not_satisfy_coverage(self) -> None:
+        # The #12448 regression: notifying only the parent coordinator while a
+        # distinct owning-US coordinator is also required must NOT pass.
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%6"
+        )
+        coverage = evaluate_callback_coverage(targets, {"%8": CALLBACK_OUTCOME_SENT})
+        self.assertFalse(coverage.satisfied)
+        self.assertEqual(coverage.pending_routes, ("%6",))
+        self.assertIn(CALLBACK_PURPOSE_OWNING_US_COORDINATOR, coverage.pending_purposes)
+
+    def test_all_required_outcomes_satisfy_coverage(self) -> None:
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%6"
+        )
+        coverage = evaluate_callback_coverage(
+            targets,
+            {"%8": CALLBACK_OUTCOME_SENT, "%6": CALLBACK_OUTCOME_BLOCKED},
+        )
+        self.assertTrue(coverage.satisfied)
+        self.assertEqual(coverage.pending_routes, ())
+
+    def test_explicit_not_applicable_satisfies_a_target(self) -> None:
+        # not_applicable is an explicit operator decision, not silent omission.
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%6"
+        )
+        coverage = evaluate_callback_coverage(
+            targets,
+            {"%8": CALLBACK_OUTCOME_SENT, "%6": CALLBACK_OUTCOME_NOT_APPLICABLE},
+        )
+        self.assertTrue(coverage.satisfied)
+
+    def test_shared_route_single_outcome_satisfies_both_purposes(self) -> None:
+        targets = build_required_callback_targets(
+            delegation_parent_route="%8", owning_us_coordinator_route="%8"
+        )
+        coverage = evaluate_callback_coverage(targets, {"%8": CALLBACK_OUTCOME_SENT})
+        self.assertTrue(coverage.satisfied)
 
 
 if __name__ == "__main__":

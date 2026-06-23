@@ -5539,11 +5539,20 @@ def cmd_handoff_delegate_coordinator_lane(args: argparse.Namespace) -> int:
 
     Either way the durable record carries the launch/adopt selection, target /
     parent issue, target project, canonical repo root, lane / worktree identity,
-    callback route, the parent → child delegation breadcrumb, and the explicit
-    ``no_hidden_subagent`` guarantee, so the route replays from the Redmine journal
-    and the cockpit / ``agents targets`` projection re-derives from it. Owner
-    approval and parent close authority stay on the parent coordinator (the
-    delegation breadcrumb records the parent as this lane's retire owner).
+    the purpose-tagged required callback targets, the parent → child delegation
+    breadcrumb, and the explicit ``no_hidden_subagent`` guarantee, so the route
+    replays from the Redmine journal and the cockpit / ``agents targets``
+    projection re-derives from it. Owner approval and parent close authority stay
+    on the parent coordinator (the delegation breadcrumb records the parent as this
+    lane's retire owner).
+
+    Multi-recipient callbacks (Redmine #12449): the record models purpose-tagged
+    required callback targets rather than one route — ``--parent-callback-target``
+    (``delegation_parent``) plus ``--owning-us-coordinator`` / ``--audit-coordinator``
+    when a separate US owns the child issue. #12448 showed a single-route model let
+    a lane record PASS after notifying only the parent coordinator while the
+    owning-US coordinator never received a pointer; the durable record now lists
+    every required target so acceptance can check all of them have an outcome.
     """
     require_tmux()
 
@@ -5610,6 +5619,8 @@ def cmd_handoff_delegate_coordinator_lane(args: argparse.Namespace) -> int:
             parent_project=getattr(args, "parent_project", None),
             parent_issue=getattr(args, "parent_issue", None),
             parent_callback_target=getattr(args, "parent_callback_target", None),
+            owning_us_coordinator=getattr(args, "owning_us_coordinator", None),
+            audit_coordinator=getattr(args, "audit_coordinator", None),
             delegation_root=getattr(args, "delegation_root", None),
             delegation_parent=getattr(args, "delegation_parent", None),
         )
@@ -5617,11 +5628,27 @@ def cmd_handoff_delegate_coordinator_lane(args: argparse.Namespace) -> int:
         _blocked(_LANE_DECISION_REASONS.get(exc.code, "invalid_args"), str(exc))
 
     # 3. Emit the replayable launch/adopt durable record (the governance artifact
-    #    the coordinator pastes into the Redmine journal).
+    #    the coordinator pastes into the Redmine journal). The record carries the
+    #    purpose-tagged required callback targets (#12449): a delegated lane is not
+    #    "done" until every required target has a recorded callback outcome.
     lane_record = build_delegation_lane_record(decision)
     print("## delegated coordinator lane decision\n")
     print(_json.dumps(lane_record, indent=2, sort_keys=True))
     print()
+    if decision.callback_targets:
+        print(
+            "required callback targets (every one needs a recorded callback "
+            "outcome before final PASS — same-lane surfacing is not a callback):"
+        )
+        for target in decision.callback_targets:
+            print(f"  - {target.route}: {', '.join(target.purposes)}")
+        print()
+    else:
+        print(
+            "warning: no callback targets resolved — supply "
+            "--parent-callback-target (delegation_parent) and, when a separate US "
+            "owns the child issue, --owning-us-coordinator / --audit-coordinator.\n"
+        )
 
     if decision.mode == LANE_LAUNCH:
         # Never spawn a hidden worker: launch emits a plan for the operator to

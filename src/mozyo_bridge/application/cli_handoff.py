@@ -588,7 +588,10 @@ def register(sub) -> None:
             "cockpit Unit and the live run is verified separately. Fails closed when "
             "the canonical root is absent locally or the launch/adopt identity is "
             "ambiguous. Owner approval and parent close authority stay on the parent "
-            "coordinator."
+            "coordinator. The durable record models purpose-tagged required callback "
+            "targets (Redmine #12449): `--parent-callback-target` (delegation_parent) "
+            "plus `--owning-us-coordinator` / `--audit-coordinator` when a separate US "
+            "owns the child issue, so a single parent-only callback cannot pass."
         ),
         epilog=(
             "Examples:\n"
@@ -598,6 +601,7 @@ def register(sub) -> None:
             "    --projects-config ../gk-3500-it-operations/projects.yaml \\\n"
             "    --target-project giken-3800-mozyo-bridge \\\n"
             "    --parent-issue 12437 --parent-callback-target %8 \\\n"
+            "    --owning-us-coordinator %6 \\\n"
             "    --adopt-target %10 --summary 'adopt child delegated coordinator'\n\n"
             "  # plan a fresh child lane launch (operator then materializes it)\n"
             "  mozyo-bridge handoff delegate-coordinator-lane --lane launch \\\n"
@@ -605,6 +609,7 @@ def register(sub) -> None:
             "    --projects-config ../gk-3500-it-operations/projects.yaml \\\n"
             "    --target-project giken-3800-mozyo-bridge \\\n"
             "    --parent-issue 12437 --parent-callback-target %8 \\\n"
+            "    --owning-us-coordinator %6 \\\n"
             "    --child-issue 12448 --branch issue_12448_live_verify \\\n"
             "    --worktree mozyo_bridge-12448"
         ),
@@ -704,8 +709,30 @@ def register(sub) -> None:
         "--parent-callback-target",
         dest="parent_callback_target",
         help=(
-            "Parent coordinator callback route (where the delegated coordinator "
-            "returns handoff-worthy state / owner-approval needs)."
+            "Parent coordinator callback route (the `delegation_parent` callback "
+            "target: where the delegated coordinator returns handoff-worthy state "
+            "/ owner-approval needs)."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--owning-us-coordinator",
+        dest="owning_us_coordinator",
+        help=(
+            "(#12449) Callback route for the coordinator owning the child issue's "
+            "US-level audit / disposition, when distinct from the parent project "
+            "coordinator. Recorded as a separate required callback target so a "
+            "single parent-only callback cannot pass. If it resolves to the same "
+            "route as `--parent-callback-target`, both purposes are recorded "
+            "explicitly on that one target."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--audit-coordinator",
+        dest="audit_coordinator",
+        help=(
+            "(#12449) Explicit audit coordinator callback route, when distinct "
+            "from both the parent and the owning-US coordinator. Recorded as an "
+            "additional required callback target."
         ),
     )
     handoff_delegate_lane.add_argument(

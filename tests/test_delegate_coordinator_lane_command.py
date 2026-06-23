@@ -44,6 +44,8 @@ def _args(**overrides) -> argparse.Namespace:
         parent_project=None,
         parent_issue="12437",
         parent_callback_target="%8",
+        owning_us_coordinator=None,
+        audit_coordinator=None,
         delegation_root=None,
         delegation_parent=None,
         profile_field=None,
@@ -95,6 +97,7 @@ class DelegateCoordinatorLaneCommandTest(unittest.TestCase):
                 child_issue="12448",
                 branch="issue_12448_live_verify",
                 worktree="mozyo_bridge-12448",
+                owning_us_coordinator="%6",
             )
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -109,8 +112,28 @@ class DelegateCoordinatorLaneCommandTest(unittest.TestCase):
             self.assertEqual(payload["branch"], "issue_12448_live_verify")
             self.assertEqual(payload["worktree"], "mozyo_bridge-12448")
             self.assertEqual(payload["parent_issue"], "12437")
-            self.assertEqual(payload["callback_route"], "%8")
             self.assertTrue(payload["no_hidden_subagent"])
+            # Multi-recipient callback targets are recorded, not one route (#12449):
+            # both the parent coordinator (%8) and the owning-US coordinator (%6).
+            self.assertNotIn("callback_route", payload)
+            self.assertEqual(
+                payload["callback_targets"],
+                [
+                    {
+                        "route": "%8",
+                        "purposes": ["delegation_parent"],
+                        "required": True,
+                    },
+                    {
+                        "route": "%6",
+                        "purposes": ["owning_us_coordinator"],
+                        "required": True,
+                    },
+                ],
+            )
+            # The emitted plan reminds the operator every target needs an outcome.
+            self.assertIn("required callback targets", out)
+            self.assertIn("%6: owning_us_coordinator", out)
             # Launch never sends; it instructs the operator to materialize a
             # visible lane (no hidden subagent).
             self.assertIn("never auto-launches", out)

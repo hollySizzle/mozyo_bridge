@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6515
+    lines: 6542
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -69,7 +69,11 @@ allowlist:
       explicit launch|adopt front stage over the #12438 delegate-coordinator send
       that emits a replayable launch/adopt durable record and never silently
       reuses an existing lane); its pure, fail-closed decision core + record
-      builders live in the new `domain/delegated_lane.py`.
+      builders live in the new `domain/delegated_lane.py`. Raised 6515 -> 6542 for
+      the #12449 multi-recipient callback targets (purpose-tagged required callback
+      routes threaded into `cmd_handoff_delegate_coordinator_lane` + the emitted
+      plan reminder); the schema / builders / coverage check live in
+      `domain/delegated_lane.py`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
