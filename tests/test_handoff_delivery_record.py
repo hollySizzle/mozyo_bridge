@@ -330,12 +330,14 @@ class DeliveryRecordTest(unittest.TestCase):
         record = build_delivery_record(outcome)
 
         self.assertIn("Delivery result — not delivered (marker_timeout)", record)
-        # #12450 supersedes the #12188 "cannot verify" wording: the marker_timeout
-        # reason now means the C-u rollback was re-captured and the composer no
-        # longer shows the marker (rollback verified). Enter is still not pressed.
+        # #12450 j#63612: the marker_timeout reason means C-u was issued and NO
+        # residual was detected — but capture-absence is NOT proof of a clean
+        # composer, so the wording stays honestly unverified (never "verified
+        # clear") and steers to read-before-resend. Enter is not pressed.
         self.assertIn("C-u rollback was issued", record)
         self.assertIn("Enter was not pressed", record)
-        self.assertIn("rollback verified", record)
+        self.assertIn("cannot be verified from tmux capture", record)
+        self.assertNotIn("rollback verified", record)
         self.assertNotIn("input was cleared via C-u", record)
         self.assertIn("Receiver-side contract", record)
         self.assertIn("manually if action is still required", record)
@@ -751,9 +753,11 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIsInstance(result, SystemExit)
         self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
         self.assertIn("Delivery result — not delivered (marker_timeout)", stdout)
-        # #12450: rollback issued AND re-captured as cleared (rollback verified).
+        # #12450 j#63612: C-u issued, no residual detected, but clearance stays
+        # honestly unverified — never a positive "verified clear" claim.
         self.assertIn("C-u rollback was issued", stdout)
-        self.assertIn("rollback verified", stdout)
+        self.assertIn("cannot be verified from tmux capture", stdout)
+        self.assertNotIn("rollback verified", stdout)
         self.assertNotIn("input was cleared via C-u", stdout)
         self.assertIn("Next action owner: `sender`", stdout)
 

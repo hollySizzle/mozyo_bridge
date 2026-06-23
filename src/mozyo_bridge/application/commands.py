@@ -698,13 +698,25 @@ def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
     the fallback path; this trailer surfaces it on the failure stream so the
     agent sees it even when the durable record is consumed by a downstream
     process and not re-read.
+
+    Redmine #12450: this fires only on the *no-residual-detected* branch, where
+    composer clearance is unverified (not proven clear). So it leads with a
+    read-to-confirm step and only then the bounded ``--no-submit`` retry, so a
+    staged-but-out-of-view prompt is submitted/cleared rather than duplicated.
     """
     cap = NO_SUBMIT_RETRY_BUDGET
     print(
-        f"hint: fallback path: `mozyo-bridge read {receiver}` then "
-        f"`mozyo-bridge message {receiver} \"<resubmit text>\" --no-submit "
-        f"--attempt <N>` (up to {cap} attempts per preset contract; track "
-        "remaining with `--attempt N`).",
+        f"hint: read the pane first (`mozyo-bridge read {receiver}`) to confirm "
+        "the typed prompt is not staged. If it IS staged, submit it "
+        f"(`mozyo-bridge keys {receiver} Enter`) or clear it — do not resend "
+        "(that would duplicate).",
+        file=sys.stderr,
+    )
+    print(
+        f"hint: only if the pane is confirmed clear, fallback path: `mozyo-bridge "
+        f"read {receiver}` then `mozyo-bridge message {receiver} \"<resubmit "
+        f"text>\" --no-submit --attempt <N>` (up to {cap} attempts per preset "
+        "contract; track remaining with `--attempt N`).",
         file=sys.stderr,
     )
     print(
@@ -746,6 +758,29 @@ def _emit_handoff_pending_prompt_guidance(receiver: str) -> None:
     )
 
 
+def _emit_message_pending_prompt_guidance(target: str) -> None:
+    """Stderr trailer for a `mozyo-bridge message --submit` pending residual (#12450).
+
+    The C-u rollback did not clear the target composer, so the typed message is
+    still staged. Unlike :func:`_emit_message_gate_guidance` (the clean-miss retry
+    trailer), this must NOT tell the operator to re-run the failed `message`
+    command — re-running would duplicate the staged text. The recovery is to
+    submit the already-staged message or clear it.
+    """
+    print(
+        f"hint: the typed message is still PENDING in {target}'s composer (C-u "
+        "did not clear it). Do NOT resend / re-run the failed `mozyo-bridge "
+        "message` command — it would duplicate the staged message.",
+        file=sys.stderr,
+    )
+    print(
+        f"hint: confirm with `mozyo-bridge read {target}`, then submit the staged "
+        f"message (`mozyo-bridge keys {target} Enter`) or clear it "
+        f"(`mozyo-bridge keys {target} C-u`, or manually).",
+        file=sys.stderr,
+    )
+
+
 def cmd_message(args: argparse.Namespace) -> int:
     require_tmux()
     target = resolve_target(args.target)
@@ -768,23 +803,32 @@ def cmd_message(args: argparse.Namespace) -> int:
         read_lines = int(getattr(args, "read_lines", 50) or 50)
         landing_lines = max(read_lines, 200)
         if not wait_for_text(target, header, landing_lines, landing_timeout):
-            # Redmine #12450: verify the C-u rollback actually cleared the
-            # composer instead of asserting an unverified rollback.
-            cleared = rollback_and_verify_cleared(target, header, landing_lines)
+            # Redmine #12450: after the C-u, re-capture for a residual of the
+            # typed input (header OR a tail of the message body). A residual means
+            # the composer did not clear → pending: emit submit/clear guidance
+            # only (NOT the resend/re-run retry trailer, which would duplicate the
+            # staged text). No residual is inconclusive (not proof of a clean
+            # composer), so keep the honest unverified wording.
+            residual = rollback_and_detect_residual(
+                target, header, landing_lines, body=args.text
+            )
             clear_read(target)
-            _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
-            if cleared:
+            if residual:
+                _emit_message_pending_prompt_guidance(target)
                 die(
-                    "message marker was not observed in target pane; a C-u "
-                    "rollback was issued and verified (composer cleared); Enter "
-                    f"was not pressed. target={target} marker={header}"
+                    "message marker was not observed in target pane and a residual "
+                    "of the typed message is STILL visible in the target composer "
+                    "(C-u did not clear it, Redmine #12450); Enter was not pressed. "
+                    "Do NOT resend — submit the pending message (`mozyo-bridge keys "
+                    f"{target} Enter`) or clear it. target={target} marker={header}"
                 )
+            _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
             die(
-                "message marker was not observed in target pane and the typed "
-                "message is STILL pending in the target composer (C-u did not "
-                "clear it, Redmine #12450); Enter was not pressed. Do NOT resend "
-                "— submit the pending message (`mozyo-bridge keys "
-                f"{target} Enter`) or clear it. target={target} marker={header}"
+                "message marker was not observed in target pane; a C-u rollback "
+                "was issued and Enter was not pressed. No residual is visible in "
+                "the post-rollback capture, but composer clearance cannot be "
+                "verified from tmux capture — read the pane to confirm before any "
+                f"resend. target={target} marker={header}"
             )
         submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
         if submit_delay:
@@ -1063,8 +1107,15 @@ def wait_for_agent_terminal_pane(pane_id: str, agent: str, timeout: float) -> No
 _WRAP_INDENT = re.compile(r"\n\s+")
 
 # Seconds to let a receiver TUI redraw after a C-u rollback keystroke before
-# re-capturing to verify the composer was actually cleared (Redmine #12450).
+# re-capturing to look for a residual of the typed input (Redmine #12450).
 ROLLBACK_VERIFY_SETTLE = 0.3
+
+# How many trailing characters of the typed body to look for in the post-rollback
+# capture. The receiver composer shows the *end* of a long staged input, so the
+# marker (typed first) can scroll out of the visible region while the body tail
+# is still visible — checking the tail catches that residual (Redmine #12450
+# j#63612, where a marker-only check falsely read "cleared").
+RESIDUAL_TAIL_CHARS = 48
 
 
 def _marker_in_capture(captured: str, marker: str) -> bool:
@@ -1116,29 +1167,46 @@ def rollback_unsubmitted_input(target: str) -> None:
     cmd_keys(argparse.Namespace(target=target, keys=["C-u"]))
 
 
-def rollback_and_verify_cleared(target: str, marker: str, lines: int) -> bool:
-    """Issue a C-u rollback, then re-capture to verify the composer was cleared.
+def rollback_and_detect_residual(
+    target: str, marker: str, lines: int, *, body: str | None = None
+) -> bool:
+    """Issue a C-u rollback, then re-capture and report whether a residual of the
+    typed input is still visible in the composer.
 
     Redmine #12450: a strict-rail ``marker_timeout`` issued a ``C-u`` and reported
-    a clean rollback, but receiver TUIs (Claude Code / codex CLI composers) do not
+    a *clean* rollback, but receiver TUIs (Claude Code / codex composers) do not
     reliably clear their input on ``C-u``, so the typed prompt stayed staged while
-    the outcome implied a clean rollback. This re-captures after the rollback and
-    returns whether the marker is *gone*:
+    the outcome implied a clean rollback. A marker-only re-capture is not enough:
+    the composer shows the *end* of a long staged input, so the marker (typed
+    first) can scroll out of the visible region while the prompt is fully staged
+    (j#63612 reproduced exactly this false "cleared"). So this also looks for a
+    tail of the typed ``body``.
 
-    - ``True``  — the receiver composer no longer shows the marker; the rollback
-      is verified clean (genuine ``marker_timeout``).
-    - ``False`` — the typed prompt is still staged in the composer (the TUI did
-      not clear it); the caller must report ``marker_timeout_pending`` and offer
-      pending-composer recovery instead of claiming a clean rollback.
+    Returns:
 
-    Uses the same wrap-tolerant match as :func:`wait_for_text` so a marker split
-    by TUI line-wrap is not mistaken for a cleared composer.
+    - ``True``  — a residual (the marker, or a :data:`RESIDUAL_TAIL_CHARS` tail of
+      ``body``) is still visible. The input is definitely still staged; the caller
+      reports ``marker_timeout_pending`` and offers pending-composer recovery.
+    - ``False`` — no residual is visible. This is **inconclusive, not proof of a
+      clean composer** (a staged prompt can still sit out of the captured region);
+      the caller must keep honest "clearance not verifiable from capture" wording
+      and steer the operator to read the pane before any resend — never a positive
+      "verified clear" claim.
+
+    Uses the same wrap-tolerant match as :func:`wait_for_text` so a residual split
+    by TUI line-wrap is still detected.
     """
     run_tmux("send-keys", "-t", target, "C-u")
     # Let the TUI redraw after the rollback keystroke before checking.
     time.sleep(ROLLBACK_VERIFY_SETTLE)
     captured = capture_pane(target, lines)
-    return not _marker_in_capture(captured, marker)
+    if _marker_in_capture(captured, marker):
+        return True
+    if body:
+        tail = body.strip()[-RESIDUAL_TAIL_CHARS:]
+        if tail and _marker_in_capture(captured, tail):
+            return True
+    return False
 
 
 def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
@@ -5301,12 +5369,17 @@ def orchestrate_handoff(
 
     if not marker_observed and mode != MODE_QUEUE_ENTER:
         # Redmine #12450: do not claim a clean rollback we cannot back up. Issue
-        # the C-u and re-capture to verify the composer actually cleared. If the
-        # typed prompt is still staged (the TUI did not clear it), report the
-        # distinct `marker_timeout_pending` reason with explicit pending-composer
-        # recovery instead of implying a clean rollback + un-notified retry.
-        cleared = rollback_and_verify_cleared(target, marker, landing_lines)
-        reason = "marker_timeout" if cleared else "marker_timeout_pending"
+        # the C-u and re-capture for a residual of the typed input (marker OR a
+        # tail of the body — the marker can scroll out of the composer while the
+        # prompt stays staged, j#63612). If a residual is visible the prompt is
+        # definitely still staged → `marker_timeout_pending` with submit/clear
+        # recovery. Otherwise keep honest "clearance not verifiable from capture"
+        # wording (never a positive "verified clear" claim) and steer the operator
+        # to read the pane before any resend.
+        residual = rollback_and_detect_residual(
+            target, marker, landing_lines, body=body
+        )
+        reason = "marker_timeout_pending" if residual else "marker_timeout"
         outcome = make_outcome(
             status="blocked",
             reason=reason,
@@ -5326,23 +5399,26 @@ def orchestrate_handoff(
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
         )
-        if cleared:
+        if residual:
+            _emit_handoff_pending_prompt_guidance(receiver)
+            die(
+                "handoff marker was not observed in target pane and a residual of "
+                "the typed prompt is STILL visible in the target composer (the "
+                "receiver TUI did not clear it on C-u, Redmine #12450); Enter was "
+                "not pressed and nothing was submitted. Do NOT resend — that would "
+                f"duplicate; recover the pending composer (see hints). target="
+                f"{target} marker={marker}"
+            )
+        else:
             _emit_handoff_marker_timeout_guidance(receiver)
             die(
                 "handoff marker was not observed in target pane; a C-u rollback "
-                "was issued and verified (the target composer no longer shows the "
-                "marker); Enter was not pressed. "
-                f"target={target} marker={marker}"
-            )
-        else:
-            _emit_handoff_pending_prompt_guidance(receiver)
-            die(
-                "handoff marker was not observed in target pane and the typed "
-                "prompt is STILL pending in the target composer (the receiver TUI "
-                "did not clear it on C-u, Redmine #12450); Enter was not pressed "
-                "and nothing was submitted. Do NOT resend — that would duplicate; "
-                f"recover the pending composer (see hints). target={target} "
-                f"marker={marker}"
+                "was issued and Enter was not pressed. No residual of the typed "
+                "prompt is visible in the post-rollback capture, but composer "
+                "clearance cannot be verified from tmux capture (a staged prompt "
+                "can sit outside the visible region) — read the pane to confirm "
+                "before any resend; if it is staged, submit or clear it instead "
+                f"of duplicating. target={target} marker={marker}"
             )
         raise AssertionError("unreachable")
 

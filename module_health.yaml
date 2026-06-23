@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6439
+    lines: 6515
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -68,8 +68,13 @@ allowlist:
       the #12450 marker_timeout verified-rollback fix: `_marker_in_capture` +
       `rollback_and_verify_cleared` helpers, the `_emit_handoff_pending_prompt_guidance`
       trailer, and the orchestrate / `cmd_message` branches that re-capture
-      after C-u and report `marker_timeout` (verified clear) vs `marker_timeout_pending`
-      (composer still staged) instead of an unverified rollback claim.
+      after C-u and report `marker_timeout` vs `marker_timeout_pending` instead of
+      an unverified rollback claim. Raised 6439 -> 6515 on the j#63610/j#63612
+      review rework: residual detection via marker OR body-tail
+      (`rollback_and_detect_residual`, the marker can scroll out while the prompt
+      stays staged), honest "clearance not verified" wording on the no-residual
+      path (never a positive verified-clear claim), and the `cmd_message` pending
+      path emitting submit/clear guidance instead of the resend retry trailer.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -110,7 +115,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/handoff.py
-    lines: 1280
+    lines: 1289
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
@@ -119,10 +124,12 @@ allowlist:
       #12441 main-lane implementation_request guard: the pure
       `main_lane_implementation_request_blocked` predicate (cockpit/sublane-scoped
       fail-closed decision), the `main_lane_implementation_blocked` reason, and
-      its next-action / narrative branches. Raised 1238 -> 1280 for the #12450
+      its next-action / narrative branches. Raised 1238 -> 1289 for the #12450
       `marker_timeout_pending` reason and its next-action / narrative /
-      receiver-contract / delivery-record branches (the verified-rollback
-      distinction between a cleared composer and a still-staged prompt).
+      receiver-contract / delivery-record branches (the distinction between a
+      still-staged-prompt residual and an unverified no-residual rollback; the
+      no-residual `marker_timeout` wording stays honestly unverified per the
+      j#63612 review and steers to read-before-resend).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

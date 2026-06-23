@@ -367,10 +367,10 @@ class HandoffOrchestratorTest(unittest.TestCase):
         # Asana task 1214779823377861: the rollback path must emit the
         # `--no-submit` fallback hint on stderr so agents do not jump to the
         # preset's `Notification fails` branch after a single transient
-        # marker_timeout. Names the receiver and the per-preset cap so the
-        # budget is unambiguous and not borrowed from the `handoff send`
-        # retry pool.
-        self.assertIn("hint: fallback path:", stderr)
+        # marker_timeout. #12450 j#63612 front-loads a read-to-confirm step
+        # (composer clearance unverified) before the bounded resend.
+        self.assertIn("read the pane first", stderr)
+        self.assertIn("fallback path:", stderr)
         self.assertIn("mozyo-bridge read claude", stderr)
         self.assertIn("mozyo-bridge message claude", stderr)
         self.assertIn("--no-submit", stderr)
@@ -378,14 +378,14 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertIn("separate budgets", stderr)
         self.assertIn("next-action verb", stderr)
 
-    def test_marker_timeout_pending_when_composer_not_cleared(self) -> None:
-        # Redmine #12450: when the C-u rollback does NOT clear the receiver
-        # composer (the typed prompt is still staged), the outcome must be the
-        # distinct `marker_timeout_pending`, not a clean `marker_timeout`, and the
-        # guidance must steer the operator to the staged prompt — not a resend.
+    def test_marker_timeout_pending_when_residual_detected(self) -> None:
+        # Redmine #12450: when a residual of the typed input is still visible
+        # after the C-u rollback (the prompt is still staged), the outcome must be
+        # the distinct `marker_timeout_pending`, not a clean `marker_timeout`, and
+        # the guidance must steer the operator to the staged prompt — not a resend.
         with patch(
-            "mozyo_bridge.application.commands.rollback_and_verify_cleared",
-            return_value=False,
+            "mozyo_bridge.application.commands.rollback_and_detect_residual",
+            return_value=True,
         ):
             result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
                 [
@@ -416,13 +416,14 @@ class HandoffOrchestratorTest(unittest.TestCase):
         # It must NOT emit the clean-rollback `--no-submit` resend trailer.
         self.assertNotIn("--no-submit", stderr)
 
-    def test_marker_timeout_cleared_path_uses_verified_helper(self) -> None:
-        # Companion to the pending case: when rollback verifies the composer
-        # cleared, the reason stays `marker_timeout` (clean miss) and the
-        # `--no-submit` retry trailer is emitted.
+    def test_marker_timeout_no_residual_is_honest_not_verified(self) -> None:
+        # Companion: when no residual is detected the reason stays `marker_timeout`
+        # but the wording must stay HONEST — it must NOT claim a verified clean
+        # rollback (Redmine #12450 j#63612: capture-absence is not proof of clear),
+        # and recovery leads with read-to-confirm before any `--no-submit` resend.
         with patch(
-            "mozyo_bridge.application.commands.rollback_and_verify_cleared",
-            return_value=True,
+            "mozyo_bridge.application.commands.rollback_and_detect_residual",
+            return_value=False,
         ):
             result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
                 [
@@ -440,6 +441,12 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
         outcome = self._outcome_from_stdout(stdout)
         self.assertEqual("marker_timeout", outcome["reason"])
+        # No false "verified clear" claim anywhere in the emitted record/error.
+        self.assertNotIn("rollback verified", stdout)
+        self.assertNotIn("no longer shows the marker", stdout)
+        self.assertIn("cannot be verified", stdout)
+        # Recovery leads with read-to-confirm before the bounded --no-submit retry.
+        self.assertIn("read the pane first", stderr)
         self.assertIn("--no-submit", stderr)
 
     def test_invalid_anchor_emits_blocked_invalid_anchor_outcome(self) -> None:
@@ -1732,15 +1739,18 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertNotIn("Operator note", record)
 
 
-class RollbackVerifyClearedTest(unittest.TestCase):
-    """`rollback_and_verify_cleared` re-captures to confirm the C-u took (#12450)."""
+class RollbackDetectResidualTest(unittest.TestCase):
+    """`rollback_and_detect_residual` re-captures for a residual of the typed
+    input after C-u (#12450). True = staged residual visible; False = inconclusive
+    (NOT proof of a clean composer)."""
 
     MARKER = (
         "[mozyo:handoff:source=redmine:issue=12450:journal=63593:"
         "kind=implementation_request:to=claude]"
     )
+    BODY = "Please implement the marker_timeout verified-rollback fix per j#63593."
 
-    def _run(self, capture_return: str):
+    def _run(self, capture_return: str, *, body: str | None = None):
         calls: list[tuple[str, ...]] = []
 
         def fake_run_tmux(*tmux_args: str, check: bool = True):
@@ -1753,25 +1763,37 @@ class RollbackVerifyClearedTest(unittest.TestCase):
             "mozyo_bridge.application.commands.capture_pane",
             return_value=capture_return,
         ):
-            cleared = commands.rollback_and_verify_cleared("%2", self.MARKER, 200)
-        return cleared, calls
+            residual = commands.rollback_and_detect_residual(
+                "%2", self.MARKER, 200, body=body
+            )
+        return residual, calls
 
-    def test_issues_c_u_then_reports_cleared_when_marker_absent(self) -> None:
-        cleared, calls = self._run("a clean composer with other content")
-        self.assertTrue(cleared)
-        # The rollback keystroke is always issued before verifying.
+    def test_issues_c_u_then_reports_no_residual_when_capture_clean(self) -> None:
+        residual, calls = self._run("a clean composer with other content")
+        self.assertFalse(residual)
+        # The rollback keystroke is always issued before checking.
         self.assertIn(("send-keys", "-t", "%2", "C-u"), calls)
 
-    def test_reports_pending_when_marker_still_in_composer(self) -> None:
-        cleared, _ = self._run(f"> {self.MARKER} please implement ...")
-        self.assertFalse(cleared)
+    def test_detects_residual_when_marker_still_in_composer(self) -> None:
+        residual, _ = self._run(f"> {self.MARKER} please implement ...")
+        self.assertTrue(residual)
 
-    def test_reports_pending_when_marker_is_tui_wrap_split(self) -> None:
-        # A marker split across composer lines by TUI character-wrap is still
-        # detected (wrap-tolerant match), so it is not mistaken for cleared.
+    def test_detects_residual_when_marker_is_tui_wrap_split(self) -> None:
         wrapped = self.MARKER[:30] + "\n      " + self.MARKER[30:]
-        cleared, _ = self._run(f"composer: {wrapped}")
-        self.assertFalse(cleared)
+        residual, _ = self._run(f"composer: {wrapped}", body=self.BODY)
+        self.assertTrue(residual)
+
+    def test_detects_residual_via_body_tail_when_marker_scrolled_out(self) -> None:
+        # The #12450 j#63612 false-cleared regression: the marker (typed first)
+        # scrolled out of the composer's visible region, but the END of the body
+        # is still shown. A marker-only check would read "cleared"; the body-tail
+        # check correctly detects the staged residual.
+        composer_tail = self.BODY.strip()[-commands.RESIDUAL_TAIL_CHARS:]
+        capture = f"... earlier lines ...\n│ {composer_tail}\n"
+        # Marker is absent from the capture; only the body tail is visible.
+        self.assertNotIn(self.MARKER, capture)
+        residual, _ = self._run(capture, body=self.BODY)
+        self.assertTrue(residual)
 
 
 if __name__ == "__main__":

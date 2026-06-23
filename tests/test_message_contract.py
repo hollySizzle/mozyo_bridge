@@ -367,6 +367,52 @@ class MessageGateGuidanceTest(unittest.TestCase):
         # budget that does not apply here.
         self.assertNotIn("--no-submit retry budget:", stderr)
 
+    def test_submit_marker_timeout_pending_residual_emits_no_resend_guidance(
+        self,
+    ) -> None:
+        # Redmine #12450 j#63610 finding #1: when the C-u rollback leaves a
+        # residual of the typed message in the composer, `cmd_message --submit`
+        # must NOT emit the clean-miss retry trailer ("re-run the failed message
+        # command") — that would duplicate the staged text. It emits pending
+        # submit/clear guidance with "Do NOT resend" instead.
+        parser = build_parser()
+        args = parser.parse_args(
+            ["message", "%2", "lost body", "--landing-timeout", "0.01", "--submit-delay", "0"]
+        )
+        sent: list[tuple[str, ...]] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            sent.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch("mozyo_bridge.application.commands.require_read"), \
+            patch("mozyo_bridge.application.commands.clear_read"), \
+            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
+            patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
+            patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
+            patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch("mozyo_bridge.application.commands.wait_for_text", return_value=False), \
+            patch(
+                "mozyo_bridge.application.commands.capture_pane",
+                return_value="... earlier ...\n│ lost body\n",
+            ), \
+            contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                args.func(args)
+
+        out = stderr.getvalue()
+        # Fail-closed: Enter not pressed; C-u issued.
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        # Pending guidance, NOT the clean-miss resend retry trailer.
+        self.assertIn("Do NOT resend", out)
+        self.assertIn("PENDING", out)
+        self.assertNotIn("hint: retry path:", out)
+
     def test_no_submit_message_happy_path_emits_no_gate_guidance(self) -> None:
         # Anti-regression: the trailer must NOT fire when require_read
         # succeeds. The happy path must remain silent on stderr.

@@ -561,7 +561,11 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
         return (
             "sender",
             (
-                f"refresh the read marker via `mozyo-bridge read {receiver}` then "
+                f"read the pane (`mozyo-bridge read {receiver}`) to confirm the "
+                "typed prompt is not staged (composer clearance is not verifiable "
+                "from capture, Redmine #12450). If it IS staged, submit it "
+                f"(`mozyo-bridge keys {receiver} Enter`) or clear it — do NOT "
+                "resend (that duplicates). Only if the pane is confirmed clear, "
                 f"retry with `mozyo-bridge message {receiver} \"<resubmit text>\" "
                 f"--no-submit --attempt <N>` (up to {NO_SUBMIT_RETRY_BUDGET} "
                 "attempts per preset contract). Only after that budget is "
@@ -916,18 +920,20 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
     if reason == "marker_timeout_pending":
         return (
             "Landing marker was not observed in the target pane before timeout; a "
-            "C-u rollback was issued but a re-capture confirms the typed prompt is "
-            "STILL staged in the receiver composer (the TUI did not clear it on "
-            "C-u, Redmine #12450). Enter was not pressed and nothing was "
-            "submitted, but the composer is not clean — recover it explicitly "
-            "instead of resending."
+            "C-u rollback was issued but a re-capture found a residual of the typed "
+            "input (marker or body tail) STILL visible in the receiver composer "
+            "(the TUI did not clear it on C-u, Redmine #12450). Enter was not "
+            "pressed and nothing was submitted, but the composer is not clean — "
+            "recover it explicitly instead of resending."
         )
     if reason == "marker_timeout":
         return (
             "Landing marker was not observed in the target pane before timeout; a "
-            "C-u rollback was issued and a re-capture confirms the receiver "
-            "composer no longer shows the marker (rollback verified). Enter was "
-            "not pressed."
+            "C-u rollback was issued and Enter was not pressed. No residual of the "
+            "typed input is visible in the post-rollback capture, but composer "
+            "clearance cannot be verified from tmux capture (a staged prompt can "
+            "sit outside the visible region, Redmine #12450) — read the pane to "
+            "confirm before any resend."
         )
     if reason == "target_unavailable":
         return (
@@ -1156,13 +1162,16 @@ def build_delivery_record(
         # can replay why escalation happened (or did not).
         receiver_label = outcome.receiver or "<receiver>"
         lines.append(
-            f"- Fallback path: refresh the read marker via `mozyo-bridge read "
-            f"{receiver_label}` then retry with `mozyo-bridge message "
-            f"{receiver_label} \"<resubmit text>\" --no-submit --attempt <N>` "
-            f"(up to {NO_SUBMIT_RETRY_BUDGET} attempts per preset contract; "
-            "track attempts with `--attempt N`). Only after the budget is "
-            "exhausted AND the last gate error lacks a literal next-action "
-            "verb (`read target again`, `retry`, `refresh`) should the "
+            f"- Fallback path: composer clearance is not verifiable from capture "
+            f"(#12450). First read the pane (`mozyo-bridge read {receiver_label}`) "
+            "to confirm the prompt is not staged; if it IS staged, submit it "
+            f"(`mozyo-bridge keys {receiver_label} Enter`) or clear it — do NOT "
+            "resend (that duplicates). Only if the pane is confirmed clear, retry "
+            f"with `mozyo-bridge message {receiver_label} \"<resubmit text>\" "
+            f"--no-submit --attempt <N>` (up to {NO_SUBMIT_RETRY_BUDGET} attempts "
+            "per preset contract; track attempts with `--attempt N`). Only after "
+            "the budget is exhausted AND the last gate error lacks a literal "
+            "next-action verb (`read target again`, `retry`, `refresh`) should the "
             "preset's `Notification fails` branch fire."
         )
     if outcome.status == "blocked" and outcome.reason == "marker_timeout_pending":

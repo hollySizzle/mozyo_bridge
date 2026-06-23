@@ -198,20 +198,23 @@ class MarkerTimeoutDiagnosticsTest(_HandoffFailureHarness):
             any(call == ("send-keys", "-t", "%2", "Enter") for call in sent),
             msg=f"Enter pressed on marker_timeout: {sent!r}",
         )
-        # #12450 supersedes the #12188 "not verified" wording: the die() error
-        # line now states the C-u rollback was issued AND verified (the target
-        # composer no longer shows the marker); Enter is still never pressed.
-        self.assertIn("a C-u rollback was issued and verified", stderr)
-        self.assertIn("Enter was not pressed", stderr)
+        # #12450 j#63612: the die() error line states C-u was issued and Enter
+        # not pressed, with no residual detected — but it must NOT claim a verified
+        # clean rollback (capture-absence is not proof); it stays honestly
+        # unverified and steers to read-before-resend.
+        self.assertIn("a C-u rollback was issued and Enter was not pressed", stderr)
+        self.assertIn("cannot be verified from tmux capture", stderr)
+        self.assertNotIn("and verified", stderr)
         self.assertNotIn("input was cleared and Enter was not pressed", stderr)
 
         # The durable delivery record on stdout carries the same distinction.
         self.assertIn("C-u rollback was issued", stdout)
-        self.assertIn("rollback verified", stdout)
+        self.assertIn("cannot be verified from tmux capture", stdout)
+        self.assertNotIn("rollback verified", stdout)
         self.assertNotIn("input was cleared via C-u", stdout)
 
         # stderr trailer surfaces the bounded --no-submit fallback budget.
-        self.assertIn("hint: fallback path:", stderr)
+        self.assertIn("fallback path:", stderr)
         self.assertIn("mozyo-bridge read claude", stderr)
         self.assertIn("--no-submit", stderr)
         self.assertIn("separate budgets", stderr)
