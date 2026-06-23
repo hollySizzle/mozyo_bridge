@@ -217,7 +217,49 @@ callback が missing / misaddressed の場合は、管制塔が Redmine journal 
 
 Redmine journal recovery は強い fallback であり、nagger は品質向上の補助である。nagger や複数 Claude による機械的強制を primary control にしない。source of truth は journal、callback は pointer、nagger は secondary signal として扱う。
 
-### 9. Review / close
+### 9. External-submodule / delegated coordinator live adoption smoke
+
+既存プロジェクトが別 project を submodule や external dependency として参照している場合、adoption smoke は「submodule 内を直接編集できるか」ではなく、親 project の coordinator が canonical 子 project の coordinator へ安全に委譲できるかを確認する。実地記録は Redmine #12437 / #12439 / #12444。
+
+確認する境界:
+
+- 親 project の config が子 project を `external-submodule` または同等の external dependency として分類できる。
+- 親 project 側の submodule source は implementation target にしない。子 project の canonical checkout / lane を受信先にする。
+- receiver は cross-project Claude ではなく子 project の Codex gateway である。
+- role profile は `delegated_coordinator` とし、親 issue、親 callback route、owner approval / parent close authority を親 coordinator 側に残す。
+- target repo identity gate を通す。明示 pane を使う場合は `--target <codex_%pane> --target-repo auto` のように、pane cwd から target repo identity を確認する。
+- hidden subagent を作らない。すべて Redmine issue / journal、visible cockpit lane、pane identity から replay できるようにする。
+
+live config schema の扱い:
+
+- project list entry が explicit `id` を持たず、`redmine_project` を identity として使う形は実地で確認済みの schema shape である (#12439 j#63484 / #12444)。
+- classification は `status: external-submodule` のような scalar field が `relation` mapping より明確な場合がある。parser / resolver が live schema を誤読して fail-closed した場合は、target repo を手で書き換えず、bug issue に切り出して review 付きで修正してから smoke を再実行する。
+- live config に local canonical repo root が無い場合、明示 target 無しの automatic discovery は fail-closed になり得る。これは安全側の失敗であり、今回のような実機 smoke では explicit target + `--target-repo auto` を使う。local canonical root を config contract に持たせるかは別 scope として扱う。
+
+candidate implementation を使った smoke:
+
+- 親 project の submodule pointer や installed CLI を更新せずに候補実装を試す場合は、candidate checkout の `src` を `PYTHONPATH` で指定して `python3 -m mozyo_bridge ...` を実行してよい。
+- この方式は test runtime の選択であり、配布済み CLI や親 project submodule を変更したことにはならない。実行 command の実 path は Redmine journal に記録し、tracked public docs へ private absolute path を固定しない。
+- smoke が green でも、commit-bearing implementation の review / origin reachability / integration disposition は別に確認する。
+
+grandchild dispatch の判定:
+
+- delegated coordinator が受けた作業が route verification / disposition / ticket-only update のような context-neutral work であれば、孫 implementation lane を開かなくてよい。`coordinator-sublane-development-flow.md` の `### 孫 dispatch / context 保護` どおり、孫 dispatch の主目的は `purpose: preserve_coordinator_context` である。
+- live smoke が「委譲 route を受け、durable anchor を読んで disposition を返す」だけなら、実装 diff や iterative trial を子 coordinator context に載せていないため、孫 lane 不使用は PASS 条件と矛盾しない。
+- 逆に、delegated coordinator が長い diff、長い test log、反復修正、大量 journal 読解を扱うなら、孫 lane dispatch を検討し、dispatch する場合は durable parent link と callback outcome を残す。context を消費し得る作業を孫に出さない非自明判断は dispatch decision に `grandchild_dispatch: avoided` と理由を追記する。
+
+PASS として扱える最低条件:
+
+- Redmine journal から、最初の preflight、blocker、bugfix / review、rerun、delegated coordinator receipt、parent callback outcome を replay できる。
+- 親 project config は子 project を external dependency として分類し、親 submodule source を編集していない。
+- delegated coordinator handoff は Codex 宛てに送られ、role profile が解決済みである。
+- parent callback が親 coordinator route へ返っている。
+- owner approval と parent issue close authority が親 coordinator 側に残っている。
+- direct cross-project Claude send と hidden subagent が発生していない。
+
+この smoke の PASS は close approval ではない。親 US / Test issue の close には、Review Gate、owner close approval、integration disposition、Close Gate の順序を別途満たす。
+
+### 10. Review / close
 
 管制塔 audit では次を読む。
 
