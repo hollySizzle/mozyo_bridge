@@ -23,6 +23,7 @@ import argparse
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.application.commands import (
     cmd_handoff_cross_workspace_consult,
+    cmd_handoff_delegate_coordinator,
     cmd_handoff_reply,
     cmd_handoff_send,
     cmd_message,
@@ -440,6 +441,109 @@ def register(sub) -> None:
         target_repo_required=True,
     )
     handoff_consult.set_defaults(func=cmd_handoff_cross_workspace_consult)
+
+    handoff_delegate = handoff_sub.add_parser(
+        "delegate-coordinator",
+        help=(
+            "Delegate work to a canonical project's Codex as "
+            "`delegated_coordinator`, resolved from project-router metadata"
+        ),
+        description=(
+            "High-level project-router delegation route (Redmine #12438 / US "
+            "#12437). A coordinator names an external-submodule target (e.g. "
+            "`giken-3800-mozyo-bridge`) from a gk-style `projects.yaml` instead "
+            "of editing the submodule directly; this command reads that routing "
+            "config, resolves the canonical project's Codex gateway pane by "
+            "canonical-repo-root match, and sends a delegated handoff with the "
+            "`delegated_coordinator` role profile. It is a boundary-preserving "
+            "wrapper over `handoff send`: the receiver is fixed to `codex` (never "
+            "a direct cross-project Claude send), the repo-identity gate is "
+            "preserved (the chosen pane's cwd must resolve to the canonical repo "
+            "root), and a missing / ambiguous gateway fails closed — the route "
+            "never auto-launches a Unit and never creates a hidden worker. The "
+            "role-profile fields (`parent_project` / `child_project` / "
+            "`parent_callback_target` / `parent_issue` / `redmine_project`) are "
+            "auto-filled from the router decision, with explicit "
+            "`--profile-field` overrides winning. `--kind` defaults to "
+            "`implementation_request`. Grandchild dispatch stays the delegated "
+            "coordinator's own policy decision."
+        ),
+        epilog=(
+            "Operational route:\n"
+            "  1. Record the delegation request on the durable source of truth "
+            "(Redmine issue/journal) first; the pane notification is only the "
+            "pointer.\n"
+            "  2. Ensure the canonical project's Codex Unit is loaded "
+            "(`mozyo-bridge agents targets` shows it); this route never "
+            "auto-launches it.\n"
+            "  3. Run this command with `--projects-config` and "
+            "`--target-project`; the target Codex pane is resolved "
+            "automatically (or pass an explicit `--target %pane`).\n\n"
+            "Example:\n"
+            "  mozyo-bridge handoff delegate-coordinator \\\n"
+            "    --source redmine --issue 12438 --journal 63431 \\\n"
+            "    --projects-config ../gk-3500-it-operations/projects.yaml \\\n"
+            "    --target-project giken-3800-mozyo-bridge \\\n"
+            "    --parent-issue 12437 \\\n"
+            "    --summary 'delegated coordinator handoff route'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    configure_handoff_parser(
+        handoff_delegate,
+        kind_required=False,
+        include_to=False,
+        include_force=False,
+        target_required=False,
+        target_repo_required=False,
+    )
+    handoff_delegate.add_argument(
+        "--projects-config",
+        dest="projects_config",
+        required=True,
+        help=(
+            "Path to the gk-style `projects.yaml` project-router config that "
+            "classifies the target as an external-submodule and declares its "
+            "canonical repo root / project."
+        ),
+    )
+    handoff_delegate.add_argument(
+        "--target-project",
+        dest="target_project",
+        required=True,
+        help=(
+            "External-submodule project id to delegate (e.g. "
+            "`giken-3800-mozyo-bridge`); looked up in the `--projects-config`."
+        ),
+    )
+    handoff_delegate.add_argument(
+        "--parent-project",
+        dest="parent_project",
+        help=(
+            "Override the delegating (parent) project id for the "
+            "`parent_project` role-profile field; defaults to the project id "
+            "declared at the top of `--projects-config` when present."
+        ),
+    )
+    handoff_delegate.add_argument(
+        "--parent-issue",
+        dest="parent_issue",
+        help=(
+            "Parent coordinator issue pointer for the `parent_issue` "
+            "role-profile field (the issue the delegated coordinator must not "
+            "close)."
+        ),
+    )
+    handoff_delegate.add_argument(
+        "--parent-callback-target",
+        dest="parent_callback_target",
+        help=(
+            "Parent coordinator callback route for the "
+            "`parent_callback_target` role-profile field (where the delegated "
+            "coordinator returns handoff-worthy state / owner-approval needs)."
+        ),
+    )
+    handoff_delegate.set_defaults(func=cmd_handoff_delegate_coordinator)
 
     reply_alias = sub.add_parser(
         "reply",

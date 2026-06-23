@@ -23,6 +23,7 @@ from mozyo_bridge.domain.agent_discovery import (
     build_target_candidates,
     discover_agents,
     filter_agents,
+    fold_agents_by_pane,
     infer_repo_root,
     project_preflight_target,
 )
@@ -55,9 +56,17 @@ from mozyo_bridge.domain.handoff import (
     normalize_anchor,
 )
 from mozyo_bridge.domain.role_profile import (
+    ROLE_DELEGATED_COORDINATOR,
     RoleProfileError,
     parse_profile_fields,
     resolve_role_profile,
+)
+from mozyo_bridge.domain.project_router import (
+    CODE_NO_TARGET,
+    ProjectRouterError,
+    delegated_coordinator_profile_fields,
+    resolve_delegation_target,
+    select_delegation_codex_pane,
 )
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -5283,6 +5292,153 @@ def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:
     args.to = "codex"
     if getattr(args, "kind", None) is None:
         args.kind = CONSULT_DEFAULT_KIND
+    return orchestrate_handoff(args, require_receiver_binding=True)
+
+
+DELEGATE_COORDINATOR_DEFAULT_KIND = "implementation_request"
+"""Default ``--kind`` for `handoff delegate-coordinator` (Redmine #12438).
+
+The delegation hands implementation-shaped work to the canonical project's
+delegated coordinator, which then fans it out *inside its own project* (the
+delegated coordinator owns the grandchild dispatch policy — this route never
+creates a hidden worker). So the request defaults to ``implementation_request``
+while still accepting any other ``KIND_LABELS`` value via an explicit ``--kind``.
+"""
+
+
+def cmd_handoff_delegate_coordinator(args: argparse.Namespace) -> int:
+    """Delegate work to a canonical project's Codex as ``delegated_coordinator`` (#12438).
+
+    The high-level project-router delegation route (US #12437). A
+    gk-3500-it-operations coordinator names an external-submodule target (e.g.
+    ``giken-3800-mozyo-bridge``) instead of editing the gk submodule directly,
+    and this command resolves the canonical project's Codex gateway and sends a
+    delegated handoff to it. It is a boundary-preserving wrapper over
+    :func:`orchestrate_handoff` (``require_receiver_binding=True``) — it resolves
+    routing and role-profile fields but hides or weakens no safety gate:
+
+    - The routing config (gk ``projects.yaml``, ``--projects-config``) is read
+      and the target classified by :func:`resolve_delegation_target`; a
+      non-external-submodule, an absent project, or a missing canonical repo root
+      fails closed.
+    - The unique target Codex gateway pane is resolved by canonical-repo-root
+      match (:func:`select_delegation_codex_pane`) from the same candidate
+      projection ``agents targets`` uses. Absent → ``target_unavailable``
+      (operator must launch the Unit; never auto-launched). Ambiguous → blocked.
+      An explicit ``--target`` overrides discovery.
+    - The receiver is fixed to ``codex`` (never a direct cross-project Claude
+      send) and the role profile to ``delegated_coordinator``; its placeholder
+      fields (``parent_project`` / ``child_project`` / ``parent_callback_target``
+      / ``parent_issue`` / ``redmine_project``) are auto-filled from the router
+      decision, with explicit ``--profile-field`` overrides winning.
+    - The repo-identity gate is preserved by asserting the chosen pane's cwd
+      resolves to the canonical repo root (an explicit ``--target-repo`` is
+      honored if supplied).
+    - Grandchild dispatch stays the delegated coordinator's policy decision; this
+      route only hands off and never spawns a hidden worker.
+
+    Every actual gate (cross-session Claude block, repo identity gate,
+    receiver-process binding, landing rail) is enforced by the shared
+    orchestration. The durable source of truth stays the ticket anchor; the pane
+    notification is only the pointer.
+    """
+    require_tmux()
+
+    record_format = _record_format_from_args(args)
+    record_command = _record_command_from_args(args)
+    source = getattr(args, "source", None)
+    mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
+    kind = getattr(args, "kind", None) or DELEGATE_COORDINATOR_DEFAULT_KIND
+
+    def _blocked(reason: str, message: str, *, target: str | None = None) -> None:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason=reason,
+                receiver="codex",
+                target=target,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(message)
+        raise AssertionError("unreachable")
+
+    # 1. Load the gk-style project-router config (the caller passes its path).
+    import yaml
+
+    config_path = Path(getattr(args, "projects_config")).expanduser()
+    if not config_path.is_file():
+        _blocked("invalid_args", f"--projects-config not found: {config_path}")
+    try:
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        _blocked(
+            "invalid_args",
+            f"could not parse --projects-config {config_path}: {exc}",
+        )
+
+    # 2. Resolve and classify the external-submodule delegation target.
+    target_project = getattr(args, "target_project")
+    try:
+        delegation = resolve_delegation_target(raw_config, target_project)
+    except ProjectRouterError as exc:
+        _blocked("invalid_args", str(exc))
+
+    # 3. Resolve the unique target Codex gateway pane. An explicit --target wins;
+    #    otherwise discover and select by canonical-repo-root match, fail-closed
+    #    on absent / ambiguous and never auto-launching a Unit.
+    explicit_target = getattr(args, "target", None)
+    if explicit_target:
+        resolved_target = explicit_target
+    else:
+        candidates = _agents_target_candidates(args)
+        try:
+            chosen = select_delegation_codex_pane(
+                candidates, canonical_repo_root=delegation.canonical_repo_root
+            )
+        except ProjectRouterError as exc:
+            reason = "target_unavailable" if exc.code == CODE_NO_TARGET else "invalid_args"
+            _blocked(reason, str(exc))
+        resolved_target = chosen.pane_id
+
+    args.target = resolved_target
+    # Preserve the explicit repo-identity gate: assert the chosen pane's cwd
+    # resolves to the canonical repo root (target_repo_mismatch otherwise),
+    # unless the operator already passed an explicit --target-repo override.
+    if not getattr(args, "target_repo", None):
+        args.target_repo = delegation.canonical_repo_root
+
+    # 4. Fix the receiver to the Codex gateway and the role profile to
+    #    delegated_coordinator; never a direct cross-project Claude send.
+    args.to = "codex"
+    args.role_profile = ROLE_DELEGATED_COORDINATOR
+    if getattr(args, "kind", None) is None:
+        args.kind = DELEGATE_COORDINATOR_DEFAULT_KIND
+
+    # 5. Auto-fill the delegated_coordinator role-profile fields from the router
+    #    decision; explicit --profile-field overrides win.
+    computed_fields = delegated_coordinator_profile_fields(
+        delegation,
+        parent_project=getattr(args, "parent_project", None),
+        parent_issue=getattr(args, "parent_issue", None),
+        parent_callback_target=getattr(args, "parent_callback_target", None),
+    )
+    try:
+        operator_fields = parse_profile_fields(getattr(args, "profile_field", None))
+    except RoleProfileError as exc:
+        _blocked("invalid_args", str(exc))
+    merged_fields = dict(computed_fields)
+    merged_fields.update(operator_fields)
+    args.profile_field = [f"{key}={value}" for key, value in merged_fields.items()]
+
+    # 6. Delegate to the shared orchestration with the receiver-binding gate so
+    #    the explicit %pane must resolve to the Codex gateway in every mode.
     return orchestrate_handoff(args, require_receiver_binding=True)
 
 
