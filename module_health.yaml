@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6292
+    lines: 6346
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -61,7 +61,10 @@ allowlist:
       that resolves routing config + the canonical Codex gateway + delegated-
       coordinator role-profile fields); it sits beside the sibling
       `cmd_handoff_cross_workspace_consult` wrapper, and its pure resolution core
-      lives in the new `domain/project_router.py`.
+      lives in the new `domain/project_router.py`. Raised 6292 -> 6346 for the
+      #12441 main-lane implementation_request fail-closed guard wired into
+      `orchestrate_handoff` (the decision predicate lives in `domain/handoff.py`;
+      this is the blocked-outcome + actionable-die wiring).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -102,12 +105,16 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/handoff.py
-    lines: 1151
+    lines: 1238
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
       delivery outcome / notification body / delivery record (the resolved-text
-      rendering stays out of the auto-persist body).
+      rendering stays out of the auto-persist body). Raised 1151 -> 1238 for the
+      #12441 main-lane implementation_request guard: the pure
+      `main_lane_implementation_request_blocked` predicate (cockpit/sublane-scoped
+      fail-closed decision), the `main_lane_implementation_blocked` reason, and
+      its next-action / narrative branches.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -350,6 +350,7 @@ Reason = Literal[
     "queue_enter",
     "cross_session_claude",
     "target_repo_mismatch",
+    "main_lane_implementation_blocked",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -591,6 +592,18 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "target whose cwd lives under the expected repo."
             ),
         )
+    if reason == "main_lane_implementation_blocked":
+        return (
+            "sender",
+            (
+                "dispatch implementation-shaped work to a cockpit-visible "
+                "sublane (route the request to the target-lane Codex gateway "
+                "with `--to codex`, which performs the same-lane Claude "
+                "handoff), or — only with a genuine owner/operator decision — "
+                "record a `main_lane_exception` in the durable anchor and pass "
+                "`--main-lane-exception <journal-ref>`."
+            ),
+        )
     return "sender", "inspect handoff failure and decide the next step"
 
 
@@ -612,6 +625,69 @@ def is_explicit_pane_target(target_arg: "Optional[str]") -> bool:
     receiver-window discovery. Pure/string-only.
     """
     return bool(target_arg) and target_arg.startswith("%")
+
+
+MAIN_LANE_ID = "default"
+"""Canonical lane id of a repo's default / main lane (Redmine #12441).
+
+A scaffolded sublane carries a distinct ``@mozyo_lane_id`` pane option (e.g.
+``lane-5ba25a56f773``); a main-unit pane has no lane option (or an explicit
+``default``), which the discovery resolver normalizes to ``default``. The
+main-lane implementation-dispatch guard keys on this single id so a renamed
+window or session cannot disguise the main lane.
+"""
+
+
+def main_lane_implementation_request_blocked(
+    *,
+    receiver: str,
+    kind: "Optional[str]",
+    target_lane_id: "Optional[str]",
+    target_is_cockpit_pane: bool,
+    target_binds_claude: bool,
+    has_main_lane_exception: bool,
+) -> bool:
+    """True when a Claude ``implementation_request`` to the main lane must fail closed.
+
+    The mechanical control behind the main-lane dispatch guard (Redmine #12441 /
+    prevention note #12438 j#63436). In the managed cockpit / sublane operating
+    model (epic #12366; ``coordinator-sublane-development-flow.md``) the
+    main-*unit* Claude is not an implementer — implementation-shaped work defaults
+    to a cockpit-visible sublane — so a direct ``handoff send --to claude --kind
+    implementation_request`` into the cockpit's default/main-lane Claude is a
+    process gap (#12438 j#63432/j#63434). This predicate returns ``True`` exactly
+    when the send must be rejected:
+
+    - the receiver is ``claude`` (a ``--to codex`` gateway dispatch is unaffected),
+    - the intent is ``implementation_request`` (read-only investigation, summary,
+      design consultation, custom hold/stop, and ``reply`` notifications to the
+      main-lane Claude are unaffected),
+    - the resolved target genuinely **is** the cockpit main-lane Claude: it is a
+      managed cockpit pane (``target_is_cockpit_pane``), it strongly binds the
+      ``claude`` role (``target_binds_claude``), and its lane normalizes to the
+      main lane. The guard is deliberately scoped to the cockpit/sublane model
+      where the main-unit-vs-sublane split exists: a plain ``normal_window``
+      Claude in an unmanaged repo carries no sublane role and is unaffected; a
+      same-lane *sublane* Claude (non-``default`` lane) is the sanctioned
+      implementer route and is unaffected; and a pane that does not bind
+      ``claude`` (e.g. a cockpit pane marked ``codex``) is left to the
+      receiver-binding gate's role-mismatch rejection rather than mislabeled a
+      main-lane block, and
+    - no explicit ``main_lane_exception`` (a referenced owner/operator decision)
+      was supplied.
+
+    Pure and side-effect-free; the lane id is normalized the same way the
+    discovery resolver normalizes it (empty / missing -> ``default``).
+    """
+    if not (target_is_cockpit_pane and target_binds_claude):
+        return False
+    normalized_lane = (target_lane_id or "").strip() or MAIN_LANE_ID
+    return (
+        receiver == "claude"
+        and kind == "implementation_request"
+        and normalized_lane == MAIN_LANE_ID
+        and not has_main_lane_exception
+    )
 
 
 def build_inactive_pane_fallback_command(
@@ -860,6 +936,15 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
         return (
             "Target pane's inferred repo root does not match `--target-repo`; "
             "handoff aborted before typing. No notification was typed."
+        )
+    if reason == "main_lane_implementation_blocked":
+        return (
+            "Main-lane dispatch guard (Redmine #12441): `--to claude --kind "
+            "implementation_request` resolved to the repo's default/main lane "
+            "with no `--main-lane-exception`. Implementation-shaped work "
+            "defaults to a cockpit-visible sublane; route via the target-lane "
+            "Codex gateway (`--to codex`) or record an owner/operator "
+            "exception. Handoff aborted before typing; no notification was typed."
         )
     return "Handoff did not deliver; see structured outcome for details."
 
@@ -1120,6 +1205,7 @@ __all__: Iterable[str] = (
     "ExecutionRoot",
     "KIND_LABELS",
     "LastInputProjection",
+    "MAIN_LANE_ID",
     "MODES",
     "MODE_PENDING",
     "MODE_QUEUE_ENTER",
@@ -1143,6 +1229,7 @@ __all__: Iterable[str] = (
     "build_notification_body",
     "cross_session_gateway_hint",
     "is_explicit_pane_target",
+    "main_lane_implementation_request_blocked",
     "make_outcome",
     "next_action_for",
     "normalize_anchor",
