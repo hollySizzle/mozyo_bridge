@@ -318,14 +318,12 @@ class OrchestratorDuplicateSurfacingTest(_OrchestratorHarness):
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("marker_timeout", outcome["reason"])
 
-        # Honest rollback wording (#12188): the narrative claims only that a
-        # C-u rollback was issued and that the composer clearing is NOT
-        # verifiable — never a positive "cleared" claim.
-        self.assertIn("a C-u rollback was issued and Enter was not pressed", stdout)
-        self.assertIn(
-            "cannot verify from tmux capture that the receiver composer was cleared",
-            stdout,
-        )
+        # #12450 supersedes the #12188 "cannot verify" wording: marker_timeout now
+        # means the C-u rollback was re-captured and the composer no longer shows
+        # the marker (rollback verified); Enter is still not pressed.
+        self.assertIn("C-u rollback was issued", stdout)
+        self.assertIn("Enter was not pressed", stdout)
+        self.assertIn("rollback verified", stdout)
         # Duplicate surfaced on the rollback path (residual-text home).
         self.assertIn("Duplicate same-lane pane(s):", stdout)
         self.assertIn("%16", stdout)

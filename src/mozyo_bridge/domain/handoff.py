@@ -345,6 +345,7 @@ Reason = Literal[
     "target_unavailable",
     "target_not_agent",
     "marker_timeout",
+    "marker_timeout_pending",
     "invalid_anchor",
     "invalid_args",
     "queue_enter",
@@ -527,6 +528,23 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
         return (
             "operator",
             "inspect the pending prompt at the target pane and decide whether to submit",
+        )
+    if reason == "marker_timeout_pending":
+        # Redmine #12450: the marker was not observed, a C-u rollback was issued,
+        # but a re-capture confirmed the typed prompt is STILL staged in the
+        # receiver composer (the TUI did not clear it). The composer is not clean,
+        # so resending would duplicate; the owner is the operator who must resolve
+        # the pending composer (submit the already-staged prompt or clear it).
+        return (
+            "operator",
+            (
+                f"the typed prompt is still pending in the {receiver} composer "
+                "(the receiver TUI did not clear it on C-u). Do NOT resend — that "
+                f"would duplicate. Confirm it with `mozyo-bridge read {receiver}`, "
+                f"then either submit the staged prompt (`mozyo-bridge keys "
+                f"{receiver} Enter`) or clear it; the durable anchor remains the "
+                "source of truth."
+            ),
         )
     if reason == "marker_timeout":
         # The previous wording attributed the next action to "record
@@ -895,12 +913,21 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
             "Notification body was typed but Enter was intentionally not pressed; "
             "input is left pending at the target prompt."
         )
+    if reason == "marker_timeout_pending":
+        return (
+            "Landing marker was not observed in the target pane before timeout; a "
+            "C-u rollback was issued but a re-capture confirms the typed prompt is "
+            "STILL staged in the receiver composer (the TUI did not clear it on "
+            "C-u, Redmine #12450). Enter was not pressed and nothing was "
+            "submitted, but the composer is not clean — recover it explicitly "
+            "instead of resending."
+        )
     if reason == "marker_timeout":
         return (
-            "Landing marker was not observed in the target pane before timeout; "
-            "a C-u rollback was issued and Enter was not pressed. The sender "
-            "cannot verify from tmux capture that the receiver composer was "
-            "cleared."
+            "Landing marker was not observed in the target pane before timeout; a "
+            "C-u rollback was issued and a re-capture confirms the receiver "
+            "composer no longer shows the marker (rollback verified). Enter was "
+            "not pressed."
         )
     if reason == "target_unavailable":
         return (
@@ -955,7 +982,7 @@ def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Op
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "before acting; the pane notification is only the pointer."
         )
-    if reason == "marker_timeout":
+    if reason in ("marker_timeout", "marker_timeout_pending"):
         return (
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; nothing was submitted at the pane."
@@ -1137,6 +1164,21 @@ def build_delivery_record(
             "exhausted AND the last gate error lacks a literal next-action "
             "verb (`read target again`, `retry`, `refresh`) should the "
             "preset's `Notification fails` branch fire."
+        )
+    if outcome.status == "blocked" and outcome.reason == "marker_timeout_pending":
+        # Redmine #12450: the C-u rollback did not clear the receiver composer,
+        # so the typed prompt is still staged. Resending would duplicate; the
+        # durable record carries the explicit pending-composer recovery so an
+        # auditor sees that "blocked" here means "staged but unsubmitted", not a
+        # clean miss.
+        receiver_label = outcome.receiver or "<receiver>"
+        lines.append(
+            f"- Pending composer recovery: the typed prompt is still staged in "
+            f"the {receiver_label} composer (C-u did not clear it). Do NOT resend "
+            f"(it would duplicate). Confirm via `mozyo-bridge read "
+            f"{receiver_label}` and either submit the staged prompt "
+            f"(`mozyo-bridge keys {receiver_label} Enter`) or clear it; the "
+            "durable anchor stays the source of truth."
         )
     if role_profile_contract:
         # Redmine #12388: the fully resolved role-profile contract body (template

@@ -21,6 +21,7 @@ from mozyo_bridge.domain.pane_resolver import (
     resolve_target,
 )
 import mozyo_bridge.domain.pane_resolver as pane_resolver
+from mozyo_bridge.application import commands
 from mozyo_bridge.domain.handoff import (
     MODE_PENDING,
     MODE_QUEUE_ENTER,
@@ -376,6 +377,70 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertIn("3", stderr)
         self.assertIn("separate budgets", stderr)
         self.assertIn("next-action verb", stderr)
+
+    def test_marker_timeout_pending_when_composer_not_cleared(self) -> None:
+        # Redmine #12450: when the C-u rollback does NOT clear the receiver
+        # composer (the typed prompt is still staged), the outcome must be the
+        # distinct `marker_timeout_pending`, not a clean `marker_timeout`, and the
+        # guidance must steer the operator to the staged prompt — not a resend.
+        with patch(
+            "mozyo_bridge.application.commands.rollback_and_verify_cleared",
+            return_value=False,
+        ):
+            result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "asana",
+                    "--kind", "review_result", "--task-id", "T1",
+                    "--anchor-url", "https://example/x", "--target", "%2",
+                    "--mode", "standard", "--landing-timeout", "0.01",
+                    "--submit-delay", "0",
+                ],
+                captures=["", "", ""],
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        # Fail-closed: Enter was never pressed.
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout_pending", outcome["reason"])
+        # The operator owns resolving the staged composer (not the sender retry).
+        self.assertEqual("operator", outcome["next_action_owner"])
+
+        # Pending-prompt guidance: do NOT resend; submit/clear the staged prompt.
+        self.assertIn("PENDING", stderr)
+        self.assertIn("Do NOT resend", stderr)
+        self.assertIn("mozyo-bridge keys claude Enter", stderr)
+        # It must NOT emit the clean-rollback `--no-submit` resend trailer.
+        self.assertNotIn("--no-submit", stderr)
+
+    def test_marker_timeout_cleared_path_uses_verified_helper(self) -> None:
+        # Companion to the pending case: when rollback verifies the composer
+        # cleared, the reason stays `marker_timeout` (clean miss) and the
+        # `--no-submit` retry trailer is emitted.
+        with patch(
+            "mozyo_bridge.application.commands.rollback_and_verify_cleared",
+            return_value=True,
+        ):
+            result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "asana",
+                    "--kind", "review_result", "--task-id", "T1",
+                    "--anchor-url", "https://example/x", "--target", "%2",
+                    "--mode", "standard", "--landing-timeout", "0.01",
+                    "--submit-delay", "0",
+                ],
+                captures=["", "", ""],
+                allow_exit=True,
+            )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "Enter") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertIn("--no-submit", stderr)
 
     def test_invalid_anchor_emits_blocked_invalid_anchor_outcome(self) -> None:
         # Anchor normalization fires before rail-specific preflight, so this
@@ -1665,6 +1730,48 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertIn("Next action owner: `receiver`", record)
         # No operator escalation note when the marker was actually observed.
         self.assertNotIn("Operator note", record)
+
+
+class RollbackVerifyClearedTest(unittest.TestCase):
+    """`rollback_and_verify_cleared` re-captures to confirm the C-u took (#12450)."""
+
+    MARKER = (
+        "[mozyo:handoff:source=redmine:issue=12450:journal=63593:"
+        "kind=implementation_request:to=claude]"
+    )
+
+    def _run(self, capture_return: str):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            calls.append(tmux_args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux
+        ), patch("mozyo_bridge.application.commands.time.sleep"), patch(
+            "mozyo_bridge.application.commands.capture_pane",
+            return_value=capture_return,
+        ):
+            cleared = commands.rollback_and_verify_cleared("%2", self.MARKER, 200)
+        return cleared, calls
+
+    def test_issues_c_u_then_reports_cleared_when_marker_absent(self) -> None:
+        cleared, calls = self._run("a clean composer with other content")
+        self.assertTrue(cleared)
+        # The rollback keystroke is always issued before verifying.
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), calls)
+
+    def test_reports_pending_when_marker_still_in_composer(self) -> None:
+        cleared, _ = self._run(f"> {self.MARKER} please implement ...")
+        self.assertFalse(cleared)
+
+    def test_reports_pending_when_marker_is_tui_wrap_split(self) -> None:
+        # A marker split across composer lines by TUI character-wrap is still
+        # detected (wrap-tolerant match), so it is not mistaken for cleared.
+        wrapped = self.MARKER[:30] + "\n      " + self.MARKER[30:]
+        cleared, _ = self._run(f"composer: {wrapped}")
+        self.assertFalse(cleared)
 
 
 if __name__ == "__main__":

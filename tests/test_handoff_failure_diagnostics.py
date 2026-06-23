@@ -198,17 +198,16 @@ class MarkerTimeoutDiagnosticsTest(_HandoffFailureHarness):
             any(call == ("send-keys", "-t", "%2", "Enter") for call in sent),
             msg=f"Enter pressed on marker_timeout: {sent!r}",
         )
-        # #12188: the die() error line claims only that a C-u rollback was
-        # issued and Enter was not pressed — never that the receiver composer
-        # was verified cleared (a sender cannot confirm composer state from
-        # tmux capture).
-        self.assertIn("a C-u rollback was issued and Enter was not pressed", stderr)
-        self.assertIn("receiver composer state was not verified", stderr)
+        # #12450 supersedes the #12188 "not verified" wording: the die() error
+        # line now states the C-u rollback was issued AND verified (the target
+        # composer no longer shows the marker); Enter is still never pressed.
+        self.assertIn("a C-u rollback was issued and verified", stderr)
+        self.assertIn("Enter was not pressed", stderr)
         self.assertNotIn("input was cleared and Enter was not pressed", stderr)
 
         # The durable delivery record on stdout carries the same distinction.
         self.assertIn("C-u rollback was issued", stdout)
-        self.assertIn("cannot verify", stdout)
+        self.assertIn("rollback verified", stdout)
         self.assertNotIn("input was cleared via C-u", stdout)
 
         # stderr trailer surfaces the bounded --no-submit fallback budget.

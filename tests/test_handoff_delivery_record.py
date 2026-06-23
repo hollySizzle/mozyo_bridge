@@ -330,12 +330,12 @@ class DeliveryRecordTest(unittest.TestCase):
         record = build_delivery_record(outcome)
 
         self.assertIn("Delivery result — not delivered (marker_timeout)", record)
-        # #12188: the narrative claims only that a C-u rollback was issued, not
-        # that the receiver composer was verified cleared (a sender cannot
-        # confirm composer state from tmux capture).
+        # #12450 supersedes the #12188 "cannot verify" wording: the marker_timeout
+        # reason now means the C-u rollback was re-captured and the composer no
+        # longer shows the marker (rollback verified). Enter is still not pressed.
         self.assertIn("C-u rollback was issued", record)
         self.assertIn("Enter was not pressed", record)
-        self.assertIn("cannot verify", record)
+        self.assertIn("rollback verified", record)
         self.assertNotIn("input was cleared via C-u", record)
         self.assertIn("Receiver-side contract", record)
         self.assertIn("manually if action is still required", record)
@@ -751,9 +751,9 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIsInstance(result, SystemExit)
         self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
         self.assertIn("Delivery result — not delivered (marker_timeout)", stdout)
-        # #12188: rollback issued, composer clearing not verified.
+        # #12450: rollback issued AND re-captured as cleared (rollback verified).
         self.assertIn("C-u rollback was issued", stdout)
-        self.assertIn("cannot verify", stdout)
+        self.assertIn("rollback verified", stdout)
         self.assertNotIn("input was cleared via C-u", stdout)
         self.assertIn("Next action owner: `sender`", stdout)
 
