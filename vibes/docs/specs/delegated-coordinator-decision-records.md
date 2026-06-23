@@ -42,6 +42,12 @@ bypass の **correction record** である。
 
 - `parent_coordinator_route`: 委譲元である最上位 `coordinator` (親管制塔) への
   durable callback 経路。anchor pointer であり pane 配置ではない。
+- `owning_us_coordinator_route`: 子 project 側の owning US / audit coordinator への
+  durable callback 経路。親 project の `parent_coordinator_route` と異なる場合が
+  ある。anchor pointer であり pane 配置ではない。
+- `callback_target`: handoff-worthy state を通知すべき route anchor。各 target は
+  `purpose` を持つ。少なくとも `delegation_parent` と
+  `owning_us_coordinator` / `audit_coordinator` を区別する。
 - `child_coordinator_route`: 親 `coordinator` が委譲先として使う子 project /
   child workspace の `delegated_coordinator` gateway route。anchor pointer であり
   pane 配置ではない。
@@ -192,12 +198,57 @@ callback するときの durable record。目的は、親 `coordinator` が call
 **親→子 delegation 判断と子→孫 dispatch 判断を検査できる**ことである。callback は
 durable anchor への pointer であり work log ではない (spine / role-profile spec)。
 
+### 4.1 callback target model
+
+単純な親子委譲では `parent_coordinator_route` だけで足りるが、既存 project の
+external-submodule adoption や multi-project cockpit では、委譲元の親 coordinator と
+子 project の owning US / audit coordinator が別 lane になることがある。この場合、
+単一 `callback_route` だけでは片方の coordinator が durable state を見落とし、
+US-level audit / child disposition が停止して見える。
+
+そのため delegated callback は、必要な callback 先を **目的付き target 群**として
+記録する。各 target は pane id ではなく route anchor として扱い、private runtime
+identifier は journal 上の実機結果にだけ書く。
+
+```markdown
+## Delegated callback targets
+
+- record_kind: delegated_callback_targets
+- source_state: <implementation_done | review_request | review_result | owner_close_approval_waiting | blocked>
+- child_issue: <子 issue id>
+- parent_issue: <親 issue / US id>
+- callback_targets:
+  - purpose: delegation_parent
+    route: <parent_coordinator_route>
+    required: true
+    outcome_anchor: <callback outcome journal | pending | blocked | not_applicable>
+  - purpose: owning_us_coordinator | audit_coordinator
+    route: <owning_us_coordinator_route>
+    required: <true | false>
+    outcome_anchor: <callback outcome journal | pending | blocked | not_applicable>
+- pass_condition: <all_required_callback_outcomes_recorded | blocked_with_replayable_retry>
+```
+
+固定境界:
+
+- `delegation_parent` は親 project の close / owner approval authority を持つ
+  coordinator への通知である。
+- `owning_us_coordinator` / `audit_coordinator` は子 project 側の US-level audit /
+  child disposition を進める coordinator への通知である。
+- 両者が同一 route なら target を統合してよいが、同一であることを durable record に
+  明記する。推測で省略しない。
+- required target の callback outcome が `sent` / `blocked` / `not_applicable` の
+  いずれでも記録されていない状態を PASS / complete としない。`blocked` は候補と
+  retry command を持つ replayable block の場合だけ受理する。
+- same-lane surfacing はどの target の outcome にも数えない。
+
 ```markdown
 ## Delegated callback
 
 - record_kind: delegated_callback
 - from: <delegated_coordinator_lane>
 - to: <parent_coordinator_route>
+- callback_targets_anchor: <Delegated callback targets anchor | same_as_parent_only>
 - state: <implementation_done | review_request | review_result | owner_close_approval_waiting | blocked>
 - child_issue: <子 issue id>
 - parent_issue: <親 issue / US id>
@@ -216,6 +267,9 @@ durable anchor への pointer であり work log ではない (spine / role-prof
 - `state` の vocabulary は role-profile spec の handoff-worthy state
   (implementation_done / review_request / review_result / owner_close_approval_waiting
   / blocked) に従う。
+- `callback_targets_anchor` が `same_as_parent_only` 以外の場合、required target 全件の
+  outcome が記録されるまで callback は不完全である。単一 parent callback だけで
+  owning US / audit coordinator への pointer を代替しない。
 - `child_dispatch_anchors` は本書 §1 / §2 / §3 の record anchor を列挙する。親
   coordinator はこの anchor から親→子 delegation と子→孫 dispatch / no-dispatch
   判断を検査する。anchor を欠いた callback は「委譲判断が検査不能」であり、
@@ -278,6 +332,10 @@ project policy knob は本書の record fields を省略してよい根拠にな
   欠いた callback は、親→子 / 子→孫の委譲判断が検査不能であり完了扱いにしない。
   context-neutral default で anchor が無い場合でも、`dispatch_judgment_summary` に
   その理由を明記する。
+- multi-project / external-submodule adoption では、`delegation_parent` と
+  `owning_us_coordinator` / `audit_coordinator` の callback target を明示し、required
+  target 全件の outcome を残す。単一 `callback_route` による parent callback だけでは
+  multi-coordinator callback coverage を満たさない。
 - owner approval は親 coordinator route の単一 aggregation point に戻す。子 lane で
   ratify した場合は §5 `owner_approval_bypass` の correction を起票する。
 - parent issue close は最上位 `coordinator` のみ。子が close した場合は §5
