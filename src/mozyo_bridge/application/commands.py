@@ -70,6 +70,14 @@ from mozyo_bridge.domain.project_router import (
     resolve_delegation_target,
     select_delegation_codex_pane,
 )
+from mozyo_bridge.domain.delegated_lane import (
+    CODE_ADOPT_NO_EXISTING_LANE,
+    LANE_ADOPT,
+    LANE_LAUNCH,
+    DelegationLaneError,
+    build_delegation_lane_record,
+    decide_delegation_lane,
+)
 from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -5493,6 +5501,167 @@ def cmd_handoff_delegate_coordinator(args: argparse.Namespace) -> int:
 
     # 6. Delegate to the shared orchestration with the receiver-binding gate so
     #    the explicit %pane must resolve to the Codex gateway in every mode.
+    return orchestrate_handoff(args, require_receiver_binding=True)
+
+
+# Map the fail-closed launch/adopt decision codes onto structured-outcome reasons.
+# ``adopt_no_existing_lane`` is the one "operator must act" case (load / launch a
+# Unit), mirroring ``target_unavailable``; every other ambiguity is ``invalid_args``.
+_LANE_DECISION_REASONS = {CODE_ADOPT_NO_EXISTING_LANE: "target_unavailable"}
+
+
+def cmd_handoff_delegate_coordinator_lane(args: argparse.Namespace) -> int:
+    """Launch or explicitly adopt a delegated coordinator child lane (#12447).
+
+    The launch/adopt harness in front of :func:`cmd_handoff_delegate_coordinator`
+    (US #12437). The #12438 route silently selects whatever unique Codex pane
+    already lives in the canonical repo, so "an existing lane answered" reads as
+    PASS even though no fresh child lane was launched and no adoption was recorded
+    (#12437 j#63530). This command closes that gap with an **explicit**
+    ``--lane {launch,adopt}`` decision and a replayable durable record:
+
+    - It resolves the canonical target from the same gk-style ``projects.yaml``
+      (:func:`resolve_delegation_target`), then asks the pure, fail-closed core
+      (:func:`decide_delegation_lane`) to decide. There is no auto mode: omitting
+      ``--lane`` fails closed so a pre-existing lane is never silently reused.
+    - ``--lane adopt`` resolves the visible existing canonical Codex lane (an
+      explicit ``--adopt-target %pane`` wins, else the unique unambiguous match)
+      and then hands off to it through the **Codex gateway** with the
+      ``delegated_coordinator`` role profile (reusing the #12438 send path) — no
+      direct cross-project Claude send. Fails closed on absent / ambiguous lanes.
+    - ``--lane launch`` produces a replayable identity for a *fresh* lane
+      (``--child-issue`` + ``--branch`` / ``--worktree``) and emits the launch plan
+      record. It does **not** spawn the lane: mozyo-bridge core is not a git
+      worktree manager (``coordinator-sublane-development-flow.md``); the operator
+      materializes the visible worktree / cockpit Unit (plain git) and the live
+      run is verified in the separate test issue. It fails closed when the
+      canonical repo root is not present locally or the identity is incomplete.
+
+    Either way the durable record carries the launch/adopt selection, target /
+    parent issue, target project, canonical repo root, lane / worktree identity,
+    callback route, the parent → child delegation breadcrumb, and the explicit
+    ``no_hidden_subagent`` guarantee, so the route replays from the Redmine journal
+    and the cockpit / ``agents targets`` projection re-derives from it. Owner
+    approval and parent close authority stay on the parent coordinator (the
+    delegation breadcrumb records the parent as this lane's retire owner).
+    """
+    require_tmux()
+
+    record_format = _record_format_from_args(args)
+    record_command = _record_command_from_args(args)
+    source = getattr(args, "source", None)
+    mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
+    kind = getattr(args, "kind", None) or DELEGATE_COORDINATOR_DEFAULT_KIND
+    lane_mode = getattr(args, "lane", None)
+
+    def _blocked(reason: str, message: str, *, target: str | None = None) -> None:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason=reason,
+                receiver="codex",
+                target=target,
+                anchor=None,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(message)
+        raise AssertionError("unreachable")
+
+    # 1. Load the gk-style project-router config and classify the target.
+    import json as _json
+    import yaml
+
+    config_path = Path(getattr(args, "projects_config")).expanduser()
+    if not config_path.is_file():
+        _blocked("invalid_args", f"--projects-config not found: {config_path}")
+    try:
+        raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        _blocked("invalid_args", f"could not parse --projects-config {config_path}: {exc}")
+
+    target_project = getattr(args, "target_project")
+    try:
+        delegation = resolve_delegation_target(raw_config, target_project)
+    except ProjectRouterError as exc:
+        _blocked("invalid_args", str(exc))
+
+    # 2. Decide launch vs adopt (pure, fail-closed). The canonical root presence
+    #    check is the command's only filesystem touch; the core stays pure.
+    canonical_root_present = Path(delegation.canonical_repo_root).expanduser().is_dir()
+    candidates = _agents_target_candidates(args)
+    try:
+        decision = decide_delegation_lane(
+            delegation,
+            mode=lane_mode,
+            candidates=candidates,
+            explicit_adopt_target=getattr(args, "adopt_target", None)
+            or getattr(args, "target", None),
+            canonical_root_present=canonical_root_present,
+            child_issue=getattr(args, "child_issue", None),
+            branch=getattr(args, "branch", None),
+            worktree=getattr(args, "worktree", None),
+            lane_id=getattr(args, "lane_id", None),
+            parent_project=getattr(args, "parent_project", None),
+            parent_issue=getattr(args, "parent_issue", None),
+            parent_callback_target=getattr(args, "parent_callback_target", None),
+            delegation_root=getattr(args, "delegation_root", None),
+            delegation_parent=getattr(args, "delegation_parent", None),
+        )
+    except DelegationLaneError as exc:
+        _blocked(_LANE_DECISION_REASONS.get(exc.code, "invalid_args"), str(exc))
+
+    # 3. Emit the replayable launch/adopt durable record (the governance artifact
+    #    the coordinator pastes into the Redmine journal).
+    lane_record = build_delegation_lane_record(decision)
+    print("## delegated coordinator lane decision\n")
+    print(_json.dumps(lane_record, indent=2, sort_keys=True))
+    print()
+
+    if decision.mode == LANE_LAUNCH:
+        # Never spawn a hidden worker: launch emits a plan for the operator to
+        # materialize a visible lane (plain git worktree + cockpit Unit). The live
+        # launch/adopt verification runs in the separate test issue (#12448).
+        print(
+            "next_action: materialize the visible lane (plain `git worktree add` "
+            "+ cockpit Unit) for the identity above, load its Codex gateway, then "
+            "run `handoff delegate-coordinator-lane --lane adopt --adopt-target "
+            "%pane ...` (or `handoff delegate-coordinator`) to deliver the "
+            "delegated handoff. This route never auto-launches a Unit and creates "
+            "no hidden subagent."
+        )
+        return 0
+
+    # 4. ADOPT: hand off to the adopted lane through the Codex gateway with the
+    #    delegated_coordinator role profile (reuse the #12438 send path). Never a
+    #    direct cross-project Claude send; the repo-identity gate is preserved.
+    args.target = decision.adopt_target
+    if not getattr(args, "target_repo", None):
+        args.target_repo = delegation.canonical_repo_root
+    args.to = "codex"
+    args.role_profile = ROLE_DELEGATED_COORDINATOR
+    if getattr(args, "kind", None) is None:
+        args.kind = DELEGATE_COORDINATOR_DEFAULT_KIND
+
+    computed_fields = delegated_coordinator_profile_fields(
+        delegation,
+        parent_project=getattr(args, "parent_project", None),
+        parent_issue=getattr(args, "parent_issue", None),
+        parent_callback_target=getattr(args, "parent_callback_target", None),
+    )
+    try:
+        operator_fields = parse_profile_fields(getattr(args, "profile_field", None))
+    except RoleProfileError as exc:
+        _blocked("invalid_args", str(exc))
+    merged_fields = dict(computed_fields)
+    merged_fields.update(operator_fields)
+    args.profile_field = [f"{key}={value}" for key, value in merged_fields.items()]
+
     return orchestrate_handoff(args, require_receiver_binding=True)
 
 

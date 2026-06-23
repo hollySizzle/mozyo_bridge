@@ -24,6 +24,7 @@ from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.application.commands import (
     cmd_handoff_cross_workspace_consult,
     cmd_handoff_delegate_coordinator,
+    cmd_handoff_delegate_coordinator_lane,
     cmd_handoff_reply,
     cmd_handoff_send,
     cmd_message,
@@ -558,6 +559,172 @@ def register(sub) -> None:
         ),
     )
     handoff_delegate.set_defaults(func=cmd_handoff_delegate_coordinator)
+
+    handoff_delegate_lane = handoff_sub.add_parser(
+        "delegate-coordinator-lane",
+        help=(
+            "Launch or explicitly adopt a visible delegated coordinator child "
+            "lane (requires an explicit --lane launch|adopt decision)"
+        ),
+        description=(
+            "Launch/adopt harness in front of `handoff delegate-coordinator` "
+            "(Redmine #12447 / US #12437). The plain `delegate-coordinator` route "
+            "silently selects whatever unique Codex pane already lives in the "
+            "canonical repo, so an existing-lane route reads as PASS even when no "
+            "fresh child lane was launched and no adoption was recorded (#12437 "
+            "j#63530). This command requires an explicit `--lane {launch,adopt}` "
+            "decision — there is no auto mode, so a pre-existing lane is never "
+            "silently reused — and emits a replayable durable record (launch/adopt "
+            "selection, target/parent issue, target project, canonical repo root, "
+            "lane/worktree identity, callback route, parent->child delegation "
+            "breadcrumb, no-hidden-subagent guarantee). `--lane adopt` resolves the "
+            "visible existing canonical Codex lane (explicit `--adopt-target %pane` "
+            "wins, else the unique unambiguous match) and hands off to it through "
+            "the Codex gateway with the `delegated_coordinator` role profile (no "
+            "direct cross-project Claude send). `--lane launch` produces a fresh "
+            "lane identity (`--child-issue` + `--branch`/`--worktree`) and emits the "
+            "launch plan: it never spawns the lane (mozyo-bridge core is not a git "
+            "worktree manager) — the operator materializes the visible worktree / "
+            "cockpit Unit and the live run is verified separately. Fails closed when "
+            "the canonical root is absent locally or the launch/adopt identity is "
+            "ambiguous. Owner approval and parent close authority stay on the parent "
+            "coordinator."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # explicitly adopt the existing canonical Codex lane\n"
+            "  mozyo-bridge handoff delegate-coordinator-lane --lane adopt \\\n"
+            "    --source redmine --issue 12447 --journal 63531 \\\n"
+            "    --projects-config ../gk-3500-it-operations/projects.yaml \\\n"
+            "    --target-project giken-3800-mozyo-bridge \\\n"
+            "    --parent-issue 12437 --parent-callback-target %8 \\\n"
+            "    --adopt-target %10 --summary 'adopt child delegated coordinator'\n\n"
+            "  # plan a fresh child lane launch (operator then materializes it)\n"
+            "  mozyo-bridge handoff delegate-coordinator-lane --lane launch \\\n"
+            "    --source redmine --issue 12447 --journal 63531 \\\n"
+            "    --projects-config ../gk-3500-it-operations/projects.yaml \\\n"
+            "    --target-project giken-3800-mozyo-bridge \\\n"
+            "    --parent-issue 12437 --parent-callback-target %8 \\\n"
+            "    --child-issue 12448 --branch issue_12448_live_verify \\\n"
+            "    --worktree mozyo_bridge-12448"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    configure_handoff_parser(
+        handoff_delegate_lane,
+        kind_required=False,
+        include_to=False,
+        include_force=False,
+        target_required=False,
+        target_repo_required=False,
+    )
+    handoff_delegate_lane.add_argument(
+        "--lane",
+        dest="lane",
+        required=True,
+        choices=["launch", "adopt"],
+        help=(
+            "Explicit lane decision. `launch` plans a fresh visible delegated "
+            "coordinator lane; `adopt` explicitly adopts an existing one. There is "
+            "no auto mode: a pre-existing lane is never silently reused as PASS."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--projects-config",
+        dest="projects_config",
+        required=True,
+        help=(
+            "Path to the gk-style `projects.yaml` project-router config that "
+            "classifies the target as an external-submodule and declares its "
+            "canonical repo root / project."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--target-project",
+        dest="target_project",
+        required=True,
+        help=(
+            "External-submodule project id to delegate (e.g. "
+            "`giken-3800-mozyo-bridge`); looked up in the `--projects-config`."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--adopt-target",
+        dest="adopt_target",
+        help=(
+            "(--lane adopt) Explicit `%%pane` of the existing canonical Codex lane "
+            "to adopt; overrides discovery. Omit to adopt the unique unambiguous "
+            "canonical Codex lane (fail-closed on absent / ambiguous)."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--child-issue",
+        dest="child_issue",
+        help=(
+            "(--lane launch) The child issue the fresh lane will work; part of the "
+            "replayable lane identity."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--branch",
+        dest="branch",
+        help="(--lane launch) Branch identity for the fresh lane.",
+    )
+    handoff_delegate_lane.add_argument(
+        "--worktree",
+        dest="worktree",
+        help="(--lane launch) Worktree identity for the fresh lane.",
+    )
+    handoff_delegate_lane.add_argument(
+        "--lane-id",
+        dest="lane_id",
+        help=(
+            "Optional explicit lane id (e.g. `lane-<hash>`); defaults to the "
+            "adopted lane's discovered id, or is derived when the lane is "
+            "materialized."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--parent-project",
+        dest="parent_project",
+        help=(
+            "Override the delegating (parent) project id; defaults to the project "
+            "declared at the top of `--projects-config` when present."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--parent-issue",
+        dest="parent_issue",
+        help=(
+            "Parent coordinator issue pointer (the issue the delegated coordinator "
+            "must not close); also seeds the delegation breadcrumb."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--parent-callback-target",
+        dest="parent_callback_target",
+        help=(
+            "Parent coordinator callback route (where the delegated coordinator "
+            "returns handoff-worthy state / owner-approval needs)."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--delegation-root",
+        dest="delegation_root",
+        help=(
+            "Optional explicit delegation-tree root unit pointer (display / audit "
+            "breadcrumb, not routing identity); defaults to the parent pointer."
+        ),
+    )
+    handoff_delegate_lane.add_argument(
+        "--delegation-parent",
+        dest="delegation_parent",
+        help=(
+            "Optional explicit direct-parent unit pointer (display / audit "
+            "breadcrumb, not routing identity); defaults to the delegation root."
+        ),
+    )
+    handoff_delegate_lane.set_defaults(func=cmd_handoff_delegate_coordinator_lane)
 
     reply_alias = sub.add_parser(
         "reply",

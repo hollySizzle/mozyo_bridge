@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6346
+    lines: 6515
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -64,7 +64,12 @@ allowlist:
       lives in the new `domain/project_router.py`. Raised 6292 -> 6346 for the
       #12441 main-lane implementation_request fail-closed guard wired into
       `orchestrate_handoff` (the decision predicate lives in `domain/handoff.py`;
-      this is the blocked-outcome + actionable-die wiring).
+      this is the blocked-outcome + actionable-die wiring). Raised 6346 -> 6515
+      for the #12447 `handoff delegate-coordinator-lane` launch/adopt harness (an
+      explicit launch|adopt front stage over the #12438 delegate-coordinator send
+      that emits a replayable launch/adopt durable record and never silently
+      reuses an existing lane); its pure, fail-closed decision core + record
+      builders live in the new `domain/delegated_lane.py`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
