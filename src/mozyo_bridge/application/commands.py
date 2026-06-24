@@ -469,6 +469,53 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
 
     delegation_map = derive_targets_delegation(candidates)
 
+    # Desired delegated-coordinator window-separation policy (#12467), an additive
+    # `delegation_window` JSON projection alongside the #12466 `delegation` record
+    # (which stays byte-identical). `delegation_window_policy` is a repo-local
+    # display preference, so it is read per distinct repo (memoized) from
+    # `.mozyo-bridge/config.yaml` and resolved per candidate against the #12466
+    # breadcrumb. Display-only and fail-soft: any load / parse failure falls back
+    # to the documented default (`separate`) and never blocks this read-only
+    # table, and the resolved fields are never folded into the canonical
+    # `TargetRecord` routing projection (`to_dict`).
+    from mozyo_bridge.domain.presentation_grouping import (
+        DEFAULT_DELEGATION_WINDOW_POLICY,
+        resolve_delegation_window_display,
+    )
+
+    _window_policy_by_repo: dict[object, str] = {}
+
+    def _delegation_window_policy_for(repo_root: object) -> str:
+        if repo_root in _window_policy_by_repo:
+            return _window_policy_by_repo[repo_root]
+        policy = DEFAULT_DELEGATION_WINDOW_POLICY
+        if repo_root:
+            try:
+                from mozyo_bridge.application.repo_local_config_loader import (
+                    load_repo_local_config,
+                )
+
+                policy = (
+                    load_repo_local_config(repo_root)
+                    .presentation.grouping.delegation_window_policy
+                )
+            except Exception:  # noqa: BLE001 - fail-soft read-only display
+                policy = DEFAULT_DELEGATION_WINDOW_POLICY
+        _window_policy_by_repo[repo_root] = policy
+        return policy
+
+    def _delegation_window_payload(candidate) -> dict:
+        breadcrumb = delegation_map[candidate.pane_id]
+        unit = f"{candidate.workspace_id or ''}/{candidate.lane_id or ''}"
+        return resolve_delegation_window_display(
+            _delegation_window_policy_for(candidate.repo_root),
+            lane_kind=breadcrumb.lane_kind,
+            delegation_depth=breadcrumb.delegation_depth,
+            delegation_unit=unit,
+            delegation_root=breadcrumb.delegation_root,
+            status=breadcrumb.status,
+        ).as_payload()
+
     # Single observation timestamp for this read; the pure attention read model
     # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
     # here once. Attention is an additive projection (#11952): JSON gains an
@@ -485,6 +532,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                 **candidate.to_dict(),
                 "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
                 "delegation": delegation_map[candidate.pane_id].as_payload(),
+                "delegation_window": _delegation_window_payload(candidate),
             }
             for candidate in candidates
         ]

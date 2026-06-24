@@ -258,6 +258,55 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         self.assertEqual("normal_window", c["view"]["kind"])
         self.assertIsNone(c["view"]["group"])
 
+    def test_json_adds_additive_delegation_window_projection(self) -> None:
+        # #12467: agents targets --json gains a `delegation_window` projection
+        # sibling to the #12466 `delegation` record. With no repo-local config the
+        # policy is the documented default `separate`, so a derived grandchild
+        # (depth 2) projects to its own window.
+        rc, out = self._run([
+            _pane("%1", "mozyo-cockpit:0.0", window_name="codex",
+                  agent_role="codex", lane_id="lane-root",
+                  lane_kind="coordinator"),
+            _pane("%2", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="codex", lane_id="lane-deleg",
+                  lane_kind="delegated_coordinator",
+                  delegation_parent="wsA/lane-root"),
+            _pane("%3", "mozyo-cockpit:0.2", window_name="claude",
+                  agent_role="claude", lane_id="lane-impl",
+                  lane_kind="implementation",
+                  delegation_parent="wsA/lane-deleg"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        by_pane = {c["runtime"]["pane_id"]: c for c in payload}
+        # #12466 record stays present and unchanged alongside the new sibling.
+        self.assertIn("delegation", by_pane["%3"])
+        win = by_pane["%3"]["delegation_window"]
+        self.assertEqual("separate", win["window_policy"])
+        self.assertTrue(win["window_separated"])
+        self.assertEqual("wsA/lane-impl", win["window_group"])
+        self.assertEqual("resolved", win["window_status"])
+        # Root coordinator is its own top-of-tree window under any policy.
+        self.assertTrue(by_pane["%1"]["delegation_window"]["window_separated"])
+
+    def test_delegation_window_is_not_in_canonical_target_record(self) -> None:
+        # Non-authoritative: the window projection rides as an additive sibling
+        # only; the canonical TargetRecord (host/runtime/identity/repo/view) that
+        # routing/preflight consume never carries a window policy field (#12467).
+        rc, out = self._run([
+            _pane("%3", "mozyo-cockpit:0.2", window_name="claude",
+                  agent_role="claude", lane_id="lane-impl",
+                  lane_kind="implementation",
+                  delegation_parent="wsA/lane-deleg"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        c = json.loads(out)[0]
+        self.assertIn("delegation_window", c)  # additive sibling present
+        for section in ("host", "runtime", "identity", "repo", "view"):
+            self.assertNotIn("window_policy", c[section])
+            self.assertNotIn("window_separated", c[section])
+            self.assertNotIn("window_group", c[section])
+
     def test_unknown_panes_are_not_listed(self) -> None:
         rc, out = self._run([
             _pane("%5", "s:0.0", window_name="shell", command="zsh"),

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6157
+    lines: 6205
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -60,6 +60,11 @@ allowlist:
       columns in `cmd_agents_targets` (derive once + render KIND/DEPTH/PARENT in
       text and the additive JSON `delegation` record; the derivation itself lives
       in the new `domain/delegation_display.py`, not here).
+      Raised 6157 -> 6205 for the #12467 delegated-coordinator window-policy
+      display wiring in `cmd_agents_targets` (per-repo fail-soft
+      `delegation_window_policy` resolution + the additive JSON
+      `delegation_window` sibling; the policy schema/resolver live in
+      `domain/presentation_grouping/`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
