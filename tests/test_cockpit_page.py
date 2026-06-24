@@ -400,6 +400,131 @@ class FilterDensityGroupingControlsTest(unittest.TestCase):
             self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
 
 
+class ActionAffordanceAndFeedbackTest(unittest.TestCase):
+    """Pin the #12380 acceptance: cockpit actions read their target, show a reason
+    when disabled, persist their result in the UI, and add no destructive operation.
+
+    These pin the four acceptance criteria as template assertions, all DOM-only and
+    over the existing token-gated ``/api/actions/*`` endpoints (no new endpoint, no
+    new side effect): a readable action target, a displayed disabled reason, a
+    persistent success / failure log (no transient ``alert``), and no destructive /
+    external operation introduced.
+    """
+
+    def _style(self) -> str:
+        return INDEX_HTML_TEMPLATE[
+            INDEX_HTML_TEMPLATE.index("<style>"):INDEX_HTML_TEMPLATE.index(
+                "</style>"
+            )
+        ]
+
+    def test_action_button_target_is_readable(self) -> None:
+        # Acceptance 1: the action target must be readable. A shared factory sets
+        # the target on every button's title + aria-label (textContent stays the
+        # short label so the dense layout is unchanged), and each view builds a
+        # target description from the identity the operator already sees.
+        self.assertIn("function actionButton(", INDEX_HTML_TEMPLATE)
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"button\.title\s*=")
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"setAttribute\('aria-label'"
+        )
+        # The enabled-button description names the target after the label.
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"label\s*\+\s*' → '\s*\+\s*targetDesc"
+        )
+        # The flat row targets agent @ session; a grouped slot targets role · lane.
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"targetDesc\s*=\s*p\.agent_kind\s*\+\s*' @ '"
+        )
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"targetDesc\s*=\s*role\s*\+\s*' · '"
+        )
+
+    def test_disabled_action_shows_its_reason(self) -> None:
+        # Acceptance 2: a disabled action must show *why*, not just look greyed.
+        # Each disable path has a reason constant, the disabled branch carries it in
+        # the title, and a visible inline action-reason note is rendered as well.
+        self.assertIn("STALE_ACTION_REASON", INDEX_HTML_TEMPLATE)
+        self.assertIn("RELOAD_ACTION_REASON", INDEX_HTML_TEMPLATE)
+        stale = re.search(r"STALE_ACTION_REASON = '([^']*)'", INDEX_HTML_TEMPLATE)
+        reload = re.search(r"RELOAD_ACTION_REASON = '([^']*)'", INDEX_HTML_TEMPLATE)
+        self.assertTrue(stale and reload, "action-reason constants not found")
+        self.assertNotEqual(stale.group(1), reload.group(1))
+        # The disabled branch records the reason in the accessible title.
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"\(disabled: '\s*\+\s*disabledReason")
+        # A visible inline note carries the reason next to the disabled action.
+        self.assertIn("function actionReason(", INDEX_HTML_TEMPLATE)
+        self.assertIn("action-reason", INDEX_HTML_TEMPLATE)
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"if \(data\.stale\) actions\.appendChild\(actionReason"
+        )
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"if \(disabled\) slot\.appendChild\(actionReason"
+        )
+
+    def test_action_result_persists_instead_of_alert(self) -> None:
+        # Acceptance 3: the result / failure reason must stay in the UI. A dedicated
+        # log region and a recordAction helper persist each outcome (ok / failed +
+        # reason); the transient alert() is gone.
+        self.assertIn('id="action-feedback"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="action-log"', INDEX_HTML_TEMPLATE)
+        self.assertIn("function recordAction(", INDEX_HTML_TEMPLATE)
+        # Both action paths (flat act + grouped actGrouped) route both their
+        # success and their failure/error branch through the persistent log.
+        self.assertEqual(
+            INDEX_HTML_TEMPLATE.count("recordAction(kind, targetDesc, res.ok"), 2
+        )
+        self.assertEqual(
+            INDEX_HTML_TEMPLATE.count("recordAction(kind, targetDesc, false"), 2
+        )
+        # The transient alert is removed (it vanished on dismiss, leaving no record).
+        self.assertNotIn("alert(", INDEX_HTML_TEMPLATE)
+        # Success and failure read distinctly.
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"ok \? 'action-ok' : 'action-failed'")
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"ok \? 'ok' : 'failed'")
+
+    def test_no_destructive_or_external_action_added(self) -> None:
+        # Acceptance 4: no destructive / external side-effect operation is added.
+        # The only action kinds remain jump / reveal (Finder), and every action
+        # request still goes to the existing token-gated /api/actions/* endpoints —
+        # no new endpoint, no new verb, the custom token header preserved.
+        kinds = set(re.findall(r"\['(jump|reveal)', '(?:jump|Finder)'\]",
+                               INDEX_HTML_TEMPLATE))
+        self.assertEqual(kinds, {"jump", "reveal"})
+        fetched = set(re.findall(r"fetch\('(/[^']*)'", INDEX_HTML_TEMPLATE))
+        for url in fetched:
+            self.assertTrue(
+                url.startswith("/api/units")
+                or url.startswith("/api/grouped-units")
+                or url.startswith("/api/transitions")
+                or url.startswith("/api/actions/"),
+                f"unexpected fetch target {url} — no new action endpoint allowed",
+            )
+        # The token header still gates every action request (no relaxation).
+        self.assertIn("X-Mozyo-Cockpit-Token", INDEX_HTML_TEMPLATE)
+
+    def test_action_feedback_classes_are_styled(self) -> None:
+        # Every class the action affordance / feedback tags a node with must have a
+        # CSS rule, or it renders unstyled (often invisible / indistinguishable).
+        style = self._style()
+        for cls in ("action-ok", "action-failed", "action-disabled",
+                    "action-reason"):
+            self.assertRegex(
+                style,
+                rf"\.{re.escape(cls)}\b[^{{]*\{{",
+                f"action class .{cls} has no CSS rule (would render unstyled)",
+            )
+        self.assertRegex(style, r"#action-log\b[^{]*\{")
+        self.assertRegex(style, r"#action-feedback\b[^{]*\{")
+
+    def test_action_affordance_keeps_dom_only_no_injection(self) -> None:
+        # The new affordance / feedback code path must keep the page's no-injection
+        # property: DOM construction only, never an HTML-string sink.
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                     "document.write"):
+            self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
+
+
 class ServedCockpitSmokeTest(unittest.TestCase):
     """Page-level browser smoke against the daemon-served cockpit document."""
 

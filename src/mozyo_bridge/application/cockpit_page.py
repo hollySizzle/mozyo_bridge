@@ -160,6 +160,22 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   body.dense .group-header { padding: 2px 5px; }
   body.dense .lane-issue, body.dense .lane-state,
   body.dense .group-summary, body.dense .tag { font-size: 11px; }
+  /* Action affordance + feedback (#12380): every jump / Finder button reads its
+     target (title + aria-label, set by actionButton()), a disabled action shows
+     its reason inline (action-reason) instead of only in the global banner, and
+     each action's result persists in #action-log (ok / failed + reason) instead
+     of a transient alert. Display only — feedback authorizes no action and moves
+     no gate; the server re-preflights every action regardless. */
+  #action-feedback { margin: 6px 0; }
+  #action-feedback .feedback-label { display: block; }
+  #action-log { list-style: none; padding-left: 0; margin: 2px 0; }
+  #action-log li { font-size: 12px; overflow-wrap: anywhere; }
+  #action-log .ts { color: #999; font-size: 11px; margin-right: 4px; }
+  .action-ok { color: #2e7d32; }
+  .action-failed { color: #b71c1c; font-weight: 600; }
+  .action-disabled { opacity: 0.6; }
+  .action-reason { font-size: 11px; color: #ef6c00; overflow-wrap: anywhere; }
+  body.dense #action-log li, body.dense .action-reason { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -191,6 +207,11 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 </div>
 <div id="stale" class="stale-banner">tmux runtime unavailable — showing the
 last cached snapshot; activity may be outdated and actions are disabled.</div>
+<div id="action-feedback">
+<span class="muted feedback-label">action results — success / failure (with
+reason) persist here so the outcome stays readable after the click</span>
+<ul id="action-log"></ul>
+</div>
 <section id="flat-view">
 <div id="units-wrap">
 <table id="units"><thead><tr>
@@ -248,6 +269,13 @@ const FILTERED_GROUPED_TEXT = 'no project groups match the current filter';
 const VIEW_MODES = ["both", "flat", "grouped"];
 const DENSITY_MODES = ["comfortable", "compact"];
 const ROLE_FILTERS = ["all", "codex", "claude"];
+// #12380 disabled-action reasons: a disabled action must say *why*, not just look
+// greyed. The flat table disables on the snapshot-level stale flag; a grouped lane
+// disables on its own reload_required flag. Each reason reads as an inline
+// action-reason note next to the buttons (and in the button title / aria-label),
+// so the operator sees the cause at the action instead of only in the global banner.
+const STALE_ACTION_REASON = 'tmux runtime unavailable — reload before acting';
+const RELOAD_ACTION_REASON = 'lane needs reload — refresh before acting';
 const view = { text: "", role: "all", attentionOnly: false,
                mode: "both", density: "comfortable" };
 // Last payloads, so a control change re-renders immediately and the filter
@@ -309,39 +337,102 @@ function redmineClass(rm) {
   const state = rm && rm.state;
   return KNOWN_RM_STATES.includes(state) ? ("rm-" + state) : "unknown";
 }
-async function act(kind, pane) {
-  const res = await fetch('/api/actions/' + kind, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
-    },
-    body: JSON.stringify({pane_id: pane})
-  });
-  const body = await res.json();
-  if (!res.ok) alert(body.error || 'action failed');
+// #12380 persistent action feedback: each action's outcome stays in #action-log
+// (success, or failure + reason) instead of a transient alert that vanishes the
+// moment it is dismissed. The operator can read what happened, and why, after the
+// fact. textContent only — the target / error strings are never an HTML sink — and
+// the log is capped so it stays an indicator, not a growing transcript.
+function recordAction(kind, targetDesc, ok, detail) {
+  const list = document.getElementById('action-log');
+  const item = document.createElement('li');
+  item.className = ok ? 'action-ok' : 'action-failed';
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = new Date().toLocaleTimeString();
+  item.appendChild(ts);
+  const text = document.createElement('span');
+  let line = kind + ' → ' + targetDesc + ': ' + (ok ? 'ok' : 'failed');
+  if (!ok && detail) line += ' (' + detail + ')';
+  text.textContent = line;
+  item.appendChild(text);
+  list.insertBefore(item, list.firstChild);
+  while (list.children.length > 8) list.removeChild(list.lastChild);
+}
+async function act(kind, pane, targetDesc) {
+  try {
+    const res = await fetch('/api/actions/' + kind, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
+      },
+      body: JSON.stringify({pane_id: pane})
+    });
+    const body = await res.json().catch(() => ({}));
+    recordAction(kind, targetDesc, res.ok,
+      res.ok ? null : (body.error || 'action failed'));
+  } catch (e) {
+    // Daemon unreachable / network error: persist the failure instead of dropping it.
+    recordAction(kind, targetDesc, false, 'request failed (daemon unreachable)');
+  }
 }
 // #12286 grouped action: the request carries only the candidate Unit identity
 // (workspace_id / role / lane_id / host_id) the displayed row exposes — never a
 // pane id. The server re-resolves it live and fails closed; this is the same
 // explicit-click + token-gated path as `act`.
 const KNOWN_FRESHNESS = ["fresh", "stale", "expired", "unknown"];
-async function actGrouped(kind, unit, role) {
-  const res = await fetch('/api/actions/grouped-' + kind, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
-    },
-    body: JSON.stringify({
-      workspace_id: unit.workspace_id,
-      role: role,
-      lane_id: unit.lane_id,
-      host_id: unit.host_id
-    })
-  });
-  const body = await res.json();
-  if (!res.ok) alert(body.error || 'action failed');
+async function actGrouped(kind, unit, role, targetDesc) {
+  try {
+    const res = await fetch('/api/actions/grouped-' + kind, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Mozyo-Cockpit-Token': COCKPIT_TOKEN
+      },
+      body: JSON.stringify({
+        workspace_id: unit.workspace_id,
+        role: role,
+        lane_id: unit.lane_id,
+        host_id: unit.host_id
+      })
+    });
+    const body = await res.json().catch(() => ({}));
+    recordAction(kind, targetDesc, res.ok,
+      res.ok ? null : (body.error || 'action failed'));
+  } catch (e) {
+    recordAction(kind, targetDesc, false, 'request failed (daemon unreachable)');
+  }
+}
+// #12380 action affordance: one factory so every jump / Finder button reads its
+// target and, when disabled, its reason. The target / reason land via title +
+// aria-label (textContent stays the short label so the dense layout is unchanged);
+// both are set as attributes / textContent only, so a payload-derived target string
+// is never an HTML or class sink. The click handler is the caller's, so the flat
+// (pane id) and grouped (re-resolved Unit) request shapes stay separate.
+function actionButton(kind, label, targetDesc, disabled, disabledReason, onClick) {
+  const button = document.createElement('button');
+  button.textContent = label;
+  if (disabled) {
+    button.disabled = true;
+    button.classList.add('action-disabled');
+    const why = label + ' → ' + targetDesc + ' (disabled: ' + disabledReason + ')';
+    button.title = why;
+    button.setAttribute('aria-label', why);
+  } else {
+    const desc = label + ' → ' + targetDesc;
+    button.title = desc;
+    button.setAttribute('aria-label', desc);
+    button.addEventListener('click', onClick);
+  }
+  return button;
+}
+// #12380 inline disabled reason: a visible note next to a disabled action so the
+// cause is *displayed*, not only carried in the button title or the global banner.
+function actionReason(text) {
+  const span = document.createElement('span');
+  span.className = 'action-reason';
+  span.textContent = text;
+  return span;
 }
 // The canonical role-pane vocabulary (cockpit_layout.ROLES = codex, claude),
 // pinned in the front end so each lane renders a fixed slot per role. The class
@@ -362,13 +453,16 @@ function roleSlot(unit, role, isPresent) {
   name.textContent = role;
   slot.appendChild(name);
   if (isPresent) {
+    // The Target these actions act on: this lane's role. Shown in each button's
+    // title / aria-label so the operator reads what jump / Finder will target.
+    const targetDesc = role + ' · ' + (unit.lane_label || unit.lane_id || 'lane');
+    const disabled = !!unit.reload_required;
     for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
-      const button = document.createElement('button');
-      button.textContent = label;
-      button.disabled = !!unit.reload_required;
-      button.addEventListener('click', () => actGrouped(kind, unit, role));
-      slot.appendChild(button);
+      slot.appendChild(actionButton(kind, label, targetDesc, disabled,
+        RELOAD_ACTION_REASON, () => actGrouped(kind, unit, role, targetDesc)));
     }
+    // A disabled (reload-required) lane shows its reason inline, once per slot.
+    if (disabled) slot.appendChild(actionReason(RELOAD_ACTION_REASON));
   } else {
     const miss = document.createElement('span');
     miss.className = 'role-missing-tag';
@@ -598,13 +692,16 @@ function renderUnits(data) {
     cell(row, ws);
     cell(row, redmineText(p.redmine), redmineClass(p.redmine));
     const actions = document.createElement('td');
+    // The Target these actions act on (agent @ session), shown in each button's
+    // title / aria-label so the operator reads what jump / Finder will target.
+    const targetDesc = p.agent_kind + ' @ ' + (p.session || '-');
     for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
-      const button = document.createElement('button');
-      button.textContent = label;
-      button.disabled = !!data.stale;
-      button.addEventListener('click', () => act(kind, p.pane_id));
-      actions.appendChild(button);
+      actions.appendChild(actionButton(kind, label, targetDesc, !!data.stale,
+        STALE_ACTION_REASON, () => act(kind, p.pane_id, targetDesc)));
     }
+    // When the snapshot is stale every action is disabled; show the reason inline
+    // (the banner explains it globally, but the disabled action itself now says why).
+    if (data.stale) actions.appendChild(actionReason(STALE_ACTION_REASON));
     row.appendChild(actions);
     tbody.appendChild(row);
     rendered += 1;
