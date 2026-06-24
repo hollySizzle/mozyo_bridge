@@ -128,6 +128,13 @@ REASON_DEPTH_CEILING_EXCEEDED = "depth_ceiling_exceeded"
 #: The delegated coordinator already holds ``max_active_child_lanes`` active
 #: grandchild lanes; opening another would exceed the capacity.
 REASON_ACTIVE_LANE_CAPACITY_EXHAUSTED = "active_lane_capacity_exhausted"
+#: ``current_depth`` is malformed (non-int / bool) or shallower than a delegated
+#: coordinator (``< 1``), so the dispatching actor could not be a delegated
+#: coordinator and the grandchild lane depth cannot be trusted.
+REASON_INVALID_DELEGATION_DEPTH = "invalid_delegation_depth"
+#: ``active_grandchild_lanes`` is malformed (non-int / bool) or negative, so the
+#: capacity gate cannot be trusted (a negative count would silently widen it).
+REASON_INVALID_ACTIVE_LANE_COUNT = "invalid_active_lane_count"
 
 # --- grandchild dispatch purpose (spine ### 孫 dispatch / context 保護) ---------
 
@@ -278,6 +285,11 @@ class GrandchildPolicyGate:
     reason: Optional[str] = None
 
 
+def _is_plain_int(value: object) -> bool:
+    """True only for a real ``int`` (a ``bool`` is rejected — it subclasses int)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def resolve_grandchild_policy_gate(
     policy: DelegationPolicy,
     *,
@@ -286,23 +298,33 @@ def resolve_grandchild_policy_gate(
 ) -> GrandchildPolicyGate:
     """Resolve whether the policy permits a grandchild lane at ``current_depth + 1``.
 
-    The fail-closed order (master gate wins, then grandchild flag, then depth
-    ceiling, then capacity), per ``delegation-policy-project-config.md`` ``### knob
-    間の安全な相互作用``:
+    The fail-closed order (master gate wins, then grandchild flag, then runtime
+    input validation, then depth ceiling, then capacity), per
+    ``delegation-policy-project-config.md`` ``### knob 間の安全な相互作用``:
 
     1. ``enable_delegated_coordinator: false`` →
        :data:`REASON_MASTER_GATE_DISABLED`.
     2. ``enable_grandchild_dispatch: false`` → :data:`REASON_GRANDCHILD_DISABLED`.
-    3. the new lane depth (``current_depth + 1``) exceeds the effective max depth
+    3. a malformed (non-int / bool) or too-shallow ``current_depth`` (``< 1``, i.e.
+       the dispatching actor is not even a delegated coordinator) →
+       :data:`REASON_INVALID_DELEGATION_DEPTH`; a malformed or negative
+       ``active_grandchild_lanes`` → :data:`REASON_INVALID_ACTIVE_LANE_COUNT`.
+       Malformed runtime input must never be trusted — a negative depth/count
+       would otherwise silently form a depth-0/1 route or widen the capacity gate.
+    4. the new lane depth (``current_depth + 1``) exceeds the effective max depth
        or the hard ceiling → :data:`REASON_DEPTH_CEILING_EXCEEDED` (covers
-       ``max_delegation_depth < 2`` and an invalid clamped-to-0 depth).
-    4. ``active_grandchild_lanes >= max_active_child_lanes`` →
+       ``max_delegation_depth < 2``, an invalid clamped-to-0 depth, and a
+       ``current_depth`` already at the ceiling).
+    5. ``active_grandchild_lanes >= max_active_child_lanes`` →
        :data:`REASON_ACTIVE_LANE_CAPACITY_EXHAUSTED`.
 
     Pure and deterministic over its inputs.
     """
     eff = effective_policy(policy)
-    new_lane_depth = current_depth + 1
+    # Derive the lane depth defensively: a malformed current_depth gets a 0
+    # sentinel so the audit record carries a value and the invalid-depth check
+    # below fails closed rather than crashing on the arithmetic.
+    new_lane_depth = (current_depth + 1) if _is_plain_int(current_depth) else 0
 
     def _gate(permitted: bool, reason: Optional[str]) -> GrandchildPolicyGate:
         return GrandchildPolicyGate(
@@ -316,6 +338,10 @@ def resolve_grandchild_policy_gate(
         return _gate(False, REASON_MASTER_GATE_DISABLED)
     if not eff.enable_grandchild_dispatch:
         return _gate(False, REASON_GRANDCHILD_DISABLED)
+    if not _is_plain_int(current_depth) or current_depth < DEFAULT_DELEGATED_COORDINATOR_DEPTH:
+        return _gate(False, REASON_INVALID_DELEGATION_DEPTH)
+    if not _is_plain_int(active_grandchild_lanes) or active_grandchild_lanes < 0:
+        return _gate(False, REASON_INVALID_ACTIVE_LANE_COUNT)
     if new_lane_depth > eff.effective_max_depth or new_lane_depth > HARD_CEILING_DEPTH:
         return _gate(False, REASON_DEPTH_CEILING_EXCEEDED)
     if active_grandchild_lanes >= eff.effective_max_active_child_lanes:
@@ -577,6 +603,8 @@ __all__ = (
     "REASON_GRANDCHILD_DISABLED",
     "REASON_DEPTH_CEILING_EXCEEDED",
     "REASON_ACTIVE_LANE_CAPACITY_EXHAUSTED",
+    "REASON_INVALID_DELEGATION_DEPTH",
+    "REASON_INVALID_ACTIVE_LANE_COUNT",
     "PURPOSE_PRESERVE_CONTEXT",
     "NO_DISPATCH_REASON_CONTEXT_COST_LOW",
     "NO_DISPATCH_REASON_SINGLE_PASS",

@@ -50,6 +50,8 @@ from mozyo_bridge.domain.grandchild_dispatch import (
     REASON_ACTIVE_LANE_CAPACITY_EXHAUSTED,
     REASON_DEPTH_CEILING_EXCEEDED,
     REASON_GRANDCHILD_DISABLED,
+    REASON_INVALID_ACTIVE_LANE_COUNT,
+    REASON_INVALID_DELEGATION_DEPTH,
     REASON_MASTER_GATE_DISABLED,
     DelegationPolicy,
     effective_policy,
@@ -220,6 +222,47 @@ class PolicyGateTest(unittest.TestCase):
         self.assertEqual(gate.reason, REASON_DEPTH_CEILING_EXCEEDED)
         self.assertEqual(gate.new_lane_depth, 3)
 
+    def test_current_depth_below_one_fails_closed(self):
+        # A dispatching actor shallower than a delegated coordinator (depth < 1)
+        # must not silently form a depth-0/1 route.
+        for depth in (0, -1, -5):
+            gate = resolve_grandchild_policy_gate(_open_policy(), current_depth=depth)
+            self.assertFalse(gate.permitted, depth)
+            self.assertEqual(gate.reason, REASON_INVALID_DELEGATION_DEPTH, depth)
+
+    def test_non_int_current_depth_fails_closed(self):
+        for depth in (1.0, "1", True, None):
+            gate = resolve_grandchild_policy_gate(_open_policy(), current_depth=depth)
+            self.assertFalse(gate.permitted, depth)
+            self.assertEqual(gate.reason, REASON_INVALID_DELEGATION_DEPTH, depth)
+
+    def test_negative_active_lane_count_fails_closed(self):
+        # A negative active count would otherwise widen the capacity gate.
+        gate = resolve_grandchild_policy_gate(
+            _open_policy(), active_grandchild_lanes=-1
+        )
+        self.assertFalse(gate.permitted)
+        self.assertEqual(gate.reason, REASON_INVALID_ACTIVE_LANE_COUNT)
+
+    def test_non_int_active_lane_count_fails_closed(self):
+        for count in (1.5, "0", True):
+            gate = resolve_grandchild_policy_gate(
+                _open_policy(), active_grandchild_lanes=count
+            )
+            self.assertFalse(gate.permitted, count)
+            self.assertEqual(gate.reason, REASON_INVALID_ACTIVE_LANE_COUNT, count)
+
+    def test_invalid_depth_checked_after_master_and_grandchild_flags(self):
+        # Policy-level gates keep priority over the input-validation reasons.
+        master_off = resolve_grandchild_policy_gate(
+            _open_policy(enable_delegated_coordinator=False), current_depth=-1
+        )
+        self.assertEqual(master_off.reason, REASON_MASTER_GATE_DISABLED)
+        gc_off = resolve_grandchild_policy_gate(
+            _open_policy(enable_grandchild_dispatch=False), current_depth=-1
+        )
+        self.assertEqual(gc_off.reason, REASON_GRANDCHILD_DISABLED)
+
 
 class ResolveGrandchildDispatchTest(unittest.TestCase):
     def test_permitted_unique_codex_is_dispatch_adopt(self):
@@ -315,6 +358,31 @@ class ResolveGrandchildDispatchTest(unittest.TestCase):
                 candidates=[_codex()],
                 target_repo_identity=GRANDCHILD_REPO,
             )
+
+    def test_invalid_current_depth_fails_closed_before_selection(self):
+        # Even with a perfect unique candidate, a malformed depth fails closed and
+        # never consults the candidate (no depth-0/1 route ever forms).
+        decision = resolve_grandchild_dispatch(
+            policy=_open_policy(),
+            mode="adopt_existing",
+            candidates=[_codex(pane_id="%41")],
+            target_repo_identity=GRANDCHILD_REPO,
+            current_depth=-1,
+        )
+        self.assertEqual(decision.outcome, OUTCOME_FAIL_CLOSED)
+        self.assertEqual(decision.reason, REASON_INVALID_DELEGATION_DEPTH)
+        self.assertIsNone(decision.launch_adopt)
+
+    def test_negative_active_lane_count_fails_closed_dispatch(self):
+        decision = resolve_grandchild_dispatch(
+            policy=_open_policy(),
+            mode="adopt_existing",
+            candidates=[_codex(pane_id="%41")],
+            target_repo_identity=GRANDCHILD_REPO,
+            active_grandchild_lanes=-1,
+        )
+        self.assertEqual(decision.outcome, OUTCOME_FAIL_CLOSED)
+        self.assertEqual(decision.reason, REASON_INVALID_ACTIVE_LANE_COUNT)
 
     def test_selection_ignores_display_proximity(self):
         # Two codex candidates differing only in session/window are still
@@ -548,6 +616,24 @@ class HandlerIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(code, 3)
         self.assertIn("ambiguous_candidates", out)
+
+    def test_negative_current_depth_flag_fails_closed_nonzero(self):
+        # A malformed runtime --current-depth must not form a route via the CLI.
+        code, out = self._run(
+            self._base("adopt_existing") + ["--current-depth", "-1"],
+            [_target_row(pane_id="%41")],
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("invalid_delegation_depth", out)
+        self.assertNotIn("mozyo-bridge handoff send", out)
+
+    def test_negative_active_lanes_flag_fails_closed_nonzero(self):
+        code, out = self._run(
+            self._base("adopt_existing") + ["--active-grandchild-lanes", "-1"],
+            [_target_row(pane_id="%41")],
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("invalid_active_lane_count", out)
 
     def test_no_dispatch_path_skips_discovery(self):
         # --no-dispatch records avoided without any tmux discovery; patch nothing.

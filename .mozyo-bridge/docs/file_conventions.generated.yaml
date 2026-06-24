@@ -57,9 +57,12 @@ rules:
   patterns:
   - src/mozyo_bridge/domain/delegation_launch_adopt.py
   - src/mozyo_bridge/application/delegation_launch_adopt.py
+  - src/mozyo_bridge/domain/grandchild_dispatch.py
+  - src/mozyo_bridge/application/grandchild_dispatch.py
   - src/mozyo_bridge/domain/delegation_projection.py
   - src/mozyo_bridge/domain/delegation_display.py
   - tests/test_delegation_launch_adopt.py
+  - tests/test_grandchild_dispatch.py
   - tests/test_delegation_projection.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
