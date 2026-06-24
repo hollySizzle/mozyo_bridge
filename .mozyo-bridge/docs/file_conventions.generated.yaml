@@ -277,7 +277,7 @@ rules:
   - tests/**
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/logics/turnkey-e2e-acceptance.md
-    をよく確認し従うこと
+    と @vibes/docs/logics/tests-placement-discovery-policy.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
