@@ -217,6 +217,29 @@ mozyo      12395b claude implementation         2      mozyo/12395a implementing
 DEPTH / PARENT / KIND は routing key ではない。handoff は Unit → Target preflight を
 使う。
 
+## context-free smoke と UX 判定
+
+親子孫表示の UX を検証するときは、既に親子孫構造を agent の chat/pane context に
+注入した状態だけで判断しない。Redmine durable anchor だけを受け取った coordinator が
+project config / Redmine issue / cataloged docs から delegation tree を発生または
+採用できるかを、別 smoke として確認する。
+
+この smoke は #12453 型の「明示 context 付き route replay」と別物である。#12453 型は
+既知の parent / child / grandchild 候補を与えて transport と callback を確認する。
+context-free smoke は、起点側へ具体 pane id、親子孫候補、window 配置を事前に教えず、
+次を検査する。
+
+- durable anchor から parent coordinator が child delegated coordinator を解決できるか。
+- child delegated coordinator が必要なら grandchild gateway / worker を発生または採用
+  できるか。
+- 自律発生しない場合、どの context が不足していたかを Redmine に記録できるか。
+- cockpit projection が、発生した tree または発生しなかった理由を operator に示せるか。
+
+成功条件は「必ず親子孫が自然発生すること」ではない。自律発生しない場合も、必要な
+durable field / project config / display metadata の不足が replayable に残れば、
+UX 設計 input として有効である。逆に、事前に pane id や候補 lane を chat で教えてから
+PASS しただけでは context-free smoke の証跡にならない。
+
 ## retire owner と stale-lane safeguard
 
 US #12391 受入の「retire owner / record requirement」を固定する。目的は階層が増えても
@@ -314,6 +337,8 @@ profile field と context-preservation policy には踏み込まない。
    `retire_owner_actor`) の record / sweep への結線。
 5. delegation tree を Redmine parent link + dispatch journal から再導出する read
    model (pane option を正本にしない)。
+6. context-free smoke: 起点側へ親子孫候補を chat/pane で事前注入せず、Redmine durable
+   anchor だけから delegation tree が発生または fail-closed することを確認する。
 
 各 task は runtime / tests を伴うため Claude implementer lane に回し、Codex が review
 する。とくに delegation reference / window knob が routing / handoff safety gate を

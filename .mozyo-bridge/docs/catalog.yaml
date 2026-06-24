@@ -638,7 +638,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/delegated-coordinator-cockpit-display.md
-    purpose: 親 coordinator → 委譲 (子) coordinator → 孫 implementation lane の shallow delegation における window 分離 (既定 separate / project policy で調整可能)、parent reference display metadata、cockpit 最小追跡 contract、retire owner と ancestor-before-descendant retirement ordering を display 投影として routing/governance から分離して固定する設計正本。
+    purpose: 親 coordinator → 委譲 (子) coordinator → 孫 implementation lane の shallow delegation における window 分離 (既定 separate / project policy で調整可能)、parent reference display metadata、cockpit 最小追跡 contract、context-free smoke 観点、retire owner と ancestor-before-descendant retirement ordering を display 投影として routing/governance から分離して固定する設計正本。
     audit_role: delegated_coordinator_cockpit_display_logic
     related_document_refs:
       - logic-coordinator-sublane-development-flow

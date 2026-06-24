@@ -242,6 +242,25 @@ candidate implementation を使った smoke:
 - この方式は test runtime の選択であり、配布済み CLI や親 project submodule を変更したことにはならない。実行 command の実 path は Redmine journal に記録し、tracked public docs へ private absolute path を固定しない。
 - smoke が green でも、commit-bearing implementation の review / origin reachability / integration disposition は別に確認する。
 
+context-free delegated smoke:
+
+- #12453 のように親子孫候補を Start Gate / chat / pane context で明示してから実行する
+  route replay は有用だが、それだけでは実運用で自律的に delegation tree が発生するかを
+  確認したことにならない。
+- 既存 project adoption の UX / operability を見る場合は、別 Test issue を作り、親
+  project coordinator へ具体 pane id、親子孫候補、window 配置を事前注入しない状態で
+  Redmine durable anchor だけを渡す smoke を行う。
+- 期待する観測は 2 通りある。自律的に parent -> child delegated coordinator ->
+  grandchild gateway / worker が発生または採用されるなら、その route と callback を
+  Redmine から replay できるようにする。発生しないなら、どの durable field / project
+  config / display metadata が不足していたかを Progress Log に残す。
+- 「発生しなかった」こと自体は失敗ではない。必要 context が明確になれば、
+  `delegated-coordinator-cockpit-display.md` / delegation policy / cockpit projection
+  の設計 input として扱う。
+- context-free smoke では、operator 固有 pane id や private cockpit composition を
+  tracked docs / catalog default へ焼き込まない。実機 journal に観測 pane id を残すのは
+  replay evidence として許容する。
+
 grandchild dispatch の判定:
 
 - delegated coordinator が受けた作業が route verification / disposition / ticket-only update のような context-neutral work であれば、孫 implementation lane を開かなくてよい。`coordinator-sublane-development-flow.md` の `### 孫 dispatch / context 保護` どおり、孫 dispatch の主目的は `purpose: preserve_coordinator_context` である。
