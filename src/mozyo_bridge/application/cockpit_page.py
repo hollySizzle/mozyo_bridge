@@ -90,6 +90,14 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .obs-healthy { color: #2e7d32; }
   .obs-reload_required { color: #ef6c00; font-weight: 600; }
   .obs-unknown { color: #b71c1c; font-weight: 600; }
+  /* Empty vs error must never render as the same blank surface (#12378): an
+     empty cockpit (the daemon responded, nothing to show) reads as a neutral
+     muted note, while a data-unavailable error (the daemon could not be reached)
+     reads fail-closed red. Defined after .muted so the later equal-specificity
+     rule wins when both classes are present. */
+  .units-state { padding: 4px 8px; font-size: 12px; }
+  .state-empty { color: #616161; }
+  .state-error { color: #b71c1c; font-weight: 600; }
   /* Project Group box: a managed (configured) group reads with a left accent;
      a default / ungrouped bucket stays plain so the two are visually separable. */
   .group { margin: 8px 0; border: 1px solid #e0e0e0; border-radius: 4px;
@@ -145,6 +153,7 @@ last cached snapshot; activity may be outdated and actions are disabled.</div>
 <th>redmine</th><th>actions</th>
 </tr></thead><tbody></tbody></table>
 </div>
+<p id="units-state" class="units-state" style="display:none"></p>
 <p class="muted">three layers: state is OTel activity (active / idle /
 unknown — never "dead"); tmux liveness is the row's presence itself;
 redmine is read-only gate context (latest open issue), degrading to
@@ -172,6 +181,27 @@ const KNOWN_RM_STATES = ["available", "unconfigured", "unavailable"];
 // (runtime-observability-boundary.md). The class is whitelisted from this list,
 // so the (local but untrusted) payload can never inject a class name.
 const KNOWN_DISPLAY_STATES = ["healthy", "reload_required", "unknown"];
+// #12378 empty vs error: an empty cockpit (the daemon responded but nothing is
+// observed) must never look the same as a data-unavailable error (the daemon
+// could not be reached). The two carry distinct text and a distinct state class.
+const EMPTY_UNITS_TEXT = 'no agents observed — the cockpit is empty (the daemon responded)';
+const ERROR_UNITS_TEXT = 'cockpit data unavailable — could not reach the daemon (retrying)';
+const EMPTY_GROUPED_TEXT = 'no project groups observed — the cockpit is empty';
+// Surface the flat unit table's empty / error / ok state on a dedicated line so
+// an empty cockpit and an unreachable daemon never render as the same blank
+// table (#12378). Diagnostic only — it moves no gate and authorizes no action.
+function setUnitsState(mode, text) {
+  const el = document.getElementById('units-state');
+  if (mode === 'ok') {
+    el.style.display = 'none';
+    el.className = 'units-state';
+    el.textContent = '';
+    return;
+  }
+  el.style.display = 'block';
+  el.className = 'units-state state-' + mode;  // state-empty | state-error
+  el.textContent = text;
+}
 function renderObservation(obs) {
   // The runtime view is a timestamped snapshot, not live truth. Surface its
   // observed_at / freshness / display_state so a stale or unreadable snapshot
@@ -375,24 +405,43 @@ function renderGrouped(data) {
   const container = document.getElementById('grouped');
   container.replaceChildren();
   if (!data || !Array.isArray(data.groups)) {
+    // Malformed / missing payload is an error, not an empty cockpit (#12378).
+    meta.className = 'muted state-error';
     meta.textContent = 'grouped: unavailable';
     return;
   }
+  meta.className = 'muted';
   meta.textContent = groupedSummaryText(data);
+  if (!data.groups.length) {
+    // Zero groups is an empty projection (the daemon responded), shown as a
+    // neutral empty note — distinct from the red "unavailable" error (#12378).
+    const empty = document.createElement('div');
+    empty.className = 'lane-row state-empty';
+    empty.textContent = EMPTY_GROUPED_TEXT;
+    container.appendChild(empty);
+    return;
+  }
   for (const g of data.groups) container.appendChild(groupSection(g));
 }
 async function refreshGrouped() {
+  const meta = document.getElementById('grouped-meta');
   try {
     const res = await fetch('/api/grouped-units');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      document.getElementById('grouped-meta').textContent =
-        'grouped: ' + (body.error || 'unavailable');
+      meta.className = 'muted state-error';
+      meta.textContent = 'grouped: ' + (body.error || 'unavailable');
       document.getElementById('grouped').replaceChildren();
       return;
     }
     renderGrouped(await res.json());
-  } catch (e) { /* daemon restarting; next poll recovers */ }
+  } catch (e) {
+    // Daemon unreachable: surface a grouped error state distinct from empty,
+    // then recover on the next poll.
+    meta.className = 'muted state-error';
+    meta.textContent = 'grouped: unavailable';
+    document.getElementById('grouped').replaceChildren();
+  }
 }
 // DOM construction only: every payload string lands via textContent, so
 // workspace / session names with HTML metacharacters render as text.
@@ -411,6 +460,7 @@ async function refresh() {
     renderObservation(data.observation);
     const tbody = document.querySelector('#units tbody');
     tbody.replaceChildren();
+    let rendered = 0;
     for (const p of (data.panes || [])) {
       if (p.agent_kind === 'unknown') continue;
       const row = document.createElement('tr');
@@ -433,7 +483,23 @@ async function refresh() {
       }
       row.appendChild(actions);
       tbody.appendChild(row);
+      rendered += 1;
     }
+    // Empty (the daemon responded, nothing observed) reads as a neutral note,
+    // distinct from the fail-closed error state below (#12378).
+    setUnitsState(rendered ? 'ok' : 'empty', EMPTY_UNITS_TEXT);
+  } catch (e) {
+    // The daemon is unreachable / returned unparseable data. Surface an explicit
+    // error state — never the same blank surface as the empty state — and let the
+    // next poll recover. The previous build swallowed this silently, so an
+    // unreachable daemon looked identical to an empty cockpit.
+    renderObservation(null);
+    setUnitsState('error', ERROR_UNITS_TEXT);
+  }
+  // Transitions are a secondary panel; a failure here must not be read as a
+  // units error. The units empty / error state above already reflects the
+  // primary fetch.
+  try {
     const tr = await (await fetch('/api/transitions')).json();
     const list = document.getElementById('transitions');
     list.replaceChildren();
@@ -443,7 +509,7 @@ async function refresh() {
         t.session + ': ' + t.previous_state + ' \\u2192 ' + t.state;
       list.appendChild(item);
     }
-  } catch (e) { /* daemon restarting; next poll recovers */ }
+  } catch (e) { /* transitions are secondary; the units state already shows */ }
   // The grouped read model is served from its own endpoint; refresh it on the
   // same cadence so its freshness line tracks the flat view.
   refreshGrouped();

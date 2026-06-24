@@ -167,6 +167,91 @@ class GroupedRenderingTest(unittest.TestCase):
         self.assertRegex(style, r"\.group\.default\b[^{]*\{")
 
 
+class EmptyVersusErrorStateTest(unittest.TestCase):
+    """Pin the #12378 acceptance: empty state and error state never render the
+    same surface.
+
+    An empty cockpit (the daemon responded, nothing observed) and a
+    data-unavailable error (the daemon could not be reached) must be distinct in
+    both text and styling, and the flat refresh must no longer silently swallow a
+    failed ``/api/units`` fetch — the failure that previously made an unreachable
+    daemon look identical to an empty cockpit.
+    """
+
+    def _style(self) -> str:
+        return INDEX_HTML_TEMPLATE[
+            INDEX_HTML_TEMPLATE.index("<style>"):INDEX_HTML_TEMPLATE.index(
+                "</style>"
+            )
+        ]
+
+    def test_flat_view_has_dedicated_empty_and_error_machinery(self) -> None:
+        # A dedicated state line and a single helper that drives the ok / empty /
+        # error modes, so the empty and error paths cannot diverge by accident.
+        self.assertIn('id="units-state"', INDEX_HTML_TEMPLATE)
+        self.assertIn("function setUnitsState(", INDEX_HTML_TEMPLATE)
+        self.assertIn("EMPTY_UNITS_TEXT", INDEX_HTML_TEMPLATE)
+        self.assertIn("ERROR_UNITS_TEXT", INDEX_HTML_TEMPLATE)
+        # The empty branch is driven by the rendered-row count; the error branch
+        # by the catch path.
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"setUnitsState\(rendered \? 'ok' : 'empty'")
+        self.assertIn("setUnitsState('error'", INDEX_HTML_TEMPLATE)
+
+    def test_empty_and_error_text_differ(self) -> None:
+        empty = re.search(r"EMPTY_UNITS_TEXT = '([^']*)'", INDEX_HTML_TEMPLATE)
+        error = re.search(r"ERROR_UNITS_TEXT = '([^']*)'", INDEX_HTML_TEMPLATE)
+        self.assertTrue(empty and error, "empty/error text constants not found")
+        self.assertNotEqual(empty.group(1), error.group(1))
+        # The empty text reads as "nothing to show"; the error text as
+        # "could not reach the daemon".
+        self.assertIn("empty", empty.group(1))
+        self.assertRegex(error.group(1), r"unavailable|reach")
+
+    def test_empty_and_error_classes_are_distinctly_styled(self) -> None:
+        # If both classes resolved to the same CSS the two states would read the
+        # same even with different text. Require a rule for each and that they
+        # differ (the error reads fail-closed, the empty reads neutral).
+        style = self._style()
+        empty_rule = re.search(r"\.state-empty\b[^{]*\{([^}]*)\}", style)
+        error_rule = re.search(r"\.state-error\b[^{]*\{([^}]*)\}", style)
+        self.assertTrue(empty_rule, ".state-empty has no CSS rule")
+        self.assertTrue(error_rule, ".state-error has no CSS rule")
+        self.assertNotEqual(
+            empty_rule.group(1).strip(),
+            error_rule.group(1).strip(),
+            "empty and error states must not share identical styling",
+        )
+
+    def test_units_fetch_error_is_not_silently_swallowed(self) -> None:
+        # Regression: the prior refresh() caught the /api/units failure and
+        # rendered nothing, so an unreachable daemon looked identical to an empty
+        # cockpit. Pin that the catch path now surfaces the explicit error state.
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE,
+            r"catch \(e\) \{[^}]*setUnitsState\('error'",
+        )
+
+    def test_grouped_empty_state_distinct_from_unavailable(self) -> None:
+        # Grouped view: zero groups is an empty projection (neutral note), the
+        # malformed / failed fetch is the red "unavailable" error.
+        self.assertIn("EMPTY_GROUPED_TEXT", INDEX_HTML_TEMPLATE)
+        self.assertIn("data.groups.length", INDEX_HTML_TEMPLATE)
+        # The grouped empty note uses the neutral empty class; the error path
+        # tags the meta with the fail-closed state class.
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"lane-row state-empty"
+        )
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"'muted state-error'"
+        )
+
+    def test_state_classes_keep_dom_only_no_injection(self) -> None:
+        # The new state machinery must keep the page's no-injection property.
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                     "document.write"):
+            self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
+
+
 class ServedCockpitSmokeTest(unittest.TestCase):
     """Page-level browser smoke against the daemon-served cockpit document."""
 
@@ -239,6 +324,7 @@ class ServedCockpitSmokeTest(unittest.TestCase):
             'id="stale"',           # tmux-runtime-unavailable banner
             'stale-banner',
             'id="units"',           # the unit rows table
+            'id="units-state"',     # empty-vs-error state line (#12378)
             'id="transitions"',     # recent state transitions
         ):
             self.assertIn(anchor, html, anchor)
