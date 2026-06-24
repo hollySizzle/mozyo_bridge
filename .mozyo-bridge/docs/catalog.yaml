@@ -867,6 +867,25 @@ file_conventions:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: fc-delegated-coordinator-runtime-source
+    name: delegated coordinator runtime and projection source
+    patterns:
+      - src/mozyo_bridge/domain/delegation_launch_adopt.py
+      - src/mozyo_bridge/application/delegation_launch_adopt.py
+      - src/mozyo_bridge/domain/delegation_projection.py
+      - tests/test_delegation_launch_adopt.py
+      - tests/test_delegation_projection.py
+    severity: block
+    document_refs:
+      - logic-delegated-coordinator-cockpit-display
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: fc-cli-entrypoints
     name: package CLI and command entrypoints
     patterns:
