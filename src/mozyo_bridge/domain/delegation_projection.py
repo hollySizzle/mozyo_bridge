@@ -52,16 +52,19 @@ from typing import Iterable, Mapping
 LANE_KIND_COORDINATOR = "coordinator"
 LANE_KIND_DELEGATED_COORDINATOR = "delegated_coordinator"
 LANE_KIND_IMPLEMENTATION = "implementation"
-# Explicit "could not determine" kind so a caller without a durable kind fact
-# states that honestly rather than guessing; a typo'd token still fails closed.
-LANE_KIND_UNKNOWN = "unknown"
 
+# The closed contract enum. There is deliberately **no** ``unknown`` member: a
+# caller without a durable kind fact must fail closed
+# (:class:`DelegationProjectionError`) rather than emit an off-contract value
+# into the projection / ``@mozyo_lane_kind`` cache, which a downstream consumer
+# (#12466 writer / ``agents targets`` columns) could mistake for a new enum
+# value (Redmine #12465 review j#63800). The fail-closed error is itself the
+# diagnostic surface; an unknown kind is never carried as ``lane_kind``.
 LANE_KINDS = frozenset(
     {
         LANE_KIND_COORDINATOR,
         LANE_KIND_DELEGATED_COORDINATOR,
         LANE_KIND_IMPLEMENTATION,
-        LANE_KIND_UNKNOWN,
     }
 )
 
@@ -97,10 +100,14 @@ class DelegationSource:
     is the ``unit_id`` of the *direct* parent lane, or ``None`` for the tree root
     (the top coordinator). ``source_refs`` carry only human-traceable anchors
     (e.g. ``redmine:#12465#journal-63763``) and no path / secret.
+
+    ``lane_kind`` is required and must be one of :data:`LANE_KINDS`; a caller
+    without a durable kind fact fails closed rather than passing an off-contract
+    value (Redmine #12465 review j#63800).
     """
 
     unit_id: str
-    lane_kind: str = LANE_KIND_UNKNOWN
+    lane_kind: str
     delegation_parent: str | None = None
     source_refs: tuple[str, ...] = ()
 
@@ -253,7 +260,6 @@ __all__: Iterable[str] = (
     "LANE_KIND_COORDINATOR",
     "LANE_KIND_DELEGATED_COORDINATOR",
     "LANE_KIND_IMPLEMENTATION",
-    "LANE_KIND_UNKNOWN",
     "LANE_KINDS",
     "MAX_DELEGATION_DEPTH",
     "OPTION_LANE_KIND",

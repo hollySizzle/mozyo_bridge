@@ -20,7 +20,7 @@ from mozyo_bridge.domain.delegation_projection import (
     LANE_KIND_COORDINATOR,
     LANE_KIND_DELEGATED_COORDINATOR,
     LANE_KIND_IMPLEMENTATION,
-    LANE_KIND_UNKNOWN,
+    LANE_KINDS,
     MAX_DELEGATION_DEPTH,
     OPTION_DELEGATION_DEPTH,
     OPTION_DELEGATION_PARENT,
@@ -157,16 +157,22 @@ class FailClosedTest(unittest.TestCase):
         with self.assertRaises(DelegationProjectionError):
             derive_delegation_tree(sources)
 
-    def test_unknown_lane_kind_fails_closed(self) -> None:
-        sources = [
-            DelegationSource(
-                unit_id=ROOT_ID,
-                lane_kind="manager",  # not in LANE_KINDS
-                delegation_parent=None,
-            )
-        ]
-        with self.assertRaises(DelegationProjectionError):
-            derive_delegation_tree(sources)
+    def test_off_contract_lane_kind_fails_closed(self) -> None:
+        # Any token outside the closed contract enum — including the literal
+        # "unknown" — must fail closed rather than be emitted as a projection /
+        # @mozyo_lane_kind cache value (Redmine #12465 review j#63800).
+        self.assertNotIn("unknown", LANE_KINDS)
+        for off_contract in ("manager", "unknown", "", "Coordinator"):
+            with self.subTest(lane_kind=off_contract):
+                sources = [
+                    DelegationSource(
+                        unit_id=ROOT_ID,
+                        lane_kind=off_contract,
+                        delegation_parent=None,
+                    )
+                ]
+                with self.assertRaises(DelegationProjectionError):
+                    derive_delegation_tree(sources)
 
     def test_duplicate_unit_id_fails_closed(self) -> None:
         sources = [
@@ -249,14 +255,13 @@ class NonAuthorityBoundaryTest(unittest.TestCase):
         self.assertEqual(payload["delegation_depth"], 1)
         self.assertEqual(payload["source_refs"], ["redmine:#12465#journal-63763"])
 
-    def test_unknown_lane_kind_token_is_a_valid_explicit_value(self) -> None:
-        # A caller without a durable kind fact passes LANE_KIND_UNKNOWN
-        # explicitly; that is honest, not a failure.
-        projection = derive_delegation_projection(
-            ROOT_ID,
-            [DelegationSource(unit_id=ROOT_ID, lane_kind=LANE_KIND_UNKNOWN)],
-        )
-        self.assertEqual(projection.lane_kind, LANE_KIND_UNKNOWN)
+    def test_emitted_lane_kind_is_always_a_contract_value(self) -> None:
+        # Every derived projection / option-cache lane_kind is one of the closed
+        # contract enum values; "unknown" is never carried (review j#63800).
+        for projection in derive_delegation_tree(_three_level_sources()).values():
+            self.assertIn(projection.lane_kind, LANE_KINDS)
+            options = delegation_user_options(projection)
+            self.assertIn(options[OPTION_LANE_KIND], LANE_KINDS)
 
 
 if __name__ == "__main__":
