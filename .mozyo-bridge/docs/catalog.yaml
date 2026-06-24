@@ -319,6 +319,23 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-source-layout-bounded-context-migration
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/source-layout-bounded-context-migration.md
+    purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の bounded context (handoff / coordinator / cockpit / governance / scaffold / release / plugin adapter + shared kernel / managed-state) へ段階移行する計画正本。import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。"
+    audit_role: source_layout_bounded_context_migration_logic
+    related_document_refs:
+      - logic-refactor-split-strategy
+      - logic-plugin-ready-adapter-boundary
+      - logic-modular-config-driven-refactor
+      - logic-managed-state-model
+      - logic-runtime-observability-boundary
+      - logic-coordinator-sublane-development-flow
+      - logic-module-health-gate
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-runtime-observability-boundary
     type: logic
     status: active
