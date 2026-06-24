@@ -33,7 +33,7 @@ from mozyo_bridge.domain.agent_discovery import (
 
 def _pane(pane_id, location, *, command="node", cwd="/work/repo",
           window_name="cockpit", pane_active="1", agent_role="",
-          lane_id="", lane_label=""):
+          lane_id="", lane_label="", lane_kind="", delegation_parent=""):
     return {
         "id": pane_id,
         "location": location,
@@ -45,6 +45,8 @@ def _pane(pane_id, location, *, command="node", cwd="/work/repo",
         "workspace_id": "",
         "lane_id": lane_id,
         "lane_label": lane_label,
+        "lane_kind": lane_kind,
+        "delegation_parent": delegation_parent,
     }
 
 
@@ -255,6 +257,55 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         c = json.loads(out)[0]
         self.assertEqual("normal_window", c["view"]["kind"])
         self.assertIsNone(c["view"]["group"])
+
+    def test_json_adds_additive_delegation_window_projection(self) -> None:
+        # #12467: agents targets --json gains a `delegation_window` projection
+        # sibling to the #12466 `delegation` record. With no repo-local config the
+        # policy is the documented default `separate`, so a derived grandchild
+        # (depth 2) projects to its own window.
+        rc, out = self._run([
+            _pane("%1", "mozyo-cockpit:0.0", window_name="codex",
+                  agent_role="codex", lane_id="lane-root",
+                  lane_kind="coordinator"),
+            _pane("%2", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="codex", lane_id="lane-deleg",
+                  lane_kind="delegated_coordinator",
+                  delegation_parent="wsA/lane-root"),
+            _pane("%3", "mozyo-cockpit:0.2", window_name="claude",
+                  agent_role="claude", lane_id="lane-impl",
+                  lane_kind="implementation",
+                  delegation_parent="wsA/lane-deleg"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        by_pane = {c["runtime"]["pane_id"]: c for c in payload}
+        # #12466 record stays present and unchanged alongside the new sibling.
+        self.assertIn("delegation", by_pane["%3"])
+        win = by_pane["%3"]["delegation_window"]
+        self.assertEqual("separate", win["window_policy"])
+        self.assertTrue(win["window_separated"])
+        self.assertEqual("wsA/lane-impl", win["window_group"])
+        self.assertEqual("resolved", win["window_status"])
+        # Root coordinator is its own top-of-tree window under any policy.
+        self.assertTrue(by_pane["%1"]["delegation_window"]["window_separated"])
+
+    def test_delegation_window_is_not_in_canonical_target_record(self) -> None:
+        # Non-authoritative: the window projection rides as an additive sibling
+        # only; the canonical TargetRecord (host/runtime/identity/repo/view) that
+        # routing/preflight consume never carries a window policy field (#12467).
+        rc, out = self._run([
+            _pane("%3", "mozyo-cockpit:0.2", window_name="claude",
+                  agent_role="claude", lane_id="lane-impl",
+                  lane_kind="implementation",
+                  delegation_parent="wsA/lane-deleg"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        c = json.loads(out)[0]
+        self.assertIn("delegation_window", c)  # additive sibling present
+        for section in ("host", "runtime", "identity", "repo", "view"):
+            self.assertNotIn("window_policy", c[section])
+            self.assertNotIn("window_separated", c[section])
+            self.assertNotIn("window_group", c[section])
 
     def test_unknown_panes_are_not_listed(self) -> None:
         rc, out = self._run([
@@ -507,6 +558,246 @@ class AttentionForCandidateHelperTest(unittest.TestCase):
                                                "role_source": "unknown"}):
             rec = self._attention(self._candidate(**over))
             self.assertIn(rec.attention_state, {"healthy", "unknown"})
+
+
+class DeriveTargetsDelegationTest(unittest.TestCase):
+    """Display-only delegated-coordinator-tree projection (Redmine #12466).
+
+    Pins :func:`derive_targets_delegation`, which consumes the closed #12465
+    ``delegation_projection`` foundation. Derivation is fail-soft and strictly
+    non-authoritative: it never raises, never blocks the table, and carries no
+    routing / handoff / approval / close field.
+    """
+
+    def _cand(self, pane_id, *, lane_id, lane_kind="", delegation_parent="",
+              workspace_id="wsA", role="codex"):
+        from mozyo_bridge.domain.agent_discovery import TargetCandidate
+
+        return TargetCandidate(
+            pane_id=pane_id,
+            role=role,
+            role_source="pane_option",
+            confidence="strong",
+            ambiguous=False,
+            session="mozyo-cockpit",
+            window_name="cockpit",
+            window_index="0",
+            pane_index="0",
+            active=True,
+            workspace_id=workspace_id,
+            workspace_label="mozyo-bridge",
+            lane_id=lane_id,
+            lane_label=None,
+            repo_short="repo",
+            repo_root="/work/repo",
+            cwd="/work/repo",
+            host="local",
+            view_kind="cockpit_pane",
+            branch="main",
+            lane_kind=lane_kind,
+            delegation_parent=delegation_parent,
+        )
+
+    def _three_level_tree(self):
+        # parent (0) -> delegated (1) -> grandchild (2); the parent pointer uses
+        # the `<workspace_id>/<lane_id>` unit format the display defines.
+        return [
+            self._cand("%1", lane_id="root", lane_kind="coordinator"),
+            self._cand("%2", lane_id="deleg", lane_kind="delegated_coordinator",
+                       delegation_parent="wsA/root"),
+            self._cand("%3", lane_id="gc", lane_kind="implementation",
+                       delegation_parent="wsA/deleg"),
+        ]
+
+    def test_no_delegation_facts_is_blank_none_status(self) -> None:
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        out = derive_targets_delegation([self._cand("%1", lane_id="default")])
+        deleg = out["%1"]
+        self.assertEqual("none", deleg.status)
+        self.assertEqual("", deleg.lane_kind)
+        self.assertIsNone(deleg.delegation_depth)
+        self.assertEqual("", deleg.delegation_parent)
+        self.assertEqual("", deleg.delegation_root)
+
+    def test_derives_kind_depth_parent_root_for_three_level_tree(self) -> None:
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        out = derive_targets_delegation(self._three_level_tree())
+
+        self.assertEqual("coordinator", out["%1"].lane_kind)
+        self.assertEqual(0, out["%1"].delegation_depth)
+        self.assertEqual("", out["%1"].delegation_parent)
+        self.assertEqual("wsA/root", out["%1"].delegation_root)
+        self.assertEqual("derived", out["%1"].status)
+
+        self.assertEqual("delegated_coordinator", out["%2"].lane_kind)
+        self.assertEqual(1, out["%2"].delegation_depth)
+        self.assertEqual("wsA/root", out["%2"].delegation_parent)
+        self.assertEqual("wsA/root", out["%2"].delegation_root)
+
+        self.assertEqual("implementation", out["%3"].lane_kind)
+        self.assertEqual(2, out["%3"].delegation_depth)
+        self.assertEqual("wsA/deleg", out["%3"].delegation_parent)
+        self.assertEqual("wsA/root", out["%3"].delegation_root)
+
+    def test_two_panes_in_one_lane_share_the_derived_unit(self) -> None:
+        # A lane's codex gateway + claude worker share `<workspace_id>/<lane_id>`;
+        # both panes resolve to the same derived breadcrumb (no duplicate-unit
+        # failure in the foundation).
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        cands = [
+            self._cand("%1", lane_id="root", lane_kind="coordinator", role="codex"),
+            self._cand("%2", lane_id="deleg", lane_kind="delegated_coordinator",
+                       delegation_parent="wsA/root", role="codex"),
+            self._cand("%3", lane_id="deleg", lane_kind="delegated_coordinator",
+                       delegation_parent="wsA/root", role="claude"),
+        ]
+        out = derive_targets_delegation(cands)
+        self.assertEqual(out["%2"].as_payload(), out["%3"].as_payload())
+        self.assertEqual(1, out["%2"].delegation_depth)
+
+    def test_off_contract_lane_kind_is_diagnostic_not_authoritative(self) -> None:
+        # An off-contract kind must not be emitted as a healthy projection value
+        # (mirrors the foundation's fail-closed boundary) but must not crash the
+        # display either: it degrades to a diagnostic row.
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        out = derive_targets_delegation([self._cand("%1", lane_id="x", lane_kind="manager")])
+        deleg = out["%1"]
+        self.assertEqual("diagnostic", deleg.status)
+        self.assertEqual("", deleg.lane_kind)  # off-contract kind is withheld
+        self.assertIsNone(deleg.delegation_depth)
+
+    def test_unknown_parent_pointer_fails_soft_to_diagnostic(self) -> None:
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        out = derive_targets_delegation([
+            self._cand("%1", lane_id="deleg", lane_kind="delegated_coordinator",
+                       delegation_parent="wsA/ghost"),
+        ])
+        self.assertEqual("diagnostic", out["%1"].status)
+        self.assertIsNone(out["%1"].delegation_depth)
+        # The contract kind is still shown so the broken breadcrumb is visible.
+        self.assertEqual("delegated_coordinator", out["%1"].lane_kind)
+
+    def test_depth_beyond_shallow_maximum_fails_soft(self) -> None:
+        # parent -> delegated -> grandchild -> great-grandchild (depth 3 > 2).
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        cands = self._three_level_tree() + [
+            self._cand("%4", lane_id="ggc", lane_kind="implementation",
+                       delegation_parent="wsA/gc"),
+        ]
+        out = derive_targets_delegation(cands)
+        # The over-deep tree is rejected wholesale -> every in-tree unit diagnostic.
+        self.assertEqual("diagnostic", out["%4"].status)
+        self.assertIsNone(out["%4"].delegation_depth)
+
+    def test_conflicting_panes_in_one_lane_are_diagnostic(self) -> None:
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        cands = [
+            self._cand("%1", lane_id="deleg", lane_kind="coordinator"),
+            self._cand("%2", lane_id="deleg", lane_kind="implementation"),
+        ]
+        out = derive_targets_delegation(cands)
+        self.assertEqual("diagnostic", out["%1"].status)
+        self.assertEqual("diagnostic", out["%2"].status)
+
+    def test_payload_carries_no_routing_or_close_authority_field(self) -> None:
+        # The display breadcrumb must never grow a routing / approval / close key
+        # (same non-authoritative contract as the #12465 foundation).
+        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+
+        payload = derive_targets_delegation(self._three_level_tree())["%2"].as_payload()
+        self.assertEqual(
+            {"lane_kind", "delegation_depth", "delegation_parent",
+             "delegation_root", "status"},
+            set(payload),
+        )
+        forbidden = ("target", "route", "routing", "send", "approval",
+                     "close", "gateway", "preflight")
+        for key in payload:
+            self.assertFalse(
+                any(token in key for token in forbidden),
+                f"display field {key!r} must not look like a routing key",
+            )
+
+    def test_canonical_target_record_excludes_delegation(self) -> None:
+        # The routing-facing TargetRecord projection (`to_dict`) is unchanged: the
+        # delegation breadcrumb is additive (like attention), never folded into
+        # the identity/repo/view vocabulary used for handoff target selection.
+        cand = self._cand("%2", lane_id="deleg", lane_kind="delegated_coordinator",
+                          delegation_parent="wsA/root")
+        record = cand.to_dict()
+        flat = json.dumps(record)
+        self.assertNotIn("delegation_depth", flat)
+        self.assertNotIn("delegation_root", flat)
+        self.assertNotIn("lane_kind", flat)
+
+
+class AgentsTargetsDelegationColumnsTest(unittest.TestCase):
+    """The ``agents targets`` CLI surfaces the delegation breadcrumb (#12466)."""
+
+    def _run(self, panes, *, as_json=False, workspace_id="wsA",
+             label="mozyo-bridge", repo_root="/work/repo", branch="issue_12466"):
+        from mozyo_bridge.application import commands
+
+        canon = argparse.Namespace(name=label, workspace_id=workspace_id)
+        args = argparse.Namespace(session=None, agent=None, as_json=as_json)
+        with patch.object(commands, "require_tmux"), \
+            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
+            patch.object(commands, "resolve_canonical_session", return_value=canon), \
+            patch.object(commands, "_probe_checkout_facts", return_value={"branch": branch}), \
+            contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = commands.cmd_agents_targets(args)
+        return rc, out.getvalue()
+
+    def _tree_panes(self):
+        return [
+            _pane("%1", "mozyo-cockpit:0.0", window_name="codex", agent_role="codex",
+                  lane_id="root", lane_kind="coordinator"),
+            _pane("%2", "mozyo-cockpit:1.0", window_name="codex", agent_role="codex",
+                  lane_id="deleg", lane_kind="delegated_coordinator",
+                  delegation_parent="wsA/root"),
+            _pane("%3", "mozyo-cockpit:2.0", window_name="claude", agent_role="claude",
+                  lane_id="gc", lane_kind="implementation",
+                  delegation_parent="wsA/deleg"),
+        ]
+
+    def test_text_appends_kind_depth_parent_columns(self) -> None:
+        rc, out = self._run(self._tree_panes())
+        self.assertEqual(0, rc)
+        # Appended after the existing ATTENTION / REASON run so existing column
+        # positions stay valid for current parsers.
+        self.assertIn("ATTENTION\tREASON\tKIND\tDEPTH\tPARENT", out)
+        self.assertIn("\tdelegated_coordinator\t1\twsA/root", out)
+        self.assertIn("\timplementation\t2\twsA/deleg", out)
+        # The root coordinator shows depth 0 and a blank parent cell.
+        self.assertIn("\tcoordinator\t0\t-", out)
+
+    def test_text_blank_columns_when_no_delegation_facts(self) -> None:
+        rc, out = self._run([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex", agent_role="claude"),
+        ])
+        self.assertEqual(0, rc)
+        # No @mozyo_lane_kind -> trailing KIND / DEPTH / PARENT cells are blank.
+        self.assertTrue(out.rstrip().endswith("\t-\t-\t-"))
+
+    def test_json_adds_additive_delegation_record(self) -> None:
+        rc, out = self._run(self._tree_panes(), as_json=True)
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        by_pane = {row["runtime"]["pane_id"]: row for row in payload}
+        deleg = by_pane["%3"]["delegation"]
+        self.assertEqual("implementation", deleg["lane_kind"])
+        self.assertEqual(2, deleg["delegation_depth"])
+        self.assertEqual("wsA/deleg", deleg["delegation_parent"])
+        self.assertEqual("wsA/root", deleg["delegation_root"])
+        self.assertEqual("derived", deleg["status"])
 
 
 if __name__ == "__main__":

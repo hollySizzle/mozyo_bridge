@@ -20,7 +20,13 @@ PRESENTATION_GROUPING_VERSION: int = 1
 
 #: Closed top-level keys of the desired presentation grouping record.
 GROUPING_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"version", "project_groups", "grouping", "project_group_presentation"}
+    {
+        "version",
+        "project_groups",
+        "grouping",
+        "project_group_presentation",
+        "delegation_window_policy",
+    }
 )
 
 #: Closed keys of one ``project_groups[]`` entry (#12262 schema field contract).
@@ -118,6 +124,40 @@ PROJECT_GROUP_PRESENTATION_MODES: frozenset[str] = frozenset(
 #: Missing ``project_group_presentation`` preserves current behavior exactly: a
 #: single cockpit column.
 DEFAULT_PROJECT_GROUP_PRESENTATION: str = PROJECT_GROUP_PRESENTATION_SAME_COLUMN
+
+#: Desired *window-separation policy* for a delegated-coordinator tree (Redmine
+#: #12467, ``delegated-coordinator-cockpit-display.md`` ``## window 分離方針``).
+#: This is presentation-only metadata describing whether a delegated coordinator
+#: and its grandchild implementation lane are *desired* to be projected into
+#: separate cockpit windows / columns or shared into one — it is never routing /
+#: approval / close authority, never a guaranteed window / tab / OS result, and
+#: never used by handoff target selection, the role resolver, ``--target-repo``,
+#: or send preflight. It is a display knob in the existing
+#: ``unit_overrides`` / ``defaults`` family and adds no new authority key:
+#:
+#: - ``separate`` (the default) keeps the documented behavior — a delegated
+#:   coordinator (depth 1) and its grandchild worker (depth 2) each project to
+#:   their own window so a ``callback_due`` / ``review_waiting`` coordinator row
+#:   and an ``implementing`` worker row stay independently readable;
+#: - ``shared`` is an opt-in request to fold the delegated coordinator and its
+#:   grandchild into one display group. Choosing ``shared`` never relaxes the
+#:   fixed invariants (cross-lane handoff still routes through the target-lane
+#:   Codex gateway; owner approval still aggregates to the parent coordinator;
+#:   durable callback requirements still hold).
+#:
+#: Naming any other value fails closed.
+DELEGATION_WINDOW_POLICY_SEPARATE: str = "separate"
+DELEGATION_WINDOW_POLICY_SHARED: str = "shared"
+DELEGATION_WINDOW_POLICY_MODES: frozenset[str] = frozenset(
+    {
+        DELEGATION_WINDOW_POLICY_SEPARATE,
+        DELEGATION_WINDOW_POLICY_SHARED,
+    }
+)
+
+#: Missing ``delegation_window_policy`` preserves the documented default: a
+#: delegated coordinator and its grandchild worker project to separate windows.
+DEFAULT_DELEGATION_WINDOW_POLICY: str = DELEGATION_WINDOW_POLICY_SEPARATE
 
 #: The default lane id every non-lane construction lands on (mirrors
 #: :data:`mozyo_bridge.domain.cockpit_layout.DEFAULT_LANE`). Kept as a local

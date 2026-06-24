@@ -457,6 +457,65 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     require_tmux()
     candidates = _agents_target_candidates(args)
 
+    # Delegated-coordinator-tree display projection (#12466), consuming the
+    # closed #12465 `delegation_projection` foundation. Derived once across all
+    # candidates because depth / root are a function of the whole parent chain;
+    # display-only and never a routing key. JSON gains a `delegation` record per
+    # target, text appends KIND / DEPTH / PARENT columns.
+    from mozyo_bridge.domain.delegation_display import (
+        delegation_cells,
+        derive_targets_delegation,
+    )
+
+    delegation_map = derive_targets_delegation(candidates)
+
+    # Desired delegated-coordinator window-separation policy (#12467), an additive
+    # `delegation_window` JSON projection alongside the #12466 `delegation` record
+    # (which stays byte-identical). `delegation_window_policy` is a repo-local
+    # display preference, so it is read per distinct repo (memoized) from
+    # `.mozyo-bridge/config.yaml` and resolved per candidate against the #12466
+    # breadcrumb. Display-only and fail-soft: any load / parse failure falls back
+    # to the documented default (`separate`) and never blocks this read-only
+    # table, and the resolved fields are never folded into the canonical
+    # `TargetRecord` routing projection (`to_dict`).
+    from mozyo_bridge.domain.presentation_grouping import (
+        DEFAULT_DELEGATION_WINDOW_POLICY,
+        resolve_delegation_window_display,
+    )
+
+    _window_policy_by_repo: dict[object, str] = {}
+
+    def _delegation_window_policy_for(repo_root: object) -> str:
+        if repo_root in _window_policy_by_repo:
+            return _window_policy_by_repo[repo_root]
+        policy = DEFAULT_DELEGATION_WINDOW_POLICY
+        if repo_root:
+            try:
+                from mozyo_bridge.application.repo_local_config_loader import (
+                    load_repo_local_config,
+                )
+
+                policy = (
+                    load_repo_local_config(repo_root)
+                    .presentation.grouping.delegation_window_policy
+                )
+            except Exception:  # noqa: BLE001 - fail-soft read-only display
+                policy = DEFAULT_DELEGATION_WINDOW_POLICY
+        _window_policy_by_repo[repo_root] = policy
+        return policy
+
+    def _delegation_window_payload(candidate) -> dict:
+        breadcrumb = delegation_map[candidate.pane_id]
+        unit = f"{candidate.workspace_id or ''}/{candidate.lane_id or ''}"
+        return resolve_delegation_window_display(
+            _delegation_window_policy_for(candidate.repo_root),
+            lane_kind=breadcrumb.lane_kind,
+            delegation_depth=breadcrumb.delegation_depth,
+            delegation_unit=unit,
+            delegation_root=breadcrumb.delegation_root,
+            status=breadcrumb.status,
+        ).as_payload()
+
     # Single observation timestamp for this read; the pure attention read model
     # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
     # here once. Attention is an additive projection (#11952): JSON gains an
@@ -472,22 +531,29 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
             {
                 **candidate.to_dict(),
                 "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
+                "delegation": delegation_map[candidate.pane_id].as_payload(),
+                "delegation_window": _delegation_window_payload(candidate),
             }
             for candidate in candidates
         ]
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
-    # Compatibility-preserving text projection (#11907, #11952): the original
-    # column run (PANE..WINDOW) keeps its order so existing parsers stay valid;
-    # VIEW_KIND / BRANCH (#11907) and ATTENTION / REASON (#11952) are appended.
+    # Compatibility-preserving text projection (#11907, #11952, #12466): the
+    # original column run (PANE..WINDOW) keeps its order so existing parsers stay
+    # valid; VIEW_KIND / BRANCH (#11907), ATTENTION / REASON (#11952) and the
+    # delegation KIND / DEPTH / PARENT breadcrumb (#12466) are appended. KIND /
+    # DEPTH / PARENT are a derived projection, never a routing key.
     print(
         "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON"
+        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON\tKIND\tDEPTH\tPARENT"
     )
     for c in candidates:
         lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
         attention = _attention_for_candidate(c, observed_at)
+        kind_cell, depth_cell, parent_cell = delegation_cells(
+            delegation_map.get(c.pane_id)
+        )
         print(
             "\t".join(
                 [
@@ -506,6 +572,9 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     c.branch or "-",
                     attention.attention_state,
                     attention.reason_code,
+                    kind_cell,
+                    depth_cell,
+                    parent_cell,
                 ]
             )
         )

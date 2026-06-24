@@ -37,6 +37,7 @@ from .authority import (
     _reject_unknown_keys,
 )
 from .constants import (
+    DEFAULT_DELEGATION_WINDOW_POLICY,
     DEFAULT_LANE,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
     GROUPING_CONFIG_KEYS,
@@ -49,6 +50,7 @@ from .constants import (
 )
 from .errors import PresentationGroupingConfigError
 from .validation import (
+    _checked_delegation_window_policy,
     _checked_project_group_presentation,
     _checked_version,
     _optional_bool,
@@ -351,6 +353,11 @@ class PresentationGroupingConfig:
     #: behavior-preserving ``same_cockpit_column`` by default; display-only
     #: metadata, never routing / approval / window guarantee.
     project_group_presentation: str = DEFAULT_PROJECT_GROUP_PRESENTATION
+    #: Desired window-separation policy for a delegated-coordinator tree (#12467).
+    #: ``separate`` (default) projects a delegated coordinator and its grandchild
+    #: worker to distinct windows; ``shared`` folds them into one display group.
+    #: Display-only metadata, never routing / approval / send-preflight authority.
+    delegation_window_policy: str = DEFAULT_DELEGATION_WINDOW_POLICY
 
     @classmethod
     def default(cls) -> "PresentationGroupingConfig":
@@ -390,6 +397,9 @@ class PresentationGroupingConfig:
         )
         _checked_version(mapping, source="grouping config")
         project_group_presentation = _checked_project_group_presentation(
+            mapping, source="grouping config"
+        )
+        delegation_window_policy = _checked_delegation_window_policy(
             mapping, source="grouping config"
         )
 
@@ -451,6 +461,7 @@ class PresentationGroupingConfig:
             unit_overrides=tuple(unit_overrides),
             defaults=defaults,
             project_group_presentation=project_group_presentation,
+            delegation_window_policy=delegation_window_policy,
         )
         config._validate_group_references()
         return config
