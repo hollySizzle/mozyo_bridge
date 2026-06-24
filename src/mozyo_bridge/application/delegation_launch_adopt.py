@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from typing import Optional
 
 from mozyo_bridge.domain.delegation_launch_adopt import (
@@ -124,24 +125,40 @@ def _recommended_command(
         return None
     source = getattr(args, "source", None) or "redmine"
     issue = getattr(args, "child_issue", None) or "<child_issue>"
+    # Build a flat token list (flag, value, flag, value, ...) and render every
+    # token through ``shlex.quote`` so a canonical child repo with spaces (a
+    # Google Drive path) or a profile value with shell metacharacters stays a
+    # single argv token — otherwise the pasteable command would re-split and the
+    # mandatory ``--target-repo`` identity gate would not actually run. Same
+    # precedent as ``domain.handoff.explicit_standard_retry_command`` (#12162).
     parts = [
-        "mozyo-bridge handoff send --to codex",
-        f"--target {decision.selected.pane_id}",
-        f"--target-repo {decision.target_repo_identity}",
-        f"--source {source}",
-        f"--issue {issue}",
-        "--kind implementation_request",
-        f"--role-profile {_DELEGATED_COORDINATOR_ROLE_PROFILE}",
+        "mozyo-bridge",
+        "handoff",
+        "send",
+        "--to",
+        "codex",
+        "--target",
+        decision.selected.pane_id,
+        "--target-repo",
+        str(decision.target_repo_identity),
+        "--source",
+        source,
+        "--issue",
+        issue,
+        "--kind",
+        "implementation_request",
+        "--role-profile",
+        _DELEGATED_COORDINATOR_ROLE_PROFILE,
     ]
     journal = getattr(args, "journal", None)
     if journal:
-        parts.append(f"--journal {journal}")
+        parts += ["--journal", journal]
     parent_project = getattr(args, "parent_project", None)
     if parent_project:
-        parts.append(f"--profile-field parent_project={parent_project}")
+        parts += ["--profile-field", f"parent_project={parent_project}"]
     if decision.child_project:
-        parts.append(f"--profile-field child_project={decision.child_project}")
-    return " ".join(parts)
+        parts += ["--profile-field", f"child_project={decision.child_project}"]
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def _render_decision_record(

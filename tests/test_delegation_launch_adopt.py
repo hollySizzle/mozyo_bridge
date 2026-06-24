@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shlex
 import types
 import unittest
 from unittest import mock
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.delegation_launch_adopt import (
+    _recommended_command,
     cmd_handoff_delegate_launch_adopt,
 )
 from mozyo_bridge.domain.delegation_launch_adopt import (
@@ -406,6 +408,62 @@ class ParserSurfaceTest(unittest.TestCase):
         )
         self.assertEqual(ns.excluded_lane, ["lane-a", "lane-b"])
         self.assertTrue(ns.as_json)
+
+
+class RecommendedCommandQuotingTest(unittest.TestCase):
+    """The pasteable adopt recommendation must be genuinely shell-safe (#12457 j#63780)."""
+
+    def _adopt_decision(self, repo, child_project=None):
+        decision = resolve_launch_adopt(
+            mode=LAUNCH_ADOPT_MODE_ADOPT_EXISTING,
+            candidates=[_codex(pane_id="%19", repo_root=repo)],
+            target_repo_identity=repo,
+            child_project=child_project,
+        )
+        self.assertEqual(decision.outcome, OUTCOME_ADOPT)
+        return decision
+
+    def test_space_repo_path_stays_a_single_token(self):
+        # A canonical child repo can be a Google Drive path with spaces; the
+        # mandatory --target-repo gate must survive the round-trip as one token.
+        space_repo = "/Users/me/Google Drive/child repo"
+        decision = self._adopt_decision(space_repo, child_project="child proj")
+        args = types.SimpleNamespace(
+            source="redmine",
+            child_issue="12457",
+            journal=None,
+            parent_project=None,
+        )
+        cmd = _recommended_command(decision, args)
+        tokens = shlex.split(cmd)
+        idx = tokens.index("--target-repo")
+        self.assertEqual(tokens[idx + 1], space_repo)
+        # The whole command re-parses to exactly the tokens it was built from.
+        self.assertEqual(shlex.join(tokens), cmd)
+
+    def test_shell_metacharacters_in_profile_values_are_quoted(self):
+        decision = self._adopt_decision("/repo/child", child_project="child&proj")
+        args = types.SimpleNamespace(
+            source="redmine",
+            child_issue="12457",
+            journal=None,
+            parent_project="parent; rm -rf x",
+        )
+        cmd = _recommended_command(decision, args)
+        tokens = shlex.split(cmd)
+        # Each --profile-field value survives as one KEY=VALUE argv token, so a
+        # metacharacter never starts a second shell command.
+        self.assertIn("parent_project=parent; rm -rf x", tokens)
+        self.assertIn("child_project=child&proj", tokens)
+        self.assertNotIn("rm", [t for t in tokens if t == "rm"])
+
+    def test_non_adopt_outcome_has_no_command(self):
+        decision = resolve_launch_adopt(
+            mode=LAUNCH_ADOPT_MODE_DISABLED,
+            candidates=[_codex()],
+            target_repo_identity=CHILD_REPO,
+        )
+        self.assertIsNone(_recommended_command(decision, types.SimpleNamespace()))
 
 
 def _target_row(**overrides):
