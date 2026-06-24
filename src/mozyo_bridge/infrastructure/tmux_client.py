@@ -58,7 +58,15 @@ def try_pane_lines() -> list[dict[str, str]] | None:
         # window name, so the role resolver can classify them and compact target
         # discovery can disambiguate without title parsing. Empty when unset.
         "#{@mozyo_agent_role}\t#{@mozyo_workspace_id}\t#{@mozyo_lane_id}\t"
-        "#{@mozyo_lane_label}"
+        "#{@mozyo_lane_label}\t"
+        # Delegated-coordinator-tree display breadcrumb (Redmine #12466,
+        # consuming the #12465 `delegation_projection` foundation). A projection
+        # cache, never routing authority: `@mozyo_lane_kind` is the coarse
+        # display kind and `@mozyo_delegation_parent` the direct-parent unit
+        # pointer; depth / root are re-derived from the parent chain, never read
+        # from the (deliberately omitted) `@mozyo_delegation_depth` cache. Empty
+        # for panes outside a delegation tree -> the display shows them blank.
+        "#{@mozyo_lane_kind}\t#{@mozyo_delegation_parent}"
     )
     try:
         result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -79,10 +87,10 @@ def pane_lines() -> list[dict[str, str]]:
 def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
     for line in stdout.splitlines():
-        # 10 tab-separated fields; the trailing mozyo option fields are empty for
+        # 12 tab-separated fields; the trailing mozyo option fields are empty for
         # panes that do not carry them (older tmux output / pre-option panes).
         # Splitting with maxsplit keeps any stray tab inside the last field.
-        parts = (line.split("\t", 9) + [""] * 10)[:10]
+        parts = (line.split("\t", 11) + [""] * 12)[:12]
         (
             pane_id,
             location,
@@ -94,6 +102,8 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
             workspace_id,
             lane_id,
             lane_label,
+            lane_kind,
+            delegation_parent,
         ) = parts
         panes.append(
             {
@@ -107,6 +117,10 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
                 "workspace_id": workspace_id,
                 "lane_id": lane_id,
                 "lane_label": lane_label,
+                # Delegated-coordinator-tree display breadcrumb (#12466). Empty
+                # for panes outside a delegation tree; never routing authority.
+                "lane_kind": lane_kind,
+                "delegation_parent": delegation_parent,
             }
         )
     return panes

@@ -457,6 +457,18 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     require_tmux()
     candidates = _agents_target_candidates(args)
 
+    # Delegated-coordinator-tree display projection (#12466), consuming the
+    # closed #12465 `delegation_projection` foundation. Derived once across all
+    # candidates because depth / root are a function of the whole parent chain;
+    # display-only and never a routing key. JSON gains a `delegation` record per
+    # target, text appends KIND / DEPTH / PARENT columns.
+    from mozyo_bridge.domain.delegation_display import (
+        delegation_cells,
+        derive_targets_delegation,
+    )
+
+    delegation_map = derive_targets_delegation(candidates)
+
     # Single observation timestamp for this read; the pure attention read model
     # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
     # here once. Attention is an additive projection (#11952): JSON gains an
@@ -472,22 +484,28 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
             {
                 **candidate.to_dict(),
                 "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
+                "delegation": delegation_map[candidate.pane_id].as_payload(),
             }
             for candidate in candidates
         ]
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
 
-    # Compatibility-preserving text projection (#11907, #11952): the original
-    # column run (PANE..WINDOW) keeps its order so existing parsers stay valid;
-    # VIEW_KIND / BRANCH (#11907) and ATTENTION / REASON (#11952) are appended.
+    # Compatibility-preserving text projection (#11907, #11952, #12466): the
+    # original column run (PANE..WINDOW) keeps its order so existing parsers stay
+    # valid; VIEW_KIND / BRANCH (#11907), ATTENTION / REASON (#11952) and the
+    # delegation KIND / DEPTH / PARENT breadcrumb (#12466) are appended. KIND /
+    # DEPTH / PARENT are a derived projection, never a routing key.
     print(
         "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON"
+        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON\tKIND\tDEPTH\tPARENT"
     )
     for c in candidates:
         lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
         attention = _attention_for_candidate(c, observed_at)
+        kind_cell, depth_cell, parent_cell = delegation_cells(
+            delegation_map.get(c.pane_id)
+        )
         print(
             "\t".join(
                 [
@@ -506,6 +524,9 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     c.branch or "-",
                     attention.attention_state,
                     attention.reason_code,
+                    kind_cell,
+                    depth_cell,
+                    parent_cell,
                 ]
             )
         )
