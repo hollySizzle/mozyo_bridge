@@ -252,6 +252,154 @@ class EmptyVersusErrorStateTest(unittest.TestCase):
             self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
 
 
+class FilterDensityGroupingControlsTest(unittest.TestCase):
+    """Pin the #12379 acceptance: the served page exposes minimal filter /
+    density / grouping controls that narrow the view without changing the payload
+    contract, breaking dense readability, or weakening the no-injection property.
+
+    The controls are display-only: they narrow the already-fetched ``/api/units``
+    and ``/api/grouped-units`` payloads in the front end (no new endpoint, no
+    server state), and every control value is constrained to a whitelist so it
+    can never become an injected class.
+    """
+
+    def _style(self) -> str:
+        return INDEX_HTML_TEMPLATE[
+            INDEX_HTML_TEMPLATE.index("<style>"):INDEX_HTML_TEMPLATE.index(
+                "</style>"
+            )
+        ]
+
+    def test_minimal_filter_controls_present(self) -> None:
+        # Acceptance: at least project / lane / role minimal scan filters. A
+        # free-text input narrows by project / lane / role substring, a role
+        # select narrows to a single canonical role, and an attention checkbox
+        # narrows to stale / reload-required units.
+        self.assertIn('id="view-controls"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="filter-text"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="filter-role"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="filter-attention"', INDEX_HTML_TEMPLATE)
+        # The role filter offers the canonical roles plus "all".
+        self.assertIn('<option value="codex">codex</option>', INDEX_HTML_TEMPLATE)
+        self.assertIn('<option value="claude">claude</option>',
+                      INDEX_HTML_TEMPLATE)
+
+    def test_filter_values_are_whitelisted(self) -> None:
+        # No control value may become an injected class: each is constrained to a
+        # whitelist before it is read into the view state.
+        self.assertEqual(
+            _js_string_list(INDEX_HTML_TEMPLATE, "ROLE_FILTERS"),
+            ["all", "codex", "claude"],
+        )
+        self.assertEqual(
+            _js_string_list(INDEX_HTML_TEMPLATE, "VIEW_MODES"),
+            ["both", "flat", "grouped"],
+        )
+        self.assertEqual(
+            _js_string_list(INDEX_HTML_TEMPLATE, "DENSITY_MODES"),
+            ["comfortable", "compact"],
+        )
+
+    def test_grouped_flat_view_toggle_present(self) -> None:
+        # Acceptance: a grouped / flat view switch (or equivalent scan support).
+        # The two sections are wrapped so the view select can flip flat / grouped
+        # / both by display only.
+        self.assertIn('id="filter-view"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="flat-view"', INDEX_HTML_TEMPLATE)
+        self.assertIn('id="grouped-view"', INDEX_HTML_TEMPLATE)
+        self.assertIn('<option value="both">both</option>', INDEX_HTML_TEMPLATE)
+        self.assertIn('<option value="flat">flat</option>', INDEX_HTML_TEMPLATE)
+        self.assertIn('<option value="grouped">grouped</option>',
+                      INDEX_HTML_TEMPLATE)
+        # The toggle flips section visibility, not the payload contract.
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE,
+            r"getElementById\('flat-view'\)\.style\.display",
+        )
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE,
+            r"getElementById\('grouped-view'\)\.style\.display",
+        )
+
+    def test_density_toggle_present_and_styled(self) -> None:
+        # Acceptance: a dense view that keeps major state and actions readable.
+        # The density select toggles a single literal `dense` body class, and
+        # compact density has CSS rules so it actually tightens spacing.
+        self.assertIn('id="filter-density"', INDEX_HTML_TEMPLATE)
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE,
+            r"classList\.toggle\('dense'",
+        )
+        style = self._style()
+        self.assertRegex(style, r"body\.dense\b[^{]*\{")
+        # Dense mode tightens lane-row and table-cell spacing.
+        self.assertRegex(style, r"body\.dense\s+\.lane-row\b[^{]*\{")
+        self.assertRegex(style, r"body\.dense\s+(th|td)\b")
+
+    def test_view_controls_row_wraps_for_small_viewport(self) -> None:
+        # Acceptance: small viewport must avoid text overlap. The new controls
+        # row wraps (like #controls) so it never overlaps on a narrow screen.
+        style = self._style()
+        self.assertRegex(style, r"#view-controls\s*\{[^}]*flex-wrap:\s*wrap")
+
+    def test_filters_are_display_only_no_new_endpoint(self) -> None:
+        # The controls narrow the already-fetched payloads in the front end. They
+        # must not introduce a new fetch path or a server round-trip: only the
+        # existing /api/units, /api/grouped-units, /api/transitions, and the
+        # token-gated action endpoints may be fetched.
+        fetched = set(re.findall(r"fetch\('(/[^']*)'", INDEX_HTML_TEMPLATE))
+        allowed = {
+            "/api/units",
+            "/api/grouped-units",
+            "/api/transitions",
+            "/api/actions/",
+        }
+        for url in fetched:
+            self.assertTrue(
+                any(url.startswith(a) for a in allowed),
+                f"unexpected fetch target {url} — filters must be display-only",
+            )
+        # The filter helper is a pure substring test (no class / markup sink).
+        self.assertIn("function matchesText(", INDEX_HTML_TEMPLATE)
+        self.assertIn("function filterActive(", INDEX_HTML_TEMPLATE)
+
+    def test_filtered_empty_is_distinct_from_empty_and_error(self) -> None:
+        # A filter that hides every row is a filter result, not an empty cockpit
+        # or an unavailable error. Pin distinct "no match" text for both views,
+        # rendered with the neutral empty state class.
+        self.assertIn("FILTERED_UNITS_TEXT", INDEX_HTML_TEMPLATE)
+        self.assertIn("FILTERED_GROUPED_TEXT", INDEX_HTML_TEMPLATE)
+        filtered = re.search(
+            r"FILTERED_UNITS_TEXT = '([^']*)'", INDEX_HTML_TEMPLATE
+        )
+        empty = re.search(r"EMPTY_UNITS_TEXT = '([^']*)'", INDEX_HTML_TEMPLATE)
+        error = re.search(r"ERROR_UNITS_TEXT = '([^']*)'", INDEX_HTML_TEMPLATE)
+        self.assertTrue(filtered and empty and error)
+        self.assertNotEqual(filtered.group(1), empty.group(1))
+        self.assertNotEqual(filtered.group(1), error.group(1))
+
+    def test_controls_rerender_without_refetch(self) -> None:
+        # A control change must re-render from the last payload (immediate, no
+        # re-fetch) and persist across the 5s poll. Pin the cached payloads and
+        # that applyControls re-renders from them.
+        self.assertIn("let lastUnitsData", INDEX_HTML_TEMPLATE)
+        self.assertIn("let lastGroupedData", INDEX_HTML_TEMPLATE)
+        self.assertIn("function applyControls(", INDEX_HTML_TEMPLATE)
+        self.assertRegex(
+            INDEX_HTML_TEMPLATE, r"if \(lastUnitsData\) renderUnits\(lastUnitsData\)"
+        )
+        # The controls are wired to re-apply on change / input.
+        self.assertIn(
+            "getElementById('filter-text').addEventListener('input', applyControls)",
+            INDEX_HTML_TEMPLATE,
+        )
+
+    def test_filter_controls_keep_dom_only_no_injection(self) -> None:
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                     "document.write"):
+            self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
+
+
 class ServedCockpitSmokeTest(unittest.TestCase):
     """Page-level browser smoke against the daemon-served cockpit document."""
 

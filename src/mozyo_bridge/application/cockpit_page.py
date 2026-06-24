@@ -137,6 +137,29 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .fresh-fresh { color: #2e7d32; }
   .fresh-stale, .fresh-expired { color: #ef6c00; font-weight: 600; }
   .fresh-unknown { color: #b71c1c; font-weight: 600; }
+  /* Filter / density / grouping controls (#12379): a second controls row so an
+     operator can narrow by project / lane / role / attention, switch flat vs
+     grouped vs both, and pick a reading density. It wraps like #controls so it
+     never overlaps on a narrow viewport, and every label / input stays on the
+     flow. A "no match" note reads neutral (it is a filter result, not an error). */
+  #view-controls { margin: 4px 0; display: flex; align-items: center;
+                   gap: 8px; flex-wrap: wrap; }
+  #view-controls label { font-size: 12px; color: #555; display: inline-flex;
+                         align-items: center; gap: 4px; }
+  #view-controls input[type="text"] { font-size: 12px; min-width: 8ch;
+                                       max-width: 22ch; }
+  .filter-empty { padding: 4px 8px; font-size: 12px; color: #616161; }
+  /* Compact density: tighten chrome padding / gaps and secondary-text size so
+     more lanes fit without forcing horizontal overflow. Only spacing shrinks —
+     state text and the jump / Finder action buttons keep their own readable
+     sizing, and flex-wrap / overflow-wrap stay in force, so a dense view never
+     overlaps or clips a unit's major state or actions on a small viewport. */
+  body.dense { margin: 0.5rem; }
+  body.dense th, body.dense td { padding: 1px 5px; }
+  body.dense .lane-row { padding: 1px 5px; gap: 6px; }
+  body.dense .group-header { padding: 2px 5px; }
+  body.dense .lane-issue, body.dense .lane-state,
+  body.dense .group-summary, body.dense .tag { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -145,8 +168,30 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 <button id="reload" type="button">Reload</button>
 <span id="observation" class="muted">observation: loading…</span>
 </div>
+<div id="view-controls">
+<label>filter <input id="filter-text" type="text" placeholder="project / lane / role"></label>
+<label>role
+<select id="filter-role">
+<option value="all">all</option>
+<option value="codex">codex</option>
+<option value="claude">claude</option>
+</select></label>
+<label><input id="filter-attention" type="checkbox"> attention only</label>
+<label>view
+<select id="filter-view">
+<option value="both">both</option>
+<option value="flat">flat</option>
+<option value="grouped">grouped</option>
+</select></label>
+<label>density
+<select id="filter-density">
+<option value="comfortable">comfortable</option>
+<option value="compact">compact</option>
+</select></label>
+</div>
 <div id="stale" class="stale-banner">tmux runtime unavailable — showing the
 last cached snapshot; activity may be outdated and actions are disabled.</div>
+<section id="flat-view">
 <div id="units-wrap">
 <table id="units"><thead><tr>
 <th>state</th><th>agent</th><th>session</th><th>workspace</th>
@@ -159,6 +204,8 @@ unknown — never "dead"); tmux liveness is the row's presence itself;
 redmine is read-only gate context (latest open issue), degrading to
 unconfigured / unavailable without affecting the other layers.
 Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
+</section>
+<section id="grouped-view">
 <h3>grouped (Project Group &#8594; Unit &#8594; Target)</h3>
 <div id="grouped-meta" class="muted">grouped: loading…</div>
 <div id="grouped"></div>
@@ -170,6 +217,7 @@ a stale row stay visible. Display only — group membership and freshness are a
 projection, never routing authority; an action re-resolves its candidate Unit live
 before acting. project_group_presentation is a desired display-placement request
 (same_cockpit_column default), never a guaranteed window / tab.</p>
+</section>
 <h3>recent transitions</h3>
 <ul id="transitions"></ul>
 <script>
@@ -187,6 +235,35 @@ const KNOWN_DISPLAY_STATES = ["healthy", "reload_required", "unknown"];
 const EMPTY_UNITS_TEXT = 'no agents observed — the cockpit is empty (the daemon responded)';
 const ERROR_UNITS_TEXT = 'cockpit data unavailable — could not reach the daemon (retrying)';
 const EMPTY_GROUPED_TEXT = 'no project groups observed — the cockpit is empty';
+// #12379 filter result (not an error): rows / groups exist but the current
+// filter hides them all. Reads as a neutral "no match" note, distinct from both
+// the empty-cockpit note and the fail-closed unavailable error (#12378).
+const FILTERED_UNITS_TEXT = 'no agents match the current filter';
+const FILTERED_GROUPED_TEXT = 'no project groups match the current filter';
+// #12379 filter / density / grouping controls. Display-only narrowing over the
+// already-fetched payloads — no new endpoint, no server state, no routing
+// authority. Each control value is constrained to one of these whitelists so a
+// control value can never become an injected class; density toggles a single
+// literal body class and the view toggle only flips section display.
+const VIEW_MODES = ["both", "flat", "grouped"];
+const DENSITY_MODES = ["comfortable", "compact"];
+const ROLE_FILTERS = ["all", "codex", "claude"];
+const view = { text: "", role: "all", attentionOnly: false,
+               mode: "both", density: "comfortable" };
+// Last payloads, so a control change re-renders immediately and the filter
+// persists across the 5s poll instead of resetting on the next fetch.
+let lastUnitsData = null;
+let lastGroupedData = null;
+// Free-text filter: case-insensitive substring over a row's identity parts. The
+// text is only ever used with String.includes (never as a class / markup), so it
+// keeps the page's no-injection property.
+function matchesText(parts) {
+  if (!view.text) return true;
+  return parts.filter(Boolean).join(' ').toLowerCase().includes(view.text);
+}
+function filterActive() {
+  return !!view.text || view.role !== 'all' || view.attentionOnly;
+}
 // Surface the flat unit table's empty / error / ok state on a dedicated line so
 // an empty cockpit and an unreachable daemon never render as the same blank
 // table (#12378). Diagnostic only — it moves no gate and authorizes no action.
@@ -360,11 +437,29 @@ function groupedSummaryText(data) {
   if (data.needs_attention) text += ' · reload recommended';
   return text;
 }
+// Display-only lane filter (#12379): a lane is visible when it matches the role
+// filter (the lane carries that canonical role), the attention filter (only
+// reload-required lanes), and the free-text filter. The text haystack includes
+// the group's header label, so filtering by a project name keeps that group's
+// lanes. Filtering hides rows only; it never moves a gate or re-resolves an
+// action (those re-preflight live on click).
+function laneVisible(unit, group) {
+  if (view.role !== 'all' && !(unit.roles || []).includes(view.role)) return false;
+  if (view.attentionOnly && !unit.reload_required) return false;
+  return matchesText([group.header_label, unit.lane_label, unit.issue_label,
+    unit.state_label, unit.status, (unit.roles || []).join(' ')]);
+}
 // Render one Project Group section: a header (label + managed/source tag + the
 // projection-only attention summary) and its lane rows. A managed (configured)
 // group and a default / ungrouped bucket carry distinct classes so they read as
 // separate; an empty group stays visible (never dropped) so a missing lane shows.
+// With a filter active, a group whose every lane is filtered out returns null so
+// the caller can omit it; with no filter active the empty-group row stays, so the
+// #12377 missing-lane visibility is preserved on the unfiltered default view.
 function groupSection(g) {
+  const units = (g.units || []).filter((u) => laneVisible(u, g));
+  const hiddenUnits = (g.hidden_units || []).filter((u) => laneVisible(u, g));
+  if (filterActive() && !units.length && !hiddenUnits.length) return null;
   const box = document.createElement('div');
   box.className = 'group ' + (g.managed ? 'managed' : 'default');
   const header = document.createElement('div');
@@ -390,9 +485,9 @@ function groupSection(g) {
   if (summary.needs_attention) sum.classList.add('attention');
   header.appendChild(sum);
   box.appendChild(header);
-  for (const u of (g.units || [])) box.appendChild(laneRow(u, false));
-  for (const u of (g.hidden_units || [])) box.appendChild(laneRow(u, true));
-  if (!(g.units || []).length && !(g.hidden_units || []).length) {
+  for (const u of units) box.appendChild(laneRow(u, false));
+  for (const u of hiddenUnits) box.appendChild(laneRow(u, true));
+  if (!units.length && !hiddenUnits.length) {
     const empty = document.createElement('div');
     empty.className = 'lane-row muted';
     empty.textContent = 'no lane observed in this group';
@@ -421,7 +516,22 @@ function renderGrouped(data) {
     container.appendChild(empty);
     return;
   }
-  for (const g of data.groups) container.appendChild(groupSection(g));
+  const active = filterActive();
+  let shown = 0;
+  for (const g of data.groups) {
+    const section = groupSection(g);
+    if (!section) continue;  // filtered to empty under an active filter
+    container.appendChild(section);
+    shown += 1;
+  }
+  if (active && !shown) {
+    // Groups exist but the filter hid them all: a neutral "no match" note (a
+    // filter result, not an unavailable error).
+    const empty = document.createElement('div');
+    empty.className = 'lane-row state-empty';
+    empty.textContent = FILTERED_GROUPED_TEXT;
+    container.appendChild(empty);
+  }
 }
 async function refreshGrouped() {
   const meta = document.getElementById('grouped-meta');
@@ -432,15 +542,18 @@ async function refreshGrouped() {
       meta.className = 'muted state-error';
       meta.textContent = 'grouped: ' + (body.error || 'unavailable');
       document.getElementById('grouped').replaceChildren();
+      lastGroupedData = null;
       return;
     }
-    renderGrouped(await res.json());
+    lastGroupedData = await res.json();
+    renderGrouped(lastGroupedData);
   } catch (e) {
     // Daemon unreachable: surface a grouped error state distinct from empty,
     // then recover on the next poll.
     meta.className = 'muted state-error';
     meta.textContent = 'grouped: unavailable';
     document.getElementById('grouped').replaceChildren();
+    lastGroupedData = null;
   }
 }
 // DOM construction only: every payload string lands via textContent, so
@@ -451,48 +564,91 @@ function cell(row, text, cls) {
   el.textContent = text;
   row.appendChild(el);
 }
+// Render the flat unit table from a /api/units payload, applying the #12379
+// display-only filters (role / free-text / attention). Split out of refresh() so
+// a control change can re-render the last payload immediately without re-fetching
+// (the filter persists across the 5s poll). DOM APIs only — no injection sink.
+function renderUnits(data) {
+  if (!data) return;
+  document.getElementById('stale').style.display =
+    data.stale ? 'block' : 'none';
+  renderObservation(data.observation);
+  const tbody = document.querySelector('#units tbody');
+  tbody.replaceChildren();
+  let rendered = 0;
+  let total = 0;
+  for (const p of (data.panes || [])) {
+    if (p.agent_kind === 'unknown') continue;
+    total += 1;
+    const raw = (p.activity && p.activity.state) || 'unknown';
+    const st = KNOWN_STATES.includes(raw) ? raw : 'unknown';
+    const ws = (p.workspace && (p.workspace.project_name ||
+                p.workspace.canonical_session)) || '-';
+    // Display-only filters (#12379). Role: match the pane's agent kind. Text:
+    // substring over the row's identity. Attention: the flat row carries no
+    // per-row reload flag (that lives in the grouped read model), so "attention"
+    // here is the snapshot-level stale flag or the fail-closed unknown state.
+    if (view.role !== 'all' && p.agent_kind !== view.role) continue;
+    if (!matchesText([st, p.agent_kind, p.session, ws, redmineText(p.redmine)])) continue;
+    if (view.attentionOnly && !(data.stale || st === 'unknown')) continue;
+    const row = document.createElement('tr');
+    cell(row, st, st);
+    cell(row, p.agent_kind);
+    cell(row, p.session);
+    cell(row, ws);
+    cell(row, redmineText(p.redmine), redmineClass(p.redmine));
+    const actions = document.createElement('td');
+    for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.disabled = !!data.stale;
+      button.addEventListener('click', () => act(kind, p.pane_id));
+      actions.appendChild(button);
+    }
+    row.appendChild(actions);
+    tbody.appendChild(row);
+    rendered += 1;
+  }
+  // Three distinct empty surfaces: rows present but all filtered out reads as a
+  // neutral "no match" note; nothing observed reads as the empty-cockpit note;
+  // both stay distinct from the fail-closed error state in refresh()'s catch
+  // (#12378 / #12379).
+  const emptyText = total ? FILTERED_UNITS_TEXT : EMPTY_UNITS_TEXT;
+  setUnitsState(rendered ? 'ok' : 'empty', emptyText);
+}
+// Read the controls into `view`, apply the layout-only effects (density body
+// class, flat / grouped section visibility), then re-render from the last
+// payloads so filters take effect immediately and survive the next poll. Every
+// control value is constrained to its whitelist, so it can never become an
+// injected class; the view toggle flips display only.
+function applyControls() {
+  view.text = (document.getElementById('filter-text').value || '').trim().toLowerCase();
+  const role = document.getElementById('filter-role').value;
+  view.role = ROLE_FILTERS.includes(role) ? role : 'all';
+  view.attentionOnly = document.getElementById('filter-attention').checked;
+  const mode = document.getElementById('filter-view').value;
+  view.mode = VIEW_MODES.includes(mode) ? mode : 'both';
+  const density = document.getElementById('filter-density').value;
+  view.density = DENSITY_MODES.includes(density) ? density : 'comfortable';
+  document.body.classList.toggle('dense', view.density === 'compact');
+  document.getElementById('flat-view').style.display =
+    view.mode === 'grouped' ? 'none' : '';
+  document.getElementById('grouped-view').style.display =
+    view.mode === 'flat' ? 'none' : '';
+  if (lastUnitsData) renderUnits(lastUnitsData);
+  if (lastGroupedData) renderGrouped(lastGroupedData);
+}
 async function refresh() {
   try {
     const res = await fetch('/api/units');
-    const data = await res.json();
-    document.getElementById('stale').style.display =
-      data.stale ? 'block' : 'none';
-    renderObservation(data.observation);
-    const tbody = document.querySelector('#units tbody');
-    tbody.replaceChildren();
-    let rendered = 0;
-    for (const p of (data.panes || [])) {
-      if (p.agent_kind === 'unknown') continue;
-      const row = document.createElement('tr');
-      const raw = (p.activity && p.activity.state) || 'unknown';
-      const st = KNOWN_STATES.includes(raw) ? raw : 'unknown';
-      const ws = (p.workspace && (p.workspace.project_name ||
-                  p.workspace.canonical_session)) || '-';
-      cell(row, st, st);
-      cell(row, p.agent_kind);
-      cell(row, p.session);
-      cell(row, ws);
-      cell(row, redmineText(p.redmine), redmineClass(p.redmine));
-      const actions = document.createElement('td');
-      for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
-        const button = document.createElement('button');
-        button.textContent = label;
-        button.disabled = !!data.stale;
-        button.addEventListener('click', () => act(kind, p.pane_id));
-        actions.appendChild(button);
-      }
-      row.appendChild(actions);
-      tbody.appendChild(row);
-      rendered += 1;
-    }
-    // Empty (the daemon responded, nothing observed) reads as a neutral note,
-    // distinct from the fail-closed error state below (#12378).
-    setUnitsState(rendered ? 'ok' : 'empty', EMPTY_UNITS_TEXT);
+    lastUnitsData = await res.json();
+    renderUnits(lastUnitsData);
   } catch (e) {
     // The daemon is unreachable / returned unparseable data. Surface an explicit
     // error state — never the same blank surface as the empty state — and let the
     // next poll recover. The previous build swallowed this silently, so an
     // unreachable daemon looked identical to an empty cockpit.
+    lastUnitsData = null;
     renderObservation(null);
     setUnitsState('error', ERROR_UNITS_TEXT);
   }
@@ -518,6 +674,12 @@ async function refresh() {
 // live preflight): re-fetch the snapshot on demand. Refreshing the display moves
 // no workflow gate and authorizes no action.
 document.getElementById('reload').addEventListener('click', refresh);
+// #12379 controls: a change re-applies the filter / density / view to the last
+// payload immediately (no re-fetch needed) and persists it across the poll.
+document.getElementById('filter-text').addEventListener('input', applyControls);
+for (const id of ['filter-role', 'filter-attention', 'filter-view', 'filter-density']) {
+  document.getElementById(id).addEventListener('change', applyControls);
+}
 refresh();
 setInterval(refresh, 5000);
 </script>
