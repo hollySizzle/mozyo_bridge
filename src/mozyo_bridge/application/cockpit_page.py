@@ -37,6 +37,27 @@ pinned by the served-cockpit browser smoke (``test_cockpit_page``):
   unavailable text and unit rows never overlap or overflow off-screen. This is
   a fit affordance, not a layout policy: no marketing chrome, no private
   operator layout baked into the OSS default.
+
+Grouped scannability (Redmine #12377): the grouped Project Group -> Unit ->
+Target view makes the project / lane / pane-role relationships readable at a
+glance without changing the ``/api/units`` or ``/api/grouped-units`` payload
+contract. It renders, from the data the grouped payload already carries:
+
+- **project vs lane vs role separation** — a Project Group box (managed vs
+  default), then each lane (Unit) as its own row with a distinct lane-identity
+  column, then a per-role Target slot;
+- **same-lane Codex / Claude grouping** — the two canonical roles render as a
+  fixed role matrix on the one lane row, so a lane's Codex and Claude read as one
+  group instead of two unrelated table rows;
+- **missing / one-sided / stale clarity** — a one-sided lane shows the absent
+  canonical role as a dashed "missing" slot, an empty / missing-lane group stays
+  visible (never dropped) with a "no lane observed" row, and a stale /
+  reload-required lane carries an attention background plus the existing
+  freshness state — none of which read as current.
+
+Class names for the role slots come from the front-end's whitelist
+(``GROUPED_ROLES``) plus the payload's role *presence*, never a payload-supplied
+string, so the DOM-only rendering keeps its no-injection property.
 """
 
 from __future__ import annotations
@@ -69,13 +90,42 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   .obs-healthy { color: #2e7d32; }
   .obs-reload_required { color: #ef6c00; font-weight: 600; }
   .obs-unknown { color: #b71c1c; font-weight: 600; }
-  .group { margin: 8px 0; border: 1px solid #e0e0e0; border-radius: 4px; }
-  .group-header { background: #f5f5f5; padding: 4px 8px; font-weight: 600; }
-  .group-header .tag { font-weight: 400; font-size: 11px; color: #757575; margin-left: 6px; }
+  /* Project Group box: a managed (configured) group reads with a left accent;
+     a default / ungrouped bucket stays plain so the two are visually separable. */
+  .group { margin: 8px 0; border: 1px solid #e0e0e0; border-radius: 4px;
+           border-left: 3px solid #e0e0e0; }
+  .group.managed { border-left-color: #1565c0; }
+  .group.default { border-left-color: #bdbdbd; }
+  .group-header { background: #f5f5f5; padding: 4px 8px; font-weight: 600;
+                  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .group-header .group-title { flex: 1 1 auto; }
+  .group-header .tag { font-weight: 400; font-size: 11px; color: #757575; }
   .group-header .stale { color: #b71c1c; }
   .group-header .reload { color: #ef6c00; }
-  .unit-row { padding: 3px 8px; border-top: 1px solid #f0f0f0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .unit-row.hidden-unit { opacity: 0.65; }
+  .group-summary { font-weight: 400; font-size: 11px; color: #757575; }
+  .group-summary.attention { color: #ef6c00; font-weight: 600; }
+  /* One lane (Unit) within a group: lane identity, state/freshness, role matrix. */
+  .lane-row { padding: 3px 8px; border-top: 1px solid #f0f0f0; display: flex;
+              align-items: center; gap: 10px; flex-wrap: wrap; }
+  .lane-row.hidden-unit { opacity: 0.65; }
+  .lane-row.lane-attention { background: #fff8e1; }
+  .lane-ident { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+                min-width: 12ch; }
+  .lane-id { font-weight: 600; }
+  .lane-issue { color: #555; font-size: 12px; }
+  .lane-state { font-size: 12px; }
+  /* The Target layer: one slot per canonical role (codex, claude). A present role
+     carries its action buttons; a missing role reads "missing" so a one-sided lane
+     (only Codex or only Claude live) is obvious at a glance. */
+  .role-matrix { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .role-slot { display: inline-flex; align-items: center; gap: 4px;
+               border: 1px solid #e0e0e0; border-radius: 3px; padding: 1px 4px; }
+  .role-slot .role-name { font-size: 11px; font-weight: 600; }
+  .role-present { border-color: #2e7d32; }
+  .role-present .role-name { color: #2e7d32; }
+  .role-missing { border-style: dashed; border-color: #b71c1c; opacity: 0.85; }
+  .role-missing .role-name { color: #b71c1c; }
+  .role-missing-tag { font-size: 11px; color: #b71c1c; }
   .fresh-fresh { color: #2e7d32; }
   .fresh-stale, .fresh-expired { color: #ef6c00; font-weight: 600; }
   .fresh-unknown { color: #b71c1c; font-weight: 600; }
@@ -103,12 +153,14 @@ Jump switches the attached tmux client (iTerm2 -CC focus is out of scope).</p>
 <h3>grouped (Project Group &#8594; Unit &#8594; Target)</h3>
 <div id="grouped-meta" class="muted">grouped: loading…</div>
 <div id="grouped"></div>
-<p class="muted">grouped read model (#12286): Project Group headers, each Unit's
-lane / issue and its Codex / Claude role panes (the Target layer). Display only —
-group membership and freshness are a projection, never routing authority; an
-action re-resolves its candidate Unit live before acting. project_group_presentation
-is a desired display-placement request (same_cockpit_column default), never a
-guaranteed window / tab.</p>
+<p class="muted">grouped read model (#12286 / #12377): Project Group headers
+(managed vs default, with an active / reload / attention summary), each lane's
+lane / issue identity, and a fixed Codex / Claude role matrix (the Target layer) so
+a one-sided lane shows the absent role as "missing" and an empty / missing lane and
+a stale row stay visible. Display only — group membership and freshness are a
+projection, never routing authority; an action re-resolves its candidate Unit live
+before acting. project_group_presentation is a desired display-placement request
+(same_cockpit_column default), never a guaranteed window / tab.</p>
 <h3>recent transitions</h3>
 <ul id="transitions"></ul>
 <script>
@@ -184,49 +236,139 @@ async function actGrouped(kind, unit, role) {
   const body = await res.json();
   if (!res.ok) alert(body.error || 'action failed');
 }
-// Render the grouped read model (Project Group -> Unit -> Target). DOM APIs only;
-// every label lands via textContent, and the freshness/display-state class names
-// are whitelisted, so the (local but untrusted) payload can never inject markup
-// or a class. The grouped view is display only: a degraded (reload_required) row
-// disables its action buttons, and the server re-preflights regardless.
-function unitRow(unit, hidden) {
+// The canonical role-pane vocabulary (cockpit_layout.ROLES = codex, claude),
+// pinned in the front end so each lane renders a fixed slot per role. The class
+// names a slot uses (role-present / role-missing) come from this whitelist + the
+// payload's role *presence*, never from a payload-supplied string, so the (local
+// but untrusted) payload can never inject a class. Codex (owner-facing gateway)
+// is shown first, mirroring grouped_display.ROLE_DISPLAY_ORDER.
+const GROUPED_ROLES = ["codex", "claude"];
+// One Target-layer slot for a single role of a lane. A present role carries its
+// jump / Finder action buttons (disabled when the row is not current); a missing
+// canonical role reads "missing" so a one-sided lane is obvious at a glance. The
+// server re-preflights every action regardless, so this is display only.
+function roleSlot(unit, role, isPresent) {
+  const slot = document.createElement('span');
+  slot.className = isPresent ? 'role-slot role-present' : 'role-slot role-missing';
+  const name = document.createElement('span');
+  name.className = 'role-name';
+  name.textContent = role;
+  slot.appendChild(name);
+  if (isPresent) {
+    for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.disabled = !!unit.reload_required;
+      button.addEventListener('click', () => actGrouped(kind, unit, role));
+      slot.appendChild(button);
+    }
+  } else {
+    const miss = document.createElement('span');
+    miss.className = 'role-missing-tag';
+    miss.textContent = 'missing';
+    slot.appendChild(miss);
+  }
+  return slot;
+}
+// Render one lane (Unit) row: its lane identity (lane + issue label), its
+// state / freshness, and the role matrix (a fixed codex / claude slot plus any
+// other observed role). DOM APIs only; every label lands via textContent and the
+// freshness / role class names are whitelisted, so the payload can never inject
+// markup or a class. A degraded (reload_required) row reads as needing attention
+// and its action buttons are disabled; the server re-preflights regardless.
+function laneRow(unit, hidden) {
   const row = document.createElement('div');
-  row.className = hidden ? 'unit-row hidden-unit' : 'unit-row';
-  const lane = document.createElement('span');
-  lane.textContent = (unit.lane_label || '-') +
-    (unit.issue_label ? ' · ' + unit.issue_label : '');
-  row.appendChild(lane);
-  const fresh = KNOWN_FRESHNESS.includes(unit.freshness) ? unit.freshness : 'unknown';
-  const state = document.createElement('span');
-  state.className = 'fresh-' + fresh;
-  state.textContent = (unit.state_label || unit.status || 'unknown') +
-    ' / ' + (unit.freshness_label || fresh);
-  row.appendChild(state);
+  row.className = hidden ? 'lane-row hidden-unit' : 'lane-row';
+  if (unit.reload_required) row.classList.add('lane-attention');
+  const ident = document.createElement('div');
+  ident.className = 'lane-ident';
+  const laneId = document.createElement('span');
+  laneId.className = 'lane-id';
+  laneId.textContent = unit.lane_label || '-';
+  ident.appendChild(laneId);
+  if (unit.issue_label) {
+    const issue = document.createElement('span');
+    issue.className = 'lane-issue';
+    issue.textContent = unit.issue_label;
+    ident.appendChild(issue);
+  }
   if (hidden) {
     const tag = document.createElement('span');
     tag.className = 'muted';
     tag.textContent = '(hidden)';
-    row.appendChild(tag);
+    ident.appendChild(tag);
   }
-  // The Target layer: one action affordance per observed role pane. Disabled
-  // when the row is not current (reload_required) — the candidate selector would
-  // fail closed anyway.
-  for (const role of (unit.roles || [])) {
-    for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
-      const button = document.createElement('button');
-      button.textContent = role + ':' + label;
-      button.disabled = !!unit.reload_required;
-      button.addEventListener('click', () => actGrouped(kind, unit, role));
-      row.appendChild(button);
-    }
-  }
-  if (!(unit.roles || []).length) {
-    const none = document.createElement('span');
-    none.className = 'muted';
-    none.textContent = 'no live role pane';
-    row.appendChild(none);
-  }
+  row.appendChild(ident);
+  const fresh = KNOWN_FRESHNESS.includes(unit.freshness) ? unit.freshness : 'unknown';
+  const state = document.createElement('span');
+  state.className = 'lane-state fresh-' + fresh;
+  state.textContent = (unit.state_label || unit.status || 'unknown') +
+    ' / ' + (unit.freshness_label || fresh);
+  row.appendChild(state);
+  // The role matrix: a fixed slot per canonical role so a one-sided lane shows a
+  // "missing" slot for the absent role, then any other observed role as present.
+  const present = new Set(unit.roles || []);
+  const extras = (unit.roles || []).filter((r) => !GROUPED_ROLES.includes(r));
+  const matrix = document.createElement('div');
+  matrix.className = 'role-matrix';
+  for (const role of GROUPED_ROLES) matrix.appendChild(roleSlot(unit, role, present.has(role)));
+  for (const role of extras) matrix.appendChild(roleSlot(unit, role, true));
+  row.appendChild(matrix);
   return row;
+}
+// The whole-projection summary line: placement + freshness, the lane / active /
+// reload / attention roll-up (#12297 summary), and a reload hint. Counts only,
+// no routing authority.
+function groupedSummaryText(data) {
+  const s = data.summary || {};
+  let text = 'placement: ' + (data.project_group_presentation || 'unknown') +
+    ' · ' + (data.freshness_label || 'unknown');
+  if (typeof s.total === 'number') {
+    text += ' · ' + s.total + ' lanes · ' + (s.active_lanes || 0) + ' active · ' +
+      (s.reload_required || 0) + ' reload · ' + (s.attention || 0) + ' attention';
+  }
+  if (data.needs_attention) text += ' · reload recommended';
+  return text;
+}
+// Render one Project Group section: a header (label + managed/source tag + the
+// projection-only attention summary) and its lane rows. A managed (configured)
+// group and a default / ungrouped bucket carry distinct classes so they read as
+// separate; an empty group stays visible (never dropped) so a missing lane shows.
+function groupSection(g) {
+  const box = document.createElement('div');
+  box.className = 'group ' + (g.managed ? 'managed' : 'default');
+  const header = document.createElement('div');
+  header.className = 'group-header';
+  const title = document.createElement('span');
+  title.className = 'group-title';
+  title.textContent = g.header_label || '(ungrouped)';
+  header.appendChild(title);
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  let tagText = g.managed ? g.source : g.source + ' (unmanaged)';
+  if (g.stale) tagText += ' · stale';
+  if (g.reload_required) tagText += ' · reload';
+  tag.textContent = tagText;
+  if (g.stale) tag.classList.add('stale');
+  else if (g.reload_required) tag.classList.add('reload');
+  header.appendChild(tag);
+  const summary = g.summary || {};
+  const sum = document.createElement('span');
+  sum.className = 'group-summary';
+  sum.textContent = (summary.active_lanes || 0) + ' active / ' +
+    (summary.reload_required || 0) + ' reload / ' + (summary.attention || 0) + ' attention';
+  if (summary.needs_attention) sum.classList.add('attention');
+  header.appendChild(sum);
+  box.appendChild(header);
+  for (const u of (g.units || [])) box.appendChild(laneRow(u, false));
+  for (const u of (g.hidden_units || [])) box.appendChild(laneRow(u, true));
+  if (!(g.units || []).length && !(g.hidden_units || []).length) {
+    const empty = document.createElement('div');
+    empty.className = 'lane-row muted';
+    empty.textContent = 'no lane observed in this group';
+    box.appendChild(empty);
+  }
+  return box;
 }
 function renderGrouped(data) {
   const meta = document.getElementById('grouped-meta');
@@ -236,31 +378,8 @@ function renderGrouped(data) {
     meta.textContent = 'grouped: unavailable';
     return;
   }
-  meta.textContent = 'placement: ' + (data.project_group_presentation || 'unknown') +
-    ' · ' + (data.freshness_label || 'unknown') +
-    (data.needs_attention ? ' · reload recommended' : '');
-  for (const g of data.groups) {
-    const box = document.createElement('div');
-    box.className = 'group';
-    const header = document.createElement('div');
-    header.className = 'group-header';
-    const title = document.createElement('span');
-    title.textContent = g.header_label || '(ungrouped)';
-    header.appendChild(title);
-    const tag = document.createElement('span');
-    tag.className = 'tag';
-    let tagText = g.source;
-    if (g.stale) tagText += ' · stale';
-    if (g.reload_required) tagText += ' · reload';
-    tag.textContent = tagText;
-    if (g.stale) tag.classList.add('stale');
-    else if (g.reload_required) tag.classList.add('reload');
-    header.appendChild(tag);
-    box.appendChild(header);
-    for (const u of (g.units || [])) box.appendChild(unitRow(u, false));
-    for (const u of (g.hidden_units || [])) box.appendChild(unitRow(u, true));
-    container.appendChild(box);
-  }
+  meta.textContent = groupedSummaryText(data);
+  for (const g of data.groups) container.appendChild(groupSection(g));
 }
 async function refreshGrouped() {
   try {

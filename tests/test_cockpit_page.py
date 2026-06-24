@@ -89,6 +89,84 @@ class IndexHtmlTemplateTest(unittest.TestCase):
         self.assertNotIn("innerHTML", INDEX_HTML_TEMPLATE)
 
 
+class GroupedRenderingTest(unittest.TestCase):
+    """Pin the #12377 grouped scannability rendering (template assertions).
+
+    These pin that the served grouped view makes the project / lane / pane-role
+    relationships scannable — a Project Group header, a per-lane row, a fixed
+    Codex / Claude role matrix, and clear missing / one-sided / stale state —
+    while keeping the DOM-only no-injection property and not touching the
+    ``/api/units`` payload contract.
+    """
+
+    def test_grouped_role_vocabulary_is_whitelisted(self) -> None:
+        # The role matrix renders a fixed slot per canonical role. The class a
+        # slot uses must derive from this whitelist + payload presence, never a
+        # payload-supplied string, so the (local but untrusted) payload cannot
+        # inject a class. Pin the whitelist and that it matches the domain
+        # vocabulary (codex, claude), Codex first.
+        roles = _js_string_list(INDEX_HTML_TEMPLATE, "GROUPED_ROLES")
+        self.assertEqual(roles, ["codex", "claude"])
+
+    def test_grouped_role_matrix_present_and_missing(self) -> None:
+        # Acceptance (#12377): same-lane Codex / Claude read as one group via a
+        # fixed role matrix on the one lane row, and a one-sided lane shows the
+        # absent role as a "missing" slot.
+        self.assertIn("function roleSlot(", INDEX_HTML_TEMPLATE)
+        self.assertIn("function laneRow(", INDEX_HTML_TEMPLATE)
+        self.assertIn("role-matrix", INDEX_HTML_TEMPLATE)
+        self.assertIn("role-present", INDEX_HTML_TEMPLATE)
+        self.assertIn("role-missing", INDEX_HTML_TEMPLATE)
+        # The missing slot carries a visible "missing" label.
+        self.assertIn("role-missing-tag", INDEX_HTML_TEMPLATE)
+        self.assertRegex(INDEX_HTML_TEMPLATE, r"textContent\s*=\s*'missing'")
+
+    def test_grouped_project_group_separation(self) -> None:
+        # Acceptance (#12377): project / lane / role are visually separated — a
+        # managed (configured) group and a default / ungrouped bucket carry
+        # distinct classes, and the header shows the projection-only summary.
+        self.assertIn("function groupSection(", INDEX_HTML_TEMPLATE)
+        self.assertIn("'group ' + (g.managed ? 'managed' : 'default')",
+                      INDEX_HTML_TEMPLATE)
+        self.assertIn("group-summary", INDEX_HTML_TEMPLATE)
+        self.assertIn("group-title", INDEX_HTML_TEMPLATE)
+        # The lane identity column is distinct from the role matrix.
+        self.assertIn("lane-ident", INDEX_HTML_TEMPLATE)
+        self.assertIn("lane-id", INDEX_HTML_TEMPLATE)
+
+    def test_grouped_empty_group_and_stale_stay_visible(self) -> None:
+        # Acceptance (#12377): a missing / empty lane group stays visible (never
+        # dropped) and a stale / reload-required lane reads as needing attention.
+        self.assertIn("no lane observed in this group", INDEX_HTML_TEMPLATE)
+        self.assertIn("lane-attention", INDEX_HTML_TEMPLATE)
+
+    def test_grouped_rendering_is_dom_only(self) -> None:
+        # The new grouped code path must keep the page's no-injection property:
+        # DOM construction only, never an HTML-string sink.
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                     "document.write"):
+            self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
+
+    def test_grouped_new_classes_are_styled(self) -> None:
+        # Every grouped display class the front end tags a node with must have a
+        # CSS rule, or it renders unstyled (often invisible / indistinguishable).
+        style = INDEX_HTML_TEMPLATE[
+            INDEX_HTML_TEMPLATE.index("<style>"):INDEX_HTML_TEMPLATE.index("</style>")
+        ]
+        for cls in ("group-summary", "lane-row", "lane-ident", "lane-id",
+                    "lane-issue", "lane-state", "lane-attention", "role-matrix",
+                    "role-slot", "role-present", "role-missing",
+                    "role-missing-tag"):
+            self.assertRegex(
+                style,
+                rf"\.{re.escape(cls)}\b[^{{]*\{{",
+                f"grouped class .{cls} has no CSS rule (would render unstyled)",
+            )
+        # The managed / default group accent variants are styled too.
+        self.assertRegex(style, r"\.group\.managed\b[^{]*\{")
+        self.assertRegex(style, r"\.group\.default\b[^{]*\{")
+
+
 class ServedCockpitSmokeTest(unittest.TestCase):
     """Page-level browser smoke against the daemon-served cockpit document."""
 
