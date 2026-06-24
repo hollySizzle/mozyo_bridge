@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6136
+    lines: 6157
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -56,6 +56,10 @@ allowlist:
       handlers into this module (#12321 j#62683). Raised 6072 -> 6136 for the
       #12388 role-profile resolution wiring in `orchestrate_handoff` (fail-closed
       resolve + threading the resolution through the typed terminal paths).
+      Raised 6136 -> 6157 for the #12466 delegated-coordinator-tree display
+      columns in `cmd_agents_targets` (derive once + render KIND/DEPTH/PARENT in
+      text and the additive JSON `delegation` record; the derivation itself lives
+      in the new `domain/delegation_display.py`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -873,6 +873,7 @@ file_conventions:
       - src/mozyo_bridge/domain/delegation_launch_adopt.py
       - src/mozyo_bridge/application/delegation_launch_adopt.py
       - src/mozyo_bridge/domain/delegation_projection.py
+      - src/mozyo_bridge/domain/delegation_display.py
       - tests/test_delegation_launch_adopt.py
       - tests/test_delegation_projection.py
     severity: block

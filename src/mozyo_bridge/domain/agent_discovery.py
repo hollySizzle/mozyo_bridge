@@ -128,6 +128,14 @@ class AgentRecord:
     # same-workspace / different-lane panes without parsing titles.
     lane_id: str = ""
     lane_label: str | None = None
+    # Delegated-coordinator-tree display breadcrumb (Redmine #12466), read from
+    # the pane's `@mozyo_lane_kind` / `@mozyo_delegation_parent` options when
+    # present. A projection cache for the cockpit display only: depth / root are
+    # re-derived from the parent chain by the #12465 `delegation_projection`
+    # foundation, and none of these carry routing / handoff / approval authority.
+    # Empty for panes outside a delegation tree.
+    lane_kind: str = ""
+    delegation_parent: str = ""
     views: tuple[PaneView, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
@@ -147,6 +155,8 @@ class AgentRecord:
             "confidence": self.confidence,
             "lane_id": self.lane_id,
             "lane_label": self.lane_label,
+            "lane_kind": self.lane_kind,
+            "delegation_parent": self.delegation_parent,
             "views": [view.as_payload() for view in self.views],
         }
 
@@ -377,6 +387,8 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 confidence=resolution.confidence,
                 lane_id=pane.get("lane_id") or "",
                 lane_label=(pane.get("lane_label") or "").strip() or None,
+                lane_kind=(pane.get("lane_kind") or "").strip(),
+                delegation_parent=(pane.get("delegation_parent") or "").strip(),
             )
         )
     return records
@@ -590,6 +602,16 @@ class TargetCandidate:
     host: str
     view_kind: str
     branch: str | None
+    # Delegated-coordinator-tree display breadcrumb (Redmine #12466). Raw
+    # projection-cache values read from the pane's `@mozyo_lane_kind` /
+    # `@mozyo_delegation_parent` options; the derived KIND / DEPTH / PARENT /
+    # ROOT projection is computed by :func:`derive_targets_delegation` (it walks
+    # the parent chain across all candidates), not stored per-pane. Defaulted so
+    # existing constructors stay valid. Never a routing identity: these are not
+    # part of the canonical ``TargetRecord`` :meth:`to_dict` projection used for
+    # handoff, exactly like the additive attention projection (#11952).
+    lane_kind: str = ""
+    delegation_parent: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Nested canonical ``TargetRecord`` projection (Redmine #11907).
@@ -727,6 +749,8 @@ def build_target_candidates(
                 host=host,
                 view_kind=_derive_view_kind(record.role_source),
                 branch=branch_for(record.repo_root),
+                lane_kind=record.lane_kind,
+                delegation_parent=record.delegation_parent,
             )
         )
     return candidates
