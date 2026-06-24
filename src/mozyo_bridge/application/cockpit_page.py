@@ -58,6 +58,22 @@ contract. It renders, from the data the grouped payload already carries:
 Class names for the role slots come from the front-end's whitelist
 (``GROUPED_ROLES``) plus the payload's role *presence*, never a payload-supplied
 string, so the DOM-only rendering keeps its no-injection property.
+
+Visual design + responsive polish (Redmine #12381): the page is meant to be a
+quiet, practical local indicator, with color used for *state meaning* rather than
+decoration. The palette is defined once as semantic CSS custom properties in the
+``:root`` block (``--c-ok`` / ``--c-warn`` / ``--c-danger`` / ``--c-info`` /
+neutral + gray tokens, plus an ``--fs-*`` type scale), and every state class
+(flat ``.active`` / ``.idle`` / ``.unknown``, ``.rm-*``, ``.obs-*``, grouped
+freshness / role / attention, and the action feedback classes) resolves its color
+through those tokens, so the same green / amber / red vocabulary maps to the same
+class of state wherever it appears. No gradients or shadows are used and the group
+box keeps a single border + one left accent (no nested cards). For fit, flex
+identity / role containers carry ``min-width: 0`` so a long lane / issue / project
+label wraps inside its column instead of forcing the body wider than a narrow
+viewport, badge-like slots cap at ``max-width: 100%`` with ``overflow-wrap``, and a
+``@media (max-width: 600px)`` query tightens only the outer margin and inter-item
+gaps. These are fit affordances, not layout policy.
 """
 
 from __future__ import annotations
@@ -69,74 +85,110 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mozyo cockpit</title>
 <style>
+  /* Semantic design tokens (#12381): color encodes state *meaning*, not
+     decoration. One green / amber / red / blue / gray vocabulary is defined
+     once here and reused across the flat table, grouped view, observation line,
+     freshness, and action feedback, so a given color always reads as the same
+     class of state wherever it appears. No gradients / shadows — a quiet,
+     practical local indicator surface, not marketing chrome. Type and spacing
+     tokens carry the information-priority scale (primary state > secondary
+     identity > tertiary muted note). */
+  :root {
+    --c-ok: #2e7d32;        /* active / present / fresh / success */
+    --c-warn: #ef6c00;      /* idle / stale / reload / attention / failed-reason */
+    --c-danger: #b71c1c;    /* unknown-snapshot / unavailable / failed / missing */
+    --c-info: #1565c0;      /* redmine available / managed-group accent */
+    --c-state-unknown: #757575; /* no activity signal (neutral, not an alarm) */
+    --c-neutral: #616161;   /* empty-state / secondary body text */
+    --c-text-2: #555;       /* secondary identity text (issue label) */
+    --c-muted: #999;        /* tertiary muted note */
+    --c-disabled: #9e9e9e;  /* unconfigured / not-applicable */
+    --c-border: #e0e0e0;    /* hairline chrome border */
+    --c-border-soft: #f0f0f0;
+    --c-rule: #ddd;         /* table row rule */
+    --c-accent-soft: #bdbdbd; /* default (ungrouped) group accent */
+    --c-surface: #f5f5f5;   /* flat header / strip fill (no gradient) */
+    --c-attention-bg: #fff8e1;
+    --c-stale-bg: #fff3e0;
+    --fs-2: 12px;           /* secondary text size */
+    --fs-3: 11px;           /* tertiary / tag text size */
+  }
   body { font: 13px/1.5 -apple-system, sans-serif; margin: 1rem; }
   #units-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 2px 8px; border-bottom: 1px solid #ddd; }
+  th, td { text-align: left; padding: 2px 8px; border-bottom: 1px solid var(--c-rule); }
   td { overflow-wrap: anywhere; word-break: break-word; }
-  .active  { color: #2e7d32; font-weight: 600; }
-  .idle    { color: #ef6c00; font-weight: 600; }
-  .unknown { color: #757575; }
-  .rm-available    { color: #1565c0; }
-  .rm-unconfigured { color: #9e9e9e; }
-  .rm-unavailable  { color: #b71c1c; }
-  .stale-banner { background: #fff3e0; padding: 4px 8px; display: none; }
+  .active  { color: var(--c-ok); font-weight: 600; }
+  .idle    { color: var(--c-warn); font-weight: 600; }
+  .unknown { color: var(--c-state-unknown); }
+  .rm-available    { color: var(--c-info); }
+  .rm-unconfigured { color: var(--c-disabled); }
+  .rm-unavailable  { color: var(--c-danger); }
+  .stale-banner { background: var(--c-stale-bg); padding: 4px 8px; display: none; }
   button { font-size: 12px; white-space: nowrap; }
   #transitions { padding-left: 1.2rem; }
-  #transitions li { color: #555; overflow-wrap: anywhere; }
-  .muted { color: #999; font-size: 11px; }
+  #transitions li { color: var(--c-text-2); overflow-wrap: anywhere; }
+  .muted { color: var(--c-muted); font-size: var(--fs-3); }
   #controls { margin: 4px 0; display: flex; align-items: center;
               gap: 8px; flex-wrap: wrap; }
-  .obs-healthy { color: #2e7d32; }
-  .obs-reload_required { color: #ef6c00; font-weight: 600; }
-  .obs-unknown { color: #b71c1c; font-weight: 600; }
+  .obs-healthy { color: var(--c-ok); }
+  .obs-reload_required { color: var(--c-warn); font-weight: 600; }
+  .obs-unknown { color: var(--c-danger); font-weight: 600; }
   /* Empty vs error must never render as the same blank surface (#12378): an
      empty cockpit (the daemon responded, nothing to show) reads as a neutral
      muted note, while a data-unavailable error (the daemon could not be reached)
      reads fail-closed red. Defined after .muted so the later equal-specificity
      rule wins when both classes are present. */
-  .units-state { padding: 4px 8px; font-size: 12px; }
-  .state-empty { color: #616161; }
-  .state-error { color: #b71c1c; font-weight: 600; }
+  .units-state { padding: 4px 8px; font-size: var(--fs-2); }
+  .state-empty { color: var(--c-neutral); }
+  .state-error { color: var(--c-danger); font-weight: 600; }
   /* Project Group box: a managed (configured) group reads with a left accent;
-     a default / ungrouped bucket stays plain so the two are visually separable. */
-  .group { margin: 8px 0; border: 1px solid #e0e0e0; border-radius: 4px;
-           border-left: 3px solid #e0e0e0; }
-  .group.managed { border-left-color: #1565c0; }
-  .group.default { border-left-color: #bdbdbd; }
-  .group-header { background: #f5f5f5; padding: 4px 8px; font-weight: 600;
+     a default / ungrouped bucket stays plain so the two are visually separable.
+     One border + one left accent only — no nested cards, no shadow. */
+  .group { margin: 8px 0; border: 1px solid var(--c-border); border-radius: 4px;
+           border-left: 3px solid var(--c-border); }
+  .group.managed { border-left-color: var(--c-info); }
+  .group.default { border-left-color: var(--c-accent-soft); }
+  .group-header { background: var(--c-surface); padding: 4px 8px; font-weight: 600;
                   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .group-header .group-title { flex: 1 1 auto; }
-  .group-header .tag { font-weight: 400; font-size: 11px; color: #757575; }
-  .group-header .stale { color: #b71c1c; }
-  .group-header .reload { color: #ef6c00; }
-  .group-summary { font-weight: 400; font-size: 11px; color: #757575; }
-  .group-summary.attention { color: #ef6c00; font-weight: 600; }
+  /* min-width:0 lets the title shrink and wrap a long project name instead of
+     forcing the header (and the body) wider than a narrow viewport. */
+  .group-header .group-title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .group-header .tag { font-weight: 400; font-size: var(--fs-3); color: var(--c-state-unknown);
+                       overflow-wrap: anywhere; }
+  .group-header .stale { color: var(--c-danger); }
+  .group-header .reload { color: var(--c-warn); }
+  .group-summary { font-weight: 400; font-size: var(--fs-3); color: var(--c-state-unknown); }
+  .group-summary.attention { color: var(--c-warn); font-weight: 600; }
   /* One lane (Unit) within a group: lane identity, state/freshness, role matrix. */
-  .lane-row { padding: 3px 8px; border-top: 1px solid #f0f0f0; display: flex;
+  .lane-row { padding: 3px 8px; border-top: 1px solid var(--c-border-soft); display: flex;
               align-items: center; gap: 10px; flex-wrap: wrap; }
   .lane-row.hidden-unit { opacity: 0.65; }
-  .lane-row.lane-attention { background: #fff8e1; }
+  .lane-row.lane-attention { background: var(--c-attention-bg); }
+  /* min-width:0 + overflow-wrap so a long lane / issue label wraps inside the
+     identity column instead of overflowing the row on a narrow viewport. */
   .lane-ident { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
-                min-width: 12ch; }
-  .lane-id { font-weight: 600; }
-  .lane-issue { color: #555; font-size: 12px; }
-  .lane-state { font-size: 12px; }
+                min-width: 0; max-width: 100%; }
+  .lane-id { font-weight: 600; overflow-wrap: anywhere; }
+  .lane-issue { color: var(--c-text-2); font-size: var(--fs-2); overflow-wrap: anywhere; }
+  .lane-state { font-size: var(--fs-2); overflow-wrap: anywhere; }
   /* The Target layer: one slot per canonical role (codex, claude). A present role
      carries its action buttons; a missing role reads "missing" so a one-sided lane
      (only Codex or only Claude live) is obvious at a glance. */
-  .role-matrix { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .role-matrix { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+                 min-width: 0; }
   .role-slot { display: inline-flex; align-items: center; gap: 4px;
-               border: 1px solid #e0e0e0; border-radius: 3px; padding: 1px 4px; }
-  .role-slot .role-name { font-size: 11px; font-weight: 600; }
-  .role-present { border-color: #2e7d32; }
-  .role-present .role-name { color: #2e7d32; }
-  .role-missing { border-style: dashed; border-color: #b71c1c; opacity: 0.85; }
-  .role-missing .role-name { color: #b71c1c; }
-  .role-missing-tag { font-size: 11px; color: #b71c1c; }
-  .fresh-fresh { color: #2e7d32; }
-  .fresh-stale, .fresh-expired { color: #ef6c00; font-weight: 600; }
-  .fresh-unknown { color: #b71c1c; font-weight: 600; }
+               border: 1px solid var(--c-border); border-radius: 3px; padding: 1px 4px;
+               max-width: 100%; }
+  .role-slot .role-name { font-size: var(--fs-3); font-weight: 600; overflow-wrap: anywhere; }
+  .role-present { border-color: var(--c-ok); }
+  .role-present .role-name { color: var(--c-ok); }
+  .role-missing { border-style: dashed; border-color: var(--c-danger); opacity: 0.85; }
+  .role-missing .role-name { color: var(--c-danger); }
+  .role-missing-tag { font-size: var(--fs-3); color: var(--c-danger); }
+  .fresh-fresh { color: var(--c-ok); }
+  .fresh-stale, .fresh-expired { color: var(--c-warn); font-weight: 600; }
+  .fresh-unknown { color: var(--c-danger); font-weight: 600; }
   /* Filter / density / grouping controls (#12379): a second controls row so an
      operator can narrow by project / lane / role / attention, switch flat vs
      grouped vs both, and pick a reading density. It wraps like #controls so it
@@ -144,11 +196,11 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
      flow. A "no match" note reads neutral (it is a filter result, not an error). */
   #view-controls { margin: 4px 0; display: flex; align-items: center;
                    gap: 8px; flex-wrap: wrap; }
-  #view-controls label { font-size: 12px; color: #555; display: inline-flex;
+  #view-controls label { font-size: var(--fs-2); color: var(--c-text-2); display: inline-flex;
                          align-items: center; gap: 4px; }
-  #view-controls input[type="text"] { font-size: 12px; min-width: 8ch;
+  #view-controls input[type="text"] { font-size: var(--fs-2); min-width: 8ch;
                                        max-width: 22ch; }
-  .filter-empty { padding: 4px 8px; font-size: 12px; color: #616161; }
+  .filter-empty { padding: 4px 8px; font-size: var(--fs-2); color: var(--c-neutral); }
   /* Compact density: tighten chrome padding / gaps and secondary-text size so
      more lanes fit without forcing horizontal overflow. Only spacing shrinks —
      state text and the jump / Finder action buttons keep their own readable
@@ -169,13 +221,27 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   #action-feedback { margin: 6px 0; }
   #action-feedback .feedback-label { display: block; }
   #action-log { list-style: none; padding-left: 0; margin: 2px 0; }
-  #action-log li { font-size: 12px; overflow-wrap: anywhere; }
-  #action-log .ts { color: #999; font-size: 11px; margin-right: 4px; }
-  .action-ok { color: #2e7d32; }
-  .action-failed { color: #b71c1c; font-weight: 600; }
+  #action-log li { font-size: var(--fs-2); overflow-wrap: anywhere; }
+  #action-log .ts { color: var(--c-muted); font-size: var(--fs-3); margin-right: 4px; }
+  .action-ok { color: var(--c-ok); }
+  .action-failed { color: var(--c-danger); font-weight: 600; }
   .action-disabled { opacity: 0.6; }
-  .action-reason { font-size: 11px; color: #ef6c00; overflow-wrap: anywhere; }
-  body.dense #action-log li, body.dense .action-reason { font-size: 11px; }
+  .action-reason { font-size: var(--fs-3); color: var(--c-warn); overflow-wrap: anywhere; }
+  body.dense #action-log li, body.dense .action-reason { font-size: var(--fs-3); }
+  /* Narrow viewport (#12381): the layout already wraps every controls / lane /
+     role row via flex-wrap + overflow-wrap, and the wide unit table scrolls
+     inside #units-wrap. This query only tightens the outer margin and inter-item
+     gaps on a phone-ish width so the wrapped rows stay legible without forcing
+     horizontal body overflow — major state / identity / actions never overlap.
+     No layout policy beyond fit: no marketing chrome, no operator-specific
+     breakpoint baked into the OSS default. */
+  @media (max-width: 600px) {
+    body { margin: 0.5rem; }
+    #controls, #view-controls { gap: 6px; }
+    .lane-row { gap: 6px 8px; }
+    .group-header { gap: 4px 8px; }
+    #view-controls input[type="text"] { max-width: 100%; }
+  }
 </style>
 </head>
 <body>

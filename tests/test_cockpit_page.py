@@ -525,6 +525,131 @@ class ActionAffordanceAndFeedbackTest(unittest.TestCase):
             self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
 
 
+class VisualDesignResponsiveTest(unittest.TestCase):
+    """Pin the #12381 acceptance: color encodes state meaning (no decorative
+    gradient / nested-card chrome), major information stays non-overlapping at
+    desktop and narrow viewport, and button / badge / row text never overflows
+    incoherently — all while keeping the DOM-only no-injection property.
+
+    These are template assertions on the served page's CSS contract; the
+    real-browser desktop / narrow render + screenshots are recorded out of band
+    in the issue journal (acceptance criterion 4).
+    """
+
+    def _style(self) -> str:
+        return INDEX_HTML_TEMPLATE[
+            INDEX_HTML_TEMPLATE.index("<style>"):INDEX_HTML_TEMPLATE.index(
+                "</style>"
+            )
+        ]
+
+    def _root_block(self) -> str:
+        style = self._style()
+        start = style.index(":root")
+        # The :root token block is the first declaration block in the style.
+        return style[start:style.index("}", start) + 1]
+
+    def test_semantic_color_tokens_defined_in_root(self) -> None:
+        # Acceptance 1: color is used for state *meaning*. The palette is defined
+        # once as semantic CSS custom properties, so the green / amber / red /
+        # blue vocabulary maps to a named state concept instead of ad-hoc hex.
+        root = self._root_block()
+        for token in ("--c-ok", "--c-warn", "--c-danger", "--c-info",
+                      "--c-neutral", "--c-muted"):
+            self.assertRegex(
+                root, rf"{re.escape(token)}\s*:\s*#[0-9a-fA-F]{{3,6}}",
+                f"semantic token {token} not defined in :root",
+            )
+
+    def test_state_classes_resolve_color_through_tokens(self) -> None:
+        # The state classes must read their color from the semantic tokens, not a
+        # raw literal, so "color == state" is structural and auditable. Pin a
+        # representative class per state surface (flat state, redmine, observation,
+        # grouped freshness, action feedback).
+        style = self._style()
+        for selector, token in (
+            (r"\.active\b", "--c-ok"),
+            (r"\.idle\b", "--c-warn"),
+            (r"\.rm-available\b", "--c-info"),
+            (r"\.obs-unknown\b", "--c-danger"),
+            (r"\.fresh-fresh\b", "--c-ok"),
+            (r"\.action-failed\b", "--c-danger"),
+        ):
+            self.assertRegex(
+                style,
+                rf"{selector}[^}}]*\{{[^}}]*var\({re.escape(token)}\)",
+                f"{selector} should resolve its color via var({token})",
+            )
+
+    def test_color_literals_are_centralized_in_root(self) -> None:
+        # No scattered hex color literals: every 6-digit color literal must live
+        # in the :root token block (so the palette has a single source of truth).
+        # A leak elsewhere means a state color drifted out of the semantic set.
+        style = self._style()
+        root = self._root_block()
+        outside = style.replace(root, "")
+        leaked = re.findall(r"#[0-9a-fA-F]{6}\b", outside)
+        self.assertEqual(
+            leaked, [],
+            f"hex color literals leaked outside :root tokens: {leaked}",
+        )
+        # And the token block actually carries the palette.
+        self.assertGreaterEqual(len(re.findall(r"#[0-9a-fA-F]{6}\b", root)), 8)
+
+    def test_no_decorative_gradient_or_shadow(self) -> None:
+        # Acceptance 1: avoid decorative gradient / over-styled chrome. The quiet
+        # local indicator uses flat fills and hairline borders only — no gradient,
+        # no drop shadow. Check the actual declarations, not the comment prose
+        # (the design rationale comments mention "no gradients / shadows").
+        declarations = re.sub(r"/\*.*?\*/", "", self._style(), flags=re.DOTALL)
+        for decoration in ("gradient", "box-shadow", "text-shadow"):
+            self.assertNotIn(
+                decoration, declarations,
+                f"decorative {decoration} must not be used (#12381 quiet look)",
+            )
+
+    def test_narrow_viewport_media_query_tightens_layout(self) -> None:
+        # Acceptance 2: major information stays non-overlapping at a narrow
+        # viewport. A max-width media query tightens the outer margin / gaps for a
+        # phone-ish width (the rows already wrap via flex-wrap; this keeps the
+        # wrapped layout legible without horizontal body overflow).
+        style = self._style()
+        self.assertRegex(style, r"@media\s*\([^)]*max-width:\s*\d+px")
+        media = style[style.index("@media"):]
+        self.assertRegex(media, r"body\s*\{\s*margin:\s*0\.5rem")
+
+    def test_flex_identity_and_role_containers_contain_overflow(self) -> None:
+        # Acceptance 2 / 3: a long lane / issue / project / role string must wrap
+        # inside its column, not overflow the row or widen the body. Flex item
+        # default min-width:auto blocks shrinking, so the identity / role / title
+        # flex children carry min-width:0, and the text leaves carry overflow-wrap.
+        style = self._style()
+        for selector in (r"\.lane-ident\b", r"\.role-matrix\b",
+                         r"\.group-title\b"):
+            self.assertRegex(
+                style, rf"{selector}[^}}]*\{{[^}}]*min-width:\s*0",
+                f"{selector} should set min-width:0 so it can shrink and wrap",
+            )
+        for selector in (r"\.lane-id\b", r"\.lane-issue\b", r"\.role-name\b"):
+            self.assertRegex(
+                style, rf"{selector}[^}}]*\{{[^}}]*overflow-wrap:\s*anywhere",
+                f"{selector} should wrap long unbreakable strings",
+            )
+
+    def test_badge_like_slots_cap_their_width(self) -> None:
+        # Acceptance 3: a badge-like role slot must not push the row wider than the
+        # viewport when its contents are long; it caps at the available width and
+        # wraps internally.
+        style = self._style()
+        self.assertRegex(style, r"\.role-slot\b[^}]*\{[^}]*max-width:\s*100%")
+
+    def test_visual_design_keeps_dom_only_no_injection(self) -> None:
+        # The visual-design refactor must not introduce an HTML-string sink.
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                     "document.write"):
+            self.assertNotIn(sink, INDEX_HTML_TEMPLATE, sink)
+
+
 class ServedCockpitSmokeTest(unittest.TestCase):
     """Page-level browser smoke against the daemon-served cockpit document."""
 
