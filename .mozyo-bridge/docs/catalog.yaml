@@ -102,6 +102,18 @@ documents:
     audit_role: project_map_spec
     related_document_refs:
       - skill-project-map-reference
+      - spec-bounded-context-map
+
+  - id: spec-bounded-context-map
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/bounded-context-map.md
+    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine 階層を焼き込まず横断作業を分類する。
+    audit_role: bounded_context_map_spec
+    related_document_refs:
+      - spec-project-map
+      - logic-coordinator-sublane-development-flow
+      - logic-module-health-gate
 
   - id: spec-vscode-agent-pane-contract
     type: spec
@@ -691,6 +703,21 @@ documents:
       - logic-release-flow
       - skill-release-reference
 
+  - id: logic-tests-placement-discovery-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/tests-placement-discovery-policy.md
+    purpose: "tests の test type (unit/integration/scenarios/regressions/support) と #12488 bounded context を type-first で組み合わせる配置規約、新規テストの一意な配置決定木、`unittest discover -s tests -v` 不変の discovery 方針と #12490 への __init__.py package 化移行契約。"
+    audit_role: tests_placement_discovery_policy_logic
+    related_document_refs:
+      - logic-turnkey-e2e-acceptance
+      - logic-refactor-split-strategy
+      - logic-module-health-gate
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-project-map
+      - skill-workflow-reference
+
   - id: logic-autonomous-ticket-entrypoint
     type: logic
     status: active
@@ -875,14 +902,14 @@ file_conventions:
       - src/mozyo_bridge/application/grouped_detail.py
       - src/mozyo_bridge/application/cockpit_ui.py
       - src/mozyo_bridge/application/otel_receiver.py
-      - tests/test_presentation_grouping_schema.py
-      - tests/test_presentation_grouping_placement.py
-      - tests/test_presentation_grouping_degraded.py
-      - tests/test_grouped_read_model.py
-      - tests/test_grouped_reload_view.py
-      - tests/test_grouped_detail.py
-      - tests/test_cockpit_grouped_action.py
-      - tests/test_grouped_display.py
+      - tests/unit/operations_cockpit/test_presentation_grouping_schema.py
+      - tests/unit/operations_cockpit/test_presentation_grouping_placement.py
+      - tests/unit/operations_cockpit/test_presentation_grouping_degraded.py
+      - tests/unit/operations_cockpit/test_grouped_read_model.py
+      - tests/unit/operations_cockpit/test_grouped_reload_view.py
+      - tests/integration/operations_cockpit/test_grouped_detail.py
+      - tests/integration/operations_cockpit/test_cockpit_grouped_action.py
+      - tests/integration/operations_cockpit/test_grouped_display.py
     severity: block
     document_refs:
       - logic-unit-target-model
@@ -899,7 +926,7 @@ file_conventions:
       - src/mozyo_bridge/presentation_state.py
       - src/mozyo_bridge/application/cli_presentation.py
       - src/mozyo_bridge/application/commands_presentation.py
-      - tests/test_presentation_state.py
+      - tests/unit/operations_cockpit/test_presentation_state.py
     severity: block
     document_refs:
       - logic-unit-presentation-state-db
@@ -914,7 +941,7 @@ file_conventions:
       - src/mozyo_bridge/state_store.py
       - src/mozyo_bridge/application/cli_state.py
       - src/mozyo_bridge/application/commands_state.py
-      - tests/test_state_store.py
+      - tests/integration/execution_platform/test_state_store.py
     severity: block
     document_refs:
       - logic-managed-state-model
@@ -1024,6 +1051,7 @@ file_conventions:
       - spec-project-map
       - skill-workflow-reference
       - logic-turnkey-e2e-acceptance
+      - logic-tests-placement-discovery-policy
 
   - id: fc-vscode-agent-pane-poc
     name: VS Code Agent Pane experimental PoC

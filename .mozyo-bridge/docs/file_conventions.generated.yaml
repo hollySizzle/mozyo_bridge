@@ -144,14 +144,14 @@ rules:
   - src/mozyo_bridge/application/grouped_detail.py
   - src/mozyo_bridge/application/cockpit_ui.py
   - src/mozyo_bridge/application/otel_receiver.py
-  - tests/test_presentation_grouping_schema.py
-  - tests/test_presentation_grouping_placement.py
-  - tests/test_presentation_grouping_degraded.py
-  - tests/test_grouped_read_model.py
-  - tests/test_grouped_reload_view.py
-  - tests/test_grouped_detail.py
-  - tests/test_cockpit_grouped_action.py
-  - tests/test_grouped_display.py
+  - tests/unit/operations_cockpit/test_presentation_grouping_schema.py
+  - tests/unit/operations_cockpit/test_presentation_grouping_placement.py
+  - tests/unit/operations_cockpit/test_presentation_grouping_degraded.py
+  - tests/unit/operations_cockpit/test_grouped_read_model.py
+  - tests/unit/operations_cockpit/test_grouped_reload_view.py
+  - tests/integration/operations_cockpit/test_grouped_detail.py
+  - tests/integration/operations_cockpit/test_cockpit_grouped_action.py
+  - tests/integration/operations_cockpit/test_grouped_display.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/unit-target-model.md と @vibes/docs/logics/unit-presentation-state-db.md と @vibes/docs/logics/pane-centric-cockpit-semantics.md
     と @vibes/docs/logics/managed-state-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
@@ -165,7 +165,7 @@ rules:
   - src/mozyo_bridge/presentation_state.py
   - src/mozyo_bridge/application/cli_presentation.py
   - src/mozyo_bridge/application/commands_presentation.py
-  - tests/test_presentation_state.py
+  - tests/unit/operations_cockpit/test_presentation_state.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/unit-presentation-state-db.md と @vibes/docs/logics/managed-state-model.md と
     @vibes/docs/logics/workspace-registry.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/specs/project-map.md
@@ -179,7 +179,7 @@ rules:
   - src/mozyo_bridge/state_store.py
   - src/mozyo_bridge/application/cli_state.py
   - src/mozyo_bridge/application/commands_state.py
-  - tests/test_state_store.py
+  - tests/integration/execution_platform/test_state_store.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/workspace-registry.md と @vibes/docs/logics/session-inventory.md
     と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
@@ -277,7 +277,7 @@ rules:
   - tests/**
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/logics/turnkey-e2e-acceptance.md
-    をよく確認し従うこと
+    と @vibes/docs/logics/tests-placement-discovery-policy.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
