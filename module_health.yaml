@@ -47,13 +47,24 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6072
+    lines: 6205
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
       here. Largest decomposition target. Baseline raised 5720 -> 6072 on
       integrating already-reviewed #12341 cockpit membership list/status CLI
-      handlers into this module (#12321 j#62683).
+      handlers into this module (#12321 j#62683). Raised 6072 -> 6136 for the
+      #12388 role-profile resolution wiring in `orchestrate_handoff` (fail-closed
+      resolve + threading the resolution through the typed terminal paths).
+      Raised 6136 -> 6157 for the #12466 delegated-coordinator-tree display
+      columns in `cmd_agents_targets` (derive once + render KIND/DEPTH/PARENT in
+      text and the additive JSON `delegation` record; the derivation itself lives
+      in the new `domain/delegation_display.py`, not here).
+      Raised 6157 -> 6205 for the #12467 delegated-coordinator window-policy
+      display wiring in `cmd_agents_targets` (per-repo fail-soft
+      `delegation_window_policy` resolution + the additive JSON
+      `delegation_window` sibling; the policy schema/resolver live in
+      `domain/presentation_grouping/`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -86,17 +97,22 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/handoff.py
-    lines: 1084
+    lines: 1151
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
+      Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
+      delivery outcome / notification body / delivery record (the resolved-text
+      rendering stays out of the auto-persist body).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/scaffold/rules.py
-    lines: 1027
+    lines: 1081
     reason: >-
-      Scaffold preset/rule installation logic. Just over threshold.
+      Scaffold preset/rule installation logic. Just over threshold. Grew in
+      #12363 for the opt-in sublane-flow profile (category registration, the
+      router-variant template selector, and the sublane_flow_enabled toggle).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

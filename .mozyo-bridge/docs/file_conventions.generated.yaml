@@ -53,6 +53,34 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: delegated coordinator runtime and projection source
+  patterns:
+  - src/mozyo_bridge/domain/delegation_launch_adopt.py
+  - src/mozyo_bridge/application/delegation_launch_adopt.py
+  - src/mozyo_bridge/domain/grandchild_dispatch.py
+  - src/mozyo_bridge/application/grandchild_dispatch.py
+  - src/mozyo_bridge/domain/grandchild_stamp.py
+  - src/mozyo_bridge/application/grandchild_stamp.py
+  - src/mozyo_bridge/domain/delegation_projection.py
+  - src/mozyo_bridge/domain/delegation_display.py
+  - src/mozyo_bridge/domain/delegated_coordinator_route_plan.py
+  - src/mozyo_bridge/domain/redmine_read_boundary.py
+  - tests/test_delegation_launch_adopt.py
+  - tests/test_grandchild_dispatch.py
+  - tests/test_grandchild_stamp.py
+  - tests/test_delegation_projection.py
+  - tests/scenarios/test_delegated_coordinator_route_plan.py
+  - tests/regressions/test_issue_12474_delegated_route_gaps.py
+  - tests/support/delegation_route_fakes.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
+    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
+    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: package CLI and command entrypoints
   patterns:
   - src/mozyo_bridge/__main__.py

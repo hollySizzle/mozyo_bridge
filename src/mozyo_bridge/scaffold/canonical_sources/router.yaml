@@ -24,6 +24,21 @@ outputs:
   - target: presets/_router/CLAUDE.md
     context:
       tool: claude
+  # Opt-in `--with-sublane-flow` variants (Redmine #12362 / #12363).
+  # Byte-identical to the base router plus a thin sublane-flow read-route
+  # section. `render_router_pair(..., sublane_flow=True)` reads these
+  # instead of the base templates and still writes them to the target as
+  # `AGENTS.md` / `CLAUDE.md`. The `sublane_flow: enabled` context only
+  # activates the `sublane_route` fragment; the base outputs omit the key
+  # so they render exactly as before.
+  - target: presets/_router/AGENTS.sublane.md
+    context:
+      tool: codex
+      sublane_flow: enabled
+  - target: presets/_router/CLAUDE.sublane.md
+    context:
+      tool: claude
+      sublane_flow: enabled
 
 fragments:
   - id: title_intro
@@ -52,6 +67,15 @@ fragments:
     when:
       tool: claude
     body_file: bodies/body_claude.md
+  # Emits only for the `--with-sublane-flow` variant outputs (the base
+  # outputs carry no `sublane_flow` key, so this `when` never matches
+  # there). Shared across both tools; placed after the tool body and
+  # before the project-local block so the read-route reads as its own
+  # thin section just above Project-Local Additions.
+  - id: sublane_route
+    when:
+      sublane_flow: enabled
+    body_file: bodies/sublane_route.md
   - id: project_local
     when:
       tool: codex

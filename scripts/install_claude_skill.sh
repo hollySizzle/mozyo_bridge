@@ -23,6 +23,14 @@
 # script is intentionally out of scope of the deprecation task; see
 # vibes/docs/logics/skill-distribution.md `## Legacy Global Claude Skill
 # Deprecation` for the policy detail.
+#
+# Default scope is `global` (the legacy personal-skill destination above).
+# `project` scope (writing this repo's tracked .claude/skills/ adapter +
+# skills/ shared body mirror) is now an explicit legacy/offline/internal
+# opt-in: set MOZYO_BRIDGE_CLAUDE_SCOPE=project to request it. New installs
+# should prefer the plugin marketplace path over either legacy scope. See
+# vibes/docs/logics/skill-distribution.md `## Legacy Project Claude Skill
+# (.claude/skills/mozyo-bridge-agent/) Grace-Period Deprecation`.
 
 set -eu
 
@@ -32,7 +40,7 @@ shared_path="${MOZYO_BRIDGE_SHARED_SKILL_PATH:-skills/mozyo-bridge-agent}"
 adapter_path="${MOZYO_BRIDGE_CLAUDE_ADAPTER_PATH:-.claude/skills/mozyo-bridge-agent}"
 project_dir="${MOZYO_BRIDGE_CLAUDE_PROJECT_DIR:-$PWD}"
 claude_home="${MOZYO_BRIDGE_CLAUDE_HOME:-$HOME/.claude}"
-scope="${MOZYO_BRIDGE_CLAUDE_SCOPE:-project}"
+scope="${MOZYO_BRIDGE_CLAUDE_SCOPE:-global}"
 archive_url="${MOZYO_BRIDGE_SKILL_ARCHIVE_URL:-https://codeload.github.com/$repo/tar.gz/$ref}"
 
 case "$scope" in
@@ -89,6 +97,7 @@ fi
 
 case "$scope" in
   project)
+    echo "note: project scope is a deprecated legacy/offline/internal opt-in; new installs should use the plugin marketplace (claude plugin install mozyo-bridge-agent@mozyo-bridge --scope user)" >&2
     mkdir -p "$(dirname -- "$shared_dest_project")" "$(dirname -- "$adapter_dest_project")"
     rsync -a --delete "$shared_src" "$shared_dest_project"
     rsync -a --delete "$adapter_src" "$adapter_dest_project"

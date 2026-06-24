@@ -115,6 +115,54 @@ documents:
       - logic-coordinator-sublane-development-flow
       - logic-module-health-gate
 
+  - id: spec-delegated-coordinator-role-profile
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegated-coordinator-role-profile.md
+    purpose: coordinator / delegated_coordinator / implementation_gateway / implementation_worker の最小 role 語彙、親 issue close・owner approval・callback・downstream dispatch の責務境界、固定 role profile template の正本。
+    audit_role: delegated_coordinator_role_profile_spec
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-role-profile-handoff-expansion
+      - spec-delegated-coordinator-decision-records
+      - spec-delegation-policy-project-config
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: spec-delegated-coordinator-decision-records
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegated-coordinator-decision-records.md
+    purpose: 親 coordinator の parent delegation decision / no-child-delegation reason、委譲管制塔 (delegated_coordinator) の child dispatch decision / no-dispatch decision (許容理由 vocabulary) / parent callback と multi-recipient callback target (親→子 delegation 判断、子→孫 dispatch 判断、delegation_parent と owning US / audit coordinator への callback coverage を親が検査できる fields) / process gap correction (parent close・owner approval・release gate bypass の是正経路) の durable record schema 正本。role 語彙は role-profile spec、dispatch / bandwidth / 孫 dispatch policy は coordinator-sublane-development-flow spine を参照し複製しない。
+    audit_role: delegated_coordinator_decision_records_spec
+    related_document_refs:
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-cockpit-display
+      - logic-existing-project-sublane-adoption
+      - rule-release-distribution
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: spec-delegation-policy-project-config
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegation-policy-project-config.md
+    purpose: delegated coordinator / grandchild dispatch の project config knob (`enable_delegated_coordinator` / `enable_grandchild_dispatch` / `max_delegation_depth` / `max_active_child_lanes` / window policy / decision record policy) の schema field contract、fail-closed 規約、緩めてよい運用しきい値と固定 safety invariant (owner approval / parent close / durable anchor / hidden subagent 禁止 / callback) の境界、安全側 default の正本。
+    audit_role: delegation_policy_project_config_spec
+    related_document_refs:
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-cockpit-display
+      - logic-unit-presentation-state-db
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-vscode-agent-pane-contract
     type: spec
     status: active
@@ -411,6 +459,7 @@ documents:
       - logic-managed-state-model
       - logic-event-timeline-source
       - logic-tmux-send-safety-contract
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -474,6 +523,7 @@ documents:
       - logic-managed-state-model
       - logic-session-inventory
       - logic-workspace-registry
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -486,6 +536,7 @@ documents:
     related_document_refs:
       - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
       - spec-project-map
 
@@ -506,17 +557,40 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、仕様決定 routing、US close 権限、sublane retirement、後続 Version / US 提案順序を定義する repo-local 開発フロー spine。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、後続 Version / US 提案順序を定義する repo-local 開発フロー spine。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
       - logic-worktree-lifecycle-boundary
       - logic-unit-target-model
       - logic-managed-state-model
       - logic-session-inventory
       - logic-tmux-send-safety-contract
+      - logic-delegated-coordinator-cockpit-display
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-existing-project-sublane-adoption
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/existing-project-sublane-adoption.md
+    purpose: 既存プロジェクトへ governed scaffold と sublane 運用を導入するための runbook。read-only preflight、root adoption、既存 routing / catalog の保持、verification、origin 到達性、callback recovery、Redmine close gate を再現可能な adoption 手順として定義する。
+    audit_role: existing_project_sublane_adoption_logic
+    related_document_refs:
+      - logic-scaffold-rules
+      - logic-bootstrap
+      - logic-coordinator-sublane-development-flow
+      - spec-delegated-coordinator-decision-records
+      - logic-delegated-coordinator-cockpit-display
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-executive-terminal-setup
+      - logic-workspace-registry
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
       - skill-workflow-reference
       - spec-project-map
 
@@ -585,7 +659,41 @@ documents:
       - logic-iterm-webviewer-presentation-boundary
       - logic-cockpit-attention-state
       - logic-cross-project-cockpit-smoke-runbook
+      - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-delegated-coordinator-cockpit-display
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-cockpit-display.md
+    purpose: 親 coordinator → 委譲 (子) coordinator → 孫 implementation lane の shallow delegation における window 分離 (既定 separate / project policy で調整可能)、parent reference display metadata、cockpit 最小追跡 contract、context-free smoke 観点、retire owner と ancestor-before-descendant retirement ordering を display 投影として routing/governance から分離して固定する設計正本。
+    audit_role: delegated_coordinator_cockpit_display_logic
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-pane-centric-cockpit-semantics
+      - logic-cockpit-attention-state
+      - logic-unit-presentation-state-db
+      - logic-unit-target-model
+      - logic-worktree-lifecycle-boundary
+      - spec-delegation-policy-project-config
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-role-profile-handoff-expansion
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/role-profile-handoff-expansion.md
+    purpose: handoff send / init 送信側が固定 role profile template を runtime で解決し、structured pointer field (role_profile / profile_source / profile_version) と完全解決 contract を durable delivery record + 単一行 pane pointer として展開する設計正本。template missing は fail-closed、未指定は明示 fallback、routing landing marker は不変。
+    audit_role: role_profile_handoff_expansion_logic
+    related_document_refs:
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
       - spec-project-map
 
   - id: logic-cockpit-web-ui
@@ -800,6 +908,37 @@ file_conventions:
     severity: warn
     document_refs:
       - spec-project-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-delegated-coordinator-runtime-source
+    name: delegated coordinator runtime and projection source
+    patterns:
+      - src/mozyo_bridge/domain/delegation_launch_adopt.py
+      - src/mozyo_bridge/application/delegation_launch_adopt.py
+      - src/mozyo_bridge/domain/grandchild_dispatch.py
+      - src/mozyo_bridge/application/grandchild_dispatch.py
+      - src/mozyo_bridge/domain/grandchild_stamp.py
+      - src/mozyo_bridge/application/grandchild_stamp.py
+      - src/mozyo_bridge/domain/delegation_projection.py
+      - src/mozyo_bridge/domain/delegation_display.py
+      - src/mozyo_bridge/domain/delegated_coordinator_route_plan.py
+      - src/mozyo_bridge/domain/redmine_read_boundary.py
+      - tests/test_delegation_launch_adopt.py
+      - tests/test_grandchild_dispatch.py
+      - tests/test_grandchild_stamp.py
+      - tests/test_delegation_projection.py
+      - tests/scenarios/test_delegated_coordinator_route_plan.py
+      - tests/regressions/test_issue_12474_delegated_route_gaps.py
+      - tests/support/delegation_route_fakes.py
+    severity: block
+    document_refs:
+      - logic-delegated-coordinator-cockpit-display
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
 

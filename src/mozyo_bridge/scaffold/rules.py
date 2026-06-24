@@ -53,6 +53,7 @@ PRESET_FILES_CATEGORY_PREFIXES: dict[str, str] = {
     "tmux-ui": ".mozyo-bridge/tmux/",
     "nagger": ".claude-nagger/",
     "worktree-runbook": "vibes/docs/logics/",
+    "sublane-flow": "vibes/docs/profiles/",
 }
 PRESET_FILES_CATEGORIES = frozenset(PRESET_FILES_CATEGORY_PREFIXES.keys())
 
@@ -63,7 +64,19 @@ PRESET_FILES_CATEGORIES = frozenset(PRESET_FILES_CATEGORY_PREFIXES.keys())
 # way (Redmine #11955) because adoption is per-project and the docs are
 # generic, public-safe operator recipes rather than always-on guardrail
 # artifacts.
-PRESET_FILES_OPT_IN_CATEGORIES = frozenset({"worktree-runbook"})
+#
+# `sublane-flow` (Redmine #12362 / #12363) is the second opt-in category.
+# Beyond shipping its portable profile doc under `vibes/docs/profiles/`,
+# enabling it also activates a thin sublane-flow read-route in the
+# generated routers (see ``SUBLANE_FLOW_CATEGORY`` and
+# ``render_router_pair``). A plain apply keeps sublane flow out of every
+# runtime-active entrypoint; the route appears only on opt-in.
+PRESET_FILES_OPT_IN_CATEGORIES = frozenset({"worktree-runbook", "sublane-flow"})
+
+# The opt-in category that, in addition to shipping docs, toggles the
+# router read-route variant. Kept as a named constant so the router
+# selector and the CLI flag wiring agree on the exact label.
+SUBLANE_FLOW_CATEGORY = "sublane-flow"
 
 # Opt-out categories are everything that is not opt-in: default-on
 # artifacts an operator can drop with `--skip-<category>`.
@@ -269,6 +282,22 @@ def router_template_text(filename: str) -> str:
     )
 
 
+def router_template_filename(output_filename: str, *, sublane_flow: bool) -> str:
+    """Map a router output filename to the template variant to read.
+
+    The base apply reads ``AGENTS.md`` / ``CLAUDE.md`` from ``_router/``.
+    When the ``--with-sublane-flow`` opt-in is enabled the scaffold reads
+    the ``AGENTS.sublane.md`` / ``CLAUDE.sublane.md`` variants instead —
+    these carry the extra read-route section — while still writing the
+    result to the target as ``AGENTS.md`` / ``CLAUDE.md``. Both variants
+    are canonical-rendered from the same source so they cannot drift.
+    """
+    if not sublane_flow:
+        return output_filename
+    stem, _, suffix = output_filename.rpartition(".")
+    return f"{stem}.sublane.{suffix}"
+
+
 def installed_preset_dir(
     preset: str,
     home: Path | None = None,
@@ -436,11 +465,13 @@ def render_router_pair(
     workflow_path: Path,
     *,
     repo_local: bool = False,
+    sublane_flow: bool = False,
 ) -> list[RenderedFile]:
     context = router_context(preset, target, workflow_path, repo_local=repo_local)
     files = []
     for filename in ("AGENTS.md", "CLAUDE.md"):
-        template = Template(router_template_text(filename))
+        template_filename = router_template_filename(filename, sublane_flow=sublane_flow)
+        template = Template(router_template_text(template_filename))
         files.append(RenderedFile(Path(filename), template.safe_substitute(context)))
     return files
 
@@ -537,6 +568,17 @@ def _effective_skip_categories(
     enabled = _normalize_with_categories(with_categories)
     default_skipped = PRESET_FILES_OPT_IN_CATEGORIES - enabled
     return frozenset(skip | default_skipped)
+
+
+def sublane_flow_enabled(with_categories: set[str] | None) -> bool:
+    """Return True when the ``sublane-flow`` opt-in category is enabled.
+
+    Reuses ``_normalize_with_categories`` so an unknown / opt-out label
+    fails the same way it does for the file-shipping path, and so the
+    router-route toggle and the doc-shipping toggle key off one validated
+    set. The empty / None case is the default-off path (no route added).
+    """
+    return SUBLANE_FLOW_CATEGORY in _normalize_with_categories(with_categories)
 
 
 def render_preset_extra_files(
@@ -736,7 +778,13 @@ def render_scaffold_files(
     target = target.expanduser().resolve()
     store = _resolve_scaffold_store(target, home, repo_local)
     workflow_path = require_installed_preset(preset, store=store)
-    rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
+    rendered = render_router_pair(
+        preset,
+        target,
+        workflow_path,
+        repo_local=store.is_repo_local,
+        sublane_flow=sublane_flow_enabled(with_categories),
+    )
     rendered = apply_project_local_preservation(rendered, target)
     extras = render_preset_extra_files(
         preset, skip_categories=skip_categories, with_categories=with_categories
@@ -786,7 +834,13 @@ def write_scaffold(
     target = target.expanduser().resolve()
     store = _resolve_scaffold_store(target, home, repo_local)
     workflow_path = require_installed_preset(preset, store=store)
-    rendered = render_router_pair(preset, target, workflow_path, repo_local=store.is_repo_local)
+    rendered = render_router_pair(
+        preset,
+        target,
+        workflow_path,
+        repo_local=store.is_repo_local,
+        sublane_flow=sublane_flow_enabled(with_categories),
+    )
     rendered = apply_project_local_preservation(rendered, target)
     extras = render_preset_extra_files(
         preset, skip_categories=skip_categories, with_categories=with_categories

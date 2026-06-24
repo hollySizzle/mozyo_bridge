@@ -18,7 +18,9 @@ from typing import Optional
 
 from .constants import (
     ALLOWED_PROJECTIONS,
+    DEFAULT_DELEGATION_WINDOW_POLICY,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
+    DELEGATION_WINDOW_POLICY_MODES,
     PRESENTATION_GROUPING_VERSION,
     PROJECT_GROUP_PRESENTATION_MODES,
 )
@@ -127,5 +129,29 @@ def _checked_project_group_presentation(
         raise PresentationGroupingConfigError(
             f"{source} 'project_group_presentation' must be one of "
             f"{sorted(PROJECT_GROUP_PRESENTATION_MODES)} when present, got {value!r}"
+        )
+    return value
+
+
+def _checked_delegation_window_policy(
+    record: "Mapping[object, object]", *, source: str
+) -> str:
+    """Return the desired delegated-coordinator window-separation policy, fail-closed.
+
+    ``delegation_window_policy`` is optional and defaults to
+    :data:`DEFAULT_DELEGATION_WINDOW_POLICY` (``separate``), so a missing field
+    preserves the documented default. Any value outside
+    :data:`DELEGATION_WINDOW_POLICY_MODES` — including a boundary- / authority-
+    shaped string — is rejected rather than silently normalized; the policy is a
+    closed display-only vocabulary, never a routing / approval target (Redmine
+    #12467).
+    """
+    value = record.get(
+        "delegation_window_policy", DEFAULT_DELEGATION_WINDOW_POLICY
+    )
+    if not isinstance(value, str) or value not in DELEGATION_WINDOW_POLICY_MODES:
+        raise PresentationGroupingConfigError(
+            f"{source} 'delegation_window_policy' must be one of "
+            f"{sorted(DELEGATION_WINDOW_POLICY_MODES)} when present, got {value!r}"
         )
     return value

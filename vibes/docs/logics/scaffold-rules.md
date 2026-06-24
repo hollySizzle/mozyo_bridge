@@ -285,6 +285,38 @@ must not add another runbook file.
   shipped docs, and do not add a core `git worktree add/remove` lifecycle
   command — worktree lifecycle stays a runbook/recipe, not core CLI.
 
+### Opt-in: sublane-flow
+
+The `sublane-flow` category (Redmine #12362 / #12363) makes the sublane
+development flow a **runtime-active** reference only on opt-in. It is the
+one opt-in category that goes beyond shipping a doc: enabling it also
+toggles a thin read-route section in the generated routers.
+
+- Prefix: `vibes/docs/profiles/`. Flag: `--with-sublane-flow` on
+  `scaffold apply` / `scaffold diff`. Disjoint from the
+  `worktree-runbook` prefix (`vibes/docs/logics/`) so the two opt-ins are
+  independent; enable either or both.
+- **Ships** the portable profile doc
+  `vibes/docs/profiles/sublane-flow-runtime-profile.md`, the opt-in
+  entrypoint that routes to the distributed `mozyo-bridge-agent` skill
+  workflow reference sublane sections (and, when also opted in, the
+  `worktree-runbook` lifecycle doc).
+- **Toggles** a router read-route: a `sublane_route` fragment in the
+  canonical source `router.yaml` is emitted only for the
+  `sublane_flow: enabled` output variants (`_router/AGENTS.sublane.md` /
+  `_router/CLAUDE.sublane.md`). `render_router_pair(..., sublane_flow=...)`
+  selects the variant; `sublane_flow_enabled(with_categories)` derives the
+  flag. A plain apply renders the base templates with no route. After
+  editing the canonical source, rerun `mozyo-bridge scaffold canonical`
+  and recommit; `--check` gates drift.
+- Router stays thin: the route is a pointer section above
+  Project-Local Additions, never the inlined long-form workflow body.
+- **Catalog refs are not auto-written**, same governed invariant as
+  `worktree-runbook`: the scaffold never mutates `.mozyo-bridge/docs/catalog.yaml`.
+- Private operator policy (lane count, cockpit composition, absolute
+  paths, session naming) is never shipped in the distributed default;
+  adopters define their own operating profile.
+
 ## Preset: none
 
 The `none` preset is a minimal router preset for projects without a ticket system.

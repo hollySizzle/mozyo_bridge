@@ -250,6 +250,46 @@ class CanonicalRendererTest(unittest.TestCase):
         self.assertIn(shared_opening, codex)
         self.assertIn(shared_opening, claude)
 
+    def test_sublane_route_only_in_opt_in_variant(self) -> None:
+        """The sublane read-route fragment is gated on `sublane_flow`.
+
+        Redmine #12362 / #12363: the route activates only when the output
+        context carries `sublane_flow: enabled`. The base tool contexts
+        must render byte-for-byte as before (no route), and the four
+        committed outputs split base vs `.sublane.` accordingly.
+        """
+        from mozyo_bridge.scaffold.canonical import (
+            collect_render_results,
+            load_canonical_source,
+            render_for_context,
+        )
+
+        heading = "## サブレーン開発フロー (opt-in profile)"
+        source = load_canonical_source(ROOT / self.SOURCE_RELATIVE)
+
+        # Base contexts (no sublane_flow key) never emit the route.
+        for tool in ("codex", "claude"):
+            self.assertNotIn(heading, render_for_context(source, {"tool": tool}))
+            # The opt-in context adds the route and points at the doc.
+            opt = render_for_context(
+                source, {"tool": tool, "sublane_flow": "enabled"}
+            )
+            self.assertIn(heading, opt)
+            self.assertIn(
+                "vibes/docs/profiles/sublane-flow-runtime-profile.md", opt
+            )
+
+        # The committed outputs match: only the `.sublane.` variants carry
+        # the route, and the base templates stay thin.
+        by_name = {
+            result.output_path.name: result.rendered
+            for result in collect_render_results(ROOT)
+        }
+        self.assertNotIn(heading, by_name["AGENTS.md"])
+        self.assertNotIn(heading, by_name["CLAUDE.md"])
+        self.assertIn(heading, by_name["AGENTS.sublane.md"])
+        self.assertIn(heading, by_name["CLAUDE.sublane.md"])
+
     def test_render_preserves_project_local_marker_pair(self) -> None:
         from mozyo_bridge.scaffold.canonical import (
             load_canonical_source,

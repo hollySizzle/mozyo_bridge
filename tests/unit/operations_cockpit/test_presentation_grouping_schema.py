@@ -32,13 +32,21 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.presentation_grouping import (
     ALLOWED_PROJECTIONS,
+    DEFAULT_DELEGATION_WINDOW_POLICY,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
+    DELEGATION_WINDOW_POLICY_MODES,
+    DELEGATION_WINDOW_POLICY_SEPARATE,
+    DELEGATION_WINDOW_POLICY_SHARED,
+    DELEGATION_WINDOW_STATUS_DIAGNOSTIC,
+    DELEGATION_WINDOW_STATUS_NONE,
+    DELEGATION_WINDOW_STATUS_RESOLVED,
     PROJECT_GROUP_PRESENTATION_MODES,
     PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
     PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
     PresentationGroupingConfig,
     PresentationGroupingConfigError,
+    resolve_delegation_window_display,
 )
 
 
@@ -372,6 +380,187 @@ class ProjectGroupPresentationTest(unittest.TestCase):
                 }
             ),
         )
+
+
+class DelegationWindowPolicyConfigTest(unittest.TestCase):
+    """The #12467 ``delegation_window_policy`` display knob: default / round-trip /
+    fail-closed. A closed display-only vocabulary that never becomes routing
+    authority, mirroring the ``project_group_presentation`` contract."""
+
+    def test_default_is_separate(self) -> None:
+        config = PresentationGroupingConfig.from_record(None)
+        self.assertEqual(
+            config.delegation_window_policy, DEFAULT_DELEGATION_WINDOW_POLICY
+        )
+        self.assertEqual(
+            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SEPARATE
+        )
+
+    def test_missing_field_preserves_default(self) -> None:
+        config = PresentationGroupingConfig.from_record({"version": 1})
+        self.assertEqual(
+            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SEPARATE
+        )
+
+    def test_explicit_modes_round_trip(self) -> None:
+        for mode in (
+            DELEGATION_WINDOW_POLICY_SEPARATE,
+            DELEGATION_WINDOW_POLICY_SHARED,
+        ):
+            config = PresentationGroupingConfig.from_record(
+                {"delegation_window_policy": mode}
+            )
+            self.assertEqual(config.delegation_window_policy, mode)
+
+    def test_invalid_value_fails_closed(self) -> None:
+        with self.assertRaises(PresentationGroupingConfigError):
+            PresentationGroupingConfig.from_record(
+                {"delegation_window_policy": "split_screen"}
+            )
+
+    def test_authority_shaped_value_fails_closed(self) -> None:
+        # An authority / routing-shaped value is not a known policy -> rejected;
+        # the window policy can never become a routing / approval target.
+        for value in ("route_to_owner", "approve", "%5", True, 1):
+            with self.assertRaises(PresentationGroupingConfigError):
+                PresentationGroupingConfig.from_record(
+                    {"delegation_window_policy": value}
+                )
+
+    def test_mode_set_is_exactly_the_two_documented_policies(self) -> None:
+        self.assertEqual(
+            DELEGATION_WINDOW_POLICY_MODES,
+            frozenset(
+                {
+                    DELEGATION_WINDOW_POLICY_SEPARATE,
+                    DELEGATION_WINDOW_POLICY_SHARED,
+                }
+            ),
+        )
+
+    def test_coexists_with_project_group_presentation(self) -> None:
+        # The two top-level display knobs are independent fields.
+        config = PresentationGroupingConfig.from_record(
+            {
+                "project_group_presentation": PROJECT_GROUP_PRESENTATION_TMUX_WINDOW,
+                "delegation_window_policy": DELEGATION_WINDOW_POLICY_SHARED,
+            }
+        )
+        self.assertEqual(
+            config.project_group_presentation, PROJECT_GROUP_PRESENTATION_TMUX_WINDOW
+        )
+        self.assertEqual(
+            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SHARED
+        )
+
+
+class DelegationWindowResolverTest(unittest.TestCase):
+    """The #12467 display-only resolver: separate/shared projection over the
+    closed #12466 delegated-tree breadcrumb, fail-soft and non-authoritative."""
+
+    def _resolve(self, policy, **kw):
+        base = dict(
+            lane_kind="implementation",
+            delegation_depth=2,
+            delegation_unit="wsA/deleg",
+            delegation_root="wsA/root",
+            status="derived",
+        )
+        base.update(kw)
+        return resolve_delegation_window_display(policy, **base)
+
+    def test_separate_keeps_grandchild_in_its_own_window(self) -> None:
+        win = self._resolve(DELEGATION_WINDOW_POLICY_SEPARATE)
+        self.assertTrue(win.separated)
+        self.assertEqual(win.window_group, "wsA/deleg")
+        self.assertEqual(win.status, DELEGATION_WINDOW_STATUS_RESOLVED)
+        self.assertEqual(win.policy, DELEGATION_WINDOW_POLICY_SEPARATE)
+
+    def test_shared_folds_grandchild_onto_tree_root(self) -> None:
+        win = self._resolve(DELEGATION_WINDOW_POLICY_SHARED)
+        self.assertFalse(win.separated)
+        self.assertEqual(win.window_group, "wsA/root")
+        self.assertEqual(win.status, DELEGATION_WINDOW_STATUS_RESOLVED)
+
+    def test_delegated_coordinator_depth1_follows_policy(self) -> None:
+        sep = self._resolve(
+            DELEGATION_WINDOW_POLICY_SEPARATE,
+            lane_kind="delegated_coordinator",
+            delegation_depth=1,
+        )
+        self.assertTrue(sep.separated)
+        self.assertEqual(sep.window_group, "wsA/deleg")
+        shared = self._resolve(
+            DELEGATION_WINDOW_POLICY_SHARED,
+            lane_kind="delegated_coordinator",
+            delegation_depth=1,
+        )
+        self.assertFalse(shared.separated)
+        self.assertEqual(shared.window_group, "wsA/root")
+
+    def test_root_is_always_its_own_window_regardless_of_policy(self) -> None:
+        for policy in (
+            DELEGATION_WINDOW_POLICY_SEPARATE,
+            DELEGATION_WINDOW_POLICY_SHARED,
+        ):
+            win = self._resolve(
+                policy,
+                lane_kind="coordinator",
+                delegation_depth=0,
+                delegation_unit="wsA/root",
+            )
+            self.assertTrue(win.separated)
+            self.assertEqual(win.window_group, "wsA/root")
+            self.assertEqual(win.status, DELEGATION_WINDOW_STATUS_RESOLVED)
+
+    def test_no_delegation_fact_yields_none_status(self) -> None:
+        win = self._resolve(
+            DELEGATION_WINDOW_POLICY_SEPARATE,
+            lane_kind="",
+            delegation_depth=None,
+            status="none",
+        )
+        self.assertEqual(win.status, DELEGATION_WINDOW_STATUS_NONE)
+        self.assertFalse(win.separated)
+        self.assertEqual(win.window_group, "")
+        # The effective policy is still echoed so the surface is explicit.
+        self.assertEqual(win.policy, DELEGATION_WINDOW_POLICY_SEPARATE)
+
+    def test_diagnostic_tree_withholds_decision(self) -> None:
+        win = self._resolve(
+            DELEGATION_WINDOW_POLICY_SHARED,
+            lane_kind="coordinator",
+            delegation_depth=None,
+            status="diagnostic",
+        )
+        self.assertEqual(win.status, DELEGATION_WINDOW_STATUS_DIAGNOSTIC)
+        self.assertFalse(win.separated)
+        self.assertEqual(win.window_group, "")
+
+    def test_unexpected_policy_degrades_to_default(self) -> None:
+        # The display layer never raises on a drifted policy; the config layer is
+        # the fail-closed boundary. An unknown value resolves under the default.
+        win = self._resolve("bogus")
+        self.assertEqual(win.policy, DEFAULT_DELEGATION_WINDOW_POLICY)
+        self.assertTrue(win.separated)  # default `separate`
+
+    def test_payload_carries_no_routing_or_authority_field(self) -> None:
+        payload = self._resolve(DELEGATION_WINDOW_POLICY_SHARED).as_payload()
+        self.assertEqual(
+            set(payload),
+            {"window_policy", "window_separated", "window_group", "window_status"},
+        )
+        forbidden = {
+            "target",
+            "pane_id",
+            "route",
+            "send",
+            "approval",
+            "close",
+            "role",
+            "repo_root",
+        }
+        self.assertEqual(forbidden & set(payload), set())
 
 
 if __name__ == "__main__":

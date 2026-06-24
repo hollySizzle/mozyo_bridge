@@ -1933,6 +1933,274 @@ class ScaffoldRulesTest(unittest.TestCase):
         for runbook_path in self.WORKTREE_RUNBOOK_PATHS:
             self.assertIn(runbook_path, paths)
 
+    # ------------------------------------------------------------------
+    # Redmine #12362 / #12363: opt-in sublane-flow runtime profile.
+    # `--with-sublane-flow` ships a portable profile doc AND toggles a
+    # thin sublane read-route in the generated routers. Default scaffold
+    # must keep sublane flow out of every runtime-active entrypoint.
+    # ------------------------------------------------------------------
+    SUBLANE_PROFILE_PATH = "vibes/docs/profiles/sublane-flow-runtime-profile.md"
+    SUBLANE_ROUTE_HEADING = "## サブレーン開発フロー (opt-in profile)"
+
+    def test_sublane_flow_is_off_by_default(self) -> None:
+        """A plain governed `scaffold apply` adds no sublane runtime route.
+
+        Default-off (Redmine #12362): the profile doc is not written, the
+        manifest does not track it, and neither generated router carries
+        the sublane read-route section. Single-lane projects stay light.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    state = scaffold_state(project)
+                    assert state is not None
+                    tracked = set(state["files"].keys())
+                    self.assertFalse(
+                        (project / self.SUBLANE_PROFILE_PATH).exists(),
+                        msg="default apply wrote opt-in sublane profile doc",
+                    )
+                    self.assertNotIn(self.SUBLANE_PROFILE_PATH, tracked)
+                    for router in ("AGENTS.md", "CLAUDE.md"):
+                        body = (project / router).read_text(encoding="utf-8")
+                        self.assertNotIn(
+                            self.SUBLANE_ROUTE_HEADING,
+                            body,
+                            msg=f"default {router} carries the sublane read-route",
+                        )
+
+    def test_sublane_flow_installs_with_flag(self) -> None:
+        """`--with-sublane-flow` ships the profile doc + router read-route.
+
+        Option-on installs the portable profile doc, tracks it in the
+        manifest, and adds the thin read-route section to BOTH generated
+        routers. Per the governed invariant the scaffold never creates or
+        mutates `catalog.yaml`, and `scaffold status` stays clean.
+        """
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            with self.subTest(preset=preset):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp) / "home"
+                    project = Path(tmp) / "project"
+                    project.mkdir()
+                    self.run_cli(["rules", "install", "--home", str(home)])
+
+                    result, _ = self.run_cli(
+                        [
+                            "scaffold",
+                            "apply",
+                            preset,
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                            "--with-sublane-flow",
+                        ]
+                    )
+                    self.assertEqual(0, result)
+
+                    state = scaffold_state(project)
+                    assert state is not None
+                    tracked = set(state["files"].keys())
+                    self.assertTrue(
+                        (project / self.SUBLANE_PROFILE_PATH).exists(),
+                        msg="--with-sublane-flow did not write the profile doc",
+                    )
+                    self.assertIn(self.SUBLANE_PROFILE_PATH, tracked)
+
+                    # Both routers carry the thin read-route section, and
+                    # the route points at the profile doc rather than
+                    # inlining the long-form workflow body.
+                    for router in ("AGENTS.md", "CLAUDE.md"):
+                        body = (project / router).read_text(encoding="utf-8")
+                        self.assertIn(self.SUBLANE_ROUTE_HEADING, body)
+                        self.assertIn(self.SUBLANE_PROFILE_PATH, body)
+                        self.assertIn(
+                            "skills/mozyo-bridge-agent/references/workflow.md",
+                            (project / self.SUBLANE_PROFILE_PATH).read_text(
+                                encoding="utf-8"
+                            ),
+                        )
+
+                    # Redmine #12432: the opt-in profile must give adopters a
+                    # read-route to the existing-project adoption procedure
+                    # (distilled into the distributed skill workflow reference),
+                    # so `--with-sublane-flow` reaches it without the repo-local
+                    # runbook.
+                    profile_body = (project / self.SUBLANE_PROFILE_PATH).read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertIn(
+                        "## Existing-Project Sublane Adoption",
+                        profile_body,
+                        msg="sublane profile lost the existing-project adoption read-route",
+                    )
+
+                    # B1 invariant: scaffold never auto-writes catalog.yaml.
+                    self.assertFalse(
+                        (project / ".mozyo-bridge/docs/catalog.yaml").exists(),
+                        msg="sublane opt-in apply must not auto-write catalog.yaml",
+                    )
+
+                    status_result, status_out = self.run_cli(
+                        [
+                            "scaffold",
+                            "status",
+                            "--target",
+                            str(project),
+                            "--home",
+                            str(home),
+                        ]
+                    )
+                    self.assertEqual(0, status_result)
+                    self.assertIn("clean", status_out)
+
+    def test_sublane_flow_diff_matches_opt_in_behavior(self) -> None:
+        """`scaffold diff` mirrors the apply opt-in gating.
+
+        A default diff against an empty target must not mention the
+        sublane route or profile doc; the `--with-sublane-flow` diff must
+        surface both. This keeps preview and apply in lockstep.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+
+            default_code, default_out = self.run_cli(
+                [
+                    "scaffold",
+                    "diff",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.assertEqual(1, default_code)  # empty target → changes
+            self.assertNotIn(self.SUBLANE_ROUTE_HEADING, default_out)
+            self.assertNotIn(self.SUBLANE_PROFILE_PATH, default_out)
+
+            optin_code, optin_out = self.run_cli(
+                [
+                    "scaffold",
+                    "diff",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                    "--with-sublane-flow",
+                ]
+            )
+            self.assertEqual(1, optin_code)
+            self.assertIn(self.SUBLANE_ROUTE_HEADING, optin_out)
+            self.assertIn(self.SUBLANE_PROFILE_PATH, optin_out)
+
+    def test_sublane_flow_library_surface_round_trips(self) -> None:
+        """Library callers key both the doc and the route off one set.
+
+        `render_preset_extra_files(with_categories={"sublane-flow"})`
+        surfaces the profile doc, and `sublane_flow_enabled` + the
+        `render_router_pair(sublane_flow=...)` selector add the route only
+        when enabled. An unknown / opt-out label is rejected the same way
+        the file-shipping path rejects it.
+        """
+        from mozyo_bridge.scaffold.rules import (
+            installed_agent_workflow,
+            render_preset_extra_files,
+            render_router_pair,
+            sublane_flow_enabled,
+        )
+
+        # Validation parity with the file-shipping path.
+        self.assertFalse(sublane_flow_enabled(None))
+        self.assertFalse(sublane_flow_enabled(set()))
+        self.assertTrue(sublane_flow_enabled({"sublane-flow"}))
+        with self.assertRaises(SystemExit):
+            sublane_flow_enabled({"nagger"})
+
+        extras = render_preset_extra_files(
+            "redmine-governed", with_categories={"sublane-flow"}
+        )
+        paths = {item.path.as_posix() for item in extras}
+        self.assertIn(self.SUBLANE_PROFILE_PATH, paths)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self.run_cli(["rules", "install", "--home", str(home)])
+            workflow = installed_agent_workflow("redmine-governed", home)
+            base = render_router_pair(
+                "redmine-governed", Path(tmp), workflow, sublane_flow=False
+            )
+            opt = render_router_pair(
+                "redmine-governed", Path(tmp), workflow, sublane_flow=True
+            )
+            for item in base:
+                self.assertNotIn(self.SUBLANE_ROUTE_HEADING, item.content)
+            for item in opt:
+                self.assertIn(self.SUBLANE_ROUTE_HEADING, item.content)
+                self.assertIn(self.SUBLANE_PROFILE_PATH, item.content)
+
+    def test_sublane_flow_profile_doc_excludes_private_operating_policy(self) -> None:
+        """The shipped profile doc stays portable (Redmine #12362).
+
+        Private operator-specific elements (lane counts, cockpit
+        composition, absolute paths, session naming) must NOT be baked
+        into the distributed default. The doc routes to the portable
+        skill workflow reference instead of inlining policy.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        copies: list[bytes] = []
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            packaged = (
+                repo_root
+                / "src/mozyo_bridge/scaffold/presets"
+                / preset
+                / "files"
+                / self.SUBLANE_PROFILE_PATH
+            )
+            with self.subTest(preset=preset):
+                self.assertTrue(packaged.is_file(), msg=f"missing: {packaged}")
+                text = packaged.read_text(encoding="utf-8")
+                # Routes to the portable distributed entrypoint.
+                self.assertIn(
+                    "skills/mozyo-bridge-agent/references/workflow.md", text
+                )
+                # No leaked operator home / absolute path.
+                self.assertNotIn("/Users/", text)
+                self.assertNotIn("/home/", text)
+                # Explicitly carves out private operating policy.
+                self.assertIn("private operating policy", text)
+                copies.append(packaged.read_bytes())
+
+        # Both governed presets ship the identical portable doc; pin them
+        # so a future edit to one is mirrored to the other.
+        self.assertEqual(
+            copies[0],
+            copies[1],
+            msg="sublane profile doc drifted between governed presets",
+        )
+
     def test_governed_doctor_reports_skipped_after_skip_with_backup(self) -> None:
         """`--skip-* --backup` opt-out: doctor must use the manifest, not disk.
 
