@@ -195,6 +195,25 @@ class ResolveStampPlanTest(unittest.TestCase):
             )
         self.assertIn("depth 2", str(ctx.exception))
 
+    def test_grandchild_must_declare_a_live_pane(self) -> None:
+        # A valid depth-2 implementation grandchild, but declared for derivation
+        # only (no pane): stamping it would write no live grandchild breadcrumb,
+        # reintroducing the #12460 PARTIAL-display gap. Fail closed (j#64105).
+        with self.assertRaises(GrandchildStampError) as ctx:
+            resolve_grandchild_stamp_plan(
+                _chain(gc_panes=()), grandchild_unit=GC_UNIT,
+                realization=REALIZATION_LAUNCH,
+            )
+        self.assertIn("no live pane", str(ctx.exception))
+
+    def test_grandchild_empty_string_pane_is_not_a_live_pane(self) -> None:
+        # An empty-string pane is not a live pane and must not satisfy the guard.
+        with self.assertRaises(GrandchildStampError):
+            resolve_grandchild_stamp_plan(
+                _chain(gc_panes=("",)), grandchild_unit=GC_UNIT,
+                realization=REALIZATION_LAUNCH,
+            )
+
     def test_unknown_parent_fails_closed(self) -> None:
         lanes = [
             DeclaredLane(
@@ -341,6 +360,21 @@ class CmdStampTest(unittest.TestCase):
         self.assertEqual(0, rc)
         run.assert_not_called()
         self.assertIn("preview (no tmux mutation)", out)
+
+    def test_grandchild_without_pane_fails_closed(self) -> None:
+        # The CLI must reject a grandchild lane declared with no pane= (j#64105):
+        # a realization record without a live grandchild breadcrumb is not a PASS.
+        args = _stamp_args(
+            lane=[
+                f"kind=coordinator,unit={PARENT_UNIT},parent=-",
+                f"kind=delegated_coordinator,unit={DELEG_UNIT},parent={PARENT_UNIT},pane=%15",
+                f"kind=implementation,unit={GC_UNIT},parent={DELEG_UNIT}",
+            ],
+            realization=REALIZATION_LAUNCH,
+            adopt_reason=None,
+        )
+        with self.assertRaises(SystemExit):
+            self._run(args)
 
     def test_json_surface(self) -> None:
         rc, out = self._run(_stamp_args(as_json=True))

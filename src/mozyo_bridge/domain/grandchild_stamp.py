@@ -157,11 +157,16 @@ def resolve_grandchild_stamp_plan(
        :class:`DelegationProjectionError` is re-raised as a
        :class:`GrandchildStampError` so the caller has one error type.
     3. **Grandchild acceptance shape.** ``grandchild_unit`` must be present in
-       the tree, be a :data:`LANE_KIND_IMPLEMENTATION` lane, and derive to
-       :data:`GRANDCHILD_DEPTH` (2) — the #12473 acceptance (``KIND`` /
-       ``DEPTH`` / ``PARENT``). A decision / same-lane-worker-only realization
-       that does not form the depth-2 implementation lane fails closed here
-       rather than stamping a half-formed tree.
+       the tree, be a :data:`LANE_KIND_IMPLEMENTATION` lane, derive to
+       :data:`GRANDCHILD_DEPTH` (2), **and declare at least one live pane** —
+       the #12473 acceptance (``KIND`` / ``DEPTH`` / ``PARENT`` on a *visible*
+       grandchild lane). Ancestor lanes may be derivation-only (no panes), but
+       the realized grandchild may not: a derivation-only grandchild would emit
+       a realization record without writing any live grandchild breadcrumb,
+       reintroducing the #12460 ``PARTIAL-display`` gap (Redmine #12473 review
+       j#64105). A decision / same-lane-worker-only realization that does not
+       form the depth-2 implementation lane with a stampable pane fails closed
+       here rather than stamping a half-formed tree.
 
     The stamp values come straight from the declared lanes (the durable
     declaration), so the written options equal the derived projection; only the
@@ -219,6 +224,23 @@ def resolve_grandchild_stamp_plan(
             f"{GRANDCHILD_DEPTH} (parent -> delegated -> grandchild); got depth "
             f"{grandchild.delegation_depth}. A decision / same-lane-worker-only "
             "route does not form a depth-2 grandchild display (Redmine #12460)."
+        )
+    # The realized grandchild lane must carry at least one live pane to stamp.
+    # Ancestors may be derivation-only (panes=()), but a derivation-only
+    # grandchild would emit a realization record without writing any live
+    # grandchild KIND/DEPTH/PARENT breadcrumb — the #12460 PARTIAL-display gap
+    # (Redmine #12473 review j#64105). grandchild_unit is in the tree, so exactly
+    # one declared lane carries it (derive_delegation_tree rejects duplicates).
+    grandchild_lane = next(
+        lane for lane in declared_lanes if lane.unit_id == grandchild_unit
+    )
+    if not any(pane for pane in grandchild_lane.panes):
+        raise GrandchildStampError(
+            f"grandchild_unit {grandchild_unit!r} declares no live pane to stamp; "
+            "a realized grandchild must carry at least one pane= so its live "
+            "KIND/DEPTH/PARENT breadcrumb is written. A derivation-only grandchild "
+            "would record a realization without a visible grandchild lane "
+            "(Redmine #12460 PARTIAL-display / #12473 j#64105)."
         )
 
     commands: list[tuple[str, ...]] = []

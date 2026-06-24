@@ -54,11 +54,6 @@ from mozyo_bridge.domain.grandchild_stamp import (
 #: Tokens that declare "no parent" (tree root) in a ``--lane`` spec's ``parent=``.
 _ROOT_PARENT_TOKENS = frozenset({"", "-", "none", "root"})
 
-#: Non-zero exit when the plan cannot be built (invalid tree / shape), so a
-#: runtime / script detects "no stampable grandchild realization" without parsing
-#: text (mirrors the #12458 ``delegate-grandchild-dispatch`` fail-closed exit).
-_EXIT_PLAN_ERROR = 3
-
 
 def _parse_lane_spec(raw: str) -> DeclaredLane:
     """Parse one ``--lane`` spec into a :class:`DeclaredLane`.
@@ -189,8 +184,8 @@ def cmd_handoff_grandchild_stamp(args: argparse.Namespace) -> int:
     Builds the pure stamp plan from the declared chain, then previews (default)
     or applies (``--apply``, ``--dry-run`` wins) the ``set-option -p`` writes
     best-effort and prints the replayable ``## Grandchild lane realization``
-    record. Returns :data:`_EXIT_PLAN_ERROR` when the plan cannot be built
-    (invalid tree / shape) and ``0`` otherwise.
+    record. A plan that cannot be built (invalid tree / shape, or a grandchild
+    with no live pane) exits non-zero via ``die``; a built plan returns ``0``.
     """
     from mozyo_bridge.shared.errors import die
 
