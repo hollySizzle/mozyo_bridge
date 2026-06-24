@@ -83,23 +83,30 @@ bounded context の正本カタログは #12488 (Redmine Epic/Feature catalog,
 `110_...` 表示名) と、それを repo の ASCII snake_case directory 名へ正規化する
 対応表である。tests layout はこの対応表を **再利用**し、Redmine 階層を焼き込まない。
 
-#12488 j#64296 / j#64298 の Epic から導く working な正規化トークン (provisional):
+bounded context の **frozen な canonical ASCII トークン**は #12488 の対応表
+`vibes/docs/specs/bounded-context-map.md` (`## repo bounded context 定義` /
+`## 対応表`) を単一正本とする。tests / source はこのトークンを共有する:
 
-| Redmine Epic (#12488) | tests/source bounded context (ASCII) |
+| Redmine Epic (#12488) | tests/source bounded context (ASCII canonical) |
 |---|---|
-| `110_実行基盤・Routing` (#12501) | `routing` |
-| `120_運用Cockpit・表示` (#12502) | `cockpit` |
-| `130_統治・Scaffold配布` (#12503) | `governance` |
-| `140_Adapter・Provider基盤` (#12504) | `adapter` |
-| `150_品質・アーキテクチャ統治` (#12505) | `quality` |
-| `160_外部AgentUI連携` (#12506) | `agent_ui` |
+| `110_実行基盤・Routing` (#12501) | `execution_platform` |
+| `120_運用Cockpit・表示` (#12502) | `operations_cockpit` |
+| `130_統治・Scaffold配布` (#12503) | `governance_distribution` |
+| `140_Adapter・Provider基盤` (#12504) | `adapter_provider` |
+| `150_品質・アーキテクチャ統治` (#12505) | `quality_architecture` |
+| `160_外部AgentUI連携` (#12506) | `external_agent_ui` |
 
-> 依存・gap (明示): 上記 ASCII トークンは本 doc が tests 配置を一意化するための
-> **working set** であり、frozen な canonical 名ではない。source layout の
-> bounded context 正規化は #12492 / #12493 が所有し、#12488 の対応表が両者の
-> 単一正本になる。**tests と source は同一トークンを共有する**こと。tokens が
-> #12492 側で確定したら本表を対応表へのポインタに置き換える。本 doc は naming の
-> 一次正本を主張しない。
+> 正本: 上表のトークンは `bounded-context-map.md` の snapshot であり、naming の
+> 一次正本は同 doc + Redmine catalog (#12488)。`external_agent_ui` は
+> `experimental/vscode-agent-pane/` の PoC で `src/mozyo_bridge/` runtime tests を
+> 持たないため、現状 tests サブディレクトリは作らない (該当テストが現れた時点で
+> 追加)。
+>
+> 履歴: 本 doc 初版は provisional な working-set トークン (`routing` / `cockpit` /
+> `governance` / `adapter` / `quality` / `agent_ui`) を仮置きしていたが、coordinator
+> decision (Redmine #12490 j#64403, Option A) で #12488 canonical トークンへ統一し、
+> short token は **superseded** とした。tests と source は `bounded-context-map.md`
+> の canonical トークンを共有する。
 
 組み合わせ方:
 
@@ -110,24 +117,29 @@ bounded context の正本カタログは #12488 (Redmine Epic/Feature catalog,
 - **support** は context で細分しない (横断 helper)。context 固有 helper が必要に
   なったら `tests/support/<context>/` を後から足してよいが、初期は flat。
 
-## 目標 directory layout (To-Be / #12490 が実体化)
+## 目標 directory layout (To-Be / #12490 が実体化済み)
+
+context トークンは #12488 canonical (`execution_platform` / `operations_cockpit` /
+`governance_distribution` / `adapter_provider` / `quality_architecture` /
+`external_agent_ui`)。
 
 ```text
 tests/
-  __init__.py
+  __init__.py                  # src/ を sys.path へ bootstrap (discovery 順非依存)
   unit/
     __init__.py
-    routing/__init__.py        test_*.py
-    cockpit/__init__.py        test_*.py
-    governance/__init__.py     test_*.py
-    adapter/__init__.py        test_*.py
-    quality/__init__.py        test_*.py
-    agent_ui/__init__.py       test_*.py
+    execution_platform/__init__.py     test_*.py
+    operations_cockpit/__init__.py     test_*.py
+    governance_distribution/__init__.py test_*.py
+    adapter_provider/__init__.py       test_*.py
+    quality_architecture/__init__.py   test_*.py
   integration/
     __init__.py
-    routing/__init__.py        test_*.py
-    cockpit/__init__.py        test_*.py
-    ...
+    execution_platform/__init__.py     test_*.py
+    operations_cockpit/__init__.py     test_*.py
+    governance_distribution/__init__.py test_*.py
+    adapter_provider/__init__.py       test_*.py
+    quality_architecture/__init__.py   test_*.py
   scenarios/
     __init__.py                test_*.py
   regressions/
@@ -137,7 +149,13 @@ tests/
 ```
 
 存在しない context サブディレクトリは作らない (空 package を量産しない)。該当
-テストが現れた時点で追加する。
+テストが現れた時点で追加する。#12490 初回移行では `scenarios` / `regressions` /
+`support` と `external_agent_ui` に該当ファイルが無かったため、それらのディレクトリは
+作成していない。
+
+> 移動後の `ROOT` 解決: フラット時代の `Path(__file__).resolve().parents[1]` は
+> `tests/<type>/<context>/` への移動で 2 階層深くなるため `parents[3]` に更新する。
+> import 順非依存の `src/` bootstrap は `tests/__init__.py` に集約する。
 
 ## discovery / CI 方針
 
@@ -210,18 +228,24 @@ python -m unittest discover -s tests -v
   integration)。
 - 破壊的 / 実 host / 実 network を要する受入は本 tests/ ではなく `smoke/**`。
 
-## #12490 への migration contract handoff
+## #12490 migration contract (実施結果)
 
-本 doc が固定し、#12490 が実装する:
+本 doc が固定し、#12490 が実装した (Redmine #12490 j#64403 coordinator Option A):
 
-- フラット 91 ファイルを決定木に従って type/context へ振り分ける (本 issue では
-  移動しない)。
-- 上記 `__init__.py` package 化を行い、`discover` コマンド不変・collected 数一致を
-  検証する。
+- フラット 91 ファイルのうち 87 を決定木 + #12488 canonical context map に従って
+  `tests/<type>/<context>/` へ移動した。`__init__.py` package 化を行い、`discover`
+  コマンド不変・collected 数一致 (移行前後ともに `Ran 2100 (skipped=2)`) を検証した。
 - `.mozyo-bridge/docs/catalog.yaml` の `fc-cockpit-grouped-projection-source` /
-  `fc-presentation-state-db-source` / `fc-state-store-source` などが個別 test path を
-  列挙している file_conventions を、移動後 path へ追随させ
-  `mozyo-bridge docs generate-file-conventions --repo . --check` を緑にする。
+  `fc-presentation-state-db-source` / `fc-state-store-source` が列挙していた個別
+  test path を移動後 path へ追随させ、`generate-file-conventions --check` を緑に保った。
+- 残 4 ファイル (`test_repo_local_config.py` / `test_repo_local_config_loader.py` /
+  `test_cli_repo_local_config_wiring.py` / `test_runtime_config_instruction.py`) は
+  subject (`repo_local_config` / runtime-config instruction) が #12488 map の 6
+  context のどれにも一意に割り当たらないため、**flat 直下に残す documented exception**
+  とした。理由: 複数 context (governance_distribution / quality_architecture /
+  adapter_provider) に等しく妥当で、guess を避け fail-closed する。期限・解消条件:
+  #12488 map が repo-local config の context を定義した時点、または owner 判断で
+  context を確定した時点で移動する (Feature #12533 source 配置と同期)。
 - module-health gate / CI / docs full discovery の最終監査は #12494 が所有する。
 
 ## Anti-patterns
