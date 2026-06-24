@@ -59,8 +59,9 @@ repo を 6 つの bounded context へ分ける。各 context は Redmine Epic 1 
   - state: `state_store.py`、`managed_events.py`、`domain/managed_marker.py`、`application/commands_state.py`
   - infra: `infrastructure/queue_reader.py`、`infrastructure/tmux_client.py`
 - 主要 tests: `tests/test_handoff_*.py`、`test_agent_*.py`、`test_session_*.py`、`test_workspace_registry.py`、`test_event_timeline.py`、`test_state_store*.py`。
-- 注: delegated coordinator の route-plan domain は未実装。classical test 化方針は #12474 j#64217、docs は
-  `vibes/docs/logics/delegated-coordinator-smoke-test-frame.md` / `coordinator-sublane-development-flow.md`。
+- 注: delegated coordinator の route-plan domain は未実装。classical test 化方針の正本は Redmine #12474
+  j#64209 / j#64217、関連 docs は `vibes/docs/logics/coordinator-sublane-development-flow.md`。
+  (#12474 の smoke-test-frame doc 化は別 branch にあり origin/main 未統合。merge 後に本 doc から参照を張る。)
 
 ### `operations_cockpit`
 
@@ -113,7 +114,7 @@ repo を 6 つの bounded context へ分ける。各 context は Redmine Epic 1 
   - test 構造 / source 配置: `tests/` 全体、本 doc
 - 主要 tests: `tests/test_module_health.py`、`test_cli_module_registry.py`、`test_mozyo_bridge.py` (構造 assertion)。
 - 関連 docs: 本 doc (`bounded-context-map.md`)、`module-health-gate.md`、`refactor-split-strategy.md`、
-  `delegated-coordinator-smoke-test-frame.md`、および downstream US #12489 / #12490 / Feature #12533。
+  `coordinator-sublane-development-flow.md`、および downstream US #12489 / #12490 / Feature #12533。
 
 ### `external_agent_ui`
 
@@ -154,8 +155,8 @@ context 境界とは直交する。`shared/` (`errors.py` / `name_compat.py` / `
   分離して評価する (#12474 受入条件)。
 - `adapter_provider`: Redmine read-boundary 分類 (allowed / insufficient / contaminated)。
   sparse anchor からの委任推論で、parent journals / sibling 越境読みを contamination 扱いする (#12474 j#64172 / j#64185)。
-- `quality_architecture`: 実機 E2E smoke を主検証にせず classical test harness へ落とす方針 (#12474 j#64209 /
-  j#64217、`delegated-coordinator-smoke-test-frame.md`)。
+- `quality_architecture`: 実機 E2E smoke を主検証にせず classical test harness へ落とす方針 (正本 Redmine
+  #12474 j#64209 / j#64217)。
 
 この作業を「handoff の話だから #12509 だけ」のように単一 node へ焼き込むと、cockpit 表示 / read-boundary /
 test 層の関係が失われる。よって delegated coordinator は **cross-cutting concern** として本節で束ね、各 context の
