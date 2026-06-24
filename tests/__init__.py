@@ -1,12 +1,16 @@
-"""Test package root.
+"""Test package root (Redmine #12490 type-first / bounded-context layout).
 
-Bootstraps the repo-local ``src/`` directory onto ``sys.path`` so that
-``import mozyo_bridge`` resolves to this checkout regardless of the order in
-which ``unittest discover`` imports the test modules. The flat layout relied on
-most test modules each inserting ``ROOT/"src"`` themselves; after the
-type-first / bounded-context migration (Redmine #12490) the tests live in
-``tests/<type>/<context>/`` packages, so the bootstrap is centralised here and
-runs once when the ``tests`` package is first imported — before any submodule.
+Note on src import: ``python -m unittest discover -s tests -v`` (the CI command)
+uses ``tests`` as ``top_level_dir`` and imports modules as
+``unit.<context>.test_*`` / ``integration.<context>.test_*`` — it does **not**
+import this ``tests`` package, so code here does not run under that command.
+Each test module therefore inserts the repo-local ``src/`` onto ``sys.path``
+itself, which keeps full discovery, subpackage-scoped discovery, and single-file
+discovery all self-sufficient regardless of import order.
+
+The bootstrap below only takes effect when ``tests`` is imported *as a package*
+(e.g. ``pytest`` with the project ``pythonpath``), and is a harmless no-op
+otherwise.
 """
 
 import sys

@@ -125,7 +125,7 @@ context トークンは #12488 canonical (`execution_platform` / `operations_coc
 
 ```text
 tests/
-  __init__.py                  # src/ を sys.path へ bootstrap (discovery 順非依存)
+  __init__.py                  # package marker (discover -s tests では import されない)
   unit/
     __init__.py
     execution_platform/__init__.py     test_*.py
@@ -155,7 +155,11 @@ tests/
 
 > 移動後の `ROOT` 解決: フラット時代の `Path(__file__).resolve().parents[1]` は
 > `tests/<type>/<context>/` への移動で 2 階層深くなるため `parents[3]` に更新する。
-> import 順非依存の `src/` bootstrap は `tests/__init__.py` に集約する。
+> `src/` の sys.path 投入は **各 test module が self-insert** する (repo の既存
+> idiom)。`python -m unittest discover -s tests` は `tests` を top_level_dir と
+> して扱い `tests/__init__.py` を import しないため、`tests/__init__.py` の
+> bootstrap には依存しない。これにより full / subpackage / single-file の
+> isolated discovery がすべて自己完結する (Redmine #12490 j#64426 review fix)。
 
 ## discovery / CI 方針
 

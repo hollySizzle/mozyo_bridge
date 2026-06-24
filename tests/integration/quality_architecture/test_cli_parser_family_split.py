@@ -16,6 +16,14 @@ from __future__ import annotations
 import argparse
 import unittest
 
+import sys
+from pathlib import Path
+
+# Self-contained src bootstrap so isolated discovery (unittest discover
+# scoped to this subpackage or a single file) imports mozyo_bridge without
+# relying on a sibling test inserting src first (Redmine #12490 j#64426).
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+
 from mozyo_bridge.application import (
     cli,
     cli_agents,

@@ -26,6 +26,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import sys
+
+# Self-contained src bootstrap so isolated discovery (unittest discover
+# scoped to this subpackage or a single file) imports mozyo_bridge without
+# relying on a sibling test inserting src first (Redmine #12490 j#64426).
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+
 from mozyo_bridge.domain.presentation_grouping import PresentationGroupingConfig
 from mozyo_bridge.domain.repo_local_config import REPO_LOCAL_CONFIG_VERSION
 from mozyo_bridge.presentation_state import (
