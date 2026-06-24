@@ -8,7 +8,12 @@ the receiver reads its role contract without guessing a template path. Missing
 templates fail closed; omitting the profile is the explicit fallback.
 """
 
+import sys
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.domain.handoff import (
     RedmineAnchor,

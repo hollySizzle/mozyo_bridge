@@ -24,9 +24,14 @@ import argparse
 import contextlib
 import io
 import json
+import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.grandchild_stamp import (

@@ -2169,7 +2169,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         into the distributed default. The doc routes to the portable
         skill workflow reference instead of inlining policy.
         """
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[3]
         copies: list[bytes] = []
         for preset in ("redmine-governed", "redmine-rails-governed"):
             packaged = (

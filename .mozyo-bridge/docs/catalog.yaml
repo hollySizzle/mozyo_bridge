@@ -924,10 +924,10 @@ file_conventions:
       - src/mozyo_bridge/domain/delegation_display.py
       - src/mozyo_bridge/domain/delegated_coordinator_route_plan.py
       - src/mozyo_bridge/domain/redmine_read_boundary.py
-      - tests/test_delegation_launch_adopt.py
-      - tests/test_grandchild_dispatch.py
-      - tests/test_grandchild_stamp.py
-      - tests/test_delegation_projection.py
+      - tests/unit/execution_platform/test_delegation_launch_adopt.py
+      - tests/unit/execution_platform/test_grandchild_dispatch.py
+      - tests/unit/execution_platform/test_grandchild_stamp.py
+      - tests/unit/execution_platform/test_delegation_projection.py
       - tests/scenarios/test_delegated_coordinator_route_plan.py
       - tests/regressions/test_issue_12474_delegated_route_gaps.py
       - tests/support/delegation_route_fakes.py
