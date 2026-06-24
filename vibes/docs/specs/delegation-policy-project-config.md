@@ -24,6 +24,10 @@ delegation policy config は repo-local の `.mozyo-bridge/config.yaml` に `del
 - config は **desired policy declaration**。実際の dispatch 可否は runtime preflight と spine の admission / bandwidth 判断が最終決定する (`unit-presentation-state-db.md` の desired/runtime 分離をそのまま継承)。
 - config が無い / `delegation:` section が無い project は、後述の **safety-biased default** で動く。delegation は default で無効なので、config 不在は「従来の単一 coordinator + sublane spine」と等価である。
 - config は portable / public-safe な値だけを持つ。private path / host topology / 個人名 / Redmine project 名・private lane naming を持たない (`rule-public-private-boundary`)。
+- config と decision record は actuator ではない。`enable_grandchild_dispatch: true`
+  や `delegation_window_policy: separate`、`delegated_dispatch_decision` が存在しても、
+  runtime が実際に孫 lane/window/worktree を作成または明示採用し、live metadata を
+  stamp / project しなければ 3-window display acceptance は満たさない。
 
 ## config knob schema (conceptual)
 
@@ -158,6 +162,10 @@ OSS default に入れてよいもの:
 3. invalid config diagnostic (unsupported version / out-of-range depth / authority-shaped key) の surface。
 4. `decision_record_policy` を spine の `### 孫 dispatch / context 保護` 記録粒度へ結線。
 5. delegation tree depth を Redmine parent link + dispatch journal から再導出し、config 上限との整合を検査する read model。
+6. grandchild dispatch actuator: `delegated_dispatch_decision` を、宣言済み
+   grandchild worktree/lane/window の作成または明示採用と live delegation metadata
+   stamping (`KIND` / `DEPTH` / `PARENT`) へ接続する。decision record / same-lane
+   worker handoff だけでは display full PASS としないことを regression smoke で固定する。
 
 各 task は runtime / tests を伴うため Claude implementer lane に回す。とくに config knob が固定 invariant (owner approval / parent close / durable anchor / hidden subagent 禁止 / callback) を緩められないこと、`enable_*: false` / config 不在が behavior-preserving (従来 spine) であることを test で固定する。
 

@@ -872,9 +872,12 @@ file_conventions:
     patterns:
       - src/mozyo_bridge/domain/delegation_launch_adopt.py
       - src/mozyo_bridge/application/delegation_launch_adopt.py
+      - src/mozyo_bridge/domain/grandchild_dispatch.py
+      - src/mozyo_bridge/application/grandchild_dispatch.py
       - src/mozyo_bridge/domain/delegation_projection.py
       - src/mozyo_bridge/domain/delegation_display.py
       - tests/test_delegation_launch_adopt.py
+      - tests/test_grandchild_dispatch.py
       - tests/test_delegation_projection.py
     severity: block
     document_refs:
