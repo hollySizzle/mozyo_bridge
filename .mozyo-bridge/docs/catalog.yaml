@@ -400,6 +400,23 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-acceptance-rerun-protocol
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/acceptance-rerun-protocol.md
+    purpose: "親→delegated coordinator→grandchild の 3層 window/lane 実機 acceptance smoke を closed Version 再オープンなしに再実行する protocol。baseline snapshot、失敗分類 (failed/blocked/contaminated/insufficient/environmental)、stale pane/worktree/journal の reset checklist、bounded-read 契約、evidence reuse vs reacquire、direct cross-lane Claude send / hidden subagent 禁止、rerun follow-up ticket policy を #12473/#12474 失敗知見から固定する。"
+    audit_role: acceptance_rerun_protocol_logic
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-unit-target-model
+      - logic-turnkey-e2e-acceptance
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-tmux-send-safety-contract
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-local-remote-cockpit-host-boundary
     type: logic
     status: active
@@ -672,6 +689,7 @@ documents:
     related_document_refs:
       - logic-bootstrap
       - logic-release-flow
+      - logic-acceptance-rerun-protocol
       - skill-release-reference
 
   - id: logic-autonomous-ticket-entrypoint
