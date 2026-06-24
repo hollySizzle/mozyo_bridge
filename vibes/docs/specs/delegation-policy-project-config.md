@@ -166,6 +166,15 @@ OSS default に入れてよいもの:
    grandchild worktree/lane/window の作成または明示採用と live delegation metadata
    stamping (`KIND` / `DEPTH` / `PARENT`) へ接続する。decision record / same-lane
    worker handoff だけでは display full PASS としないことを regression smoke で固定する。
+   (実装済み #12473: `mozyo-bridge handoff delegate-grandchild-stamp` が宣言済み
+   delegation chain を検証し、grandchild が depth 2 の `implementation` lane に
+   derive することを fail-closed で確認したうえで、discovery が読む
+   `@mozyo_lane_kind` / `@mozyo_delegation_parent` を live pane へ stamp する。
+   `delegation_depth` / `delegation_root` は parent chain から derive され pane
+   option には書かない。stamp は display/audit breadcrumb のみで routing authority
+   を持たない。regression は decision/same-lane-worker だけでは display が blank の
+   ままで、stamp 後に初めて `KIND=implementation` / `DEPTH=2` / `PARENT` が出ることを
+   固定する。)
 
 各 task は runtime / tests を伴うため Claude implementer lane に回す。とくに config knob が固定 invariant (owner approval / parent close / durable anchor / hidden subagent 禁止 / callback) を緩められないこと、`enable_*: false` / config 不在が behavior-preserving (従来 spine) であることを test で固定する。
 
