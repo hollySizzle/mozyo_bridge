@@ -278,6 +278,125 @@ def resolve_grandchild_stamp_plan(
     )
 
 
+# --- grandchild realization gate (Redmine #12474 QA / #12473 j#64151) ---------
+# The stamp plan above realizes a *declared* grandchild lane. This gate closes
+# the runtime-path hole the #12474 smoke exposed: the delegated coordinator could
+# resolve a grandchild dispatch decision and then silently fall through to a
+# same-lane worker handoff, leaving the grandchild unrealized and KIND/DEPTH/
+# PARENT blank. The gate maps "did the dispatch decision require a grandchild" +
+# "is one actually realized/stamped" to a replayable verdict, so a same-lane
+# handoff alone can never be treated as display acceptance when policy required
+# grandchild realization.
+
+#: A grandchild was required and a route-bound, stamped depth-2 implementation
+#: lane is realized: the worker handoff may proceed to that lane.
+GATE_REALIZED = "realized"
+#: A grandchild was required but none is realized/stamped: the runtime must
+#: record blocked replayably, never treat the same-lane handoff as acceptance.
+GATE_BLOCKED = "blocked"
+#: No grandchild was required (the dispatch decision was no_dispatch): a same-lane
+#: worker is the legitimate, policy-correct outcome.
+GATE_SAME_LANE_OK = "same_lane_ok"
+
+
+@dataclass(frozen=True)
+class RealizationGateResult:
+    """The realize-or-blocked verdict for a delegated-coordinator worker handoff."""
+
+    verdict: str
+    reason: str
+    grandchild_required: bool
+    realized_grandchild_unit: Optional[str]
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.verdict == GATE_BLOCKED
+
+    @property
+    def is_realized(self) -> bool:
+        return self.verdict == GATE_REALIZED
+
+
+def find_realized_grandchild_unit(
+    units: Sequence[tuple[str, str, Optional[int], str, str]],
+    *,
+    delegated_coordinator_unit: str,
+) -> Optional[str]:
+    """Return the unit_id of a route-bound, realized grandchild lane, or ``None``.
+
+    ``units`` is a sequence of ``(unit_id, lane_kind, delegation_depth,
+    delegation_parent, status)`` rows — one per discovered lane unit, derived by
+    the caller from ``delegation_display.derive_targets_delegation``. A *realized*
+    grandchild is a ``derived`` (not diagnostic / none) depth-:data:`GRANDCHILD_DEPTH`
+    :data:`LANE_KIND_IMPLEMENTATION` lane whose ``delegation_parent`` is
+    ``delegated_coordinator_unit``. Pure; the first match wins (the route is
+    one-grandchild-per-delegated-coordinator under the shallow-delegation model).
+    """
+    for unit_id, lane_kind, depth, parent, status in units:
+        if (
+            status == "derived"
+            and lane_kind == LANE_KIND_IMPLEMENTATION
+            and depth == GRANDCHILD_DEPTH
+            and parent == delegated_coordinator_unit
+        ):
+            return unit_id
+    return None
+
+
+def evaluate_grandchild_realization_gate(
+    *, grandchild_required: bool, realized_grandchild_unit: Optional[str]
+) -> RealizationGateResult:
+    """Gate the delegated-coordinator worker handoff on grandchild realization.
+
+    The #12474 QA finding (#12473 j#64151): a successful same-lane worker handoff
+    alone must NOT satisfy display acceptance when policy requires grandchild
+    realization. This maps the dispatch decision's grandchild requirement + the
+    live realization evidence to a replayable verdict:
+
+    - ``grandchild_required`` false (the dispatch decision was no_dispatch) ->
+      :data:`GATE_SAME_LANE_OK`: a same-lane worker is the legitimate outcome.
+    - required AND a route-bound depth-2 implementation lane is realized ->
+      :data:`GATE_REALIZED`: the worker handoff may proceed to that lane.
+    - required AND none realized -> :data:`GATE_BLOCKED`: the runtime must record
+      blocked replayably (create/adopt + ``delegate-grandchild-stamp`` first),
+      never treat the same-lane handoff as acceptance.
+
+    Pure and deterministic.
+    """
+    if not grandchild_required:
+        return RealizationGateResult(
+            verdict=GATE_SAME_LANE_OK,
+            reason=(
+                "dispatch decision did not require a grandchild lane "
+                "(no_dispatch); a same-lane worker is the legitimate outcome"
+            ),
+            grandchild_required=False,
+            realized_grandchild_unit=None,
+        )
+    if realized_grandchild_unit:
+        return RealizationGateResult(
+            verdict=GATE_REALIZED,
+            reason=(
+                "a route-bound depth-2 implementation grandchild lane is realized "
+                "and stamped; the worker handoff may proceed"
+            ),
+            grandchild_required=True,
+            realized_grandchild_unit=realized_grandchild_unit,
+        )
+    return RealizationGateResult(
+        verdict=GATE_BLOCKED,
+        reason=(
+            "grandchild_required_but_not_realized: the dispatch decision requires "
+            "a grandchild lane, but no route-bound depth-2 implementation lane is "
+            "stamped/visible. A same-lane worker handoff alone does not satisfy "
+            "display acceptance (Redmine #12460 / #12474 j#64151); create/adopt a "
+            "grandchild lane and run delegate-grandchild-stamp, or record blocked."
+        ),
+        grandchild_required=True,
+        realized_grandchild_unit=None,
+    )
+
+
 __all__ = (
     "REALIZATION_LAUNCH",
     "REALIZATION_ADOPT",
@@ -287,4 +406,10 @@ __all__ = (
     "DeclaredLane",
     "GrandchildStampPlan",
     "resolve_grandchild_stamp_plan",
+    "GATE_REALIZED",
+    "GATE_BLOCKED",
+    "GATE_SAME_LANE_OK",
+    "RealizationGateResult",
+    "find_realized_grandchild_unit",
+    "evaluate_grandchild_realization_gate",
 )

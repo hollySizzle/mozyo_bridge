@@ -48,8 +48,19 @@ from mozyo_bridge.domain.grandchild_stamp import (
     GrandchildStampPlan,
     REALIZATION_ADOPT,
     REALIZATIONS,
+    RealizationGateResult,
+    evaluate_grandchild_realization_gate,
+    find_realized_grandchild_unit,
     resolve_grandchild_stamp_plan,
 )
+
+#: Non-zero exit when the realization gate blocks (grandchild required but not
+#: realized), so the delegated-coordinator runtime can detect "do not proceed to
+#: a same-lane worker handoff" without parsing text, while the replayable gate
+#: record is still printed (same convention as the #12458 dispatch fail-closed
+#: exit). ``blocked`` is a valid recorded outcome, not a caller error, so it is
+#: returned rather than raised through ``die``.
+_EXIT_GATE_BLOCKED = 3
 
 #: Tokens that declare "no parent" (tree root) in a ``--lane`` spec's ``parent=``.
 _ROOT_PARENT_TOKENS = frozenset({"", "-", "none", "root"})
@@ -240,4 +251,118 @@ def cmd_handoff_grandchild_stamp(args: argparse.Namespace) -> int:
     return 0
 
 
-__all__ = ("cmd_handoff_grandchild_stamp",)
+def _discover_delegation_units(args: argparse.Namespace):
+    """Discover live lanes and derive their delegation breadcrumb per unit.
+
+    Returns a list of ``(unit_id, lane_kind, delegation_depth,
+    delegation_parent, status)`` rows folded per ``<workspace_id>/<lane_id>``
+    unit, ready for :func:`find_realized_grandchild_unit`. Reads ``agents
+    targets`` discovery; the delegation derivation is the same read-only #12466
+    projection ``agents targets`` itself uses.
+    """
+    from mozyo_bridge.application.commands import _agents_target_candidates
+    from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+    from mozyo_bridge.infrastructure.tmux_client import require_tmux
+
+    require_tmux()
+    candidates = _agents_target_candidates(args)
+    displays = derive_targets_delegation(candidates)
+    units: dict[str, tuple[str, object, str, str]] = {}
+    for cand in candidates:
+        unit_id = f"{getattr(cand, 'workspace_id', '') or ''}/{getattr(cand, 'lane_id', '') or ''}"
+        display = displays.get(cand.pane_id)
+        if display is None:
+            continue
+        # Prefer a derived row over a none/diagnostic one when a unit's panes
+        # disagree, so a realized grandchild is not masked by a blank sibling pane.
+        existing = units.get(unit_id)
+        if existing is None or (existing[3] != "derived" and display.status == "derived"):
+            units[unit_id] = (
+                display.lane_kind,
+                display.delegation_depth,
+                display.delegation_parent,
+                display.status,
+            )
+    return [
+        (unit_id, kind, depth, parent, status)
+        for unit_id, (kind, depth, parent, status) in units.items()
+    ]
+
+
+def _render_gate_record(
+    result: RealizationGateResult, args: argparse.Namespace
+) -> str:
+    """Pasteable ``## Grandchild realization gate`` record (Redmine #12474 / j#64151)."""
+    delegated = getattr(args, "delegated_coordinator_unit", None) or "<delegated_coordinator_unit>"
+    parent_issue = getattr(args, "parent_issue", None) or "<parent_issue>"
+    child_issue = getattr(args, "child_issue", None) or "<child_issue>"
+    lines = [
+        "## Grandchild realization gate",
+        "",
+        "- record_kind: grandchild_realization_gate",
+        f"- verdict: {result.verdict}",
+        f"- grandchild_required: {str(result.grandchild_required).lower()}",
+        f"- parent_issue: {parent_issue}",
+        f"- child_issue: {child_issue}",
+        f"- delegated_coordinator_unit: {delegated}",
+        f"- realized_grandchild_unit: {result.realized_grandchild_unit or 'none'}",
+        f"- reason: {result.reason}",
+        "- enforcement: a same-lane worker handoff alone does not satisfy display "
+        "acceptance when grandchild realization is required (#12460 / #12474 j#64151).",
+    ]
+    if result.is_blocked:
+        lines.append(
+            "- remediation: create/adopt a route-bound grandchild lane/window, run "
+            "`handoff delegate-grandchild-stamp`, then re-run this gate; or record "
+            "blocked replayably. Do not proceed to a same-lane worker handoff as "
+            "if it were a display PASS."
+        )
+    lines.append(
+        "- projection_note: KIND/DEPTH/PARENT are display/audit breadcrumb only; "
+        "never routing authority. No direct cross-lane Claude send; no hidden subagent."
+    )
+    return "\n".join(lines)
+
+
+def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
+    """Gate a delegated-coordinator worker handoff on grandchild realization (#12473 j#64151).
+
+    Reads ``agents targets`` discovery, derives each lane's delegation breadcrumb,
+    looks for a route-bound depth-2 ``implementation`` grandchild lane under
+    ``--delegated-coordinator-unit``, and evaluates the realize-or-blocked gate.
+    Prints the replayable ``## Grandchild realization gate`` record and returns
+    :data:`_EXIT_GATE_BLOCKED` when the gate blocks (a grandchild is required but
+    none is realized) so the runtime records blocked replayably instead of
+    silently treating a same-lane worker handoff as display acceptance. Returns
+    ``0`` for a ``realized`` or ``same_lane_ok`` verdict.
+    """
+    units = _discover_delegation_units(args)
+    realized = find_realized_grandchild_unit(
+        units, delegated_coordinator_unit=args.delegated_coordinator_unit
+    )
+    result = evaluate_grandchild_realization_gate(
+        grandchild_required=bool(getattr(args, "require_grandchild", True)),
+        realized_grandchild_unit=realized,
+    )
+
+    if getattr(args, "as_json", False):
+        payload = {
+            "verdict": result.verdict,
+            "grandchild_required": result.grandchild_required,
+            "delegated_coordinator_unit": args.delegated_coordinator_unit,
+            "realized_grandchild_unit": result.realized_grandchild_unit,
+            "reason": result.reason,
+            "blocked": result.is_blocked,
+            "gate_record": _render_gate_record(result, args),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f"verdict: {result.verdict}")
+        print(f"reason: {result.reason}")
+        print("")
+        print(_render_gate_record(result, args))
+
+    return _EXIT_GATE_BLOCKED if result.is_blocked else 0
+
+
+__all__ = ("cmd_handoff_grandchild_stamp", "cmd_handoff_grandchild_gate")

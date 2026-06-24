@@ -144,6 +144,18 @@ display / audit breadcrumb のみで、routing authority を持たず direct cro
 send も hidden subagent も使わない。replay は `## Grandchild lane realization`
 durable record による。
 
+さらに #12474 QA (#12473 j#64151) で判明したとおり、stamp actuator が存在するだけでは
+不十分で、delegated coordinator の runtime path が grandchild dispatch decision を
+解決した後に **same-lane worker handoff へ silent に fall through** すると grandchild
+は未実体化のまま KIND/DEPTH/PARENT が blank に残る。これを塞ぐ realize-or-blocked
+gate を #12473 で実装した: `mozyo-bridge handoff delegate-grandchild-gate` が live
+discovery から「delegated coordinator 配下に route-bound な depth-2 `implementation`
+lane が realize/stamp されているか」を判定し、`realized` (worker handoff 続行可) /
+`same_lane_ok` (no_dispatch で grandchild 不要) / `blocked` (grandchild 必須だが未実体化)
+を返す。`blocked` は非ゼロ終了し replayable な `## Grandchild realization gate` record を
+残すので、grandchild realization が必要な場面で **same-lane worker handoff 単独を
+display PASS として扱えない**。gate も display/audit のみで routing authority を持たない。
+
 ### project policy で調整可能な部分
 
 window をまとめたい project は、`unit-presentation-state-db.md` の repo-local

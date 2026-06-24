@@ -31,6 +31,7 @@ from unittest import mock
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.grandchild_stamp import (
     _parse_lane_spec,
+    cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
 )
 from mozyo_bridge.domain.delegation_projection import (
@@ -39,9 +40,14 @@ from mozyo_bridge.domain.delegation_projection import (
 )
 from mozyo_bridge.domain.grandchild_stamp import (
     DeclaredLane,
+    GATE_BLOCKED,
+    GATE_REALIZED,
+    GATE_SAME_LANE_OK,
     GrandchildStampError,
     REALIZATION_ADOPT,
     REALIZATION_LAUNCH,
+    evaluate_grandchild_realization_gate,
+    find_realized_grandchild_unit,
     resolve_grandchild_stamp_plan,
 )
 
@@ -498,6 +504,143 @@ class Issue12460RegressionTest(unittest.TestCase):
         self.assertEqual("2", depth)
         self.assertEqual("mozyo/lane-deleg", parent)
         self.assertEqual("derived", display["%16"].status)
+
+
+class RealizationGateTest(unittest.TestCase):
+    """The realize-or-blocked gate (#12473 j#64151 / #12474 QA)."""
+
+    def test_not_required_is_same_lane_ok(self) -> None:
+        r = evaluate_grandchild_realization_gate(
+            grandchild_required=False, realized_grandchild_unit=None
+        )
+        self.assertEqual(GATE_SAME_LANE_OK, r.verdict)
+        self.assertFalse(r.is_blocked)
+
+    def test_required_and_realized(self) -> None:
+        r = evaluate_grandchild_realization_gate(
+            grandchild_required=True, realized_grandchild_unit="mozyo/gc"
+        )
+        self.assertEqual(GATE_REALIZED, r.verdict)
+        self.assertTrue(r.is_realized)
+        self.assertEqual("mozyo/gc", r.realized_grandchild_unit)
+
+    def test_required_and_not_realized_is_blocked(self) -> None:
+        # The #12474 failure shape: grandchild required, none realized.
+        r = evaluate_grandchild_realization_gate(
+            grandchild_required=True, realized_grandchild_unit=None
+        )
+        self.assertEqual(GATE_BLOCKED, r.verdict)
+        self.assertTrue(r.is_blocked)
+        self.assertIn("grandchild_required_but_not_realized", r.reason)
+
+
+class FindRealizedGrandchildTest(unittest.TestCase):
+    def _rows(self):
+        return [
+            ("gk/p", "coordinator", 0, None, "derived"),
+            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived"),
+            ("mozyo/gc", "implementation", 2, "mozyo/d", "derived"),
+        ]
+
+    def test_finds_realized_grandchild(self) -> None:
+        self.assertEqual(
+            "mozyo/gc",
+            find_realized_grandchild_unit(self._rows(), delegated_coordinator_unit="mozyo/d"),
+        )
+
+    def test_wrong_parent_no_match(self) -> None:
+        self.assertIsNone(
+            find_realized_grandchild_unit(self._rows(), delegated_coordinator_unit="other/x")
+        )
+
+    def test_diagnostic_status_no_match(self) -> None:
+        rows = [("mozyo/gc", "implementation", 2, "mozyo/d", "diagnostic")]
+        self.assertIsNone(
+            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+        )
+
+    def test_wrong_depth_no_match(self) -> None:
+        # A same-lane worker masquerading at depth 1 is not a realized grandchild.
+        rows = [("mozyo/gc", "implementation", 1, "mozyo/d", "derived")]
+        self.assertIsNone(
+            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+        )
+
+    def test_none_depth_no_match(self) -> None:
+        rows = [("mozyo/gc", "implementation", None, "mozyo/d", "derived")]
+        self.assertIsNone(
+            find_realized_grandchild_unit(rows, delegated_coordinator_unit="mozyo/d")
+        )
+
+
+def _gate_args(**over) -> argparse.Namespace:
+    base = dict(
+        delegated_coordinator_unit="mozyo/d",
+        require_grandchild=True,
+        parent_issue="12454",
+        child_issue="12484",
+        session=None,
+        as_json=False,
+    )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+class CmdGateTest(unittest.TestCase):
+    _PATCH = "mozyo_bridge.application.grandchild_stamp._discover_delegation_units"
+
+    def _run(self, args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_handoff_grandchild_gate(args)
+        return rc, buf.getvalue()
+
+    def test_blocked_when_required_and_no_grandchild(self) -> None:
+        # Exactly the #12474 live shape: only delegated coordinator, no grandchild.
+        rows = [("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived")]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args())
+        self.assertEqual(3, rc)
+        self.assertIn("verdict: blocked", out)
+        self.assertIn("## Grandchild realization gate", out)
+        self.assertIn("remediation:", out)
+
+    def test_realized_when_grandchild_present(self) -> None:
+        rows = [
+            ("mozyo/d", "delegated_coordinator", 1, "gk/p", "derived"),
+            ("mozyo/gc", "implementation", 2, "mozyo/d", "derived"),
+        ]
+        with mock.patch(self._PATCH, return_value=rows):
+            rc, out = self._run(_gate_args())
+        self.assertEqual(0, rc)
+        self.assertIn("verdict: realized", out)
+
+    def test_same_lane_ok_when_not_required(self) -> None:
+        with mock.patch(self._PATCH, return_value=[]):
+            rc, out = self._run(_gate_args(require_grandchild=False))
+        self.assertEqual(0, rc)
+        self.assertIn("verdict: same_lane_ok", out)
+
+    def test_json_surface(self) -> None:
+        with mock.patch(self._PATCH, return_value=[]):
+            rc, out = self._run(_gate_args(as_json=True))
+        self.assertEqual(3, rc)
+        payload = json.loads(out)
+        self.assertEqual("blocked", payload["verdict"])
+        self.assertTrue(payload["blocked"])
+        self.assertIsNone(payload["realized_grandchild_unit"])
+
+
+class GateParserRegistrationTest(unittest.TestCase):
+    def test_gate_subcommand_registered(self) -> None:
+        parser = build_parser()
+        ns = parser.parse_args([
+            "handoff", "delegate-grandchild-gate",
+            "--delegated-coordinator-unit", "mozyo/d",
+            "--no-require-grandchild",
+        ])
+        self.assertEqual("cmd_handoff_grandchild_gate", ns.func.__name__)
+        self.assertFalse(ns.require_grandchild)
 
 
 if __name__ == "__main__":

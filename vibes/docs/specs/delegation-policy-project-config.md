@@ -174,7 +174,11 @@ OSS default に入れてよいもの:
    option には書かない。stamp は display/audit breadcrumb のみで routing authority
    を持たない。regression は decision/same-lane-worker だけでは display が blank の
    ままで、stamp 後に初めて `KIND=implementation` / `DEPTH=2` / `PARENT` が出ることを
-   固定する。)
+   固定する。さらに #12474 QA (#12473 j#64151) を受け、stamp actuator だけでは runtime
+   path が silent に same-lane worker handoff へ落ちる穴を塞ぐ realize-or-blocked gate
+   `handoff delegate-grandchild-gate` を追加: grandchild 必須かつ未実体化なら `blocked`
+   を非ゼロ終了で replayable に記録し、same-lane worker handoff 単独を display PASS と
+   して扱わない。)
 
 各 task は runtime / tests を伴うため Claude implementer lane に回す。とくに config knob が固定 invariant (owner approval / parent close / durable anchor / hidden subagent 禁止 / callback) を緩められないこと、`enable_*: false` / config 不在が behavior-preserving (従来 spine) であることを test で固定する。
 

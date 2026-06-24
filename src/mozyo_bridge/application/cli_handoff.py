@@ -40,6 +40,7 @@ from mozyo_bridge.application.grandchild_dispatch import (
     cmd_handoff_grandchild_dispatch,
 )
 from mozyo_bridge.application.grandchild_stamp import (
+    cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
 )
 from mozyo_bridge.domain.delegation_launch_adopt import LAUNCH_ADOPT_MODES
@@ -456,6 +457,7 @@ def register(sub) -> None:
     _register_delegate_launch_adopt(handoff_sub)
     _register_grandchild_dispatch(handoff_sub)
     _register_grandchild_stamp(handoff_sub)
+    _register_grandchild_gate(handoff_sub)
 
     reply_alias = sub.add_parser(
         "reply",
@@ -970,3 +972,93 @@ def _register_grandchild_stamp(handoff_sub) -> None:
         help="Emit the plan, derived projections, and realization record as JSON.",
     )
     parser.set_defaults(func=cmd_handoff_grandchild_stamp)
+
+
+def _register_grandchild_gate(handoff_sub) -> None:
+    """Register `handoff delegate-grandchild-gate` (Redmine #12473 j#64151).
+
+    The realize-or-blocked gate that closes the #12474 runtime-path hole: a
+    delegated coordinator could resolve a grandchild dispatch decision and then
+    silently fall through to a same-lane worker handoff, leaving the grandchild
+    unrealized and KIND/DEPTH/PARENT blank. This gate reads `agents targets`
+    discovery, looks for a route-bound depth-2 `implementation` grandchild lane
+    under the delegated coordinator unit, and returns `realized` /
+    `same_lane_ok` / `blocked`. `blocked` (grandchild required but none realized)
+    exits non-zero with a replayable record so the runtime records blocked
+    instead of treating a same-lane worker handoff as display acceptance. It
+    sends nothing, holds no routing authority, and never promotes
+    window/session/title/proximity into a route.
+    """
+    parser = handoff_sub.add_parser(
+        "delegate-grandchild-gate",
+        help=(
+            "Gate a delegated-coordinator worker handoff on grandchild "
+            "realization: realized / same_lane_ok / blocked (Redmine #12473 "
+            "j#64151)"
+        ),
+        description=(
+            "Realize-or-blocked gate for the delegated coordinator -> grandchild "
+            "runtime path (Redmine #12473 j#64151, #12474 QA). A grandchild "
+            "dispatch decision that requires a separate grandchild lane "
+            "(dispatch_launch / dispatch_adopt) must not silently fall through to "
+            "a same-lane worker handoff. This command reads `agents targets` "
+            "discovery, derives each lane's delegation breadcrumb (the same "
+            "read-only #12466 projection), and checks for a route-bound depth-2 "
+            "`implementation` grandchild lane whose parent is "
+            "`--delegated-coordinator-unit`. Verdict: `realized` (proceed), "
+            "`same_lane_ok` (`--no-require-grandchild`, the dispatch was "
+            "no_dispatch), or `blocked` (a grandchild is required but none is "
+            "realized/stamped) — `blocked` exits non-zero with a replayable "
+            "`## Grandchild realization gate` record so the runtime records "
+            "blocked instead of treating a same-lane worker handoff as a display "
+            "PASS. Read-only over discovery; sends nothing; holds no routing "
+            "authority; never promotes window/session/title/proximity into a "
+            "route. Remediation for `blocked`: create/adopt a grandchild "
+            "lane/window and run `handoff delegate-grandchild-stamp`, then re-run "
+            "this gate."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--delegated-coordinator-unit",
+        dest="delegated_coordinator_unit",
+        required=True,
+        metavar="workspace_id/lane_id",
+        help=(
+            "The delegated coordinator lane unit; a realized grandchild is a "
+            "depth-2 `implementation` lane whose `delegation_parent` is this unit."
+        ),
+    )
+    parser.add_argument(
+        "--no-require-grandchild",
+        dest="require_grandchild",
+        action="store_false",
+        default=True,
+        help=(
+            "Declare the dispatch decision did NOT require a grandchild lane "
+            "(a no_dispatch / low-context same-lane outcome), so a same-lane "
+            "worker is the legitimate verdict. Default (fail-closed) assumes a "
+            "grandchild IS required, so an unrealized grandchild blocks."
+        ),
+    )
+    parser.add_argument(
+        "--parent-issue",
+        dest="parent_issue",
+        help="Parent issue / US id recorded in the gate record.",
+    )
+    parser.add_argument(
+        "--child-issue",
+        dest="child_issue",
+        help="Child (grandchild-target) issue id recorded in the gate record.",
+    )
+    parser.add_argument(
+        "--session",
+        help="Restrict candidate discovery to this tmux session (read-only filter).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the gate verdict, realized grandchild unit, and record as JSON.",
+    )
+    parser.set_defaults(func=cmd_handoff_grandchild_gate)
