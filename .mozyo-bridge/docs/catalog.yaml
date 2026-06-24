@@ -102,6 +102,18 @@ documents:
     audit_role: project_map_spec
     related_document_refs:
       - skill-project-map-reference
+      - spec-bounded-context-map
+
+  - id: spec-bounded-context-map
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/bounded-context-map.md
+    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine 階層を焼き込まず横断作業を分類する。
+    audit_role: bounded_context_map_spec
+    related_document_refs:
+      - spec-project-map
+      - logic-coordinator-sublane-development-flow
+      - logic-module-health-gate
 
   - id: spec-vscode-agent-pane-contract
     type: spec
