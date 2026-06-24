@@ -131,6 +131,43 @@ implementation-shaped work では sublane dispatch が default である。Main-
 
 すべて満たし ready implementation work がある場合、dispatch が preferred action である。ready work を残して管制塔が止まる場合、または default-lane Claude に直接渡す場合は、その状態で直列実行の方が効率的または安全である理由を記録する。
 
+### Implementation Request Preflight
+
+`mozyo-bridge handoff send --kind implementation_request` を実行する直前に、管制塔は次の
+preflight を同一 issue の durable record へ照合する。これは上記 `### Admission Rule`
+の実行時 checklist であり、別の正本を増やすものではない。
+
+```yaml
+implementation_request_preflight:
+  required_before_send:
+    - work_shape を分類済み
+    - target が sublane / main-unit / default-lane のどれかを明示済み
+    - sublane を使わない場合は main_lane_exception を先に journal 記録済み
+  default:
+    implementation_shaped_work: sublane_dispatch
+  valid_main_lane_exception:
+    - read_only_investigation
+    - summary_or_draft
+    - design_consultation_preparation
+    - urgent_minimal_correction_with_durable_reason
+    - explicit_owner_or_operator_exception
+  invalid_main_lane_exception:
+    - stale_lane_avoidance_only
+    - pane_already_open
+    - default_claude_is_nearby
+    - old_issue_lane_is_inconvenient
+  stop_condition:
+    - work_shape が implementation かつ target が main/default Claude で、
+      有効な main_lane_exception journal が無い場合は送信しない
+    - sublane candidate が無い場合は、送信ではなく sublane create/adopt または
+      blocked/retry plan を記録する
+```
+
+この preflight は pane 選択を routing authority に昇格させない。target pane が一意に
+見えても、implementation-shaped work の default は sublane dispatch である。例外は
+「既存 lane が使いづらい」ではなく、main lane で処理する方が安全または速いことを
+durable record から説明できる場合だけである。
+
 ### Pipeline Dispatch Check
 
 待つかどうかを決める前に、次の quick classification を使う。
