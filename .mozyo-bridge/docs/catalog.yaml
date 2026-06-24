@@ -653,6 +653,23 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-delegated-coordinator-smoke-test-frame
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-smoke-test-frame.md
+    purpose: "#12474 系の親子孫 delegated coordinator 実機 smoke を、context contamination / bounded-read / role profile 展開 / grandchild realization / live projection の観点へ分解し、classical tests と薄い実機 E2E へ役割分担するための test frame 正本。"
+    audit_role: delegated_coordinator_smoke_test_frame_logic
+    related_document_refs:
+      - logic-delegated-coordinator-cockpit-display
+      - logic-role-profile-handoff-expansion
+      - logic-coordinator-sublane-development-flow
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-role-profile-handoff-expansion
     type: logic
     status: active
