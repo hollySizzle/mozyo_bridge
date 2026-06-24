@@ -44,12 +44,9 @@ CODEX_SKILL_INSTALL_HINT = (
     "curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main"
     "/scripts/install_codex_skill.sh | sh"
 )
-# Use `command | VAR=value sh` so the env var actually reaches the script.
-# `VAR=value curl ... | sh` sets the var only for curl, not for the downstream
-# sh, which then runs with the script's default scope. The script now defaults
-# to `global`, so the explicit `MOZYO_BRIDGE_CLAUDE_SCOPE=global` keeps the hint
-# intent-clear and robust against any future default change, and is required to
-# select any non-default scope (e.g. the legacy `project` opt-in).
+# Use `command | VAR=value sh` so the env var reaches the downstream sh, not just
+# curl. The script defaults to `global`; the explicit `MOZYO_BRIDGE_CLAUDE_SCOPE=global`
+# documents intent and is required to select non-default scopes (e.g. legacy `project`).
 CLAUDE_GLOBAL_SKILL_INSTALL_HINT = (
     "curl -fsSL https://raw.githubusercontent.com/hollySizzle/mozyo_bridge/main"
     "/scripts/install_claude_skill.sh | MOZYO_BRIDGE_CLAUDE_SCOPE=global sh"

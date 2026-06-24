@@ -79,14 +79,10 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1855
+    lines: 1852
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
-      with each new diagnostic section. Baseline raised 1852 -> 1855 on the
-      #12494 v0.10.13 integration, reconciling the #12360 install-scope hint
-      comment expansion (3-line clarification, commit 4411778) that arrived via
-      the #12491 chain without a baseline bump; this is a comment-only growth,
-      not new logic. doctor.py decomposition remains owned by #12468.
+      with each new diagnostic section.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
