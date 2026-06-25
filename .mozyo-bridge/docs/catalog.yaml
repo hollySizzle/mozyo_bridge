@@ -153,6 +153,26 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-delegated-route-live-executor
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegated-route-live-executor.md
+    purpose: #12550 の pure planner / operator-confirmed command plan を、cockpit lane/window append/adopt、stamp、handoff send、Redmine record package へ接続する live executor / actuator contract。
+    audit_role: delegated_route_live_executor_spec
+    related_document_refs:
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-smoke-test-frame
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegation-policy-project-config
     type: spec
     status: active
@@ -935,8 +955,10 @@ file_conventions:
       - src/mozyo_bridge/domain/cockpit_layout.py
       - src/mozyo_bridge/domain/delegation_project_config.py
       - src/mozyo_bridge/domain/delegation_route_planner.py
+      - src/mozyo_bridge/domain/delegation_route_executor.py
       - src/mozyo_bridge/domain/route_identity_ledger.py
       - src/mozyo_bridge/domain/handoff_route_identity.py
+      - src/mozyo_bridge/application/delegation_route_executor.py
       - src/mozyo_bridge/application/cli_handoff.py
       - src/mozyo_bridge/application/cli_cockpit.py
       - src/mozyo_bridge/domain/delegation_launch_adopt.py
@@ -959,6 +981,8 @@ file_conventions:
       - tests/test_delegation_projection.py
       - tests/test_delegation_project_config.py
       - tests/test_delegation_route_planner.py
+      - tests/test_delegation_route_executor.py
+      - tests/test_delegation_route_executor_integration.py
       - tests/test_handoff_same_lane_gateway.py
       - tests/test_cockpit_lane_identity.py
       - tests/test_route_identity_ledger.py
@@ -969,6 +993,7 @@ file_conventions:
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
       - spec-delegated-coordinator-decision-records
+      - spec-delegated-route-live-executor
       - spec-route-identity-ledger
       - spec-delegated-coordinator-role-profile
       - logic-coordinator-sublane-development-flow

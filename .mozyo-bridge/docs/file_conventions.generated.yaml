@@ -63,8 +63,10 @@ rules:
   - src/mozyo_bridge/domain/cockpit_layout.py
   - src/mozyo_bridge/domain/delegation_project_config.py
   - src/mozyo_bridge/domain/delegation_route_planner.py
+  - src/mozyo_bridge/domain/delegation_route_executor.py
   - src/mozyo_bridge/domain/route_identity_ledger.py
   - src/mozyo_bridge/domain/handoff_route_identity.py
+  - src/mozyo_bridge/application/delegation_route_executor.py
   - src/mozyo_bridge/application/cli_handoff.py
   - src/mozyo_bridge/application/cli_cockpit.py
   - src/mozyo_bridge/domain/delegation_launch_adopt.py
@@ -87,6 +89,8 @@ rules:
   - tests/test_delegation_projection.py
   - tests/test_delegation_project_config.py
   - tests/test_delegation_route_planner.py
+  - tests/test_delegation_route_executor.py
+  - tests/test_delegation_route_executor_integration.py
   - tests/test_handoff_same_lane_gateway.py
   - tests/test_cockpit_lane_identity.py
   - tests/test_route_identity_ledger.py
@@ -94,10 +98,11 @@ rules:
   - tests/test_live_pane_reresolution.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
-    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
-    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
-    と @vibes/docs/logics/unit-target-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
-    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-route-live-executor.md と @vibes/docs/specs/route-identity-ledger.md
+    と @vibes/docs/specs/delegated-coordinator-role-profile.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
+    と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/unit-target-model.md
+    と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
