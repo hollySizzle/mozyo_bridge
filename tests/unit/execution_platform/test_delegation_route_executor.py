@@ -145,18 +145,24 @@ class FakeStamp:
 
 
 class FakeSink:
-    """A fake Redmine record sink; persists unless ``ok`` is False."""
+    """A fake Redmine record sink.
+
+    Persists unless ``ok`` is False (every record fails) or the record's kind is
+    in ``fail_kinds`` (only those records fail) — the latter lets a test fail a
+    single record, e.g. the final classification record alone.
+    """
 
     name = "fake-redmine"
 
-    def __init__(self, ok=True, reason=PERSIST_TRANSPORT_ERROR):
+    def __init__(self, ok=True, reason=PERSIST_TRANSPORT_ERROR, fail_kinds=()):
         self._ok = ok
         self._reason = reason
+        self._fail_kinds = set(fail_kinds)
         self.records = []
 
     def persist(self, record):
         self.records.append(record)
-        if self._ok:
+        if self._ok and record.kind not in self._fail_kinds:
             return RouteRecordReceipt(persisted=True, reason=PERSIST_OK, location="j#0")
         return RouteRecordReceipt(persisted=False, reason=self._reason)
 
@@ -491,6 +497,24 @@ class EnvironmentalAndEvidenceTest(unittest.TestCase):
         self.assertTrue(result.write_failed)
         self.assertEqual(result.classification, CLASS_ENVIRONMENTAL)
         self.assertNotEqual(result.classification, CLASS_PASS)
+
+    def test_final_record_write_failure_is_not_pass(self):
+        # Regression for #12556 j#64989: only the final_classification record's
+        # write fails. Every prior record persisted (so the candidate verdict was
+        # PASS), but a verdict that cannot be durably written is not a PASS.
+        sink = FakeSink(fail_kinds={RECORD_FINAL_CLASSIFICATION})
+        result = _executor(sink=sink).execute(
+            _grandchild_plan(), _ledger(), _context()
+        )
+        self.assertTrue(result.write_failed)
+        self.assertNotEqual(result.classification, CLASS_PASS)
+        self.assertEqual(result.classification, CLASS_ENVIRONMENTAL)
+        # The invariant under audit: is_pass must never coexist with write_failed.
+        self.assertFalse(result.is_pass and result.write_failed)
+        # Package's final record matches the downgraded verdict (no PASS claim).
+        final = result.package.records()[-1]
+        self.assertEqual(final.kind, RECORD_FINAL_CLASSIFICATION)
+        self.assertIn(("classification", CLASS_ENVIRONMENTAL), final.fields)
 
     def test_pending_required_callback_is_insufficient(self):
         # Every hop delivered, but the required callback was never recorded:

@@ -69,6 +69,7 @@ from mozyo_bridge.domain.delegation_route_planner import (
 )
 from mozyo_bridge.domain.delegation_route_records import (
     CLASS_BLOCKED,
+    CLASS_ENVIRONMENTAL,
     CLASS_FAILED_ACCEPTANCE,
     CLASS_INSUFFICIENT,
     CLASS_PASS,
@@ -652,13 +653,36 @@ class _Run:
 
     def _finish(self, classification: str, reason: str) -> ExecutionResult:
         classification = validate_classification(classification)
-        self._emit(
-            final_classification_record(
+        # Persist the verdict, then fold the final record's *own* write outcome
+        # back into the classification. ``_classify`` only saw the receipts of
+        # the records emitted before this one, so a failure to persist the
+        # final-classification record itself would otherwise leave a ``PASS``
+        # result whose verdict was never durably written (``is_pass`` True while
+        # ``write_failed`` True). A run whose verdict cannot be replayed is not a
+        # PASS: downgrade fail-closed to ``environmental`` (Redmine write failure
+        # is non-PASS — #12558 contract).
+        record = final_classification_record(
+            source_issue=self.context.source_issue,
+            classification=classification,
+            reason=reason,
+        )
+        receipt = self.executor._sink.persist(record)
+        if classification == CLASS_PASS and (
+            not receipt.persisted or any(not r.persisted for r in self.receipts)
+        ):
+            classification = CLASS_ENVIRONMENTAL
+            reason = "redmine_record_write_failed"
+            # Re-stamp the in-memory verdict record so the package and the
+            # returned classification never disagree. The failed write means no
+            # ``PASS`` verdict was persisted durably, so there is nothing to
+            # contradict.
+            record = final_classification_record(
                 source_issue=self.context.source_issue,
                 classification=classification,
                 reason=reason,
             )
-        )
+        self.package.append(record)
+        self.receipts.append(receipt)
         return ExecutionResult(
             classification=classification,
             reason=reason,
