@@ -55,12 +55,29 @@ rules:
     '
 - name: delegated coordinator runtime and projection source
   patterns:
+  - src/mozyo_bridge/domain/repo_local_config.py
+  - src/mozyo_bridge/application/repo_local_config_loader.py
+  - src/mozyo_bridge/domain/role_profile.py
+  - src/mozyo_bridge/domain/handoff.py
+  - src/mozyo_bridge/domain/agent_discovery.py
+  - src/mozyo_bridge/domain/cockpit_layout.py
+  - src/mozyo_bridge/application/cli_handoff.py
+  - src/mozyo_bridge/application/cli_cockpit.py
   - src/mozyo_bridge/domain/delegation_launch_adopt.py
   - src/mozyo_bridge/application/delegation_launch_adopt.py
   - src/mozyo_bridge/domain/grandchild_dispatch.py
   - src/mozyo_bridge/application/grandchild_dispatch.py
   - src/mozyo_bridge/domain/delegation_projection.py
   - src/mozyo_bridge/domain/delegation_display.py
+  - tests/test_repo_local_config.py
+  - tests/test_repo_local_config_loader.py
+  - tests/test_handoff_role_profile.py
+  - tests/test_handoff_cross_workspace_consult.py
+  - tests/test_handoff_target_record_preflight.py
+  - tests/test_cockpit_append.py
+  - tests/test_cockpit_adopt.py
+  - tests/test_cockpit_adopt_phase2.py
+  - tests/test_cockpit_presentation_placement.py
   - tests/test_delegation_launch_adopt.py
   - tests/test_grandchild_dispatch.py
   - tests/test_delegation_projection.py
