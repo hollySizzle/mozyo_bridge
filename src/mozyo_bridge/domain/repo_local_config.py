@@ -12,6 +12,9 @@ internal selection records:
   select.
 - ``presentation`` -> :class:`PresentationSelectionConfig` (this module):
   selects which built-in projection *surface* to use.
+- ``delegation`` -> :class:`mozyo_bridge.domain.delegation_project_config.DelegationConfig`
+  (Redmine #12549): the public-safe external-parent child-candidate surface that
+  a delegation resolver reads. Default (no candidates) is behavior-preserving.
 
 Boundary, kept enforced in code (this is *schema only*):
 
@@ -50,6 +53,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
+from mozyo_bridge.domain.delegation_project_config import (
+    DelegationConfig,
+    DelegationConfigError,
+)
 from mozyo_bridge.domain.module_registry import CliCompositionConfig
 from mozyo_bridge.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
@@ -68,7 +75,7 @@ REPO_LOCAL_CONFIG_VERSION: int = 1
 
 #: The closed set of recognized top-level keys. Anything else fails closed.
 REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"version", "cli", "providers", "presentation"}
+    {"version", "cli", "providers", "presentation", "delegation"}
 )
 
 #: The closed set of recognized keys inside the ``presentation`` sub-record.
@@ -364,9 +371,10 @@ class PresentationSelectionConfig:
 class RepoLocalConfig:
     """The closed top-level ``.mozyo-bridge/config.yaml`` record (schema only).
 
-    Composes the three configurable surfaces — :attr:`cli`, :attr:`providers`,
-    :attr:`presentation` — each behavior-preserving by default. The default
-    (no fields set) reproduces the current ``mozyo-bridge`` behavior exactly.
+    Composes the four configurable surfaces — :attr:`cli`, :attr:`providers`,
+    :attr:`presentation`, :attr:`delegation` — each behavior-preserving by
+    default. The default (no fields set) reproduces the current ``mozyo-bridge``
+    behavior exactly.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -382,6 +390,7 @@ class RepoLocalConfig:
     presentation: PresentationSelectionConfig = field(
         default_factory=PresentationSelectionConfig.default
     )
+    delegation: DelegationConfig = field(default_factory=DelegationConfig.default)
 
     @classmethod
     def default(cls) -> "RepoLocalConfig":
@@ -407,12 +416,14 @@ class RepoLocalConfig:
           boundary-specific message;
         - any other unknown top-level key is rejected (closed schema);
         - ``version``, if present, must be the supported integer version;
-        - ``cli`` / ``providers`` / ``presentation`` each delegate to their own
-          sub-record :meth:`from_record`, which fail closed on their own shapes;
-          ``providers`` selection categories / ids are additionally screened for
-          module / callable / entry point / authority / routing / target / pane /
-          send / credential-shaped tokens here, since the provider record itself
-          rejects only the exact core-owned authority names.
+        - ``cli`` / ``providers`` / ``presentation`` / ``delegation`` each
+          delegate to their own sub-record :meth:`from_record`, which fail closed
+          on their own shapes; ``providers`` selection categories / ids are
+          additionally screened for module / callable / entry point / authority /
+          routing / target / pane / send / credential-shaped tokens here, since
+          the provider record itself rejects only the exact core-owned authority
+          names. ``delegation``'s own ``DelegationConfigError`` is re-raised as a
+          ``RepoLocalConfigError`` so the single fail-closed boundary holds.
 
         Whether a selected CLI family / provider actually exists is validated by
         the respective registry at resolution time (a later lane), not here; this
@@ -448,7 +459,24 @@ class RepoLocalConfig:
         presentation = PresentationSelectionConfig.from_record(
             record.get("presentation")
         )
-        return cls(cli=cli, providers=providers, presentation=presentation)
+        # The delegation child-candidate surface (#12549) is parsed by its own
+        # self-contained domain schema; its DelegationConfigError is re-raised as
+        # a RepoLocalConfigError so the loader keeps a single fail-closed boundary
+        # for every repo-local-config failure (same pattern as the grouping
+        # sub-record above). An absent ``delegation`` block resolves to the
+        # no-candidate default, so it stays behavior-preserving.
+        try:
+            delegation = DelegationConfig.from_record(record.get("delegation"))
+        except DelegationConfigError as exc:
+            raise RepoLocalConfigError(
+                f"delegation config is invalid: {exc}"
+            ) from exc
+        return cls(
+            cli=cli,
+            providers=providers,
+            presentation=presentation,
+            delegation=delegation,
+        )
 
 
 __all__ = (
@@ -460,4 +488,6 @@ __all__ = (
     "RepoLocalConfigError",
     "PresentationSelectionConfig",
     "RepoLocalConfig",
+    "DelegationConfig",
+    "DelegationConfigError",
 )

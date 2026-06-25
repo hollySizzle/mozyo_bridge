@@ -36,6 +36,7 @@ from mozyo_bridge.domain.provider_registry import (
     ProviderRegistryError,
     ProviderSelectionConfig,
 )
+from mozyo_bridge.domain.delegation_project_config import DelegationConfig
 from mozyo_bridge.domain.repo_local_config import (
     DEFAULT_PRESENTATION_SURFACE,
     REPO_LOCAL_CONFIG_VERSION,
@@ -414,6 +415,67 @@ class PresentationGroupingWiringTest(unittest.TestCase):
                                 "label": "G",
                                 "route_target": "%5",
                             }
+                        ]
+                    }
+                }
+            )
+
+
+class DelegationWiringTest(unittest.TestCase):
+    """``delegation`` top-level surface (#12549): default-preserving + delegated.
+
+    The exhaustive child-candidate schema / resolver behavior lives in
+    ``tests/test_delegation_project_config.py``; here we only pin that the
+    top-level repo-local record composes the new surface, stays
+    behavior-preserving when absent, and folds the delegation schema's own
+    fail-closed error into ``RepoLocalConfigError`` (the single loader boundary).
+    """
+
+    def test_missing_delegation_is_behavior_preserving_default(self) -> None:
+        self.assertEqual(
+            RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}}).delegation,
+            DelegationConfig.default(),
+        )
+
+    def test_empty_delegation_block_is_default(self) -> None:
+        self.assertEqual(
+            RepoLocalConfig.from_record({"delegation": {}}).delegation,
+            DelegationConfig.default(),
+        )
+
+    def test_child_candidate_parses_under_top_level_record(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {
+                "delegation": {
+                    "child_candidates": [
+                        {
+                            "child_project": "mozyo_bridge",
+                            "capabilities": ["implementation"],
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual(len(config.delegation.child_candidates), 1)
+        self.assertEqual(
+            config.delegation.child_candidates[0].child_project, "mozyo_bridge"
+        )
+
+    def test_invalid_delegation_fails_closed_as_repo_local_error(self) -> None:
+        # A delegation schema violation surfaces as the loader's own error, not a
+        # bare DelegationConfigError, so the single fail-closed boundary holds.
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"delegation": {"child_candidates": [{"child_project": "/abs/path"}]}}
+            )
+
+    def test_authority_shaped_delegation_key_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {
+                    "delegation": {
+                        "child_candidates": [
+                            {"child_project": "mozyo_bridge", "target_pane": "%9"}
                         ]
                     }
                 }

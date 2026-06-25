@@ -147,6 +147,24 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-route-identity-ledger
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/route-identity-ledger.md
+    purpose: delegated coordinator / sublane handoff と callback target を stale pane id ではなく stable route identity + live pane inventory 再照合で fail-closed に解決する contract。`last_seen_pane_id` は cache/snapshot のみ、route authority は workspace / lane / role / pane_name / purpose identity に置く。
+    audit_role: route_identity_ledger_spec
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-managed-state-model
+      - logic-session-inventory
+      - logic-tmux-send-safety-contract
+      - spec-delegated-coordinator-decision-records
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegation-policy-project-config
     type: spec
     status: active
@@ -472,6 +490,7 @@ documents:
     related_document_refs:
       - logic-unit-target-model
       - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-real-machine-acceptance
       - logic-tmux-send-safety-contract
       - logic-worktree-lifecycle-boundary
       - rule-public-private-boundary
@@ -586,6 +605,7 @@ documents:
       - logic-coordinator-sublane-development-flow
       - spec-delegated-coordinator-decision-records
       - logic-delegated-coordinator-cockpit-display
+      - logic-delegated-coordinator-real-machine-acceptance
       - logic-cross-project-cockpit-smoke-runbook
       - logic-executive-terminal-setup
       - logic-workspace-registry
@@ -678,6 +698,43 @@ documents:
       - logic-worktree-lifecycle-boundary
       - spec-delegation-policy-project-config
       - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-delegated-coordinator-smoke-test-frame
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-smoke-test-frame.md
+    purpose: "#12474 系の親子孫 delegated coordinator 実機 smoke を、context contamination / bounded-read / role profile 展開 / grandchild realization / live projection の観点へ分解し、classical tests と薄い実機 E2E へ役割分担するための test frame 正本。"
+    audit_role: delegated_coordinator_smoke_test_frame_logic
+    related_document_refs:
+      - logic-delegated-coordinator-cockpit-display
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-role-profile-handoff-expansion
+      - logic-coordinator-sublane-development-flow
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-delegated-coordinator-real-machine-acceptance
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md
+    purpose: GK3500 / IT Operations のような外部親 project が抽象依頼と project config から mozyo_bridge delegated coordinator を能動選択し、子が孫 implementation lane を起動する 3 層 real-machine acceptance の合格条件、parent prompt boundary、context contamination、failure classification、Redmine record package を固定する正本。
+    audit_role: delegated_coordinator_real_machine_acceptance_logic
+    related_document_refs:
+      - logic-delegated-coordinator-smoke-test-frame
+      - logic-existing-project-sublane-adoption
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-delegated-coordinator-cockpit-display
+      - logic-coordinator-sublane-development-flow
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
       - rule-project-agent-workflow
       - skill-workflow-reference
       - spec-project-map
@@ -914,6 +971,18 @@ file_conventions:
   - id: fc-delegated-coordinator-runtime-source
     name: delegated coordinator runtime and projection source
     patterns:
+      - src/mozyo_bridge/domain/repo_local_config.py
+      - src/mozyo_bridge/application/repo_local_config_loader.py
+      - src/mozyo_bridge/domain/role_profile.py
+      - src/mozyo_bridge/domain/handoff.py
+      - src/mozyo_bridge/domain/agent_discovery.py
+      - src/mozyo_bridge/domain/cockpit_layout.py
+      - src/mozyo_bridge/domain/delegation_project_config.py
+      - src/mozyo_bridge/domain/delegation_route_planner.py
+      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/domain/handoff_route_identity.py
+      - src/mozyo_bridge/application/cli_handoff.py
+      - src/mozyo_bridge/application/cli_cockpit.py
       - src/mozyo_bridge/domain/delegation_launch_adopt.py
       - src/mozyo_bridge/application/delegation_launch_adopt.py
       - src/mozyo_bridge/domain/grandchild_dispatch.py
@@ -928,6 +997,9 @@ file_conventions:
       - tests/unit/execution_platform/test_grandchild_dispatch.py
       - tests/unit/execution_platform/test_grandchild_stamp.py
       - tests/unit/execution_platform/test_delegation_projection.py
+      - tests/unit/execution_platform/test_delegated_coordinator_acceptance_oracle.py
+      - tests/unit/execution_platform/test_delegation_project_config.py
+      - tests/unit/execution_platform/test_delegation_route_planner.py
       - tests/scenarios/test_delegated_coordinator_route_plan.py
       - tests/regressions/test_issue_12474_delegated_route_gaps.py
       - tests/support/delegation_route_fakes.py
@@ -936,8 +1008,12 @@ file_conventions:
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
       - spec-delegated-coordinator-decision-records
+      - spec-route-identity-ledger
       - spec-delegated-coordinator-role-profile
       - logic-coordinator-sublane-development-flow
+      - logic-tmux-send-safety-contract
+      - logic-managed-state-model
+      - logic-unit-target-model
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
@@ -1093,13 +1169,21 @@ file_conventions:
     name: handoff notification and tmux transport source
     patterns:
       - src/mozyo_bridge/domain/handoff.py
+      - src/mozyo_bridge/application/cli_handoff.py
       - src/mozyo_bridge/domain/notification.py
       - src/mozyo_bridge/domain/pane_resolver.py
+      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/domain/handoff_route_identity.py
       - src/mozyo_bridge/infrastructure/tmux_client.py
       - src/mozyo_bridge/infrastructure/queue_reader.py
+      - tests/unit/execution_platform/test_handoff_same_lane_gateway.py
+      - tests/unit/execution_platform/test_route_identity_ledger.py
     severity: block
     document_refs:
       - logic-tmux-send-safety-contract
+      - spec-route-identity-ledger
+      - logic-unit-target-model
+      - logic-managed-state-model
       - logic-workspace-defaults-renderer
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state

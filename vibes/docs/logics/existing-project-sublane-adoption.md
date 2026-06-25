@@ -247,19 +247,12 @@ context-free delegated smoke:
 - #12453 のように親子孫候補を Start Gate / chat / pane context で明示してから実行する
   route replay は有用だが、それだけでは実運用で自律的に delegation tree が発生するかを
   確認したことにならない。
-- 既存 project adoption の UX / operability を見る場合は、別 Test issue を作り、親
-  project coordinator へ具体 pane id、親子孫候補、window 配置を事前注入しない状態で
-  Redmine durable anchor だけを渡す smoke を行う。
-- 期待する観測は 2 通りある。自律的に parent -> child delegated coordinator ->
-  grandchild gateway / worker が発生または採用されるなら、その route と callback を
-  Redmine から replay できるようにする。発生しないなら、どの durable field / project
-  config / display metadata が不足していたかを Progress Log に残す。
-- 「発生しなかった」こと自体は失敗ではない。必要 context が明確になれば、
-  `delegated-coordinator-cockpit-display.md` / delegation policy / cockpit projection
-  の設計 input として扱う。
-- context-free smoke では、operator 固有 pane id や private cockpit composition を
-  tracked docs / catalog default へ焼き込まない。実機 journal に観測 pane id を残すのは
-  replay evidence として許容する。
+- 既存 project adoption の UX / operability を見る場合の acceptance 境界、親 prompt に
+  渡してよい情報 / 渡してはいけない情報、`insufficient` / `contaminated` / `failed_acceptance`
+  の分類は `vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md` を正本とする。
+- 本 runbook には adoption 固有の境界だけを残す。operator 固有 pane id や private cockpit
+  composition を tracked docs / catalog default へ焼き込まない。実機 journal に観測 pane id
+  を残すのは replay evidence として許容する。
 
 grandchild dispatch の判定:
 
@@ -272,6 +265,9 @@ PASS として扱える最低条件:
 - Redmine journal から、最初の preflight、blocker、bugfix / review、rerun、delegated coordinator receipt、parent callback outcome を replay できる。
 - 親 project config は子 project を external dependency として分類し、親 submodule source を編集していない。
 - delegated coordinator handoff は Codex 宛てに送られ、role profile が解決済みである。
+- autonomous parent smoke として PASS するには、
+  `delegated-coordinator-real-machine-acceptance.md` の Parent Prompt Boundary と
+  Acceptance Criteria も満たす。
 - parent callback が親 coordinator route へ返っている。
 - 親 project coordinator と子 project の owning US / audit coordinator が別 lane の場合は、
   `vibes/docs/specs/delegated-coordinator-decision-records.md` の

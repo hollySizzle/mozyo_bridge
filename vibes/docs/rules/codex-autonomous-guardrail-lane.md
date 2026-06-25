@@ -64,7 +64,7 @@ preset 側 schema をそのまま採用する。journal field の最小例:
 - intent: spec-project-map に最新の重要 path を 1 件追記する。
 - verification:
   - `mozyo-bridge docs validate --repo .` → passed
-  - `mozyo-bridge docs validate --check-file-coverage --repo .` → passed
+  - `mozyo-bridge docs generate-file-conventions --check --repo .` → passed
   - `git diff --check` → clean
 - commit_hash: `<hash>` (or `pending: staged-not-committed`)
 - follow_up_review_required: false
