@@ -81,6 +81,7 @@ rules:
   - tests/test_delegation_launch_adopt.py
   - tests/test_grandchild_dispatch.py
   - tests/test_delegation_projection.py
+  - tests/test_delegated_coordinator_acceptance_oracle.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
     と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-coordinator-role-profile.md

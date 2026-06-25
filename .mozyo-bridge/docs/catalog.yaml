@@ -935,6 +935,7 @@ file_conventions:
       - tests/test_delegation_launch_adopt.py
       - tests/test_grandchild_dispatch.py
       - tests/test_delegation_projection.py
+      - tests/test_delegated_coordinator_acceptance_oracle.py
     severity: block
     document_refs:
       - logic-delegated-coordinator-cockpit-display
