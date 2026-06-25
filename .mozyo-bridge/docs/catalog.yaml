@@ -135,6 +135,24 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-route-identity-ledger
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/route-identity-ledger.md
+    purpose: delegated coordinator / sublane handoff と callback target を stale pane id ではなく stable route identity + live pane inventory 再照合で fail-closed に解決する contract。`last_seen_pane_id` は cache/snapshot のみ、route authority は workspace / lane / role / pane_name / purpose identity に置く。
+    audit_role: route_identity_ledger_spec
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-managed-state-model
+      - logic-session-inventory
+      - logic-tmux-send-safety-contract
+      - spec-delegated-coordinator-decision-records
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegation-policy-project-config
     type: spec
     status: active
@@ -915,6 +933,10 @@ file_conventions:
       - src/mozyo_bridge/domain/handoff.py
       - src/mozyo_bridge/domain/agent_discovery.py
       - src/mozyo_bridge/domain/cockpit_layout.py
+      - src/mozyo_bridge/domain/delegation_project_config.py
+      - src/mozyo_bridge/domain/delegation_route_planner.py
+      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/domain/handoff_route_identity.py
       - src/mozyo_bridge/application/cli_handoff.py
       - src/mozyo_bridge/application/cli_cockpit.py
       - src/mozyo_bridge/domain/delegation_launch_adopt.py
@@ -935,13 +957,24 @@ file_conventions:
       - tests/test_delegation_launch_adopt.py
       - tests/test_grandchild_dispatch.py
       - tests/test_delegation_projection.py
+      - tests/test_delegation_project_config.py
+      - tests/test_delegation_route_planner.py
+      - tests/test_handoff_same_lane_gateway.py
+      - tests/test_cockpit_lane_identity.py
+      - tests/test_route_identity_ledger.py
+      - tests/test_handoff_route_identity.py
+      - tests/test_live_pane_reresolution.py
     severity: block
     document_refs:
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
       - spec-delegated-coordinator-decision-records
+      - spec-route-identity-ledger
       - spec-delegated-coordinator-role-profile
       - logic-coordinator-sublane-development-flow
+      - logic-tmux-send-safety-contract
+      - logic-managed-state-model
+      - logic-unit-target-model
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
@@ -1097,13 +1130,23 @@ file_conventions:
     name: handoff notification and tmux transport source
     patterns:
       - src/mozyo_bridge/domain/handoff.py
+      - src/mozyo_bridge/application/cli_handoff.py
       - src/mozyo_bridge/domain/notification.py
       - src/mozyo_bridge/domain/pane_resolver.py
+      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/domain/handoff_route_identity.py
       - src/mozyo_bridge/infrastructure/tmux_client.py
       - src/mozyo_bridge/infrastructure/queue_reader.py
+      - tests/test_handoff_same_lane_gateway.py
+      - tests/test_route_identity_ledger.py
+      - tests/test_handoff_route_identity.py
+      - tests/test_live_pane_reresolution.py
     severity: block
     document_refs:
       - logic-tmux-send-safety-contract
+      - spec-route-identity-ledger
+      - logic-unit-target-model
+      - logic-managed-state-model
       - logic-workspace-defaults-renderer
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state
