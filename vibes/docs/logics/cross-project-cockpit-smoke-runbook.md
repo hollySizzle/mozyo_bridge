@@ -8,6 +8,12 @@ routing / governance identity の正本ではない。
 載せるか、どの順で並べるか、どの lane policy を使うかは operator / private
 consumer 側の運用規約に置く。
 
+外部親 project が抽象依頼から child project を能動選択し、孫 implementation lane まで
+起動する delegated coordinator real-machine acceptance は
+`vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md` を正本とする。本 doc は
+cockpit append / adopt / discovery / handoff の汎用操作だけを扱い、自律 delegation の
+PASS/FAIL 判定を定義しない。
+
 ## Baseline
 
 現行 CLI の事実:

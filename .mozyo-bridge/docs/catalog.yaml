@@ -443,6 +443,7 @@ documents:
     related_document_refs:
       - logic-unit-target-model
       - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-real-machine-acceptance
       - logic-tmux-send-safety-contract
       - logic-worktree-lifecycle-boundary
       - rule-public-private-boundary
@@ -557,6 +558,7 @@ documents:
       - logic-coordinator-sublane-development-flow
       - spec-delegated-coordinator-decision-records
       - logic-delegated-coordinator-cockpit-display
+      - logic-delegated-coordinator-real-machine-acceptance
       - logic-cross-project-cockpit-smoke-runbook
       - logic-executive-terminal-setup
       - logic-workspace-registry
@@ -661,7 +663,27 @@ documents:
     audit_role: delegated_coordinator_smoke_test_frame_logic
     related_document_refs:
       - logic-delegated-coordinator-cockpit-display
+      - logic-delegated-coordinator-real-machine-acceptance
       - logic-role-profile-handoff-expansion
+      - logic-coordinator-sublane-development-flow
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-delegated-coordinator-real-machine-acceptance
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md
+    purpose: GK3500 / IT Operations のような外部親 project が抽象依頼と project config から mozyo_bridge delegated coordinator を能動選択し、子が孫 implementation lane を起動する 3 層 real-machine acceptance の合格条件、parent prompt boundary、context contamination、failure classification、Redmine record package を固定する正本。
+    audit_role: delegated_coordinator_real_machine_acceptance_logic
+    related_document_refs:
+      - logic-delegated-coordinator-smoke-test-frame
+      - logic-existing-project-sublane-adoption
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-delegated-coordinator-cockpit-display
       - logic-coordinator-sublane-development-flow
       - spec-delegation-policy-project-config
       - spec-delegated-coordinator-role-profile

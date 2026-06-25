@@ -15,23 +15,16 @@ receiver の Redmine read、route observation、projection 照合、contaminatio
 stamping のどこが壊れたのかを後から切り分けることになる。実機 smoke は最後の薄い
 受入確認に寄せ、失敗しやすい契約は classical tests で先に弾く。
 
-## 現行実機 smoke の観測手順
+## 実機 acceptance 正本との境界
 
-今回の #12474 系列で使った flow は次の通り。
+外部親 project が抽象依頼から mozyo_bridge child を能動選択し、子が孫 implementation
+lane を起動する full real-machine acceptance の正本は
+`vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md` に置く。
 
-1. #12473 runtime branch / worktree を visible sublane として用意する。
-2. sparse target issue を Redmine に作る。
-3. fresh GK3500 parent panes を用意する。
-4. sparse target journal だけを GK3500 Codex へ handoff する。
-5. GK3500 parent が target issue から委譲判断を記録する。
-6. mozyo_bridge delegated coordinator へ parent -> child handoff する。
-7. delegated coordinator が grandchild dispatch を判断し、grandchild lane/window を
-   新規作成または明示採用する。
-8. grandchild lane を stamp し、`agents targets` / cockpit projection に
-   `KIND=implementation_worker`, `DEPTH=2`, `PARENT=<delegated coordinator lane>` が
-   出ることを確認する。
-9. product work が sparse issue で blocked になる場合でも、route/display evidence と
-   product implementation result を分離して記録する。
+本書は、その acceptance を実機 smoke だけに依存させないための test frame である。ここには
+classical tests へ落とす契約、実機に残す最小確認、過去の failure mode の分解だけを置く。
+親 prompt にどの hint を渡してはいけないか、autonomous parent smoke と context-rich smoke
+の PASS/FAIL 境界は acceptance 正本を参照する。
 
 ## #12474 / #12484 / #12485 で分かった failure mode
 
@@ -128,6 +121,8 @@ Redmine MCP 実体に依存せず、receiver に渡す issue surface を fixture
 classical tests を通した後、実機 smoke は次だけを見る。
 
 - fresh panes / worktrees が stale evidence なしで用意される。
+- `delegated-coordinator-real-machine-acceptance.md` が定義する test model
+  (`autonomous_parent`, `bounded_read`, `context_rich`) が Start Gate で明示されている。
 - parent -> delegated coordinator -> grandchild gateway の actual handoff が submit-complete する。
 - Redmine journal から route / creation-or-adoption / stamp / callback が replay できる。
 - live `agents targets` が expected `KIND` / `DEPTH` / `PARENT` を表示する。
@@ -161,6 +156,7 @@ classical tests を通した後、実機 smoke は次だけを見る。
 ## 参照正本
 
 - `vibes/docs/logics/delegated-coordinator-cockpit-display.md`
+- `vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md`
 - `vibes/docs/specs/delegation-policy-project-config.md`
 - `vibes/docs/specs/delegated-coordinator-role-profile.md`
 - `vibes/docs/logics/role-profile-handoff-expansion.md`
