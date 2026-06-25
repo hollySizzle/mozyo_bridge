@@ -529,6 +529,18 @@ def _validate_inputs(
             f"unknown route_target_role {request.route_target_role!r}; expected "
             f"{ROUTE_CODEX_GATEWAY!r} or {ROUTE_CLAUDE_DIRECT!r}"
         )
+    # ``ChildCandidateResolution`` is a plain dataclass and does not itself
+    # enforce its status vocabulary, so an unknown / internally inconsistent
+    # status must fail closed here before any route is built — otherwise it would
+    # fall through the missing/ambiguous branches into realization and could
+    # surface as a PASS-eligible plan (Required behavior #1: malformed resolver
+    # results stay fail-closed and oracle-compatible).
+    if resolution.status not in (STATUS_RESOLVED, STATUS_MISSING, STATUS_AMBIGUOUS):
+        raise DelegationRoutePlanError(
+            f"unknown ChildCandidateResolution status {resolution.status!r}; "
+            f"expected {STATUS_RESOLVED!r}, {STATUS_MISSING!r}, or "
+            f"{STATUS_AMBIGUOUS!r}"
+        )
     # A ``resolved`` status must carry exactly its single candidate, and the
     # candidate / request must agree on the child project. An inconsistent
     # resolution is a malformed input, not a fail-closed runtime outcome.

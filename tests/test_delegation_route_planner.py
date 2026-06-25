@@ -270,6 +270,21 @@ class ResolverFailClosedTest(unittest.TestCase):
         with self.assertRaises(DelegationRoutePlanError):
             plan_delegation_route(object(), _request())  # type: ignore[arg-type]
 
+    def test_unknown_status_fails_closed(self) -> None:
+        # An unknown / internally inconsistent resolution status must never fall
+        # through into realization and surface as a PASS-eligible plan
+        # (Required behavior #1). ChildCandidateResolution is a plain dataclass
+        # and does not enforce its status vocabulary, so the planner must.
+        bogus = ChildCandidateResolution(
+            status="bogus",
+            diagnostic="x",
+            requested_child_project=CHILD_PROJECT,
+            requested_capability=None,
+            candidate=ChildCandidate(child_project=CHILD_PROJECT),
+        )
+        with self.assertRaises(DelegationRoutePlanError):
+            plan_delegation_route(bogus, _request(), child_candidates=_match(1))
+
 
 class CodexGatewayRoutingTest(unittest.TestCase):
     """parent -> child handoff targets the Codex gateway, never Claude (Required #4)."""
