@@ -61,6 +61,10 @@ rules:
   - src/mozyo_bridge/domain/handoff.py
   - src/mozyo_bridge/domain/agent_discovery.py
   - src/mozyo_bridge/domain/cockpit_layout.py
+  - src/mozyo_bridge/domain/delegation_project_config.py
+  - src/mozyo_bridge/domain/delegation_route_planner.py
+  - src/mozyo_bridge/domain/route_identity_ledger.py
+  - src/mozyo_bridge/domain/handoff_route_identity.py
   - src/mozyo_bridge/application/cli_handoff.py
   - src/mozyo_bridge/application/cli_cockpit.py
   - src/mozyo_bridge/domain/delegation_launch_adopt.py
@@ -82,10 +86,18 @@ rules:
   - tests/test_grandchild_dispatch.py
   - tests/test_delegation_projection.py
   - tests/test_delegated_coordinator_acceptance_oracle.py
+  - tests/test_delegation_project_config.py
+  - tests/test_delegation_route_planner.py
+  - tests/test_handoff_same_lane_gateway.py
+  - tests/test_cockpit_lane_identity.py
+  - tests/test_route_identity_ledger.py
+  - tests/test_handoff_route_identity.py
+  - tests/test_live_pane_reresolution.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
-    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
-    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
+    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/logics/unit-target-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
     と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
@@ -228,12 +240,20 @@ rules:
 - name: handoff notification and tmux transport source
   patterns:
   - src/mozyo_bridge/domain/handoff.py
+  - src/mozyo_bridge/application/cli_handoff.py
   - src/mozyo_bridge/domain/notification.py
   - src/mozyo_bridge/domain/pane_resolver.py
+  - src/mozyo_bridge/domain/route_identity_ledger.py
+  - src/mozyo_bridge/domain/handoff_route_identity.py
   - src/mozyo_bridge/infrastructure/tmux_client.py
   - src/mozyo_bridge/infrastructure/queue_reader.py
+  - tests/test_handoff_same_lane_gateway.py
+  - tests/test_route_identity_ledger.py
+  - tests/test_handoff_route_identity.py
+  - tests/test_live_pane_reresolution.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/workspace-defaults-renderer.md
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/specs/route-identity-ledger.md と
+    @vibes/docs/logics/unit-target-model.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/workspace-defaults-renderer.md
     と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @vibes/docs/logics/ack-completion-receiver-state.md と @skills/mozyo-bridge-agent/references/safety.md
     をよく確認し従うこと
 
