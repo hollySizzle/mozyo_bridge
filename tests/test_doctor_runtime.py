@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -20,9 +21,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.doctor_runtime import (
+    SOURCE_PROBE_MARKERS,
+    SOURCE_PROBE_SCAN_EXCLUDE,
     STATUS_DRIFTED,
     STATUS_OK,
     STATUS_WARNING,
+    _source_feature_probes,
     classify_surface,
     evaluate_fingerprint,
     run_runtime_fingerprint,
@@ -146,6 +150,89 @@ class EvaluateFingerprintTest(unittest.TestCase):
         verdict = evaluate_fingerprint(active, source)
         self.assertEqual([], verdict["probe_mismatch"])
         self.assertNotEqual(STATUS_DRIFTED, verdict["status"])
+
+
+class SourceFeatureProbesTest(unittest.TestCase):
+    """Redmine #12612 j#65856: the source probe must verify the real feature
+    definition, not the diagnostic module's own marker literals."""
+
+    def _pkg(self, base: Path) -> Path:
+        pkg = base / "mozyo_bridge"
+        pkg.mkdir(parents=True, exist_ok=True)
+        return pkg
+
+    def test_returns_none_without_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(_source_feature_probes(Path(tmp) / "mozyo_bridge"))
+
+    def test_diagnostic_module_markers_do_not_self_satisfy(self) -> None:
+        # A source tree whose ONLY file is a copy of the diagnostic module
+        # (carrying the marker literals) must NOT register the features as
+        # present — the markers there are probe definitions, not the real impl.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._pkg(Path(tmp))
+            lines = ["SOURCE_PROBE_MARKERS = {"]
+            for key, marker in SOURCE_PROBE_MARKERS.items():
+                lines.append(f"    {key!r}: {marker!r},")
+            lines.append("}")
+            (pkg / SOURCE_PROBE_SCAN_EXCLUDE).write_text(
+                "\n".join(lines), encoding="utf-8"
+            )
+            probes = _source_feature_probes(pkg)
+            self.assertEqual(
+                {"standard_target_admission": False, "no_target_activation": False},
+                probes,
+            )
+
+    def test_real_definitions_are_detected(self) -> None:
+        # Definition-anchored markers in real-looking impl files register True.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._pkg(Path(tmp))
+            (pkg / "handoff.py").write_text(
+                "def resolve_standard_target_admission_policy(x):\n    return x\n",
+                encoding="utf-8",
+            )
+            (pkg / "cli_handoff.py").write_text(
+                'p.add_argument(\n    "--no-target-activation",\n'
+                '    action="store_true",\n)\n',
+                encoding="utf-8",
+            )
+            probes = _source_feature_probes(pkg)
+            self.assertEqual(
+                {"standard_target_admission": True, "no_target_activation": True},
+                probes,
+            )
+
+    def test_real_definitions_detected_even_with_diagnostic_module_present(self) -> None:
+        # Excluding the diagnostic module must not hide real definitions living
+        # in other files.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._pkg(Path(tmp))
+            (pkg / SOURCE_PROBE_SCAN_EXCLUDE).write_text(
+                "SOURCE_PROBE_MARKERS = {}\n", encoding="utf-8"
+            )
+            (pkg / "handoff.py").write_text(
+                "def resolve_standard_target_admission_policy(x):\n    return x\n",
+                encoding="utf-8",
+            )
+            (pkg / "cli_handoff.py").write_text(
+                'p.add_argument("--no-target-activation")\n', encoding="utf-8"
+            )
+            probes = _source_feature_probes(pkg)
+            self.assertTrue(probes["standard_target_admission"])
+            self.assertTrue(probes["no_target_activation"])
+
+    def test_bare_mention_does_not_satisfy_admission_probe(self) -> None:
+        # An import / call / prose mention (no `def`) must not register True.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._pkg(Path(tmp))
+            (pkg / "user.py").write_text(
+                "from x import resolve_standard_target_admission_policy\n"
+                "resolve_standard_target_admission_policy(1)\n",
+                encoding="utf-8",
+            )
+            probes = _source_feature_probes(pkg)
+            self.assertFalse(probes["standard_target_admission"])
 
 
 class DoctorRuntimeDispatchTest(unittest.TestCase):

@@ -42,18 +42,33 @@ from mozyo_bridge.application.doctor import (
 )
 
 # Gate-critical feature probes. Each entry maps a probe key to the textual
-# marker that proves the *source tree* ships the behavior (a defining symbol or
-# CLI flag literal, deliberately not a file path so the probe survives the
-# in-flight features/<epic_slug>/ layout migration). The *active* surface is
-# probed live instead — see `_active_feature_probes` — because a live import /
-# parser walk is the authoritative answer to "does this runtime actually have
-# the behavior", which is the whole point of the fingerprint.
+# marker that proves the *source tree* ships the behavior. The markers are
+# **definition-anchored** (the function `def` and the quoted CLI-flag literal as
+# it appears in `add_argument`), not bare symbol mentions, so an import / call /
+# prose reference does not satisfy the probe — only the real definition does.
+# They are deliberately not file paths so the probe survives the in-flight
+# features/<epic_slug>/ layout migration. The *active* surface is probed live
+# instead — see `_active_feature_probes` — because a live import / parser walk is
+# the authoritative answer to "does this runtime actually have the behavior".
+#
+# This diagnostic module itself carries these marker literals (in the dict below
+# and in `_probe_active_no_target_activation`), so scanning it would let the
+# source probe self-satisfy even if the real implementation were deleted
+# (Redmine #12612 review j#65856). `_source_feature_probes` therefore skips the
+# diagnostic module by name — see SOURCE_PROBE_SCAN_EXCLUDE — and the markers are
+# definition-anchored so the module's own string literals could not match anyway.
 SOURCE_PROBE_MARKERS = {
-    # Redmine #12597: inactive-split admission/activation policy.
-    "standard_target_admission": "resolve_standard_target_admission_policy",
-    # Redmine #12597: the queue-enter opt-out flag on `handoff send`.
-    "no_target_activation": "--no-target-activation",
+    # Redmine #12597: inactive-split admission/activation policy. Anchored on the
+    # resolver definition in `domain/handoff.py`, not a mention/import/call.
+    "standard_target_admission": "def resolve_standard_target_admission_policy",
+    # Redmine #12597: the queue-enter opt-out flag on `handoff send`. Anchored on
+    # the quoted flag literal as it appears in the `add_argument` registration.
+    "no_target_activation": '"--no-target-activation"',
 }
+
+# The diagnostic module's own filename, excluded from the source scan so its
+# marker definitions cannot self-satisfy the source probe (Redmine #12612 j#65856).
+SOURCE_PROBE_SCAN_EXCLUDE = "doctor_runtime.py"
 
 # Drift relation / status vocabulary. `drifted` is intentionally one of
 # doctor's BAD_SECTION_STATUSES so a gate consuming either surface treats a
@@ -176,6 +191,10 @@ def _source_feature_probes(source_pkg: Path) -> dict[str, bool] | None:
     Returns None when ``source_pkg`` is not a directory (no repo-local source to
     compare against). Scans ``*.py`` for each marker and short-circuits once all
     markers are found, so a hit is O(files-until-found), not the whole tree.
+
+    The diagnostic module itself (``SOURCE_PROBE_SCAN_EXCLUDE``) is skipped: it
+    carries the marker literals, so scanning it would self-satisfy the source
+    probe even if the real implementation were gone (Redmine #12612 j#65856).
     """
     if not source_pkg.is_dir():
         return None
@@ -184,6 +203,8 @@ def _source_feature_probes(source_pkg: Path) -> dict[str, bool] | None:
     for path in source_pkg.rglob("*.py"):
         if not remaining:
             break
+        if path.name == SOURCE_PROBE_SCAN_EXCLUDE:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
