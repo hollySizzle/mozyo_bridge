@@ -1,7 +1,7 @@
 """Route identity ledger / pane-name live re-resolution (Redmine #12553).
 
 The #12550 planner seam
-(:mod:`mozyo_bridge.domain.delegation_route_planner`) emits *logical* route
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner`) emits *logical* route
 targets (``child_gateway`` / ``grandchild_gateway`` / ``same_lane_worker`` /
 ``parent_coordinator``) and deliberately deferred the durable ledger that turns
 one of those logical tokens — or a previously-observed route — back into a
@@ -34,7 +34,7 @@ Fail-closed re-resolution outcomes (Required behavior #4):
 Purity (mirrors the #12550 planner contract): this module never opens tmux,
 never sends a handoff, never writes Redmine, never mutates cockpit membership.
 It consumes a *read-only* live inventory snapshot (the
-:func:`mozyo_bridge.infrastructure.tmux_client.try_pane_lines` row shape) and
+:func:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines` row shape) and
 returns typed results. Persisting the ledger to DB / runtime state is a
 serialization concern handled through :meth:`RouteIdentity.to_record` /
 :meth:`RouteIdentity.from_record` and :meth:`RouteIdentityLedger.to_records`;
@@ -57,7 +57,7 @@ from typing import Optional
 # Integrate with the #12550 planner's logical route-identity vocabulary rather
 # than redefining it, so the ledger and the planner cannot drift. The planner's
 # fail-closed error is reused for the cross-boundary guard below.
-from mozyo_bridge.domain.delegation_route_planner import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (
     DelegationRoutePlanError,
     TARGET_CHILD_GATEWAY,
     TARGET_GRANDCHILD_GATEWAY,
@@ -444,13 +444,13 @@ def resolve_for_route_target(
     """Re-resolve a #12550 logical route target, enforcing the routing guards.
 
     Bridges the planner's logical vocabulary
-    (:data:`~mozyo_bridge.domain.delegation_route_planner.TARGET_SAME_LANE_WORKER`
+    (:data:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.TARGET_SAME_LANE_WORKER`
     and friends) to live re-resolution. Two fail-closed guards run before any
     live match, mirroring the planner's invariants:
 
     - A ``same_lane_worker`` (Claude) target may never be re-resolved across a
       project boundary — that is a direct cross-project Claude send and raises
-      :class:`~mozyo_bridge.domain.delegation_route_planner.DelegationRoutePlanError`
+      :class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.DelegationRoutePlanError`
       (Required behavior #6, defense-in-depth with the planner's own guard).
     - The ledgered identity's role must match the role the logical target
       expects (a gateway/coordinator token must resolve to a Codex pane, a

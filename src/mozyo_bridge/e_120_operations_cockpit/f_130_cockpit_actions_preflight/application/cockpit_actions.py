@@ -94,7 +94,7 @@ def _pick_attached_client() -> str:
     window focus there is iTerm2's domain and out of v1 scope, so control
     clients are only used when no regular client exists.
     """
-    from mozyo_bridge.infrastructure.tmux_client import run_tmux
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 
     result = run_tmux(
         "list-clients",
@@ -128,7 +128,7 @@ def _pick_attached_client() -> str:
 
 def jump_to_unit(pane_id: str, *, home: Path | None = None) -> dict:
     """Switch the attached tmux client to the unit's window (jump v1)."""
-    from mozyo_bridge.infrastructure.tmux_client import run_tmux
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 
     record = _resolve_record(pane_id, home=home)
     client = _pick_attached_client()
@@ -174,7 +174,7 @@ DEFAULT_HOST: str = "local"
 def candidate_unit_selector(unit_view) -> dict:
     """The identity selector a grouped action may carry from a read-model row.
 
-    A :class:`~mozyo_bridge.domain.grouped_read_model.UnitView` is display state.
+    A :class:`~mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model.UnitView` is display state.
     Only its public-safe *identity* (``workspace_id`` / ``lane_id`` / ``host_id``)
     may seed an action; the row's ``group_id`` / ``active`` / ``position`` /
     freshness are display facts, never routing authority. A degraded row — one
@@ -231,7 +231,7 @@ def _resolve_unit_target(
       discriminator did not faithfully separate them, so a contradicted / drifted
       projection never picks one silently.
     """
-    from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
+    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import ROLE_CLAUDE, ROLE_CODEX
 
     if not isinstance(workspace_id, str) or not workspace_id:
         raise CockpitActionError(

@@ -34,16 +34,16 @@ from mozyo_bridge.application.repo_local_config_loader import (
     load_repo_local_config_from_path,
     repo_local_config_path,
 )
-from mozyo_bridge.domain.module_registry import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     CliCompositionConfig,
     ModuleRegistryError,
 )
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     SURFACE_TEXT,
     SURFACE_TMUX_USER_OPTION,
 )
-from mozyo_bridge.domain.provider_registry import ProviderSelectionConfig
-from mozyo_bridge.domain.repo_local_config import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import ProviderSelectionConfig
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfig,
     RepoLocalConfigError,
 )

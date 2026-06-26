@@ -42,12 +42,12 @@ from mozyo_bridge.application.cockpit_payload import (
     observed_units_from_inventory,
     units_payload,
 )
-from mozyo_bridge.domain import runtime_observation as ro
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     UNIT_STATUS_CONTRADICTED,
     build_grouped_read_model,
 )
-from mozyo_bridge.domain.runtime_observation import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (
     DISPLAY_STATE_HEALTHY,
     FRESHNESS_FRESH,
     READABILITY_READABLE,
@@ -390,7 +390,7 @@ class GroupedUnitsPayloadTest(unittest.TestCase):
         self.assertNotIn("target", unit)
 
     def test_invalid_placement_config_raises(self) -> None:
-        from mozyo_bridge.domain.repo_local_config import RepoLocalConfigError
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import RepoLocalConfigError
 
         self._write_config(
             "presentation:\n  project_group_presentation: iterm_tab\n"

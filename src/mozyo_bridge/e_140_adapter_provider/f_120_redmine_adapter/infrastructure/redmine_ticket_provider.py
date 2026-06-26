@@ -1,7 +1,7 @@
 """Built-in Redmine ticket provider (Redmine #12034).
 
 The first — and, per the adapter-boundary design (Redmine #12001), for v0.8 the
-*only* — concrete :class:`~mozyo_bridge.domain.ticket_adapter.TicketProvider`.
+*only* — concrete :class:`~mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter.TicketProvider`.
 It converts Redmine API JSON shapes (the ``/issues.json`` payload, the
 ``journals`` array, and the ``RedmineAnchor`` used by handoffs) into the
 core-facing normalized records, and owns Redmine-specific URL formatting.
@@ -9,9 +9,9 @@ core-facing normalized records, and owns Redmine-specific URL formatting.
 What this provider deliberately does **not** do, because core owns it:
 
 - it does not classify workflow gates (use
-  :func:`mozyo_bridge.domain.ticket_adapter.classify_workflow_gate`);
+  :func:`mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter.classify_workflow_gate`);
 - it does not decide owner close approval (use
-  :func:`mozyo_bridge.domain.ticket_adapter.owner_approval`);
+  :func:`mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter.owner_approval`);
 - it does not perform any network call here — normalization is pure over data
   the caller already fetched, so it can never become a second place that sends
   the API key anywhere. The trusted-base / credential boundary stays in
@@ -25,8 +25,8 @@ from __future__ import annotations
 
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.domain.handoff import RedmineAnchor
-from mozyo_bridge.domain.ticket_adapter import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import RedmineAnchor
+from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter import (
     CommentRef,
     IssueRef,
     JournalRef,

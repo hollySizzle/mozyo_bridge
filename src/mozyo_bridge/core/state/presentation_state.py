@@ -73,7 +73,7 @@ from typing import TYPE_CHECKING, Mapping, Optional
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 if TYPE_CHECKING:  # avoid importing the domain config at runtime; only typed here
-    from mozyo_bridge.domain.presentation_grouping import PresentationGroupingConfig
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import PresentationGroupingConfig
 
 #: The home-scoped SQLite file holding desired presentation current state. A
 #: separate DB from ``registry.sqlite`` (identity) and ``inventory.sqlite``
@@ -685,7 +685,7 @@ class PresentationStateStore:
         never depends on a live observation or a pane tree (the doc's live
         geometry boundary). ``membership_rules`` are *deliberately not* seeded:
         a rule derives a group from launch-time facts and is evaluated at launch
-        by :func:`~mozyo_bridge.domain.presentation_grouping.resolve_launch_placement`,
+        by :func:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.resolve_launch_placement`,
         not frozen into durable membership here.
 
         For each override:

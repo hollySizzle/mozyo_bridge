@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.provider_registry import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import (
     BUILTIN_PROVIDER_REGISTRY,
     FORBIDDEN_PROVIDER_AUTHORITIES,
     BuiltinProvider,
@@ -29,7 +29,7 @@ from mozyo_bridge.domain.provider_registry import (
 from mozyo_bridge.application.tmux_attention_presentation_provider import (
     PROVIDER_NAME as TMUX_PRESENTATION_PROVIDER_NAME,
 )
-from mozyo_bridge.infrastructure.redmine_ticket_provider import (
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider import (
     PROVIDER_NAME as REDMINE_PROVIDER_NAME,
 )
 

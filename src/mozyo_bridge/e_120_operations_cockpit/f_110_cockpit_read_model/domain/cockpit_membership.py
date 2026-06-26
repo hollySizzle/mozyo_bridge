@@ -9,7 +9,7 @@ shouts "agent window missing" without ever saying the workspace is in fact a
 cockpit column — exactly the #12339 mis-read this US closes.
 
 This module is **pure and read-only by construction**, mirroring
-:mod:`mozyo_bridge.domain.cockpit_geometry`. The application layer reads live
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry`. The application layer reads live
 tmux (the managed cockpit windows + their geometry) and the workspace registry,
 then hands the *resolved facts* to :func:`project_membership_report` /
 :func:`absent_membership`. The projection plans no tmux, touches no filesystem,
@@ -29,13 +29,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.domain.cockpit_geometry import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
     FINDING_MIXED_UNIT_COLUMN,
     FINDING_ROLE_LESS_PANE,
     SEVERITY_WARNING,
     GeometryDiagnosis,
 )
-from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW, normalize_lane
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW, normalize_lane
 
 # The single sentence every membership view repeats: this is a projection of live
 # display state, not the durable work record. Kept here so text + JSON consumers

@@ -1,7 +1,7 @@
 """Classical tests for the route identity ledger / live re-resolution (#12553).
 
 These are hermetic, no-side-effect tests for the pure ledger seam
-(:mod:`mozyo_bridge.domain.route_identity_ledger`). They pin the contract that a
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger`). They pin the contract that a
 ``pane_id`` is a cache/snapshot only and is never the route authority: every
 resolution re-matches a live inventory snapshot against the stable identity
 tuple ``(workspace_id, lane_id, role, pane_name)`` and fails closed — with
@@ -21,12 +21,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (  # noqa: E402
     DelegationRoutePlanError,
     TARGET_CHILD_GATEWAY,
     TARGET_SAME_LANE_WORKER,
 )
-from mozyo_bridge.domain.route_identity_ledger import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
     DEFAULT_LANE,
     RESOLVE_OK,
     ROUTE_LABEL_MISSING,

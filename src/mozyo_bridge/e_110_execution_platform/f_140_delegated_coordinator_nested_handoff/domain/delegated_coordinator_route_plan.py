@@ -48,21 +48,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.domain.grandchild_dispatch import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import (
     DEFAULT_DELEGATED_COORDINATOR_DEPTH,
     DelegationPolicy,
     GrandchildDispatchDecision,
     resolve_grandchild_dispatch,
     resolve_no_dispatch,
 )
-from mozyo_bridge.domain.grandchild_stamp import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
     RealizationGateResult,
     evaluate_grandchild_realization_gate,
     find_realized_grandchild_unit,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import DelegationCandidate
-from mozyo_bridge.domain.redmine_read_boundary import ReadBoundaryVerdict
-from mozyo_bridge.domain.role_profile import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import DelegationCandidate
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_read_boundary import ReadBoundaryVerdict
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,

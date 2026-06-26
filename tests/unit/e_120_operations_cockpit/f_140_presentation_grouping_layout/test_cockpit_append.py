@@ -24,7 +24,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     CockpitWorkspace,
     build_cockpit_append_plan,
     build_cockpit_focus_plan,
@@ -119,7 +119,7 @@ class EvenColumnShareTest(unittest.TestCase):
     """Fair-share column width for append re-equalization (Redmine #11854)."""
 
     def test_share_is_one_over_n_percent(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import even_column_share
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import even_column_share
 
         self.assertEqual(50, even_column_share(2))
         self.assertEqual(33, even_column_share(3))
@@ -128,7 +128,7 @@ class EvenColumnShareTest(unittest.TestCase):
         self.assertEqual(17, even_column_share(6))
 
     def test_degenerate_counts_clamp_to_a_splittable_percentage(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import even_column_share
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import even_column_share
 
         # 0 / 1 columns can't yield a 0% or 100% split tmux would reject; clamp
         # to a sane 2-column (50%) floor and keep 1..99.

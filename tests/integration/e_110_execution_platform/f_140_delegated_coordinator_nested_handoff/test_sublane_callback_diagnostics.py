@@ -32,8 +32,8 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import sublane_diagnostics
-from mozyo_bridge.domain import sublane_callback
-from mozyo_bridge.domain.claude_permission_policy import CLAUDE_PERMISSION_MODE_ENV
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import CLAUDE_PERMISSION_MODE_ENV
 
 
 class ClassifyCallbackStallTest(unittest.TestCase):

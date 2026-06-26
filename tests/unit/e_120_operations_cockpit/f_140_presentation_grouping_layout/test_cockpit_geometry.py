@@ -24,7 +24,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_geometry import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
     FINDING_DUPLICATE_ROLE,
     FINDING_MISSING_CLAUDE,
     FINDING_MISSING_CODEX,

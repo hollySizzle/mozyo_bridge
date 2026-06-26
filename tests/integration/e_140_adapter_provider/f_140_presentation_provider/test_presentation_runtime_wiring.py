@@ -56,13 +56,13 @@ from mozyo_bridge.application.text_attention_presentation_provider import (
 from mozyo_bridge.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
 )
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
     SURFACE_TEXT,
     SURFACE_TMUX_USER_OPTION,
     PresentationProvider,
 )
-from mozyo_bridge.domain.repo_local_config import (
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     PresentationSelectionConfig,
     RepoLocalConfig,
     RepoLocalConfigError,

@@ -5,14 +5,14 @@ v0.9 repo-local config source. It defines the closed top-level record shape and
 the small presentation-surface selection record, and composes the two existing
 internal selection records:
 
-- ``cli`` -> :class:`mozyo_bridge.domain.module_registry.CliCompositionConfig`
+- ``cli`` -> :class:`mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry.CliCompositionConfig`
   (Redmine #12155 / #12184): names built-in CLI families to disable.
-- ``providers`` -> :class:`mozyo_bridge.domain.provider_registry.ProviderSelectionConfig`
+- ``providers`` -> :class:`mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderSelectionConfig`
   (Redmine #12035 / #12184): names, per category, which built-in provider id to
   select.
 - ``presentation`` -> :class:`PresentationSelectionConfig` (this module):
   selects which built-in projection *surface* to use.
-- ``delegation`` -> :class:`mozyo_bridge.domain.delegation_project_config.DelegationConfig`
+- ``delegation`` -> :class:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config.DelegationConfig`
   (Redmine #12549): the public-safe external-parent child-candidate surface that
   a delegation resolver reads. Default (no candidates) is behavior-preserving.
 
@@ -53,20 +53,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
-from mozyo_bridge.domain.delegation_project_config import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (
     DelegationConfig,
     DelegationConfigError,
 )
-from mozyo_bridge.domain.module_registry import CliCompositionConfig
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import CliCompositionConfig
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
     SURFACE_TMUX_USER_OPTION,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     PresentationGroupingConfig,
     PresentationGroupingConfigError,
 )
-from mozyo_bridge.domain.provider_registry import ProviderSelectionConfig
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import ProviderSelectionConfig
 
 #: The supported repo-local config record version. ``version`` is optional in a
 #: record and defaults to this; any other value is rejected so a future,
@@ -83,7 +83,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
 #: grouping keys (#12286) carry the desired presentation *grouping* config — the
 #: Project Group layer (``project_groups`` / ``grouping``) and the whole-view
 #: display-placement mode (``project_group_presentation``) — delegated to
-#: :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`.
+#: :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`.
 PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
     {
         "version",
@@ -95,7 +95,7 @@ PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
 )
 
 #: The ``presentation`` sub-keys that belong to the grouping config (forwarded to
-#: :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`).
+#: :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`).
 #: A separate set so the surface-selection keys and the grouping keys never blur.
 PRESENTATION_GROUPING_SUBKEYS: frozenset[str] = frozenset(
     {"project_groups", "grouping", "project_group_presentation"}
@@ -157,9 +157,9 @@ class RepoLocalConfigError(ValueError):
     """The repo-local YAML config record violates the closed schema.
 
     Inherits :class:`ValueError` for fail-closed semantics, matching the sibling
-    domain errors (:class:`~mozyo_bridge.domain.module_registry.ModuleRegistryError`,
-    :class:`~mozyo_bridge.domain.provider_registry.ProviderRegistryError`,
-    :class:`~mozyo_bridge.domain.presentation_adapter.PresentationRecordError`).
+    domain errors (:class:`~mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry.ModuleRegistryError`,
+    :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderRegistryError`,
+    :class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PresentationRecordError`).
     """
 
 
@@ -219,7 +219,7 @@ def _reject_provider_selection_boundary_tokens(
 ) -> None:
     """Fail closed on a boundary-shaped provider-selection category / id.
 
-    :class:`~mozyo_bridge.domain.provider_registry.ProviderSelectionConfig`
+    :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderSelectionConfig`
     rejects only the *exact* core-owned authority names
     (``workflow_authority`` / ``owner_approval`` / ``close_approval`` /
     ``routing_authority``); the repo-local YAML schema boundary additionally
@@ -281,14 +281,14 @@ class PresentationSelectionConfig:
     Two display-only concerns live under one ``presentation`` block:
 
     - :attr:`surface` names which built-in projection
-      :data:`~mozyo_bridge.domain.presentation_adapter.PRESENTATION_SURFACES`
+      :data:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PRESENTATION_SURFACES`
       surface to use — ``tmux_user_option`` (default) or ``text`` (#12189). It
       cannot add a surface, supply a renderer / module / callable, address a
       target / pane / route, send / approve / close anything, or grant authority.
     - :attr:`grouping` carries the desired presentation *grouping* config — the
       Project Group layer (``project_groups`` / ``grouping``) and the whole-view
       ``project_group_presentation`` display-placement mode (#12286) — parsed by
-      :class:`~mozyo_bridge.domain.presentation_grouping.PresentationGroupingConfig`,
+      :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`,
       itself display-only and fail-closed (no routing / approval / window
       guarantee).
 

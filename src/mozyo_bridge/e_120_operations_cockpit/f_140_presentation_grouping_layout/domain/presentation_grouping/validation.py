@@ -8,7 +8,7 @@ is one of the built-in vocabulary values. They fail closed through
 
 The *authority / boundary-leak* guard (forbidden tokens in keys and identity /
 diagnostic values) is a separate concern and lives in
-:mod:`mozyo_bridge.domain.presentation_grouping.authority`.
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.authority`.
 """
 
 from __future__ import annotations

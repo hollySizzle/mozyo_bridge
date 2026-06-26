@@ -51,8 +51,8 @@ from pathlib import Path
 
 import yaml
 
-from mozyo_bridge.domain.ticket_adapter import IssueRef
-from mozyo_bridge.infrastructure.redmine_ticket_provider import (
+from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter import IssueRef
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider import (
     REDMINE_TICKET_PROVIDER,
 )
 from mozyo_bridge.workspace_defaults import defaults_resolution

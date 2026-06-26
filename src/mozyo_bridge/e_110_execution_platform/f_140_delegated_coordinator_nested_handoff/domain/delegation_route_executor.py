@@ -1,12 +1,12 @@
 """Delegated route live executor core (Redmine #12557).
 
 The #12550 planner
-(:mod:`mozyo_bridge.domain.delegation_route_planner`) emits a *pure*
-:class:`~mozyo_bridge.domain.delegation_route_planner.RoutePlan` — an ordered,
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner`) emits a *pure*
+:class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.RoutePlan` — an ordered,
 typed command/record sequence — and explicitly deferred the side-effecting
 *executor* that turns it into live cockpit / tmux / Redmine mutations (planner
 docstring, ``executor (a deliberately deferred follow-up)``). The #12553 route
-identity ledger (:mod:`mozyo_bridge.domain.route_identity_ledger`) likewise
+identity ledger (:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger`) likewise
 shipped the stable-identity / live-re-resolution contract and deferred wiring it
 into the live ``handoff send`` path. This module is that shared follow-up: the
 live executor core that runs a :class:`RoutePlan` against the route identity
@@ -23,7 +23,7 @@ contracts are exercised — ``delegated-coordinator-smoke-test-frame.md``
   upgrade a rejected plan into a live route.
 - **Re-resolve immediately before every send.** Each handoff / stamp hop
   re-scans a freshly fetched live inventory through the ledger
-  (:func:`~mozyo_bridge.domain.route_identity_ledger.resolve_for_route_target`),
+  (:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_for_route_target`),
   so a moved pane is transparently recovered and a stale / ambiguous / missing
   target fails closed *before* anything is sent. A cached ``last_seen_pane_id``
   is never the send authority (#12553 Required behavior #2).
@@ -37,7 +37,7 @@ Purity / boundary (mirrors #12550 / #12553): this module performs no real I/O
 itself. tmux, the live inventory, the handoff transport, and the Redmine write
 are all **injected** protocols (:class:`LiveInventoryProvider`,
 :class:`HandoffTransport`, :class:`StampTransport`, and the #12558
-:class:`~mozyo_bridge.domain.delegation_route_records.RouteRecordSink`); the
+:class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_records.RouteRecordSink`); the
 live, credential-gated adapters are the deferred actuator follow-up and the
 classical tests drive fakes. Private topology (a resolved ``%N`` pane id) never
 enters a public record — it stays on the runtime request objects only.
@@ -49,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
-from mozyo_bridge.domain.delegation_route_planner import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (
     DelegationRoutePlanError,
     PLAN_BLOCKED,
     PLAN_FAILED,
@@ -67,7 +67,7 @@ from mozyo_bridge.domain.delegation_route_planner import (
     RoutePlan,
     PlannedStep,
 )
-from mozyo_bridge.domain.delegation_route_records import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_records import (
     CLASS_BLOCKED,
     CLASS_ENVIRONMENTAL,
     CLASS_FAILED_ACCEPTANCE,
@@ -92,7 +92,7 @@ from mozyo_bridge.domain.delegation_route_records import (
     validate_classification,
     worker_evidence_record,
 )
-from mozyo_bridge.domain.route_identity_ledger import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
     RESOLVE_OK,
     ROLE_CLAUDE,
     ROLE_CODEX,
@@ -141,7 +141,7 @@ class LiveInventoryProvider(Protocol):
     Called once per hop, immediately before re-resolution, so every send is
     matched against the *current* topology rather than a snapshot taken at plan
     time. Returns the read-only row sequence
-    :func:`~mozyo_bridge.domain.route_identity_ledger.resolve_route` consumes.
+    :func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_route` consumes.
     """
 
     def snapshot(self) -> Sequence[Mapping[str, object]]:

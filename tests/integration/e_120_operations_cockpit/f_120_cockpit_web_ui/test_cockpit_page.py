@@ -244,7 +244,7 @@ class ServedCockpitSmokeTest(unittest.TestCase):
         # blank because a field the front end expects went missing.
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             status, body = self._get("/api/units")
@@ -269,12 +269,12 @@ class ServedCockpitSmokeTest(unittest.TestCase):
         # sees "outdated / unavailable" instead of a falsely-current view.
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             self._get("/api/units")  # seed the cache from a live snapshot
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,  # tmux unavailable -> stale cache snapshot
         ):
             status, body = self._get("/api/units")

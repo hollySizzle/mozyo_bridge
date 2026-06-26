@@ -28,8 +28,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge import session_inventory
 from mozyo_bridge.application.commands import cmd_session_list
-from mozyo_bridge.domain.session_naming import derive_session_name
-from mozyo_bridge.domain.session_naming import SOURCE_REPO_FALLBACK
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import SOURCE_REPO_FALLBACK
 from mozyo_bridge.session_inventory import (
     SOURCE_CACHE,
     SOURCE_RUNTIME,
@@ -237,7 +237,7 @@ class CollectRuntimeInventoryTest(SessionInventoryBase):
         nfc_root = unicodedata.normalize("NFC", str(repo.resolve()))
         self.assertNotEqual(nfc_root, str(repo.resolve()))
         with patch(
-            "mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
             return_value=nfc_root,
         ):
             records = collect_runtime_inventory(
@@ -361,7 +361,7 @@ class TakeInventoryTest(SessionInventoryBase):
             panes=[pane("%1", "mozyo-demo:1.0", cwd=str(self.repo))],
         )
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,
         ):
             snapshot = take_inventory(home=self.home)
@@ -372,7 +372,7 @@ class TakeInventoryTest(SessionInventoryBase):
 
     def test_tmux_unavailable_without_cache_yields_empty_stale(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,
         ):
             snapshot = take_inventory(home=self.home)
@@ -397,7 +397,7 @@ class SessionListCliTest(SessionInventoryBase):
             pane("%1", "grouped-view:1.0", cwd=str(self.repo)),
         ]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             code, out, _ = self.capture(
@@ -450,7 +450,7 @@ class SessionListCliTest(SessionInventoryBase):
             panes=[pane("%1", "mozyo-demo:1.0", cwd=str(self.repo))],
         )
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,
         ):
             code, out, err = self.capture(

@@ -2,6 +2,6 @@
 
 Provider-neutral ticket adapter common contract for the adapter / provider context
 (Epic #12504). Holds ``domain/ticket_adapter`` (issue ref / adapter protocol). Legacy
-``mozyo_bridge.domain.ticket_adapter`` import path preserved as a ``sys.modules`` facade
+``mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter`` import path preserved as a ``sys.modules`` facade
 (US #12627, Redmine-numbered layout correction).
 """

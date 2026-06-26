@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AnchorError,
     AsanaAnchor,
     KIND_LABELS,

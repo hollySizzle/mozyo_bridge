@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.plugin_manifest import (
+from mozyo_bridge.e_140_adapter_provider.f_150_plugin_manifest_marketplace.domain.plugin_manifest import (
     PACKAGING_METADATA_FIELDS,
     PLUGIN_MANIFEST_KEYS,
     PLUGIN_MANIFEST_VERSION,
@@ -26,7 +26,7 @@ from mozyo_bridge.domain.plugin_manifest import (
     PluginManifestError,
     validate_plugin_manifest,
 )
-from mozyo_bridge.domain.provider_registry import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import (
     FORBIDDEN_PROVIDER_AUTHORITIES,
     ProviderCategory,
 )

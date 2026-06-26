@@ -9,7 +9,7 @@ handoff) does not by itself make ``agents targets`` show the grandchild lane wit
 ``KIND=implementation`` / ``DEPTH=2`` / ``PARENT=<delegated coordinator lane>`` —
 nothing **stamps** the live ``@mozyo_lane_kind`` / ``@mozyo_delegation_parent``
 projection-cache options that the discovery read path
-(:mod:`mozyo_bridge.domain.delegation_display`) consumes
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display`) consumes
 (``delegated-coordinator-cockpit-display.md`` ``### separate は actuator ではない``;
 ``delegation-policy-project-config.md`` follow-up #6).
 
@@ -19,7 +19,7 @@ dispatch journal, never inferred from pane proximity) and which lane is the
 realized grandchild, it
 
 1. validates the declared chain through the closed #12465
-   :func:`~mozyo_bridge.domain.delegation_projection.derive_delegation_tree`
+   :func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection.derive_delegation_tree`
    foundation (fail-closed on a duplicate / unknown parent / cycle / a depth
    beyond the shallow-delegation maximum / an off-contract ``lane_kind``), and
 2. asserts the realized grandchild lane derives to the acceptance shape — a
@@ -55,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-from mozyo_bridge.domain.delegation_projection import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
     LANE_KIND_IMPLEMENTATION,
     OPTION_DELEGATION_PARENT,
     OPTION_LANE_KIND,

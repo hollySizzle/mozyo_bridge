@@ -51,12 +51,12 @@ sys.path.insert(
 
 import test_delegated_coordinator_acceptance_oracle as oracle  # noqa: E402
 
-from mozyo_bridge.domain.delegation_project_config import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (  # noqa: E402
     ChildCandidate,
     DelegationConfig,
     resolve_child_candidate,
 )
-from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (  # noqa: E402
     OUTPUT_EXECUTE,
     OUTPUT_RECOMMEND_ONLY,
     ROUTE_CLAUDE_DIRECT,
@@ -65,7 +65,7 @@ from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
     RouteRequest,
     plan_delegation_route,
 )
-from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_records import (  # noqa: E402
     CALLBACK_SENT,
     CLASS_PASS,
     PERSIST_OK,
@@ -78,13 +78,13 @@ from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
     CallbackOutcome,
     RouteRecordReceipt,
 )
-from mozyo_bridge.domain.delegation_route_executor import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_executor import (  # noqa: E402
     DelegationRouteExecutor,
     ExecutionContext,
     HandoffSendOutcome,
     StampOutcome,
 )
-from mozyo_bridge.domain.route_identity_ledger import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
     RouteIdentity,
     RouteIdentityLedger,
 )

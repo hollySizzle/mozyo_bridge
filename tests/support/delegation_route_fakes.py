@@ -3,7 +3,7 @@
 Redmine #12491 (parent Feature #12531 ``120_シナリオ・受入テスト基盤``). This is
 the **support** layer for the classical (Detroit-school) scenario / regression
 tests: the subject-under-test is the real pure
-:func:`~mozyo_bridge.domain.delegated_coordinator_route_plan.plan_delegated_coordinator_route`
+:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan.plan_delegated_coordinator_route`
 planner, and the only fakes live here — at the side-effecting boundary (the
 durable record sink and the pane-send / stamp transport the CLI would drive). No
 real tmux, Redmine, or pane scrollback is touched; the executor records what it
@@ -29,22 +29,22 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from mozyo_bridge.domain.delegated_coordinator_route_plan import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan import (  # noqa: E402
     DelegatedCoordinatorRoutePlan,
     RoutePlanRequest,
     STEP_SEND_SAME_LANE_WORKER,
     STEP_SEND_TO_GRANDCHILD_GATEWAY,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (  # noqa: E402
     CONFIDENCE_STRONG,
     DelegationCandidate,
     LAUNCH_ADOPT_MODE_LAUNCH_OR_ADOPT,
 )
-from mozyo_bridge.domain.delegation_projection import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (  # noqa: E402
     LANE_KIND_IMPLEMENTATION,
 )
-from mozyo_bridge.domain.grandchild_dispatch import DelegationPolicy  # noqa: E402
-from mozyo_bridge.domain.redmine_read_boundary import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import DelegationPolicy  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_read_boundary import (  # noqa: E402
     ReadAccess,
     ReadBoundaryVerdict,
     SURFACE_PARENT_DESCRIPTION,

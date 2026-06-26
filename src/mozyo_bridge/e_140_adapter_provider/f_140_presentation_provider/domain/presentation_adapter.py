@@ -47,7 +47,7 @@ from typing import Optional, Protocol, runtime_checkable
 # authority vocabulary from the provider registry seam (Redmine #12035) so a
 # presentation projection and a registered provider are checked against the same
 # core-owned list and the two can never drift apart.
-from mozyo_bridge.domain.provider_registry import FORBIDDEN_PROVIDER_AUTHORITIES
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import FORBIDDEN_PROVIDER_AUTHORITIES
 
 # --- recognized projection surfaces (core-owned vocabulary) ------------------
 # The design doc's presentation MVP names "tmux user options and text output" as

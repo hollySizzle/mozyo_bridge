@@ -160,7 +160,7 @@ DELEGATION_WINDOW_POLICY_MODES: frozenset[str] = frozenset(
 DEFAULT_DELEGATION_WINDOW_POLICY: str = DELEGATION_WINDOW_POLICY_SEPARATE
 
 #: The default lane id every non-lane construction lands on (mirrors
-#: :data:`mozyo_bridge.domain.cockpit_layout.DEFAULT_LANE`). Kept as a local
+#: :data:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout.DEFAULT_LANE`). Kept as a local
 #: constant so this domain package imports nothing from the cockpit layout layer.
 DEFAULT_LANE: str = "default"
 

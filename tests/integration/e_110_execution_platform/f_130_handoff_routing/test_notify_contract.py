@@ -14,13 +14,13 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.notification import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import (
     build_prompt,
     landing_marker,
     validate_notify_gate,
 )
-import mozyo_bridge.domain.pane_resolver as pane_resolver
-from mozyo_bridge.infrastructure.queue_reader import find_handoff_task
+import mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver as pane_resolver
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.queue_reader import find_handoff_task
 
 class NotificationTest(unittest.TestCase):
     def assert_exits_cleanly(self, callback) -> None:
@@ -132,8 +132,8 @@ class NotifyContractTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout:
             try:
                 result = args.func(args)
@@ -147,7 +147,7 @@ class NotifyContractTest(unittest.TestCase):
     def test_notify_by_journal_types_observed_text_then_submits(self) -> None:
         # `notify-codex` is a thin wrapper over the new handoff primitive
         # (Codex audit: `1214760803593547`). The marker and body shape come
-        # from `mozyo_bridge.domain.handoff`; the legacy `[mozyo:notify:...]`
+        # from `mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff`; the legacy `[mozyo:notify:...]`
         # marker is reserved for the legacy queue subcommands. v0.4: the
         # standard notify wrappers default to `--mode queue-enter`, so the
         # Layer B preflight admits the send under the fake's codex pane.

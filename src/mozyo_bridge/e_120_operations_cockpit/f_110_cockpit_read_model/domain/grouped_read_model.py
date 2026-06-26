@@ -5,10 +5,10 @@ the Project Group -> Unit view a cockpit UI reads — by composing three pure
 inputs the predecessors fixed:
 
 - the **repo-local desired presentation grouping config** and its launch-placement
-  resolver (Redmine #12263, :mod:`mozyo_bridge.domain.presentation_grouping`):
+  resolver (Redmine #12263, :mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping`):
   *which* Project Group a Unit is desired to display under;
 - a **live observation envelope** per Unit and for the whole projection
-  (Redmine #12224, :mod:`mozyo_bridge.domain.runtime_observation`): *how fresh /
+  (Redmine #12224, :mod:`mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation`): *how fresh /
   readable / contradicted* the runtime observation behind each row is
   (``observed_at`` / ``freshness`` / ``stale_reason`` / ``contradiction``);
 - **home-scoped runtime / projection inputs** (:class:`ObservedUnit`): the
@@ -77,7 +77,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     DEFAULT_LANE,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
     STATUS_DESIRED_UNIT_MISSING,
@@ -89,7 +89,7 @@ from mozyo_bridge.domain.presentation_grouping import (
     UnitOverride,
     resolve_launch_placement,
 )
-from mozyo_bridge.domain.runtime_observation import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (
     DISPLAY_STATE_UNKNOWN,
     FRESHNESS_EXPIRED,
     FRESHNESS_STALE,

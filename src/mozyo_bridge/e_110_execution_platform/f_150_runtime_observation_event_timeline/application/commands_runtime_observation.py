@@ -3,7 +3,7 @@
 ``mozyo-bridge observe reload`` re-captures runtime observation snapshots so an
 operator can explicitly refresh a diagnostic / display view and see how old it
 is. The semantics are the runtime observation snapshot contract codified in
-:mod:`mozyo_bridge.domain.runtime_observation` (closed under #12223, recorded in
+:mod:`mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation` (closed under #12223, recorded in
 ``vibes/docs/logics/runtime-observability-boundary.md``):
 
 - The reload refreshes diagnostic / display snapshots ONLY. It never updates
@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
-from mozyo_bridge.domain import runtime_observation as ro
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
 
 SOURCE_TMUX = "tmux"
 SOURCE_OTEL = "otel"

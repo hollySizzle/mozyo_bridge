@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.application.commands import cmd_events_query, cmd_events_tail
-from mozyo_bridge.domain.event_timeline import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.event_timeline import (
     LAYER_RUNTIME,
     project_event,
     project_rows,

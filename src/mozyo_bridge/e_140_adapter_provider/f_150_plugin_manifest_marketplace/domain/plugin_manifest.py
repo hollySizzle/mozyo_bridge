@@ -25,7 +25,7 @@ as the sibling config records (``domain/repo_local_config.py``,
   ``declared_permission`` that names a core-owned authority — workflow / owner /
   close / review / routing / send — or a destructive / install / shell capability
   is rejected. The forbidden-authority set is sourced from
-  :data:`~mozyo_bridge.domain.provider_registry.FORBIDDEN_PROVIDER_AUTHORITIES`
+  :data:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.FORBIDDEN_PROVIDER_AUTHORITIES`
   so a manifest permission and a registered provider are screened against the
   same core-owned list and cannot drift.
 - **No second source of truth for packaging metadata.** A plugin's packaging
@@ -41,7 +41,7 @@ as the sibling config records (``domain/repo_local_config.py``,
 - **No public ABI / compatibility promise.** The closed key set, the category
   vocabulary, and the record shapes are internal and may change with no
   deprecation window. The categories a manifest may claim are the same
-  core-owned :class:`~mozyo_bridge.domain.provider_registry.ProviderCategory`
+  core-owned :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderCategory`
   vocabulary, so a manifest can never invent an adapter category.
 
 The module is pure (a frozen dataclass + small validation helpers) and imports
@@ -55,7 +55,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from mozyo_bridge.domain.provider_registry import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import (
     FORBIDDEN_PROVIDER_AUTHORITIES,
     ProviderCategory,
 )
@@ -235,8 +235,8 @@ class PluginManifestError(ValueError):
     """A plugin manifest record violates the static, declarative-only schema.
 
     Inherits :class:`ValueError` for fail-closed semantics, matching the sibling
-    domain errors (:class:`~mozyo_bridge.domain.provider_registry.ProviderRegistryError`,
-    :class:`~mozyo_bridge.domain.repo_local_config.RepoLocalConfigError`).
+    domain errors (:class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderRegistryError`,
+    :class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.RepoLocalConfigError`).
     """
 
 
@@ -458,7 +458,7 @@ class PluginManifest:
     - ``summary``: one-line, public-safe review note (default empty). Distinct
       from the packaging ``description``, which this manifest never stores.
     - ``categories``: the core-owned
-      :class:`~mozyo_bridge.domain.provider_registry.ProviderCategory` members the
+      :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderCategory` members the
       plugin claims to serve. A manifest may not invent a category.
     - ``capabilities``: descriptive labels for the mechanics the plugin says it
       performs (e.g. ``"normalize_issue"``). Purely descriptive.

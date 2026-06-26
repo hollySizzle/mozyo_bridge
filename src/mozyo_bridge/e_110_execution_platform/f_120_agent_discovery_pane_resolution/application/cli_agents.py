@@ -12,7 +12,7 @@ from mozyo_bridge.application.commands import (
     cmd_agents_list,
     cmd_agents_targets,
 )
-from mozyo_bridge.domain.agent_discovery import AGENT_KINDS
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import AGENT_KINDS
 
 
 def register(sub) -> None:

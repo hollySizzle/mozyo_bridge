@@ -42,7 +42,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.handoff import MODE_QUEUE_ENTER, MODE_STANDARD
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import MODE_QUEUE_ENTER, MODE_STANDARD
 
 DIE_EXIT_CODE = 2
 
@@ -88,9 +88,9 @@ class _HandoffFailureHarness(unittest.TestCase):
             "mozyo_bridge.application.commands.current_session_name",
             return_value=current_session,
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.validate_target"
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]
         ), contextlib.redirect_stdout(
             io.StringIO()
         ) as stdout, contextlib.redirect_stderr(
@@ -132,9 +132,9 @@ class _HandoffFailureHarness(unittest.TestCase):
         ), patch(
             "mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.validate_target"
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]
         ), contextlib.redirect_stdout(
             io.StringIO()
         ) as stdout, contextlib.redirect_stderr(

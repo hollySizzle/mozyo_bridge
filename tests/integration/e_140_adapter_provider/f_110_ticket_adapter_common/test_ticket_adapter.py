@@ -18,8 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.handoff import RedmineAnchor
-from mozyo_bridge.domain.ticket_adapter import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import RedmineAnchor
+from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter import (
     WORKFLOW_GATE_KINDS,
     CommentRef,
     IssueRef,
@@ -31,7 +31,7 @@ from mozyo_bridge.domain.ticket_adapter import (
     classify_workflow_gate,
     owner_approval,
 )
-from mozyo_bridge.infrastructure.redmine_ticket_provider import (
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider import (
     REDMINE_TICKET_PROVIDER,
     RedmineTicketProvider,
 )

@@ -24,8 +24,8 @@ from mozyo_bridge.application.commands import (
     cmd_session_boundary_prompt,
     cmd_session_pane_decision,
 )
-from mozyo_bridge.domain.handoff import build_execution_root
-from mozyo_bridge.domain.session_boundary import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import build_execution_root
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
     PRESERVATION_SIGNALS,
     SESSION_BOUNDARY_SIGNALS,
     BoundaryPrompt,
@@ -219,7 +219,7 @@ class DecidePaneLifecycleTests(unittest.TestCase):
             decide_pane_lifecycle(PaneLifecycleState(requested="nuke"))
 
     def test_decision_values_are_in_the_documented_set(self) -> None:
-        from mozyo_bridge.domain.session_boundary import PANE_LIFECYCLE_DECISIONS
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import PANE_LIFECYCLE_DECISIONS
 
         for state in (
             PaneLifecycleState(),

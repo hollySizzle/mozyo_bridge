@@ -208,7 +208,7 @@ class DelegationCandidate:
     """A discovery candidate considered for delegated-coordinator adoption.
 
     A minimal, decoupled projection of a ``agents targets`` row
-    (:class:`mozyo_bridge.domain.agent_discovery.TargetCandidate`) carrying only
+    (:class:`mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.TargetCandidate`) carrying only
     the fields the deterministic selector reads: ``pane_id`` /  ``role`` (the
     routing identity), ``repo_root`` / ``workspace_id`` (the canonical identity
     gate inputs), ``lane_id`` / ``lane_label`` (lane state), and the resolver

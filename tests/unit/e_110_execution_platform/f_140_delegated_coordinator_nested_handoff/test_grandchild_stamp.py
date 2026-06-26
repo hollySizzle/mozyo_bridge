@@ -1,7 +1,7 @@
 """Tests for the grandchild lane realization stamp actuator (Redmine #12473).
 
 Covers the pure stamp-plan resolver
-(:mod:`mozyo_bridge.domain.grandchild_stamp`): the realization shape gate
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp`): the realization shape gate
 (launch / adopt + adopt-reason), the declared-tree validation reused from the
 #12465 projection foundation (fail-closed on unknown parent / cycle / depth > 2 /
 off-contract kind), the grandchild acceptance shape (a depth-2 `implementation`
@@ -39,11 +39,11 @@ from mozyo_bridge.application.grandchild_stamp import (
     cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
 )
-from mozyo_bridge.domain.delegation_projection import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
     OPTION_DELEGATION_PARENT,
     OPTION_LANE_KIND,
 )
-from mozyo_bridge.domain.grandchild_stamp import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
     DeclaredLane,
     GATE_BLOCKED,
     GATE_REALIZED,
@@ -324,9 +324,9 @@ class CmdStampTest(unittest.TestCase):
 
     def test_preview_default_no_tmux_write(self) -> None:
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux"
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux"
         ) as run, mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux"
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux"
         ):
             rc, out = self._run(_stamp_args())
         self.assertEqual(0, rc)
@@ -338,10 +338,10 @@ class CmdStampTest(unittest.TestCase):
 
     def test_apply_writes_each_option(self) -> None:
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             return_value=types.SimpleNamespace(returncode=0),
         ) as run, mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux"
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux"
         ):
             rc, out = self._run(_stamp_args(apply=True))
         self.assertEqual(0, rc)
@@ -355,17 +355,17 @@ class CmdStampTest(unittest.TestCase):
             return types.SimpleNamespace(returncode=rc)
 
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux", side_effect=_flaky
-        ), mock.patch("mozyo_bridge.infrastructure.tmux_client.require_tmux"):
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux", side_effect=_flaky
+        ), mock.patch("mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux"):
             rc, out = self._run(_stamp_args(apply=True))
         self.assertEqual(0, rc)
         self.assertIn("partial", out)
 
     def test_dry_run_wins_over_apply(self) -> None:
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux"
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux"
         ) as run, mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux"
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux"
         ):
             rc, out = self._run(_stamp_args(apply=True, dry_run=True))
         self.assertEqual(0, rc)
@@ -423,7 +423,7 @@ class Issue12460RegressionTest(unittest.TestCase):
 
     def _cand(self, pane_id, *, lane_id, workspace_id, lane_kind="",
               delegation_parent=""):
-        from mozyo_bridge.domain.agent_discovery import TargetCandidate
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import TargetCandidate
 
         return TargetCandidate(
             pane_id=pane_id, role="codex", role_source="pane_option",
@@ -469,7 +469,7 @@ class Issue12460RegressionTest(unittest.TestCase):
         return out
 
     def test_unstamped_grandchild_shows_blank_columns(self) -> None:
-        from mozyo_bridge.domain.delegation_display import (
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import (
             delegation_cells,
             derive_targets_delegation,
         )
@@ -480,7 +480,7 @@ class Issue12460RegressionTest(unittest.TestCase):
         self.assertEqual(("-", "-", "-"), delegation_cells(display["%16"]))
 
     def test_stamp_makes_grandchild_show_kind_depth_parent(self) -> None:
-        from mozyo_bridge.domain.delegation_display import (
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import (
             delegation_cells,
             derive_targets_delegation,
         )

@@ -108,7 +108,7 @@ def derive_targets_delegation(candidates: Iterable) -> dict[str, DelegationDispl
     The result feeds the additive KIND / DEPTH / PARENT display columns only; it
     is not part of the canonical ``TargetRecord`` routing projection.
     """
-    from mozyo_bridge.domain.delegation_projection import (
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
         LANE_KINDS,
         DelegationProjectionError,
         DelegationSource,

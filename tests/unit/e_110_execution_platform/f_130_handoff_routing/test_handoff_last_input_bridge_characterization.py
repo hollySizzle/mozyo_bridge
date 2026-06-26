@@ -1,7 +1,7 @@
 """Family 4 / DeliveryOutcome -> last_input bridge characterization wave 1.
 
 Pins the currently-landed bridge semantics from
-``mozyo_bridge.domain.handoff.project_last_input`` (and the equivalent
+``mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff.project_last_input`` (and the equivalent
 :meth:`DeliveryOutcome.to_last_input_projection` method) into the
 ``last_input`` block defined by
 
@@ -65,7 +65,7 @@ from typing import Any, Literal, Optional, Union, get_args, get_origin, get_type
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AckStatus,
     DeliveryOutcome,
     LastInputProjection,

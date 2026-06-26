@@ -1,7 +1,7 @@
 """Grouped cockpit reload / freshness UX view (Redmine #12266).
 
 This module is the **reload / freshness UX layer** over the #12264 grouped
-cockpit read model (:mod:`mozyo_bridge.domain.grouped_read_model`). It is the
+cockpit read model (:mod:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model`). It is the
 grouped-view counterpart of what #12225 did for the flat pane cockpit
 (``cockpit_ui.attach_observation`` / the ``renderObservation`` + Reload button):
 it answers, for the Project Group -> Unit view a grouped cockpit renders, the
@@ -19,7 +19,7 @@ two operator questions the Start Gate (#12266 j#61875) names —
 It exists as a separate projection (not extra fields on the read model) because
 the read model deliberately does **not** serialize ``needs_reload`` — "Derived
 (not carried) so the row's stored data never names a reload / loading verb"
-(:class:`~mozyo_bridge.domain.grouped_read_model.UnitView`). The *display* layer
+(:class:`~mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model.UnitView`). The *display* layer
 is where ``reload_required`` becomes an explicit, rendered flag and where the
 reload affordance's semantics live. Like #12264, this is an object-to-object
 slice: it derives a view from a :class:`GroupedReadModel` object and wires no
@@ -61,12 +61,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     GroupedReadModel,
     ProjectGroupView,
     UnitView,
 )
-from mozyo_bridge.domain.runtime_observation import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (
     DISPLAY_STATE_HEALTHY,
     DISPLAY_STATE_RELOAD_REQUIRED,
     DISPLAY_STATE_UNKNOWN,

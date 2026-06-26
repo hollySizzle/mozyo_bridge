@@ -23,7 +23,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.pane_resolver import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (  # noqa: E402
     coordinator_codex_candidates,
     resolve_coordinator_codex,
     resolve_target,
@@ -93,9 +93,9 @@ def _runtime(panes, *, sender_pane_id):
     if sender_pane_id is not None:
         env["TMUX_PANE"] = sender_pane_id
     with patch(
-        "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+        "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes
     ), patch(
-        "mozyo_bridge.domain.pane_resolver.current_session_name",
+        "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name",
         return_value="mozyo-cockpit",
     ), patch.dict(os.environ, env, clear=True):
         yield

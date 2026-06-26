@@ -23,7 +23,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AgentRecord,
     build_target_candidates,
     discover_agents,
@@ -54,7 +54,7 @@ class BuildTargetCandidatesTest(unittest.TestCase):
     def _records(self, panes):
         # Fold with a fixed repo root so workspace resolution can fire.
         with patch(
-            "mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
             return_value="/work/repo",
         ):
             return fold_agents_by_pane(discover_agents(panes))
@@ -172,8 +172,8 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         canon = argparse.Namespace(name=label, workspace_id=workspace_id)
         args = argparse.Namespace(session=session, agent=agent, as_json=as_json)
         with patch.object(commands, "require_tmux"), \
-            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_probe_checkout_facts",
                          return_value={"branch": branch}), \
@@ -364,11 +364,11 @@ class AgentsTargetsUnregisteredDefaultsTest(unittest.TestCase):
         # registry is empty (fresh home) and the repo is unregistered, so the
         # only thing standing between discovery and a hang is the fix.
         with patch.object(commands, "require_tmux"), \
-            patch("mozyo_bridge.domain.agent_discovery.pane_lines",
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                   return_value=[_pane("%9", "mozyo-cockpit:0.1",
                                       window_name="codex", agent_role="claude",
                                       cwd=str(self.repo))]), \
-            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
                   return_value=str(self.repo)), \
             patch.object(workspace_registry, "derive_session_name",
                          side_effect=AssertionError(
@@ -419,8 +419,8 @@ class AgentsTargetsAttentionTest(unittest.TestCase):
         canon = argparse.Namespace(name="mozyo-bridge", workspace_id="wsA")
         args = argparse.Namespace(session=None, agent=None, as_json=as_json)
         with patch.object(commands, "require_tmux"), \
-            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
                   return_value="/work/repo"), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_probe_checkout_facts",
@@ -502,7 +502,7 @@ class AttentionForCandidateHelperTest(unittest.TestCase):
     """Conservative extraction mapping for one target (Redmine #11952)."""
 
     def _candidate(self, **over):
-        from mozyo_bridge.domain.agent_discovery import TargetCandidate
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import TargetCandidate
 
         base = dict(
             pane_id="%9",
@@ -571,7 +571,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
 
     def _cand(self, pane_id, *, lane_id, lane_kind="", delegation_parent="",
               workspace_id="wsA", role="codex"):
-        from mozyo_bridge.domain.agent_discovery import TargetCandidate
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import TargetCandidate
 
         return TargetCandidate(
             pane_id=pane_id,
@@ -610,7 +610,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         ]
 
     def test_no_delegation_facts_is_blank_none_status(self) -> None:
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         out = derive_targets_delegation([self._cand("%1", lane_id="default")])
         deleg = out["%1"]
@@ -621,7 +621,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         self.assertEqual("", deleg.delegation_root)
 
     def test_derives_kind_depth_parent_root_for_three_level_tree(self) -> None:
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         out = derive_targets_delegation(self._three_level_tree())
 
@@ -645,7 +645,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         # A lane's codex gateway + claude worker share `<workspace_id>/<lane_id>`;
         # both panes resolve to the same derived breadcrumb (no duplicate-unit
         # failure in the foundation).
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         cands = [
             self._cand("%1", lane_id="root", lane_kind="coordinator", role="codex"),
@@ -662,7 +662,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         # An off-contract kind must not be emitted as a healthy projection value
         # (mirrors the foundation's fail-closed boundary) but must not crash the
         # display either: it degrades to a diagnostic row.
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         out = derive_targets_delegation([self._cand("%1", lane_id="x", lane_kind="manager")])
         deleg = out["%1"]
@@ -671,7 +671,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         self.assertIsNone(deleg.delegation_depth)
 
     def test_unknown_parent_pointer_fails_soft_to_diagnostic(self) -> None:
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         out = derive_targets_delegation([
             self._cand("%1", lane_id="deleg", lane_kind="delegated_coordinator",
@@ -684,7 +684,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
 
     def test_depth_beyond_shallow_maximum_fails_soft(self) -> None:
         # parent -> delegated -> grandchild -> great-grandchild (depth 3 > 2).
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         cands = self._three_level_tree() + [
             self._cand("%4", lane_id="ggc", lane_kind="implementation",
@@ -696,7 +696,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
         self.assertIsNone(out["%4"].delegation_depth)
 
     def test_conflicting_panes_in_one_lane_are_diagnostic(self) -> None:
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         cands = [
             self._cand("%1", lane_id="deleg", lane_kind="coordinator"),
@@ -709,7 +709,7 @@ class DeriveTargetsDelegationTest(unittest.TestCase):
     def test_payload_carries_no_routing_or_close_authority_field(self) -> None:
         # The display breadcrumb must never grow a routing / approval / close key
         # (same non-authoritative contract as the #12465 foundation).
-        from mozyo_bridge.domain.delegation_display import derive_targets_delegation
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
 
         payload = derive_targets_delegation(self._three_level_tree())["%2"].as_payload()
         self.assertEqual(
@@ -748,8 +748,8 @@ class AgentsTargetsDelegationColumnsTest(unittest.TestCase):
         canon = argparse.Namespace(name=label, workspace_id=workspace_id)
         args = argparse.Namespace(session=None, agent=None, as_json=as_json)
         with patch.object(commands, "require_tmux"), \
-            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_probe_checkout_facts", return_value={"branch": branch}), \
             contextlib.redirect_stdout(io.StringIO()) as out:

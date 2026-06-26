@@ -17,7 +17,7 @@ from mozyo_bridge.application.grandchild_stamp import (
     cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
 )
-from mozyo_bridge.domain.grandchild_stamp import REALIZATIONS
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import REALIZATIONS
 
 
 def register_grandchild_realization(handoff_sub) -> None:

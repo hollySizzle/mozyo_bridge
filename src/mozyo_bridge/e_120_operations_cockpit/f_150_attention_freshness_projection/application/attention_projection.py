@@ -1,7 +1,7 @@
 """tmux pane user-option projection for derived attention (Redmine #11954).
 
 Builds the ``tmux set-option`` command plan that caches a #11951
-:class:`~mozyo_bridge.domain.attention.AttentionRecord` onto a pane's user
+:class:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.AttentionRecord` onto a pane's user
 options. The plan builder is **pure** (returns argv tuples, runs no tmux), so
 the projection's command generation is testable without a tmux server; the CLI
 command (``agents attention-project``) previews or executes the plan.
@@ -15,7 +15,7 @@ client, no routing, no ``agent-ui.conf`` / color.
 
 from __future__ import annotations
 
-from mozyo_bridge.domain.attention import AttentionRecord
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionRecord
 
 # tmux pane user-option names from `vibes/docs/logics/cockpit-attention-state.md`
 # (`### tmux user option`). These are cache markers; the design doc pins that

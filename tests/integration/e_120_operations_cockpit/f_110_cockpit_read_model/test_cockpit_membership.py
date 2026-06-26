@@ -23,8 +23,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain import cockpit_membership as membership
-from mozyo_bridge.domain.cockpit_geometry import diagnose_cockpit_geometry
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain import cockpit_membership as membership
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import diagnose_cockpit_geometry
 
 
 def _facts(label="alpha", repo="/repo/alpha", reg=True, anchor=True):
@@ -399,7 +399,7 @@ class CockpitListStatusCliTest(unittest.TestCase):
 
     @contextlib.contextmanager
     def _status_identity(self, commands, *, ws_id="wsA", name="alpha", lane_id="default"):
-        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import LaneIdentity
 
         canon = argparse.Namespace(name=name, workspace_id=ws_id)
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \

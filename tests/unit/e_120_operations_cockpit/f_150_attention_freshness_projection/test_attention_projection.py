@@ -28,7 +28,7 @@ from mozyo_bridge.application.attention_projection import (
     ATTENTION_UPDATED_AT_OPTION,
     build_attention_option_plan,
 )
-from mozyo_bridge.domain.attention import AttentionInputs, derive_attention
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionInputs, derive_attention
 
 
 def _pane(pane_id, location, *, command="node", cwd="/work/repo",
@@ -127,8 +127,8 @@ class AttentionProjectCommandTest(unittest.TestCase):
             return argparse.Namespace(returncode=rc, stdout="", stderr="")
 
         with patch.object(commands, "require_tmux"), \
-            patch("mozyo_bridge.domain.agent_discovery.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
                   return_value="/work/repo"), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_probe_checkout_facts",

@@ -21,7 +21,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
@@ -187,11 +187,11 @@ class DiscoverAgentsRoleTest(unittest.TestCase):
 class FindAgentWindowRoleTest(unittest.TestCase):
     def _patch(self, panes):
         return patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes
         )
 
     def test_resolves_cockpit_pane_by_role_option(self) -> None:
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%9", "mozyo-cockpit:0.2", window_name="cockpit", agent_role="claude"),
@@ -204,7 +204,7 @@ class FindAgentWindowRoleTest(unittest.TestCase):
     def test_multiple_cockpit_role_panes_same_session_fail_closed(self) -> None:
         # Cockpit packs several workspaces' agents into one window; `--to claude`
         # with no explicit pane must fail closed, not pick one silently.
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%9", "mozyo-cockpit:0.2", window_name="cockpit", agent_role="claude"),
@@ -216,7 +216,7 @@ class FindAgentWindowRoleTest(unittest.TestCase):
                     find_agent_window("claude", "mozyo-cockpit")
 
     def test_window_name_session_still_resolves(self) -> None:
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%1", "repo:0.0", window_name="claude", command="claude"),
@@ -226,7 +226,7 @@ class FindAgentWindowRoleTest(unittest.TestCase):
         self.assertEqual("%1", pane["id"])
 
     def test_weak_process_pane_is_not_targeted(self) -> None:
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%1", "repo:0.0", window_name="shell", command="claude"),
@@ -239,7 +239,7 @@ class FindAgentWindowRoleTest(unittest.TestCase):
         # pane (`@mozyo_agent_role=claude`) in a window named `codex`. The
         # explicit marker is authoritative, so `--to claude` must resolve this
         # pane (the release-blocker) rather than fail-closed on the layout name.
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%9", "mozyo-cockpit:0.2", window_name="codex", agent_role="claude"),
@@ -252,7 +252,7 @@ class FindAgentWindowRoleTest(unittest.TestCase):
     def test_window_name_codex_without_option_does_not_resolve_to_claude(self) -> None:
         # A normal pane (no marker) in a `codex` window is codex, not claude —
         # the window-name rail is unchanged when no pane option is present.
-        from mozyo_bridge.domain.pane_resolver import find_agent_window
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import find_agent_window
 
         panes = [
             _pane("%1", "repo:0.0", window_name="codex", command="node"),

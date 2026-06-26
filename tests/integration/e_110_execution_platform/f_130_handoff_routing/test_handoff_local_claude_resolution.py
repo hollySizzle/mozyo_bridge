@@ -166,15 +166,15 @@ class HandoffLocalClaudeCliTest(unittest.TestCase):
                 commands, "current_session_name", return_value=sender_session
             ), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.current_session_name",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name",
                 return_value=sender_session,
             ), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes
             ), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
                 _fake_infer_repo_root,
             ), \
             patch.dict(os.environ, env, clear=True), \

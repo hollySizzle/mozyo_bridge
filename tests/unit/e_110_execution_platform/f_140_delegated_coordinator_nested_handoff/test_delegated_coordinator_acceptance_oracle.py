@@ -22,7 +22,7 @@ fixed here; this oracle is the executable spec they are measured against.
 The oracle is anchored to *shipped* code where the vocabulary already exists: the
 role-profile chain it expects (``delegated_coordinator`` ->
 ``implementation_gateway`` -> ``implementation_worker``) is validated against the
-real :mod:`mozyo_bridge.domain.role_profile` tokens and resolver, so the
+real :mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile` tokens and resolver, so the
 hermetic oracle cannot silently drift from the role taxonomy the runtime sends.
 
 Hermetic by construction: no live tmux, no Redmine reads/writes, no private pane
@@ -41,7 +41,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.role_profile import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E402
     ROLE_COORDINATOR,
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,

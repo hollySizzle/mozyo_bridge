@@ -15,7 +15,7 @@ from mozyo_bridge.application.commands import (
     cmd_session_pane_decision,
     cmd_session_vscode_settings,
 )
-from mozyo_bridge.domain.session_boundary import SESSION_BOUNDARY_SIGNALS
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import SESSION_BOUNDARY_SIGNALS
 
 
 def register(sub) -> None:

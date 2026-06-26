@@ -398,7 +398,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             from mozyo_bridge.application.cockpit_payload import (
                 grouped_units_payload,
             )
-            from mozyo_bridge.domain.repo_local_config import (
+            from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
                 RepoLocalConfigError,
             )
 
@@ -677,7 +677,7 @@ def build_server(
     """
     import secrets
 
-    from mozyo_bridge.domain.agent_activity import TransitionTracker
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import TransitionTracker
 
     store = OtelEventStore(db_path, home=home)
     server = HTTPServer((_require_loopback(host), port), _ReceiverHandler)

@@ -2,9 +2,9 @@
 
 The handoff primitive (`orchestrate_handoff`) already owns receiver-pane
 resolution, validation, typing, the landing rail, fail-closed rollback, the
-structured :class:`~mozyo_bridge.domain.handoff.DeliveryOutcome`, and the
+structured :class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff.DeliveryOutcome`, and the
 pasteable markdown record produced by
-:func:`~mozyo_bridge.domain.handoff.build_delivery_record`. Until this module
+:func:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff.build_delivery_record`. Until this module
 existed, persisting that record into the durable source-of-truth ticket system
 (a Redmine journal note / an Asana comment) was a manual paste step: the
 ``DeliveryOutcome`` docstring named it an explicit follow-up.
@@ -64,7 +64,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
-from mozyo_bridge.domain.handoff import SOURCE_ASANA, SOURCE_REDMINE, SOURCES
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import SOURCE_ASANA, SOURCE_REDMINE, SOURCES
 
 # The class of a persisted delivery record. It is a *notification pointer*, not
 # a workflow gate or an owner approval — those stay core constructs in
@@ -124,7 +124,7 @@ class DeliveryRecordNote:
     """The normalized, persistable delivery record.
 
     Built only via :func:`build_delivery_record_note` from a
-    :class:`~mozyo_bridge.domain.handoff.DeliveryOutcome`. ``body`` is the
+    :class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff.DeliveryOutcome`. ``body`` is the
     already-redacted pasteable markdown from ``build_delivery_record``. The
     caller renders it for the durable sink path WITHOUT the free-text
     ``--record-command`` (Finding 1, j#62549) so no user-supplied free text is

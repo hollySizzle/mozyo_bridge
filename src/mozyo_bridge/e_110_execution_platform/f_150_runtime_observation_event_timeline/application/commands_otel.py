@@ -178,7 +178,7 @@ def cmd_events_tail(args: argparse.Namespace) -> int:
     of truth; gate state stays with Redmine and liveness with the tmux
     layer.
     """
-    from mozyo_bridge.domain.event_timeline import project_rows
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.event_timeline import project_rows
 
     store = _events_store(args)
     rows = store.query_events(limit=int(getattr(args, "limit", None) or 50))
@@ -193,7 +193,7 @@ def cmd_events_query(args: argparse.Namespace) -> int:
     `--source` matches the emitting service exactly. Same redacted,
     source-layer-tagged envelope as `events tail`.
     """
-    from mozyo_bridge.domain.event_timeline import project_rows
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.event_timeline import project_rows
 
     store = _events_store(args)
     rows = store.query_events(
@@ -214,7 +214,7 @@ def cmd_otel_activity(args: argparse.Namespace) -> int:
     """
     import json as _json
 
-    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import summarize_activity
     from mozyo_bridge.otel_store import OtelEventStore
 
     store = OtelEventStore(

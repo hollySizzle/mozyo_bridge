@@ -47,7 +47,7 @@ from mozyo_bridge.application.grouped_detail import (
     build_grouped_unit_detail,
 )
 from mozyo_bridge.application.otel_receiver import build_server
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     UNIT_STATUS_CONTRADICTED,
     UNIT_STATUS_OBSERVED,
     UNIT_STATUS_PARTIAL,
@@ -56,7 +56,7 @@ from mozyo_bridge.domain.grouped_read_model import (
     UNIT_STATUS_UNREADABLE,
     UnitView,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
 )

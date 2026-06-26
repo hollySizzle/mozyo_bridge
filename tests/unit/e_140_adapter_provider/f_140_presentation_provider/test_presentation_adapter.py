@@ -33,8 +33,8 @@ from mozyo_bridge.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
     TmuxAttentionPresentationProvider,
 )
-from mozyo_bridge.domain.attention import AttentionRecord
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionRecord
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     FORBIDDEN_PROJECTION_FIELDS,
     PRESENTATION_SURFACES,
     SURFACE_TEXT,
@@ -44,7 +44,7 @@ from mozyo_bridge.domain.presentation_adapter import (
     ProjectionField,
     SurfaceProjection,
 )
-from mozyo_bridge.domain.provider_registry import FORBIDDEN_PROVIDER_AUTHORITIES
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import FORBIDDEN_PROVIDER_AUTHORITIES
 
 
 def _attention_record() -> AttentionRecord:

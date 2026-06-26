@@ -33,8 +33,8 @@ import sys
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
-from mozyo_bridge.domain.presentation_grouping import PresentationGroupingConfig
-from mozyo_bridge.domain.repo_local_config import REPO_LOCAL_CONFIG_VERSION
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import PresentationGroupingConfig
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import REPO_LOCAL_CONFIG_VERSION
 from mozyo_bridge.presentation_state import (
     PRESENTATION_STATE_SCHEMA_VERSION,
     SOURCE_REPO_LOCAL_CONFIG,

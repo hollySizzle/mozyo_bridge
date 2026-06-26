@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mozyo_bridge.domain.session_naming import (
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
     derive_session_name,
     derive_session_name_without_defaults,
 )

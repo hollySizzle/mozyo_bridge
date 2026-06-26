@@ -1,7 +1,7 @@
 """Tests for the grandchild (depth-2) dispatch decision primitive (#12458).
 
 Covers the pure decision resolver
-(:mod:`mozyo_bridge.domain.grandchild_dispatch`): the delegation policy
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch`): the delegation policy
 normalization / fail-closed clamp, the depth-2 policy gate (master gate /
 grandchild flag / depth ceiling / active-lane capacity), the grandchild dispatch
 decision reusing the #12457 launch/adopt selector (adopt / launch / fail-closed,
@@ -30,7 +30,7 @@ from mozyo_bridge.application.grandchild_dispatch import (
     _recommended_command,
     cmd_handoff_grandchild_dispatch,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
     CONFIDENCE_STRONG,
     CallbackTarget,
     DelegationCandidate,
@@ -43,7 +43,7 @@ from mozyo_bridge.domain.delegation_launch_adopt import (
     ROLE_CLAUDE,
     ROLE_CODEX,
 )
-from mozyo_bridge.domain.grandchild_dispatch import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import (
     DEFAULT_DELEGATED_COORDINATOR_DEPTH,
     HARD_CEILING_DEPTH,
     OUTCOME_DISPATCH_ADOPT,
@@ -556,7 +556,7 @@ class HandlerIntegrationTest(unittest.TestCase):
             "mozyo_bridge.application.commands._agents_target_candidates",
             return_value=rows,
         ), mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux",
             return_value=None,
         ), contextlib.redirect_stdout(buf):
             code = cmd_handoff_grandchild_dispatch(ns)
@@ -673,7 +673,7 @@ class HandlerIntegrationTest(unittest.TestCase):
             ]
         )
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux", return_value=None
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux", return_value=None
         ), self.assertRaises(SystemExit):
             cmd_handoff_grandchild_dispatch(ns)
 

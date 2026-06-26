@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.pane_resolver import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     clear_read,
     require_read,
     resolve_target,

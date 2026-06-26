@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     GROUP_SOURCE_DEFAULT,
     GROUP_SOURCE_DESIRED,
     GROUPED_READ_MODEL_DIAGNOSTIC_ONLY_NOTE,
@@ -45,15 +45,15 @@ from mozyo_bridge.domain.grouped_read_model import (
     UnitView,
     build_grouped_read_model,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
     PresentationGroupingConfig,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     _FORBIDDEN_KEY_PARTS as FORBIDDEN_KEY_PARTS,
 )
-from mozyo_bridge.domain.runtime_observation import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (
     CONTRADICTION_LIVE_RUNTIME_CONFLICT,
     DISPLAY_STATE_HEALTHY,
     DISPLAY_STATE_RELOAD_REQUIRED,

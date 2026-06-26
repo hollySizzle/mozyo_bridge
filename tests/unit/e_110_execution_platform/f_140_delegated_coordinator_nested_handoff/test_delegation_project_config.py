@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # this module.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mozyo_bridge.domain.delegation_project_config import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (  # noqa: E402
     CHILD_CANDIDATE_AMBIGUOUS,
     CHILD_CANDIDATE_MISSING,
     CHILD_CANDIDATE_RESOLVED,

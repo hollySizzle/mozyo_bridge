@@ -23,7 +23,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     ADOPT_STATUS_AMBIGUOUS,
     ADOPT_STATUS_CANDIDATE,
     ADOPT_STATUS_NONE,
@@ -152,7 +152,7 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
     """`_coexisting_normal_observations` keeps only normal-`mozyo` agent panes."""
 
     def _record(self, **over):
-        from mozyo_bridge.domain.agent_discovery import ROLE_SOURCE_WINDOW_NAME
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import ROLE_SOURCE_WINDOW_NAME
         from mozyo_bridge.session_inventory import InventoryRecord, WorkspaceIdentity
 
         base = dict(
@@ -180,7 +180,7 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
     @contextlib.contextmanager
     def _inventory(self, records):
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
         from mozyo_bridge.session_inventory import InventorySnapshot
 
         snapshot = InventorySnapshot(
@@ -236,7 +236,7 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
         # Cockpit panes carry the role on `@mozyo_agent_role`
         # (role_source=pane_option); they are not a normal-session adopt source.
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.agent_discovery import ROLE_SOURCE_PANE_OPTION
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import ROLE_SOURCE_PANE_OPTION
 
         rec = self._record(session="mozyo-cockpit", role_source=ROLE_SOURCE_PANE_OPTION)
         with self._inventory([rec]):
@@ -245,7 +245,7 @@ class CoexistingObservationsProjectionTest(unittest.TestCase):
 
     def test_drops_unknown_agent_kind(self) -> None:
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             AGENT_KIND_UNKNOWN,
             ROLE_SOURCE_UNKNOWN,
         )
@@ -285,7 +285,7 @@ class CockpitAdoptCommandTest(unittest.TestCase):
     @contextlib.contextmanager
     def _patched(self, *, columns, advisory):
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
 
         canon = argparse.Namespace(name="mozyo-ws", workspace_id="wsX")
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \

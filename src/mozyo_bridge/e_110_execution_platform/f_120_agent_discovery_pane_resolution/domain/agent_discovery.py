@@ -28,7 +28,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
-from mozyo_bridge.infrastructure.tmux_client import pane_lines
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import pane_lines
 from mozyo_bridge.shared.paths import REPO_ROOT_MARKERS
 
 
@@ -810,7 +810,7 @@ class PreflightTarget:
 def project_preflight_target(pane: dict[str, str]) -> PreflightTarget:
     """Project a resolved pane dict onto the canonical preflight ``TargetRecord``.
 
-    Pure over the fields :func:`mozyo_bridge.infrastructure.tmux_client.pane_lines`
+    Pure over the fields :func:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.pane_lines`
     emits. Reuses the #11822 role resolver (pane-option primary, window-name
     fallback, process weak) and the #11907 :func:`_derive_view_kind` so the
     handoff preflight and ``agents targets`` never grow two divergent resolvers.

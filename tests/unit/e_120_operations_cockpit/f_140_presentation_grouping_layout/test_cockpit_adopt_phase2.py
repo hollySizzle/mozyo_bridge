@@ -24,7 +24,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     ROLE_CLAUDE,
     ROLE_CODEX,
     CockpitWorkspace,
@@ -267,7 +267,7 @@ class CockpitAdoptConfirmFlowTest(unittest.TestCase):
     def _patched(self, *, columns, advisory, attached=(), run=None,
                  session_present=True):
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE, LaneIdentity
 
         canon = argparse.Namespace(name="mozyo-ws", workspace_id="wsX")
         run = run or RecordingRun()

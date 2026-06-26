@@ -42,12 +42,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain import pane_resolver
-from mozyo_bridge.domain.pane_resolver import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     duplicate_pane_record_row,
     same_lane_receiver_duplicates,
 )
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODE_STANDARD,
     build_delivery_record,
     make_outcome,
@@ -272,9 +272,9 @@ class _OrchestratorHarness(unittest.TestCase):
             patch.object(commands, "wait_for_text", return_value=marker_lands), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch.object(commands, "current_session_name", return_value="mozyo-cockpit"), \
-            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="mozyo-cockpit"), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value="mozyo-cockpit"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes), \
             patch.dict(os.environ, env, clear=True), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.delivery_record_sink import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     DeliveryRecordError,
     DeliveryRecordNote,
     DeliveryReceipt,
@@ -46,7 +46,7 @@ from mozyo_bridge.domain.delivery_record_sink import (
     build_delivery_record_note,
     resolve_delivery_record_sink,
 )
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODE_STANDARD,
     build_delivery_record,
     make_outcome,
@@ -354,8 +354,8 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch("mozyo_bridge.application.commands.current_session_name", return_value=None), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
             contextlib.redirect_stderr(io.StringIO()):
             result = args.func(args)
@@ -408,7 +408,7 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
             raise RuntimeError("sink resolution blew up")
 
         with patch(
-            "mozyo_bridge.domain.delivery_record_sink.resolve_delivery_record_sink",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.resolve_delivery_record_sink",
             side_effect=boom,
         ):
             result, stdout = self._run_send(argv)
@@ -431,7 +431,7 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         transport = _FakeTransport(journal_id="77001")
         argv = self._base_argv() + ["--persist-delivery"]
         with patch(
-            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport."
             "redmine_delivery_transport_from_env",
             return_value=transport,
         ):
@@ -458,7 +458,7 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         # surfaces its explicit reason through the wiring, without breaking send.
         argv = self._base_argv() + ["--persist-delivery"]
         with patch(
-            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport."
             "redmine_delivery_transport_from_env",
             return_value=_RaisingTransport(reason=PERSIST_CREDENTIAL_MISSING),
         ):
@@ -486,7 +486,7 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
             sentinel,
         ]
         with patch(
-            "mozyo_bridge.infrastructure.redmine_note_transport."
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport."
             "redmine_delivery_transport_from_env",
             return_value=transport,
         ):
@@ -528,7 +528,7 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
             sentinel,
         ]
         with patch(
-            "mozyo_bridge.domain.delivery_record_sink.resolve_delivery_record_sink",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.resolve_delivery_record_sink",
             return_value=_CapturingSink(),
         ):
             result, stdout = self._run_send(argv)

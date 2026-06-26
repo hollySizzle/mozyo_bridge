@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.delegation_projection import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_projection import (
     LANE_KIND_COORDINATOR,
     LANE_KIND_DELEGATED_COORDINATOR,
     LANE_KIND_IMPLEMENTATION,

@@ -43,7 +43,7 @@ from mozyo_bridge.application.sublane_diagnostics import (
     cmd_sublane_callback_recovery,
     cmd_sublane_readiness,
 )
-from mozyo_bridge.domain.sublane_callback import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
 )

@@ -34,14 +34,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import (  # noqa: E402
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (  # noqa: E402
     GROUP_WINDOW_OPTION,
     CockpitWorkspace,
     build_group_window_create_plan,
     build_group_window_focus_plan,
     sanitize_group_window_name,
 )
-from mozyo_bridge.domain.presentation_grouping import (  # noqa: E402
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (  # noqa: E402
     GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
     GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
     GroupPlacement,
