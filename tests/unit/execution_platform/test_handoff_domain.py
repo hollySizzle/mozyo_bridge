@@ -14,14 +14,20 @@ from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     LastInputProjection,
     MODE_PENDING,
+    MODE_QUEUE_ENTER,
     MODE_STANDARD,
+    QUEUE_ENTER_RETRY_INTERVAL_SECONDS,
+    QUEUE_ENTER_RETRY_WINDOW_SECONDS,
+    QueueEnterRetryOutcome,
     RedmineAnchor,
+    build_delivery_record,
     build_marker,
     build_notification_body,
     make_outcome,
     next_action_for,
     normalize_anchor,
     project_last_input,
+    resolve_queue_enter_retry_policy,
 )
 
 class HandoffDomainTest(unittest.TestCase):
@@ -400,6 +406,90 @@ class ProjectLastInputTest(unittest.TestCase):
             },
             projection.to_dict(),
         )
+
+
+class QueueEnterRetryPolicyTest(unittest.TestCase):
+    def test_defaults_resolve_to_module_constants(self) -> None:
+        policy = resolve_queue_enter_retry_policy()
+        self.assertEqual(QUEUE_ENTER_RETRY_WINDOW_SECONDS, policy.window_seconds)
+        self.assertEqual(QUEUE_ENTER_RETRY_INTERVAL_SECONDS, policy.interval_seconds)
+        # 30s / 2s -> 15 additional Enter presses.
+        self.assertEqual(15, policy.max_retries)
+        self.assertTrue(policy.enabled)
+
+    def test_explicit_overrides_are_clamped_non_negative(self) -> None:
+        policy = resolve_queue_enter_retry_policy(10, 2)
+        self.assertEqual(5, policy.max_retries)
+        # Negative values clamp to 0 (disabled) rather than producing a
+        # nonsensical negative count.
+        self.assertFalse(resolve_queue_enter_retry_policy(-5, 2).enabled)
+        self.assertEqual(0, resolve_queue_enter_retry_policy(-5, 2).max_retries)
+
+    def test_zero_window_or_interval_disables_retry(self) -> None:
+        self.assertEqual(0, resolve_queue_enter_retry_policy(0, 2).max_retries)
+        self.assertEqual(0, resolve_queue_enter_retry_policy(30, 0).max_retries)
+        self.assertFalse(resolve_queue_enter_retry_policy(0, 2).enabled)
+
+    def test_none_falls_back_per_field(self) -> None:
+        # Only the interval is overridden; the window keeps the default.
+        policy = resolve_queue_enter_retry_policy(None, 5)
+        self.assertEqual(QUEUE_ENTER_RETRY_WINDOW_SECONDS, policy.window_seconds)
+        self.assertEqual(5.0, policy.interval_seconds)
+        self.assertEqual(6, policy.max_retries)
+
+
+class DeliveryRecordRetryLineTest(unittest.TestCase):
+    def _queue_enter_outcome(self, reason: str):
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        return make_outcome(
+            status="sent",
+            reason=reason,
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="implementation_request",
+            notification_marker=build_marker(anchor, "implementation_request", "claude"),
+        )
+
+    def test_retry_line_rendered_for_unobserved_pass(self) -> None:
+        record = build_delivery_record(
+            self._queue_enter_outcome("queue_enter"),
+            retry=QueueEnterRetryOutcome(
+                window_seconds=30.0,
+                interval_seconds=2.0,
+                enter_attempts=16,
+                marker_observed=False,
+            ),
+        )
+        self.assertIn(
+            "- Retry: queue-enter Enter-only retry (window 30s / interval 2s)",
+            record,
+        )
+        self.assertIn("re-issued Enter 15 time(s)", record)
+        self.assertIn("16 Enter press(es) total", record)
+        self.assertIn("marker+body typed once and never re-injected", record)
+        self.assertIn("still unobserved after the retry window", record)
+
+    def test_retry_line_reports_observed_after_retry(self) -> None:
+        record = build_delivery_record(
+            self._queue_enter_outcome("ok"),
+            retry=QueueEnterRetryOutcome(
+                window_seconds=30.0,
+                interval_seconds=2.0,
+                enter_attempts=3,
+                marker_observed=True,
+            ),
+        )
+        self.assertIn("re-issued Enter 2 time(s)", record)
+        self.assertIn("landing marker observed after retry", record)
+
+    def test_no_retry_line_without_retry_record(self) -> None:
+        # Default callers (no retry pass) get a byte-identical record: the retry
+        # telemetry is opt-in and never reaches the wire outcome.
+        record = build_delivery_record(self._queue_enter_outcome("ok"))
+        self.assertNotIn("Enter-only retry", record)
+        self.assertNotIn("retry", self._queue_enter_outcome("ok").to_dict())
 
 
 if __name__ == "__main__":

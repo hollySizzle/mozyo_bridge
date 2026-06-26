@@ -38,6 +38,93 @@ MODES: frozenset[str] = frozenset({MODE_STANDARD, MODE_PENDING, MODE_QUEUE_ENTER
 RECEIVERS: frozenset[str] = frozenset({"claude", "codex"})
 
 
+# --- queue-enter Enter-only retry policy (Redmine #12580 / #12581) -----------
+#
+# Under the `queue-enter` rail a busy or redrawing Claude/Codex TUI can drop the
+# first Enter even though the marker+body was typed cleanly. The rail therefore
+# re-issues Enter — and ONLY Enter; the marker+body is typed exactly once and is
+# never re-injected — on a fixed interval until the landing marker is observed
+# or the retry window elapses. These two numbers are the policy's only tunables
+# and are kept here as named constants (the config boundary) so a future
+# config-file driver can override them without touching the send path. The CLI
+# (`--queue-enter-retry-window` / `--queue-enter-retry-interval`) defaults to
+# them, and `resolve_queue_enter_retry_policy` is the single resolution seam.
+QUEUE_ENTER_RETRY_WINDOW_SECONDS = 30.0
+QUEUE_ENTER_RETRY_INTERVAL_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class QueueEnterRetryPolicy:
+    """Resolved Enter-only retry policy for the `queue-enter` rail.
+
+    ``window_seconds`` bounds the total time the rail keeps nudging the prompt;
+    ``interval_seconds`` is the delay between successive Enter presses. The
+    derived ``max_retries`` is how many *additional* Enter presses (beyond the
+    initial one) the rail may issue, so the rail re-presses Enter without ever
+    re-typing the marker+body. A non-positive window or interval disables the
+    retry (``max_retries == 0``), collapsing the rail back to the historical
+    single-Enter behavior.
+    """
+
+    window_seconds: float
+    interval_seconds: float
+
+    @property
+    def max_retries(self) -> int:
+        if self.window_seconds <= 0 or self.interval_seconds <= 0:
+            return 0
+        return int(self.window_seconds // self.interval_seconds)
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_retries > 0
+
+
+def resolve_queue_enter_retry_policy(
+    window_seconds: Optional[float] = None,
+    interval_seconds: Optional[float] = None,
+) -> QueueEnterRetryPolicy:
+    """Resolve the Enter-only retry policy from optional overrides.
+
+    ``None`` falls back to the module default constant (the config boundary);
+    an explicit value is clamped to be non-negative. This is the single seam the
+    send path and any future config-file driver resolve the policy through, so
+    the policy numbers are never re-derived ad hoc at the call site.
+    """
+
+    window = (
+        QUEUE_ENTER_RETRY_WINDOW_SECONDS
+        if window_seconds is None
+        else max(0.0, float(window_seconds))
+    )
+    interval = (
+        QUEUE_ENTER_RETRY_INTERVAL_SECONDS
+        if interval_seconds is None
+        else max(0.0, float(interval_seconds))
+    )
+    return QueueEnterRetryPolicy(window_seconds=window, interval_seconds=interval)
+
+
+@dataclass(frozen=True)
+class QueueEnterRetryOutcome:
+    """Durable-record-safe summary of one Enter-only retry pass.
+
+    Carries only numbers and a bool — no paths, no free text — so it is safe to
+    render verbatim into the pasteable delivery record and the opt-in persisted
+    note. ``enter_attempts`` counts the total Enter presses (the initial press
+    plus every retry); ``marker_observed`` is the final landing-marker
+    observation state after the retry loop.
+    """
+
+    window_seconds: float
+    interval_seconds: float
+    enter_attempts: int
+    marker_observed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class AnchorError(ValueError):
     """Anchor arguments did not satisfy the source's contract."""
 
@@ -936,6 +1023,7 @@ def build_delivery_record(
     recovery_command: Optional[str] = None,
     duplicate_lane_panes: Optional[Sequence[str]] = None,
     role_profile_contract: Optional[str] = None,
+    retry: Optional["QueueEnterRetryOutcome"] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -1023,6 +1111,24 @@ def build_delivery_record(
             "so read each duplicate before reusing it, and record the "
             "implementation actor as the target pane above (not a duplicate) so "
             "the receiver and actor records do not diverge."
+        )
+    if retry is not None:
+        # Redmine #12580 / #12581: durable record of the queue-enter Enter-only
+        # retry policy and what it did. Numbers + a bool only, so it is safe in
+        # the pasteable record and the opt-in persisted note. `next_action` is
+        # not overridden; this only documents the retry that already happened.
+        retries = max(0, retry.enter_attempts - 1)
+        observed = (
+            "landing marker observed after retry"
+            if retry.marker_observed
+            else "landing marker still unobserved after the retry window"
+        )
+        lines.append(
+            "- Retry: queue-enter Enter-only retry "
+            f"(window {retry.window_seconds:g}s / interval "
+            f"{retry.interval_seconds:g}s) re-issued Enter {retries} time(s) "
+            f"— {retry.enter_attempts} Enter press(es) total, marker+body typed "
+            f"once and never re-injected; {observed}."
         )
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
@@ -1126,6 +1232,10 @@ __all__: Iterable[str] = (
     "MODE_STANDARD",
     "NO_SUBMIT_RETRY_BUDGET",
     "NormalizedAnchor",
+    "QUEUE_ENTER_RETRY_INTERVAL_SECONDS",
+    "QUEUE_ENTER_RETRY_WINDOW_SECONDS",
+    "QueueEnterRetryOutcome",
+    "QueueEnterRetryPolicy",
     "RECEIVERS",
     "RECORD_FORMATS",
     "RECORD_FORMAT_BOTH",
@@ -1147,5 +1257,6 @@ __all__: Iterable[str] = (
     "next_action_for",
     "normalize_anchor",
     "project_last_input",
+    "resolve_queue_enter_retry_policy",
     "target_unavailable_codex_diagnostic",
 )
