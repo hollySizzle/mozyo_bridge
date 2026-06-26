@@ -165,6 +165,26 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-delegated-route-live-executor
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/delegated-route-live-executor.md
+    purpose: #12550 の pure planner / operator-confirmed command plan を、cockpit lane/window append/adopt、stamp、handoff send、Redmine record package へ接続する live executor / actuator contract。
+    audit_role: delegated_route_live_executor_spec
+    related_document_refs:
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-smoke-test-frame
+      - spec-delegation-policy-project-config
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - logic-coordinator-sublane-development-flow
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegation-policy-project-config
     type: spec
     status: active
@@ -1008,6 +1028,7 @@ file_conventions:
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
       - spec-delegated-coordinator-decision-records
+      - spec-delegated-route-live-executor
       - spec-route-identity-ledger
       - spec-delegated-coordinator-role-profile
       - logic-coordinator-sublane-development-flow
