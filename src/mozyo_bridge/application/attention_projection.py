@@ -1,57 +1,23 @@
-"""tmux pane user-option projection for derived attention (Redmine #11954).
+"""Compatibility facade — real implementation relocated to
+:mod:`mozyo_bridge.features.operations_cockpit.application.attention_projection`.
 
-Builds the ``tmux set-option`` command plan that caches a #11951
-:class:`~mozyo_bridge.domain.attention.AttentionRecord` onto a pane's user
-options. The plan builder is **pure** (returns argv tuples, runs no tmux), so
-the projection's command generation is testable without a tmux server; the CLI
-command (``agents attention-project``) previews or executes the plan.
-
-Boundary: these user options are a **projection cache**, not the source of
-truth. They are re-derivable from durable state / the read model, may be deleted
-freely, and are never consulted for routing / handoff preflight / target
-resolution. This module imports only the pure attention read model — no tmux
-client, no routing, no ``agent-ui.conf`` / color.
+US #12593 (parent US #12590, Feature #12533 `140_ソース配置管理`) expands the
+#12570 source-layout pilot to the ``operations_cockpit`` bounded context (Redmine
+Epic #12502). The cockpit attention projection bridge moved out of the technical-layer ``application/`` package into
+the Redmine Epic-slug package ``features/operations_cockpit/application/`` (layer-leaf
+shape, #12591 j#65435). This legacy import path is preserved per the migration
+plan (``vibes/docs/logics/source-layout-bounded-context-migration.md``); the
+relocated module object is re-bound here via ``sys.modules`` so that
+``mozyo_bridge.application.attention_projection`` and the new
+``mozyo_bridge.features.operations_cockpit.application.attention_projection`` refer to the exact same
+module object — attribute access and monkeypatch on either path stay equivalent.
+Do not remove this facade outside the fallback-retirement-ledger process.
 """
 
-from __future__ import annotations
+import sys as _sys
 
-from mozyo_bridge.domain.attention import AttentionRecord
-
-# tmux pane user-option names from `vibes/docs/logics/cockpit-attention-state.md`
-# (`### tmux user option`). These are cache markers; the design doc pins that
-# they are not used for handoff preflight / routing.
-ATTENTION_STATE_OPTION = "@mozyo_attention_state"
-ATTENTION_SEVERITY_OPTION = "@mozyo_attention_severity"
-ATTENTION_REASON_OPTION = "@mozyo_attention_reason"
-ATTENTION_UPDATED_AT_OPTION = "@mozyo_attention_updated_at"
-
-ATTENTION_OPTION_NAMES = (
-    ATTENTION_STATE_OPTION,
-    ATTENTION_SEVERITY_OPTION,
-    ATTENTION_REASON_OPTION,
-    ATTENTION_UPDATED_AT_OPTION,
+from mozyo_bridge.features.operations_cockpit.application import (
+    attention_projection as _impl,
 )
 
-
-def build_attention_option_plan(
-    pane_id: str | None, record: AttentionRecord
-) -> list[tuple[str, ...]]:
-    """Return the ``tmux set-option -p`` argv tuples caching ``record`` on a pane.
-
-    Pure: one ``("set-option", "-p", "-t", pane_id, name, value)`` tuple per
-    attention user option, in a stable order, and nothing is executed. Returns
-    an empty plan when ``pane_id`` is falsy (a candidate without a pane id cannot
-    carry a pane option). Values are passed as argv elements, so no shell
-    escaping is needed at execution time.
-    """
-    if not pane_id:
-        return []
-    pairs = (
-        (ATTENTION_STATE_OPTION, record.attention_state),
-        (ATTENTION_SEVERITY_OPTION, record.severity),
-        (ATTENTION_REASON_OPTION, record.reason_code),
-        (ATTENTION_UPDATED_AT_OPTION, record.observed_at or ""),
-    )
-    return [
-        ("set-option", "-p", "-t", pane_id, name, value) for name, value in pairs
-    ]
+_sys.modules[__name__] = _impl

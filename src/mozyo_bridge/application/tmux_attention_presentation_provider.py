@@ -1,85 +1,23 @@
-"""Built-in tmux attention presentation provider (Redmine #12156).
+"""Compatibility facade — real implementation relocated to
+:mod:`mozyo_bridge.features.operations_cockpit.application.tmux_attention_presentation_provider`.
 
-The first — and, per the adapter-boundary design (Redmine #12001), for v0.8 the
-*only* — concrete
-:class:`~mozyo_bridge.domain.presentation_adapter.PresentationProvider`. It is
-the "Candidate 2" presentation slice, kept read / projection-first: it converts
-an already-derived :class:`~mozyo_bridge.domain.attention.AttentionRecord` into a
-normalized :class:`~mozyo_bridge.domain.presentation_adapter.SurfaceProjection`
-for the ``tmux_user_option`` surface.
-
-It lives in the application layer next to :mod:`attention_projection` because it
-is pure plan/record building — no tmux is executed here — and it reuses that
-module's pane user-option names (``@mozyo_attention_*``) as the single source of
-truth, so the classified projection and the executed
-``build_attention_option_plan`` cannot drift apart. The argv mechanics
-(``set-option -p -t <pane> ...``) stay in :mod:`attention_projection`; this
-provider only produces the normalized, pane-agnostic record.
-
-What this provider deliberately does **not** do, because core owns it:
-
-- it defines no workflow truth, owner approval, or routing authority — the
-  projection is display only, and the option values are a re-derivable cache the
-  design doc pins as never consulted for routing / handoff preflight;
-- it invents no surface — ``tmux_user_option`` is a core-recognized surface;
-- it performs no tmux I/O; the projection is pure over the supplied record.
-
-There is no dynamic provider loading and no public plugin contract; this is a
-built-in classification, not an extension point.
+US #12593 (parent US #12590, Feature #12533 `140_ソース配置管理`) expands the
+#12570 source-layout pilot to the ``operations_cockpit`` bounded context (Redmine
+Epic #12502). The tmux presentation provider for cockpit attention moved out of the technical-layer ``application/`` package into
+the Redmine Epic-slug package ``features/operations_cockpit/application/`` (layer-leaf
+shape, #12591 j#65435). This legacy import path is preserved per the migration
+plan (``vibes/docs/logics/source-layout-bounded-context-migration.md``); the
+relocated module object is re-bound here via ``sys.modules`` so that
+``mozyo_bridge.application.tmux_attention_presentation_provider`` and the new
+``mozyo_bridge.features.operations_cockpit.application.tmux_attention_presentation_provider`` refer to the exact same
+module object — attribute access and monkeypatch on either path stay equivalent.
+Do not remove this facade outside the fallback-retirement-ledger process.
 """
 
-from __future__ import annotations
+import sys as _sys
 
-from mozyo_bridge.application.attention_projection import (
-    ATTENTION_REASON_OPTION,
-    ATTENTION_SEVERITY_OPTION,
-    ATTENTION_STATE_OPTION,
-    ATTENTION_UPDATED_AT_OPTION,
-)
-from mozyo_bridge.domain.attention import AttentionRecord
-from mozyo_bridge.domain.presentation_adapter import (
-    SURFACE_TMUX_USER_OPTION,
-    ProjectionField,
-    SurfaceProjection,
+from mozyo_bridge.features.operations_cockpit.application import (
+    tmux_attention_presentation_provider as _impl,
 )
 
-PROVIDER_NAME = "tmux-presentation"
-
-
-class TmuxAttentionPresentationProvider:
-    """Project a core :class:`AttentionRecord` onto tmux pane user options."""
-
-    name = PROVIDER_NAME
-    surface = SURFACE_TMUX_USER_OPTION
-
-    def project(self, record: AttentionRecord) -> SurfaceProjection:
-        """Normalize one :class:`AttentionRecord` into a :class:`SurfaceProjection`.
-
-        The field keys are the canonical ``@mozyo_attention_*`` option names from
-        :mod:`attention_projection`; the values come straight off the derived
-        record. ``source_unit_id`` carries the record's unit for provenance only
-        — it is never used to pick a target. Pure; no tmux, no I/O.
-        """
-        fields = (
-            ProjectionField(ATTENTION_STATE_OPTION, record.attention_state),
-            ProjectionField(ATTENTION_SEVERITY_OPTION, record.severity),
-            ProjectionField(ATTENTION_REASON_OPTION, record.reason_code),
-            ProjectionField(ATTENTION_UPDATED_AT_OPTION, record.observed_at or ""),
-        )
-        return SurfaceProjection(
-            provider=self.name,
-            surface=self.surface,
-            source_unit_id=record.unit_id,
-            fields=fields,
-        )
-
-
-# Stateless singleton; the provider holds no per-call state.
-TMUX_ATTENTION_PRESENTATION_PROVIDER = TmuxAttentionPresentationProvider()
-
-
-__all__ = (
-    "PROVIDER_NAME",
-    "TMUX_ATTENTION_PRESENTATION_PROVIDER",
-    "TmuxAttentionPresentationProvider",
-)
+_sys.modules[__name__] = _impl

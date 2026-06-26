@@ -80,11 +80,13 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/domain/cockpit_layout.py
+  - path: src/mozyo_bridge/features/operations_cockpit/domain/cockpit_layout.py
     lines: 2344
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
-      to split along geometry vs projection responsibilities.
+      to split along geometry vs projection responsibilities. Relocated to the
+      operations_cockpit Epic-slug package by US #12593 (path-only repath; the
+      module is unchanged and the split itself is still owner #12321 scope).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
