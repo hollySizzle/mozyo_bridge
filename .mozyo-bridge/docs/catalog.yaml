@@ -532,6 +532,27 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-project-scoped-workspace-identity
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/project-scoped-workspace-identity.md
+    purpose: "monorepo 内 project directory を fake Git repo にせず、self-describing project.yaml と root generated discovery cache で project-scoped cockpit identity / target projection / consultation-to-implementation 境界を扱う設計正本。"
+    audit_role: project_scoped_workspace_identity_logic
+    related_document_refs:
+      - logic-unit-target-model
+      - logic-pane-centric-cockpit-semantics
+      - logic-cross-project-cockpit-smoke-runbook
+      - logic-delegated-coordinator-cockpit-display
+      - logic-coordinator-sublane-development-flow
+      - logic-workspace-registry
+      - logic-workspace-defaults-renderer
+      - logic-workspace-anchor-project-defaults-migration
+      - logic-managed-state-model
+      - logic-session-inventory
+      - rule-public-private-boundary
+      - rule-docs-catalog-governance
+      - spec-project-map
+
   - id: logic-acceptance-rerun-protocol
     type: logic
     status: active
@@ -578,6 +599,7 @@ documents:
       - logic-session-inventory
       - logic-workspace-registry
       - logic-workspace-anchor-project-defaults-migration
+      - logic-project-scoped-workspace-identity
       - logic-cross-project-cockpit-smoke-runbook
       - logic-local-remote-cockpit-host-boundary
       - rule-public-private-boundary
@@ -730,6 +752,7 @@ documents:
       - logic-managed-state-model
       - logic-iterm-webviewer-presentation-boundary
       - logic-cockpit-attention-state
+      - logic-project-scoped-workspace-identity
       - logic-cross-project-cockpit-smoke-runbook
       - logic-delegated-coordinator-cockpit-display
       - rule-public-private-boundary
@@ -747,6 +770,7 @@ documents:
       - logic-cockpit-attention-state
       - logic-unit-presentation-state-db
       - logic-unit-target-model
+      - logic-project-scoped-workspace-identity
       - logic-worktree-lifecycle-boundary
       - spec-delegation-policy-project-config
       - rule-public-private-boundary
