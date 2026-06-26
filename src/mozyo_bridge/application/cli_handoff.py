@@ -48,6 +48,8 @@ from mozyo_bridge.domain.handoff import (
     KIND_LABELS,
     MODE_QUEUE_ENTER,
     MODES,
+    QUEUE_ENTER_RETRY_INTERVAL_SECONDS,
+    QUEUE_ENTER_RETRY_WINDOW_SECONDS,
     RECORD_FORMAT_BOTH,
     RECORD_FORMATS,
     SOURCES,
@@ -257,6 +259,31 @@ def configure_handoff_parser(
     )
     parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
     parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
+    parser_.add_argument(
+        "--queue-enter-retry-window",
+        dest="queue_enter_retry_window",
+        type=float,
+        default=QUEUE_ENTER_RETRY_WINDOW_SECONDS,
+        help=(
+            "queue-enter Enter-only retry window in seconds (default "
+            f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}). When the landing marker is "
+            "not observed, Enter — and only Enter; the marker+body is never "
+            "re-typed — is re-issued every --queue-enter-retry-interval seconds "
+            "until the marker is observed or this window elapses. `0` disables "
+            "the retry (single Enter). Ignored under --mode standard/pending."
+        ),
+    )
+    parser_.add_argument(
+        "--queue-enter-retry-interval",
+        dest="queue_enter_retry_interval",
+        type=float,
+        default=QUEUE_ENTER_RETRY_INTERVAL_SECONDS,
+        help=(
+            "Seconds between Enter-only retries on the queue-enter rail "
+            f"(default {QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). `0` disables the "
+            "retry."
+        ),
+    )
     parser_.add_argument(
         "--record-format",
         dest="record_format",

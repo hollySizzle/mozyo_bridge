@@ -778,6 +778,137 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual("marker_timeout", outcome["reason"])
         self.assertEqual(MODE_STANDARD, outcome["mode"])
 
+    # --- Enter-only retry (Redmine #12580 / #12581) --------------------------------
+
+    @staticmethod
+    def _enter_calls(sent):
+        return [c for c in sent if c == ("send-keys", "-t", "%2", "Enter")]
+
+    @staticmethod
+    def _typed_calls(sent):
+        return [c for c in sent if c[:4] == ("send-keys", "-t", "%2", "-l")]
+
+    def test_queue_enter_retry_reissues_enter_for_window_when_unobserved(self) -> None:
+        # The landing marker is never observed (wait_for_text patched False, so
+        # the staged captures are only consumed by the retry probes). The
+        # Enter-only retry must keep re-pressing Enter for the whole window:
+        # window 6s / interval 2s -> 3 retries, i.e. 4 Enter presses total
+        # (1 initial + 3). The marker+body is typed exactly once and never
+        # re-injected, and no C-u rollback occurs.
+        with patch(
+            "mozyo_bridge.application.commands.wait_for_text", return_value=False
+        ):
+            result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "asana",
+                    "--kind", "implementation_request", "--task-id", "T1",
+                    "--comment-id", "C1", "--target", "%2", "--mode", "queue-enter",
+                    "--submit-delay", "0",
+                    "--queue-enter-retry-window", "6",
+                    "--queue-enter-retry-interval", "2",
+                ],
+                captures=["", "", "", "", ""],
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, len(self._typed_calls(sent)))
+        self.assertEqual(4, len(self._enter_calls(sent)))
+        self.assertFalse(any(c == ("send-keys", "-t", "%2", "C-u") for c in sent))
+
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("queue_enter", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        # Durable retry telemetry (policy + attempted count + interval) lives in
+        # the delivery record / narrative, never in the wire outcome.
+        self.assertIn("queue-enter Enter-only retry", stdout)
+        self.assertIn("window 6s / interval 2s", stdout)
+        self.assertIn("re-issued Enter 3 time(s)", stdout)
+        self.assertIn("4 Enter press(es) total", stdout)
+        self.assertIn("still unobserved", stdout)
+        self.assertNotIn("retry", outcome)
+
+    def test_queue_enter_retry_stops_early_when_marker_observed(self) -> None:
+        # The first retry probe misses, the second observes the marker: the rail
+        # stops re-pressing Enter, flips to sent/ok, and records 2 Enter presses
+        # (1 initial + 1 retry). captures[0] is the typing preflight; the retry
+        # probes consume captures[1] (miss -> Enter) and captures[2] (observed).
+        marker = (
+            "[mozyo:handoff:source=asana:task=T1:comment=C1:kind=reply:to=claude]"
+        )
+        with patch(
+            "mozyo_bridge.application.commands.wait_for_text", return_value=False
+        ):
+            result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "asana",
+                    "--kind", "reply", "--task-id", "T1", "--comment-id", "C1",
+                    "--target", "%2", "--mode", "queue-enter", "--submit-delay", "0",
+                    "--queue-enter-retry-window", "6",
+                    "--queue-enter-retry-interval", "2",
+                ],
+                captures=["", "", marker],
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, len(self._typed_calls(sent)))
+        self.assertEqual(2, len(self._enter_calls(sent)))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        self.assertIn("re-issued Enter 1 time(s)", stdout)
+        self.assertIn("2 Enter press(es) total", stdout)
+        self.assertIn("observed after retry", stdout)
+
+    def test_queue_enter_retry_disabled_with_zero_window_presses_enter_once(self) -> None:
+        # `--queue-enter-retry-window 0` collapses the rail back to the historical
+        # single-Enter behavior: one Enter, reason queue_enter, and no retry line.
+        with patch(
+            "mozyo_bridge.application.commands.wait_for_text", return_value=False
+        ):
+            result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "asana",
+                    "--kind", "reply", "--task-id", "T1", "--comment-id", "C1",
+                    "--target", "%2", "--mode", "queue-enter", "--submit-delay", "0",
+                    "--queue-enter-retry-window", "0",
+                ],
+                captures=["", "", ""],
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, len(self._enter_calls(sent)))
+        self.assertNotIn("queue-enter Enter-only retry", stdout)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("queue_enter", outcome["reason"])
+
+    def test_standard_rail_ignores_retry_flags_and_still_rolls_back(self) -> None:
+        # The retry is queue-enter-only: passing the retry flags under
+        # `--mode standard` must not engage any retry; strict still rolls back
+        # with a single C-u and no Enter on marker timeout.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff", "send", "--to", "claude", "--source", "asana",
+                "--kind", "reply", "--task-id", "T1", "--comment-id", "C1",
+                "--target", "%2", "--mode", "standard",
+                "--landing-timeout", "0.01", "--submit-delay", "0",
+                "--queue-enter-retry-window", "6",
+                "--queue-enter-retry-interval", "2",
+            ],
+            captures=["", "", ""],
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertEqual(0, len(self._enter_calls(sent)))
+        self.assertIn(("send-keys", "-t", "%2", "C-u"), sent)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+        self.assertNotIn("queue-enter Enter-only retry", stdout)
+
     # --- agent-target restriction --------------------------------------------------
 
     def test_queue_enter_rejects_force_flag(self) -> None:

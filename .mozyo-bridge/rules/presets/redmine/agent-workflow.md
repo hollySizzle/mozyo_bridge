@@ -113,6 +113,11 @@ Close Gate では少なくとも以下を照合する。項目を満たせない
 - `notify-*` wrappers (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) は Redmine 互換 entrypoint として残す。内部では同じ primitive に乗る。新規 caller は、durable record に明示的な `--kind` を残せる `mozyo-bridge handoff send/reply` を優先する。
 - `notify-*-legacy-task` は retired-queue cleanup wrapper であり、新規通知に使わない。
 - 低レベルの `mozyo-bridge read`、`mozyo-bridge message`、`mozyo-bridge type`、`mozyo-bridge keys` は operator/debug primitives である。pane inspect、ad-hoc operator message、raw typing、raw keys 用であり、standard handoff/reply の代替ではない。
+- raw tmux pane mutation を agent の workflow delivery / recovery 手段として使わない。具体的には `tmux send-keys`、`tmux paste-buffer`、agent pane への直接 Enter / `C-u` / その他 raw key injection を禁止する。これらは handoff send/reply rail の代替にも、failed handoff の self-repair にもしない。
+- `mozyo-bridge type` / `mozyo-bridge keys` を handoff の代替として使わない。`mozyo-bridge message --no-submit` で notification を type した後、agent 自身が raw Enter / `mozyo-bridge keys ... Enter` を送って submit する self-repair も同じく禁止する。
+- read-only inspection は許可する: `tmux capture-pane`、`mozyo-bridge read` で pane 状態を確認してよい。状態確認のために pane を mutate しない。
+- raw tmux mutation は operator/debug 専用である。使用するのは、使用時点の明示的 operator 指示と、それを残す Redmine durable record の両方が揃うときに限る。agent は自律判断でこれを実行しない。
+- `mozyo-bridge handoff send` / `handoff reply` が失敗 (例: `marker_timeout`) しても、agent は raw pane input で self-repair しない。Handoff Startup Decision の Notification fails 分岐に従い、`un-notified` 状態と required receiver action を Redmine gate に記録する。
 - Redmine journal を作る前に pane 通知しない。journal より先の通知は順序依存になり、監査 replay を壊す。
 - pane 通知成功は review record ではない。pane 通知失敗も review failure ではない。唯一の判断 record は Redmine gate である。
 - 受信者は、通知本文だけで動かず、指定された Redmine issue / journal を読む。durable Redmine anchor が利用可能な場合、`mozyo-bridge status`、`mozyo-bridge doctor`、pane scrollback から receiver state / issue state / gate state を推測しない。それらは operator/debug aids である。
@@ -215,6 +220,7 @@ Scope:
 - `Claude Code が常に実装、Codex が常に監査` のような固定 role split を shared preset に hard-code しない。split は project-configurable であり、project が採用した場合だけ境界が適用される。
 - pane message、chat message、queue file を authoritative state として扱わない。
 - retired `.agent_handoff/tasks.yaml` queue、`read-next --wait`、Stop hook handoff wait を通常運用に戻さない。
+- agent が workflow delivery / recovery のために raw tmux pane mutation (`tmux send-keys`、`tmux paste-buffer`、直接 Enter / `C-u` / raw key injection) を実行しない。`mozyo-bridge type` / `keys` / `message --no-submit` + 手動 Enter を handoff の代替や self-repair に使わない。raw mutation は operator/debug 専用で、明示的 operator 指示 + Redmine durable record が揃うときだけ許可する。failed handoff は self-repair せず `un-notified` を記録する。read-only inspection (`tmux capture-pane` / `mozyo-bridge read`) は可。
 - `vibes/tools/mozyo_bridge` を runtime path として再導入しない。installed `mozyo-bridge` CLI を使う。
 - source project 固有 path、Rails 固有 app path、private docs catalog、custom resolver script、source-project file conventions を shared preset の必須依存にしない。`project が提供している場合は使う` という条件付きに留める。
 - `catalog.yaml` / docs resolver / nagger file conventions tooling の標準化は別タスクで扱う。この preset 変更に混ぜない。

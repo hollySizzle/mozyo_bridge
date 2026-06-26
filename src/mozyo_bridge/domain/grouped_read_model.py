@@ -59,7 +59,13 @@ migration are deliberately **out of scope** here: this slice consumes config /
 observation *objects* and stays a pure projection, mirroring the staged
 discipline of #12263 (schema -> resolver -> read model). The ``presentation:``
 namespace shape for the on-disk loader (surface selection vs grouping, the open
-design note carried from #12263) is not resolved by this object-to-object slice.
+design note carried from #12263) is now fixed in ``unit-presentation-state-db.md``
+(``config namespace / path / ownership``): grouping shares the single
+``presentation:`` namespace with the #12189 surface selection
+(``presentation.surface`` selection, ``presentation.project_groups`` /
+``presentation.grouping`` grouping, a shared ``presentation.version``), and the
+on-disk loader split was wired by #12286. This object-to-object slice still only
+consumes config objects and asserts no namespace shape.
 
 The module is pure (dataclasses + derivation helpers) and imports only from the
 domain layer, so the dependency only ever points within the domain.

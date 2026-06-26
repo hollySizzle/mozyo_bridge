@@ -39,6 +39,7 @@ from mozyo_bridge.domain.handoff import (
     MODE_QUEUE_ENTER,
     MODES,
     NO_SUBMIT_RETRY_BUDGET,
+    QueueEnterRetryOutcome,
     RECEIVERS,
     RECORD_FORMAT_BOTH,
     RECORD_FORMAT_JSON,
@@ -53,6 +54,7 @@ from mozyo_bridge.domain.handoff import (
     is_explicit_pane_target,
     make_outcome,
     normalize_anchor,
+    resolve_queue_enter_retry_policy,
 )
 from mozyo_bridge.domain.role_profile import (
     RoleProfileError,
@@ -1110,14 +1112,27 @@ def wait_for_text(target: str, text: str, lines: int, timeout: float) -> bool:
     # fail-closed rollback contract.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        captured = capture_pane(target, lines)
-        if text in captured:
-            return True
-        if text in _WRAP_INDENT.sub(" ", captured):
-            return True
-        if text in _WRAP_INDENT.sub("", captured):
+        if _marker_visible_in(capture_pane(target, lines), text):
             return True
         time.sleep(0.2)
+    return False
+
+
+def _marker_visible_in(captured: str, text: str) -> bool:
+    """One-shot check whether ``text`` is visible in ``captured`` pane text.
+
+    Mirrors the three wrap normalizations :func:`wait_for_text` polls with: raw
+    substring, word-boundary wrap (``\\n\\s+`` -> ``" "``), and character-wrap
+    (``\\n\\s+`` -> ``""``). Shared so the queue-enter Enter-only retry can probe
+    for the marker once per interval without re-implementing the wrap handling
+    or paying a second polling timeout.
+    """
+    if text in captured:
+        return True
+    if text in _WRAP_INDENT.sub(" ", captured):
+        return True
+    if text in _WRAP_INDENT.sub("", captured):
+        return True
     return False
 
 
@@ -4254,6 +4269,7 @@ def _emit_outcome(
     recovery_command: str | None = None,
     duplicate_lane_panes: list[str] | None = None,
     role_profile_contract: str | None = None,
+    retry: QueueEnterRetryOutcome | None = None,
 ) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -4292,6 +4308,7 @@ def _emit_outcome(
                 recovery_command=recovery_command,
                 duplicate_lane_panes=duplicate_lane_panes,
                 role_profile_contract=role_profile_contract,
+                retry=retry,
             )
         )
         if record_format == RECORD_FORMAT_BOTH:
@@ -4343,6 +4360,7 @@ def _maybe_persist_delivery_record(
     *,
     duplicate_lane_panes: list[str] | None,
     record_format: str,
+    retry: QueueEnterRetryOutcome | None = None,
 ) -> None:
     """Best-effort durable persistence of the delivery record (Redmine #12311).
 
@@ -4399,6 +4417,7 @@ def _maybe_persist_delivery_record(
             outcome,
             command=None,
             duplicate_lane_panes=duplicate_lane_panes or None,
+            retry=retry,
         )
         note = build_delivery_record_note(
             outcome,
@@ -5263,12 +5282,41 @@ def orchestrate_handoff(
     if submit_delay:
         time.sleep(submit_delay)
     run_tmux("send-keys", "-t", target, "Enter")
+    enter_attempts = 1
+
+    # Enter-only retry (Redmine #12580 / #12581). Only the `queue-enter` rail,
+    # and only when the landing marker was not observed: a busy or redrawing
+    # Claude/Codex TUI can drop the first Enter even though the marker+body
+    # landed cleanly. Re-issue Enter — and ONLY Enter; the marker+body typed
+    # once above is never re-injected, and an empty Enter on an idle agent
+    # composer is a no-op, so the payload cannot be duplicated — on the policy
+    # interval until the marker is observed or the window elapses. The
+    # `standard` / `pending` rails never reach this branch, so their semantics
+    # are untouched. The 30s/2s defaults live behind
+    # `resolve_queue_enter_retry_policy` (the config boundary) and are
+    # overridable via `--queue-enter-retry-window` / `-interval`.
+    retry_policy = resolve_queue_enter_retry_policy(
+        getattr(args, "queue_enter_retry_window", None),
+        getattr(args, "queue_enter_retry_interval", None),
+    )
+    retry_engaged = (
+        mode == MODE_QUEUE_ENTER and not marker_observed and retry_policy.enabled
+    )
+    if retry_engaged:
+        for _ in range(retry_policy.max_retries):
+            if retry_policy.interval_seconds:
+                time.sleep(retry_policy.interval_seconds)
+            if _marker_visible_in(capture_pane(target, landing_lines), marker):
+                marker_observed = True
+                break
+            run_tmux("send-keys", "-t", target, "Enter")
+            enter_attempts += 1
 
     # Wording-layer differentiation under the relaxed `queue-enter` rail:
-    # marker observed → strict `sent`/`ok`; marker unobserved → `sent`/
-    # `queue_enter` (sender did not pre-confirm landing). The receiver-side
-    # contract and `next_action_owner` stay identical to strict `sent` per
-    # the contract.
+    # marker observed (possibly via the Enter-only retry above) → strict
+    # `sent`/`ok`; marker still unobserved → `sent`/`queue_enter` (sender did
+    # not pre-confirm landing). The receiver-side contract and
+    # `next_action_owner` stay identical to strict `sent` per the contract.
     relaxed_unobserved = mode == MODE_QUEUE_ENTER and not marker_observed
     outcome = make_outcome(
         status="sent",
@@ -5282,18 +5330,35 @@ def orchestrate_handoff(
         execution_root=execution_root,
         role_profile=role_profile_resolution,
     )
+    # Durable retry telemetry (policy + attempted count + interval) is recorded
+    # in the delivery record / narrative only when the Enter-only retry actually
+    # engaged. It is wording-layer only: it never reaches the wire enums or the
+    # inspector projection (`Status` / `reason` / `next_action_owner` are
+    # unchanged), matching the contract's strong boundary.
+    retry_record = (
+        QueueEnterRetryOutcome(
+            window_seconds=retry_policy.window_seconds,
+            interval_seconds=retry_policy.interval_seconds,
+            enter_attempts=enter_attempts,
+            marker_observed=marker_observed,
+        )
+        if retry_engaged
+        else None
+    )
     _emit_outcome(
         outcome,
         record_format=record_format,
         command=record_command,
         duplicate_lane_panes=duplicate_lane_panes or None,
         role_profile_contract=role_profile_contract,
+        retry=retry_record,
     )
     _maybe_persist_delivery_record(
         args,
         outcome,
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
+        retry=retry_record,
     )
     return 0
 
