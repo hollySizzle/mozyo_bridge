@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6592
+    lines: 6607
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -88,6 +88,12 @@ allowlist:
       `target_project` handoff gate (require an explicit `--target-repo` gate
       under `--target-project`, and verify a stamped pane-option scope's cwd is
       under the stamped project path before trusting it).
+      Raised 6592 -> 6607 for the #12658 j#66499 scenario fix: project-scope
+      resolution prefers the real Git worktree root over a nested project-local
+      `.mozyo-bridge/scaffold.json` (via the new `resolve_workspace_root`) in
+      `_resolve_project_scope_fields` and the `target_project` gate, so cockpit
+      dry-run / handoff from a project subdir emit the Git root + a repo-relative
+      project path while non-git scaffold workspaces are preserved.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

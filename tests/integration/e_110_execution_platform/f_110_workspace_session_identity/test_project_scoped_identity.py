@@ -338,6 +338,73 @@ class FilesystemScanTests(unittest.TestCase):
         self.assertIsNone(pd.project_scope_for_cwd(str(self.repo), str(self.repo)))
 
 
+class NestedScaffoldGitRootTests(unittest.TestCase):
+    """A nested project-local scaffold must not collapse the workspace (j#66499).
+
+    The GK project subdir carries its own ``.mozyo-bridge/scaffold.json``; marker
+    resolution would stop there. Project-scoped resolution must prefer the real
+    Git worktree root so cockpit dry-run emits the Git root + a repo-relative
+    project path — while a genuinely non-git scaffolded workspace still resolves
+    to its scaffold root.
+    """
+
+    _DOC = (
+        "schema_version: 1\n"
+        "project:\n"
+        "  redmine_project: giken-cloud-drive-management\n"
+        "  path: projects/giken-cloud-drive-management\n"
+        "  status: active\n"
+        "  display_label: \"クラウドドライブ管理\"\n"
+        "  runtime_identity:\n"
+        "    enabled: true\n"
+    )
+
+    def setUp(self):
+        pd.clear_discovery_cache()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name) / "gk-3500-it-operations"
+        self.proj = self.repo / "projects" / "giken-cloud-drive-management"
+        self.proj.mkdir(parents=True)
+        (self.repo / ".git").mkdir()  # Git worktree root
+        (self.proj / ".mozyo-bridge").mkdir()
+        (self.proj / ".mozyo-bridge" / "scaffold.json").write_text(
+            "{}", encoding="utf-8"
+        )  # nested project-local scaffold marker
+        (self.proj / "project.yaml").write_text(self._DOC, encoding="utf-8")
+
+    def tearDown(self):
+        pd.clear_discovery_cache()
+        self._tmp.cleanup()
+
+    def test_workspace_root_prefers_git_over_nested_scaffold(self):
+        root = pd.resolve_workspace_root(str(self.proj))
+        self.assertEqual(Path(root), self.repo.resolve())
+
+    def test_cockpit_resolution_emits_git_root_and_repo_relative_project_path(self):
+        # Mirrors `mozyo cockpit --repo <project subdir> --dry-run`: the resolved
+        # workspace re-roots to the Git root and carries a repo-relative path.
+        from mozyo_bridge.application.commands import _resolve_project_scope_fields
+
+        cwd = str(self.proj)
+        effective_root, (scope, path, label) = _resolve_project_scope_fields(cwd, cwd)
+        self.assertEqual(Path(effective_root), self.repo.resolve())
+        self.assertEqual(scope, "giken-cloud-drive-management")
+        self.assertEqual(path, "projects/giken-cloud-drive-management")
+        self.assertFalse(path.startswith("/"))  # repo-relative, no abs leak
+        self.assertEqual(label, "クラウドドライブ管理")
+
+    def test_non_git_scaffold_workspace_behavior_preserved(self):
+        # A genuinely non-git scaffolded workspace (no `.git` anywhere) still
+        # resolves to its own scaffold root — the fallback is preserved.
+        with tempfile.TemporaryDirectory() as tmp2:
+            ws = Path(tmp2) / "scaffolded-workspace"
+            (ws / ".mozyo-bridge").mkdir(parents=True)
+            (ws / ".mozyo-bridge" / "scaffold.json").write_text("{}", encoding="utf-8")
+            (ws / "src").mkdir()
+            root = pd.resolve_workspace_root(str(ws / "src"))
+            self.assertEqual(Path(root), ws.resolve())
+
+
 class DriftFailClosedTests(unittest.TestCase):
     """Runtime lookup must fail closed on generated-cache drift (j#66481 blocker 3)."""
 

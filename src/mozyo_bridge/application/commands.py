@@ -1357,9 +1357,16 @@ def _resolve_project_scope_fields(
     try:
         from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
             project_scope_for_cwd,
+            resolve_workspace_root,
         )
 
-        git_root = infer_repo_root(cwd) or repo_root
+        # Prefer the real Git worktree root over a nested project-local scaffold
+        # marker (Redmine #12658 j#66499): a monorepo project subdir may carry its
+        # own `.mozyo-bridge/scaffold.json`, at which `infer_repo_root` would stop
+        # and collapse the workspace onto the project. The Git root is the
+        # workspace; the scaffold marker is the fallback only when there is no Git
+        # root above (non-git scaffolded workspace, #11301).
+        git_root = resolve_workspace_root(cwd) or repo_root
         if not git_root:
             return repo_root, none_triple
         scope = project_scope_for_cwd(cwd, git_root)
@@ -5194,17 +5201,25 @@ def orchestrate_handoff(
             )
             raise AssertionError("unreachable")
 
-        git_root = str(Path(expected_target_repo).expanduser().resolve())
         observed_scope = None
         observed_path = None
+        # Default to the explicit repo gate value so the fail-closed die() message
+        # below always has a concrete git_repo_root, even if discovery raises.
+        git_root = str(Path(expected_target_repo).expanduser().resolve())
         try:
             from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
                 project_scope_for_cwd,
+                resolve_workspace_root,
             )
             from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (
                 path_under_repo_relative,
             )
 
+            # The project path is repo-relative to the real Git worktree root, so
+            # the stamped cwd-under-project check resolves the Git root (preferring
+            # it over a nested project-local scaffold marker, #12658 j#66499). The
+            # repo gate above already enforced `--target-repo`.
+            git_root = resolve_workspace_root(target_cwd) or git_root
             stamped_scope = (target_info.get("project_scope") or "").strip()
             stamped_path = (target_info.get("project_path") or "").strip()
             # A stamped pane option is a projection cache, not authority: it is only

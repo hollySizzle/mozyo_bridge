@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     repo_relative_path,
     resolve_project_scope_for_path,
 )
+from mozyo_bridge.shared.paths import infer_git_worktree_root
 
 #: The project-owned descriptor filename scanned for under the repository root.
 PROJECT_FILE_NAME = "project.yaml"
@@ -224,9 +225,34 @@ def adopted_scopes_for_repo(
     return _cached_adopted_scopes(str(repo_root), max_depth)
 
 
+def resolve_workspace_root(cwd: Optional[str]) -> Optional[str]:
+    """Resolve the workspace root for ``cwd``, preferring the Git worktree root.
+
+    Project-scoped identity (Redmine #12658 j#66499): a monorepo project
+    subdirectory may carry its own ``.mozyo-bridge/scaffold.json``, at which the
+    marker-based ``infer_repo_root`` would stop — collapsing the workspace
+    identity onto the project. The Git worktree root is the workspace, so it is
+    preferred; the marker resolver is the fallback ONLY when no Git root is
+    reachable above (a genuinely non-git scaffolded workspace, Redmine #11301).
+    Returns ``None`` when neither resolves.
+    """
+    if not cwd:
+        return None
+    git_root = infer_git_worktree_root(cwd)
+    if git_root is not None:
+        return str(git_root)
+    # No Git root above: fall back to the marker resolver so a non-git scaffolded
+    # workspace still resolves to its scaffold root (behavior preserved).
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+        infer_repo_root,
+    )
+
+    return infer_repo_root(cwd)
+
+
 def project_scope_for_cwd(
     cwd: Optional[str],
-    repo_root: Optional[str],
+    repo_root: Optional[str] = None,
     *,
     max_depth: int = DEFAULT_MAX_DEPTH,
 ) -> Optional[ProjectScope]:
@@ -234,17 +260,31 @@ def project_scope_for_cwd(
 
     Convenience wrapper over :func:`adopted_scopes_for_repo` +
     :func:`resolve_project_scope_for_path` for the cockpit / discovery / handoff
-    call sites: a pane whose cwd is the repo root (or outside every project)
+    call sites. ``repo_root`` is the workspace root the project path is taken
+    relative to; when omitted (or when it is a nested project-local scaffold root)
+    the Git-worktree-preferring :func:`resolve_workspace_root` is used so the
+    project path stays repo-relative to the real Git root (Redmine #12658
+    j#66499). A pane whose cwd is the repo root (or outside every adopted project)
     resolves to ``None`` so single-repo workspaces keep their existing display.
     """
-    if not cwd or not repo_root:
+    if not cwd:
         return None
-    adopted = adopted_scopes_for_repo(repo_root, max_depth=max_depth)
+    # Prefer the Git worktree root so a nested project-local scaffold marker does
+    # not collapse the workspace onto the project. An explicitly-passed repo_root
+    # is honored only when it is at or above the resolved Git root (i.e. not a
+    # nested scaffold subdir); otherwise the Git root wins.
+    git_pref = resolve_workspace_root(cwd)
+    effective_root = git_pref or (
+        str(Path(repo_root).expanduser().resolve()) if repo_root else None
+    )
+    if not effective_root:
+        return None
+    adopted = adopted_scopes_for_repo(effective_root, max_depth=max_depth)
     if not adopted:
         return None
     return resolve_project_scope_for_path(
         str(Path(cwd).expanduser().resolve()),
-        repo_root=str(Path(repo_root).expanduser().resolve()),
+        repo_root=str(Path(effective_root).expanduser().resolve()),
         adopted=adopted,
     )
 
