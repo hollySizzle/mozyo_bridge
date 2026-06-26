@@ -417,6 +417,21 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-object-oriented-architecture-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/object-oriented-architecture-policy.md
+    purpose: "v0.10.22 以降の architecture work で OOP-first と static typing を基本姿勢にする設計思想正本。CLI / use case / domain policy / port-adapter / value object の責務境界と pure function の残し方を定義する。"
+    audit_role: object_oriented_architecture_policy_logic
+    related_document_refs:
+      - logic-refactor-split-strategy
+      - logic-source-layout-bounded-context-migration
+      - logic-plugin-ready-adapter-boundary
+      - logic-module-health-gate
+      - logic-coordinator-sublane-development-flow
+      - spec-bounded-context-map
+      - spec-project-map
+
   - id: logic-source-layout-bounded-context-migration
     type: logic
     status: active
