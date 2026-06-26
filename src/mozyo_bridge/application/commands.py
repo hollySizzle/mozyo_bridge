@@ -1337,23 +1337,26 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
 
 def _resolve_project_scope_fields(
     cwd: str | None, repo_root: str | None
-) -> tuple[str | None, tuple[str | None, str | None, str | None]]:
+) -> tuple[str | None, tuple[str | None, str | None, str | None], str | None]:
     """Resolve a cockpit column's Git repo root + project scope (Redmine #12658).
 
     When ``cwd`` resolves inside an adopted monorepo project, the workspace
     identity is the *Git repository root* (the umbrella/department workspace) and
     the project scope (the project's ``redmine_project`` id) is carried
     separately — so the cockpit / dry-run JSON keeps ``repo_root`` and the project
-    path distinct. Returns ``(effective_repo_root, (scope, path, label))``.
+    path distinct. Returns ``(effective_repo_root, (scope, path, label),
+    launch_cwd)`` where ``launch_cwd`` is the absolute project workdir a launched
+    pane should start in (Redmine #12658 j#66505) so its cwd is under the project
+    path and a ``--target-project`` handoff gate can pass.
 
     Fail-soft and compatibility-preserving: when no adopted project contains the
     cwd (a single-repo workspace, an un-scanned root, or any discovery error) the
-    original ``repo_root`` is returned unchanged with an empty project triple, so
-    existing single-repo cockpit behavior is byte-identical.
+    original ``repo_root`` is returned unchanged with an empty project triple and
+    a ``None`` launch_cwd, so existing single-repo cockpit behavior is identical.
     """
     none_triple: tuple[str | None, str | None, str | None] = (None, None, None)
     if not cwd:
-        return repo_root, none_triple
+        return repo_root, none_triple, None
     try:
         from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
             project_scope_for_cwd,
@@ -1368,13 +1371,16 @@ def _resolve_project_scope_fields(
         # root above (non-git scaffolded workspace, #11301).
         git_root = resolve_workspace_root(cwd) or repo_root
         if not git_root:
-            return repo_root, none_triple
+            return repo_root, none_triple, None
         scope = project_scope_for_cwd(cwd, git_root)
     except Exception:  # noqa: BLE001 - project scope is additive; never block cockpit
-        return repo_root, none_triple
+        return repo_root, none_triple, None
     if scope is None:
-        return repo_root, none_triple
-    return git_root, (scope.scope, scope.path, scope.label)
+        return repo_root, none_triple, None
+    # Launch the pane at the project workdir (repo-relative ``scope.workdir``
+    # resolved against the Git root) so the pane cwd is under the project path.
+    launch_cwd = str(Path(git_root) / scope.workdir)
+    return git_root, (scope.scope, scope.path, scope.label), launch_cwd
 
 
 def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
@@ -1394,8 +1400,8 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
             # Project-scoped identity (#12658): re-root to the Git repo root and
             # carry the project scope separately when this column is an adopted
             # monorepo project; single-repo columns are unchanged.
-            effective_root, (p_scope, p_path, p_label) = _resolve_project_scope_fields(
-                resolved, resolved
+            effective_root, (p_scope, p_path, p_label), p_launch = (
+                _resolve_project_scope_fields(resolved, resolved)
             )
             canon = resolve_canonical_session(effective_root)
             wsid = getattr(canon, "workspace_id", None) or canon.name
@@ -1410,6 +1416,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
                     project_scope=p_scope,
                     project_path=p_path,
                     project_label=p_label,
+                    launch_cwd=p_launch,
                 )
             )
         return out
@@ -1438,7 +1445,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
         # Project-scoped identity (#12658): a discovered pane carries its own cwd,
         # so resolve the project scope from it; the Git repo_root is kept as the
         # workspace authority.
-        _eff_root, (p_scope, p_path, p_label) = _resolve_project_scope_fields(
+        _eff_root, (p_scope, p_path, p_label), p_launch = _resolve_project_scope_fields(
             rec.cwd, rec.repo_root
         )
         key = (wsid, normalize_lane(lane.lane_id), p_scope or "")
@@ -1452,6 +1459,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
                 project_scope=p_scope,
                 project_path=p_path,
                 project_label=p_label,
+                launch_cwd=p_launch,
             )
     return list(by_lane.values())
 
@@ -3760,7 +3768,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     # adopted monorepo project, the workspace identity is the Git repo root and the
     # project scope rides separately, so the dry-run JSON keeps repo_root and the
     # project path distinct. A single-repo workspace keeps repo_root == cwd_root.
-    repo_root, (p_scope, p_path, p_label) = _resolve_project_scope_fields(
+    repo_root, (p_scope, p_path, p_label), p_launch = _resolve_project_scope_fields(
         cwd_root, cwd_root
     )
     canon = resolve_canonical_session(repo_root)
@@ -3774,6 +3782,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         project_scope=p_scope,
         project_path=p_path,
         project_label=p_label,
+        launch_cwd=p_launch,
     )
 
     def launch(role: str, ws) -> str:
@@ -4859,7 +4868,17 @@ def orchestrate_handoff(
             )
             raise AssertionError("unreachable")
         auto_cwd = target_info.get("cwd") or ""
-        auto_root = infer_repo_root(auto_cwd)
+        # Prefer the real Git worktree root over a nested project-local scaffold
+        # marker (Redmine #12658 j#66504): a target pane inside a monorepo project
+        # subdir that carries its own `.mozyo-bridge/scaffold.json` must still
+        # resolve `--target-repo auto` to the Git repo root, not the subdir, so the
+        # repo gate gates on the Git root as documented. Non-git scaffold
+        # workspaces still fall back to the marker resolver (#11301).
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+            resolve_workspace_root as _resolve_workspace_root,
+        )
+
+        auto_root = _resolve_workspace_root(auto_cwd)
         if not auto_root:
             _emit_outcome(
                 make_outcome(
@@ -5108,7 +5127,17 @@ def orchestrate_handoff(
     expected_target_repo = getattr(args, "target_repo", None)
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
-        observed_repo = infer_repo_root(target_info.get("cwd") or "")
+        # Prefer the real Git worktree root over a nested project-local scaffold
+        # marker (Redmine #12658 j#66504) so a target pane inside a monorepo
+        # project subdir (which may carry its own `.mozyo-bridge/scaffold.json`)
+        # still gates against the Git repo root — otherwise an explicit
+        # `--target-repo <Git root>` would fail closed before the project gate can
+        # run. Non-git scaffold workspaces still fall back to the marker resolver.
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+            resolve_workspace_root as _resolve_workspace_root,
+        )
+
+        observed_repo = _resolve_workspace_root(target_info.get("cwd") or "")
         # Identity comparison goes through the shared Unicode normalization
         # (Redmine #11625): an NFC-spelled --target-repo must match an NFD
         # pane cwd for the same directory instead of fail-closing on bytes.

@@ -573,6 +573,53 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         self.assertEqual("invalid_args", outcome["reason"])
         self.assertIn("requires an explicit `--target-repo`", stderr)
 
+    def test_nested_project_scaffold_repo_gate_prefers_git_root(self) -> None:
+        # Redmine #12658 j#66504: a target pane inside a monorepo project subdir
+        # that carries its OWN `.mozyo-bridge/scaffold.json` must still gate against
+        # the Git worktree root — so an explicit `--target-repo <Git root>` passes
+        # the repo gate (and reaches the project gate) instead of fail-closing as
+        # `target_repo_mismatch`.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, proj = self._build_gk_monorepo(tmp_str)
+            # Make the repo a real Git worktree root (the helper only writes
+            # pyproject.toml); the Git-preferring resolver keys off `.git`.
+            (repo / ".git").mkdir()
+            # Nested project-local scaffold marker inside the Git repo.
+            (proj / ".mozyo-bridge").mkdir()
+            (proj / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(proj / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, _stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%8",
+                    "--target-repo", str(repo),  # the Git root, not the subdir
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                    "--landing-timeout", "0.01",
+                    "--submit-delay", "0",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        # Repo gate prefers the Git root -> passes; project gate passes (cwd under
+        # project); standard mode then dies on marker_timeout, NOT on either gate.
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+
     def test_target_repo_gate_passes_for_scaffolded_non_git_workspace(self) -> None:
         # Redmine #11301: a non-git scaffolded workspace (only
         # `.mozyo-bridge/scaffold.json`) is a first-class identity root, so a

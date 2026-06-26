@@ -382,16 +382,60 @@ class NestedScaffoldGitRootTests(unittest.TestCase):
 
     def test_cockpit_resolution_emits_git_root_and_repo_relative_project_path(self):
         # Mirrors `mozyo cockpit --repo <project subdir> --dry-run`: the resolved
-        # workspace re-roots to the Git root and carries a repo-relative path.
+        # workspace re-roots to the Git root and carries a repo-relative path, and
+        # the launch cwd is the project workdir (#12658 j#66505) so the pane cwd is
+        # under the project path for a `--target-project` gate.
         from mozyo_bridge.application.commands import _resolve_project_scope_fields
 
         cwd = str(self.proj)
-        effective_root, (scope, path, label) = _resolve_project_scope_fields(cwd, cwd)
+        effective_root, (scope, path, label), launch_cwd = _resolve_project_scope_fields(
+            cwd, cwd
+        )
         self.assertEqual(Path(effective_root), self.repo.resolve())
         self.assertEqual(scope, "giken-cloud-drive-management")
         self.assertEqual(path, "projects/giken-cloud-drive-management")
         self.assertFalse(path.startswith("/"))  # repo-relative, no abs leak
         self.assertEqual(label, "クラウドドライブ管理")
+        # launch cwd is the absolute project workdir (under the Git root).
+        self.assertEqual(Path(launch_cwd), self.proj.resolve())
+
+    def test_cockpit_launch_command_uses_project_workdir_not_git_root(self):
+        # j#66505: a project-scoped cockpit column launches its panes at the
+        # project workdir (so `--target-project` can pass) while the stamped
+        # repo_root stays the Git worktree root.
+        from mozyo_bridge.application.commands import _resolve_project_scope_fields
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+            CockpitWorkspace,
+            build_cockpit_plan,
+        )
+
+        cwd = str(self.proj)
+        effective_root, (scope, path, label), launch_cwd = _resolve_project_scope_fields(
+            cwd, cwd
+        )
+        ws = CockpitWorkspace(
+            workspace_id="gk-3500-it-operations",
+            label="gk-3500-it-operations",
+            repo_root=effective_root,
+            project_scope=scope,
+            project_path=path,
+            project_label=label,
+            launch_cwd=launch_cwd,
+        )
+        plan = build_cockpit_plan([ws])
+        # Every pane-creating command launches with -c <project workdir>, NOT the
+        # Git root.
+        c_dirs = [
+            cmd.argv[cmd.argv.index("-c") + 1]
+            for cmd in plan.commands
+            if "-c" in cmd.argv
+        ]
+        self.assertTrue(c_dirs)
+        for d in c_dirs:
+            self.assertEqual(Path(d), self.proj.resolve())
+            self.assertNotEqual(Path(d), self.repo.resolve())
+        # repo_root identity stays the Git root.
+        self.assertEqual(Path(plan.panes[0].repo_root), self.repo.resolve())
 
     def test_non_git_scaffold_workspace_behavior_preserved(self):
         # A genuinely non-git scaffolded workspace (no `.git` anywhere) still

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6607
+    lines: 6636
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -94,12 +94,17 @@ allowlist:
       `_resolve_project_scope_fields` and the `target_project` gate, so cockpit
       dry-run / handoff from a project subdir emit the Git root + a repo-relative
       project path while non-git scaffold workspaces are preserved.
+      Raised 6607 -> 6636 for the #12658 j#66504/j#66505 fixes: the handoff
+      `--target-repo` / `--target-repo auto` repo gates also use the
+      Git-root-preferring resolver, and project-scoped cockpit columns thread a
+      `launch_cwd` (project workdir) through the 3 workspace-construction sites so
+      a launched pane's cwd is under the project path.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
-    lines: 2438
+    lines: 2456
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
       to split along geometry vs projection responsibilities. Path re-keyed from
@@ -113,6 +118,10 @@ allowlist:
       their `as_dict` projections, and the project stamps in
       `pane_identity_commands`). Additive only — single-repo columns are
       byte-identical to pre-#12658.
+      Raised 2438 -> 2456 for the #12658 j#66505 fix: a `launch_cwd` field on
+      `CockpitWorkspace` + the `_launch_cwd` helper routes every pane-launch `-c`
+      to the project workdir for a project-scoped column (repo_root identity
+      unchanged), so a `--target-project` handoff to such a pane can pass.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

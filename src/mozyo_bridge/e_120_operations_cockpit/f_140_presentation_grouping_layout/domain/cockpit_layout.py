@@ -96,6 +96,12 @@ class CockpitWorkspace:
     project_scope: Optional[str] = None
     project_path: Optional[str] = None
     project_label: Optional[str] = None
+    # Absolute working directory a launched pane should start in (Redmine #12658
+    # j#66505). For a project-scoped column this is the project workdir (so the
+    # pane cwd is under the project path and a `--target-project` handoff gate can
+    # pass), while ``repo_root`` stays the Git worktree root for identity/stamp.
+    # ``None`` -> launch at ``repo_root`` (single-repo / no-project behavior).
+    launch_cwd: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -345,6 +351,18 @@ def normalize_lane(value: Optional[str]) -> str:
     """Empty / missing lane id -> the backward-compatible ``default`` lane."""
     text = (value or "").strip()
     return text or DEFAULT_LANE
+
+
+def _launch_cwd(workspace: "CockpitWorkspace") -> Optional[str]:
+    """The directory a launched pane starts in (Redmine #12658 j#66505).
+
+    A project-scoped column launches at its project workdir (``launch_cwd``) so the
+    pane cwd is under the project path and a ``--target-project`` handoff gate can
+    pass; a single-repo / no-project column launches at ``repo_root`` exactly as
+    before. The pane's stamped ``repo_root`` identity stays the Git worktree root
+    regardless — only the launch cwd differs.
+    """
+    return workspace.launch_cwd or workspace.repo_root
 
 
 @dataclass(frozen=True)
@@ -851,14 +869,14 @@ def build_cockpit_plan(
                 "new-session", "-d", "-s", session, "-n", COCKPIT_WINDOW,
             ]
             if ws.repo_root:
-                argv += ["-c", ws.repo_root]
+                argv += ["-c", _launch_cwd(ws)]
             argv += ["-P", "-F", "#{pane_id}"]
         else:
             # Split the previous column's Codex pane horizontally so columns
             # land left-to-right; even-horizontal below equalizes widths.
             argv = ["split-window", "-h", "-t", prev_codex_token]
             if ws.repo_root:
-                argv += ["-c", ws.repo_root]
+                argv += ["-c", _launch_cwd(ws)]
             argv += ["-P", "-F", "#{pane_id}"]
         cmd = _launch(ROLE_CODEX, ws)
         if cmd:
@@ -907,7 +925,7 @@ def build_cockpit_plan(
             "split-window", "-v", "-t", codex_token, "-l", f"{claude_ratio}%",
         ]
         if ws.repo_root:
-            argv += ["-c", ws.repo_root]
+            argv += ["-c", _launch_cwd(ws)]
         argv += ["-P", "-F", "#{pane_id}"]
         cmd = _launch(ROLE_CLAUDE, ws)
         if cmd:
@@ -1007,7 +1025,7 @@ def build_cockpit_append_plan(
         "split-window", "-h", "-f", "-l", f"{even_share}%", "-t", anchor_pane,
     ]
     if workspace.repo_root:
-        codex_argv += ["-c", workspace.repo_root]
+        codex_argv += ["-c", _launch_cwd(workspace)]
     codex_argv += ["-P", "-F", "#{pane_id}"]
     cmd = _launch(ROLE_CODEX)
     if cmd:
@@ -1023,7 +1041,7 @@ def build_cockpit_append_plan(
         "split-window", "-v", "-t", codex_token, "-l", f"{claude_ratio}%",
     ]
     if workspace.repo_root:
-        claude_argv += ["-c", workspace.repo_root]
+        claude_argv += ["-c", _launch_cwd(workspace)]
     claude_argv += ["-P", "-F", "#{pane_id}"]
     cmd = _launch(ROLE_CLAUDE)
     if cmd:
@@ -1198,7 +1216,7 @@ def build_group_window_create_plan(
 
     codex_argv = ["new-window", "-t", session, "-n", window_name]
     if workspace.repo_root:
-        codex_argv += ["-c", workspace.repo_root]
+        codex_argv += ["-c", _launch_cwd(workspace)]
     codex_argv += ["-P", "-F", "#{pane_id}"]
     cmd = _launch(ROLE_CODEX)
     if cmd:
@@ -1212,7 +1230,7 @@ def build_group_window_create_plan(
     )
     claude_argv = ["split-window", "-v", "-t", codex_token, "-l", f"{claude_ratio}%"]
     if workspace.repo_root:
-        claude_argv += ["-c", workspace.repo_root]
+        claude_argv += ["-c", _launch_cwd(workspace)]
     claude_argv += ["-P", "-F", "#{pane_id}"]
     cmd = _launch(ROLE_CLAUDE)
     if cmd:
