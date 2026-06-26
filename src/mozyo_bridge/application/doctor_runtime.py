@@ -156,7 +156,7 @@ def _walk_subparser(
 def _probe_active_standard_target_admission() -> bool:
     """Live probe: does the loaded package expose the #12597 admission policy."""
     try:
-        module = importlib.import_module("mozyo_bridge.domain.handoff")
+        module = importlib.import_module("mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff")
     except Exception:
         return False
     return hasattr(module, "resolve_standard_target_admission_policy")

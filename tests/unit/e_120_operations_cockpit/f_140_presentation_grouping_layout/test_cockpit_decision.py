@@ -38,7 +38,7 @@ class CockpitDecisionTest(unittest.TestCase):
         self, *, columns, ws_id="wsX", session_present=False, lane=None, advisory=None
     ):
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.cockpit_layout import (
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
             ADOPT_STATUS_NONE,
             AdoptAdvisory,
             DEFAULT_LANE,
@@ -277,8 +277,8 @@ class CockpitDecisionTest(unittest.TestCase):
     # --- Adopt advisory rides the normal flow as a non-mutating notice (#11897) ---
 
     def _candidate_advisory(self):
-        from mozyo_bridge.domain.cockpit_layout import detect_adopt_candidates
-        from mozyo_bridge.domain.cockpit_layout import NormalSessionObservation
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import detect_adopt_candidates
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import NormalSessionObservation
 
         return detect_adopt_candidates(
             workspace_id="wsX",
@@ -345,7 +345,7 @@ class CockpitDecisionTest(unittest.TestCase):
 
     # --- Lane-aware duplicate detection (Redmine #11820). ---
     def _lane(self, lane_id, label=None):
-        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import LaneIdentity
 
         return LaneIdentity(lane_id, label)
 

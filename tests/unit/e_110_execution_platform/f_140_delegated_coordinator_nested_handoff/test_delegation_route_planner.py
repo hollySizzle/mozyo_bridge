@@ -2,7 +2,7 @@
 
 These are the hermetic, no-side-effect tests the planner / actuator integration
 must pass *before* the #12546 real-machine smoke is ever run. They exercise the
-pure plan layer (:mod:`mozyo_bridge.domain.delegation_route_planner`) against the
+pure plan layer (:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner`) against the
 contracts fixed by:
 
 - ``vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md``
@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # cross-check below, regardless of how this suite is discovered.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mozyo_bridge.domain.delegation_project_config import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (  # noqa: E402
     ChildCandidate,
     ChildCandidateResolution,
     DelegationConfig,
@@ -42,12 +42,12 @@ from mozyo_bridge.domain.delegation_project_config import (  # noqa: E402
     CHILD_CANDIDATE_MISSING,
     CHILD_CANDIDATE_AMBIGUOUS,
 )
-from mozyo_bridge.domain.role_profile import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E402
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,
 )
-from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (  # noqa: E402
     DelegationRoutePlanError,
     EXEC_AUTO,
     EXEC_DURABLE_RECORD,

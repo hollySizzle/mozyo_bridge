@@ -43,11 +43,11 @@ from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
 )
-from mozyo_bridge.domain.module_registry import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     CliCompositionConfig,
     ModuleRegistryError,
 )
-from mozyo_bridge.domain.repo_local_config import (
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     PresentationSelectionConfig,
     RepoLocalConfig,
     RepoLocalConfigError,

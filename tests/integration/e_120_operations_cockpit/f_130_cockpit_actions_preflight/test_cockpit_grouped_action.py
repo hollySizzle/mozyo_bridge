@@ -43,13 +43,13 @@ from mozyo_bridge.application.cockpit_actions import (
     grouped_reveal,
 )
 from mozyo_bridge.application.otel_receiver import build_server
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     UNIT_STATUS_CONTRADICTED,
     UNIT_STATUS_OBSERVED,
     UNIT_STATUS_STALE,
     UnitView,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
 )
@@ -159,7 +159,7 @@ class GroupedActionResolveTest(unittest.TestCase):
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         with _patch_inventory(snapshot), patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             side_effect=fake_run_tmux,
         ):
             result = grouped_jump(

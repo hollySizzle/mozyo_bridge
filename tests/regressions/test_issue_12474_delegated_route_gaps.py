@@ -29,14 +29,14 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from mozyo_bridge.domain.delegated_coordinator_route_plan import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan import (  # noqa: E402
     PLAN_BLOCKED,
     STEP_DISPATCH_DECISION,
     STEP_SEND_SAME_LANE_WORKER,
     STEP_SEND_TO_GRANDCHILD_GATEWAY,
     plan_delegated_coordinator_route,
 )
-from mozyo_bridge.domain.grandchild_stamp import GATE_BLOCKED  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GATE_BLOCKED  # noqa: E402
 
 from support.delegation_route_fakes import (  # noqa: E402
     FakeDelegationExecutor,

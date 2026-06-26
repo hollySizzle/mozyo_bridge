@@ -64,7 +64,7 @@ class CockpitActionTest(unittest.TestCase):
             )()
 
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=self._panes(),
         ), patch(
             f"{COCKPIT_ACTIONS}.subprocess.run",
@@ -104,10 +104,10 @@ class CockpitActionTest(unittest.TestCase):
             )()
 
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=self._panes(),
         ), patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             side_effect=fake_run_tmux,
         ):
             result = jump_to_unit("%1", home=self.home)
@@ -126,10 +126,10 @@ class CockpitActionTest(unittest.TestCase):
             )()
 
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=self._panes(),
         ), patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             side_effect=fake_run_tmux,
         ):
             with self.assertRaises(CockpitActionError) as ctx:
@@ -139,7 +139,7 @@ class CockpitActionTest(unittest.TestCase):
     def test_reveal_refuses_missing_directory(self) -> None:
         panes = [pane("%1", "mozyo-demo", "claude", cwd="/no/such/dir")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             with self.assertRaises(CockpitActionError):

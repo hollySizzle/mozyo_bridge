@@ -42,13 +42,13 @@ from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
 )
-from mozyo_bridge.domain.provider_registry import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import (
     BUILTIN_PROVIDER_REGISTRY,
     ProviderCategory,
     ProviderRegistryError,
     ProviderSelectionConfig,
 )
-from mozyo_bridge.domain.repo_local_config import RepoLocalConfig
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import RepoLocalConfig
 
 
 def _write_config(repo_root: Path, body: str) -> None:

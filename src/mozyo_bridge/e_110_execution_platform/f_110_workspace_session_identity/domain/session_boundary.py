@@ -11,7 +11,7 @@ Three concerns, all pure (no tmux, git, or ticket-system I/O):
   before crossing it).
 - :func:`build_boundary_prompt` renders the compact, pasteable next-session
   prompt a Codex session hands the operator / next Codex session. It reuses the
-  :class:`~mozyo_bridge.domain.handoff.ExecutionRoot` redaction contract so the
+  :class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff.ExecutionRoot` redaction contract so the
   prompt never carries a private absolute path (Redmine #12098 review j#59662;
   ``vibes/docs/rules/public-private-boundary.md``).
 - :func:`decide_pane_lifecycle` is the guarded Claude-pane lifecycle decision
@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-from mozyo_bridge.domain.handoff import ExecutionRoot
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import ExecutionRoot
 
 # --- Boundary candidate signal vocabulary ----------------------------------
 #

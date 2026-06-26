@@ -42,9 +42,9 @@ from mozyo_bridge.application.cli_handoff_grandchild_realization import (
 from mozyo_bridge.application.grandchild_dispatch import (
     cmd_handoff_grandchild_dispatch,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import LAUNCH_ADOPT_MODES
-from mozyo_bridge.domain.grandchild_dispatch import RECORD_POLICIES
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import LAUNCH_ADOPT_MODES
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import RECORD_POLICIES
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     KIND_LABELS,
     MODE_QUEUE_ENTER,
     MODES,
@@ -54,7 +54,7 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMATS,
     SOURCES,
 )
-from mozyo_bridge.domain.role_profile import ROLE_PROFILE_TOKENS
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import ROLE_PROFILE_TOKENS
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:

@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-import mozyo_bridge.domain.pane_resolver as pane_resolver
-from mozyo_bridge.domain.handoff import next_action_for
+import mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver as pane_resolver
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import next_action_for
 
 class CrossWorkspaceHandoffGateTest(unittest.TestCase):
     """Cross-workspace handoff gate (Redmine #10332).
@@ -51,9 +51,9 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
                 "mozyo_bridge.application.commands.current_session_name",
                 return_value=sender_session,
             ), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
                 return_value=[pane],
             ), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
@@ -479,7 +479,7 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
                 "pane_active": "1",
             }
             with patch(
-                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.resolve_pane_id",
                 return_value="%9",
             ):
                 _exc, _sent, stdout, _stderr = self.run_handoff(

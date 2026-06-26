@@ -39,7 +39,7 @@ from mozyo_bridge.application.sublane_diagnostics import (
     cmd_sublane_callback_recovery,
     cmd_sublane_readiness,
 )
-from mozyo_bridge.domain.sublane_callback import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
 )
@@ -53,9 +53,9 @@ from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
 )
-from mozyo_bridge.domain.module_registry import ModuleRegistryError
-from mozyo_bridge.domain.provider_registry import ProviderRegistryError
-from mozyo_bridge.domain.repo_local_config import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import ModuleRegistryError
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import ProviderRegistryError
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfig,
     RepoLocalConfigError,
 )
@@ -82,8 +82,8 @@ from mozyo_bridge.application.cli_runtime_config import (  # noqa: F401,E402
     _add_runtime_config_check_parser,
     _add_runtime_config_install_parser,
 )
-from mozyo_bridge.domain.agent_discovery import AGENT_KINDS  # noqa: F401,E402
-from mozyo_bridge.domain.handoff import (  # noqa: F401,E402
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import AGENT_KINDS  # noqa: F401,E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: F401,E402
     KIND_LABELS,
     MODE_QUEUE_ENTER,
     MODES,
@@ -91,7 +91,7 @@ from mozyo_bridge.domain.handoff import (  # noqa: F401,E402
     RECORD_FORMATS,
     SOURCES,
 )
-from mozyo_bridge.domain.session_boundary import SESSION_BOUNDARY_SIGNALS  # noqa: F401,E402
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import SESSION_BOUNDARY_SIGNALS  # noqa: F401,E402
 from mozyo_bridge.application.commands import (  # noqa: F401,E402
     cmd_agents_attention_project,
     cmd_agents_list,

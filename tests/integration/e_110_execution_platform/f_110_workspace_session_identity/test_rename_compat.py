@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge import workspace_registry as wr
 from mozyo_bridge import workspace_defaults as wd
-from mozyo_bridge.domain.session_naming import (
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
     SOURCE_WORKSPACE_DEFAULTS,
     derive_session_name,
     read_redmine_identifier,

@@ -25,7 +25,7 @@ It is deliberately **not** a plugin API:
 
 The module is pure (dataclasses + a small in-memory mapping) and imports no
 provider implementation, so the dependency only ever points provider -> core,
-exactly like ``mozyo_bridge.domain.ticket_adapter``.
+exactly like ``mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter``.
 
 On top of the classification skeleton, Redmine #12184 adds the smallest
 *provider-selection* layer: a typed, internal-only :class:`ProviderSelectionConfig`

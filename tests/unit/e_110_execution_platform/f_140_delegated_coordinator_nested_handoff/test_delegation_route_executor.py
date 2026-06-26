@@ -2,7 +2,7 @@
 
 These are the hermetic acceptance net the #12557 live executor / #12558 record
 package must pass *before* the #12546 real-machine smoke is ever run. They drive
-the real executor (:class:`mozyo_bridge.domain.delegation_route_executor.DelegationRouteExecutor`)
+the real executor (:class:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_executor.DelegationRouteExecutor`)
 over fake tmux / handoff / stamp / Redmine providers and assert the contracts
 fixed by:
 
@@ -31,13 +31,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.delegation_project_config import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (  # noqa: E402
     ChildCandidate,
     ChildCandidateResolution,
     STATUS_MISSING,
     STATUS_RESOLVED,
 )
-from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (  # noqa: E402
     OUTPUT_RECOMMEND_ONLY,
     PLAN_BLOCKED,
     PLAN_FAILED,
@@ -46,7 +46,7 @@ from mozyo_bridge.domain.delegation_route_planner import (  # noqa: E402
     RouteRequest,
     plan_delegation_route,
 )
-from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_records import (  # noqa: E402
     CALLBACK_PENDING,
     CALLBACK_SENT,
     CLASS_BLOCKED,
@@ -68,13 +68,13 @@ from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
     CallbackOutcome,
     RouteRecordReceipt,
 )
-from mozyo_bridge.domain.delegation_route_executor import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_executor import (  # noqa: E402
     DelegationRouteExecutor,
     ExecutionContext,
     HandoffSendOutcome,
     StampOutcome,
 )
-from mozyo_bridge.domain.route_identity_ledger import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
     RouteIdentity,
     RouteIdentityLedger,
     TARGET_AMBIGUOUS,

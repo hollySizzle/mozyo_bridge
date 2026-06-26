@@ -29,8 +29,8 @@ import argparse
 import json
 from typing import Any
 
-from mozyo_bridge.domain import sublane_callback
-from mozyo_bridge.domain.claude_permission_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODES,
     SOURCE_ENV_INVALID,
     SOURCE_ENV_OVERRIDE,

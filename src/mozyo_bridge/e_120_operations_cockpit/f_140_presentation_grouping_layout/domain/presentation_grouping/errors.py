@@ -7,5 +7,5 @@ class PresentationGroupingConfigError(ValueError):
     """The desired presentation grouping record violates the closed schema.
 
     Inherits :class:`ValueError` for fail-closed semantics, matching the sibling
-    domain error :class:`~mozyo_bridge.domain.repo_local_config.RepoLocalConfigError`.
+    domain error :class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.RepoLocalConfigError`.
     """

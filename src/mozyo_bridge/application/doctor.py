@@ -22,8 +22,8 @@ from typing import Any
 import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
-from mozyo_bridge.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
-from mozyo_bridge.infrastructure.tmux_client import run_tmux
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.state_store import (
@@ -623,7 +623,7 @@ def doctor_claude_launch_policy_section() -> dict[str, Any]:
     policy is non-retroactive, so this describes future panes only —
     already-running panes keep whatever mode they started with.
     """
-    from mozyo_bridge.domain.claude_permission_policy import (
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
         SOURCE_ENV_INVALID,
         SOURCE_ENV_OVERRIDE,
         describe_launch_policy,
@@ -826,7 +826,7 @@ def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
-    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import summarize_activity
     from mozyo_bridge.otel_store import OtelEventStore
 
     store = OtelEventStore()
@@ -863,11 +863,11 @@ def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
             observed_pairs.add((hints["session"], hints["agent"]))
     gaps: list[dict[str, str]] = []
     try:
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             discover_agents,
             fold_agents_by_pane,
         )
-        from mozyo_bridge.infrastructure.tmux_client import try_pane_lines
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import try_pane_lines
 
         panes = try_pane_lines()
         if panes is None:

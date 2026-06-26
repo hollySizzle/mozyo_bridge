@@ -15,8 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain import attention
-from mozyo_bridge.domain.attention import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain import attention
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
     REASON_CONTRADICTORY,
     REASON_SOURCE_UNREADABLE,
     STATE_BLOCKED,
@@ -163,7 +163,6 @@ class NonRoutingBoundaryTest(unittest.TestCase):
             "pane_resolver",
             "target",  # no target resolver import (target_key is a plain str field)
             "tmux_client",
-            "infrastructure",
             "agent_discovery",
         ):
             self.assertNotIn(
@@ -171,15 +170,15 @@ class NonRoutingBoundaryTest(unittest.TestCase):
                 src,
                 f"attention read model must not import {forbidden}",
             )
-            self.assertNotIn(
-                f"from mozyo_bridge.domain.{forbidden}",
-                src,
-                f"attention read model must not import {forbidden}",
-            )
-            self.assertNotIn(
-                f"from mozyo_bridge.infrastructure",
-                src,
-            )
+        # Layout-agnostic guard (#12632 retired the top-level
+        # ``mozyo_bridge.infrastructure`` facade): the read model must not import
+        # any infrastructure-layer module, wherever it now lives in the
+        # Redmine-numbered tree (every such path contains ``.infrastructure.``).
+        self.assertNotIn(
+            ".infrastructure.",
+            src,
+            "attention read model must not import an infrastructure-layer module",
+        )
 
     def test_derive_signature_takes_only_inputs(self) -> None:
         # Pure read model: derivation takes the extracted facts, not a tmux /
@@ -209,7 +208,7 @@ class ConservativeAttentionTest(unittest.TestCase):
     """
 
     def test_readable_identity_derives_healthy_no_source(self) -> None:
-        from mozyo_bridge.domain.attention import (
+        from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
             NO_ATTENTION_SOURCE_REASON,
             conservative_attention,
         )
@@ -231,7 +230,7 @@ class ConservativeAttentionTest(unittest.TestCase):
         self.assertEqual(["tmux:%1"], list(record.source_refs))
 
     def test_unreadable_or_contradictory_identity_fails_safe(self) -> None:
-        from mozyo_bridge.domain.attention import conservative_attention
+        from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import conservative_attention
 
         unreadable = conservative_attention(
             observed_at="2026-06-15T00:00:00Z",
@@ -252,7 +251,7 @@ class ConservativeAttentionTest(unittest.TestCase):
         self.assertEqual(REASON_CONTRADICTORY, contradictory.reason_code)
 
     def test_non_agent_role_normalizes_to_other(self) -> None:
-        from mozyo_bridge.domain.attention import ROLE_OTHER, conservative_attention
+        from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import ROLE_OTHER, conservative_attention
 
         record = conservative_attention(
             observed_at="2026-06-15T00:00:00Z",

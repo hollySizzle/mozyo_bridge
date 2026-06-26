@@ -1,8 +1,8 @@
 """Runtime resolution of the built-in provider selection (Redmine #12249).
 
 This is the first connection of the internal provider-selection layer
-(:class:`~mozyo_bridge.domain.provider_registry.ProviderSelectionConfig` /
-:data:`~mozyo_bridge.domain.provider_registry.BUILTIN_PROVIDER_REGISTRY`, Redmine
+(:class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderSelectionConfig` /
+:data:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.BUILTIN_PROVIDER_REGISTRY`, Redmine
 #12035 / #12184) to a real runtime surface. Before this lane the repo-local
 config's ``providers`` selection was *read and schema-validated* by the #12190
 loader but never resolved against the live registry — the staged gap the
@@ -22,7 +22,7 @@ composition wiring exactly:
 What this layer deliberately does — and does not — do:
 
 - It resolves the configured selection to concrete
-  :class:`~mozyo_bridge.domain.provider_registry.BuiltinProvider` *descriptions*
+  :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.BuiltinProvider` *descriptions*
   via :meth:`BuiltinProviderRegistry.resolve_selection`. The default (no
   selection) resolves every populated category to its current built-in default
   (``ticket`` -> ``redmine``, ``terminal_runtime`` -> ``tmux``, ``presentation``
@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mozyo_bridge.domain.provider_registry import (
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import (
     BUILTIN_PROVIDER_REGISTRY,
     BuiltinProvider,
     ProviderCategory,
@@ -63,7 +63,7 @@ def resolve_builtin_providers(
     current built-in — provider. ``None`` / the default config resolves to the
     current built-ins, so the default composition is behavior-preserving.
 
-    Raises :class:`~mozyo_bridge.domain.provider_registry.ProviderRegistryError`
+    Raises :class:`~mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry.ProviderRegistryError`
     (a :class:`ValueError`) on any invalid selection, so a caller may fail closed
     with a single ``except`` — the same fail-closed contract the CLI family
     resolution uses at the composition entrypoint.

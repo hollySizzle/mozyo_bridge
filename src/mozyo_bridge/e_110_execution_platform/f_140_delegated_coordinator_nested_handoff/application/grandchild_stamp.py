@@ -5,7 +5,7 @@ the grandchild dispatch actuator: it takes the **declared** delegation chain
 (read from the durable Redmine record, never inferred from pane proximity) and
 the realized grandchild lane, validates the tree + the grandchild acceptance
 shape through the pure
-:func:`mozyo_bridge.domain.grandchild_stamp.resolve_grandchild_stamp_plan`, and
+:func:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp.resolve_grandchild_stamp_plan`, and
 then **stamps** the live ``@mozyo_lane_kind`` / ``@mozyo_delegation_parent``
 projection-cache options onto each declared pane so ``agents targets`` /
 ``delegation_display`` immediately project the grandchild lane with
@@ -42,7 +42,7 @@ import argparse
 import json
 from typing import Optional
 
-from mozyo_bridge.domain.grandchild_stamp import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
     DeclaredLane,
     GrandchildStampError,
     GrandchildStampPlan,
@@ -218,7 +218,7 @@ def cmd_handoff_grandchild_stamp(args: argparse.Namespace) -> int:
 
     applied: Optional[bool] = None
     if apply:
-        from mozyo_bridge.infrastructure.tmux_client import require_tmux, run_tmux
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux, run_tmux
 
         require_tmux()
         applied = True
@@ -261,8 +261,8 @@ def _discover_delegation_units(args: argparse.Namespace):
     projection ``agents targets`` itself uses.
     """
     from mozyo_bridge.application.commands import _agents_target_candidates
-    from mozyo_bridge.domain.delegation_display import derive_targets_delegation
-    from mozyo_bridge.infrastructure.tmux_client import require_tmux
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux
 
     require_tmux()
     candidates = _agents_target_candidates(args)

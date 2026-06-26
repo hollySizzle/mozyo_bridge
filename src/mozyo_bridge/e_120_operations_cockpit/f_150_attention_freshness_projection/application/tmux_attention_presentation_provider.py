@@ -2,10 +2,10 @@
 
 The first — and, per the adapter-boundary design (Redmine #12001), for v0.8 the
 *only* — concrete
-:class:`~mozyo_bridge.domain.presentation_adapter.PresentationProvider`. It is
+:class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PresentationProvider`. It is
 the "Candidate 2" presentation slice, kept read / projection-first: it converts
-an already-derived :class:`~mozyo_bridge.domain.attention.AttentionRecord` into a
-normalized :class:`~mozyo_bridge.domain.presentation_adapter.SurfaceProjection`
+an already-derived :class:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.AttentionRecord` into a
+normalized :class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.SurfaceProjection`
 for the ``tmux_user_option`` surface.
 
 It lives in the application layer next to :mod:`attention_projection` because it
@@ -36,8 +36,8 @@ from mozyo_bridge.application.attention_projection import (
     ATTENTION_STATE_OPTION,
     ATTENTION_UPDATED_AT_OPTION,
 )
-from mozyo_bridge.domain.attention import AttentionRecord
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionRecord
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     SURFACE_TMUX_USER_OPTION,
     ProjectionField,
     SurfaceProjection,

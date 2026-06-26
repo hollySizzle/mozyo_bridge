@@ -1,15 +1,15 @@
 """Built-in text attention presentation provider (Redmine #12185).
 
 The second built-in
-:class:`~mozyo_bridge.domain.presentation_adapter.PresentationProvider`, added
+:class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PresentationProvider`, added
 after the tmux provider (Redmine #12156). Until now the ``text`` surface was
 core-owned vocabulary with no provider; this module fills it with the smallest
 possible projection-only implementation, kept read / projection-first exactly
 like the tmux provider.
 
 Like :mod:`tmux_attention_presentation_provider`, it converts an
-already-derived :class:`~mozyo_bridge.domain.attention.AttentionRecord` into a
-normalized :class:`~mozyo_bridge.domain.presentation_adapter.SurfaceProjection`,
+already-derived :class:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.AttentionRecord` into a
+normalized :class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.SurfaceProjection`,
 but for the ``text`` surface: stable, human-readable label keys instead of tmux
 ``@mozyo_attention_*`` option names. The two providers project the *same* four
 logical attention cells in the *same* order, so a text rendering and a tmux
@@ -38,8 +38,8 @@ projection and adds no provider-registry surface.
 
 from __future__ import annotations
 
-from mozyo_bridge.domain.attention import AttentionRecord
-from mozyo_bridge.domain.presentation_adapter import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionRecord
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     SURFACE_TEXT,
     ProjectionField,
     SurfaceProjection,

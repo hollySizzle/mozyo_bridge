@@ -1,7 +1,7 @@
 """Repo-local YAML config loader — file IO + parse layer (Redmine #12190).
 
 This is the thin *file-IO and parse* layer on top of the pure schema boundary
-defined in :mod:`mozyo_bridge.domain.repo_local_config` (Redmine #12189). The
+defined in :mod:`mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config` (Redmine #12189). The
 split is deliberate and mirrors the rest of the adapter seams:
 
 - the **domain** module owns *meaning* — the closed top-level record shape, the
@@ -27,7 +27,7 @@ The contract this layer adds, fail-closed throughout:
   YAML document (``yaml.YAMLError``) or an unreadable present file
   (``OSError`` / ``UnicodeDecodeError``) is re-raised as
   :class:`RepoLocalConfigLoadError`, a subclass of the domain's
-  :class:`~mozyo_bridge.domain.repo_local_config.RepoLocalConfigError`. Schema
+  :class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.RepoLocalConfigError`. Schema
   violations raised by :meth:`RepoLocalConfig.from_record` already are
   ``RepoLocalConfigError``. So a single ``except RepoLocalConfigError`` at the
   call site catches every repo-local-config failure — parse, IO, and schema —
@@ -46,7 +46,7 @@ from typing import Optional, Union
 
 import yaml
 
-from mozyo_bridge.domain.repo_local_config import (
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfig,
     RepoLocalConfigError,
 )
@@ -61,7 +61,7 @@ CONFIG_FILE_RELPATH = Path(".mozyo-bridge") / "config.yaml"
 class RepoLocalConfigLoadError(RepoLocalConfigError):
     """A repo-local config file could not be read or parsed (file-IO layer).
 
-    Subclasses :class:`~mozyo_bridge.domain.repo_local_config.RepoLocalConfigError`
+    Subclasses :class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.RepoLocalConfigError`
     so a caller catching the domain error catches *every* repo-local-config
     failure — schema, parse, and IO — with one ``except``. It is raised only for
     the IO / parse concerns this layer owns (an unreadable present file or a

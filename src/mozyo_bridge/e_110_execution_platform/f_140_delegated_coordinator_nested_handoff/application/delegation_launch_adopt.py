@@ -4,7 +4,7 @@
 parent -> delegated coordinator route. It is **read-only and never sends**: it
 runs the same ``agents targets`` discovery pipeline, resolves a deterministic
 fail-closed launch/adopt decision with
-:func:`mozyo_bridge.domain.delegation_launch_adopt.resolve_launch_adopt`, and
+:func:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt.resolve_launch_adopt`, and
 emits
 
 - the decision (mode / outcome / reason / matched candidate summary),
@@ -32,7 +32,7 @@ import json
 import shlex
 from typing import Optional
 
-from mozyo_bridge.domain.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
     CallbackTarget,
     DelegationCandidate,
     DelegationLaunchAdoptError,
@@ -287,7 +287,7 @@ def cmd_handoff_delegate_launch_adopt(args: argparse.Namespace) -> int:
     # / ``require_tmux`` come from their canonical modules; only the shared
     # discovery pipeline is sourced from ``commands``.
     from mozyo_bridge.application.commands import _agents_target_candidates
-    from mozyo_bridge.infrastructure.tmux_client import require_tmux
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux
     from mozyo_bridge.shared.errors import die
 
     try:

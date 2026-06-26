@@ -19,7 +19,7 @@ Boundary, restated from the design doc so it stays enforced in code:
 
 These records are intentionally pure dataclasses with no network, no I/O, and
 no approval logic. The built-in Redmine provider that fills them lives in
-``mozyo_bridge.infrastructure.redmine_ticket_provider``; this module never
+``mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider``; this module never
 imports a provider, so the dependency only ever points provider -> core.
 
 Non-goals (kept explicit so the seam does not drift into a plugin API):
@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Optional, Protocol, runtime_checkable
 
-from mozyo_bridge.domain.handoff import KIND_LABELS
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import KIND_LABELS
 
 # The workflow-gate vocabulary is core-owned. It is the durable-record subset
 # of the handoff ``KIND_LABELS`` (the kinds that move a unit through review /

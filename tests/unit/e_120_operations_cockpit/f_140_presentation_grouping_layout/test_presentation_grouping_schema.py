@@ -13,9 +13,9 @@ Pins the closed-schema parsing side of the cockpit Project Group grouping config
   opt-in round-trip, and fail-closed on unknown / authority-shaped values.
 
 These exercise the
-:mod:`mozyo_bridge.domain.presentation_grouping.config` /
-:mod:`~mozyo_bridge.domain.presentation_grouping.validation` /
-:mod:`~mozyo_bridge.domain.presentation_grouping.authority` submodules through
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.config` /
+:mod:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.validation` /
+:mod:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.authority` submodules through
 the package's public facade. The placement resolver and degraded classifier are
 covered by ``test_presentation_grouping_placement`` /
 ``test_presentation_grouping_degraded``. No tmux, file IO, or CLI here.
@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     ALLOWED_PROJECTIONS,
     DEFAULT_DELEGATION_WINDOW_POLICY,
     DEFAULT_PROJECT_GROUP_PRESENTATION,

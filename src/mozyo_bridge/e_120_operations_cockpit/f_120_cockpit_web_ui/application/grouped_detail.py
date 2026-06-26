@@ -5,7 +5,7 @@ Project Group -> Unit -> Target display the #12264 read model projects and the
 #12255 display view renders), they need to see, on **one screen**, the safe
 actions that Unit's row could next seed and the preflight boundary those actions
 run under. This module is that **detail / command preview projection**: it maps a
-single grouped read-model row (:class:`~mozyo_bridge.domain.grouped_read_model.UnitView`)
+single grouped read-model row (:class:`~mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model.UnitView`)
 to a :class:`GroupedUnitDetailView` carrying the Unit's public-safe identity /
 state plus a list of :class:`CommandPreview` rows — one per actionable role pane x
 cockpit action (``reveal`` / ``jump``).
@@ -63,9 +63,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from mozyo_bridge.application.cockpit_actions import DEFAULT_HOST
-from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
-from mozyo_bridge.domain.grouped_display import ROLE_DISPLAY_ORDER
-from mozyo_bridge.domain.grouped_read_model import UnitView
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import ROLE_CLAUDE, ROLE_CODEX
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_display import ROLE_DISPLAY_ORDER
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import UnitView
 
 #: The agent roles a grouped cockpit action can seed (``reveal`` / ``jump`` resolve
 #: a live pane by ``(workspace_id, role)``). A row's observed ``roles`` is filtered

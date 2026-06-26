@@ -482,6 +482,30 @@ tests/<type>/e_<order>_<epic_slug>/f_<order>_<feature_slug>/...
 `application/repo_local_config_loader` / `application/cli_runtime_config` (#12490 で tests を flat 例外として
 残した fail-closed 群)。
 
+### #12631 / #12632 Top-level residual removal (correction)
+
+US #12631 / Task #12632 は、#12622 close 時点で top-level に残っていた `src/mozyo_bridge/domain` /
+`src/mozyo_bridge/infrastructure` の tracked residual を Redmine-numbered path へ移し切る correction。本 correction
+**限定で** 上表の `infrastructure/tmux_client.py` (fixed) と `domain/repo_local_config.py` (ambiguous) の据え置き
+分類を supersede する (owner 裁定 #12632 j#66163)。他の fixed surface への一般許可ではない。behavior change は無し。
+
+移動した 7 body の placement (owner 承認済 map, #12632 j#66163):
+
+| old body | placement |
+| --- | --- |
+| `domain/delivery_record_sink.py` | `e_110_execution_platform/f_130_handoff_routing/domain/` |
+| `domain/role_profile.py` | `e_110_execution_platform/f_130_handoff_routing/domain/` |
+| `domain/redmine_read_boundary.py` | `e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/` (route/read classifier, Redmine adapter ではない) |
+| `domain/claude_permission_policy.py` | `e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/` |
+| `domain/agent_activity.py` | `e_110_execution_platform/f_150_runtime_observation_event_timeline/domain/` (OTel activity 分類; cockpit は consumer) |
+| `domain/repo_local_config.py` | `e_130_governance_distribution/f_140_rules_docs_catalog/domain/` (schema は分割しない) |
+| `infrastructure/tmux_client.py` | `e_110_execution_platform/f_130_handoff_routing/infrastructure/` (send-safety transport と同居; layer は infrastructure 維持) |
+
+top-level facade retirement: #12624–#12628 が残した `domain/` / `infrastructure/` 配下の `sys.modules` facade 37 件は
+本 correction の明示 retirement scope として除去し、active import を numbered path へ repoint した
+(`fallback-retirement-ledger.md` Retirement Process: caller inventory → source-of-truth 明記 → tests/docs/generated
+同期)。物理 dir `src/mozyo_bridge/domain` / `infrastructure` / `features` は消滅。
+
 ### Sublane conflict-point management
 
 並列 Epic lane (#12624–#12629) が衝突しうる shared surface と所有 / 調整先:

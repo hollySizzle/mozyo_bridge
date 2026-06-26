@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.domain.cockpit_layout import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     COCKPIT_WINDOW,
     ROLE_CLAUDE,
     ROLE_CODEX,

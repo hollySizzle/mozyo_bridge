@@ -1,7 +1,7 @@
 """Tests for the delegated coordinator launch/adopt decision primitive (#12457).
 
 Covers the pure decision resolver
-(:mod:`mozyo_bridge.domain.delegation_launch_adopt`) across every mode / outcome,
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt`) across every mode / outcome,
 the fail-closed invariants (disabled, mandatory repo identity gate, candidate
 uniqueness, weak/ambiguous identity, never a direct Claude route), the callback
 target validation, and the CLI parser surface registration.
@@ -26,7 +26,7 @@ from mozyo_bridge.application.delegation_launch_adopt import (
     _recommended_command,
     cmd_handoff_delegate_launch_adopt,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
     CONFIDENCE_STRONG,
     CallbackTarget,
     DelegationCandidate,
@@ -505,7 +505,7 @@ class HandlerIntegrationTest(unittest.TestCase):
             "mozyo_bridge.application.commands._agents_target_candidates",
             return_value=rows,
         ), mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux",
             return_value=None,
         ), contextlib.redirect_stdout(buf):
             code = cmd_handoff_delegate_launch_adopt(ns)
@@ -564,7 +564,7 @@ class HandlerIntegrationTest(unittest.TestCase):
         )
         ns.parent_coordinator_route = ""
         with mock.patch(
-            "mozyo_bridge.infrastructure.tmux_client.require_tmux", return_value=None
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux", return_value=None
         ), self.assertRaises(SystemExit):
             cmd_handoff_delegate_launch_adopt(ns)
 

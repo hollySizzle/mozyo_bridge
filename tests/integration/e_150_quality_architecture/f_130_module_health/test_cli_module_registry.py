@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import cli_modules
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.module_registry import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     COMPOSITION_RECORD_VERSION,
     CORE_OWNED_AUTHORITIES,
     BuiltinCliModuleRegistry,

@@ -16,12 +16,12 @@ each schema type performs at construction:
   cross-reference validation.
 
 Type-and-shape validators come from
-:mod:`mozyo_bridge.domain.presentation_grouping.validation`; the authority /
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.validation`; the authority /
 routing leak guard comes from
-:mod:`mozyo_bridge.domain.presentation_grouping.authority`. The placement
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.authority`. The placement
 *resolver* and the degraded *classifier* are deliberately downstream
-(:mod:`~mozyo_bridge.domain.presentation_grouping.placement` /
-:mod:`~mozyo_bridge.domain.presentation_grouping.degraded`) so this module never
+(:mod:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.placement` /
+:mod:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.degraded`) so this module never
 imports them — the dependency only ever points toward the leaves.
 """
 

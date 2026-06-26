@@ -4,7 +4,7 @@ US #12454 (`親子孫 delegated coordinator cockpit window UX`) splits the paren
 delegated coordinator -> grandchild route into a durable policy shape (#12456)
 and the runtime primitives that act on it. #12457 implemented the **depth 1**
 parent -> delegated coordinator launch/adopt decision
-(:mod:`mozyo_bridge.domain.delegation_launch_adopt`). This module is the **depth
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt`). This module is the **depth
 2** runtime decision primitive: the delegated coordinator deciding whether to
 launch or adopt a *grandchild* implementation lane for context preservation, and
 recording that decision durably.
@@ -66,7 +66,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
-from mozyo_bridge.domain.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
     CallbackTarget,
     DelegationCandidate,
     DelegationLaunchAdoptError,

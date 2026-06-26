@@ -5,11 +5,11 @@ draw the Project Group -> Unit -> (role) view. It is the slice that finally make
 the predecessors' read model and freshness view *renderable as one row set*: it
 joins
 
-- the #12264 grouped read model (:mod:`mozyo_bridge.domain.grouped_read_model`):
+- the #12264 grouped read model (:mod:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model`):
   *which* Project Group each Unit displays under, its desired/observed placement,
   and (now) its observed Codex / Claude role-pane presence; with
 - the #12266 reload / freshness view
-  (:mod:`mozyo_bridge.domain.grouped_reload_view`): the human-facing freshness
+  (:mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_reload_view`): the human-facing freshness
   label and the explicit ``reload_required`` flag at every level.
 
 into a single :class:`GroupedDisplayView` whose rows carry exactly what the
@@ -65,19 +65,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.domain.grouped_read_model import (
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     GROUP_SOURCE_DESIRED,
     UNIT_STATUS_CONTRADICTED,
     GroupedReadModel,
     ProjectGroupView,
     UnitView,
 )
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     DEFAULT_PROJECT_GROUP_PRESENTATION,
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
 )
-from mozyo_bridge.domain.grouped_reload_view import (
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_reload_view import (
     GROUPED_RELOAD_DIAGNOSTIC_ONLY_NOTE,
     GroupedReloadView,
     ReloadAffordance,

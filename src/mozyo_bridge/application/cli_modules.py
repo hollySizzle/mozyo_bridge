@@ -1,10 +1,10 @@
 """Built-in CLI module registry binding and parser composition (Redmine #12155).
 
 This is the application-layer half of the internal CLI module registry. The
-pure classification — :class:`~mozyo_bridge.domain.module_registry.CliFamily`,
-:class:`~mozyo_bridge.domain.module_registry.CliCompositionConfig`, and the
-ordered :class:`~mozyo_bridge.domain.module_registry.BuiltinCliModuleRegistry`
-— lives in :mod:`mozyo_bridge.domain.module_registry` and imports no
+pure classification — :class:`~mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry.CliFamily`,
+:class:`~mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry.CliCompositionConfig`, and the
+ordered :class:`~mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry.BuiltinCliModuleRegistry`
+— lives in :mod:`mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry` and imports no
 application code. This module binds each classified family *name* to the
 built-in registrar callable that adds its subparsers, and composes the parser
 by walking the registry in order.
@@ -41,7 +41,7 @@ from mozyo_bridge.application import (
     cli_state,
     cli_workspace,
 )
-from mozyo_bridge.domain.module_registry import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     BuiltinCliModuleRegistry,
     CliCompositionConfig,
     CliFamily,

@@ -1,7 +1,7 @@
 """Tests for the runtime observation reload surface (Redmine #12224).
 
 Covers the snapshot envelope semantics codified in
-``mozyo_bridge.domain.runtime_observation`` and the ``observe reload`` command
+``mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation`` and the ``observe reload`` command
 handler: freshness derivation, the fail-closed display-state rule (never
 ``healthy`` when stale / unreadable / contradictory), the absence of truth-like
 generic fields, and the non-zero exit on a fail-closed snapshot.
@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from mozyo_bridge.application import commands_runtime_observation as cro
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain import runtime_observation as ro
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
 
 NOW = datetime(2026, 6, 19, 12, 0, 0, tzinfo=timezone.utc)
 

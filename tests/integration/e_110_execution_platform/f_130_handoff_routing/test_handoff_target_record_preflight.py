@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
@@ -161,8 +161,8 @@ class QueueEnterPreflightBindingTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.capture_pane", side_effect=fake_capture), \
             patch("mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux), \
             patch("mozyo_bridge.application.commands.time.sleep"), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
             contextlib.redirect_stderr(io.StringIO()):
             try:

@@ -3,7 +3,7 @@
 This is the presentation analogue of
 :mod:`mozyo_bridge.application.provider_runtime` (Redmine #12249): it connects
 the internal presentation-selection layer
-(:class:`~mozyo_bridge.domain.repo_local_config.PresentationSelectionConfig`,
+(:class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.PresentationSelectionConfig`,
 Redmine #12189) to a real runtime surface — the configured projection *surface*
 is resolved against the built-in presentation providers this build actually
 ships. Before this lane the repo-local config's ``presentation`` selection was
@@ -16,11 +16,11 @@ composition and #12249 provider resolution wiring:
 - the **schema** layer (:meth:`PresentationSelectionConfig.from_record`)
   validates the selection's *shape* — closed keys, a string surface, and
   rejection of any surface outside the core-owned
-  :data:`~mozyo_bridge.domain.presentation_adapter.PRESENTATION_SURFACES`
+  :data:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PRESENTATION_SURFACES`
   vocabulary (an unknown surface, or a target / pane / route / send / approve /
   credential-shaped key, fails closed there);
 - this **runtime** layer resolves that validated surface to the concrete
-  built-in :class:`~mozyo_bridge.domain.presentation_adapter.PresentationProvider`
+  built-in :class:`~mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter.PresentationProvider`
   that owns it, so a present-but-unrealizable selection fails closed at the
   entrypoint rather than passing silently. This is the presentation analogue of
   :meth:`BuiltinProviderRegistry.resolve_selection`.
@@ -59,8 +59,8 @@ from mozyo_bridge.application.text_attention_presentation_provider import (
 from mozyo_bridge.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
 )
-from mozyo_bridge.domain.presentation_adapter import PresentationProvider
-from mozyo_bridge.domain.repo_local_config import PresentationSelectionConfig
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import PresentationProvider
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import PresentationSelectionConfig
 
 
 class PresentationRuntimeError(ValueError):

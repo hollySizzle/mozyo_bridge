@@ -35,7 +35,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.repo_local_config import (  # noqa: E402
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E402
     RepoLocalConfig,
     RepoLocalConfigError,
 )
@@ -63,7 +63,7 @@ class CockpitPresentationPlacementTest(unittest.TestCase):
     def _patched(self, *, columns, ws_id="wsX", load_return=None, load_side_effect=None):
         from mozyo_bridge.application import commands
         from mozyo_bridge.application import repo_local_config_loader
-        from mozyo_bridge.domain.cockpit_layout import (
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
             ADOPT_STATUS_NONE,
             AdoptAdvisory,
             DEFAULT_LANE,

@@ -11,7 +11,7 @@ Pins the placement-resolution side of the cockpit Project Group grouping config:
   column (never a silent reroute) and an unknown mode failing closed.
 
 These exercise the
-:mod:`mozyo_bridge.domain.presentation_grouping.placement` submodule through the
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.placement` submodule through the
 package facade. Schema / validation / authority-guard rejection lives in
 ``test_presentation_grouping_schema``; degraded-condition classification lives
 in ``test_presentation_grouping_degraded``. No tmux, file IO, or CLI here.
@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
     GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
     GROUP_WINDOW_SURFACE_NORMAL_WINDOW,

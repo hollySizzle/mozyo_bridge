@@ -26,7 +26,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_geometry import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
     PEER_ADOPT_CANDIDATE_NOT_IN_COCKPIT,
     PEER_ADOPT_CANDIDATE_NOT_ROLE_LESS,
     PEER_ADOPT_COCKPIT_ABSENT,
@@ -270,7 +270,7 @@ class NoPeerAnchorTest(unittest.TestCase):
         # Build a GeometryUnit that carries neither role's pane for the request:
         # a unit present in `units` but with empty codex/claude tuples cannot arise
         # from the real diagnoser, so we synthesize one to pin the backstop guard.
-        from mozyo_bridge.domain.cockpit_geometry import (
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
             GeometryDiagnosis,
             GeometryUnit,
             PaneGeometry,

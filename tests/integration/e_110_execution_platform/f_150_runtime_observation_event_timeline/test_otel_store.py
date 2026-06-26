@@ -33,7 +33,7 @@ from mozyo_bridge.application.otel_receiver import (
     build_server,
     decode_otlp_json,
 )
-from mozyo_bridge.domain.agent_activity import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import (
     STATE_ACTIVE,
     STATE_IDLE,
     STATE_UNKNOWN,
@@ -781,7 +781,7 @@ class DoctorOtelSectionTest(unittest.TestCase):
             with patch.dict(
                 "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch(
-                "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
                 return_value=panes,
             ):
                 section = doctor_otel_section(argparse.Namespace())

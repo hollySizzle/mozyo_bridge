@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser  # noqa: E402
-from mozyo_bridge.domain.handoff import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E402
     AsanaAnchor,
     RedmineAnchor,
     build_delivery_record,
@@ -227,9 +227,9 @@ class NotifyInactivePaneCharacterizationTest(unittest.TestCase):
         ), patch(
             "mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.validate_target"
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]
         ), contextlib.redirect_stdout(
             io.StringIO()
         ) as stdout, contextlib.redirect_stderr(
@@ -338,9 +338,9 @@ class NotifyInactivePaneCharacterizationTest(unittest.TestCase):
         ), patch(
             "mozyo_bridge.application.commands.time.sleep"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.validate_target"
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]
         ), contextlib.redirect_stdout(io.StringIO()) as stdout:
             result = args.func(args)
 

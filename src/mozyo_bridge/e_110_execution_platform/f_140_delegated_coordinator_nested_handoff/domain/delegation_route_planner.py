@@ -3,7 +3,7 @@
 #12548 (j#64716) found the external-parent delegation path stops at *read-only
 recommendation* — the resolved child candidate (#12549) and the role-profile
 vocabulary (#12388) both exist, but nothing turns a
-:class:`~mozyo_bridge.domain.delegation_project_config.ChildCandidateResolution`
+:class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config.ChildCandidateResolution`
 into a concrete, fail-closed, executable route toward a delegated coordinator and
 (when the work shape needs it) a grandchild implementation lane. This module is
 that missing *plan* layer.
@@ -57,8 +57,8 @@ Enforced invariants:
   targets.
 
 The module is pure (dataclasses + small helpers) and imports only from the
-sibling pure-domain modules :mod:`mozyo_bridge.domain.delegation_project_config`
-and :mod:`mozyo_bridge.domain.role_profile`, so it composes without a cycle.
+sibling pure-domain modules :mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config`
+and :mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile`, so it composes without a cycle.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
-from mozyo_bridge.domain.delegation_project_config import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import (
     CHILD_CANDIDATE_AMBIGUOUS,
     CHILD_CANDIDATE_MISSING,
     STATUS_AMBIGUOUS,
@@ -75,7 +75,7 @@ from mozyo_bridge.domain.delegation_project_config import (
     STATUS_RESOLVED,
     ChildCandidateResolution,
 )
-from mozyo_bridge.domain.role_profile import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,

@@ -43,7 +43,7 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
     frontend consumer can triage owner_waiting / review_waiting / blocked /
     stalled panes from the same data source as ``agents targets --json``, which
     already carries this field (#11952). Shares
-    :func:`~mozyo_bridge.domain.attention.conservative_attention` with that
+    :func:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.conservative_attention` with that
     surface so the two attention projections never drift.
 
     Additive and public-safe: it adds one ``attention`` key per pane, never
@@ -72,11 +72,11 @@ def attach_attention(payload: dict, *, observed_at: str) -> dict:
     role-ambiguity flag here (``agents targets`` carries ``ambiguous``);
     ``unit_id`` is opaque provenance, never a routing key.
     """
-    from mozyo_bridge.domain.agent_discovery import (
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
         CONFIDENCE_NONE,
         ROLE_SOURCE_UNKNOWN,
     )
-    from mozyo_bridge.domain.attention import (
+    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
         ROLE_CLAUDE,
         ROLE_CODEX,
         conservative_attention,
@@ -233,9 +233,9 @@ def observed_units_from_inventory(snapshot, *, observation):
     """
     from dataclasses import replace
 
-    from mozyo_bridge.domain.attention import ROLE_CLAUDE, ROLE_CODEX
-    from mozyo_bridge.domain.grouped_read_model import ObservedUnit
-    from mozyo_bridge.domain.runtime_observation import (
+    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import ROLE_CLAUDE, ROLE_CODEX
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import ObservedUnit
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (
         CONTRADICTION_LIVE_RUNTIME_CONFLICT,
         DISPLAY_STATE_RELOAD_REQUIRED,
     )
@@ -329,8 +329,8 @@ def grouped_units_payload(
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
     )
-    from mozyo_bridge.domain.grouped_display import build_grouped_display_view
-    from mozyo_bridge.domain.grouped_read_model import build_grouped_read_model
+    from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_display import build_grouped_display_view
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import build_grouped_read_model
 
     if now is None:
         now = datetime.now(timezone.utc)

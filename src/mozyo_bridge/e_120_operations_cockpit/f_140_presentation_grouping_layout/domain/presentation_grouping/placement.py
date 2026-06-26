@@ -1,7 +1,7 @@
 """Launch-placement resolution for the desired presentation grouping config.
 
 This module owns the **placement resolution** responsibility: mapping a
-:class:`~mozyo_bridge.domain.presentation_grouping.config.LaunchContext` (plus a
+:class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.config.LaunchContext` (plus a
 parsed config) to a :class:`GroupPlacement`, and a desired
 ``project_group_presentation`` mode (plus that placement) to a
 :class:`GroupWindowDecision`.

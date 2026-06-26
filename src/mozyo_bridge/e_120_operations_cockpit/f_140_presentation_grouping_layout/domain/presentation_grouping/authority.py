@@ -7,7 +7,7 @@ fail closed when an *unknown key* or an *identity / diagnostic value* is shaped
 like one of those boundaries.
 
 It is deliberately separate from the generic shape validators in
-:mod:`mozyo_bridge.domain.presentation_grouping.validation`: those check *types*;
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.validation`: those check *types*;
 this checks *authority boundaries*. Free public display prose (``label`` /
 ``description`` / ``label_override``) is curated author-asserted public-safe and
 is **not** token-scanned here, so a legitimate label such as "Code Review" is

@@ -7,7 +7,7 @@ import re
 import time
 from pathlib import Path
 
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     CONFIDENCE_STRONG,
@@ -15,8 +15,8 @@ from mozyo_bridge.domain.agent_discovery import (
     infer_repo_root,
     resolve_agent_role,
 )
-from mozyo_bridge.domain.cockpit_layout import DEFAULT_LANE
-from mozyo_bridge.infrastructure.tmux_client import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import DEFAULT_LANE
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     pane_lines,
     resolve_pane_id,
     run_tmux,

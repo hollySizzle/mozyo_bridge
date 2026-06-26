@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.otel_receiver import build_server
-from mozyo_bridge.domain.agent_activity import TransitionTracker
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import TransitionTracker
 from mozyo_bridge.session_inventory import take_inventory
 
 
@@ -98,7 +98,7 @@ class CockpitHttpTest(unittest.TestCase):
         # (text/plain, foreign Origin, no preflight) must be rejected at
         # the intent gate (415), NOT answered by the action handler (409).
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=[pane("%1", "mozyo-demo", "claude")],
         ):
             status, payload = self._post(
@@ -114,7 +114,7 @@ class CockpitHttpTest(unittest.TestCase):
 
     def test_action_without_token_is_403(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=[pane("%1", "mozyo-demo", "claude")],
         ):
             status, payload = self._post(
@@ -125,7 +125,7 @@ class CockpitHttpTest(unittest.TestCase):
 
     def test_action_with_foreign_origin_is_403_even_with_token(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=[pane("%1", "mozyo-demo", "claude")],
         ):
             status, payload = self._post(
@@ -147,7 +147,7 @@ class CockpitHttpTest(unittest.TestCase):
             "https://localhost",  # scheme must be http (the served origin)
         ):
             with patch(
-                "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
                 return_value=[pane("%1", "mozyo-demo", "claude")],
             ):
                 status, payload = self._post(
@@ -158,7 +158,7 @@ class CockpitHttpTest(unittest.TestCase):
 
     def test_action_with_loopback_origin_and_token_reaches_handler(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=[pane("%1", "mozyo-demo", "claude")],
         ):
             status, payload = self._post(
@@ -173,7 +173,7 @@ class CockpitHttpTest(unittest.TestCase):
     def test_units_endpoint_returns_inventory_payload(self) -> None:
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             status, body = self._get("/api/units")
@@ -190,7 +190,7 @@ class CockpitHttpTest(unittest.TestCase):
         # as an additive fourth layer that never disturbs the existing ones.
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             status, body = self._get("/api/units")
@@ -217,12 +217,12 @@ class CockpitHttpTest(unittest.TestCase):
         # attention must read unknown, not healthy, at the /api/units boundary.
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             self._get("/api/units")  # seed the cache from a live snapshot
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,  # tmux unavailable -> stale cache snapshot
         ):
             status, body = self._get("/api/units")
@@ -239,11 +239,11 @@ class CockpitHttpTest(unittest.TestCase):
         # the runtime observation snapshot freshness (observed_at / source /
         # method / freshness / readability / display_state) for the displayed
         # snapshot. A live snapshot is fresh + readable + healthy.
-        from mozyo_bridge.domain import runtime_observation as ro
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
 
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             status, body = self._get("/api/units")
@@ -280,16 +280,16 @@ class CockpitHttpTest(unittest.TestCase):
         # for a cache projection), the visible "this is cached" label stays in
         # the snapshot, and no truth-like field appears
         # (runtime-observability-boundary.md fail-safe semantics).
-        from mozyo_bridge.domain import runtime_observation as ro
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
 
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             self._get("/api/units")  # seed the cache from a live snapshot
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,  # tmux unavailable -> stale cache snapshot
         ):
             status, body = self._get("/api/units")
@@ -310,7 +310,7 @@ class CockpitHttpTest(unittest.TestCase):
 
         panes = [pane("%1", "mozyo-demo", "claude")]
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=panes,
         ):
             self._get("/api/units")
@@ -343,7 +343,7 @@ class CockpitHttpTest(unittest.TestCase):
 
     def test_action_with_unknown_pane_is_409_with_refresh_hint(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=[pane("%1", "mozyo-demo", "claude")],
         ):
             status, payload = self._post(
@@ -354,7 +354,7 @@ class CockpitHttpTest(unittest.TestCase):
 
     def test_action_on_stale_snapshot_is_409(self) -> None:
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
             return_value=None,
         ):
             status, payload = self._post(

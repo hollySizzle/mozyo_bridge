@@ -126,9 +126,9 @@ class RuntimeBoundaryNotReroutedTest(unittest.TestCase):
         # event log nor the marker module.
         forbidden = ("managed_events", "managed_marker")
         for module in (
-            "src/mozyo_bridge/domain/pane_resolver.py",
-            "src/mozyo_bridge/domain/agent_discovery.py",
-            "src/mozyo_bridge/domain/handoff.py",
+            "src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/pane_resolver.py",
+            "src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py",
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py",
             "src/mozyo_bridge/session_inventory.py",
         ):
             text = (ROOT / module).read_text(encoding="utf-8")
@@ -146,7 +146,7 @@ class RuntimeBoundaryNotReroutedTest(unittest.TestCase):
         # (CI has no live "%5" pane); we are only removing the live-tmux call,
         # not substituting an event-log source — the assertion below still
         # proves pane_info reads the patched pane_lines() snapshot.
-        from mozyo_bridge.domain import pane_resolver
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver
 
         panes = [
             {
@@ -159,9 +159,9 @@ class RuntimeBoundaryNotReroutedTest(unittest.TestCase):
             }
         ]
         with patch(
-            "mozyo_bridge.domain.pane_resolver.validate_target"
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
         ), patch(
-            "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes
         ):
             info = pane_resolver.pane_info("%5")
         self.assertEqual("%5", info["id"])

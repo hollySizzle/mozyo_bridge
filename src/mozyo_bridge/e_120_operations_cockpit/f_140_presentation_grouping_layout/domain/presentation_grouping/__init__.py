@@ -11,7 +11,7 @@ which Project Group a launching sublane is displayed under, from its
 workspace / project / lane context.
 
 It is the grouping analogue of
-:class:`~mozyo_bridge.domain.repo_local_config.PresentationSelectionConfig`
+:class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.PresentationSelectionConfig`
 (Redmine #12189), which selects a projection *surface*. Grouping is a separate
 concern — *which display group a Unit belongs to* — so it is its own typed
 record here rather than folded into the surface-selection record.
@@ -57,7 +57,7 @@ package's schema rather than the reverse.
 The package is pure (dataclasses + validation helpers) and imports nothing from
 the application layer, so the dependency only ever points within the domain.
 This module re-exports the full public surface so existing
-``from mozyo_bridge.domain.presentation_grouping import ...`` imports are
+``from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import ...`` imports are
 unchanged by the split.
 """
 

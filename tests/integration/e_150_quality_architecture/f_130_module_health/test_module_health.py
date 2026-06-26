@@ -21,7 +21,7 @@ import sys
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
-from mozyo_bridge.domain.module_health import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_health import (
     AllowlistEntry,
     DEFAULT_MAX_MODULE_LINES,
     KIND_BASELINE_BELOW_THRESHOLD,

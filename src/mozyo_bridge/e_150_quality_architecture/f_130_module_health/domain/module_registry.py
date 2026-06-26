@@ -1,7 +1,7 @@
 """Internal-only built-in CLI module registry skeleton (Redmine #12155).
 
 This is the parser-composition analogue of the built-in *provider* registry
-(:mod:`mozyo_bridge.domain.provider_registry`, Redmine #12035). Where that
+(:mod:`mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry`, Redmine #12035). Where that
 module classifies the built-in adapter providers, this one classifies the
 built-in **CLI command family modules** the codebase already ships — the
 families the feature-family parser split produced (Redmine #12153 / #12154):

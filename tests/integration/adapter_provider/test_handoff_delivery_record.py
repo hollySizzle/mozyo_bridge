@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-import mozyo_bridge.domain.pane_resolver as pane_resolver
-from mozyo_bridge.domain.handoff import (
+import mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver as pane_resolver
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODE_PENDING,
     MODE_STANDARD,
     build_delivery_record,
@@ -498,8 +498,8 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 "mozyo_bridge.application.commands.current_session_name",
                 return_value=None,
             ), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane_value]), \
             contextlib.redirect_stdout(io.StringIO()) as stdout, \
             contextlib.redirect_stderr(io.StringIO()):
             try:

@@ -9,10 +9,10 @@ the recorded seed provenance.
 Both handlers are thin: the schema boundary, the idempotent / non-destructive
 seed, and the read-model semantics live in
 :mod:`mozyo_bridge.presentation_state` (and the config schema in
-:mod:`mozyo_bridge.domain.repo_local_config`). These handlers only resolve the
+:mod:`mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config`). These handlers only resolve the
 repo / home, call the store, and render text or JSON. Following the project's
 fail-closed CLI convention (``doctor`` / ``observe reload``): a
-:class:`mozyo_bridge.domain.repo_local_config.RepoLocalConfigError` is printed
+:class:`mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.RepoLocalConfigError` is printed
 and the process exits non-zero, never a bare traceback.
 """
 
@@ -37,11 +37,11 @@ def cmd_presentation_seed(args: argparse.Namespace) -> int:
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
     )
-    from mozyo_bridge.domain.repo_local_config import (
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
         REPO_LOCAL_CONFIG_VERSION,
         RepoLocalConfigError,
     )
-    from mozyo_bridge.domain.presentation_grouping import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
         PRESENTATION_GROUPING_VERSION,
     )
     from mozyo_bridge.presentation_state import (

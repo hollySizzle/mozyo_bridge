@@ -5,7 +5,7 @@ for the delegated coordinator -> grandchild implementation lane route (depth 2).
 It is **read-only and never sends**: it resolves the delegation policy gate and a
 deterministic fail-closed launch/adopt decision over ``agents targets``
 discovery with
-:func:`mozyo_bridge.domain.grandchild_dispatch.resolve_grandchild_dispatch`, and
+:func:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch.resolve_grandchild_dispatch`, and
 emits
 
 - the decision (policy gate / outcome / reason / matched candidate summary),
@@ -40,7 +40,7 @@ import json
 import shlex
 from typing import Optional
 
-from mozyo_bridge.domain.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (
     CallbackTarget,
     DelegationCandidate,
     DelegationLaunchAdoptError,
@@ -48,7 +48,7 @@ from mozyo_bridge.domain.delegation_launch_adopt import (
     PURPOSE_DELEGATION_PARENT,
     PURPOSE_OWNING_US_COORDINATOR,
 )
-from mozyo_bridge.domain.grandchild_dispatch import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import (
     DelegationPolicy,
     GrandchildDispatchDecision,
     OUTCOME_FAIL_CLOSED,
@@ -424,7 +424,7 @@ def cmd_handoff_grandchild_dispatch(args: argparse.Namespace) -> int:
         recommended = None
     else:
         from mozyo_bridge.application.commands import _agents_target_candidates
-        from mozyo_bridge.infrastructure.tmux_client import require_tmux
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux
 
         require_tmux()
         targets = _agents_target_candidates(args)

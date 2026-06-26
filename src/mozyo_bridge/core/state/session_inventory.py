@@ -49,14 +49,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     CONFIDENCE_NONE,
     PaneView,
     ROLE_SOURCE_UNKNOWN,
     discover_agents,
     fold_agents_by_pane,
 )
-from mozyo_bridge.domain.session_naming import (
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
     SOURCE_REPO_FALLBACK,
     derive_session_name,
     derive_session_name_without_defaults,
@@ -569,7 +569,7 @@ def attach_activity(
     from dataclasses import replace
 
     from mozyo_bridge.core.state.otel_store import OtelEventStore
-    from mozyo_bridge.domain.agent_activity import summarize_activity
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import summarize_activity
 
     # Multiple OTel sources can legitimately share one join key: the agent
     # CLI mints a new session.id on every restart while the tmux pane (and
@@ -647,7 +647,7 @@ def take_inventory(
     is returned — the caller decides how loudly to surface that.
     """
     if panes is None:
-        from mozyo_bridge.infrastructure.tmux_client import try_pane_lines
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import try_pane_lines
 
         panes = try_pane_lines()
     if panes is not None:

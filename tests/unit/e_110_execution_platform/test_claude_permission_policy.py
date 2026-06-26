@@ -25,7 +25,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.claude_permission_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODE_ENV,
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,

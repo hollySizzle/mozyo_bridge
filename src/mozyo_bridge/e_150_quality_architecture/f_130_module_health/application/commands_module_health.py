@@ -7,10 +7,10 @@ when a new oversized module appears or an allowlisted module grows past its
 recorded baseline.
 
 The handlers are thin: all measurement and gate logic lives in the pure
-:mod:`mozyo_bridge.domain.module_health`; these handlers resolve the repo root
+:mod:`mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_health`; these handlers resolve the repo root
 and config path, call the core, and render text or JSON — failing closed
 (non-zero exit, no bare traceback) on a
-:class:`~mozyo_bridge.domain.module_health.ModuleHealthError`, matching the
+:class:`~mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_health.ModuleHealthError`, matching the
 ``state`` / ``doctor`` CLI convention.
 """
 
@@ -20,7 +20,7 @@ import argparse
 import json as _json
 import sys
 
-from mozyo_bridge.domain.module_health import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_health import (
     GateResult,
     ModuleHealthError,
     default_config_path,

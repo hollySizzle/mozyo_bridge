@@ -16,14 +16,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import CockpitWorkspace
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import CockpitWorkspace
 
 
 class PlannerLaneStampingTest(unittest.TestCase):
     """Lane id / label ride on tmux pane options (Redmine #11820)."""
 
     def test_lane_id_and_label_stamped_when_present(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import build_cockpit_plan
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import build_cockpit_plan
 
         ws = CockpitWorkspace(
             "wsX", "alpha", "/a", lane_id="lane-abc", lane_label="feature/x"
@@ -51,7 +51,7 @@ class PlannerLaneStampingTest(unittest.TestCase):
         self.assertTrue(all("wsX" in c.argv for c in ws_opts))
 
     def test_default_lane_stamped_and_no_label_when_absent(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import build_cockpit_plan
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import build_cockpit_plan
 
         plan = build_cockpit_plan([CockpitWorkspace("wsX", "alpha", "/a")])
         lane_opts = [
@@ -68,7 +68,7 @@ class PlannerLaneStampingTest(unittest.TestCase):
         self.assertEqual([], label_opts)
 
     def test_append_plan_stamps_lane(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import build_cockpit_append_plan
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import build_cockpit_append_plan
 
         ws = CockpitWorkspace(
             "wsB", "sessB", "/repoB", lane_id="lane-xyz", lane_label="wt"
@@ -86,7 +86,7 @@ class LaneIdentityTest(unittest.TestCase):
     """Pure lane derivation (Redmine #11820)."""
 
     def test_primary_checkout_is_default_lane(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import (
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
             DEFAULT_LANE,
             resolve_lane_identity,
         )
@@ -103,7 +103,7 @@ class LaneIdentityTest(unittest.TestCase):
         self.assertEqual("main", lane.lane_label)
 
     def test_non_git_workspace_is_default_lane(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import (
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
             DEFAULT_LANE,
             resolve_lane_identity,
         )
@@ -113,7 +113,7 @@ class LaneIdentityTest(unittest.TestCase):
         self.assertIsNone(lane.lane_label)
 
     def test_linked_worktree_is_distinct_lane(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import resolve_lane_identity
 
         lane = resolve_lane_identity(
             repo_root="/work/repo-feature",
@@ -128,7 +128,7 @@ class LaneIdentityTest(unittest.TestCase):
     def test_relocated_clone_sharing_workspace_id_is_distinct_lane(self) -> None:
         # A clone copied the tracked workspace.json (same workspace_id) but lives
         # at a different path with its own .git (git_dir == git_common_dir).
-        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import resolve_lane_identity
 
         lane = resolve_lane_identity(
             repo_root="/work/repo-clone",
@@ -140,7 +140,7 @@ class LaneIdentityTest(unittest.TestCase):
         self.assertTrue(lane.lane_id.startswith("lane-"))
 
     def test_lane_id_is_deterministic_and_carries_no_raw_path(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import resolve_lane_identity
 
         kwargs = dict(
             repo_root="/work/repo-feature",
@@ -156,7 +156,7 @@ class LaneIdentityTest(unittest.TestCase):
         self.assertNotIn("repo-feature", a.lane_id)
 
     def test_distinct_checkouts_get_distinct_lane_ids(self) -> None:
-        from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import resolve_lane_identity
 
         a = resolve_lane_identity(
             repo_root="/work/wt-a",

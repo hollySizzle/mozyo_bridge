@@ -1,7 +1,7 @@
 """Live, credential-safe Redmine journal-write transport (Redmine #12347).
 
 The delivery-record persistence seam (Redmine #12311) defined the narrow
-:class:`~mozyo_bridge.domain.delivery_record_sink.RedmineNoteTransport` write
+:class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.RedmineNoteTransport` write
 seam in core but deliberately left the live transport unwired: ticket-write is a
 per-task-review surface (``vibes/docs/logics/plugin-ready-adapter-boundary.md``
 Implementation Guardrail #6), and ``redmine_context`` is read-only by design, so
@@ -14,7 +14,7 @@ What core still owns (this module never touches): the record class
 owner approval), source semantics (a Redmine note is a journal note, never an
 Asana comment), and the secret / private-data rule. This module only performs
 the provider-owned network write through the protocol seam; the sink
-(:class:`~mozyo_bridge.domain.delivery_record_sink.RedmineDeliveryRecordSink`)
+(:class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.RedmineDeliveryRecordSink`)
 owns source/anchor validation and receipt shaping.
 
 Credential boundary (reused verbatim from ``redmine_context``, review #56232):
@@ -40,7 +40,7 @@ same trusted boundary as the credentials, so a hostile checkout can never turn a
 plain ``--persist-delivery`` into a live write.
 
 Fail-closed reasons (all normalized to
-:data:`~mozyo_bridge.domain.delivery_record_sink.PERSIST_FAILURE_REASONS`):
+:data:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.PERSIST_FAILURE_REASONS`):
 
 - no/invalid trusted base URL -> ``provider_unavailable``;
 - no API key -> ``credential_missing``;
@@ -61,7 +61,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-from mozyo_bridge.domain.delivery_record_sink import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     PERSIST_CREDENTIAL_MISSING,
     PERSIST_PROVIDER_UNAVAILABLE,
     PERSIST_TRANSPORT_ERROR,

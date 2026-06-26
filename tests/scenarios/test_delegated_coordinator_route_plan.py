@@ -2,7 +2,7 @@
 
 Parent Feature #12531 ``120_シナリオ・受入テスト基盤``. These classical
 (Detroit-school) scenarios drive the **real** pure planner
-(:func:`~mozyo_bridge.domain.delegated_coordinator_route_plan.plan_delegated_coordinator_route`)
+(:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan.plan_delegated_coordinator_route`)
 end to end — composing the real grandchild dispatch decision, launch/adopt
 selector, realization gate, read-boundary classifier, and role-profile chain —
 and fake only the side-effecting boundary (the executor in
@@ -38,7 +38,7 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from mozyo_bridge.domain.delegated_coordinator_route_plan import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan import (  # noqa: E402
     DEFAULT_ROLE_PROFILE_CHAIN,
     PLAN_BLOCKED,
     PLAN_PROCEED,
@@ -53,16 +53,16 @@ from mozyo_bridge.domain.delegated_coordinator_route_plan import (  # noqa: E402
     RoutePlanError,
     plan_delegated_coordinator_route,
 )
-from mozyo_bridge.domain.delegation_launch_adopt import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (  # noqa: E402
     LAUNCH_ADOPT_MODE_ADOPT_EXISTING,
     REASON_AMBIGUOUS_CANDIDATES,
 )
-from mozyo_bridge.domain.grandchild_dispatch import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_dispatch import (  # noqa: E402
     REASON_MASTER_GATE_DISABLED,
     DelegationPolicy,
 )
-from mozyo_bridge.domain.grandchild_stamp import GATE_BLOCKED, GATE_REALIZED  # noqa: E402
-from mozyo_bridge.domain.role_profile import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GATE_BLOCKED, GATE_REALIZED  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E402
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,

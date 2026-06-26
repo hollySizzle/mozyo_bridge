@@ -15,13 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     RedmineAnchor,
     build_delivery_record,
     build_notification_body,
     make_outcome,
 )
-from mozyo_bridge.domain.role_profile import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     ROLE_PROFILE_SOURCE,
     ROLE_PROFILE_TOKENS,
     ROLE_PROFILE_VERSION,

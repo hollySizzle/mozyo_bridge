@@ -14,7 +14,7 @@ from mozyo_bridge.application.commands_common import (
     repo_root_from_args,
     scaffold_target_from_args,
 )
-from mozyo_bridge.domain.agent_discovery import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KINDS,
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
@@ -26,12 +26,12 @@ from mozyo_bridge.domain.agent_discovery import (
     infer_repo_root,
     project_preflight_target,
 )
-from mozyo_bridge.domain.claude_permission_policy import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,
     permission_mode_flag,
 )
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     AnchorError,
     KIND_LABELS,
@@ -59,17 +59,17 @@ from mozyo_bridge.domain.handoff import (
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
 )
-from mozyo_bridge.domain.role_profile import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileError,
     parse_profile_fields,
     resolve_role_profile,
 )
-from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
     resolve_canonical_session,
 )
-from mozyo_bridge.domain.pane_resolver import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     AGENT_COMMANDS,
     AGENT_LABELS,
     clear_read,
@@ -85,8 +85,8 @@ from mozyo_bridge.domain.pane_resolver import (
     require_read,
     resolve_target,
 )
-from mozyo_bridge.infrastructure.queue_reader import find_handoff_task
-from mozyo_bridge.infrastructure.tmux_client import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.queue_reader import find_handoff_task
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     capture_pane,
     pane_lines,
     pane_location,
@@ -180,7 +180,7 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     working. Single tmux server assumed; a multi-server deployment would
     key on ``(socket, pane_id)``.
     """
-    from mozyo_bridge.domain.agent_discovery import fold_agents_by_pane
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
 
     require_tmux()
     agent_filter = getattr(args, "agent", None)
@@ -243,14 +243,14 @@ def _attention_for_candidate(candidate, observed_at: str):
     extraction tasks feed real durable / observed signals into the same pure
     :func:`derive_attention`; this stays an additive projection and is never used
     for routing / target selection. Delegates to the shared
-    :func:`~mozyo_bridge.domain.attention.conservative_attention` so this and the
+    :func:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.conservative_attention` so this and the
     cockpit ``/api/units`` join (#12007) cannot drift.
     """
-    from mozyo_bridge.domain.agent_discovery import (
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
         CONFIDENCE_NONE,
         ROLE_SOURCE_UNKNOWN,
     )
-    from mozyo_bridge.domain.attention import (
+    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
         ROLE_CLAUDE,
         ROLE_CODEX,
         conservative_attention,
@@ -282,7 +282,7 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
     registry-resolved workspace identity and a tolerant branch probe; validates
     ``--agent`` and applies ``--session`` / ``--agent`` filters.
     """
-    from mozyo_bridge.domain.agent_discovery import fold_agents_by_pane
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
 
     agent_filter = getattr(args, "agent", None)
     if agent_filter is not None and agent_filter not in AGENT_KINDS:
@@ -467,7 +467,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     # candidates because depth / root are a function of the whole parent chain;
     # display-only and never a routing key. JSON gains a `delegation` record per
     # target, text appends KIND / DEPTH / PARENT columns.
-    from mozyo_bridge.domain.delegation_display import (
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import (
         delegation_cells,
         derive_targets_delegation,
     )
@@ -483,7 +483,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     # to the documented default (`separate`) and never blocks this read-only
     # table, and the resolved fields are never folded into the canonical
     # `TargetRecord` routing projection (`to_dict`).
-    from mozyo_bridge.domain.presentation_grouping import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
         DEFAULT_DELEGATION_WINDOW_POLICY,
         resolve_delegation_window_display,
     )
@@ -1006,7 +1006,7 @@ def _record_managed_pane_created(
     registration.
     """
     try:
-        from mozyo_bridge.domain.managed_marker import mark_target
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.managed_marker import mark_target
         from mozyo_bridge.managed_events import (
             KIND_CREATED,
             record_managed_event,
@@ -1311,7 +1311,7 @@ def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
     mozyo workspaces are discovered from the live session inventory — one column
     per distinct workspace that currently carries a codex/claude agent pane.
     """
-    from mozyo_bridge.domain.cockpit_layout import CockpitWorkspace, normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import CockpitWorkspace, normalize_lane
 
     repos = getattr(args, "layout_repos", None)
     out: list = []
@@ -1600,7 +1600,7 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
     """
     import shlex as _shlex
 
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         COCKPIT_SESSION_DEFAULT,
         build_cockpit_plan,
     )
@@ -1710,7 +1710,7 @@ def _read_cockpit_columns(session: str, window: str | None = None):
     geometry (Redmine #11849) lets append pick the visually rightmost column
     instead of trusting list-panes order.
     """
-    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
 
     target_window = COCKPIT_WINDOW if window is None else window
     # A window id (`@N`) is unique across the whole tmux server, so it targets the
@@ -1785,7 +1785,7 @@ def _read_managed_cockpit_windows(session: str):
     `--dry-run` / `--json` stay non-mutating. A window whose pane read fails or
     carries no managed pane is simply omitted.
     """
-    from mozyo_bridge.domain.cockpit_layout import GROUP_WINDOW_OPTION
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import GROUP_WINDOW_OPTION
 
     try:
         result = run_tmux(
@@ -1842,7 +1842,7 @@ def _read_cockpit_geometry(session: str):
     window, degrade to ``None`` (no cockpit) rather than raising, so the diagnostic
     never mutates and never aborts.
     """
-    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
 
     def _as_int(value: str) -> int:
         try:
@@ -2077,7 +2077,7 @@ def _resolve_workspace_lane(repo_root: str, workspace_id):
     :func:`resolve_lane_identity`. Returns the backward-compatible ``default``
     lane for the primary checkout / a non-git workspace.
     """
-    from mozyo_bridge.domain.cockpit_layout import resolve_lane_identity
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import resolve_lane_identity
 
     facts = _probe_checkout_facts(repo_root)
     return resolve_lane_identity(
@@ -2101,7 +2101,7 @@ def _coexisting_normal_observations(cockpit_session: str):
     looks like an adopt source. Any failure (no tmux, inventory error) degrades
     to ``[]`` so the advisory can never break the cockpit flow.
     """
-    from mozyo_bridge.domain.cockpit_layout import NormalSessionObservation
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import NormalSessionObservation
 
     try:
         from mozyo_bridge.session_inventory import take_inventory
@@ -2160,7 +2160,7 @@ def _cockpit_adopt_advisory(workspace, cockpit_session: str):
     an :class:`AdoptAdvisory` (a benign ``none`` advisory when nothing is found
     or the inventory is unavailable).
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         AdoptAdvisory,
         ADOPT_STATUS_NONE,
         detect_adopt_candidates,
@@ -2195,7 +2195,7 @@ def _resolve_cockpit_adopt(
     no cockpit yet / attached client / no anchor) yields a ``blocked_reason`` and
     ``plan is None`` — the move is never planned past a closed gate.
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         ADOPT_STATUS_CANDIDATE,
         adopt_pane_pair,
         build_cockpit_adopt_plan,
@@ -2276,7 +2276,7 @@ def _handle_cockpit_adopt(
     import json as _json
     import shlex as _shlex
 
-    from mozyo_bridge.domain.cockpit_layout import normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import normalize_lane
 
     confirm = bool(getattr(args, "confirm", False))
     json_output = bool(getattr(args, "json_output", False))
@@ -2378,7 +2378,7 @@ def _assess_cockpit_reset(session, *, columns, session_present):
     is fail-closed (unknown client state), never silently "no client attached"
     (Redmine #11814 review j#57928).
     """
-    from mozyo_bridge.domain.cockpit_layout import assess_cockpit_reset
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import assess_cockpit_reset
 
     if session_present:
         clients, clients_known = _session_attached_clients_result(session)
@@ -2403,7 +2403,7 @@ def _cockpit_extra_windows(target):
     the window names other than the `cockpit` home window so reset can make that
     multi-window destruction visible before the confirm-gated kill (Unit 5).
     """
-    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
 
     return [w for w in target.windows if w and w != COCKPIT_WINDOW]
 
@@ -2449,7 +2449,7 @@ def _handle_cockpit_reset(
     import json as _json
     import shlex as _shlex
 
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         build_cockpit_plan,
         build_cockpit_reset_plan,
         normalize_lane,
@@ -2593,7 +2593,7 @@ def _handle_cockpit_doctor_geometry(session: str, *, json_output: bool) -> int:
     """
     import json as _json
 
-    from mozyo_bridge.domain.cockpit_geometry import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
         diagnose_cockpit_geometry,
         format_geometry_text,
     )
@@ -2618,7 +2618,7 @@ def _cockpit_unit_repo_root(session: str, *pane_ids: str) -> str:
     pane cwd is readable (the caller then falls back to the registry path).
     Tolerant: any tmux failure degrades to ``""``.
     """
-    from mozyo_bridge.domain.agent_discovery import infer_repo_root
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
     for pane_id in pane_ids:
         if not pane_id:
@@ -2638,19 +2638,19 @@ def _membership_observations_from_windows(managed_windows, session: str):
 
     Reshapes the :func:`_read_managed_cockpit_windows` output (a list of windows,
     each with its `columns`) into one
-    :class:`mozyo_bridge.domain.cockpit_membership.MembershipObservation` per
+    :class:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership.MembershipObservation` per
     ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes
     and resolving each Unit's live checkout root from its pane cwd (so a worktree /
     lane reports its own path, not the registry canonical — review j#62643).
     Role-less columns (no ``workspace_id``) are skipped here — they surface as a
     cockpit-wide warning from the geometry diagnosis instead.
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         ROLE_CLAUDE,
         ROLE_CODEX,
         normalize_lane,
     )
-    from mozyo_bridge.domain.cockpit_membership import MembershipObservation
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import MembershipObservation
 
     observations = []
     for window in managed_windows or []:
@@ -2699,7 +2699,7 @@ def _resolve_registry_facts(workspace_id: str):
     (label falls back to the id, repo root empty) rather than raising, so the
     membership view never aborts on a thin identity record.
     """
-    from mozyo_bridge.domain.cockpit_membership import RegistryFacts
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import RegistryFacts
     from mozyo_bridge.workspace_registry import load_workspace_by_id, read_anchor
 
     try:
@@ -2730,12 +2730,12 @@ def _collect_cockpit_membership(session: str):
     Group windows) for the loaded Units, runs the existing read-only geometry
     diagnosis on the `cockpit` window for drift findings, resolves each Unit's
     registry / anchor facts, and hands them all to the pure
-    :func:`mozyo_bridge.domain.cockpit_membership.project_membership_report`. All
+    :func:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership.project_membership_report`. All
     reads are tolerant: a missing tmux / cockpit degrades to an empty report, so
     `cockpit list` / `status` never abort.
     """
-    from mozyo_bridge.domain.cockpit_geometry import diagnose_cockpit_geometry
-    from mozyo_bridge.domain.cockpit_membership import project_membership_report
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import diagnose_cockpit_geometry
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import project_membership_report
 
     managed = _read_managed_cockpit_windows(session)
     geometry = diagnose_cockpit_geometry(
@@ -2770,7 +2770,7 @@ def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
     """
     import json as _json
 
-    from mozyo_bridge.domain.cockpit_membership import format_membership_text
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import format_membership_text
 
     report = _collect_cockpit_membership(session)
     if json_output:
@@ -2797,9 +2797,9 @@ def _handle_cockpit_status(
     import dataclasses as _dataclasses
     import json as _json
 
-    from mozyo_bridge.domain.agent_discovery import infer_repo_root
-    from mozyo_bridge.domain.cockpit_layout import normalize_lane
-    from mozyo_bridge.domain.cockpit_membership import (
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
         CockpitMembershipReport,
         absent_membership,
         format_membership_text,
@@ -2877,11 +2877,11 @@ def _status_repo_cockpit_membership(args: argparse.Namespace):
     cockpit membership explicitly. Tolerant: any resolution / tmux failure degrades
     to ``None`` (the caller simply omits the line) so `status` never aborts on it.
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         COCKPIT_SESSION_DEFAULT,
         normalize_lane,
     )
-    from mozyo_bridge.domain.cockpit_membership import absent_membership
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import absent_membership
 
     try:
         repo = getattr(args, "repo", None) or os.getcwd()
@@ -2901,7 +2901,7 @@ def _status_repo_cockpit_membership(args: argparse.Namespace):
             None,
         )
         if match is None:
-            from mozyo_bridge.domain.agent_discovery import infer_repo_root
+            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
             facts = _resolve_registry_facts(workspace_id)
             label = facts.label if facts.registry_present else canon.name
@@ -2963,8 +2963,8 @@ def _resolve_peer_adopt_candidate(session: str, pane_id: str):
     absolute path (privacy boundary). Tolerant: an unresolvable cwd yields empty
     ids ("unknown", not a contradiction).
     """
-    from mozyo_bridge.domain.cockpit_geometry import PeerAdoptCandidate
-    from mozyo_bridge.domain.cockpit_layout import ROLES, normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import PeerAdoptCandidate
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLES, normalize_lane
 
     runtime = _read_cockpit_pane_runtime(session, pane_id)
     cwd = (runtime.get("cwd") or "").strip()
@@ -3001,8 +3001,8 @@ def _resolve_peer_adopt_target(session: str, diagnosis, workspace_id: str, lane_
     display label defaults to the workspace id. When the Unit / peer cannot be
     found the planner blocks anyway, so missing metadata is harmless.
     """
-    from mozyo_bridge.domain.cockpit_geometry import PeerAdoptTarget
-    from mozyo_bridge.domain.cockpit_layout import ROLE_CLAUDE, normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import PeerAdoptTarget
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLE_CLAUDE, normalize_lane
 
     target_lane = normalize_lane(lane_id)
     lane_label = None
@@ -3046,12 +3046,12 @@ def _handle_cockpit_peer_adopt(
     """
     import json as _json
 
-    from mozyo_bridge.domain.cockpit_geometry import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
         diagnose_cockpit_geometry,
         format_peer_adopt_text,
         plan_peer_adopt,
     )
-    from mozyo_bridge.domain.cockpit_layout import normalize_lane
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import normalize_lane
 
     pane_id = getattr(args, "peer_pane", None)
     unit_arg = getattr(args, "peer_unit", None)
@@ -3133,7 +3133,7 @@ def _read_cockpit_window_layout(session: str):
     missing tmux binary / server / window degrades to ``None`` rather than
     raising, so the preview never mutates and never aborts.
     """
-    from mozyo_bridge.domain.cockpit_layout import COCKPIT_WINDOW
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
 
     try:
         result = run_tmux(
@@ -3160,7 +3160,7 @@ def _cockpit_rebalance_columns(session: str):
     ``columns`` is the :func:`top_level_columns` projection of the parsed
     ``window_layout`` otherwise.
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         parse_window_layout,
         top_level_columns,
     )
@@ -3191,7 +3191,7 @@ def _handle_cockpit_rebalance(
     import json as _json
     import shlex as _shlex
 
-    from mozyo_bridge.domain.cockpit_layout import build_cockpit_rebalance_plan
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import build_cockpit_rebalance_plan
 
     present, columns = _cockpit_rebalance_columns(session)
     plan = build_cockpit_rebalance_plan(columns, session=session)
@@ -3319,7 +3319,7 @@ def _handle_cockpit_reconcile(
     import json as _json
     import shlex as _shlex
 
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         build_cockpit_reconcile_plan,
         parse_window_layout,
     )
@@ -3486,7 +3486,7 @@ def _cockpit_group_window_action(
     Pure-ish: it reads live tmux (multi-window discovery) but mutates nothing; the
     returned plan is executed (with rollback) only on a real run.
     """
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         build_cockpit_append_plan,
         build_group_window_create_plan,
         build_group_window_focus_plan,
@@ -3580,7 +3580,7 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
     )
-    from mozyo_bridge.domain.cockpit_layout import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
         COCKPIT_SESSION_DEFAULT,
         CockpitWorkspace,
         build_cockpit_append_plan,
@@ -3588,13 +3588,13 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         build_cockpit_plan,
         normalize_lane,
     )
-    from mozyo_bridge.domain.presentation_grouping import (
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
         GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
         LaunchContext,
         resolve_group_window_placement,
         resolve_launch_placement,
     )
-    from mozyo_bridge.domain.repo_local_config import RepoLocalConfigError
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import RepoLocalConfigError
 
     session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
     codex_ratio = int(getattr(args, "codex_ratio", 70) or 70)
@@ -4123,7 +4123,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     # missing" note above to be mis-read as "not in the cockpit either" (#12339).
     membership = _status_repo_cockpit_membership(args)
     if membership is not None:
-        from mozyo_bridge.domain.cockpit_layout import COCKPIT_SESSION_DEFAULT
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_SESSION_DEFAULT
 
         if membership.member:
             print(
@@ -4404,14 +4404,14 @@ def _maybe_persist_delivery_record(
     """
     if not getattr(args, "persist_delivery", False):
         return
-    from mozyo_bridge.domain.delivery_record_sink import (
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
         DeliveryReceipt,
         PERSIST_TRANSPORT_ERROR,
         build_delivery_record_note,
         resolve_delivery_record_sink,
     )
-    from mozyo_bridge.domain.handoff import SOURCE_REDMINE
-    from mozyo_bridge.infrastructure.redmine_note_transport import (
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import SOURCE_REDMINE
+    from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
         redmine_delivery_transport_from_env,
     )
 
@@ -4473,7 +4473,7 @@ def _window_active_pane_id(target_info: dict) -> str | None:
     window_prefix = location.rsplit(".", 1)[0] if "." in location else location
     if not window_prefix:
         return None
-    from mozyo_bridge.domain import pane_resolver as _pr
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
 
     try:
         for pane in _pr.pane_lines():
@@ -4524,7 +4524,7 @@ def orchestrate_handoff(
     Durable delivery-record persistence is an explicit, opt-in seam (Redmine
     #12311): with ``--persist-delivery`` the typed terminal paths
     (``pending_input`` / ``sent``) hand the redacted record to a fail-closed
-    ticket sink (:mod:`mozyo_bridge.domain.delivery_record_sink`) via
+    ticket sink (:mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink`) via
     :func:`_maybe_persist_delivery_record`. It is best-effort and never alters
     the send. The live Redmine journal-write transport remains a credential-gated
     follow-up under per-task review (``redmine_context`` is read-only by design),
@@ -4669,11 +4669,11 @@ def orchestrate_handoff(
                 and not target_arg.startswith("%")
                 and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
             ):
-                from mozyo_bridge.domain import pane_resolver as _pr
-                from mozyo_bridge.domain.agent_discovery import (
+                from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
+                from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
                     codex_gateway_candidates,
                 )
-                from mozyo_bridge.domain.handoff import (
+                from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
                     target_unavailable_codex_diagnostic,
                 )
 
@@ -4707,7 +4707,7 @@ def orchestrate_handoff(
     # documented escape hatch, and queue-enter's Step 11 active-split gate
     # already fail-closes the inactive duplicate). A snapshot read failure must
     # not change delivery, so swallow any error.
-    from mozyo_bridge.domain import pane_resolver as _pr
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
 
     duplicate_lane_panes: list[str] = []
     try:
@@ -4968,11 +4968,11 @@ def orchestrate_handoff(
         # and the cross-session `--to claude` block itself is untouched.
         gateway_hint = ""
         try:
-            from mozyo_bridge.domain import pane_resolver as _pr
-            from mozyo_bridge.domain.agent_discovery import (
+            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
+            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
                 codex_gateway_candidates,
             )
-            from mozyo_bridge.domain.handoff import cross_session_gateway_hint
+            from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import cross_session_gateway_hint
 
             _cands = [
                 rec.to_dict()
@@ -5604,7 +5604,7 @@ def _write_vscode_session_name(root: Path, session_name: str) -> tuple[Path, boo
     or aborting the whole adoption. Only the workspace-local settings file is
     ever touched; user-global VS Code settings are never read or written.
     """
-    from mozyo_bridge.domain.session_naming import (
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
         VSCODE_SESSION_NAME_KEY,
         VSCODE_SETTINGS_RELATIVE,
         merge_vscode_session_name,
@@ -5828,7 +5828,7 @@ def _bind_agent_pane_markers(
     name alone. Best-effort: a non-zero tmux exit is noted but never aborts the
     already-completed adoption.
     """
-    from mozyo_bridge.domain.cockpit_layout import ROLE_OPTION, WORKSPACE_OPTION
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLE_OPTION, WORKSPACE_OPTION
 
     role_result = run_tmux("set-option", "-p", "-t", target, ROLE_OPTION, agent, check=False)
     if role_result.returncode == 0:
@@ -6019,7 +6019,7 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     ``--write`` applies it. An existing settings file with comments/trailing
     commas (JSONC) is refused rather than clobbered.
     """
-    from mozyo_bridge.domain.session_naming import (
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
         VSCODE_SESSION_NAME_KEY,
         VSCODE_SETTINGS_RELATIVE,
         merge_vscode_session_name,
@@ -6070,7 +6070,7 @@ def cmd_session_boundary_prompt(args: argparse.Namespace) -> int:
     (``vibes/docs/rules/public-private-boundary.md``). Pure / read-only towards
     tmux, git, and Redmine.
     """
-    from mozyo_bridge.domain.session_boundary import (
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
         BoundaryPrompt,
         SessionBoundaryError,
         build_boundary_prompt,
@@ -6139,7 +6139,7 @@ def cmd_session_pane_decision(args: argparse.Namespace) -> int:
     been recorded. Exits non-zero (3) when the decision is ``blocked`` so an
     operator's ``&&`` chain cannot silently proceed to a kill. Pure / read-only.
     """
-    from mozyo_bridge.domain.session_boundary import (
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
         PaneLifecycleState,
         SessionBoundaryError,
         decide_pane_lifecycle,
@@ -6257,7 +6257,7 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
     effective resolution, so registry/anchor drift is visible before it
     bites a handoff gate.
     """
-    from mozyo_bridge.domain.session_naming import derive_session_name as _derive
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name as _derive
     from mozyo_bridge.workspace_registry import (
         ANCHOR_LEGACY_RELATIVE,
         ANCHOR_RELATIVE,

@@ -11,7 +11,7 @@ acceptance was meant to exclude (#12474 j#64160 / j#64172 / j#64185).
 This module is the pure classifier that fixes that boundary. Given the surfaces a
 receiver actually read, it classifies the read as :data:`CLASS_ALLOWED`,
 :data:`CLASS_INSUFFICIENT`, or :data:`CLASS_CONTAMINATED`. The route planner
-(:mod:`mozyo_bridge.domain.delegated_coordinator_route_plan`) consumes the verdict
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan`) consumes the verdict
 to **stop before the route decision** whenever the read is not ``allowed`` — a
 contaminated or insufficient read can never be promoted into a PASS/route.
 

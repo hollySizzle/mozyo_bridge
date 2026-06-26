@@ -37,7 +37,7 @@ opens tmux, never sends a handoff, never writes Redmine. The Redmine write seam
 is the injected :class:`RouteRecordSink` protocol; the live, credential-gated
 adapter is the deferred actuator follow-up, exactly as #12550 / #12553 deferred
 theirs. The persistence-outcome vocabulary is reused from
-:mod:`mozyo_bridge.domain.delivery_record_sink` so a write failure speaks the
+:mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink` so a write failure speaks the
 same language across the codebase.
 """
 
@@ -47,12 +47,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
-from mozyo_bridge.domain.delivery_record_sink import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     PERSIST_DISABLED,
     PERSIST_OK,
     PERSIST_TRANSPORT_ERROR,
 )
-from mozyo_bridge.domain.route_identity_ledger import RouteResolution
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import RouteResolution
 
 # ---------------------------------------------------------------------------
 # Final-classification vocabulary (acceptance doc ``## Failure Classification``

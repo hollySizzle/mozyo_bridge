@@ -24,14 +24,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.delivery_record_sink import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     PERSIST_CREDENTIAL_MISSING,
     PERSIST_PROVIDER_UNAVAILABLE,
     PERSIST_TRANSPORT_ERROR,
     PERSIST_UNAUTHORIZED,
     DeliveryTransportError,
 )
-from mozyo_bridge.infrastructure.redmine_note_transport import (
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
     DELIVERY_WRITE_ENV,
     RedmineNoteHttpTransport,
     redmine_delivery_transport_from_env,

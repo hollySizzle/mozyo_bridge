@@ -47,7 +47,7 @@ returned as a :class:`ChildCandidateResolution` status (mirroring the oracle's
 raised. Only malformed / unsafe *config* raises.
 
 The module is pure (dataclasses + small validation helpers) and imports nothing
-from the rest of the package, so :mod:`mozyo_bridge.domain.repo_local_config`
+from the rest of the package, so :mod:`mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config`
 can compose it as the ``delegation`` top-level surface without a cycle.
 """
 
@@ -183,7 +183,7 @@ class DelegationConfigError(ValueError):
 
     Inherits :class:`ValueError` for fail-closed semantics, matching the sibling
     repo-local domain errors. The composing
-    :mod:`mozyo_bridge.domain.repo_local_config` re-raises this as its own
+    :mod:`mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config` re-raises this as its own
     ``RepoLocalConfigError`` so the loader keeps a single fail-closed boundary.
     """
 

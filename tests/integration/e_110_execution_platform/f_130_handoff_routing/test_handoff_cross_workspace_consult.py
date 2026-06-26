@@ -143,7 +143,7 @@ class ConsultDelegationTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch.object(commands, "current_session_name", return_value=sender_session), \
             patch.object(commands, "pane_info", return_value=pane), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             try:

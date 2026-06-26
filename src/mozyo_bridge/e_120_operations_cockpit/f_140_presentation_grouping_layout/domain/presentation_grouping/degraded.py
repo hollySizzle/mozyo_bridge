@@ -9,9 +9,9 @@ known live Units as :data:`STATUS_DESIRED_UNIT_MISSING`.
 The sibling degraded condition — ``identity_conflict`` — is detected from the
 launch context (:meth:`LaunchContext.has_identity_conflict`) and applied during
 placement resolution
-(:mod:`mozyo_bridge.domain.presentation_grouping.placement`); the shared status
+(:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.placement`); the shared status
 vocabulary lives in
-:mod:`mozyo_bridge.domain.presentation_grouping.constants`. This is a read-model
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.constants`. This is a read-model
 diagnostic only — it resolves no routing and decides no side effect.
 """
 

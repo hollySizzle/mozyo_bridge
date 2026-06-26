@@ -24,8 +24,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.agent_discovery import codex_gateway_candidates
-from mozyo_bridge.domain.handoff import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import codex_gateway_candidates
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     cross_session_gateway_hint,
     is_explicit_pane_target,
     target_unavailable_codex_diagnostic,
@@ -143,8 +143,8 @@ class CrossSessionClaudeHintIntegrationTest(unittest.TestCase):
                 "mozyo_bridge.application.commands.current_session_name",
                 return_value="local",
             ), \
-            patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(SystemExit):
@@ -202,7 +202,7 @@ class CrossSessionClaudeHintIntegrationTest(unittest.TestCase):
                 "pane_info",
                 return_value=_pane("%9", "other", "claude"),
             ), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", side_effect=boom), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", side_effect=boom), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(SystemExit):
@@ -291,7 +291,7 @@ class AutoTargetRepoTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch.object(commands, "current_session_name", return_value=sender_session), \
             patch.object(commands, "pane_info", return_value=pane), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             try:
@@ -413,7 +413,7 @@ class InactiveQueueEnterPaneFallbackTest(unittest.TestCase):
             patch("mozyo_bridge.application.commands.time.sleep"), \
             patch.object(commands, "current_session_name", return_value="mysess"), \
             patch.object(commands, "pane_info", return_value=pane), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[pane]), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[pane]), \
             contextlib.redirect_stdout(io.StringIO()) as out, \
             contextlib.redirect_stderr(io.StringIO()) as err:
             try:

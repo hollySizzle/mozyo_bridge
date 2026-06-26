@@ -294,7 +294,7 @@ class CockpitUnitsRedmineFieldTest(unittest.TestCase):
                         }
                     ]
                     with patch(
-                        "mozyo_bridge.infrastructure.tmux_client.try_pane_lines",
+                        "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
                         return_value=panes,
                     ):
                         with urlreq.urlopen(

@@ -1028,28 +1028,28 @@ file_conventions:
   - id: fc-delegated-coordinator-runtime-source
     name: delegated coordinator runtime and projection source
     patterns:
-      - src/mozyo_bridge/domain/repo_local_config.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py
       - src/mozyo_bridge/application/repo_local_config_loader.py
-      - src/mozyo_bridge/domain/role_profile.py
-      - src/mozyo_bridge/domain/handoff.py
-      - src/mozyo_bridge/domain/agent_discovery.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
+      - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
-      - src/mozyo_bridge/domain/delegation_project_config.py
-      - src/mozyo_bridge/domain/delegation_route_planner.py
-      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_project_config.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/route_identity_ledger.py
       - src/mozyo_bridge/domain/handoff_route_identity.py
       - src/mozyo_bridge/application/cli_handoff.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_120_cockpit_web_ui/application/cli_cockpit.py
-      - src/mozyo_bridge/domain/delegation_launch_adopt.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_launch_adopt.py
       - src/mozyo_bridge/application/delegation_launch_adopt.py
-      - src/mozyo_bridge/domain/grandchild_dispatch.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/grandchild_dispatch.py
       - src/mozyo_bridge/application/grandchild_dispatch.py
-      - src/mozyo_bridge/domain/grandchild_stamp.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/grandchild_stamp.py
       - src/mozyo_bridge/application/grandchild_stamp.py
-      - src/mozyo_bridge/domain/delegation_projection.py
-      - src/mozyo_bridge/domain/delegation_display.py
-      - src/mozyo_bridge/domain/delegated_coordinator_route_plan.py
-      - src/mozyo_bridge/domain/redmine_read_boundary.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_projection.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_display.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegated_coordinator_route_plan.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/redmine_read_boundary.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_delegation_launch_adopt.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_grandchild_dispatch.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_grandchild_stamp.py
@@ -1097,7 +1097,7 @@ file_conventions:
     name: workspace registry and identity resolution source
     patterns:
       - src/mozyo_bridge/workspace_registry.py
-      - src/mozyo_bridge/domain/session_naming.py
+      - src/mozyo_bridge/e_110_execution_platform/f_110_workspace_session_identity/domain/session_naming.py
     severity: block
     document_refs:
       - logic-workspace-registry
@@ -1118,7 +1118,7 @@ file_conventions:
     name: managed marker and desired-state event log source (PoC)
     patterns:
       - src/mozyo_bridge/managed_events.py
-      - src/mozyo_bridge/domain/managed_marker.py
+      - src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/managed_marker.py
     severity: block
     document_refs:
       - logic-managed-state-model
@@ -1145,7 +1145,7 @@ file_conventions:
       - src/mozyo_bridge/application/otel_launchd.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_120_cockpit_web_ui/application/cockpit_ui.py
       - src/mozyo_bridge/e_140_adapter_provider/f_120_redmine_adapter/infrastructure/redmine_context.py
-      - src/mozyo_bridge/domain/agent_activity.py
+      - src/mozyo_bridge/e_110_execution_platform/f_150_runtime_observation_event_timeline/domain/agent_activity.py
     severity: block
     document_refs:
       - logic-otel-event-store
@@ -1157,7 +1157,7 @@ file_conventions:
   - id: fc-event-timeline-source
     name: consumer event timeline projection source
     patterns:
-      - src/mozyo_bridge/domain/event_timeline.py
+      - src/mozyo_bridge/e_110_execution_platform/f_150_runtime_observation_event_timeline/domain/event_timeline.py
     severity: block
     document_refs:
       - logic-event-timeline-source
@@ -1168,7 +1168,7 @@ file_conventions:
   - id: fc-cockpit-grouped-projection-source
     name: cockpit grouped projection and display source
     patterns:
-      - src/mozyo_bridge/domain/presentation_grouping/**
+      - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/presentation_grouping/**
       - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/grouped_read_model.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_120_cockpit_web_ui/domain/grouped_reload_view.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_120_cockpit_web_ui/domain/grouped_display.py
@@ -1226,14 +1226,14 @@ file_conventions:
   - id: fc-handoff-notification-source
     name: handoff notification and tmux transport source
     patterns:
-      - src/mozyo_bridge/domain/handoff.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
       - src/mozyo_bridge/application/cli_handoff.py
-      - src/mozyo_bridge/domain/notification.py
-      - src/mozyo_bridge/domain/pane_resolver.py
-      - src/mozyo_bridge/domain/route_identity_ledger.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/notification.py
+      - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/pane_resolver.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/route_identity_ledger.py
       - src/mozyo_bridge/domain/handoff_route_identity.py
-      - src/mozyo_bridge/infrastructure/tmux_client.py
-      - src/mozyo_bridge/infrastructure/queue_reader.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/tmux_client.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/queue_reader.py
       - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_same_lane_gateway.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_route_identity_ledger.py
     severity: block
@@ -1250,7 +1250,7 @@ file_conventions:
   - id: fc-session-boundary-source
     name: session boundary detection, next-session prompt, and pane lifecycle source
     patterns:
-      - src/mozyo_bridge/domain/session_boundary.py
+      - src/mozyo_bridge/e_110_execution_platform/f_110_workspace_session_identity/domain/session_boundary.py
     severity: block
     document_refs:
       - logic-session-boundary

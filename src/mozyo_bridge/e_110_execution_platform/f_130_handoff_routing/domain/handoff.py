@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Sequence
 
 if TYPE_CHECKING:
-    from mozyo_bridge.domain.role_profile import RoleProfileResolution
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -247,7 +247,7 @@ def evaluate_standard_target_admission(
     the strong-role and unambiguous signals, and ``workspace_id`` comes from the
     live pane snapshot.
     """
-    from mozyo_bridge.domain.agent_discovery import CONFIDENCE_STRONG
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import CONFIDENCE_STRONG
 
     live = bool(target_info.get("id"))
     strong_role = (
@@ -605,7 +605,7 @@ class DeliveryOutcome:
     """Structured result emitted by the new handoff primitive.
 
     Redmine #12311 adds the durable delivery-record persistence seam over this
-    outcome: :func:`mozyo_bridge.domain.delivery_record_sink.build_delivery_record_note`
+    outcome: :func:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.build_delivery_record_note`
     turns it (plus the redacted ``build_delivery_record`` body) into a persistable
     ``delivery_notification`` note, persisted opt-in via a fail-closed ticket
     sink. The persisted record is a delivery pointer only — never a workflow gate

@@ -22,7 +22,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.managed_marker import (
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.managed_marker import (
     MANAGED,
     MANAGED_OPTION,
     SOURCE_REGISTRY_ANCHOR,
@@ -105,10 +105,10 @@ class ManagedMarkerTest(unittest.TestCase):
             return "1"
 
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.set_user_option",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.set_user_option",
             side_effect=fake_set,
         ), patch(
-            "mozyo_bridge.infrastructure.tmux_client.get_user_option",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.get_user_option",
             side_effect=fake_get,
         ):
             self.assertTrue(mark_target("%1"))
@@ -255,7 +255,7 @@ class PocBoundaryGuardTest(unittest.TestCase):
         forbidden = ("handoff", "pane_resolver", "agent_discovery")
         for module in (
             "src/mozyo_bridge/managed_events.py",
-            "src/mozyo_bridge/domain/managed_marker.py",
+            "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/managed_marker.py",
         ):
             text = (ROOT / module).read_text(encoding="utf-8")
             for token in forbidden:

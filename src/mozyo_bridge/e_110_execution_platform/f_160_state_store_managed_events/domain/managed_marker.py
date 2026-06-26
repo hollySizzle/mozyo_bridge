@@ -97,13 +97,13 @@ def classify_managed(
 
 def mark_target(target: str) -> bool:
     """Set the secondary runtime marker on a tmux target. Non-fatal PoC."""
-    from mozyo_bridge.infrastructure.tmux_client import set_user_option
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import set_user_option
 
     return set_user_option(target, MANAGED_OPTION, MANAGED_OPTION_VALUE)
 
 
 def read_target_marker(target: str) -> str | None:
     """Read the secondary runtime marker from a tmux target."""
-    from mozyo_bridge.infrastructure.tmux_client import get_user_option
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import get_user_option
 
     return get_user_option(target, MANAGED_OPTION)

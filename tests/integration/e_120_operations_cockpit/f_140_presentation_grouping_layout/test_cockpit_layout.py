@@ -22,7 +22,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.cockpit_layout import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     COCKPIT_SESSION_DEFAULT,
     CockpitWorkspace,
     build_cockpit_plan,
@@ -330,11 +330,11 @@ class ResolveWorkspacesLaneTest(unittest.TestCase):
 
     def test_same_workspace_different_lane_makes_two_columns(self) -> None:
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             AGENT_KIND_CLAUDE,
             AGENT_KIND_CODEX,
         )
-        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import LaneIdentity
 
         # Two checkouts of the SAME workspace_id at different paths/lanes; each
         # carries a codex + claude pane (4 records total).
@@ -373,11 +373,11 @@ class ResolveWorkspacesLaneTest(unittest.TestCase):
     def test_same_workspace_same_lane_dedupes_to_one_column(self) -> None:
         # codex + claude panes of one checkout collapse to a single column.
         from mozyo_bridge.application import commands
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             AGENT_KIND_CLAUDE,
             AGENT_KIND_CODEX,
         )
-        from mozyo_bridge.domain.cockpit_layout import LaneIdentity
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import LaneIdentity
 
         records = [
             self._rec(agent_kind=AGENT_KIND_CODEX, workspace_id="ws-1",

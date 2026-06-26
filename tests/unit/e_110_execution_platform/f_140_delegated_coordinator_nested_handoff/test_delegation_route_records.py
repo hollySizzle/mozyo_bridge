@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_records import (  # noqa: E402
     CALLBACK_PENDING,
     CALLBACK_SENT,
     CLASS_BLOCKED,
@@ -50,7 +50,7 @@ from mozyo_bridge.domain.delegation_route_records import (  # noqa: E402
     final_classification_record,
     validate_classification,
 )
-from mozyo_bridge.domain.route_identity_ledger import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
     RESOLVE_OK,
     RouteIdentity,
     RouteResolution,

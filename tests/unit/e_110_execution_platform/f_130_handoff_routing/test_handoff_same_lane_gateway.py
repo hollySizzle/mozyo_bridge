@@ -23,7 +23,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.pane_resolver import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (  # noqa: E402
     find_agent_window,
     narrow_to_local_claude,
     narrow_to_sender_lane,
@@ -107,7 +107,7 @@ def _runtime(panes, *, sender_pane_id):
     if sender_pane_id is not None:
         env["TMUX_PANE"] = sender_pane_id
     with patch(
-        "mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes
+        "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes
     ), patch.dict(os.environ, env, clear=True):
         yield
 
@@ -286,7 +286,7 @@ class NarrowToLocalClaudeTest(unittest.TestCase):
             "/ws/other": "/ws/other",
         }
         with patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             narrowed = narrow_to_local_claude([local_claude, foreign], self.SENDER)
@@ -317,7 +317,7 @@ class NarrowToLocalClaudeTest(unittest.TestCase):
             "/ws/it-donyu-clone": "/ws/it-donyu-clone",
         }
         with patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             narrowed = narrow_to_local_claude([same_repo, other_repo], self.SENDER)
@@ -335,7 +335,7 @@ class NarrowToLocalClaudeTest(unittest.TestCase):
             cwd="/ws/it-donyu/docs",
         )
         with patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root({}),
         ):
             narrowed = narrow_to_local_claude([local_claude], self.SENDER)
@@ -354,7 +354,7 @@ class NarrowToLocalClaudeTest(unittest.TestCase):
         )
         roots = {"/ws/it-donyu": "/ws/it-donyu"}  # candidate cwd infers None
         with patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             narrowed = narrow_to_local_claude([candidate], self.SENDER)
@@ -418,7 +418,7 @@ class FindAgentWindowLocalClaudeTest(unittest.TestCase):
         }
         panes = [sender, local_claude, clone_claude]
         with _runtime(panes, sender_pane_id="%900"), patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             pane = find_agent_window("claude", "mozyo-cockpit")
@@ -441,7 +441,7 @@ class FindAgentWindowLocalClaudeTest(unittest.TestCase):
         }
         panes = [sender, local_claude, foreign_claude]
         with _runtime(panes, sender_pane_id="%900"), patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             pane = find_agent_window("claude", "mozyo-cockpit")
@@ -467,7 +467,7 @@ class FindAgentWindowLocalClaudeTest(unittest.TestCase):
         panes = [sender, local_claude, sibling_claude]
         err = io.StringIO()
         with _runtime(panes, sender_pane_id="%900"), patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             with contextlib.redirect_stderr(err):
@@ -501,7 +501,7 @@ class FindAgentWindowLocalClaudeTest(unittest.TestCase):
         panes = [sender, local_claude, sibling_claude]
         err = io.StringIO()
         with _runtime(panes, sender_pane_id="%900"), patch(
-            "mozyo_bridge.domain.pane_resolver.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
             _fake_infer_repo_root(roots),
         ):
             with contextlib.redirect_stderr(err):

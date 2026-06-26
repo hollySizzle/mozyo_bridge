@@ -29,7 +29,7 @@ from mozyo_bridge.application.commands import (
     cmd_workspace_list,
     cmd_workspace_register,
 )
-from mozyo_bridge.domain.session_naming import (
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
     SOURCE_REPO_FALLBACK,
     SOURCE_WORKSPACE_DEFAULTS,
     derive_session_name,

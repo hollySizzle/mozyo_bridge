@@ -34,10 +34,10 @@ from mozyo_bridge.application.commands import (
     resolve_status_session,
     session_cwd_mismatch,
 )
-from mozyo_bridge.infrastructure import tmux_client
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure import tmux_client
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.domain.notification import build_prompt, landing_marker, validate_notify_gate
-from mozyo_bridge.domain.pane_resolver import (
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     clear_read,
     ensure_agent_target,
     find_agent_window,
@@ -49,8 +49,8 @@ from mozyo_bridge.domain.pane_resolver import (
     resolve_agent_label,
     resolve_target,
 )
-import mozyo_bridge.domain.pane_resolver as pane_resolver
-from mozyo_bridge.domain.handoff import (
+import mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver as pane_resolver
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AnchorError,
     AsanaAnchor,
     KIND_LABELS,
@@ -72,7 +72,7 @@ from mozyo_bridge.domain.handoff import (
     normalize_anchor,
     project_last_input,
 )
-from mozyo_bridge.infrastructure.queue_reader import find_handoff_task, load_queue
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.queue_reader import find_handoff_task, load_queue
 from mozyo_bridge.scaffold.rules import package_version, rules_status, scaffold_state
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
 
@@ -345,7 +345,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             window = find_agent_window("codex", "repo")
 
         self.assertIsNotNone(window)
@@ -361,7 +361,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertIsNone(find_agent_window("claude", "repo"))
 
     def test_find_agent_window_dies_on_duplicate_window_name(self) -> None:
@@ -380,7 +380,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     find_agent_window("claude", "repo")
@@ -401,7 +401,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             window = find_agent_window("claude", "repo")
 
         self.assertEqual("%2", window["id"])
@@ -416,7 +416,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertIsNone(find_agent_window("claude", "repo"))
 
     def test_resolve_agent_label_uses_window_name_only(self) -> None:
@@ -432,7 +432,7 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertIsNone(resolve_agent_label("claude", "repo"))
 
     def test_resolve_agent_label_never_falls_back_cross_session(self) -> None:
@@ -445,15 +445,15 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertIsNone(resolve_agent_label("claude", "repo"))
 
     def test_resolve_agent_label_returns_none_when_session_unknown(self) -> None:
-        with patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=[]):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=[]):
             self.assertIsNone(resolve_agent_label("claude", None))
 
     def test_resolve_target_for_agent_label_dies_outside_tmux(self) -> None:
-        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value=None), \
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value=None), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 resolve_target("codex")
@@ -468,8 +468,8 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="repo"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value="repo"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 resolve_target("codex")
@@ -484,26 +484,26 @@ class PaneResolverTest(unittest.TestCase):
             },
         ]
 
-        with patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="repo"), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes):
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value="repo"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes):
             self.assertEqual("%9", resolve_target("codex"))
 
     def test_resolve_target_normalizes_location_form_to_pane_id(self) -> None:
         # Redmine #11666: a `session:window` location used to be returned
         # verbatim, so pane_info()'s pane-id match never succeeded and every
         # location target died with `pane disappeared after resolve`.
-        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.resolve_pane_id",
                 return_value="%9",
             ) as resolver:
             self.assertEqual("%9", resolve_target("repo:codex"))
         resolver.assert_called_once_with("repo:codex")
 
     def test_resolve_target_passes_pane_id_through_unchanged(self) -> None:
-        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.resolve_pane_id"
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.resolve_pane_id"
             ) as resolver:
             self.assertEqual("%9", resolve_target("%9"))
         resolver.assert_not_called()
@@ -511,7 +511,7 @@ class PaneResolverTest(unittest.TestCase):
     def test_pane_info_finds_pane_for_location_target(self) -> None:
         # End-to-end through pane_info: the normalized id must match the
         # pane_lines() entry, where the raw location string never did.
-        from mozyo_bridge.domain.pane_resolver import pane_info
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import pane_info
 
         panes = [
             {
@@ -523,27 +523,27 @@ class PaneResolverTest(unittest.TestCase):
                 "pane_active": "1",
             },
         ]
-        with patch("mozyo_bridge.domain.pane_resolver.validate_target"), \
+        with patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.resolve_pane_id",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.resolve_pane_id",
                 return_value="%9",
             ), \
             patch(
-                "mozyo_bridge.domain.pane_resolver.pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
                 return_value=panes,
             ):
             self.assertEqual("%9", pane_info("repo:codex")["id"])
 
     def test_resolve_pane_id_resolves_location_and_rejects_invalid(self) -> None:
-        from mozyo_bridge.infrastructure.tmux_client import resolve_pane_id
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import resolve_pane_id
 
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             return_value=argparse.Namespace(returncode=0, stdout="%42\n", stderr=""),
         ):
             self.assertEqual("%42", resolve_pane_id("repo:codex"))
         with patch(
-            "mozyo_bridge.infrastructure.tmux_client.run_tmux",
+            "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux",
             return_value=argparse.Namespace(returncode=1, stdout="", stderr="no such window"),
         ), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -554,7 +554,7 @@ class PaneResolverTest(unittest.TestCase):
         # lookup; under the window-only model they fail closed at resolve
         # time with a hint to pass a tmux pane id or an agent label.
         with patch(
-            "mozyo_bridge.domain.pane_resolver.current_session_name",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name",
             return_value="repo",
         ), contextlib.redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit):
@@ -1497,7 +1497,7 @@ class CommandTest(unittest.TestCase):
 
         # Bare `mozyo` now derives a collision-safe session name (Redmine
         # #10796) instead of using the raw repo basename.
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         expected = derive_session_name(repo).name
         self.assertEqual(expected, captured["args"].session)
@@ -1529,7 +1529,7 @@ class CommandTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_mozyo(args))
 
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         expected = derive_session_name(repo).name
         self.assertIn(f"attach: tmux attach -t {expected}", stdout.getvalue())
@@ -1562,7 +1562,7 @@ class CommandTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_mozyo(args))
 
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         expected = derive_session_name(repo).name
         payload = json.loads(stdout.getvalue())
@@ -1623,7 +1623,7 @@ class CommandTest(unittest.TestCase):
             else:
                 with self.assertRaisesRegex(RuntimeError, "attached"):
                     cmd_mozyo(args)
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         return derive_session_name(repo).name, calls, stdout.getvalue()
 
@@ -1796,7 +1796,7 @@ class CommandTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(0, cmd_mozyo(args))
 
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         expected = derive_session_name(repo).name
         output = stdout.getvalue()
@@ -1853,7 +1853,7 @@ class CommandTest(unittest.TestCase):
             )
             # The mismatch guard keys on the derived session name (Redmine
             # #10796), so the lingering pane must live in that same session.
-            from mozyo_bridge.domain.session_naming import derive_session_name
+            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
             derived = derive_session_name(repo).name
             panes = [
@@ -1953,7 +1953,7 @@ class CommandTest(unittest.TestCase):
         )
 
         with patch("mozyo_bridge.application.commands.source_tmux_conf", wraps=tmux_client.source_tmux_conf) as wrapped, \
-            patch("mozyo_bridge.infrastructure.tmux_client.run_tmux") as run:
+            patch("mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux") as run:
             self.assertFalse(load_tmux_conf_for(args))
 
         wrapped.assert_called_once_with("/nonexistent/.tmux.conf", optional=True)
@@ -1967,7 +1967,7 @@ class CommandTest(unittest.TestCase):
         )
 
         with patch("mozyo_bridge.application.commands.source_tmux_conf", wraps=tmux_client.source_tmux_conf), \
-            patch("mozyo_bridge.infrastructure.tmux_client.run_tmux") as run, \
+            patch("mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux") as run, \
             contextlib.redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit):
                 load_tmux_conf_for(args)
@@ -1985,7 +1985,7 @@ class CommandTest(unittest.TestCase):
                 repo=None,
             )
             ok = argparse.Namespace(returncode=0, stdout="", stderr="")
-            with patch("mozyo_bridge.infrastructure.tmux_client.run_tmux", return_value=ok) as run:
+            with patch("mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.run_tmux", return_value=ok) as run:
                 self.assertTrue(load_tmux_conf_for(args))
 
         run.assert_called_once_with("source-file", str(conf), check=False)
@@ -2915,7 +2915,7 @@ class CommandTest(unittest.TestCase):
         # Redmine identifier `giken-3500-jgmlife` resolves to a confident root
         # that derives `mozyo-giken-3500-jgmlife` (Redmine #11367).
         from mozyo_bridge.application.commands import _confident_workspace_root
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._stage_jp_workspace(Path(tmp))
@@ -2987,7 +2987,7 @@ class CommandTest(unittest.TestCase):
         # derived collision-safe session name, not the raw repo basename
         # (Redmine #10796). Keeping these in sync lets `status` find the
         # bare-`mozyo` session by name.
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "my_project"
@@ -3119,8 +3119,8 @@ class CommandTest(unittest.TestCase):
 
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.find_handoff_task", return_value=None), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
             patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
             patch("mozyo_bridge.application.commands.ensure_agent_target"), \
             patch("mozyo_bridge.application.commands.cmd_read"), \
@@ -3169,8 +3169,8 @@ class CommandTest(unittest.TestCase):
 
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.find_handoff_task", return_value=None), \
-            patch("mozyo_bridge.domain.pane_resolver.pane_lines", return_value=panes), \
-            patch("mozyo_bridge.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines", return_value=panes), \
+            patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name", return_value="mozyo_bridge"), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 notify_agent(args, "codex")
@@ -4505,14 +4505,14 @@ class TmuxUiHostWiringTest(unittest.TestCase):
 class AgentDiscoveryTest(unittest.TestCase):
     """Read-only cross-workspace discovery (Redmine #10332).
 
-    Coverage for ``mozyo_bridge.domain.agent_discovery``: classification by
+    Coverage for ``mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery``: classification by
     window-name agent rail, per-session ambiguity detection, repo-root
     inference via REPO_ROOT_MARKERS, and the ``mozyo-bridge agents list``
     CLI surface (text + JSON).
     """
 
     def test_discover_agents_classifies_by_window_name(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import discover_agents
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import discover_agents
 
         records = discover_agents(
             panes=[
@@ -4549,7 +4549,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         )
 
     def test_discover_agents_flags_same_session_duplicate_window_name(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import discover_agents
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import discover_agents
 
         records = discover_agents(
             panes=[
@@ -4581,7 +4581,7 @@ class AgentDiscoveryTest(unittest.TestCase):
     def test_discover_agents_does_not_cross_flag_same_window_in_different_sessions(
         self,
     ) -> None:
-        from mozyo_bridge.domain.agent_discovery import discover_agents
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import discover_agents
 
         records = discover_agents(
             panes=[
@@ -4609,7 +4609,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         self.assertFalse(any(r.ambiguous for r in records))
 
     def test_infer_repo_root_walks_up_to_project_markers(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
         with tempfile.TemporaryDirectory() as tmp_str:
             repo = Path(tmp_str) / "repo"
@@ -4619,7 +4619,7 @@ class AgentDiscoveryTest(unittest.TestCase):
             self.assertEqual(str(repo.resolve()), infer_repo_root(str(nested)))
 
     def test_infer_repo_root_returns_none_when_no_markers_above(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
         with tempfile.TemporaryDirectory() as tmp_str:
             no_markers = Path(tmp_str) / "no_markers"
@@ -4630,7 +4630,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         # Redmine #11301: a non-git scaffolded workspace must report its own
         # root from a pane cwd under it, instead of leaking up to the home
         # directory (which fail-closes the cross-workspace --target-repo gate).
-        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
         with tempfile.TemporaryDirectory() as tmp_str:
             workspace = Path(tmp_str) / "gk-0999" / "人形使い"
@@ -4649,7 +4649,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         # workspace identity; the deeper scaffold marker wins. Existing git /
         # pyproject behavior for non-scaffolded trees is unchanged because the
         # walk still returns the deepest marker-bearing ancestor.
-        from mozyo_bridge.domain.agent_discovery import infer_repo_root
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
 
         with tempfile.TemporaryDirectory() as tmp_str:
             outer = Path(tmp_str) / "outer_git"
@@ -4666,7 +4666,7 @@ class AgentDiscoveryTest(unittest.TestCase):
             )
 
     def test_filter_agents_session_and_kind(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             discover_agents,
             filter_agents,
         )
@@ -4716,7 +4716,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         args = argparse.Namespace(session=None, agent=None, as_json=False)
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch(
-                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                 return_value=panes,
             ), \
             contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -4748,7 +4748,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         args = argparse.Namespace(session=None, agent=None, as_json=True)
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch(
-                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                 return_value=panes,
             ), \
             contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -4770,7 +4770,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         # Redmine #11628: the same pane in two grouped sessions is ONE agent.
         # The canonical view is the one matching the resolver's canonical
         # session name; the other membership lands in `views`.
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             discover_agents,
             fold_agents_by_pane,
         )
@@ -4782,7 +4782,7 @@ class AgentDiscoveryTest(unittest.TestCase):
             return "mozyo-giken-1750-labor"
 
         with patch(
-            "mozyo_bridge.domain.agent_discovery.infer_repo_root",
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
             return_value="/repo",
         ):
             records = discover_agents(
@@ -4820,7 +4820,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         self.assertEqual(["/repo"], resolved_roots)
 
     def test_fold_agents_by_pane_without_resolver_is_deterministic(self) -> None:
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             discover_agents,
             fold_agents_by_pane,
         )
@@ -4863,7 +4863,7 @@ class AgentDiscoveryTest(unittest.TestCase):
     def test_filter_agents_session_matches_grouped_view(self) -> None:
         # A folded pane is a member of every session it appears in, so the
         # --session filter must match alias views, not only the canonical one.
-        from mozyo_bridge.domain.agent_discovery import (
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
             discover_agents,
             fold_agents_by_pane,
             filter_agents,
@@ -4906,7 +4906,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         # grouped pane, with both memberships in `views` and the canonical
         # session (the workspace's derived session name) at the top level.
         from mozyo_bridge.application.commands import cmd_agents_list
-        from mozyo_bridge.domain.session_naming import derive_session_name
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name
 
         with tempfile.TemporaryDirectory() as tmp_str:
             home = Path(tmp_str) / "home"
@@ -4936,7 +4936,7 @@ class AgentDiscoveryTest(unittest.TestCase):
                 "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch("mozyo_bridge.application.commands.require_tmux"), \
                 patch(
-                    "mozyo_bridge.domain.agent_discovery.pane_lines",
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                     return_value=panes,
                 ), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -4959,7 +4959,7 @@ class AgentDiscoveryTest(unittest.TestCase):
         args = argparse.Namespace(session=None, agent="bogus", as_json=False)
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch(
-                "mozyo_bridge.domain.agent_discovery.pane_lines",
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                 return_value=[],
             ), \
             contextlib.redirect_stderr(io.StringIO()) as stderr:

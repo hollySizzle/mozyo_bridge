@@ -10,9 +10,9 @@ runtime drift surfaces as a *visible* degraded status, never a silent reroute:
   known live Units as ``desired_unit_missing``.
 
 These exercise the
-:mod:`mozyo_bridge.domain.presentation_grouping.degraded` classifier and the
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.degraded` classifier and the
 identity-conflict path of
-:mod:`~mozyo_bridge.domain.presentation_grouping.placement` through the package
+:mod:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.placement` through the package
 facade. Schema / validation lives in ``test_presentation_grouping_schema``;
 ordinary placement precedence lives in ``test_presentation_grouping_placement``.
 No tmux, file IO, or CLI here.
@@ -27,7 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.domain.presentation_grouping import (
+from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     STATUS_CONFIGURED,
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
