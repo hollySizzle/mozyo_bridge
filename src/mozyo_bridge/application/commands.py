@@ -46,15 +46,18 @@ from mozyo_bridge.domain.handoff import (
     RECORD_FORMAT_TEXT,
     RECORD_FORMATS,
     SOURCES,
+    TargetActivationOutcome,
     build_delivery_record,
     build_execution_root,
     build_inactive_pane_fallback_command,
     build_marker,
     build_notification_body,
+    evaluate_standard_target_admission,
     is_explicit_pane_target,
     make_outcome,
     normalize_anchor,
     resolve_queue_enter_retry_policy,
+    resolve_standard_target_admission_policy,
 )
 from mozyo_bridge.domain.role_profile import (
     RoleProfileError,
@@ -4270,6 +4273,7 @@ def _emit_outcome(
     duplicate_lane_panes: list[str] | None = None,
     role_profile_contract: str | None = None,
     retry: QueueEnterRetryOutcome | None = None,
+    activation: TargetActivationOutcome | None = None,
 ) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -4309,6 +4313,7 @@ def _emit_outcome(
                 duplicate_lane_panes=duplicate_lane_panes,
                 role_profile_contract=role_profile_contract,
                 retry=retry,
+                activation=activation,
             )
         )
         if record_format == RECORD_FORMAT_BOTH:
@@ -4361,6 +4366,7 @@ def _maybe_persist_delivery_record(
     duplicate_lane_panes: list[str] | None,
     record_format: str,
     retry: QueueEnterRetryOutcome | None = None,
+    activation: TargetActivationOutcome | None = None,
 ) -> None:
     """Best-effort durable persistence of the delivery record (Redmine #12311).
 
@@ -4418,6 +4424,7 @@ def _maybe_persist_delivery_record(
             command=None,
             duplicate_lane_panes=duplicate_lane_panes or None,
             retry=retry,
+            activation=activation,
         )
         note = build_delivery_record_note(
             outcome,
@@ -4450,6 +4457,56 @@ def _maybe_persist_delivery_record(
             reason=PERSIST_TRANSPORT_ERROR,
         )
     _emit_receipt(receipt, record_format=record_format)
+
+
+def _window_active_pane_id(target_info: dict) -> str | None:
+    """Best-effort id of the currently-active pane in the target's window.
+
+    Reads a live `pane_lines()` snapshot (Redmine #12597) and returns the id of
+    the *other* pane that is the active split of the target pane's window, so the
+    durable record can show which pane was active before
+    standard_target_admission activated the target. Returns `None` when it cannot
+    be observed (no window location, snapshot failure, or no other active pane);
+    a failure here must never break delivery.
+    """
+    location = target_info.get("location") or ""
+    window_prefix = location.rsplit(".", 1)[0] if "." in location else location
+    if not window_prefix:
+        return None
+    from mozyo_bridge.domain import pane_resolver as _pr
+
+    try:
+        for pane in _pr.pane_lines():
+            if pane.get("id") == target_info.get("id"):
+                continue
+            pane_loc = pane.get("location") or ""
+            pane_window = (
+                pane_loc.rsplit(".", 1)[0] if "." in pane_loc else pane_loc
+            )
+            if pane_window == window_prefix and pane.get("pane_active") == "1":
+                return pane.get("id")
+    except (Exception, SystemExit):
+        return None
+    return None
+
+
+def _activate_target_pane(target_info: dict) -> TargetActivationOutcome:
+    """Activate an admitted inactive split via `tmux select-pane` (Redmine #12597).
+
+    Pane SELECTION only — never raw `send-keys` / `paste-buffer` / low-level
+    `type` / `keys` as a delivery recovery path. Captures the previously-active
+    pane first so the durable record can show the active化 / restore facts; the
+    optional restore runs after delivery on the sent terminal path.
+    """
+    target = target_info["id"]
+    previous = _window_active_pane_id(target_info)
+    run_tmux("select-pane", "-t", target)
+    return TargetActivationOutcome(
+        activated=True,
+        target_pane=target,
+        previous_active_pane=previous,
+        restored=False,
+    )
 
 
 def orchestrate_handoff(
@@ -5000,68 +5057,103 @@ def orchestrate_handoff(
             )
             raise AssertionError("unreachable")
 
+    # Step 11 (v0.5, Redmine #12597): standard_target_admission. Replaces the
+    # v0.3 unconditional active-split fail-closed. tmux delivers keystrokes to
+    # the pane addressed by `-t` even when it is an inactive split, so the old
+    # gate's concern was visibility (the receiver agent is, by construction, not
+    # the foreground process the operator is looking at), not deliverability.
+    # The owner (j#65493) judged the hard block over-strict: an inactive
+    # registered agent pane that passes the minimal admission contract (live
+    # pane + strong role match + workspace_id + unambiguous target) is now
+    # *activated* by the rail (via `tmux select-pane` — pane selection only,
+    # never raw key injection) and delivered to, with the active化 / restore
+    # facts recorded in the durable record. `lane_id` / the Step 12 foreground
+    # allowlist / repo-cwd checks stay as additional hardening, not minimal
+    # admission conditions, so a git-less / non-scaffolded unit is not broken.
+    # The policy is config-driven through the single
+    # `resolve_standard_target_admission_policy` seam (constants + optional CLI
+    # overrides), not scattered per caller/wrapper.
+    admission_policy = resolve_standard_target_admission_policy(
+        activate_inactive=(
+            False if getattr(args, "no_target_activation", False) else None
+        ),
+        restore_previous_active=(
+            True if getattr(args, "restore_previous_active", False) else None
+        ),
+    )
+    admission = evaluate_standard_target_admission(
+        target_info, receiver=receiver, preflight=preflight_target
+    )
+    activate_inactive_target = False
+    target_activation: TargetActivationOutcome | None = None
     if mode == MODE_QUEUE_ENTER and target_info.get("pane_active") != "1":
-        # Step 11 (v0.3): active-pane binding. tmux only delivers keystrokes
-        # to the pane addressed by `-t`; an inactive split in the right window
-        # would still accept the typing but the receiver agent is, by
-        # construction, not the foreground process the operator is looking at.
-        # queue-enter requires the receiver pane to be the active split.
-        observed_active = target_info.get("pane_active") or "<unknown>"
-        # Concrete strict-rail recovery (Redmine #12162). `target` is the
-        # already-resolved pane id (an explicit `%pane`), so `--target-repo auto`
-        # can pin its identity, and the command carries the same receiver /
-        # source / kind / anchor. This is the executable form of the prose hint
-        # that #12071 added — the dogfooding failure (#12137 j#60072/#60073) was
-        # that a `notify-*` caller forwarded into this rail, got blocked, and was
-        # left to reassemble the strict-rail command by hand. It does NOT weaken
-        # the guard: queue-enter still requires the active split; we only hand
-        # back the strict `--mode standard` retry, which observes the landing
-        # marker instead (`tmux-send-safety-contract.md`).
-        recovery_command = build_inactive_pane_fallback_command(
-            receiver=receiver,
-            kind=kind,
-            target=target,
-            anchor=anchor,
-        )
-        _emit_outcome(
-            make_outcome(
-                status="blocked",
-                reason="invalid_args",
+        if admission.admitted and admission_policy.activate_inactive:
+            # Admitted inactive split: defer the actual `select-pane` until just
+            # before typing (after the remaining die-able gates) so we never
+            # steal focus for a send that then fails a later gate.
+            activate_inactive_target = True
+        else:
+            observed_active = target_info.get("pane_active") or "<unknown>"
+            # Concrete strict-rail recovery (Redmine #12162). `target` is the
+            # already-resolved pane id (an explicit `%pane`), so `--target-repo
+            # auto` can pin its identity, and the command carries the same
+            # receiver / source / kind / anchor.
+            recovery_command = build_inactive_pane_fallback_command(
                 receiver=receiver,
+                kind=kind,
                 target=target,
                 anchor=anchor,
-                mode=mode,
-                kind=kind,
-                notification_marker=None,
-                source=source,
-            ),
-            record_format=record_format,
-            command=record_command,
-            recovery_command=recovery_command,
-        )
-        if recovery_command:
-            fallback_hint = (
-                " The safest retry is the strict rail, which does not require "
-                "the receiver pane to be the active split (it observes the "
-                f"landing marker instead): `{recovery_command}`"
             )
-        else:
-            # Defensive: `target` here is always an explicit resolved pane and
-            # `anchor` is already validated, so the recovery command normally
-            # builds. Keep the descriptive hint for any future caller shape that
-            # cannot form one.
-            fallback_hint = (
-                " As a fallback you can pin the pane and re-check identity with "
-                "`--target %pane --target-repo auto` and retry under "
-                "`--mode standard`, which does not require the active split."
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+                recovery_command=recovery_command,
             )
-        die(
-            "--mode queue-enter requires the target pane to be the active "
-            f"split of its window; pane {target} has pane_active="
-            f"{observed_active!r}. Activate the receiver pane in tmux, or "
-            "drop --target to use window-name resolution." + fallback_hint
-        )
-        raise AssertionError("unreachable")
+            if not admission_policy.activate_inactive:
+                reason_clause = (
+                    "target-pane activation is disabled by policy "
+                    "(--no-target-activation), so an inactive split stays "
+                    "fail-closed exactly like the pre-#12597 active-split gate"
+                )
+            else:
+                reason_clause = (
+                    "standard_target_admission did not admit the inactive "
+                    "split; unmet minimal conditions: "
+                    f"{', '.join(admission.unmet_conditions()) or '—'} "
+                    "(register the workspace so the pane carries a workspace_id, "
+                    "or use a pane that resolves strongly to the receiver)"
+                )
+            if recovery_command:
+                fallback_hint = (
+                    " The safest retry is the strict rail, which does not "
+                    "require the receiver pane to be the active split (it "
+                    f"observes the landing marker instead): `{recovery_command}`"
+                )
+            else:
+                fallback_hint = (
+                    " As a fallback you can pin the pane and re-check identity "
+                    "with `--target %pane --target-repo auto` and retry under "
+                    "`--mode standard`, which does not require the active split."
+                )
+            die(
+                "--mode queue-enter requires the target pane to be the active "
+                "split of its window or to pass standard_target_admission; pane "
+                f"{target} has pane_active={observed_active!r} and "
+                f"{reason_clause}. Activate the receiver pane in tmux, or drop "
+                "--target to use window-name resolution." + fallback_hint
+            )
+            raise AssertionError("unreachable")
 
     if mode == MODE_QUEUE_ENTER:
         # Step 12 (v0.3): per-receiver foreground process binding. Stricter
@@ -5216,6 +5308,12 @@ def orchestrate_handoff(
     # callers to run `mozyo-bridge read` first.
     capture_pane(target, read_lines)
 
+    # Redmine #12597: activate an admitted inactive split now — after every
+    # die-able gate above — so we never steal the operator's focus for a send
+    # that then fails. Pane selection only; no raw key injection.
+    if activate_inactive_target:
+        target_activation = _activate_target_pane(target_info)
+
     run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
 
     if mode == MODE_PENDING:
@@ -5345,6 +5443,25 @@ def orchestrate_handoff(
         if retry_engaged
         else None
     )
+    # Redmine #12597: if standard_target_admission activated an inactive split
+    # and the policy asks to restore focus, re-select the previously-active pane
+    # after delivery. Pane selection only, best-effort (a vanished pane must not
+    # break the already-completed send), and the restore fact is recorded.
+    if (
+        target_activation is not None
+        and admission_policy.restore_previous_active
+        and target_activation.previous_active_pane
+    ):
+        try:
+            run_tmux("select-pane", "-t", target_activation.previous_active_pane)
+            target_activation = TargetActivationOutcome(
+                activated=True,
+                target_pane=target_activation.target_pane,
+                previous_active_pane=target_activation.previous_active_pane,
+                restored=True,
+            )
+        except (Exception, SystemExit):
+            pass
     _emit_outcome(
         outcome,
         record_format=record_format,
@@ -5352,6 +5469,7 @@ def orchestrate_handoff(
         duplicate_lane_panes=duplicate_lane_panes or None,
         role_profile_contract=role_profile_contract,
         retry=retry_record,
+        activation=target_activation,
     )
     _maybe_persist_delivery_record(
         args,
@@ -5359,6 +5477,7 @@ def orchestrate_handoff(
         duplicate_lane_panes=duplicate_lane_panes,
         record_format=record_format,
         retry=retry_record,
+        activation=target_activation,
     )
     return 0
 

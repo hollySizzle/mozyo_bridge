@@ -171,14 +171,16 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "send a concise callback to the coordinator lane",
         "owner close approval requested",
         "The sublane's Codex owns the cross-lane callback",
-        # Same-lane Claude dispatch submit-completion (Redmine #12207). A
-        # same-lane Codex→Claude dispatch is a standard handoff that must reach
-        # submit (queue-enter on an active split, marker-observed `--mode
-        # standard` on an inactive cockpit-grid split); `--no-submit` /
-        # `--mode pending` stays an explicit operator/debug fallback, not the
-        # standard dispatch path.
+        # Same-lane Claude dispatch submit-completion (Redmine #12207, updated for
+        # the Redmine #12597 standard_target_admission rail). A same-lane
+        # Codex→Claude dispatch is a standard handoff that must reach submit
+        # (queue-enter on an active split, or an inactive registered split
+        # auto-activated by standard_target_admission; marker-observed `--mode
+        # standard` only for an unadmitted inactive cockpit-grid split);
+        # `--no-submit` / `--mode pending` stays an explicit operator/debug
+        # fallback, not the standard dispatch path.
         "that dispatch is a **standard handoff and must complete the submit**",
-        "Inactive-split Claude pane uses marker-observed `--mode standard`",
+        "Inactive-split Claude pane: standard_target_admission activates a registered pane; only unadmitted panes need `--mode standard`",
         "`--no-submit` / `--mode pending` is not the standard dispatch path",
         # Named cockpit groups — grouping vs identity separation
         # (Redmine #11853). A multi-cockpit layout must not become an

@@ -285,6 +285,32 @@ def configure_handoff_parser(
         ),
     )
     parser_.add_argument(
+        "--no-target-activation",
+        dest="no_target_activation",
+        action="store_true",
+        help=(
+            "Disable standard_target_admission activation (Redmine #12597): an "
+            "inactive registered agent pane stays fail-closed exactly like the "
+            "pre-#12597 active-split gate instead of being activated via tmux "
+            "`select-pane` and delivered to. By default the queue-enter rail "
+            "admits an inactive split that passes the minimal admission contract "
+            "(live pane / strong role match / workspace_id / unambiguous) and "
+            "activates it before typing. Ignored under --mode standard/pending."
+        ),
+    )
+    parser_.add_argument(
+        "--restore-previous-active",
+        dest="restore_previous_active",
+        action="store_true",
+        help=(
+            "After standard_target_admission activates an inactive split "
+            "(Redmine #12597), re-select the pane that was the active split of "
+            "the target's window before delivery. Off by default — the receiver "
+            "pane is left active, which resolves the original active-split "
+            "concern. Pane selection only; no raw key injection."
+        ),
+    )
+    parser_.add_argument(
         "--record-format",
         dest="record_format",
         choices=sorted(RECORD_FORMATS),

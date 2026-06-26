@@ -125,6 +125,165 @@ class QueueEnterRetryOutcome:
         return asdict(self)
 
 
+# --- standard_target_admission (Redmine #12597) ------------------------------
+#
+# v0.4 fixed-fail-closed an inactive registered agent pane at the queue-enter
+# Step 11 active-split gate. The owner (j#65493) judged that over-strict: an
+# inactive registered agent pane that satisfies the minimal admission contract
+# below should be safely *activated* by the rail and delivered to, instead of
+# fail-closed. The minimal default conditions are:
+#
+#   1. live pane          (the target resolved to a live pane id)
+#   2. strong role match  (resolved role == receiver via a strong, non-ambiguous
+#                          signal; for queue-enter this is already guaranteed by
+#                          the Step 9 `binds_receiver` gate)
+#   3. workspace_id present
+#   4. unambiguous target
+#
+# `lane_id` / the per-receiver foreground process allowlist (Step 12) /
+# repo-cwd-branch checks stay as ADDITIONAL hardening — they are not part of the
+# minimal admission and must not break a git-less / non-scaffolded unit test.
+#
+# These two policy toggles are the only tunables and live here as named
+# constants (the config boundary) so a future config-file driver overrides them
+# through the single `resolve_standard_target_admission_policy` seam without
+# scattering mode/policy decisions across callers/wrappers. Activation uses ONLY
+# `tmux select-pane` (pane selection); raw `send-keys` / `paste-buffer` /
+# low-level `type` / `keys` are never used as a delivery recovery path.
+STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE = True
+STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE = False
+
+
+@dataclass(frozen=True)
+class StandardTargetAdmissionPolicy:
+    """Resolved policy for the standard_target_admission rail (Redmine #12597).
+
+    ``activate_inactive`` controls whether an admitted inactive split is
+    activated and delivered to (``True``) or left fail-closed exactly like the
+    pre-#12597 active-split gate (``False`` — the explicit escape back to the
+    historical behavior). ``restore_previous_active`` controls whether the
+    previously-active pane in the target's window is re-selected after delivery
+    (``True``) or the receiver pane is left active (``False``, the default —
+    leaving the receiver foreground resolves the original active-split concern).
+    """
+
+    activate_inactive: bool
+    restore_previous_active: bool
+
+
+def resolve_standard_target_admission_policy(
+    activate_inactive: Optional[bool] = None,
+    restore_previous_active: Optional[bool] = None,
+) -> StandardTargetAdmissionPolicy:
+    """Resolve the admission/activation policy from optional overrides.
+
+    ``None`` falls back to the module default constant (the config boundary); an
+    explicit value is coerced to ``bool``. This is the single seam the send path
+    and any future config-file driver resolve the policy through, so the policy
+    is never re-derived ad hoc at the call site.
+    """
+
+    return StandardTargetAdmissionPolicy(
+        activate_inactive=(
+            STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE
+            if activate_inactive is None
+            else bool(activate_inactive)
+        ),
+        restore_previous_active=(
+            STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE
+            if restore_previous_active is None
+            else bool(restore_previous_active)
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class StandardTargetAdmission:
+    """Evaluation of the minimal admission contract over a target pane.
+
+    Each field is one minimal condition (see module note above). ``admitted`` is
+    their conjunction; ``unmet_conditions`` names the failing ones for the
+    fail-closed die wording. Pure over the pane snapshot + preflight projection,
+    so it is deterministic and unit-testable without tmux.
+    """
+
+    live: bool
+    strong_role: bool
+    workspace_id_present: bool
+    unambiguous: bool
+
+    @property
+    def admitted(self) -> bool:
+        return (
+            self.live
+            and self.strong_role
+            and self.workspace_id_present
+            and self.unambiguous
+        )
+
+    def unmet_conditions(self) -> tuple[str, ...]:
+        unmet: list[str] = []
+        if not self.live:
+            unmet.append("live_pane")
+        if not self.strong_role:
+            unmet.append("strong_role_match")
+        if not self.workspace_id_present:
+            unmet.append("workspace_id_present")
+        if not self.unambiguous:
+            unmet.append("unambiguous_target")
+        return tuple(unmet)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def evaluate_standard_target_admission(
+    target_info: dict[str, Any], *, receiver: str, preflight: Any
+) -> StandardTargetAdmission:
+    """Evaluate the minimal standard_target_admission contract (Redmine #12597).
+
+    ``preflight`` is the canonical :class:`PreflightTarget` projection (duck-typed
+    here to avoid an import cycle): ``role`` / ``confidence`` / ``ambiguous`` give
+    the strong-role and unambiguous signals, and ``workspace_id`` comes from the
+    live pane snapshot.
+    """
+    from mozyo_bridge.domain.agent_discovery import CONFIDENCE_STRONG
+
+    live = bool(target_info.get("id"))
+    strong_role = (
+        getattr(preflight, "role", None) == receiver
+        and getattr(preflight, "confidence", None) == CONFIDENCE_STRONG
+    )
+    workspace_id_present = bool((target_info.get("workspace_id") or "").strip())
+    unambiguous = not bool(getattr(preflight, "ambiguous", False))
+    return StandardTargetAdmission(
+        live=live,
+        strong_role=strong_role,
+        workspace_id_present=workspace_id_present,
+        unambiguous=unambiguous,
+    )
+
+
+@dataclass(frozen=True)
+class TargetActivationOutcome:
+    """Durable-record-safe record of a standard_target_admission activation.
+
+    Carries only pane ids and bools — no paths, no free text — so it is safe to
+    render verbatim into the pasteable delivery record and the opt-in persisted
+    note. ``previous_active_pane`` is the pane that was the active split of the
+    target's window before activation (``None`` when it could not be observed);
+    ``restored`` records whether that pane was re-selected after delivery.
+    """
+
+    activated: bool
+    target_pane: Optional[str]
+    previous_active_pane: Optional[str]
+    restored: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class AnchorError(ValueError):
     """Anchor arguments did not satisfy the source's contract."""
 
@@ -1024,6 +1183,7 @@ def build_delivery_record(
     duplicate_lane_panes: Optional[Sequence[str]] = None,
     role_profile_contract: Optional[str] = None,
     retry: Optional["QueueEnterRetryOutcome"] = None,
+    activation: Optional["TargetActivationOutcome"] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -1129,6 +1289,26 @@ def build_delivery_record(
             f"{retry.interval_seconds:g}s) re-issued Enter {retries} time(s) "
             f"— {retry.enter_attempts} Enter press(es) total, marker+body typed "
             f"once and never re-injected; {observed}."
+        )
+    if activation is not None and activation.activated:
+        # Redmine #12597: standard_target_admission activated an inactive
+        # registered agent pane (and optionally restored the previously-active
+        # pane) before delivery. Pane ids + bools only, so it is safe in the
+        # pasteable record and the opt-in persisted note. This documents the
+        # active化 / restore facts the owner (j#65493) required in the durable
+        # record; it does not override `next_action`.
+        prev = activation.previous_active_pane or "—"
+        restore_note = (
+            "the previously-active pane was restored after delivery"
+            if activation.restored
+            else "the receiver pane was left active after delivery"
+        )
+        lines.append(
+            "- Activation: standard_target_admission activated the inactive "
+            f"registered agent pane `{activation.target_pane or '—'}` before "
+            f"delivery (previously-active pane: `{prev}`); {restore_note}. Only "
+            "a tmux pane selection was used — no raw send-keys / paste-buffer / "
+            "low-level type key injection as a recovery path."
         )
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
@@ -1245,6 +1425,11 @@ __all__: Iterable[str] = (
     "SOURCES",
     "SOURCE_ASANA",
     "SOURCE_REDMINE",
+    "STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE",
+    "STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE",
+    "StandardTargetAdmission",
+    "StandardTargetAdmissionPolicy",
+    "TargetActivationOutcome",
     "AUTO_TARGET_REPO",
     "build_delivery_record",
     "build_execution_root",
@@ -1252,11 +1437,13 @@ __all__: Iterable[str] = (
     "build_marker",
     "build_notification_body",
     "cross_session_gateway_hint",
+    "evaluate_standard_target_admission",
     "is_explicit_pane_target",
     "make_outcome",
     "next_action_for",
     "normalize_anchor",
     "project_last_input",
     "resolve_queue_enter_retry_policy",
+    "resolve_standard_target_admission_policy",
     "target_unavailable_codex_diagnostic",
 )

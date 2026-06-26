@@ -12,12 +12,18 @@ These tests pin:
   Redmine / Asana anchors and its fail-closed `None` cases,
 - `build_delivery_record` surfacing the recovery command on the durable record,
 - the characterization that a `notify-*` wrapper resolving an inactive same-window
-  pane now emits the concrete `handoff send … --target %pane --target-repo auto
-  --mode standard` recovery on both the durable record (stdout) and the error
-  (stderr), while the active-split guard still blocks (no typing, no Enter).
+  pane that does NOT pass standard_target_admission (here: the pane carries no
+  `workspace_id`) emits the concrete `handoff send … --target %pane
+  --target-repo auto --mode standard` recovery on both the durable record
+  (stdout) and the error (stderr), with no typing and no Enter.
 
-The active-split guard itself is intentionally NOT weakened: queue-enter still
-requires the active split; the fix only hands back the strict-rail retry.
+Redmine #12597 replaced the v0.3 unconditional active-split fail-closed with
+standard_target_admission: an inactive split that passes the minimal admission
+contract (live pane / strong role match / workspace_id / unambiguous) is now
+activated via `tmux select-pane` and delivered to. The pane fixtures here carry
+no `workspace_id`, so admission still fails and the historical fail-closed +
+strict-rail recovery path is preserved unchanged. The admitted-and-activated
+path is covered in `test_handoff_orchestrator.py`.
 """
 
 from __future__ import annotations
@@ -196,7 +202,9 @@ class NotifyInactivePaneCharacterizationTest(unittest.TestCase):
             return argparse.Namespace(returncode=0, stdout="", stderr="")
 
         # An inactive same-window Codex split — exactly the #12137 shape: the
-        # pane resolves and is a codex agent pane, but it is NOT the active split.
+        # pane resolves and is a codex agent pane, but it is NOT the active split
+        # AND it carries no `workspace_id`, so standard_target_admission
+        # (Redmine #12597) does not admit it and the rail stays fail-closed.
         pane = {
             "id": "%2",
             "location": "agents:0.1",
@@ -266,11 +274,16 @@ class NotifyInactivePaneCharacterizationTest(unittest.TestCase):
         self.assertIn("Fallback recovery", stdout)
         self.assertIn(expected_recovery, stderr)
 
-        # The active-split guard is NOT weakened: nothing was typed and Enter
-        # was never pressed (the block fires before any send-keys typing).
+        # Unadmitted inactive split: nothing was typed, Enter was never pressed,
+        # and the pane was never activated (the block fires before any typing or
+        # pane selection).
         self.assertFalse(
             any(call[:2] == ("send-keys", "-t") for call in sent),
             msg=f"queue-enter typed into an inactive split: {sent!r}",
+        )
+        self.assertFalse(
+            any(call[:1] == ("select-pane",) for call in sent),
+            msg=f"queue-enter activated an unadmitted inactive split: {sent!r}",
         )
 
     def test_active_pane_is_not_blocked(self) -> None:
