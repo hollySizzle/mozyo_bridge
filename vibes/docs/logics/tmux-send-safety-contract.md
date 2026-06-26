@@ -110,6 +110,23 @@ v0.4 contract land 直後は、本文書が `queue-enter` を normative default 
 
 本節は audit replay のために残してある。新規に gap を再導入しない: shipped CLI binary の default を `standard` に戻したい場合は、本 contract と downstream surfaces を同期させた上で行うこと。
 
+### Delivery Rail Dogfood Check
+
+delivery rail、default mode、inactive-pane recovery、retry policy を変更する作業では、可能な限り dedicated sublane / worktree 上の実 agent pane に対して、実際の high-level command (`mozyo-bridge handoff send` / `handoff reply` / standard `notify-*`) をそのまま実行して確認する。test double や shell receiver だけでは、Claude / Codex TUI の marker rendering、queue pickup、active split、pane identity の実挙動を十分に検証できない。
+
+この確認は #12546 real-machine smoke とは別物である。release / production smoke を解禁するものではなく、開発中の rail 変更が standard primitive 経由で実際に delivery record を出し、receiver が durable anchor を読み始めるかを確認する lightweight dogfood である。
+
+dogfood 結果は active Redmine issue に短く記録する:
+
+- 実行した high-level command shape (`--mode` を省略したか、明示したかを含む)
+- target pane / lane / worktree
+- `DeliveryOutcome` の `status` / `reason` / `mode`
+- marker observed / unobserved と Enter 発行の事実
+- receiver を read-only に一度確認した場合は、その観測結果
+- raw tmux mutation / low-level `type` / `keys` を使っていないこと
+
+dogfood は safety bypass ではない。high-level primitive が fail-closed した場合、低レベル操作で突破せず、fail reason を実装 input として扱う。
+
 ## 用語の対応 (上流 ACK spec → tmux runtime)
 
 上流 ACK spec は prompt-turn-level の state を 7 state で定義している。tmux compatibility layer はそのうち 6 state を実装し、`acknowledged` だけは原理的に取得できないことを正面から認める。
