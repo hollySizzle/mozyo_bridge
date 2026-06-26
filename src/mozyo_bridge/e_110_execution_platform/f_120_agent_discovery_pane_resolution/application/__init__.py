@@ -1,0 +1,2 @@
+"""application layer leaf for `f_120_agent_discovery_pane_resolution` (#12624).
+"""

@@ -80,13 +80,15 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/features/operations_cockpit/domain/cockpit_layout.py
+  - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
     lines: 2344
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
-      to split along geometry vs projection responsibilities. Relocated to the
-      operations_cockpit Epic-slug package by US #12593 (path-only repath; the
-      module is unchanged and the split itself is still owner #12321 scope).
+      to split along geometry vs projection responsibilities. Path re-keyed from
+      ``features/operations_cockpit/domain/cockpit_layout.py`` for the #12625
+      Redmine-numbered layout move (old path kept as a sys.modules facade); the
+      re-key lands in the same commit as the move per #12591 j#65488 atomicity.
+      The module is byte-unchanged and the split itself is still owner #12321 scope.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -100,22 +102,29 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/features/governance_distribution/application/release.py
+  - path: src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
     lines: 1470
     reason: >-
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully. Path re-keyed from
       ``application/release.py`` for the #12590/#12594 governance_distribution
-      slug-layout move (old path kept as a sys.modules facade); the re-key lands
-      in the same commit as the move per #12591 j#65488 atomicity.
+      slug-layout move (old path kept as a sys.modules facade); re-keyed again
+      to the Redmine-numbered Epic/Feature path for the #12622/#12626 layout
+      correction (byte-identical move, line count unchanged), landing in the
+      same commit as the move per the #12591 j#65488 / #12624 atomicity rule.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/domain/handoff.py
+  - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
     lines: 1449
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
+      Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
+      Redmine-numbered execution_platform layout by #12624 (US #12622); line
+      count unchanged, legacy path preserved as a `sys.modules` facade. Self-
+      module baseline re-point per #12623 conflict-point policy; foreign drift
+      and final module_health integration remain #12630's.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
       delivery outcome / notification body / delivery record (the resolved-text
       rendering stays out of the auto-persist body).

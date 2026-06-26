@@ -1,19 +1,20 @@
 """Compatibility facade — real implementation relocated to
-:mod:`mozyo_bridge.features.adapter_provider.domain.presentation_adapter`.
+:mod:`mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter`.
 
-US #12595 (parent US #12590) moved the presentation-provider protocol out of the
-technical-layer ``domain/`` package into the ``adapter_provider`` Epic-slug package
-``features/adapter_provider/domain/`` (layer-leaf shape, #12591 j#65435). The
-legacy import path ``mozyo_bridge.domain.presentation_adapter`` is preserved per
-``vibes/docs/logics/source-layout-bounded-context-migration.md``; the relocated
-module object is re-bound here via ``sys.modules`` so both paths refer to the exact
-same module object (attribute access / monkeypatch stay equivalent). Do not remove
-this facade outside the fallback-retirement-ledger process.
+US #12627 (parent US #12622, Redmine Epic #12504 `140_Adapter・Provider基盤`) re-homes
+the presentation-provider protocol to the Redmine-numbered Feature package ``src/mozyo_bridge/e_140_adapter_provider/f_140_presentation_provider/domain/`` (Feature #12527
+`140_PresentationProvider`), superseding the #12595 ``features/adapter_provider/`` epic-slug pilot
+(``features/`` root abolished, ``vibes/docs/logics/source-layout-bounded-context-migration.md``
+`## #12622 Redmine-Numbered Layout Correction`). The legacy import path
+``mozyo_bridge.domain.presentation_adapter`` is preserved; the relocated module object is re-bound here via
+``sys.modules`` so both paths refer to the exact same module object (attribute access /
+monkeypatch stay equivalent). Do not remove this facade outside the
+fallback-retirement-ledger process.
 """
 
 import sys as _sys
 
-from mozyo_bridge.features.adapter_provider.domain import (
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain import (
     presentation_adapter as _impl,
 )
 

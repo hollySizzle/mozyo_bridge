@@ -1,47 +1,22 @@
-from __future__ import annotations
+"""Compatibility facade — real implementation relocated to
+:mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.queue_reader`.
 
-import json
-from pathlib import Path
-from typing import Any
+Redmine #12624 (US #12622 `Source/Test layout を Redmine 番号付き Epic/Feature
+階層へ全面再移行する`) moved the execution_platform runtime body into the
+Redmine-numbered Epic/Feature layout
+``src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/infrastructure/`` per the reviewed migration
+map (`vibes/docs/specs/bounded-context-map.md`
+`## Redmine-numbered package path map (#12622)`). The relocated module object
+is re-bound here via ``sys.modules`` so the legacy import path
+``mozyo_bridge.infrastructure.queue_reader`` and the new path refer to the exact same module object —
+attribute access and monkeypatch on either path stay equivalent. Do not
+remove this facade outside the fallback-retirement-ledger process.
+"""
 
-from mozyo_bridge.shared.errors import die
+import sys as _sys
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure import (
+    queue_reader as _impl,
+)
 
-def load_queue(queue_path: Path) -> dict[str, Any]:
-    if not queue_path.exists():
-        return {"tasks": []}
-    try:
-        data = json.loads(queue_path.read_text(encoding="utf-8") or "{}")
-    except json.JSONDecodeError as exc:
-        die(f"queue must be JSON: {queue_path}: {exc}")
-    if not isinstance(data, dict):
-        die(f"queue root must be a mapping: {queue_path}")
-    tasks = data.setdefault("tasks", [])
-    if not isinstance(tasks, list):
-        die(f"queue tasks must be a list: {queue_path}")
-    return data
-
-
-def find_handoff_task(args: object, agent: str) -> dict[str, Any] | None:
-    task_id = getattr(args, "task_id", None)
-    if not task_id:
-        return None
-    data = load_queue(Path(getattr(args, "queue")).expanduser().resolve())
-    candidates = []
-    for task in data.get("tasks", []):
-        if task.get("to") != agent:
-            continue
-        if task_id and task.get("id") != task_id:
-            continue
-        issue = getattr(args, "issue", None)
-        if issue and str(task.get("issue_id") or "") != str(issue):
-            continue
-        task_type = getattr(args, "type", None)
-        if task_type and task.get("type") != task_type:
-            continue
-        if task.get("status") not in {"pending", "claimed"}:
-            continue
-        candidates.append(task)
-    if not candidates:
-        die("no pending/claimed handoff task matched; do not notify pane without a queue task")
-    return sorted(candidates, key=lambda task: str(task.get("created_at") or ""))[-1]
+_sys.modules[__name__] = _impl

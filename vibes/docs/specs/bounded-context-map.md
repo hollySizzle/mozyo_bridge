@@ -18,6 +18,11 @@ Feature #12530 `110_テスト構造管理` 配下 US #12488 の成果物。
 - Redmine の番号・順序を Python import package 名へそのまま焼き込まない。`110_execution_platform`
   のような数字始まりの component は Python 識別子ではないため、`src/mozyo_bridge/**` と
   `tests/**` の importable package には使わない。
+  - > #12622 / #12623 correction: 本非目的は **#12622 layout correction 限定で supersede される**。
+    > 数字始まりは禁じるが、`e_`/`f_` prefix を付けた import-safe な `e_<order>_<slug>` / `f_<order>_<slug>`
+    > を使い、Redmine portfolio order を package path へ持ち込む。詳細は `## Redmine-numbered package path map (#12622)`
+    > と `vibes/docs/logics/source-layout-bounded-context-migration.md` の
+    > `## #12622 Redmine-Numbered Layout Correction` を読む。
 - Redmine catalog node の close / 退役判断は扱わない (別 portfolio 判断)。
 
 ## 正本性と命名規約
@@ -92,6 +97,61 @@ src/mozyo_bridge/features/<epic_slug>/[<feature_slug>/]<layer>/<module>.py
 
 pilot module `delegation_route_executor` の R1 再配置 (`.../delegated_coordinator_nested_handoff/domain/`)
 は #12592 が担当する (#12591 j#65454)。
+
+## Redmine-numbered package path map (#12622)
+
+> #12622 / #12623 correction: 本節は冒頭 非目的「Redmine の番号・順序を Python import package 名へ焼き込まない」
+> と `## Redmine order metadata と repo slug` / `### Full expansion target shape` の番号なし slug 方針を
+> **本 layout correction 限定で supersede する**。supersede の理由 (#12590 incomplete judgment)・residual・
+> conflict policy・facade idiom・verification は
+> `vibes/docs/logics/source-layout-bounded-context-migration.md` の
+> `## #12622 Redmine-Numbered Layout Correction` を正本とし、本 doc は対応表のみを持つ。
+
+package segment は Python import-safe lowercase numbered を使う: Epic = `e_<order>_<slug>`、Feature =
+`f_<order>_<slug>`。`<order>` は Redmine portfolio order (`110` / `120` …)、`<slug>` は本 doc の ASCII
+snake_case slug。`e_` / `f_` prefix で先頭数字を回避し Python identifier 制約を満たす。Epic だけで止めず、
+runtime 実体は必ず Feature-level owner を持つ。番号・表示名の正本は常に Redmine (本表は snapshot)。
+
+| Epic (Redmine) | Epic package | Feature (Redmine) | Feature package |
+|---|---|---|---|
+| #12501 `110_実行基盤・Routing` | `e_110_execution_platform` | #12507 `110_Workspace・Session識別` | `f_110_workspace_session_identity` |
+| | | #12508 `120_AgentDiscovery・Pane解決` | `f_120_agent_discovery_pane_resolution` |
+| | | #12509 `130_HandoffRouting` | `f_130_handoff_routing` |
+| | | #12510 `140_DelegatedCoordinator・NestedHandoff` | `f_140_delegated_coordinator_nested_handoff` |
+| | | #12511 `150_Runtime観測・EventTimeline` | `f_150_runtime_observation_event_timeline` |
+| | | #12512 `160_StateStore・ManagedEvents` | `f_160_state_store_managed_events` |
+| #12502 `120_運用Cockpit・表示` | `e_120_operations_cockpit` | #12513 `110_CockpitReadModel` | `f_110_cockpit_read_model` |
+| | | #12514 `120_CockpitWebUI` | `f_120_cockpit_web_ui` |
+| | | #12515 `130_Cockpit操作・Preflight` | `f_130_cockpit_actions_preflight` |
+| | | #12516 `140_表示Grouping・配置` | `f_140_presentation_grouping_layout` |
+| | | #12517 `150_Attention・Freshness投影` | `f_150_attention_freshness_projection` |
+| #12503 `130_統治・Scaffold配布` | `e_130_governance_distribution` | #12518 `110_Redmine統治Workflow` | `f_110_redmine_governed_workflow` |
+| | | #12519 `120_ScaffoldPreset` | `f_120_scaffold_preset` |
+| | | #12520 `130_CanonicalRenderer` | `f_130_canonical_renderer` |
+| | | #12521 `140_Rules・DocsCatalog` | `f_140_rules_docs_catalog` |
+| | | #12522 `150_Skill・Plugin配布` | `f_150_skill_plugin_distribution` |
+| | | #12523 `160_Release・Version統治` | `f_160_release_version_governance` |
+| #12504 `140_Adapter・Provider基盤` | `e_140_adapter_provider` | #12524 `110_TicketAdapter共通` | `f_110_ticket_adapter_common` |
+| | | #12525 `120_RedmineAdapter` | `f_120_redmine_adapter` |
+| | | #12526 `130_AsanaAdapter` | `f_130_asana_adapter` |
+| | | #12527 `140_PresentationProvider` | `f_140_presentation_provider` |
+| | | #12528 `150_PluginManifest・Marketplace` | `f_150_plugin_manifest_marketplace` |
+| | | #12529 `160_ProviderRegistry` | `f_160_provider_registry` |
+| #12505 `150_品質・アーキテクチャ統治` | `e_150_quality_architecture` | #12530 `110_テスト構造管理` | `f_110_test_structure` |
+| | | #12531 `120_シナリオ・受入テスト基盤` | `f_120_scenario_acceptance` |
+| | | #12532 `130_モジュール健全性管理` | `f_130_module_health` |
+| | | #12533 `140_ソース配置管理` | `f_140_source_layout` |
+| | | #12534 `150_CI・検証方針` | `f_150_ci_verification` |
+| #12506 `160_外部AgentUI連携` | `e_160_external_agent_ui` | #12535 `110_VSCodeAgentPane` | `f_110_vscode_agent_pane` |
+| | | #12536 `120_外部LauncherContract` | `f_120_external_launcher_contract` |
+| | | #12537 `130_AgentPane昇格方針` | `f_130_agent_pane_promotion` |
+
+residual / classification note (#12623 j#66018 coordinator findings):
+
+- #12506 `e_160_external_agent_ui` は現状 `src/mozyo_bridge` runtime body を持たない。`experimental/vscode-agent-pane/**`
+  (将来 `packages/vscode-agent-pane/**`) を residual / future scope として記録し、本 round では runtime package を作らない。
+- #12529 `ProviderRegistry` は `e_140_adapter_provider` 帰属であり `quality_architecture` ではない。
+- `e_150_quality_architecture` の Feature は #12530–#12534。
 
 ## Redmine catalog inventory (snapshot)
 

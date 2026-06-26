@@ -412,6 +412,102 @@ full `python3 -m unittest discover -s tests` (count parity) / `docs validate --c
 `generate-file-conventions --check` / `audit-impact --all-changed --check-generated` /
 `health check` / `git diff --check`。#12546 real-machine smoke は held、release/tag/publish なし。
 
+## #12622 Redmine-Numbered Layout Correction (#12623 migration map / integration policy)
+
+US #12590 / #12591 expansion は test / health green まで到達したが、Redmine 上 **incomplete** と判定された。
+US #12622 (parent Feature #12533、version #267) はその correction として layout を Redmine 番号付き
+Epic/Feature 階層へ全面再移行する。本節は #12623 が著す **migration map / integration policy の正本** で、
+Epic 別 lane #12624–#12629 と final integration #12630 が従う shared authority である。前段
+`## #12590 Full Expansion` の R1 layer-leaf **target shape と naming を本 US 限定で supersede** し、#12590 の
+facade idiom / move-only / verification 制約は継承する。番号順序・全 Feature 対応表の正本は
+`vibes/docs/specs/bounded-context-map.md` の `## Redmine-numbered package path map (#12622)`。
+
+### #12590 incomplete judgment (correction 参照点)
+
+#12590 / #12591 は次の点で不完全であり、#12622 はこれを是正対象とする。
+
+- `features/` root が残った。Epic/Feature path に Redmine 番号が無く、Redmine Epic/Feature ↔ repo path の
+  照合キーとして弱い。
+- 移行が Epic-level stop に留まり、多くの runtime 実体が旧 `domain/` `application/` 横並びに残った。
+  Feature-level owner を持たない module が広範に残存した。
+- import path slug が番号なし ASCII snake_case のままで、portfolio order が path から読めない。
+
+### Naming policy (番号を焼かない方針を本 US で reverse)
+
+`bounded-context-map.md` / #12570 補正の「Redmine 番号を import package path へ焼かない」方針は
+**本 US 限定で reverse する**。
+
+- package segment は Python import-safe lowercase numbered を使う: Epic = `e_<order>_<slug>`、
+  Feature = `f_<order>_<slug>`。`<order>` は Redmine portfolio order (`110` / `120` …)、`<slug>` は
+  `bounded-context-map.md` の ASCII snake_case slug。
+- 例: `src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_route_executor.py`。
+- `e_` / `f_` prefix で先頭数字を避け Python identifier 制約を満たす。
+- Epic だけで止めない。runtime 実体は必ず Feature-level owner を持つ。Feature 帰属が真に不能な module のみ
+  residual として記録する (後述)。
+- `features/` root は廃止する。新 root は `src/mozyo_bridge/e_<order>_<slug>/`。
+
+### Target shape (R1 layer-leaf 継承 + numbered prefix)
+
+```text
+src/mozyo_bridge/e_<order>_<epic_slug>/f_<order>_<feature_slug>/<layer>/<module>.py
+tests/<type>/e_<order>_<epic_slug>/f_<order>_<feature_slug>/...
+```
+
+- `layer` ∈ `domain` / `application` / `infrastructure`。#12591 j#65435 の layer-leaf 根拠 (同名別責務
+  module の衝突回避) を継承する。
+- 旧 public import path は #12493 / #12570 と同一の `sys.modules` facade idiom で温存する (同一 module
+  object 再束縛、attribute / monkeypatch 等価)。move-only commit に behavior change を混ぜない。
+- Feature subdir は source に Feature slice がある場合のみ。layer leaf は tests に持ち込まない。tests ROOT
+  bootstrap `Path(__file__).resolve().parents[N]` の N は移動深さに合わせて bump する (#12490 mechanics)。
+
+### Fixed / generated / package-data residual policy
+
+本 round で移動しない surface (residual)。Epic lane は触らず、#12623 policy と #12630 integration が管理する。
+
+| residual surface | 分類 | 理由 |
+| --- | --- | --- |
+| `__init__.py` / `__main__.py` | fixed | package root entry / `python -m` 入口 / `__version__` |
+| `application/cli.py` (`main` / `build_parser`) | fixed | pyproject entry point `cli:main`。移行最後まで固定 |
+| `application/commands.py` / `cli_common` / `cli_core` / `commands_common` | fixed | CLI composition root / facade / patch target |
+| `shared/` (`errors` / `paths` / `name_compat`) | fixed | 最下層 kernel |
+| `infrastructure/tmux_client.py` | fixed | tmux-send-safety-contract。最初に触らない |
+| `core/state/` | fixed | #12493 Unit A で package 化済み。再移動は二重 facade churn |
+| `domain/presentation_grouping/` / `docs_tools/` | fixed | relative import subpackage。package facade が要 |
+| `scaffold/presets/**` / `scaffold/canonical_sources/**` | package-data | pyproject `package-data` glob 結合。rename = build 破壊 |
+| `.mozyo-bridge/docs/file_conventions.generated.yaml` | generated | generator 出力。hand-edit 禁止 |
+| `experimental/vscode-agent-pane/**` (将来 `packages/vscode-agent-pane/**`) | residual / future | #12506 `e_160_external_agent_ui` に `src/mozyo_bridge` runtime body 無し。docs / future scope |
+
+判断不能 module は独断配置せず、各 lane が residual list + 理由を implementation_done に記録し #12630 が裁定する
+(#12590 ambiguous-module policy を継承)。既知 residual 候補: `application/doctor`、`domain/repo_local_config` /
+`application/repo_local_config_loader` / `application/cli_runtime_config` (#12490 で tests を flat 例外として
+残した fail-closed 群)。
+
+### Sublane conflict-point management
+
+並列 Epic lane (#12624–#12629) が衝突しうる shared surface と所有 / 調整先:
+
+| conflict point | 所有 / 調整 | lane 制約 |
+| --- | --- | --- |
+| `.mozyo-bridge/docs/catalog.yaml` | #12623 policy + #12630 integration | Epic lane は catalog を直接編集しない。facade split の新 source は catch-all `fc-package-source` に乗るため catalog 変更不要。明示 `fc-*` entry の module を動かす場合のみ #12623 / #12630 へ re-point を handoff する (catalog autonomous-lane scope) |
+| `module_health.yaml` | #12630 integration | move-only は line 数を変えない想定。baseline drift が出たら自 module 分のみ調整し #12630 へ記録。foreign drift は route する (`module-health-gate.md`) |
+| CLI composition (`application/cli.py` / `commands.py` / `cli_core`) | fixed (residual 表) | Epic lane は composition root を移動しない。Feature へ寄せた parser / handler は registry composition として top-level に残す |
+| facade policy | #12623 policy | `sys.modules` facade idiom を全 lane 共通とする。lane-local の別 facade を発明しない (撤去は `fallback-retirement-ledger.md` 経由のみ) |
+| tests bootstrap | 各 lane (移動分) | `parents[N]` bump と per-dir `__init__.py` を移動分のみ。discover count parity を verify する。`repo_local_config` 系 flat 例外は #12490 どおり維持 |
+
+### Verification (#12623 Done 条件)
+
+#12623 自身は migration map / integration policy (docs / map / catalog purpose) のみを更新し source/test を
+動かさない。よって本 issue の green 条件は:
+
+- `docs validate --repo .` / `docs validate --repo . --check-file-coverage`
+- `docs generate-file-conventions --check`
+- `docs audit-impact --all-changed --check-generated`
+- `git diff --check`
+
+source/test move の full unittest / `health check` は Epic lane (#12624–#12629) と #12630 が負う。#12546
+real-machine smoke / #12616 bare/pipx alignment / pipx reinstall / local install / tag / publish / version
+bump は本 US で実行しない。
+
 ## Non-Goals
 
 - 一括 (mega) リファクタブランチ (#12590/#12591 の scoped per-lane reversal は上記
