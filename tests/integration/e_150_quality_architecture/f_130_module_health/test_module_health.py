@@ -19,7 +19,7 @@ import sys
 # Self-contained src bootstrap so isolated discovery (unittest discover
 # scoped to this subpackage or a single file) imports mozyo_bridge without
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from mozyo_bridge.domain.module_health import (
     AllowlistEntry,
@@ -41,7 +41,7 @@ from mozyo_bridge.domain.module_health import (
     module_metrics,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class CountLinesTest(unittest.TestCase):
