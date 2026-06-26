@@ -1270,7 +1270,7 @@ file_conventions:
   - id: fc-release-source
     name: release helper source and workflows
     patterns:
-      - src/mozyo_bridge/application/release.py
+      - src/mozyo_bridge/features/governance_distribution/application/release.py
       - .github/workflows/**
       - pyproject.toml
       - .github/ISSUE_TEMPLATE/**
