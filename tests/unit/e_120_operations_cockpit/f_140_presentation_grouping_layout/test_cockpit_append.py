@@ -84,6 +84,12 @@ class AppendPlannerTest(unittest.TestCase):
         self.assertIn("projects/giken-cloud-drive-management", path_cmds[0].argv)
         label_cmds = [c for c in plan.commands if "@mozyo_project_label" in c.argv]
         self.assertIn("クラウドドライブ管理", label_cmds[0].argv)
+        # The Git worktree root is stamped on `@mozyo_repo_root` (j#66513) so
+        # discovery preserves the parent workspace identity for a pane whose cwd is
+        # the project workdir.
+        repo_cmds = [c for c in plan.commands if "@mozyo_repo_root" in c.argv]
+        self.assertTrue(repo_cmds)
+        self.assertIn("/ws/gk-3500-it-operations", repo_cmds[0].argv)
         # repo_root (Git) and project_path (repo-relative) are kept distinct.
         pane0 = plan.as_dict()["panes"][0]
         self.assertEqual(pane0["repo_root"], "/ws/gk-3500-it-operations")

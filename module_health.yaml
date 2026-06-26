@@ -104,7 +104,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
-    lines: 2456
+    lines: 2482
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
       to split along geometry vs projection responsibilities. Path re-keyed from
@@ -122,6 +122,10 @@ allowlist:
       `CockpitWorkspace` + the `_launch_cwd` helper routes every pane-launch `-c`
       to the project workdir for a project-scoped column (repo_root identity
       unchanged), so a `--target-project` handoff to such a pane can pass.
+      Raised 2456 -> 2482 for the #12658 j#66513 fix: a `@mozyo_repo_root` option
+      constant + its stamp in `pane_identity_commands` so target discovery
+      preserves the parent workspace identity for a project-scoped pane whose cwd
+      is the project workdir.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -382,6 +382,14 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
             if resolution.confidence == CONFIDENCE_STRONG
             else AGENT_KIND_UNKNOWN
         )
+        # Authoritative Git worktree root (Redmine #12658 j#66513). A cockpit pane
+        # may carry a stamped `@mozyo_repo_root`; prefer it so a project-scoped
+        # pane (whose cwd is the project workdir) keeps its parent workspace
+        # identity instead of collapsing onto the project subdir. An unstamped pane
+        # (normal `mozyo`, pre-#12658) falls back to cwd-derived inference, so
+        # existing behavior is unchanged. ``cwd`` stays the real pane cwd for the
+        # project-scope gate.
+        stamped_repo_root = (pane.get("repo_root_stamp") or "").strip()
         records.append(
             AgentRecord(
                 pane_id=pane.get("id") or "",
@@ -392,7 +400,7 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 pane_active=(pane.get("pane_active") == "1"),
                 process=pane.get("command") or "",
                 cwd=cwd,
-                repo_root=infer_repo_root(cwd),
+                repo_root=stamped_repo_root or infer_repo_root(cwd),
                 agent_kind=agent_kind,
                 ambiguous=window_ambiguous or resolution.ambiguous,
                 role_source=resolution.role_source,

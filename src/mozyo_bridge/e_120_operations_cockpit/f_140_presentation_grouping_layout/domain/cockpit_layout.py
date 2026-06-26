@@ -65,6 +65,15 @@ PROJECT_SCOPE_OPTION = "@mozyo_project_scope"
 PROJECT_PATH_OPTION = "@mozyo_project_path"
 PROJECT_LABEL_OPTION = "@mozyo_project_label"
 
+# Authoritative Git worktree root for a cockpit pane (Redmine #12658 j#66513).
+# A project-scoped pane launches with its cwd at the project workdir (#12658
+# j#66505), so cwd-derived repo-root inference would collapse the pane's workspace
+# identity onto the project subdir. Stamping the Git root here lets target
+# discovery preserve the parent workspace identity while keeping cwd available for
+# the project-scope gate. Stamped on every cockpit pane (== cwd-derived root for a
+# single-repo column, so its display is unchanged).
+REPO_ROOT_OPTION = "@mozyo_repo_root"
+
 # A checkout that is not a distinct lane — the primary worktree, the registered
 # canonical checkout, or a non-git workspace — belongs to the "default" lane.
 # Pre-#11820 cockpit panes carry no `@mozyo_lane_id` and normalize to this same
@@ -208,6 +217,7 @@ def pane_identity_commands(
     project_scope: Optional[str] = None,
     project_path: Optional[str] = None,
     project_label: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> list["CockpitCommand"]:
     """Title (human-facing) + workspace/role/lane tmux user options (machine-readable).
 
@@ -228,6 +238,21 @@ def pane_identity_commands(
                 argv=("select-pane", "-t", pane_token, "-T", title),
                 captures=None,
                 purpose=f"title {workspace_id} {role}",
+            )
+        )
+    # Authoritative Git worktree root (#12658 j#66513). Stamped so target discovery
+    # preserves the parent workspace identity for a project-scoped pane whose cwd
+    # is the project workdir; for a single-repo column this equals the cwd-derived
+    # root, so display is unchanged.
+    if repo_root:
+        commands.append(
+            CockpitCommand(
+                argv=(
+                    "set-option", "-p", "-t", pane_token,
+                    REPO_ROOT_OPTION, repo_root,
+                ),
+                captures=None,
+                purpose=f"mark repo_root {repo_root} ({workspace_id})",
             )
         )
     commands.extend(
@@ -318,6 +343,7 @@ def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
         project_scope=pane.project_scope,
         project_path=pane.project_path,
         project_label=pane.project_label,
+        repo_root=pane.repo_root,
     )
 
 

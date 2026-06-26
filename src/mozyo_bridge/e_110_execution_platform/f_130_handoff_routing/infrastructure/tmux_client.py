@@ -74,7 +74,13 @@ def try_pane_lines() -> list[dict[str, str]] | None:
         # `@mozyo_project_label` the human-facing (possibly non-ASCII) label. Empty
         # for panes that carry no project scope -> single-repo display is
         # unchanged. APPENDED so the existing field positions never shift.
-        "#{@mozyo_project_scope}\t#{@mozyo_project_path}\t#{@mozyo_project_label}"
+        "#{@mozyo_project_scope}\t#{@mozyo_project_path}\t#{@mozyo_project_label}\t"
+        # Authoritative Git worktree root (Redmine #12658 j#66513). A project-scoped
+        # pane launches with its cwd at the project workdir, so cwd-derived repo
+        # inference would collapse the workspace identity onto the project subdir;
+        # this stamp lets discovery preserve the parent workspace identity. Empty
+        # for unstamped panes -> cwd-derived inference (unchanged).
+        "#{@mozyo_repo_root}"
     )
     try:
         result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -95,10 +101,10 @@ def pane_lines() -> list[dict[str, str]]:
 def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
     for line in stdout.splitlines():
-        # 15 tab-separated fields; the trailing mozyo option fields are empty for
+        # 16 tab-separated fields; the trailing mozyo option fields are empty for
         # panes that do not carry them (older tmux output / pre-option panes).
         # Splitting with maxsplit keeps any stray tab inside the last field.
-        parts = (line.split("\t", 14) + [""] * 15)[:15]
+        parts = (line.split("\t", 15) + [""] * 16)[:16]
         (
             pane_id,
             location,
@@ -115,6 +121,7 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
             project_scope,
             project_path,
             project_label,
+            repo_root_stamp,
         ) = parts
         panes.append(
             {
@@ -138,6 +145,9 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
                 "project_scope": project_scope,
                 "project_path": project_path,
                 "project_label": project_label,
+                # Authoritative Git worktree root stamp (#12658 j#66513). Empty
+                # for unstamped panes -> discovery falls back to cwd-derived root.
+                "repo_root_stamp": repo_root_stamp,
             }
         )
     return panes
