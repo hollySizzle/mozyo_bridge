@@ -1,8 +1,8 @@
-# Worktree lifecycle は core ではなく skill / runbook で扱う
+# Worktree lifecycle boundary
 
-Redmine #11889。git worktree の生成・削除・命名・並列運用 policy を mozyo-bridge core CLI の標準機能にせず、LLM が実行できる skill / runbook / operator recipe として扱う方針正本。
+Redmine #11889 / #12603。git worktree の生成・削除・命名・並列運用 policy を、現行実装では mozyo-bridge core CLI の標準機能にせず、LLM が実行できる skill / runbook / operator recipe として扱う方針正本。
 
-> 本 doc は責務境界の **方針正本 + 汎用 runbook** である。新しい core CLI worktree command は追加しない。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
+> 本 doc は責務境界の **方針正本 + 汎用 runbook** である。#11889 時点では新しい core CLI worktree command を追加しない。#12603 / v0.10.21 では、設定駆動の sublane lifecycle として core-managed Git worktree / retire-time merge を導入するかを再設計する。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
 
 ## 背景
 
@@ -10,7 +10,9 @@ Redmine #11889。git worktree の生成・削除・命名・並列運用 policy 
 
 > 配布注記: この spine 本体は **mozyo_bridge repo-local であり配布されない**。本 doc 自体は scaffold で配布されるため、配布先 (adopter) には spine が存在しない。adopter は spine を読みに行かず、配布済みの `mozyo-bridge-agent` skill workflow reference (`skills/mozyo-bridge-agent/references/workflow.md`) を sublane 規律の entrypoint として読む。とくに `## Post-Dispatch Fill Loop` (pipeline-first / coordinator-blocking 語彙 / Drain Order) と、`## Sublane Coordinator Callback` / `## Sublane Completion Guardrails` (callback drain / downstream resume) / `## Sublane Retirement Drain` / `## Owner Approval Aggregation` が、bandwidth/admission・callback・retirement・owner aggregation の配布版正本である。
 
-一方で `git worktree add/remove`、issue 番号からの branch/path 強制生成、削除 policy、N 本並列運用 policy まで mozyo-bridge core に取り込むと、core が **agent / session / handoff の identity・discovery・safety primitive** から **Git workflow manager** へ肥大する。`#11889` はこの肥大を避ける境界を固定する。
+一方で `git worktree add/remove`、issue 番号からの branch/path 強制生成、削除 policy、N 本並列運用 policy まで無条件に mozyo-bridge core に取り込むと、core が **agent / session / handoff の identity・discovery・safety primitive** から **Git workflow manager** へ肥大する。`#11889` はこの肥大を避ける境界を固定した。
+
+#12603 は、この境界を破棄するのではなく、設定駆動で再評価する follow-up である。Git worktree を使う場合は sublane 作成時に worktree を自動作成し、retire 時に target branch へ自動 merge する default を mozyo_bridge dogfood の UX として検討する。Git を使わない directory scaffold でも sublane を動かせることは別途実機テストで確認する。merge conflict / dirty state / target branch 不明などの error では退役を実行せず、feedback を管制塔へ返す。
 
 ## 中核方針
 
