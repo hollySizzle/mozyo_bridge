@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
@@ -1434,7 +1434,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         from mozyo_bridge.scaffold.rules import render_preset_extra_files
 
         rules_dir = (
-            Path(__file__).resolve().parents[3]
+            Path(__file__).resolve().parents[4]
             / "src/mozyo_bridge/scaffold/presets"
             / "redmine-rails-governed/files/.mozyo-bridge/rules"
         )
@@ -1475,7 +1475,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         import subprocess
         import venv as _venv
 
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp) / "dist"
             dist.mkdir()
@@ -1876,7 +1876,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         in Redmine #12215; the packaged copies were retired with it
         (Redmine #12235), so it is no longer a synced doc here.
         """
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         synced_docs = ("worktree-lifecycle-boundary.md",)
         for preset in ("redmine-governed", "redmine-rails-governed"):
             for doc in synced_docs:
@@ -2169,7 +2169,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         into the distributed default. The doc routes to the portable
         skill workflow reference instead of inlining policy.
         """
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         copies: list[bytes] = []
         for preset in ("redmine-governed", "redmine-rails-governed"):
             packaged = (
@@ -2482,7 +2482,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.skipTest("tmux binary not on PATH")
 
         snippet = (
-            Path(__file__).resolve().parents[3]
+            Path(__file__).resolve().parents[4]
             / "src/mozyo_bridge/scaffold/presets/redmine-rails-governed/files/.mozyo-bridge/tmux/agent-ui.conf"
         )
         self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
@@ -2554,7 +2554,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         colour as an auxiliary hint. `healthy` carries no label so healthy
         panes stay quiet, and the agent-name colours are left untouched.
         """
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         confs = [
             repo_root
             / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
@@ -2580,7 +2580,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         The preset side is the source of truth for the distributed
         artifact; the scaffolded repo-local copy must not drift from it.
         """
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         preset = (
             repo_root
             / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf"
@@ -2604,7 +2604,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         if _shutil.which("tmux") is None:
             self.skipTest("tmux binary not on PATH")
 
-        snippet = Path(__file__).resolve().parents[3] / ".mozyo-bridge/tmux/agent-ui.conf"
+        snippet = Path(__file__).resolve().parents[4] / ".mozyo-bridge/tmux/agent-ui.conf"
         self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
 
         socket = f"mozyo-attn-{os.getpid()}"
@@ -2685,7 +2685,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         * the colour-only border styles are deliberately NOT bound to
           attention, so the active/inactive focus cue is left intact.
         """
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         confs = [
             repo_root
             / "src/mozyo_bridge/scaffold/presets/redmine-governed/files/.mozyo-bridge/tmux/agent-ui.conf",
@@ -2754,7 +2754,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         if _shutil.which("tmux") is None:
             self.skipTest("tmux binary not on PATH")
 
-        snippet = Path(__file__).resolve().parents[3] / ".mozyo-bridge/tmux/agent-ui.conf"
+        snippet = Path(__file__).resolve().parents[4] / ".mozyo-bridge/tmux/agent-ui.conf"
         self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
 
         socket = f"mozyo-pane-{os.getpid()}"
@@ -2885,7 +2885,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         if _shutil.which("tmux") is None:
             self.skipTest("tmux binary not on PATH")
 
-        snippet = Path(__file__).resolve().parents[3] / ".mozyo-bridge/tmux/agent-ui.conf"
+        snippet = Path(__file__).resolve().parents[4] / ".mozyo-bridge/tmux/agent-ui.conf"
         self.assertTrue(snippet.exists(), msg=f"snippet missing: {snippet}")
 
         socket = f"mozyo-hook-{os.getpid()}"
@@ -3247,7 +3247,7 @@ class ScaffoldRulesTest(unittest.TestCase):
         import subprocess
         import zipfile
 
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "dist"
             out_dir.mkdir()
