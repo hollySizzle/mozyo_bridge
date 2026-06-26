@@ -26,6 +26,11 @@ classical tests へ落とす契約、実機に残す最小確認、過去の fai
 親 prompt にどの hint を渡してはいけないか、autonomous parent smoke と context-rich smoke
 の PASS/FAIL 境界は acceptance 正本を参照する。
 
+現在の repo-local 実行順序は #12499 の roadmap anchor と
+`delegated-coordinator-real-machine-acceptance.md` の `Current Roadmap Gates` を読む。
+#12546 autonomous parent smoke は、#12590 source/test layout full expansion、#12608
+queue-enter default rail dogfood、scenario / oracle rerun/audit の後に実行する。
+
 ## #12474 / #12484 / #12485 で分かった failure mode
 
 ### context-rich contamination
@@ -120,6 +125,8 @@ Redmine MCP 実体に依存せず、receiver に渡す issue surface を fixture
 
 classical tests を通した後、実機 smoke は次だけを見る。
 
+- #12590 / #12608 / scenario-oracle rerun が pre-smoke gate として満たされており、その記録が
+  Redmine #12499 / #12546 から追跡できる。
 - fresh panes / worktrees が stale evidence なしで用意される。
 - `delegated-coordinator-real-machine-acceptance.md` が定義する test model
   (`autonomous_parent`, `bounded_read`, `context_rich`) が Start Gate で明示されている。
