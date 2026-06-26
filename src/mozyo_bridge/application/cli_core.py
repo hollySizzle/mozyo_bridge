@@ -34,6 +34,7 @@ from mozyo_bridge.application.commands import (
     cmd_status,
     cmd_type,
 )
+from mozyo_bridge.application.doctor_runtime import cmd_doctor_runtime
 from mozyo_bridge.application.instruction_doctor import (
     KNOWN_PROFILES,
     PROFILE_REDMINE_CODEX,
@@ -188,6 +189,24 @@ def register_lifecycle(sub) -> None:
         "`redmine-codex` is defined today.",
     )
     doctor_instruction.set_defaults(func=cmd_doctor_instruction)
+
+    # `doctor runtime` is the runtime fingerprint (Redmine #12612): it proves
+    # which executable surface is under test (source tree vs installed pipx /
+    # site-packages) and fails when the active runtime and the repo-local source
+    # report the same version but differ on gate-critical feature probes
+    # (#12597 standard_target_admission / --no-target-activation). Read-only.
+    doctor_runtime = doctor_sub.add_parser(
+        "runtime",
+        help=(
+            "Read-only runtime fingerprint: classify the active executable "
+            "surface (source vs installed), report version / executable / "
+            "package path / git anchor, and probe gate-critical behavior so a "
+            "stale install cannot pass a dogfood/smoke gate while reporting the "
+            "same version as source. Does not install or hit the network."
+        ),
+    )
+    _add_doctor_diagnostic_options(doctor_runtime)
+    doctor_runtime.set_defaults(func=cmd_doctor_runtime)
 
     # `sublane` groups the read-only sublane startup / callback-stall
     # diagnostics (Redmine #12159). Both subcommands are pure over their inputs
