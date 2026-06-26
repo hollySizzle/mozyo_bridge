@@ -103,6 +103,17 @@ bandwidth 判断では、すべての lane を durable record から次のいず
 
 `implementing` は coordinator-blocking state ではない。local soft profile の lane count には数えるが、それだけでは次の dispatch を止めない。active set が `implementing` lanes と coordinator だけなら、管制塔の期待 action は独立した ready work を探して pipeline に載せることである。この状態で直列実行を選ぶなら、具体的な durable reason が必要である。
 
+### Completion Semantics
+
+sublane の `implementation_done` / `review approved` / owner close approval は、target branch へ入る前の必要 gate であって、owner-facing な「実装完了」の十分条件ではない。commit-bearing work は、次のいずれかが durable record に残るまで `integration_waiting` として扱う:
+
+- target branch (`main` / release branch / integration branch) へ merge され、push 済みである。
+- target branch と patch-equivalent であることを commit / diff / verification と共に記録している。
+- branch / commit owner、再開条件、期限、下流消費者を明記した explicit deferral がある。
+- no-commit work であることが review / close record 上明確である。
+
+管制塔は、owner から「実装終わったのか」と問われた場合、sublane branch 上の実装だけを根拠に `完了` と答えない。正しい返答は `実装・review は完了、main 統合待ち`、`main 統合済み`、`explicit deferral 済み` のように integration state を含める。closed issue に unmerged sublane commit しか無い状態は、`retire_ready` ではなく `integration_waiting` である。
+
 ### Admission Rule
 
 implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch decision を記録する。受信者が既に開いている main-unit Claude であっても同じである。この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため process gap になる。
