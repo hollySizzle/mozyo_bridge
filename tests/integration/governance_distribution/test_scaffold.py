@@ -175,7 +175,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 hashlib.sha256(asana_workflow.read_bytes()).hexdigest(),
                 state["preset_hash"],
             )
-            self.assertEqual("2026.05.17.2", state["preset_version"])
+            self.assertEqual("2026.06.26.1", state["preset_version"])
             self.assertIn("AGENTS.md", state["files"])
 
             # The audit-owned commit policy belongs in the central preset only.
@@ -368,7 +368,7 @@ class ScaffoldRulesTest(unittest.TestCase):
             self.assertEqual("central", state["mode"])
             self.assertEqual("redmine", state["preset"])
             self.assertIn("AGENTS.md", state["files"])
-            self.assertEqual("2026.06.10.1", state["preset_version"])
+            self.assertEqual("2026.06.26.1", state["preset_version"])
 
             # The audit-owned commit policy belongs in the central preset only.
             # Root routers stay thin and must not duplicate the policy body.
