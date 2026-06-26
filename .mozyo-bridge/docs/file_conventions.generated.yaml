@@ -145,9 +145,9 @@ rules:
     '
 - name: module-health metrics and oversized-module gate source
   patterns:
-  - src/mozyo_bridge/domain/module_health.py
-  - src/mozyo_bridge/application/commands_module_health.py
-  - src/mozyo_bridge/application/cli_module_health.py
+  - src/mozyo_bridge/features/quality_architecture/domain/module_health.py
+  - src/mozyo_bridge/features/quality_architecture/application/commands_module_health.py
+  - src/mozyo_bridge/features/quality_architecture/application/cli_module_health.py
   - module_health.yaml
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/module-health-gate.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
