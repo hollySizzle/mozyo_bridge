@@ -20,14 +20,19 @@ from mozyo_bridge.domain.handoff import (
     QUEUE_ENTER_RETRY_WINDOW_SECONDS,
     QueueEnterRetryOutcome,
     RedmineAnchor,
+    STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE,
+    STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE,
+    TargetActivationOutcome,
     build_delivery_record,
     build_marker,
     build_notification_body,
+    evaluate_standard_target_admission,
     make_outcome,
     next_action_for,
     normalize_anchor,
     project_last_input,
     resolve_queue_enter_retry_policy,
+    resolve_standard_target_admission_policy,
 )
 
 class HandoffDomainTest(unittest.TestCase):
@@ -490,6 +495,139 @@ class DeliveryRecordRetryLineTest(unittest.TestCase):
         record = build_delivery_record(self._queue_enter_outcome("ok"))
         self.assertNotIn("Enter-only retry", record)
         self.assertNotIn("retry", self._queue_enter_outcome("ok").to_dict())
+
+
+class _FakePreflight:
+    """Minimal duck-typed PreflightTarget for admission evaluation."""
+
+    def __init__(self, role: str, confidence: str, ambiguous: bool) -> None:
+        self.role = role
+        self.confidence = confidence
+        self.ambiguous = ambiguous
+
+
+class StandardTargetAdmissionPolicyTest(unittest.TestCase):
+    def test_defaults_resolve_to_module_constants(self) -> None:
+        policy = resolve_standard_target_admission_policy()
+        self.assertEqual(
+            STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE, policy.activate_inactive
+        )
+        self.assertEqual(
+            STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE,
+            policy.restore_previous_active,
+        )
+        # Default posture: admit+activate inactive splits, leave receiver active.
+        self.assertTrue(policy.activate_inactive)
+        self.assertFalse(policy.restore_previous_active)
+
+    def test_explicit_overrides_apply_per_field(self) -> None:
+        policy = resolve_standard_target_admission_policy(
+            activate_inactive=False, restore_previous_active=True
+        )
+        self.assertFalse(policy.activate_inactive)
+        self.assertTrue(policy.restore_previous_active)
+
+    def test_none_falls_back_per_field(self) -> None:
+        policy = resolve_standard_target_admission_policy(restore_previous_active=True)
+        self.assertEqual(
+            STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE, policy.activate_inactive
+        )
+        self.assertTrue(policy.restore_previous_active)
+
+
+class EvaluateStandardTargetAdmissionTest(unittest.TestCase):
+    def _preflight(self, *, role="claude", confidence="strong", ambiguous=False):
+        return _FakePreflight(role, confidence, ambiguous)
+
+    def test_registered_strong_pane_is_admitted(self) -> None:
+        admission = evaluate_standard_target_admission(
+            {"id": "%2", "workspace_id": "ws-1"},
+            receiver="claude",
+            preflight=self._preflight(),
+        )
+        self.assertTrue(admission.admitted)
+        self.assertEqual((), admission.unmet_conditions())
+
+    def test_missing_workspace_id_is_unmet(self) -> None:
+        admission = evaluate_standard_target_admission(
+            {"id": "%2", "workspace_id": "  "},
+            receiver="claude",
+            preflight=self._preflight(),
+        )
+        self.assertFalse(admission.admitted)
+        self.assertIn("workspace_id_present", admission.unmet_conditions())
+
+    def test_weak_or_mismatched_or_ambiguous_role_is_unmet(self) -> None:
+        weak = evaluate_standard_target_admission(
+            {"id": "%2", "workspace_id": "ws-1"},
+            receiver="claude",
+            preflight=self._preflight(confidence="weak"),
+        )
+        self.assertIn("strong_role_match", weak.unmet_conditions())
+
+        mismatched = evaluate_standard_target_admission(
+            {"id": "%2", "workspace_id": "ws-1"},
+            receiver="claude",
+            preflight=self._preflight(role="codex"),
+        )
+        self.assertIn("strong_role_match", mismatched.unmet_conditions())
+
+        ambiguous = evaluate_standard_target_admission(
+            {"id": "%2", "workspace_id": "ws-1"},
+            receiver="claude",
+            preflight=self._preflight(ambiguous=True),
+        )
+        self.assertIn("unambiguous_target", ambiguous.unmet_conditions())
+        self.assertFalse(ambiguous.admitted)
+
+
+class DeliveryRecordActivationLineTest(unittest.TestCase):
+    def _sent_outcome(self):
+        anchor = normalize_anchor("asana", task_id="T1", comment_id="C1")
+        return make_outcome(
+            status="sent",
+            reason="ok",
+            receiver="claude",
+            target="%2",
+            anchor=anchor,
+            mode=MODE_QUEUE_ENTER,
+            kind="implementation_request",
+            notification_marker=build_marker(anchor, "implementation_request", "claude"),
+        )
+
+    def test_activation_line_rendered_when_left_active(self) -> None:
+        record = build_delivery_record(
+            self._sent_outcome(),
+            activation=TargetActivationOutcome(
+                activated=True,
+                target_pane="%2",
+                previous_active_pane="%1",
+                restored=False,
+            ),
+        )
+        self.assertIn("- Activation: standard_target_admission activated", record)
+        self.assertIn("`%2`", record)
+        self.assertIn("previously-active pane: `%1`", record)
+        self.assertIn("the receiver pane was left active after delivery", record)
+        self.assertIn("no raw send-keys", record)
+
+    def test_activation_line_reports_restore(self) -> None:
+        record = build_delivery_record(
+            self._sent_outcome(),
+            activation=TargetActivationOutcome(
+                activated=True,
+                target_pane="%2",
+                previous_active_pane="%1",
+                restored=True,
+            ),
+        )
+        self.assertIn("the previously-active pane was restored after delivery", record)
+
+    def test_no_activation_line_without_record(self) -> None:
+        # The activation telemetry is opt-in and never reaches the wire outcome.
+        record = build_delivery_record(self._sent_outcome())
+        self.assertNotIn("- Activation:", record)
+        self.assertNotIn("activation", self._sent_outcome().to_dict())
 
 
 if __name__ == "__main__":

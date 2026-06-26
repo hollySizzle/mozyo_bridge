@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6270
+    lines: 6389
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -70,6 +70,12 @@ allowlist:
       marker is observed or the window elapses, marker+body typed once; the
       retry probe shares the new `_marker_visible_in` one-shot matcher and the
       policy/telemetry types live in `domain/handoff.py`, not here).
+      Raised 6270 -> 6389 for the #12597 standard_target_admission rail in
+      `orchestrate_handoff` (replace the Step 11 active-split fail-closed with
+      the admission gate + `select-pane` activation/restore via the new
+      `_activate_target_pane` / `_window_active_pane_id` helpers, threading the
+      `TargetActivationOutcome` through the emit/persist paths; the admission /
+      activation / policy types live in `domain/handoff.py`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -102,7 +108,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/domain/handoff.py
-    lines: 1262
+    lines: 1449
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
@@ -114,6 +120,13 @@ allowlist:
       seam (ready for future config-file driving), the durable-record-safe
       `QueueEnterRetryOutcome`, and the `- Retry:` line in
       `build_delivery_record`.
+      Raised 1262 -> 1449 for the #12597 standard_target_admission config
+      boundary: the `STANDARD_TARGET_ADMISSION_*` constants, the
+      `StandardTargetAdmissionPolicy` / `resolve_standard_target_admission_policy`
+      seam, the pure `StandardTargetAdmission` /
+      `evaluate_standard_target_admission` minimal-admission evaluator, the
+      durable-record-safe `TargetActivationOutcome`, and the `- Activation:` line
+      in `build_delivery_record`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -537,6 +537,13 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
             if tmux_args[:3] == ("send-keys", "-t", "%2"):
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
+            # Redmine #12597: standard_target_admission activates an admitted
+            # inactive split via pane selection (and may restore focus). Record
+            # the select-pane calls so tests can assert pane selection happened
+            # without any raw key injection.
+            if tmux_args[:1] == ("select-pane",):
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")
 
         default_pane = {
@@ -1462,11 +1469,13 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
 
     def test_queue_enter_step11_rejects_inactive_pane(self) -> None:
-        # Step 11 (v0.3): the target pane must be the active split of its
-        # window. An inactive split would still accept keystrokes typed via
-        # `send-keys -t %X`, but the receiver agent is by construction not the
-        # foreground process the operator is looking at; queue-enter rejects
-        # before typing.
+        # Step 11 (v0.5, Redmine #12597): standard_target_admission. An inactive
+        # split is no longer rejected unconditionally — it is admitted and
+        # activated when it passes the minimal admission contract. This pane has
+        # NO `workspace_id`, so admission fails (`workspace_id_present`) and the
+        # rail stays fail-closed exactly as before: no typing, no activation, and
+        # the same strict-rail recovery is offered. The die wording still names
+        # `queue-enter` and `pane_active`.
         result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
             self._queue_enter_argv(),
             pane={
@@ -1482,12 +1491,83 @@ class RelaxedQueueEnterRailTest(unittest.TestCase):
 
         self.assertIsInstance(result, SystemExit)
         self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        # No activation either: an unadmitted inactive split is never selected.
+        self.assertFalse(any(call[:1] == ("select-pane",) for call in sent))
         outcome = self._outcome_from_stdout(stdout)
         self.assertEqual("blocked", outcome["status"])
         self.assertEqual("invalid_args", outcome["reason"])
         self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
         self.assertIn("queue-enter", stderr)
         self.assertIn("pane_active", stderr)
+        self.assertIn("standard_target_admission", stderr)
+        self.assertIn("workspace_id_present", stderr)
+
+    def test_queue_enter_admits_and_activates_registered_inactive_pane(self) -> None:
+        # Redmine #12597: a registered inactive split (carries a `workspace_id`,
+        # strong role via window name, unambiguous) passes standard_target_admission
+        # and is ACTIVATED via `tmux select-pane` before typing, then delivered
+        # to on the queue-enter rail. The receiver pane is left active (restore is
+        # off by default) and the activation fact is recorded in the durable
+        # record. Only pane selection is used — no raw key injection recovery.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv(),
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "0",
+                "workspace_id": "ws-1",
+            },
+            current_session="agents",
+        )
+
+        self.assertEqual(0, result)
+        # The inactive split was activated by pane selection BEFORE any typing.
+        self.assertIn(("select-pane", "-t", "%2"), sent)
+        select_idx = sent.index(("select-pane", "-t", "%2"))
+        first_type_idx = next(
+            i for i, call in enumerate(sent) if call[:2] == ("send-keys", "-t")
+        )
+        self.assertLess(select_idx, first_type_idx)
+        # Delivery completed (Enter pressed) and the marker was observed (the
+        # fake pane echoes typed text), so this is a normal queue-enter `sent`.
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual(MODE_QUEUE_ENTER, outcome["mode"])
+        # The durable record documents the activation (active化) fact.
+        self.assertIn("- Activation:", stdout)
+        self.assertIn("the receiver pane was left active after delivery", stdout)
+        # No raw key injection was used as a recovery path.
+        self.assertIn("no raw send-keys", stdout)
+
+    def test_queue_enter_no_target_activation_keeps_inactive_fail_closed(self) -> None:
+        # Redmine #12597: `--no-target-activation` is the explicit escape back to
+        # the pre-#12597 active-split fail-closed behavior, even for a registered
+        # pane that would otherwise be admitted.
+        result, sent, stdout, stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._queue_enter_argv() + ["--no-target-activation"],
+            pane={
+                "id": "%2",
+                "location": "agents:0.1",
+                "command": "node",
+                "cwd": "/repo",
+                "window_name": "claude",
+                "pane_active": "0",
+                "workspace_id": "ws-1",
+            },
+            allow_exit=True,
+        )
+
+        self.assertIsInstance(result, SystemExit)
+        self.assertFalse(any(call[:1] == ("select-pane",) for call in sent))
+        self.assertFalse(any(call[:3] == ("send-keys", "-t", "%2") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("activation is disabled by policy", stderr)
 
     def test_queue_enter_step12_rejects_cross_receiver_literal_to_claude(self) -> None:
         # Step 12 (v0.3) strong identity: a literal `codex` process foregrounded
