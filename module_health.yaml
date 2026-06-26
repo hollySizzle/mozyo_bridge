@@ -100,14 +100,16 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/features/governance_distribution/application/release.py
+  - path: src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
     lines: 1470
     reason: >-
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully. Path re-keyed from
       ``application/release.py`` for the #12590/#12594 governance_distribution
-      slug-layout move (old path kept as a sys.modules facade); the re-key lands
-      in the same commit as the move per #12591 j#65488 atomicity.
+      slug-layout move (old path kept as a sys.modules facade); re-keyed again
+      to the Redmine-numbered Epic/Feature path for the #12622/#12626 layout
+      correction (byte-identical move, line count unchanged), landing in the
+      same commit as the move per the #12591 j#65488 / #12624 atomicity rule.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
