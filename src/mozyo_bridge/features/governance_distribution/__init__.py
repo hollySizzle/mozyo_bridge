@@ -12,6 +12,8 @@ Modules relocated here are behavior-preserving moves; their former
 ``mozyo_bridge.application.<module>`` import paths remain available as
 ``sys.modules`` compatibility facades (the #12492/#12493/#12570 facade idiom).
 ``scaffold/`` and ``docs_tools/`` are held this round as packaged/fixed surfaces
-(j#65435 Decision 3); ``application/release.py`` is deferred pending #12591
-``module_health.yaml`` sequencing.
+(j#65435 Decision 3). ``application/release.py`` (the deferred 4th governance
+module, allowlisted at 1470 lines) was completed under #12591 integration: the
+move and its ``module_health.yaml`` allowlist path re-key land in one atomic
+commit (#12591 j#65488).
 """
