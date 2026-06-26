@@ -1,45 +1,19 @@
-from __future__ import annotations
+"""Compatibility facade — real implementation relocated to
+:mod:`mozyo_bridge.features.execution_platform.handoff_routing.domain.notification`.
 
-from typing import Any
+Redmine #12592 (parent US #12590 source-layout full expansion) moved this
+execution_platform ``domain/`` real module into the Feature-slug package
+``features/execution_platform/handoff_routing/domain/`` under the R1 layer-leaf shape
+(#12591 j#65435). The legacy import path ``mozyo_bridge.domain.notification`` is
+preserved here via the ``sys.modules`` facade idiom so both paths refer to the same
+module object (attribute access / monkeypatch stay equivalent). Do not remove this
+facade outside the fallback-retirement-ledger process.
+"""
 
-from mozyo_bridge.shared.errors import die
+import sys as _sys
 
+from mozyo_bridge.features.execution_platform.handoff_routing.domain import (
+    notification as _impl,
+)
 
-def validate_notify_gate(args: object) -> None:
-    if not getattr(args, "issue", None):
-        die("--issue is required for notify commands")
-    if not getattr(args, "journal", None) and not getattr(args, "task_id", None):
-        die("--journal is required for standard pane notification; --task-id is legacy fallback only")
-
-
-def landing_marker(args: object, task: dict[str, Any] | None) -> str:
-    if getattr(args, "journal", None):
-        return (
-            f"[mozyo:notify:issue={getattr(args, 'issue')}:"
-            f"journal={getattr(args, 'journal')}:"
-            f"type={getattr(args, 'type', None) or 'unspecified'}]"
-        )
-    return f"[mozyo:notify:task={task.get('id')}:issue={task.get('issue_id')}]"
-
-
-def build_prompt(args: object, agent: str, task: dict[str, Any] | None) -> str:
-    marker = landing_marker(args, task)
-    prompt = getattr(args, "prompt", None)
-    if prompt:
-        return f"{marker} {prompt}"
-    if getattr(args, "journal", None):
-        return (
-            f"{marker} "
-            f"Redmine #{getattr(args, 'issue')} journal #{getattr(args, 'journal')} is ready for {agent}. "
-            "Confirm that Redmine gate as the source of truth before acting. "
-            "Stop-hook handoff waiting is disabled; use this pane notification as the trigger. "
-            f"type={getattr(args, 'type', None) or 'unspecified'} commit={getattr(args, 'commit', None) or ''}."
-        )
-    if task:
-        return (
-            f"{marker} "
-            f"handoff task {task.get('id')} is ready for {agent}. "
-            "This is a legacy queue fallback; confirm the Redmine gate first and treat Redmine as the source of truth. "
-            f"issue=#{task.get('issue_id')} commit={task.get('commit')} type={task.get('type')}."
-        )
-    die("--journal is required for standard pane notification; --task-id is legacy fallback only")
+_sys.modules[__name__] = _impl
