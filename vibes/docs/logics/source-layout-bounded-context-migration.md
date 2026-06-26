@@ -272,6 +272,37 @@ behavior-preserving move-only commit を基本とし、move と behavior change 
   `module-health-gate.md` 系の独立 issue で扱い、本計画の move-only 方針に混ぜない
   (move commit に behavior/baseline 変更を入れない原則)。
 
+## Feature-slug pilot record (#12570)
+
+US #12570 (parent Feature #12533) は、Redmine Epic/Feature 順序を source/test layout へ
+反映する Feature-slug 形 `features/<epic_slug>/<feature_slug>/` を、`execution_platform`
+big-box の 1 module で behavior-preserving に実証した (base `13303db`)。番号順序の正本は
+`bounded-context-map.md` の mapping metadata、命名規約・renumber 方針も同 doc。
+
+実装済み pilot slice (move-only, facade 維持):
+
+- source: `domain/delegation_route_executor.py` (the live executor; #12556/#12546 path) を
+  `features/execution_platform/delegated_coordinator_nested_handoff/delegation_route_executor.py`
+  へ移動。旧 path `mozyo_bridge.domain.delegation_route_executor` は #12493 と同一の
+  **`sys.modules` facade idiom** で同一 module object を re-bind (attribute / monkeypatch 等価)。
+- tests: 1:1 unit test を `tests/unit/execution_platform/delegated_coordinator_nested_handoff/`
+  へ移動し、ROOT bootstrap を `parents[3] → parents[4]` に bump (#12490 mechanics)。
+- catalog: facade split のため変更不要。旧 facade と新 module は共に catch-all
+  `fc-package-source` (`src/mozyo_bridge/**/*.py`)、移動 test は `fc-tests` (`tests/**`) に乗る
+  (`generate-file-conventions --check` / `docs validate --check-file-coverage` green で確認)。
+
+**意図的に deferred (本 pilot に含めない)**:
+
+- 残りの feature cluster (`delegation_route_planner` / `delegation_route_records` /
+  `route_identity_ledger` / `delegation_project_config` / `delegation_projection` /
+  `delegation_display` / `delegation_launch_adopt` / `delegated_coordinator_route_plan` /
+  `grandchild_*`) の移動。expand 判断は #12570 j#65077 decision #6 に従い pilot 合格後に行う。
+  これらは 6 件の live lane (12547/12549/12550/12553/12557/12561) が現に編集中のため、移動は
+  main-merge 競合面を増やす。本 pilot は **isolated #12570 branch** で完結し in-flight branch に
+  触れない (競合は main-merge 時の関心事。#12565 main integration は #12570 の後ろに held)。
+- cross-module の `test_delegation_route_integration_readiness.py` (integration) は executor 単独の
+  1:1 test ではないため移動せず、facade 経由で従来 path のまま green。cluster 全体移動時に追従する。
+
 ## Non-Goals
 
 - 一括 (mega) リファクタブランチ。
