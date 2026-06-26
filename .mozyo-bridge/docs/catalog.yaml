@@ -108,7 +108,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/bounded-context-map.md
-    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine の番号・順序を mapping metadata として保持し、importable path は ASCII snake_case slug に正規化する。
+    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine の番号・順序を mapping metadata として保持し、importable path は ASCII snake_case slug に正規化する。#12622 layout correction 限定で Epic/Feature → `e_<order>_<slug>` / `f_<order>_<slug>` numbered package path map を全 Feature 分定義する (`## Redmine-numbered package path map (#12622)`)。
     audit_role: bounded_context_map_spec
     related_document_refs:
       - spec-project-map
@@ -421,7 +421,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/source-layout-bounded-context-migration.md
-    purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の import-safe slug 階層へ段階移行する計画正本。Redmine 番号は mapping metadata として保持し、import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。"
+    purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の import-safe slug 階層へ段階移行する計画正本。Redmine 番号は mapping metadata として保持し、import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。#12622 Redmine-Numbered Layout Correction (#12623 migration map / integration policy) で `features/` root を廃し `e_<order>_<slug>` / `f_<order>_<slug>` numbered package path へ全面再移行する correction 方針・residual・sublane conflict-point 管理を定義する。"
     audit_role: source_layout_bounded_context_migration_logic
     related_document_refs:
       - logic-refactor-split-strategy
