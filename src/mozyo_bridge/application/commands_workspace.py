@@ -1,60 +1,22 @@
-"""Command handler for the workspace-defaults command family.
+"""Compatibility facade — real implementation relocated to
+:mod:`mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace`.
 
-Split out of ``application/commands.py`` (Redmine #12142). ``commands.py``
-re-exports ``cmd_workspace_defaults`` so existing imports / patch targets keep
-working. The workspace register/list/inspect handlers stay in ``commands.py``
-for a later wave. Behavior-preserving: the handler body (with its lazy local
-import) is moved verbatim.
+Redmine #12624 (US #12622 `Source/Test layout を Redmine 番号付き Epic/Feature
+階層へ全面再移行する`) moved the execution_platform runtime body into the
+Redmine-numbered Epic/Feature layout
+``src/mozyo_bridge/e_110_execution_platform/f_110_workspace_session_identity/application/`` per the reviewed migration
+map (`vibes/docs/specs/bounded-context-map.md`
+`## Redmine-numbered package path map (#12622)`). The relocated module object
+is re-bound here via ``sys.modules`` so the legacy import path
+``mozyo_bridge.application.commands_workspace`` and the new path refer to the exact same module object —
+attribute access and monkeypatch on either path stay equivalent. Do not
+remove this facade outside the fallback-retirement-ledger process.
 """
-from __future__ import annotations
 
-import argparse
-import sys
-from pathlib import Path
+import sys as _sys
 
-from mozyo_bridge.application.commands_common import repo_root_from_args
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
+    commands_workspace as _impl,
+)
 
-
-def cmd_workspace_defaults(args: argparse.Namespace) -> int:
-    """Render or check the workspace-local Redmine default-project snippet.
-
-    Operates on the workspace at ``--repo`` (default cwd). The single
-    source is ``<repo>/.mozyo-bridge/workspace-defaults.yaml`` and the
-    generated output is whatever target(s) the YAML declares (default:
-    ``.mozyo-bridge/redmine-defaults.md``). ``--check`` re-renders in
-    memory and fails on drift; without ``--check`` the rendered output
-    is written to disk.
-    """
-    from mozyo_bridge.workspace_defaults import (
-        collect_render_results,
-        write_render_results,
-    )
-
-    repo_root = repo_root_from_args(args)
-    results = collect_render_results(repo_root)
-    check_only = bool(getattr(args, "check", False))
-
-    def _relative(path: Path) -> str:
-        try:
-            return path.relative_to(repo_root).as_posix()
-        except ValueError:
-            return path.as_posix()
-
-    if check_only:
-        drifted = [result for result in results if result.drift]
-        if drifted:
-            for result in drifted:
-                print(
-                    f"{_relative(result.output_path)} is {result.reason}; rerun "
-                    f"`mozyo-bridge workspace-defaults` (without --check, from the repo root) to regenerate.",
-                    file=sys.stderr,
-                )
-            return 1
-        for result in results:
-            print(f"{_relative(result.output_path)} is up to date")
-        return 0
-
-    written = write_render_results(results)
-    for path in written:
-        print(_relative(path))
-    return 0
+_sys.modules[__name__] = _impl

@@ -1,27 +1,21 @@
 """Compatibility facade — real implementation relocated to
-:mod:`mozyo_bridge.features.execution_platform.delegated_coordinator_nested_handoff.delegation_route_executor`.
+:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_executor`.
 
-The US #12570 source-layout pilot (parent Feature #12533 `140_ソース配置管理`) moved
-the delegated-coordinator live executor out of the technical-layer ``domain/``
-package and into the Redmine Feature-slug package
-``features/execution_platform/delegated_coordinator_nested_handoff/`` (Feature
-#12510). The US #12590/#12591 full expansion (#12591 j#65435 R1 layer-leaf shape,
-#12592 lane) then re-placed it one level deeper into the ``domain/`` layer leaf
-``features/execution_platform/delegated_coordinator_nested_handoff/domain/`` so the
-DDD layer dimension matches the rest of the relocated cluster. This legacy import
-path is preserved per the migration plan
-(``vibes/docs/logics/source-layout-bounded-context-migration.md``); the relocated
-module object is re-bound here via ``sys.modules`` so that
-``mozyo_bridge.domain.delegation_route_executor`` and the new
-``mozyo_bridge.features.execution_platform.delegated_coordinator_nested_handoff.domain.delegation_route_executor``
-refer to the exact same module object — attribute access and monkeypatch on either
-path stay equivalent. Do not remove this facade outside the
-fallback-retirement-ledger process.
+Redmine #12624 (US #12622 `Source/Test layout を Redmine 番号付き Epic/Feature
+階層へ全面再移行する`) moved the execution_platform runtime body into the
+Redmine-numbered Epic/Feature layout
+``src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/`` per the reviewed migration
+map (`vibes/docs/specs/bounded-context-map.md`
+`## Redmine-numbered package path map (#12622)`). The relocated module object
+is re-bound here via ``sys.modules`` so the legacy import path
+``mozyo_bridge.domain.delegation_route_executor`` and the new path refer to the exact same module object —
+attribute access and monkeypatch on either path stay equivalent. Do not
+remove this facade outside the fallback-retirement-ledger process.
 """
 
 import sys as _sys
 
-from mozyo_bridge.features.execution_platform.delegated_coordinator_nested_handoff.domain import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (
     delegation_route_executor as _impl,
 )
 

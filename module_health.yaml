@@ -112,10 +112,15 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/domain/handoff.py
+  - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
     lines: 1449
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
+      Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
+      Redmine-numbered execution_platform layout by #12624 (US #12622); line
+      count unchanged, legacy path preserved as a `sys.modules` facade. Self-
+      module baseline re-point per #12623 conflict-point policy; foreign drift
+      and final module_health integration remain #12630's.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
       delivery outcome / notification body / delivery record (the resolved-text
       rendering stays out of the auto-persist body).
