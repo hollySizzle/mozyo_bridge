@@ -5163,23 +5163,63 @@ def orchestrate_handoff(
     expected_project = getattr(args, "target_project", None)
     if expected_project:
         target_cwd = target_info.get("cwd") or ""
-        git_root = (
-            str(Path(expected_target_repo).expanduser().resolve())
-            if expected_target_repo
-            else infer_repo_root(target_cwd)
-        )
+        # Project scope is layered UNDER the Git repo identity and is never a
+        # substitute for repo preflight (Redmine #12658 review j#66481 blocker 2):
+        # `--target-project` requires an explicit `--target-repo` (incl. `auto`)
+        # gate so the same adopted project id in an unrelated repo can never become
+        # the sole identity gate. `--target-repo` has already been validated above
+        # when present.
+        if not expected_target_repo:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(
+                "`--target-project` requires an explicit `--target-repo` "
+                "(or `--target-repo auto`) Git-repo gate; project scope is layered "
+                "under workspace identity and must not be the sole identity gate. "
+                f"target_project={expected_project!r} was given without "
+                "`--target-repo`. Add `--target-repo <root>` / `--target-repo auto`."
+            )
+            raise AssertionError("unreachable")
+
+        git_root = str(Path(expected_target_repo).expanduser().resolve())
         observed_scope = None
         observed_path = None
         try:
             from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
                 project_scope_for_cwd,
             )
+            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (
+                path_under_repo_relative,
+            )
 
             stamped_scope = (target_info.get("project_scope") or "").strip()
-            if stamped_scope:
+            stamped_path = (target_info.get("project_path") or "").strip()
+            # A stamped pane option is a projection cache, not authority: it is only
+            # trusted when the pane's cwd is actually under the stamped project path
+            # within the verified Git repo root (Redmine #12658 review j#66481
+            # blocker 1) — a stale / wrong option can never bypass the
+            # cwd-under-project condition. Otherwise (or on no stamp) the scope is
+            # re-derived from the live project.yaml sources, which is itself
+            # cwd-under-project by construction and fail-closes on cache drift.
+            if stamped_scope and stamped_path and path_under_repo_relative(
+                target_cwd, repo_root=git_root, project_path=stamped_path
+            ):
                 observed_scope = stamped_scope
-                observed_path = (target_info.get("project_path") or "").strip() or None
-            elif git_root:
+                observed_path = stamped_path
+            else:
                 resolved = project_scope_for_cwd(target_cwd, git_root)
                 if resolved is not None:
                     observed_scope = resolved.scope

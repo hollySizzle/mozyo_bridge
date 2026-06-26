@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6552
+    lines: 6592
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -84,6 +84,10 @@ allowlist:
       discovery / cache / drift policy itself lives in the new
       `f_110_workspace_session_identity/{domain,application}/project_*` modules,
       not here).
+      Raised 6552 -> 6592 for the #12658 review j#66481 fixes in the
+      `target_project` handoff gate (require an explicit `--target-repo` gate
+      under `--target-project`, and verify a stamped pane-option scope's cwd is
+      under the stamped project path before trusting it).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

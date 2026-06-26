@@ -424,6 +424,28 @@ def resolve_project_scope_for_path(
     return best
 
 
+def path_under_repo_relative(
+    candidate_path: str, *, repo_root: str, project_path: str
+) -> bool:
+    """True when ``candidate_path`` is at or below the repo-relative ``project_path``.
+
+    The string-only variant of :func:`path_under_project` for callers that hold a
+    project path (e.g. a stamped ``@mozyo_project_path`` pane option) rather than a
+    full :class:`ProjectScope`. Returns ``False`` when the candidate is outside the
+    repo, or when ``project_path`` is empty — so a stamped scope can never pass the
+    handoff project gate without its cwd being under the stamped project path
+    (Redmine #12658 review j#66481 blocker 1).
+    """
+    if not project_path:
+        return False
+    rel = repo_relative_path(candidate_path, repo_root)
+    if rel is None:
+        return False
+    rel_path = PurePosixPath(rel)
+    base = PurePosixPath(project_path)
+    return rel_path == base or base in rel_path.parents
+
+
 def path_under_project(candidate_path: str, *, repo_root: str, scope: ProjectScope) -> bool:
     """True when ``candidate_path`` is at or below the adopted ``scope``'s path.
 

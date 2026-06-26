@@ -174,13 +174,17 @@ def configure_handoff_parser(
         dest="target_project",
         help=(
             "Optional project-scope gate (Redmine #12658), layered ON TOP of "
-            "the Git `--target-repo` gate, never replacing it. When set, the "
-            "target pane must (1) pass the repo-root gate and (2) resolve to "
-            "this adopted project scope (its `redmine_project` id) with its cwd "
-            "under the project path; otherwise the handoff is rejected with "
-            "`target_project_mismatch`. A target in the correct Git repo but "
-            "outside the expected project path fails closed. Drop the flag to "
-            "gate on the Git repo root only."
+            "the Git `--target-repo` gate, never replacing it. REQUIRES "
+            "`--target-repo` (or `--target-repo auto`) — project scope is layered "
+            "under workspace identity and must not be the sole identity gate. "
+            "When set, the target pane must (1) pass the repo-root gate and (2) "
+            "resolve to this adopted project scope (its `redmine_project` id) with "
+            "its cwd under the project path; otherwise the handoff is rejected "
+            "with `target_project_mismatch`. A target in the correct Git repo but "
+            "outside the expected project path fails closed. A stamped "
+            "`@mozyo_project_scope` pane option is trusted only when the pane cwd "
+            "is actually under the stamped project path. Drop the flag to gate on "
+            "the Git repo root only."
         ),
     )
     parser_.add_argument(

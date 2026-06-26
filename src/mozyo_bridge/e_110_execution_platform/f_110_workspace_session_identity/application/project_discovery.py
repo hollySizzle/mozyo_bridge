@@ -23,6 +23,7 @@ a stale or missing cache never changes which scopes are adopted; it only feeds
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
@@ -185,7 +186,24 @@ def resolve_project_scopes(
 
 @lru_cache(maxsize=256)
 def _cached_adopted_scopes(repo_root: str, max_depth: int) -> tuple[ProjectScope, ...]:
-    adopted, _ = resolve_project_scopes(repo_root, max_depth=max_depth)
+    adopted, drift = resolve_project_scopes(repo_root, max_depth=max_depth)
+    if drift:
+        # Fail closed on generated-cache drift (Redmine #12658 review j#66481
+        # blocker 3): the design source requires a cache/source disagreement to be
+        # SURFACED, never silently resolved to whichever value is convenient. The
+        # runtime-facing project lookup therefore refuses to project ANY scope from
+        # a repo whose `projects.yaml` discovery cache disagrees with its live
+        # `project.yaml` sources, and emits a visible diagnostic (once per repo,
+        # this fn is memoized). Adoption resumes once the operator regenerates the
+        # cache. A repo with NO generated cache has no drift and is unaffected.
+        detail = "; ".join(f"{d.kind}:{d.cache_key}" for d in drift[:5])
+        print(
+            f"warning: project discovery cache drift in {repo_root!r}; project "
+            f"scope projection disabled until the generated `projects.yaml` "
+            f"discovery_cache is regenerated ({detail})",
+            file=sys.stderr,
+        )
+        return ()
     return tuple(adopted)
 
 
@@ -197,7 +215,9 @@ def adopted_scopes_for_repo(
     ``agents targets`` / cockpit resolve the project scope for many panes sharing
     a handful of repo roots; this caches the per-root discovery so the bounded
     scan runs once per distinct root per process. Returns an empty tuple for a
-    missing / unknown root.
+    missing / unknown root, AND fails closed (empty) when the repo's generated
+    discovery cache is in drift (Redmine #12658 review j#66481 blocker 3) so no
+    surface silently projects a scope from a drifted cache.
     """
     if not repo_root:
         return ()

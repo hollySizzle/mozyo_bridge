@@ -338,5 +338,68 @@ class FilesystemScanTests(unittest.TestCase):
         self.assertIsNone(pd.project_scope_for_cwd(str(self.repo), str(self.repo)))
 
 
+class DriftFailClosedTests(unittest.TestCase):
+    """Runtime lookup must fail closed on generated-cache drift (j#66481 blocker 3)."""
+
+    _DOC = _ENABLED_DOC
+
+    def setUp(self):
+        pd.clear_discovery_cache()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / ".git").mkdir()
+        self.proj = self.repo / "projects" / "giken-cloud-drive-management"
+        self.proj.mkdir(parents=True)
+        (self.proj / "project.yaml").write_text(self._DOC, encoding="utf-8")
+        (self.proj / "src").mkdir()
+
+    def tearDown(self):
+        pd.clear_discovery_cache()
+        self._tmp.cleanup()
+
+    def _write_cache(self, fingerprint: str):
+        # A generated root projects.yaml whose discovery_cache entry disagrees
+        # with the live source fingerprint.
+        (self.repo / "projects.yaml").write_text(
+            "projects: {}\n"
+            "discovery_cache:\n"
+            "  generated_by: mozyo-bridge project discovery\n"
+            "  generated_at: \"2026-06-27T00:00:00Z\"\n"
+            "  entries:\n"
+            "    - cache_key: \"project:giken-cloud-drive-management@projects/giken-cloud-drive-management\"\n"
+            "      source: projects/giken-cloud-drive-management/project.yaml\n"
+            "      path: projects/giken-cloud-drive-management\n"
+            "      redmine_project: giken-cloud-drive-management\n"
+            "      display_label: \"クラウドドライブ管理\"\n"
+            "      runtime_identity_enabled: true\n"
+            f"      fingerprint: \"{fingerprint}\"\n",
+            encoding="utf-8",
+        )
+
+    def test_no_cache_projects_scope_normally(self):
+        # Sanity: no generated cache -> no drift -> scope projects.
+        scope = pd.project_scope_for_cwd(str(self.proj / "src"), str(self.repo))
+        self.assertIsNotNone(scope)
+
+    def test_drifted_cache_fails_closed_no_projection(self):
+        import contextlib
+        import io
+
+        self._write_cache("sha256:stale-does-not-match")
+        pd.clear_discovery_cache()
+        # resolve_project_scopes reports drift...
+        adopted, drift = pd.resolve_project_scopes(str(self.repo))
+        self.assertTrue(drift)
+        # ...and the runtime-facing lookup refuses to project a scope (the
+        # expected fail-closed diagnostic goes to stderr; capture it for clean
+        # test output).
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(pd.adopted_scopes_for_repo(str(self.repo)), ())
+            self.assertIsNone(
+                pd.project_scope_for_cwd(str(self.proj / "src"), str(self.repo))
+            )
+        self.assertIn("cache drift", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
