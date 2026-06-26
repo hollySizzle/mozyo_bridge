@@ -486,7 +486,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/session-boundary.md
-    purpose: "Codex / Claude / pane / compact 境界の判定 (scope / pressure / preservation signal)、next-session boundary prompt の内容仕様、Claude pane lifecycle (reuse / new / orphan / guarded kill) の運用正本。durable Redmine journal + repo / execution root から replay でき、kill は owner-approval gate に保つ。"
+    purpose: "Codex / Claude / pane / compact 境界の判定 (scope / pressure / preservation signal)、next-session boundary prompt の内容仕様、Claude pane lifecycle (reuse / new / orphan / guarded kill) の運用正本。prompt は issue id だけでなく short subject / issue role / parent / non-goals を含め、durable Redmine journal + repo / execution root から replay でき、kill は owner-approval gate に保つ。"
     audit_role: session_boundary_logic
     related_document_refs:
       - logic-coordinator-sublane-development-flow

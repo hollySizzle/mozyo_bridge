@@ -58,6 +58,8 @@ boundary_signals:
 boundary_prompt_fields:
   必須:
     - issue (ticket id)
+    - issue_subject   # 短い subject。長文なら要約してよい
+    - issue_role      # この issue が何をするものか: smoke本番 / pre-smoke再検証 / metadata cleanup / operator decision 等
     - journal (latest anchor journal id)
   portable_pointer:
     - repo            # portable identifier (canonical session name / workspace id)。絶対 path にしない
@@ -74,6 +76,8 @@ boundary_prompt_fields:
 ```
 
 - prompt 先頭は handoff notification と同じ **durable-anchor 契約**で始める: 「anchor journal を source-of-truth system から読んでから着手せよ。以下は pointer であって新しい authority ではない」。
+- issue id だけを提示しない。少なくとも `issue id + short subject + issue_role + parent_issue` を同じ行または隣接行に置き、特に smoke / release / cleanup / readiness のように誤実行が高コストな issue では `not_this_issue` / `non_goals` を明示する。例: `#12650 Post-layout #12546 pre-smoke readiness を再検証する` は #12546 smoke 本番ではなく、#12499 配下の Test であり、#12546 を実行しない。
+- auto-generated subject が長すぎる、description の先頭を丸ごと使っている、または issue id だけでは役割が判別できない場合は、次 session prompt を出す前に subject を短く正規化し、clarification journal を残す。読み手が Redmine を開く前に「どの issue が本番実行で、どの issue が前提確認か」を取り違えないことを prompt の品質条件にする。
 - **repo は portable identifier (canonical session name) で参照**し、checkout は workspace registry から解決する。pane location からは解決しない。絶対 repo root と execution-root workdir は構造化出力 (`--json`) にのみ載せ、pasteable text には載せない ([[rule-public-private-boundary]])。
 - 実装: `mozyo-bridge session boundary-prompt --issue <id> --journal <id> [--parent ...] [--commit ...] [--target-lane ...] [--execution-root <abs>] [--gate ...] [--verification ...] [--residual ... (repeatable)] [--pending-action ...] [--next-actor owner|claude|codex] [--signal <name> (repeatable)] [--json]`。default は pasteable markdown、`--json` は prompt field + `prompt_markdown` + 絶対 `repo_root`。formatter 正本は `session_boundary.build_boundary_prompt`。
 
