@@ -421,7 +421,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/object-oriented-architecture-policy.md
-    purpose: "v0.10.22 以降の architecture work で OOP-first と static typing を基本姿勢にする設計思想正本。CLI / use case / domain policy / port-adapter / value object の責務境界と pure function の残し方を定義する。"
+    purpose: "OOP-first architecture and static typing planning bucket 以降の architecture work で OOP-first と static typing を基本姿勢にする設計思想正本。CLI / use case / domain policy / port-adapter / value object の責務境界と pure function の残し方を定義する。"
     audit_role: object_oriented_architecture_policy_logic
     related_document_refs:
       - logic-refactor-split-strategy

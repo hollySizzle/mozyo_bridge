@@ -68,7 +68,7 @@ main lane Claude が implementation request を受け取った場合は、実装
 
 現行実装では、worktree の add / remove は素の git または operator recipe で行う。mozyo-bridge core はまだ Git worktree manager ではない。具体 path / branch 命名、local soft profile、private cockpit composition は operator runtime policy であり OSS default に混ぜない。
 
-#12603 / v0.10.21 では、この境界を「設定駆動の sublane lifecycle」として再設計する。Git worktree 管理を sublane command に組み込むか、retire 時に target branch へ自動 merge するかは config knob で制御し、mozyo_bridge dogfood では UX 重視の default として core-managed worktree + retire-time merge を採用する方向で検討する。merge conflict / checkout failure / dirty state などで安全に統合できない場合、sublane は退役せず、管制塔へ feedback を返す。
+#12603 / `sublane lifecycle and worktree integration late window` planning bucket では、この境界を「設定駆動の sublane lifecycle」として再設計する。Git worktree 管理を sublane command に組み込むか、retire 時に target branch へ自動 merge するかは config knob で制御し、mozyo_bridge dogfood では UX 重視の default として core-managed worktree + retire-time merge を採用する方向で検討する。merge conflict / checkout failure / dirty state などで安全に統合できない場合、sublane は退役せず、管制塔へ feedback を返す。
 
 ```text
 git worktree add <worktree-path> -b <branch>
@@ -543,7 +543,7 @@ stop
 
 ## US close と Version close
 
-US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。
+US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。ここでの Version は Redmine planning bucket / acceptance bundle であり、package release 番号の決定ではない。package release 番号、tag、publish scope は release gate へ渡して別に決める。
 
 US close / Version readiness / session retrospective の前に、管制塔は `$backlog_reconciliation()` を実行する。目的は backlog を綺麗に保つことではなく、owner intent が durable record から消えないことを優先することである。特に、owner が将来機能、未決判断、標準化、配布形態、責務境界について述べた場合、実装しない判断でも未記録のまま scope 外として閉じない。
 
@@ -600,7 +600,7 @@ retirement は destructive 寄りの操作なので、pane kill / worktree remov
 
 提案順は、まず callback / review / owner / integration / close / retirement を drain し、次に `$backlog_reconciliation()` で immediate durable classification の漏れを確認し、その後に Version / US を提案する。Version roadmap を提案する場合は、各 Version を `container issue exists` または `owner decision pending` に分類してから owner approval へ進む。owner approval 後に作る Version / US も、作成結果の issue id / Version id を元の planning issue に relation または journal で戻す。
 
-2026-06-20 時点の module health / PyLint responsibility hardening roadmap では、次の Version anchor と container issue が作成済みである。これらは「後で」「別 Version」の会話を durable classification へ落とした例として扱う。
+2026-06-20 時点の module health / PyLint responsibility hardening roadmap では、次の Version anchor と container issue が作成済みである。これらは「後で」「別 Version」の会話を durable classification へ落とした歴史的な例として扱う。番号付き Version 名は当時の anchor であり、新規 planning bucket の命名例ではない。
 
 - Version #238 `v0.10.7 module health visibility / PyLint gate foundation` -> #12321
 - Version #239 `v0.10.8 presentation responsibility split` -> #12322
