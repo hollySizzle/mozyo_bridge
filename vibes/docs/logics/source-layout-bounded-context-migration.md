@@ -303,9 +303,119 @@ big-box の 1 module で behavior-preserving に実証した (base `13303db`)。
 - cross-module の `test_delegation_route_integration_readiness.py` (integration) は executor 単独の
   1:1 test ではないため移動せず、facade 経由で従来 path のまま green。cluster 全体移動時に追従する。
 
+## #12590 Full Expansion — scoped bulk-move reversal (parallel context lanes)
+
+US #12590 (parent Feature #12533) は #12570 pilot を全 `src/**` / `tests/**` へ展開し
+pilot-only 状態を解消する。owner 承認の parallelization (#12590 j#65413) により実装を
+bounded context 単位の parallel sublane へ分割し、#12591 を coordination / integration
+slice とする。本節は 5 context lane が従う shared authority であり、#12591 が唯一の編集 owner
+(#12591 j#65454 Decision 2)。
+
+### Scoped bulk-move reversal (本 US 限定の例外)
+
+本ドキュメント冒頭の「一括移動は禁止する」/ 後段 Non-Goals「一括 (mega) リファクタブランチ」は
+standing rule として維持する。ただし #12590/#12591 に限り、#12570 pilot 合格後の follow-up
+として scoped に解禁する。解禁の制約:
+
+- per-context lane で move を分割する (単一 mega-branch にしない)。
+- move-only commit に behavior / module-health baseline 変更を混ぜない。
+- docs/map update と source/test move を replay 可能に分ける (#12591 が docs、lane が move)。
+- legacy import path は facade で温存する (撤去は `fallback-retirement-ledger.md` 経由のみ)。
+
+### Target shape (R1 layer-leaf, #12591 j#65435)
+
+real module の移動先:
+
+```text
+src/mozyo_bridge/features/<epic_slug>/[<feature_slug>/]<layer>/<module>.py
+```
+
+- `layer` ∈ `domain` / `application` / `infrastructure`。旧 public import path の layer 次元を保持する。
+- 理由: `domain/<name>.py` と `application/<name>.py` が同名別責務の real module として共存する
+  (検証例: `grandchild_dispatch` domain 623行 / application 465行、`grandchild_stamp`、
+  `delegation_launch_adopt`)。flat `features/<epic>/<feature>/<module>.py` では同一 path に
+  衝突するため layer leaf を残す。
+- `feature_slug` は execution_platform の定義済み slug のみ (#12507–#12512、`bounded-context-map.md`)。
+  他 Epic は Epic-level (`features/<epic_slug>/<layer>/`) に留め、未定義 Feature slug を実装中に新設しない。
+- numeric prefix は import path に焼かない (Redmine order は `bounded-context-map.md` の metadata)。
+
+旧 import path は pilot と同一の `sys.modules` facade idiom で温存する:
+
+```python
+import sys as _sys
+from mozyo_bridge.features.<epic>.[<feature>.]<layer> import <module> as _impl
+_sys.modules[__name__] = _impl
+```
+
+facade は同一 module object を re-bind し、attribute / monkeypatch 等価性を保つ。
+
+tests: 既存の `tests/<type>/<epic_slug>/...` を基本形にする。Feature subdir は source に
+Feature slice がある場合のみ。layer leaf は tests に持ち込まない。ROOT bootstrap
+`Path(__file__).resolve().parents[N]` の N は移動深さに合わせて bump する (#12490 mechanics)。
+
+### Fixed surfaces held this round (#12591 j#65435 Decision 3)
+
+本 round では移動しない (residual として記録):
+
+| held | 理由 |
+| --- | --- |
+| `core/state/` | #12493 Unit A で package 化済み。再移動は二重 facade churn |
+| `domain/presentation_grouping/` | relative import を持つ subpackage。package facade / submodule alias が要 |
+| `docs_tools/` | 同上 (relative import subpackage) |
+| `scaffold/` (`presets/**` / `canonical_sources/**`) | pyproject `package-data` glob 結合 |
+| `shared/` (`errors`/`paths`/`name_compat`) | 最下層 kernel |
+| `infrastructure/` (特に `tmux_client.py`) | tmux-send-safety-contract |
+| `__init__.py` / `__main__.py` | package root entry / `python -m` 入口 |
+| `application/cli.py` | pyproject entry point `cli:main` (移行最後まで固定) |
+| `application/commands.py` | facade / composition surface。patch target 維持 |
+| `application/cli_common` / `cli_core` / `commands_common` | CLI composition root family |
+
+`.mozyo-bridge/docs/file_conventions.generated.yaml` は generator 出力。手編集禁止。
+
+### Ambiguous module — residual policy
+
+map の「主要 source」明記分と明確な naming cluster (`delegation_*` / `grandchild_*`) のみ
+確信配置する。真に判断不能な module は独断配置せず、各 lane が residual list + 理由を
+implementation_done に記録し、#12591 が統合時に裁定する。residual が受入条件を阻害する規模に
+なった場合は追加 design consultation に戻す。既知 residual 候補: `application/doctor`
+(cross-cutting diagnostics + module-health baseline)、`domain/repo_local_config` /
+`application/repo_local_config_loader` / `application/cli_runtime_config` (#12490 で tests を
+flat 例外として残した fail-closed 群)。
+
+### Ownership split (#12590 j#65413 / #12591 j#65454)
+
+- **#12591 (coordination / integration slice)**: 本 shared docs/map の唯一の編集 owner。
+  facade idiom / `application/commands.py` / CLI composition root / catalog / file convention /
+  `module_health.yaml` の統一 policy を持ち、child lane の implementation_done を集約して
+  final integration の single source of truth を維持する。context-owned move は横取りしない。
+- **context child lanes**: 各 context の real module source move + matching tests move /
+  reference update + lane-local verification + implementation_done。shared surface 変更が
+  必要なときは #12591 へ handoff する。child lane は #12591 で明示 coordination された場合のみ
+  shared docs を直接編集する (parallel autonomous-lane edit で競合更新しない)。
+
+| Epic context | child task | 主 source root (`bounded-context-map.md`「主要 source」) |
+| --- | --- | --- |
+| `execution_platform` | #12592 | handoff / session / state / runtime observation / delegated coordinator cluster |
+| `operations_cockpit` | #12593 | `cockpit_*` / `grouped_*` / attention / presentation provider CLI |
+| `governance_distribution` | #12594 | docs catalog tooling CLI / release / instruction install |
+| `adapter_provider` | #12595 | ticket adapter / redmine adapter / provider registry / plugin manifest |
+| `quality_architecture` | #12596 | `module_health` / `module_registry` CLI |
+
+pilot module `delegation_route_executor` の R1 再配置
+(`features/execution_platform/delegated_coordinator_nested_handoff/domain/`) は #12592
+execution_platform lane が担当する (#12591 j#65454 Decision 3)。#12570 closed history は変更せず、
+expansion scope による follow-up placement correction として記録する。
+
+### Verification (umbrella close 前に #12591 が横断確認)
+
+full `python3 -m unittest discover -s tests` (count parity) / `docs validate --check-file-coverage` /
+`generate-file-conventions --check` / `audit-impact --all-changed --check-generated` /
+`health check` / `git diff --check`。#12546 real-machine smoke は held、release/tag/publish なし。
+
 ## Non-Goals
 
-- 一括 (mega) リファクタブランチ。
+- 一括 (mega) リファクタブランチ (#12590/#12591 の scoped per-lane reversal は上記
+  `## #12590 Full Expansion` の制約下でのみ例外)。
 - move commit 内の behavior 変更 / module-health baseline 変更。
 - `domain → infrastructure` layer purity の全面修正を context 移行と同一 commit で行うこと
   (context 内 follow-up に分離)。

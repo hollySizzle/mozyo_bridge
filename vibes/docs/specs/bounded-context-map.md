@@ -63,6 +63,36 @@ tests/integration/execution_platform/delegated_coordinator_nested_handoff/
 Redmine 側の renumber は path rename へ自動反映しない。renumber は mapping metadata の更新として扱い、
 repo slug の rename は別 issue で明示的に判断する。
 
+### Full expansion target shape (#12590 / R1 layer-leaf)
+
+US #12590 は #12570 pilot を全 `src/**` へ展開する。target shape は **R1 layer-leaf** (#12591 j#65435):
+
+```text
+src/mozyo_bridge/features/<epic_slug>/[<feature_slug>/]<layer>/<module>.py
+```
+
+- `layer` ∈ `domain` / `application` / `infrastructure`。`domain/<name>.py` と
+  `application/<name>.py` が同名別責務 module として共存する (例 `grandchild_dispatch` /
+  `grandchild_stamp` / `delegation_launch_adopt`) ため、flat leaf では衝突する。layer 次元を残す。
+- `feature_slug` は execution_platform の定義済み slug のみ (上表 #12507–#12512)。他 Epic は
+  Epic-level (`features/<epic_slug>/<layer>/`) に留め、未定義 Feature slug を実装中に新設しない。
+- 旧 import path は `sys.modules` facade idiom で温存する (同一 module object 再束縛)。
+- 実装は context 別 parallel lane に分割し、#12591 が coordination / integration + 本 shared
+  docs/map の唯一の編集 owner (#12590 j#65413 / #12591 j#65454)。詳細方針・固定 surface・residual
+  policy は `vibes/docs/logics/source-layout-bounded-context-migration.md` の
+  `## #12590 Full Expansion` を正本とする。
+
+| Epic context | 主対応 Epic | child task (move owner) |
+|---|---|---|
+| `execution_platform` | #12501 | #12592 |
+| `operations_cockpit` | #12502 | #12593 |
+| `governance_distribution` | #12503 | #12594 |
+| `adapter_provider` | #12504 | #12595 |
+| `quality_architecture` | #12505 | #12596 |
+
+pilot module `delegation_route_executor` の R1 再配置 (`.../delegated_coordinator_nested_handoff/domain/`)
+は #12592 が担当する (#12591 j#65454)。
+
 ## Redmine catalog inventory (snapshot)
 
 採番規約: Epic / Feature は独立採番で `110` から 10 刻み。表示名はスペースなし・中点区切り・日本語寄せ。
