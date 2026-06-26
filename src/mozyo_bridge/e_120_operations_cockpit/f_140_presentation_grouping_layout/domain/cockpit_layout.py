@@ -54,6 +54,17 @@ ROLE_OPTION = "@mozyo_agent_role"
 LANE_OPTION = "@mozyo_lane_id"
 LANE_LABEL_OPTION = "@mozyo_lane_label"
 
+# Project-scoped cockpit identity (Redmine #12658). A monorepo project subdir is
+# a routing / presentation scope *under* the workspace; when a cockpit column is
+# summoned from inside an adopted project the column's panes carry the project
+# scope as projection metadata on these user options. Stamped only when a project
+# scope is resolved — a single-repo workspace column leaves them unset, so its
+# display is unchanged. NEVER routing authority: the `--target-repo` gate and Git
+# operations stay anchored to the repository root.
+PROJECT_SCOPE_OPTION = "@mozyo_project_scope"
+PROJECT_PATH_OPTION = "@mozyo_project_path"
+PROJECT_LABEL_OPTION = "@mozyo_project_label"
+
 # A checkout that is not a distinct lane — the primary worktree, the registered
 # canonical checkout, or a non-git workspace — belongs to the "default" lane.
 # Pre-#11820 cockpit panes carry no `@mozyo_lane_id` and normalize to this same
@@ -78,6 +89,13 @@ class CockpitWorkspace:
     # "default" lane.
     lane_id: str = DEFAULT_LANE
     lane_label: Optional[str] = None
+    # Project-scoped cockpit identity (Redmine #12658). Set when the column is
+    # summoned from inside an adopted monorepo project; empty for a single-repo
+    # workspace so its display is unchanged. Projection metadata under the
+    # workspace identity, never Git / routing authority.
+    project_scope: Optional[str] = None
+    project_path: Optional[str] = None
+    project_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +113,12 @@ class CockpitPane:
     anchor: Optional[str]
     lane_id: str = DEFAULT_LANE
     lane_label: Optional[str] = None
+    # Project-scoped cockpit identity (Redmine #12658), carried from the column's
+    # workspace so the pane stamps `@mozyo_project_scope` / `@mozyo_project_path` /
+    # `@mozyo_project_label`. Empty for a single-repo workspace pane.
+    project_scope: Optional[str] = None
+    project_path: Optional[str] = None
+    project_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +173,12 @@ class CockpitPlan:
                     "anchor": p.anchor,
                     "lane_id": p.lane_id,
                     "lane_label": p.lane_label,
+                    # Project-scoped cockpit identity (#12658); the Git repo_root
+                    # above stays the workspace authority, project_path is the
+                    # repo-relative project directory — kept visibly separate.
+                    "project_scope": p.project_scope,
+                    "project_path": p.project_path,
+                    "project_label": p.project_label,
                 }
                 for p in self.panes
             ],
@@ -169,6 +199,9 @@ def pane_identity_commands(
     lane_id: str,
     lane_label: Optional[str] = None,
     title: Optional[str] = None,
+    project_scope: Optional[str] = None,
+    project_path: Optional[str] = None,
+    project_label: Optional[str] = None,
 ) -> list["CockpitCommand"]:
     """Title (human-facing) + workspace/role/lane tmux user options (machine-readable).
 
@@ -227,6 +260,43 @@ def pane_identity_commands(
                 purpose=f"label lane {lane_label} ({workspace_id})",
             )
         )
+    # Project-scoped cockpit identity (#12658). Stamped only when the column was
+    # summoned from inside an adopted project — a single-repo workspace column
+    # leaves these unset, so its pane options are byte-identical to pre-#12658.
+    # The Git workspace identity above is unchanged; this is additive projection.
+    if project_scope:
+        commands.append(
+            CockpitCommand(
+                argv=(
+                    "set-option", "-p", "-t", pane_token,
+                    PROJECT_SCOPE_OPTION, project_scope,
+                ),
+                captures=None,
+                purpose=f"mark project {project_scope} ({workspace_id})",
+            )
+        )
+        if project_path:
+            commands.append(
+                CockpitCommand(
+                    argv=(
+                        "set-option", "-p", "-t", pane_token,
+                        PROJECT_PATH_OPTION, project_path,
+                    ),
+                    captures=None,
+                    purpose=f"mark project path {project_path} ({workspace_id})",
+                )
+            )
+        if project_label:
+            commands.append(
+                CockpitCommand(
+                    argv=(
+                        "set-option", "-p", "-t", pane_token,
+                        PROJECT_LABEL_OPTION, project_label,
+                    ),
+                    captures=None,
+                    purpose=f"label project {project_label} ({workspace_id})",
+                )
+            )
     return commands
 
 
@@ -239,6 +309,9 @@ def _pane_identity_commands(pane: "CockpitPane") -> list["CockpitCommand"]:
         lane_id=pane.lane_id,
         lane_label=pane.lane_label,
         title=pane.title,
+        project_scope=pane.project_scope,
+        project_path=pane.project_path,
+        project_label=pane.project_label,
     )
 
 
@@ -629,6 +702,9 @@ class CockpitAdoptPlan:
                     "workspace_id": p.workspace_id,
                     "lane_id": p.lane_id,
                     "lane_label": p.lane_label,
+                    "project_scope": p.project_scope,
+                    "project_path": p.project_path,
+                    "project_label": p.project_label,
                     "title": p.title,
                     "height_pct": p.height_pct,
                 }
@@ -704,6 +780,8 @@ def build_cockpit_adopt_plan(
             title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
             height_pct=codex_ratio, anchor=workspace.codex_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
         CockpitPane(
             token=source_claude_pane, column=column_index, role=ROLE_CLAUDE,
@@ -712,6 +790,8 @@ def build_cockpit_adopt_plan(
             title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
             height_pct=claude_ratio, anchor=workspace.claude_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
     )
     stamp_commands: list[CockpitCommand] = []
@@ -803,6 +883,9 @@ def build_cockpit_plan(
                 anchor=ws.codex_anchor,
                 lane_id=ws.lane_id,
                 lane_label=ws.lane_label,
+                project_scope=ws.project_scope,
+                project_path=ws.project_path,
+                project_label=ws.project_label,
             )
         )
         prev_codex_token = codex_token
@@ -849,6 +932,9 @@ def build_cockpit_plan(
                 anchor=ws.claude_anchor,
                 lane_id=ws.lane_id,
                 lane_label=ws.lane_label,
+                project_scope=ws.project_scope,
+                project_path=ws.project_path,
+                project_label=ws.project_label,
             )
         )
 
@@ -958,6 +1044,8 @@ def build_cockpit_append_plan(
             title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
             height_pct=codex_ratio, anchor=workspace.codex_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
         CockpitPane(
             token=claude_token, column=column_index, role=ROLE_CLAUDE,
@@ -966,6 +1054,8 @@ def build_cockpit_append_plan(
             title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
             height_pct=claude_ratio, anchor=workspace.claude_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
     )
     for pane in panes:
@@ -1143,6 +1233,8 @@ def build_group_window_create_plan(
             title=_pane_title(workspace.label, ROLE_CODEX, workspace.codex_anchor),
             height_pct=codex_ratio, anchor=workspace.codex_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
         CockpitPane(
             token=claude_token, column=0, role=ROLE_CLAUDE,
@@ -1151,6 +1243,8 @@ def build_group_window_create_plan(
             title=_pane_title(workspace.label, ROLE_CLAUDE, workspace.claude_anchor),
             height_pct=claude_ratio, anchor=workspace.claude_anchor,
             lane_id=workspace.lane_id, lane_label=workspace.lane_label,
+            project_scope=workspace.project_scope, project_path=workspace.project_path,
+            project_label=workspace.project_label,
         ),
     )
     for pane in panes:

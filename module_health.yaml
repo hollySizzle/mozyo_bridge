@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6389
+    lines: 6552
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -76,12 +76,20 @@ allowlist:
       `_activate_target_pane` / `_window_active_pane_id` helpers, threading the
       `TargetActivationOutcome` through the emit/persist paths; the admission /
       activation / policy types live in `domain/handoff.py`, not here).
+      Raised 6389 -> 6552 for the #12658 project-scoped cockpit identity wiring
+      (the `_resolve_project_scope_fields` helper + project-scope resolution
+      threaded through the three cockpit-workspace construction sites and
+      `_agents_target_candidates`, the appended PROJECT/PROJECT_PATH columns in
+      `cmd_agents_targets`, and the additive `target_project` handoff gate; the
+      discovery / cache / drift policy itself lives in the new
+      `f_110_workspace_session_identity/{domain,application}/project_*` modules,
+      not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
-    lines: 2344
+    lines: 2438
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
       to split along geometry vs projection responsibilities. Path re-keyed from
@@ -89,6 +97,12 @@ allowlist:
       Redmine-numbered layout move (old path kept as a sys.modules facade); the
       re-key lands in the same commit as the move per #12591 j#65488 atomicity.
       The module is byte-unchanged and the split itself is still owner #12321 scope.
+      Raised 2344 -> 2438 for the #12658 project-scoped cockpit identity additive
+      fields (`@mozyo_project_scope`/`@mozyo_project_path`/`@mozyo_project_label`
+      option constants, the project fields on `CockpitWorkspace`/`CockpitPane` +
+      their `as_dict` projections, and the project stamps in
+      `pane_identity_commands`). Additive only — single-repo columns are
+      byte-identical to pre-#12658.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

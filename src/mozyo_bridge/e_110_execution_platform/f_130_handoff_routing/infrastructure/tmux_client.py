@@ -66,7 +66,15 @@ def try_pane_lines() -> list[dict[str, str]] | None:
         # pointer; depth / root are re-derived from the parent chain, never read
         # from the (deliberately omitted) `@mozyo_delegation_depth` cache. Empty
         # for panes outside a delegation tree -> the display shows them blank.
-        "#{@mozyo_lane_kind}\t#{@mozyo_delegation_parent}"
+        "#{@mozyo_lane_kind}\t#{@mozyo_delegation_parent}\t"
+        # Project-scoped cockpit identity (Redmine #12658). A monorepo project
+        # subdir is a routing / presentation scope *under* the workspace, stamped
+        # as projection metadata: `@mozyo_project_scope` is the redmine project id,
+        # `@mozyo_project_path` the repo-relative project directory, and
+        # `@mozyo_project_label` the human-facing (possibly non-ASCII) label. Empty
+        # for panes that carry no project scope -> single-repo display is
+        # unchanged. APPENDED so the existing field positions never shift.
+        "#{@mozyo_project_scope}\t#{@mozyo_project_path}\t#{@mozyo_project_label}"
     )
     try:
         result = run_tmux("list-panes", "-a", "-F", fmt, check=False)
@@ -87,10 +95,10 @@ def pane_lines() -> list[dict[str, str]]:
 def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
     panes: list[dict[str, str]] = []
     for line in stdout.splitlines():
-        # 12 tab-separated fields; the trailing mozyo option fields are empty for
+        # 15 tab-separated fields; the trailing mozyo option fields are empty for
         # panes that do not carry them (older tmux output / pre-option panes).
         # Splitting with maxsplit keeps any stray tab inside the last field.
-        parts = (line.split("\t", 11) + [""] * 12)[:12]
+        parts = (line.split("\t", 14) + [""] * 15)[:15]
         (
             pane_id,
             location,
@@ -104,6 +112,9 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
             lane_label,
             lane_kind,
             delegation_parent,
+            project_scope,
+            project_path,
+            project_label,
         ) = parts
         panes.append(
             {
@@ -121,6 +132,12 @@ def _parse_pane_lines(stdout: str) -> list[dict[str, str]]:
                 # for panes outside a delegation tree; never routing authority.
                 "lane_kind": lane_kind,
                 "delegation_parent": delegation_parent,
+                # Project-scoped cockpit identity (#12658). Empty for panes that
+                # carry no project scope; projection metadata, never routing
+                # authority (the Git repo gate stays repo-root-anchored).
+                "project_scope": project_scope,
+                "project_path": project_path,
+                "project_label": project_label,
             }
         )
     return panes

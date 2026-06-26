@@ -33,7 +33,8 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 
 def _pane(pane_id, location, *, command="node", cwd="/work/repo",
           window_name="cockpit", pane_active="1", agent_role="",
-          lane_id="", lane_label="", lane_kind="", delegation_parent=""):
+          lane_id="", lane_label="", lane_kind="", delegation_parent="",
+          project_scope="", project_path="", project_label=""):
     return {
         "id": pane_id,
         "location": location,
@@ -47,6 +48,9 @@ def _pane(pane_id, location, *, command="node", cwd="/work/repo",
         "lane_label": lane_label,
         "lane_kind": lane_kind,
         "delegation_parent": delegation_parent,
+        "project_scope": project_scope,
+        "project_path": project_path,
+        "project_label": project_label,
     }
 
 
@@ -89,6 +93,50 @@ class BuildTargetCandidatesTest(unittest.TestCase):
         self.assertEqual("local", c.host)
         # Role resolved from the pane option -> managed/cockpit projection.
         self.assertEqual("cockpit_pane", c.view_kind)
+
+    def test_stamped_project_scope_is_projected(self) -> None:
+        # A pane carrying `@mozyo_project_scope` (cockpit-managed) projects the
+        # project scope alongside the workspace identity (#12658).
+        records = self._records([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="claude",
+                  project_scope="giken-cloud-drive-management",
+                  project_path="projects/giken-cloud-drive-management",
+                  project_label="クラウドドライブ管理"),
+        ])
+        cands = build_target_candidates(
+            records, resolve_workspace=lambda root: ("wsGK", "gk-3500-it-operations")
+        )
+        c = cands[0]
+        self.assertEqual("gk-3500-it-operations", c.workspace_label)
+        self.assertEqual("giken-cloud-drive-management", c.project_scope)
+        self.assertEqual("projects/giken-cloud-drive-management", c.project_path)
+        self.assertEqual("クラウドドライブ管理", c.project_label)
+        # JSON projection nests project scope under identity; never an abs path.
+        identity = c.to_dict()["identity"]
+        self.assertEqual(identity["project_scope"], "giken-cloud-drive-management")
+        self.assertFalse(c.project_path.startswith("/"))
+
+    def test_unstamped_pane_derives_project_scope_from_cwd(self) -> None:
+        # A normal `mozyo` pane (no stamp) derives its scope from its cwd via the
+        # injected resolver, so it still projects project scope.
+        records = self._records([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        def resolve_project(repo_root, cwd):
+            return ("giken-cloud-drive-management", "projects/giken-cloud-drive-management", "クラウドドライブ管理")
+        cands = build_target_candidates(records, resolve_project=resolve_project)
+        self.assertEqual(cands[0].project_scope, "giken-cloud-drive-management")
+
+    def test_single_repo_pane_has_no_project_scope(self) -> None:
+        # No stamp and a resolver that finds nothing -> empty project scope, so a
+        # single-repo workspace is unchanged (additive null in JSON).
+        records = self._records([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        cands = build_target_candidates(records, resolve_project=lambda r, c: None)
+        self.assertEqual(cands[0].project_scope, "")
+        self.assertIsNone(cands[0].to_dict()["identity"]["project_scope"])
 
     def test_normal_window_pane_projects_normal_view_kind(self) -> None:
         # Role from the window name (no `@mozyo_agent_role`) is the normal-`mozyo`
