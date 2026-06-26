@@ -108,7 +108,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/bounded-context-map.md
-    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine 階層を焼き込まず横断作業を分類する。
+    purpose: Redmine Epic/Feature catalog と repo bounded context / tests / source / docs の対応表正本。Redmine の番号・順序を mapping metadata として保持し、importable path は ASCII snake_case slug に正規化する。
     audit_role: bounded_context_map_spec
     related_document_refs:
       - spec-project-map
@@ -401,7 +401,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/source-layout-bounded-context-migration.md
-    purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の bounded context (handoff / coordinator / cockpit / governance / scaffold / release / plugin adapter + shared kernel / managed-state) へ段階移行する計画正本。import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。"
+    purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の import-safe slug 階層へ段階移行する計画正本。Redmine 番号は mapping metadata として保持し、import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。"
     audit_role: source_layout_bounded_context_migration_logic
     related_document_refs:
       - logic-refactor-split-strategy
@@ -872,7 +872,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/tests-placement-discovery-policy.md
-    purpose: "tests の test type (unit/integration/scenarios/regressions/support) と #12488 bounded context を type-first で組み合わせる配置規約、新規テストの一意な配置決定木、`unittest discover -s tests -v` 不変の discovery 方針と #12490 への __init__.py package 化移行契約。"
+    purpose: "tests の test type (unit/integration/scenarios/regressions/support) と #12488 bounded context / Feature slug を type-first で組み合わせる配置規約。Redmine 番号は metadata とし、directory は import-safe slug にする。`unittest discover -s tests -v` 不変の discovery 方針と #12490 への __init__.py package 化移行契約。"
     audit_role: tests_placement_discovery_policy_logic
     related_document_refs:
       - logic-turnkey-e2e-acceptance

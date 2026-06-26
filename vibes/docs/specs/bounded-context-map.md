@@ -14,7 +14,10 @@ Feature #12530 `110_テスト構造管理` 配下 US #12488 の成果物。
 ## 非目的
 
 - 本 US では implementation / tests を移動しない。配置判断のみを表で定義する。
-- Redmine 階層 (`110_...` 連番 prefix) を directory 名へそのまま焼き込まない。
+- Redmine の日本語表示名 (`110_実行基盤・Routing` など) を directory 名へそのまま焼き込まない。
+- Redmine の番号・順序を Python import package 名へそのまま焼き込まない。`110_execution_platform`
+  のような数字始まりの component は Python 識別子ではないため、`src/mozyo_bridge/**` と
+  `tests/**` の importable package には使わない。
 - Redmine catalog node の close / 退役判断は扱わない (別 portfolio 判断)。
 
 ## 正本性と命名規約
@@ -23,9 +26,42 @@ Feature #12530 `110_テスト構造管理` 配下 US #12488 の成果物。
   Redmine 側の番号・表示名を複製した時点の snapshot を持つ。番号・表示名の正本は常に Redmine。
 - repo bounded context 名は **ASCII snake_case** で定義する。Redmine 表示名 (`110_実行基盤・Routing` など)
   を directory / 識別子へ焼かない。表示名と context 名は本表で結ぶ。
+- Redmine の Epic / Feature の番号と順序は **mapping metadata** として保持する。repo の
+  importable path は番号なしの ASCII snake_case slug を使い、Redmine 番号は catalog table /
+  generated reports / review narrative で探索性を担保する。
+- Feature-level slug を導入する場合も import-safe にする。例:
+  `execution_platform/delegated_coordinator_nested_handoff`。数字始まりの
+  `110_execution_platform/140_delegated_coordinator_nested_handoff` は表示・表の値としては使えても、
+  Python package path としては使わない。
 - 対応は **many-to-many を許す**。1 つの bounded context が複数 Feature を束ね、1 つの作業が複数 context を
   横断しうる (`## Cross-cutting 分類` を読む)。
 - runtime package path は `src/mozyo_bridge/`。`vibes/tools/mozyo_bridge` を runtime path として復活させない。
+
+## Redmine order metadata と repo slug
+
+Redmine の Epic / Feature は portfolio ordering を持つため、番号を捨てない。ただし番号は
+importable path ではなく metadata として扱う。
+
+| Redmine node | order | repo slug |
+|---|---:|---|
+| #12501 `110_実行基盤・Routing` | 110 | `execution_platform` |
+| #12507 `110_Workspace・Session識別` | 110 | `workspace_session_identity` |
+| #12508 `120_AgentDiscovery・Pane解決` | 120 | `agent_discovery_pane_resolution` |
+| #12509 `130_HandoffRouting` | 130 | `handoff_routing` |
+| #12510 `140_DelegatedCoordinator・NestedHandoff` | 140 | `delegated_coordinator_nested_handoff` |
+| #12511 `150_Runtime観測・EventTimeline` | 150 | `runtime_observation_event_timeline` |
+| #12512 `160_StateStore・ManagedEvents` | 160 | `state_store_managed_events` |
+
+Source / tests の Feature-level pilot は #12570 が扱う。推奨形は source-first:
+
+```text
+src/mozyo_bridge/features/execution_platform/delegated_coordinator_nested_handoff/
+tests/unit/execution_platform/delegated_coordinator_nested_handoff/
+tests/integration/execution_platform/delegated_coordinator_nested_handoff/
+```
+
+Redmine 側の renumber は path rename へ自動反映しない。renumber は mapping metadata の更新として扱い、
+repo slug の rename は別 issue で明示的に判断する。
 
 ## Redmine catalog inventory (snapshot)
 

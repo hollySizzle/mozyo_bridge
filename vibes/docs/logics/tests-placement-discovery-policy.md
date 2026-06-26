@@ -81,7 +81,9 @@ integration)。
 
 bounded context の正本カタログは #12488 (Redmine Epic/Feature catalog,
 `110_...` 表示名) と、それを repo の ASCII snake_case directory 名へ正規化する
-対応表である。tests layout はこの対応表を **再利用**し、Redmine 階層を焼き込まない。
+対応表である。tests layout はこの対応表を **再利用**し、Redmine の日本語表示名や
+数字始まりの `110_...` component を importable package path へそのまま焼き込まない。
+Redmine の番号・順序は `bounded-context-map.md` の mapping metadata として保持する。
 
 bounded context の **frozen な canonical ASCII トークン**は #12488 の対応表
 `vibes/docs/specs/bounded-context-map.md` (`## repo bounded context 定義` /
@@ -113,6 +115,11 @@ bounded context の **frozen な canonical ASCII トークン**は #12488 の対
 - **unit / integration** は context で細分する: `tests/unit/<context>/`,
   `tests/integration/<context>/`。`<context>` は subject-under-test の primary src
   module が属する bounded context (上表)。
+- Feature-level split が必要な大箱 context では、さらに import-safe な Feature slug で
+  細分してよい: `tests/<type>/<context>/<feature_slug>/`。例:
+  `tests/integration/execution_platform/delegated_coordinator_nested_handoff/`。
+  Redmine Feature の番号 (`140`) は mapping metadata に保持し、directory component には
+  入れない。
 - **scenarios / regressions** は cross-cutting のため context で細分しない。
 - **support** は context で細分しない (横断 helper)。context 固有 helper が必要に
   なったら `tests/support/<context>/` を後から足してよいが、初期は flat。
@@ -254,7 +261,8 @@ python -m unittest discover -s tests -v
 
 ## Anti-patterns
 
-- Redmine の Epic/Feature 階層を tests directory にそのまま焼き込む (対応表で結ぶ)。
+- Redmine の日本語表示名や数字始まりの `110_...` component を tests directory にそのまま焼き込む
+  (対応表で結び、package path は import-safe slug にする)。
 - type 軸と context 軸を二重 top-level にして配置を多義にする (type-first に固定)。
 - `discover` のコマンド文字列を移行のために書き換える (不変が契約)。
 - サブディレクトリの `__init__.py` を省いて nested test を false green にする。

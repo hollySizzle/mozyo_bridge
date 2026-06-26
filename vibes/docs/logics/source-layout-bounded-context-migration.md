@@ -8,6 +8,12 @@ Redmine #12492 (parent #12533 `140_ソース配置管理`)。`src/mozyo_bridge` 
 本計画が定義する低リスク単位を per-issue で実装する (最初の単位は #12493、本計画の
 follow-up として切り出す)。一括移動は禁止する。
 
+> 後続補正 (#12570): source/test ownership layout は Redmine Epic/Feature の意味と順序を
+> 踏襲するが、Python import package path には数字始まりの `110_...` component を使わない。
+> Redmine 番号は `bounded-context-map.md` の mapping metadata として保持し、source path は
+> import-safe な ASCII snake_case slug を使う。旧 `contexts/<name>/` 候補は履歴上の計画名であり、
+> #12570 の pilot では `features/<epic_slug>/<feature_slug>/` 形を優先して検証する。
+
 関連する既存正本:
 
 - `vibes/docs/logics/refactor-split-strategy.md` (#12002): 巨大 file を feature family
