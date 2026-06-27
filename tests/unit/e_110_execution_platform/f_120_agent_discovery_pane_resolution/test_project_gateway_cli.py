@@ -161,6 +161,24 @@ class HandoffCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["transition_role"], "grandparent_coordinator")
 
+    def test_found_auto_injects_workflow_contract(self):
+        # Redmine #12700: the same grandparent -> project-gateway transition also
+        # auto-injects the workflow-contract reference bundle (keyed by the same
+        # grandparent role token) on a `found` resolution, so the receiver gateway
+        # knows the required workflow contract docs as a normal-operation contract.
+        captured = {}
+
+        def fake_orch(args):
+            captured["workflow_contract"] = getattr(args, "workflow_contract", None)
+            return 0
+
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%gw")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["workflow_contract"], "grandparent_coordinator")
+
     def test_fail_closed_does_not_inject_transition_role(self):
         # A non-found resolution does not deliver, so no boundary is injected; the
         # args carry no transition_role for a route that never reached the gateway.
@@ -174,6 +192,7 @@ class HandoffCliTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         orch.assert_not_called()
         self.assertIsNone(getattr(args, "transition_role", None))
+        self.assertIsNone(getattr(args, "workflow_contract", None))
 
     def test_rejects_explicit_target(self):
         with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):

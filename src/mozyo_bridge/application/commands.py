@@ -68,6 +68,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
     TransitionRoleError,
     resolve_transition_role,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
+    WorkflowContractError,
+    resolve_workflow_contract,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -5574,6 +5578,41 @@ def orchestrate_handoff(
             die(str(exc))
             raise AssertionError("unreachable")
 
+    # Redmine #12700: resolve the workflow-contract reference bundle before any
+    # pane send. The token is set programmatically by the routing command (the
+    # `project-gateway handoff` route injects the grandparent bundle on a
+    # successful gateway resolution), never typed manually. Fail closed (blocked /
+    # invalid_args) on an unknown token; omitting it is the explicit fallback of no
+    # contract binding. The bundle carries resolvable doc pointers (catalog ids +
+    # canonical + monorepo-nested paths), never doc bodies.
+    workflow_contract_bundle = None
+    workflow_contract_arg = getattr(args, "workflow_contract", None)
+    if workflow_contract_arg:
+        try:
+            workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
+        except WorkflowContractError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                    execution_root=execution_root,
+                    role_profile=role_profile_resolution,
+                    transition_role=transition_role_boundary,
+                ),
+                record_format=record_format,
+                command=record_command,
+                role_profile_contract=role_profile_contract,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+
     try:
         body = build_notification_body(
             anchor,
@@ -5583,6 +5622,7 @@ def orchestrate_handoff(
             execution_root=execution_root,
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
+            workflow_contract=workflow_contract_bundle,
         )
     except AnchorError as exc:
         _emit_outcome(
@@ -5599,6 +5639,7 @@ def orchestrate_handoff(
                 execution_root=execution_root,
                 role_profile=role_profile_resolution,
                 transition_role=transition_role_boundary,
+                workflow_contract=workflow_contract_bundle,
             ),
             record_format=record_format,
             command=record_command,
@@ -5635,6 +5676,7 @@ def orchestrate_handoff(
             execution_root=execution_root,
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
+            workflow_contract=workflow_contract_bundle,
         )
         _emit_outcome(
             outcome,
@@ -5669,6 +5711,7 @@ def orchestrate_handoff(
             execution_root=execution_root,
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
+            workflow_contract=workflow_contract_bundle,
         )
         _emit_outcome(
             outcome,
@@ -5735,6 +5778,13 @@ def orchestrate_handoff(
         notification_marker=marker,
         execution_root=execution_root,
         role_profile=role_profile_resolution,
+        # Redmine #12706 carried the transition boundary on the pending /
+        # marker_timeout paths but dropped it on this successful-delivery path, so
+        # the durable record / JSON wire showed no boundary on a real send. Thread
+        # it here so the standard transition payload carries the boundary on the
+        # delivery that matters; #12700 adds the workflow-contract bundle alongside.
+        transition_role=transition_role_boundary,
+        workflow_contract=workflow_contract_bundle,
     )
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually

@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
         TransitionRoleBoundary,
     )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
+        WorkflowContractBundle,
+    )
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -555,6 +558,7 @@ def build_notification_body(
     execution_root: Optional["ExecutionRoot"] = None,
     role_profile: Optional["RoleProfileResolution"] = None,
     transition_role: Optional["TransitionRoleBoundary"] = None,
+    workflow_contract: Optional["WorkflowContractBundle"] = None,
 ) -> str:
     """Compose the pane text body that follows the landing marker.
 
@@ -577,6 +581,12 @@ def build_notification_body(
     receiver never infers its lane role from ``%pane`` / active pane / docs-only
     context. The full allowed/forbidden action boundary stays in the durable
     delivery record, keeping the body single-line.
+
+    When ``workflow_contract`` is supplied (Redmine #12700), a trailing single-line
+    clause names the required workflow-contract docs (count + set version + the
+    read/callback obligations) so the receiver knows the normal-operation contract
+    without discovering the docs by luck. The full resolvable ref list stays in the
+    durable delivery record, keeping the body single-line.
     """
     if kind not in KIND_LABELS:
         raise AnchorError(f"unknown handoff kind: {kind!r}; expected one of {sorted(KIND_LABELS)}")
@@ -594,6 +604,8 @@ def build_notification_body(
         body = f"{body} {role_profile.pointer_clause()}."
     if transition_role is not None:
         body = f"{body} {transition_role.pointer_clause()}."
+    if workflow_contract is not None:
+        body = f"{body} {workflow_contract.pointer_clause()}."
     return body
 
 
@@ -655,6 +667,17 @@ class DeliveryOutcome:
     # fallback); the `project-gateway handoff` route auto-injects the
     # grandparent_coordinator -> project_gateway boundary.
     transition_role: Optional[dict[str, Any]] = None
+    # Redmine #12700: workflow-contract reference bundle structured fields
+    # (`current_role` / `contract_set_version` / `read_obligation` /
+    # `callback_obligation` / `refs` — each ref carrying a catalog `contract_id`,
+    # `canonical_path`, and the receiver-resolvable `resolvable_paths`). Carried so
+    # the receiver knows the required workflow contract docs as a normal-operation
+    # contract instead of discovering them by luck, and so a monorepo (GK3500)
+    # receiver can resolve them (#12700 j#66929). Free-text-free (fixed tokens /
+    # ids / paths) and durable-record safe in full; the bundle carries pointers,
+    # never doc bodies. `None` when no bundle was injected (the explicit fallback);
+    # the `project-gateway handoff` route auto-injects the grandparent bundle.
+    workflow_contract: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1220,6 +1243,40 @@ def _transition_role_lines(transition_role: Optional[dict[str, Any]]) -> list[st
     ]
 
 
+def _workflow_contract_lines(workflow_contract: Optional[dict[str, Any]]) -> list[str]:
+    """Render the structured workflow-contract reference bundle (Redmine #12700).
+
+    Carries only fixed tokens (catalog ids, repo-relative paths, obligation
+    tokens, an int set version) with no operator free text and no doc body, so the
+    full resolvable ref list is durable-record safe and rendered in place — the
+    receiver reads the required workflow contracts (and how to resolve them in its
+    own workspace) without discovering the docs by luck. Returns a single ``—``
+    line when no bundle was injected.
+    """
+    if not workflow_contract:
+        return ["- Workflow contracts: —"]
+    current = workflow_contract.get("current_role") or "—"
+    version = workflow_contract.get("contract_set_version")
+    read_obligation = workflow_contract.get("read_obligation") or "—"
+    callback_obligation = workflow_contract.get("callback_obligation") or "—"
+    refs = workflow_contract.get("refs") or []
+    lines = [
+        f"- Workflow contracts: `{current}` (set v{version}, {len(refs)} required)",
+        f"  - Read obligation: `{read_obligation}`",
+        f"  - Callback obligation: `{callback_obligation}`",
+    ]
+    for ref in refs:
+        contract_id = ref.get("contract_id") or "—"
+        canonical = ref.get("canonical_path") or "—"
+        resolvable = ref.get("resolvable_paths") or []
+        resolvable_text = ", ".join(f"`{p}`" for p in resolvable) or "—"
+        lines.append(
+            f"  - `{contract_id}` — canonical `{canonical}` "
+            f"(resolvable: {resolvable_text})"
+        )
+    return lines
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome",
     *,
@@ -1276,6 +1333,7 @@ def build_delivery_record(
         f"- Target execution root: {_execution_root_pointer_or_dash(outcome.execution_root)}",
         f"- Role profile: {_role_profile_pointer_or_dash(outcome.role_profile)}",
         *_transition_role_lines(outcome.transition_role),
+        *_workflow_contract_lines(outcome.workflow_contract),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -1419,6 +1477,7 @@ def make_outcome(
     execution_root: Optional[ExecutionRoot] = None,
     role_profile: Optional["RoleProfileResolution"] = None,
     transition_role: Optional["TransitionRoleBoundary"] = None,
+    workflow_contract: Optional["WorkflowContractBundle"] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1444,6 +1503,9 @@ def make_outcome(
         role_profile=role_profile.to_structured_dict() if role_profile else None,
         transition_role=(
             transition_role.to_structured_dict() if transition_role else None
+        ),
+        workflow_contract=(
+            workflow_contract.to_structured_dict() if workflow_contract else None
         ),
     )
 

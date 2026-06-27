@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6697
+    lines: 6747
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -112,6 +112,13 @@ allowlist:
       `build_notification_body` and the typed terminal `make_outcome` paths; the
       boundary values + resolver live in the new
       `f_130_handoff_routing/domain/transition_role.py`, not here).
+      Raised 6697 -> 6747 for the #12700 workflow-contract reference wiring in
+      `orchestrate_handoff` (fail-closed `resolve_workflow_contract` of the
+      `args.workflow_contract` token + threading the bundle through
+      `build_notification_body` and the typed terminal `make_outcome` paths, plus
+      restoring the #12706 `transition_role` on the successful-delivery
+      `make_outcome` it had been dropped from; the bundle values + resolver live in
+      the new `f_130_handoff_routing/domain/workflow_contract.py`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -167,7 +174,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1499
+    lines: 1561
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -197,6 +204,13 @@ allowlist:
       and the `_transition_role_lines` renderer + `- Transition role:` block in
       `build_delivery_record`. The boundary values + resolver live in the separate
       `domain/transition_role.py` (kept out of this module), so only the
+      outcome/record plumbing lands here.
+      Raised 1499 -> 1561 for the #12700 workflow-contract reference wiring: the
+      `workflow_contract` field on `DeliveryOutcome` / `make_outcome`, the
+      single-line pointer clause in `build_notification_body`, and the
+      `_workflow_contract_lines` renderer + `- Workflow contracts:` block in
+      `build_delivery_record`. The bundle values + resolver live in the separate
+      `domain/workflow_contract.py` (kept out of this module), so only the
       outcome/record plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"

@@ -341,6 +341,15 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     # not pre-empt (the #12698 defect). The operator never types the role payload;
     # the standard payload carries it.
     args.transition_role = ROLE_GRANDPARENT_COORDINATOR
+    # Redmine #12700: the same grandparent -> project-gateway transition must also
+    # carry the workflow-contract reference bundle so the receiver gateway knows the
+    # required workflow contract docs (ticketless gateway UX, delegated-coordinator
+    # acceptance / smoke frame, sublane development flow) as a normal-operation
+    # contract — with receiver-resolvable path forms — instead of discovering them
+    # by luck (#12698) or failing to resolve sender-repo-relative paths in a GK3500
+    # monorepo workspace (#12700 j#66929). Auto-injected programmatically only on a
+    # successful `found` resolution; the operator never types it.
+    args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
     return orchestrate_handoff(args)
 
 
