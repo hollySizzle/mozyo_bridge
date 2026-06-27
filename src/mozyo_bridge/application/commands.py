@@ -78,6 +78,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     TicketlessCallback,
     TicketlessCallbackError,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
+    submit_record_lines,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -4418,6 +4421,7 @@ def _emit_outcome(
     role_profile_contract: str | None = None,
     retry: QueueEnterRetryOutcome | None = None,
     activation: TargetActivationOutcome | None = None,
+    submit_lines: list[str] | None = None,
 ) -> None:
     """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -4458,12 +4462,35 @@ def _emit_outcome(
                 role_profile_contract=role_profile_contract,
                 retry=retry,
                 activation=activation,
+                submit_lines=submit_lines,
             )
         )
         if record_format == RECORD_FORMAT_BOTH:
             print("")
     if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
         print(outcome.to_json())
+
+
+def _submit_lines_for(args: argparse.Namespace, outcome) -> list[str] | None:
+    """Build the additive q-enter `- Submit:` telemetry lines, or None.
+
+    Redmine #12705: only the LLM-facing q-enter front door sets
+    ``args.submit_intent`` (+ the deterministic ``args.submit_delivery_id`` it
+    already printed in its own envelope), so a normal `handoff send` / `reply`
+    has no submit telemetry and its record is byte-identical. The composer-residue
+    classification is a pure projection of the transport ``(status, reason)``, so
+    it cannot drift from the rail's own marker/rollback decision.
+    """
+    intent = getattr(args, "submit_intent", None)
+    if not intent:
+        return None
+    delivery_id = getattr(args, "submit_delivery_id", None) or "—"
+    return submit_record_lines(
+        status=outcome.status,
+        reason=outcome.reason,
+        intent=intent,
+        delivery_id=delivery_id,
+    )
 
 
 def _record_format_from_args(args: argparse.Namespace) -> str:
@@ -5743,6 +5770,7 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
+            submit_lines=_submit_lines_for(args, outcome),
         )
         _maybe_persist_delivery_record(
             args,
@@ -5779,6 +5807,7 @@ def orchestrate_handoff(
             command=record_command,
             duplicate_lane_panes=duplicate_lane_panes or None,
             role_profile_contract=role_profile_contract,
+            submit_lines=_submit_lines_for(args, outcome),
         )
         _emit_handoff_marker_timeout_guidance(receiver)
         die(
@@ -5889,6 +5918,7 @@ def orchestrate_handoff(
         role_profile_contract=role_profile_contract,
         retry=retry_record,
         activation=target_activation,
+        submit_lines=_submit_lines_for(args, outcome),
     )
     _maybe_persist_delivery_record(
         args,
