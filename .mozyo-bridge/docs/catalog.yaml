@@ -553,6 +553,22 @@ documents:
       - rule-docs-catalog-governance
       - spec-project-map
 
+  - id: logic-ticketless-project-gateway-runtime-ux
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
+    purpose: "ticketless consultation で department root -> project gateway -> implementation worker の 3 層 UX を成立させる runtime 境界。root と project gateway は別 window/session 表示でよく、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。"
+    audit_role: ticketless_project_gateway_runtime_ux_logic
+    related_document_refs:
+      - logic-project-scoped-workspace-identity
+      - logic-unit-target-model
+      - logic-cross-project-cockpit-smoke-runbook
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - rule-public-private-boundary
+      - rule-docs-catalog-governance
+      - spec-project-map
+
   - id: logic-acceptance-rerun-protocol
     type: logic
     status: active
