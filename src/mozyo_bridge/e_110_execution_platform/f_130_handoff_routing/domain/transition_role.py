@@ -43,6 +43,15 @@ The grandparent boundary mirrors the ``classify_ticketless_consultation`` /
 Coordinator lane); the project-gateway boundary mirrors the Project Gateway lane
 that owns the project-domain ``decide_implementation_need`` /
 ``ensure_redmine_anchor`` decisions the grandparent must not pre-empt.
+
+Redmine #12737 extends the project-gateway boundary with the consultation
+*return-path* contract that ``ticketless-project-gateway-runtime-ux.md``
+``### プロジェクトゲートウェイの consultation callback 返却契約`` fixes: the gateway
+returns its consultation result through the product callback primitive
+(``handoff ticketless-callback`` / ``handoff q-enter --intent
+consultation_callback``) and must not treat a local pane final answer as workflow
+completion when a callback target exists. The worker-dispatch anchor gate is
+unchanged.
 """
 
 from __future__ import annotations
@@ -163,6 +172,18 @@ class TransitionRoleBoundary:
 # no_dispatch decision is forbidden. The project-gateway boundary is its
 # complement: it OWNS the project-domain / no_dispatch / anchor decisions the
 # grandparent must not pre-empt.
+#
+# #12737 sharpens the project-gateway boundary's *return path*. GK3500 #12709
+# observed the gateway reach a consultation result but write only a local
+# "Root coordinator callback" answer in its own pane, never returning it to the
+# caller lane through the product callback primitive. So the gateway boundary now
+# (a) names ``return_consultation_result_via_callback_primitive`` as an allowed
+# action — the result is returned via ``handoff ticketless-callback`` or ``handoff
+# q-enter --intent consultation_callback`` — and (b) forbids
+# ``treat_local_pane_answer_as_consultation_callback``: a local pane final answer
+# is not workflow completion when a callback target exists. The Redmine-anchor
+# gate on real worker dispatch is unchanged (``dispatch_redmine_anchored_worker``
+# stays the anchored action; the ticketless rail still refuses anchored dispatch).
 TRANSITION_ROLE_BOUNDARIES: dict[str, TransitionRoleBoundary] = {
     ROLE_GRANDPARENT_COORDINATOR: TransitionRoleBoundary(
         current_role=ROLE_GRANDPARENT_COORDINATOR,
@@ -190,12 +211,14 @@ TRANSITION_ROLE_BOUNDARIES: dict[str, TransitionRoleBoundary] = {
             "anchor_required_decision",
             "dispatch_redmine_anchored_worker",
             "reply_consultation_result",
+            "return_consultation_result_via_callback_primitive",
             "return_blocked_if_worker_unavailable",
         ),
         forbidden_actions=(
             "implementation",
             "owner_approval_collection",
             "parent_issue_close",
+            "treat_local_pane_answer_as_consultation_callback",
         ),
         handoff_target_role="implementation_worker",
     ),
@@ -210,6 +233,14 @@ TRANSITION_ROLE_TOKENS: tuple[str, ...] = tuple(TRANSITION_ROLE_BOUNDARIES.keys(
 PROJECT_DOMAIN_DECISIONS: tuple[str, ...] = (
     "project_domain_decision",
     "parent_gateway_no_dispatch_decision",
+)
+
+# The #12737 project-gateway return-path contract, pinned so a test can assert the
+# gateway must return its consultation result through the product callback
+# primitive and must not stop at a local pane answer when a callback target exists.
+GATEWAY_CALLBACK_PRIMITIVE_RETURN = "return_consultation_result_via_callback_primitive"
+GATEWAY_LOCAL_ANSWER_NOT_CALLBACK = (
+    "treat_local_pane_answer_as_consultation_callback"
 )
 
 
@@ -267,6 +298,8 @@ __all__: Iterable[str] = (
     "ROLE_GRANDPARENT_COORDINATOR",
     "ROLE_PROJECT_GATEWAY",
     "PROJECT_DOMAIN_DECISIONS",
+    "GATEWAY_CALLBACK_PRIMITIVE_RETURN",
+    "GATEWAY_LOCAL_ANSWER_NOT_CALLBACK",
     "TransitionRoleBoundary",
     "TRANSITION_ROLE_BOUNDARIES",
     "TRANSITION_ROLE_TOKENS",
