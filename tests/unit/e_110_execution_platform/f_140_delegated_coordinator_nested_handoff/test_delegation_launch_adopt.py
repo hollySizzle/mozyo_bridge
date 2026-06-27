@@ -431,7 +431,7 @@ class RecommendedCommandQuotingTest(unittest.TestCase):
     def test_space_repo_path_stays_a_single_token(self):
         # A canonical child repo can be a Google Drive path with spaces; the
         # mandatory --target-repo gate must survive the round-trip as one token.
-        space_repo = "/Users/me/Google Drive/child repo"
+        space_repo = "/workspace/Google Drive/child repo"
         decision = self._adopt_decision(space_repo, child_project="child proj")
         args = types.SimpleNamespace(
             source="redmine",

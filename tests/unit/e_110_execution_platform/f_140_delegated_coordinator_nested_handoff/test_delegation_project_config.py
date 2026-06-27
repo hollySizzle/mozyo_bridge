@@ -208,7 +208,7 @@ class SchemaFailClosedTest(unittest.TestCase):
                     _config({"child_project": value})
 
     def test_private_path_shaped_project_rejected(self) -> None:
-        for value in ("/Users/x/proj", "~/proj", "C:proj", "https://h/p", "a/b"):
+        for value in ("/abs/proj", "~/proj", "C:proj", "https://h/p", "a/b"):
             with self.subTest(value=value):
                 with self.assertRaises(DelegationConfigError):
                     _config({"child_project": value})
