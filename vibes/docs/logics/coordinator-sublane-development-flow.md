@@ -29,6 +29,90 @@ owner / user は状況に応じて、同じ運用単位を `管制塔`、`メイ
 - close 済み sublane を退役させ、cockpit / worktree / agent context を残し続けない。
 - ルールを既存 guardrail へ追記し続けるのではなく、本 flow を参照 spine として使う。
 
+## Workflow Orchestration Roadmap
+
+### 背景
+
+#12668 / #12659 の実機 dogfood では、実装そのものよりも
+`implementation_done`、`review_request`、`review_result`、owner close approval の
+間をつなぐ手続きが詰まりやすいことが分かった。Claude が review request を
+Redmine に記録しても、Codex auditor へ live 通知されない。Codex が review result を
+記録しても、implementer へ callback されない。これらは単純な pane 操作の失敗ではなく、
+手続き型 workflow の runtime state と next action が machine-readable に管理されていない
+ことによる。
+
+また、`Codex` / `Claude` という名前は現在の runtime provider であり、workflow 上の責務
+そのものではない。今後 Grok、別 Claude model、別 Codex surface などを使う場合でも、
+workflow は `auditor` / `implementer` / `root_coordinator` / `project_gateway` /
+`implementation_worker` のような抽象 role を正本にし、provider は binding として扱う。
+
+Redmine は durable external memory / audit log であり、細かい state machine を閉じ込める
+場所ではない。workflow runtime state、pending delivery、route identity、duplicate
+suppression は mozyo DB 側で扱い、Redmine journal は event source と durable anchor として
+読む。
+
+### 意図
+
+この roadmap の目的は、agent が「次に何をすべきか」を毎回自然文から推測しない状態へ
+移行することである。最初から完全自動化しない。まず lane / role / transition の設計語彙を
+固定し、次に mozyo DB に workflow state と next action を持たせ、各 workflow-aware command
+が結果として次 action を返す。event watcher と UI はその後に載せる。
+
+重要なのは、`mozyo-bridge next-action` のような別コマンドだけでは足りない点である。
+agent は「いつ next-action を叩くべきか」を忘れる。したがって workflow-aware command は、
+通常の実行結果に `workflow.next_action` を含める。`suggested_command` は補助であり、正本は
+structured field である。
+
+### 設計思想
+
+- Redmine: durable external memory / audit log / owner-visible source。
+- mozyo DB: workflow runtime state、pending delivery、route identity、duplicate suppression。
+- live tmux / cockpit: liveness evidence と delivery projection。pane id は cache/evidence であり authority ではない。
+- repo-local docs: 現在の設計思想、背景、意図、invariant の正本。手順の置き場ではない。
+- workflow role: `auditor` / `implementer` / `root_coordinator` / `project_gateway` / `implementation_worker`。
+- runtime provider: `codex` / `claude` / future provider。role ではなく binding target。
+- command result: workflow-aware command は `workflow.state` と `workflow.next_action` を返す。
+- event watcher: Redmine journal update を event source として読み、mozyo DB の pending action に変換する。
+- UI: workflow truth ではなく projection。DB / Redmine / live target の read model を表示する。
+
+### Roadmap US
+
+Redmine Version は semantic version number を含む名前にしない。Version 名は日付・優先度・
+run window を表す operational bucket とし、番号付き release name にしない。MCP には現時点で
+Version 作成 / rename / lock / close / delete tool がないため、実 Version 作成と移動は #12651
+で操作手段を確定してから行う。ここでは US と依存順を Redmine に残す。
+
+1. #12670 `workflow lane ownership と transition function registry を設計する`
+   - PlantUML swimlane、lane registry、transition function contract を固定する。
+   - lane owner は pane id ではなく workflow role / route identity で表す。
+   - `Codex` / `Claude` は provider であり role ではない、という語彙を最初に入れる。
+
+2. #12671 `DB-backed workflow state と command result next_action を実装する`
+   - mozyo DB に workflow state / pending delivery / route identity を持つ。
+   - workflow-aware command result に `workflow.next_action` を含める。
+   - `workflow resume` / `workflow action run` 相当の明示実行入口を持つ。
+   - 自動 watcher ではなく、まず半自動・明示実行で duplicate / risk / fail-closed を固定する。
+
+3. #12672 `Redmine journal event source から pending workflow action を作る watcher を実装する`
+   - Redmine journal / issue update を event source として poll する。
+   - 自然文 parse ではなく structured gate / marker を読む。
+   - pending action 作成、duplicate suppression、missing / ambiguous route の fail-closed を固定する。
+
+4. #12673 `workflow role と runtime provider binding を分離する`
+   - workflow role から runtime provider への binding を config 化する。
+   - DB / event schema は role を正本にし、provider は resolution result として扱う。
+   - 表示では `auditor via codex` のように role と provider を分けて出す。
+
+5. #12603 `sublane の Git worktree lifecycle と統合ドキュメントを整備する`
+   - wrong-base lane、base commit、dependency branch、retire / merge policy を強化する。
+   - workflow state / role binding が先に無い状態で worktree lifecycle だけを core 化しない。
+   - Cockpit UI projection より前には lane / worktree lifecycle の hardening が必要である。
+
+6. #12674 `workflow state を Cockpit UI で追跡できる projection を設計する`
+   - UI は source of truth ではなく projection とする。
+   - owner_role、provider、lane、next_action、blocked_reason、anchor を見せる。
+   - WebSocket / live update は state model と watcher が固まった後に扱う。
+
 ## 文書言語
 
 この repo の LLM 向け規約本文は日本語で書く。英字の固定フィールド名、gate 名、CLI option、コード識別子、branch 名、path はそのまま保持してよいが、見出しと説明本文を英語だけで置かない。
