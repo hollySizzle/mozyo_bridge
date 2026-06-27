@@ -223,10 +223,10 @@ grandparent -> parent project-gateway route の通常 UX ではない。
 
 ### 相対 route 解決と cockpit-visible 起動 evidence
 
-#12699 の正本である。GK3500 探索 smoke #12698 で、`grandparent` を絶対 root として読むと
-monorepo / subproject の delegation slice を表現しにくいこと、および実行側が
+#12699 の正本である。本節は次の 2 点を固定する。第一に、`grandparent` を絶対 root として
+読むと monorepo / subproject の delegation slice を表現しにくい。第二に、実行側が
 `mozyo --repo ... --no-attach --json` に逃げると通常 tmux session は作れるが
-cockpit-visible project gateway にならないことが観測された。本節はこの 2 点を固定する。
+cockpit-visible project gateway にならない。
 
 - **route は current Unit からの相対 slice として解決する。** `grandparent` /
   `parent` / `child` / `grandchild` は絶対 root ではなく相対位置である (`### 祖父・親・
@@ -407,9 +407,9 @@ queue-enter は delivery rail であり、task 完了 signal ではない。queu
 
 #12703 の正本である。matrix の `親 -> 祖父` / `子 -> 親` ticketless hands-off 行のうち、
 **Redmine anchor を要しない consultation 段階の callback** を返す product-standard transport を
-定義する。GK3500 smoke #12698 では、receiver が `no_dispatch` の structured hands-off を作ったのに、
-標準 `handoff reply` / `reply` が Redmine anchor (`--issue` + `--journal`) 必須のため
-`invalid_anchor` で fail-closed し、低レベルの `mozyo-bridge message` しか残らなかった。
+定義する。receiver が `no_dispatch` の structured hands-off を作っても、標準 `handoff reply` /
+`reply` は Redmine anchor (`--issue` + `--journal`) 必須のため `invalid_anchor` で fail-closed し、
+低レベルの `mozyo-bridge message` しか残らない。本 primitive はその gap を埋める。
 
 - 標準 primitive は `mozyo-bridge handoff ticketless-callback` とする。Redmine anchor を carry
   せず、偽装もしない。`--source` / `--issue` / `--journal` / `--task-id` を受け取らない。

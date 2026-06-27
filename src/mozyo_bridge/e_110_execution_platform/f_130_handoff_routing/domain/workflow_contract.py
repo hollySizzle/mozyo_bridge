@@ -1,13 +1,12 @@
 """Ticketless / delegated transition workflow-contract reference payload (#12700).
 
-GK3500 exploratory smoke #12698 (and its #12700 rerun) surfaced the third
-ticketless blocker: a ticketless prompt — kept Redmine-anchor-free on purpose to
-avoid smoke-issue contamination — carried **no pointer to the workflow contract
-docs**, so the receiver could classify the request onto a project but had no way
-to know the parent/child/grandchild lane contract, the Redmine work-item
-boundary, the blocked-callback obligation, or the child-dispatch boundary as a
-normal-operation contract. It could only act if it *happened* to discover the
-docs.
+This module addresses the third ticketless blocker: a ticketless prompt — kept
+Redmine-anchor-free on purpose to avoid route-oracle contamination — carries **no
+pointer to the workflow contract docs**, so the receiver can classify the request
+onto a project but has no way to know the parent/child/grandchild lane contract,
+the Redmine work-item boundary, the blocked-callback obligation, or the
+child-dispatch boundary as a normal-operation contract. It could only act if it
+*happened* to discover the docs.
 
 The #12700 j#66929 follow-up sharpened the requirement: passing raw mozyo_bridge
 repo-relative paths is not enough when the receiver workspace is the GK3500
@@ -33,9 +32,9 @@ reference bundle. Design boundaries (Redmine #12700 description / j#66929):
   token, an int set-version) with no operator free text, so the whole bundle —
   including the full ref list — is durable-record safe and may be persisted
   verbatim, like the :mod:`...domain.transition_role` boundary it travels beside.
-- The bundle carries no Redmine smoke issue / prior journal / ``%pane`` / expected
-  child candidate; those are the contaminating route-oracle inputs the issue
-  forbids. A bundle is a normal-operation contract pointer only.
+- The bundle carries no route-oracle input — no Redmine issue id, prior journal,
+  ``%pane``, or expected child candidate; those are the contaminating inputs the
+  contract forbids. A bundle is a normal-operation contract pointer only.
 - Construction fails closed: an unknown role token raises
   :class:`WorkflowContractError`, and a malformed bundle (blank role, empty ref
   set, blank id/path, empty resolvable paths, blank obligation token) cannot be
@@ -44,7 +43,8 @@ reference bundle. Design boundaries (Redmine #12700 description / j#66929):
 The two builtin bundles mirror the two transition roles in
 :mod:`...domain.transition_role`: the ``grandparent_coordinator`` bundle equips
 the project gateway it hands off to with the four ticketless workflow contracts
-#12698 needed; the ``project_gateway`` bundle equips a delegated child lane with
+the project gateway needs; the ``project_gateway`` bundle equips a delegated child
+lane with
 the sublane-development-flow spine and the delegated-coordinator acceptance
 contracts (the parent -> child delegated transition the issue also calls out).
 """
@@ -291,7 +291,7 @@ class WorkflowContractBundle:
 
 # Builtin bundles, keyed by the same transition-role tokens the boundary uses so
 # the two payloads stay coupled. The grandparent bundle equips the project gateway
-# with the four ticketless workflow contracts #12698 needed (parent/child/
+# with the four ticketless workflow contracts it needs (parent/child/
 # grandchild lane contract, Redmine work-item boundary, blocked callback, child
 # dispatch boundary). The project_gateway bundle equips a delegated child lane
 # with the sublane-development-flow spine + delegated-coordinator acceptance

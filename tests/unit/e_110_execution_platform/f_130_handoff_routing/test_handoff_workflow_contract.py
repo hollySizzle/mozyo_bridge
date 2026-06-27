@@ -1,10 +1,10 @@
 """Tests for the workflow-contract reference payload (Redmine #12700).
 
-GK3500 smoke #12698 / its #12700 rerun surfaced the third ticketless blocker: a
-Redmine-anchor-free ticketless prompt carried no pointer to the workflow contract
-docs, so the receiver could classify a request but had no normal-operation way to
-know the lane / work-item / callback / child-dispatch contract, and (j#66929) even
-raw sender-repo-relative paths did not resolve in the GK3500 monorepo workspace.
+The third ticketless blocker: a Redmine-anchor-free ticketless prompt carried no
+pointer to the workflow contract docs, so the receiver could classify a request
+but had no normal-operation way to know the lane / work-item / callback /
+child-dispatch contract, and (j#66929) even raw sender-repo-relative paths did not
+resolve in the GK3500 monorepo workspace.
 The fix carries a resolvable workflow-contract reference bundle (catalog
 ``contract_id`` + canonical + monorepo-nested ``resolvable_paths`` + read/callback
 obligations) on the standard transition payload and the durable delivery record.
@@ -44,8 +44,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow
     workflow_contract_from_payload,
 )
 
-# The four ticketless workflow contract docs #12698 needed; the #12700 fix must
-# carry resolvable refs to exactly these (description's required-docs list).
+# The four ticketless workflow contract docs the project gateway needs; the bundle
+# must carry resolvable refs to exactly these (the required-docs list).
 REQUIRED_TICKETLESS_DOCS = (
     "vibes/docs/logics/ticketless-project-gateway-runtime-ux.md",
     "vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md",
