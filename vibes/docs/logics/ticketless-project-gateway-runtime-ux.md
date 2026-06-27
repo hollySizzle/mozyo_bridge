@@ -188,6 +188,48 @@ failure output は `gateway_missing`、`gateway_target_ambiguous`、`selector_ga
 直接 `%pane` addressing は debug escape hatch として残してよい。ただし
 grandparent -> parent project-gateway route の通常 UX ではない。
 
+### 相対 route 解決と cockpit-visible 起動 evidence
+
+#12699 の正本である。GK3500 探索 smoke #12698 で、`grandparent` を絶対 root として読むと
+monorepo / subproject の delegation slice を表現しにくいこと、および実行側が
+`mozyo --repo ... --no-attach --json` に逃げると通常 tmux session は作れるが
+cockpit-visible project gateway にならないことが観測された。本節はこの 2 点を固定する。
+
+- **route は current Unit からの相対 slice として解決する。** `grandparent` /
+  `parent` / `child` / `grandchild` は絶対 root ではなく相対位置である (`### 祖父・親・
+  子・孫レーン契約` の正本語彙)。current Unit (caller role) を anchor として、one-step-down の
+  delegation target を semantic identity で解決する。
+  - grandparent (`grandparent_coordinator`) -> `project_gateway`
+  - parent (`project_gateway`) -> `delegated_coordinator`
+  - child (`delegated_coordinator`) -> `implementation_worker`
+  - caller は **一段だけ** 委譲する。grandparent が grandchild worker を直接解決することは
+    禁止である (`禁止遷移` の `parent_sends_to_grandchild_directly` / direct-send 禁止)。
+- **coordinator-class target (`project_gateway` / `delegated_coordinator`) の解決は
+  launch-or-adopt に従う。** live discovery では両者は同型 (strong + project-scoped Codex) で
+  あり、相対位置が contract label である。
+  - `found` -> **adopt** (live lane を identity で採用)。
+  - `gateway_missing` -> **cockpit-visible launch plan** (project workdir から
+    `mozyo-bridge cockpit` を起動)。
+  - `gateway_target_ambiguous` / `selector_gap` -> **blocked** (silent に選ばない)。
+- **`implementation_worker` は launch-or-adopt しない。** worker は Redmine anchor に対して
+  dispatch されるものであり、cockpit gateway として起動しない (`### Ticketless No-Anchor
+  Callback Primitive`)。相対 route は anchor 要件と標準 `handoff send --kind
+  implementation_request --source redmine` 導線だけを返す。
+- **cockpit-visible 起動だけが green-path route evidence である。** 次のいずれも
+  green path ではない。
+  - `mozyo-bridge cockpit --json` は **preview** であり mutate しない。起動の証拠にならない。
+  - `mozyo --no-attach` 系の **detached 通常 session** は `normal_window` であって cockpit
+    Unit ではない。`--no-attach --json` で JSON-ready な通常 session を作っただけでは、
+    route evidence として `insufficient` (= not PASS) として扱う
+    (`delegated-coordinator-real-machine-acceptance.md` の Failure Classification)。
+  - green path は、resolved lane が cockpit pane / cockpit member (peer pane あり) の
+    **cockpit-visible Unit** である場合だけである。detached normal-window lane を adopt
+    できても、cockpit-visible Unit を起動するまで route は green ではない。
+
+resolver の field 名・必須/任意・default・error wording・実 command 名は CLI help /
+validation error を正本にする (`### Transition Contract Scope`)。本節は相対 slice 境界と
+cockpit-visible green-path 条件の契約だけを持つ。
+
 ## シーケンスと遷移関数
 
 workflow は、曖昧な activity と後付け note ではなく、lane 間 transition を

@@ -283,12 +283,20 @@ def start_project_gateway_command(route: ProjectGatewayRoute, *, project_path: s
     ``project_path`` is the repo-relative project directory when known; otherwise
     the operator substitutes the workdir for the adopted ``project_scope``.
     Separate window/session projection is expected and is not a defect.
+
+    The launch MUST produce a **cockpit-visible** Unit (a ``cockpit_pane`` joined
+    to the ``mozyo-cockpit`` session). A detached ``mozyo --no-attach`` *normal*
+    session and a ``mozyo-bridge cockpit --json`` *preview* are explicitly NOT the
+    startup and NOT green-path route evidence (Redmine #12699): ``--json`` is a
+    preview that does not mutate, and a ``--no-attach`` normal session is a
+    ``normal_window``, not a cockpit Unit.
     """
     workdir = project_path or f"<workdir of project {route.project_scope}>"
     return (
         f"cd {route.repo_root}/{workdir} && mozyo-bridge cockpit  "
         f"# start_project_gateway(project_scope={route.project_scope}, "
-        "projection=separate_window_or_session); cwd is the project-scope "
-        "authority — do NOT add --repo <git-root> (it launches a root column, "
-        "not a project gateway)"
+        "projection=separate_window_or_session, startup=cockpit_visible); cwd is "
+        "the project-scope authority — do NOT add --repo <git-root> (it launches a "
+        "root column, not a project gateway). NOT a detached --no-attach normal "
+        "session and NOT a cockpit --json preview (neither is green-path evidence)"
     )

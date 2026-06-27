@@ -50,6 +50,12 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     gateway_lane_identity_from_scope,
     resolve_launch_or_adopt,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
+    RELATIVE_CALLER_ROLES,
+    classify_startup_evidence,
+    cockpit_visible_from_candidate,
+    resolve_relative_route,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
@@ -141,7 +147,9 @@ def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
         return 1
 
     # gateway_missing / selector_gap: name the concrete start action + near misses.
-    print("next: start_project_gateway ->")
+    # Redmine #12699: the start action is a cockpit-visible Unit, not a detached
+    # --no-attach normal session and not a cockpit --json preview.
+    print("next: start_project_gateway (cockpit-visible Unit) ->")
     print(f"  {start_project_gateway_command(route)}")
     if resolution.near_misses:
         print("near misses (why each pane was not the gateway):")
@@ -183,6 +191,22 @@ def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity
     )
 
 
+def _startup_evidence_for(decision):
+    """Classify the startup evidence for a launch-or-adopt decision (#12699).
+
+    An ``adopt`` is cockpit-visible green-path evidence only when the resolved lane
+    is a cockpit pane (not a detached normal window); a ``launch`` / ``blocked`` has
+    no live Unit yet, so it classifies to ``none`` until a cockpit-visible Unit is
+    started. A detached ``--no-attach`` normal session is never green-path.
+    """
+    if decision.action == ACTION_ADOPT and decision.adopted is not None:
+        return classify_startup_evidence(
+            cockpit_visible=cockpit_visible_from_candidate(decision.adopted),
+            session_present=True,
+        )
+    return classify_startup_evidence()
+
+
 def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
     """Resolve the launch-or-adopt decision for a project gateway lane (#12708).
 
@@ -202,8 +226,12 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
         session=getattr(args, "session", None),
     )
 
+    evidence = _startup_evidence_for(decision)
+
     if getattr(args, "as_json", False):
-        print(_json.dumps(decision.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        payload = decision.as_payload()
+        payload["startup_evidence"] = evidence.as_payload()
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if decision.ok else 1
 
     print(f"action: {decision.action}")
@@ -228,6 +256,19 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
             f"pane_id={sel.pane_id} session={sel.session} window={sel.window_name} "
             f"repo={sel.repo_short} project_scope={sel.project_scope}"
         )
+        # Redmine #12699: a live lane is only a green-path route once it is a
+        # cockpit-visible Unit. A detached normal-window lane is real but is NOT
+        # green-path route evidence; surface that distinction explicitly.
+        print(
+            f"startup_evidence: {evidence.mode} (green_path={evidence.is_green_path})"
+        )
+        if not evidence.is_green_path:
+            print(f"  warning: {evidence.detail}")
+            print(
+                "  start a cockpit-visible Unit from the project workdir: "
+                "cd <project workdir> && mozyo-bridge cockpit (NOT a detached "
+                "--no-attach normal session, NOT a cockpit --json preview)"
+            )
         # The normal, pane-id-free route to deliver to the adopted gateway.
         print(
             "next: handoff_to_project_gateway -> "
@@ -235,11 +276,17 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
             f"--target-repo {identity.repo_root} --target-project {identity.project_scope} "
             "--source redmine --issue <id> --journal <id> --kind ticketless_consultation"
         )
-        return 0
+        return 0 if evidence.is_green_path else 1
 
     if decision.action == ACTION_LAUNCH:
-        print("next: start_project_gateway ->")
+        # Name the cockpit-visible startup explicitly; the launch command itself
+        # warns against the detached / preview anti-patterns (#12699).
+        print("next: start_project_gateway (cockpit-visible Unit) ->")
         print(f"  {decision.launch_command}")
+        print(
+            "  note: a detached --no-attach normal session / cockpit --json preview "
+            "is NOT green-path route evidence; verify the Unit is in mozyo-cockpit."
+        )
         return 0
 
     # ACTION_BLOCKED: fail closed; name the matched / near-miss candidates so the
@@ -353,6 +400,48 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     return orchestrate_handoff(args)
 
 
+def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
+    """Resolve the current-Unit relative delegation route one step down (#12699).
+
+    The current Unit is the *relative anchor*: ``--from-role`` names this Unit's
+    lane role, and the route resolves the one-step-down target (grandparent ->
+    ``project_gateway``, parent -> ``delegated_coordinator``, child ->
+    ``implementation_worker``) semantically — never a copied ``%pane`` or an
+    absolute root. For the coordinator-class targets it reuses the launch-or-adopt
+    decision and classifies whether the resolved lane is cockpit-visible green-path
+    evidence; for the implementation worker it returns the anchor-gated dispatch
+    contract (a worker is never launched as a cockpit gateway).
+    """
+    require_tmux()
+    plan = resolve_relative_route(
+        _discover_candidates(),
+        caller_role=args.from_role,
+        repo_root=args.repo,
+        project_scope=args.project,
+        session=getattr(args, "session", None),
+    )
+
+    if getattr(args, "as_json", False):
+        print(_json.dumps(plan.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if plan.ok else 1
+
+    step = plan.step
+    print(
+        "relative_route: "
+        f"{step.caller_position}({step.caller_role}) -> "
+        f"{step.target_position}({step.target_binding}) role={step.target_role}"
+    )
+    print(f"anchor_required: {plan.anchor_required}")
+    print(
+        f"startup_evidence: {plan.startup_evidence.mode} "
+        f"(green_path={plan.green_path})"
+    )
+    if plan.detail:
+        print(f"detail: {plan.detail}")
+    print(f"next: {plan.next_action}")
+    return 0 if plan.ok else 1
+
+
 def register(sub) -> None:
     """Register the ``project-gateway`` subcommand tree onto ``sub``."""
     gateway = sub.add_parser(
@@ -441,6 +530,55 @@ def register(sub) -> None:
         help="Emit the structured LaunchOrAdoptDecision payload as JSON.",
     )
     adopt.set_defaults(func=cmd_project_gateway_adopt)
+
+    route_plan = gateway_sub.add_parser(
+        "route-plan",
+        help=(
+            "Read-only: resolve the current-Unit relative delegation route one step "
+            "down (Redmine #12699). --from-role names this Unit's lane role; the "
+            "route resolves the next-step-down project_gateway / "
+            "delegated_coordinator / implementation_worker semantically and reports "
+            "the launch-or-adopt action, the anchor requirement, and whether the "
+            "resolved lane is cockpit-visible green-path evidence (a detached "
+            "--no-attach normal session / cockpit --json preview is not)."
+        ),
+    )
+    route_plan.add_argument(
+        "--from-role",
+        dest="from_role",
+        required=True,
+        choices=list(RELATIVE_CALLER_ROLES),
+        help=(
+            "The current Unit's lane role (the relative anchor). One of "
+            f"{', '.join(RELATIVE_CALLER_ROLES)}; the one-step-down target is "
+            "derived from it (a grandchild worker has no downward delegation)."
+        ),
+    )
+    route_plan.add_argument(
+        "--repo",
+        required=True,
+        help="Workspace Git worktree root (repo_root authority).",
+    )
+    route_plan.add_argument(
+        "--project",
+        required=True,
+        help="Adopted project scope id (redmine_project) for the relative route.",
+    )
+    route_plan.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Optional session or cockpit group to narrow candidates. Omit to "
+            "resolve across separate windows/sessions (the normal path)."
+        ),
+    )
+    route_plan.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the structured RelativeRoutePlan payload as JSON.",
+    )
+    route_plan.set_defaults(func=cmd_project_gateway_route_plan)
 
     handoff = gateway_sub.add_parser(
         "handoff",

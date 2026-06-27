@@ -87,6 +87,14 @@ class ResolveCliTest(unittest.TestCase):
         # Start action is cwd-authority; must not misdirect via --repo (j#66626 b1).
         self.assertNotIn("cockpit --repo", text)
 
+    def test_missing_names_cockpit_visible_startup(self):
+        # Redmine #12699: the start action is a cockpit-visible Unit, and the
+        # launch command warns against the detached / preview escape hatch.
+        rc, text = self._run(_resolve_args(), [_candidate("%w", role="claude")])
+        self.assertEqual(rc, 1)
+        self.assertIn("cockpit-visible Unit", text)
+        self.assertIn("--no-attach", text)
+
     def test_claude_worker_is_not_resolved_as_gateway(self):
         # Only a Claude worker is up; the gateway role is fixed to codex, so this
         # is gateway_missing, never a resolved Claude target (j#66626 blocker 2).
