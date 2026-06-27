@@ -42,6 +42,14 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     resolve_project_gateway,
     start_project_gateway_command,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
+    ACTION_ADOPT,
+    ACTION_BLOCKED,
+    ACTION_LAUNCH,
+    GatewayLaneIdentity,
+    gateway_lane_identity_from_scope,
+    resolve_launch_or_adopt,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
@@ -132,6 +140,112 @@ def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
     # gateway_missing / selector_gap: name the concrete start action + near misses.
     print("next: start_project_gateway ->")
     print(f"  {start_project_gateway_command(route)}")
+    if resolution.near_misses:
+        print("near misses (why each pane was not the gateway):")
+        for near in resolution.near_misses:
+            cand = near.candidate
+            print(
+                f"  - pane_id={cand.pane_id} role={cand.role} "
+                f"repo={cand.repo_short} project_scope={cand.project_scope or '<none>'} "
+                f"reason={near.reason}"
+            )
+    return 1
+
+
+def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity:
+    """Build the gateway lane identity for ``project_scope`` under ``repo_root``.
+
+    Prefers the project's adopted metadata (#12658 ``adopted_scopes_for_repo``) so
+    the launch action carries the real project path / label / parent workspace.
+    Falls back to a metadata-thin identity from the flags when the project is not
+    discoverable / not adopted (e.g. ``runtime_identity.enabled`` is off): the
+    launch-or-adopt resolution still runs and fails closed honestly rather than
+    pretending the scope is adopted.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+        adopted_scopes_for_repo,
+    )
+
+    for scope in adopted_scopes_for_repo(repo_root):
+        if scope.scope == project_scope:
+            return gateway_lane_identity_from_scope(scope, repo_root=repo_root)
+    # Not adopted: derive a thin identity directly from the route inputs. The
+    # project path is unknown, so the launch command names the project workdir
+    # generically; this never invents an adoption that the metadata does not show.
+    return GatewayLaneIdentity(
+        project_scope=project_scope,
+        project_label=project_scope,
+        project_path="",
+        repo_root=repo_root,
+    )
+
+
+def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
+    """Resolve the launch-or-adopt decision for a project gateway lane (#12708).
+
+    The grandparent (department root) -> parent (project gateway) transition entry
+    point: classify a request onto ``--project``, then decide — purely by semantic
+    identity, never a copied ``%pane`` — whether to *adopt* a live gateway lane,
+    *launch* one (none exists), or fail *blocked* (ambiguous / under-specified).
+    Read-only: it prints the decision and the concrete next action; the actual
+    launch is the named ``start_project_gateway`` command (cockpit), and delivery
+    to an adopted gateway stays ``project-gateway handoff``.
+    """
+    require_tmux()
+    identity = _gateway_identity(args.repo, args.project)
+    decision = resolve_launch_or_adopt(
+        _discover_candidates(),
+        identity,
+        session=getattr(args, "session", None),
+    )
+
+    if getattr(args, "as_json", False):
+        print(_json.dumps(decision.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if decision.ok else 1
+
+    print(f"action: {decision.action}")
+    print(
+        "identity: "
+        f"target_kind={identity.target_kind} role={identity.role} "
+        f"lane_kind={identity.lane_kind} launch_policy={identity.launch_policy} "
+        f"callback_to={identity.callback_to}"
+    )
+    print(
+        "route: "
+        f"repo_root={identity.repo_root} project_scope={identity.project_scope} "
+        f"workspace={identity.workspace or '<unknown>'}"
+    )
+    if decision.detail:
+        print(f"detail: {decision.detail}")
+
+    if decision.action == ACTION_ADOPT and decision.adopted is not None:
+        sel = decision.adopted
+        print(
+            "adopt: "
+            f"pane_id={sel.pane_id} session={sel.session} window={sel.window_name} "
+            f"repo={sel.repo_short} project_scope={sel.project_scope}"
+        )
+        # The normal, pane-id-free route to deliver to the adopted gateway.
+        print(
+            "next: handoff_to_project_gateway -> "
+            f"mozyo-bridge project-gateway handoff --to {identity.role} "
+            f"--target-repo {identity.repo_root} --target-project {identity.project_scope} "
+            "--source redmine --issue <id> --journal <id> --kind ticketless_consultation"
+        )
+        return 0
+
+    if decision.action == ACTION_LAUNCH:
+        print("next: start_project_gateway ->")
+        print(f"  {decision.launch_command}")
+        return 0
+
+    # ACTION_BLOCKED: fail closed; name the matched / near-miss candidates so the
+    # operator can disambiguate or complete the route.
+    resolution = decision.resolution
+    if resolution.matched:
+        print("matched (ambiguous — refuse to adopt or launch):")
+        for cand in resolution.matched:
+            print(f"  - pane_id={cand.pane_id} session={cand.session} window={cand.window_name}")
     if resolution.near_misses:
         print("near misses (why each pane was not the gateway):")
         for near in resolution.near_misses:
@@ -267,6 +381,43 @@ def register(sub) -> None:
         help="Emit the structured GatewayResolution payload as JSON.",
     )
     resolve.set_defaults(func=cmd_project_gateway_resolve)
+
+    adopt = gateway_sub.add_parser(
+        "adopt",
+        help=(
+            "Read-only: decide launch-or-adopt for the project gateway lane "
+            "(Redmine #12708). Resolves the live gateway by semantic identity and "
+            "returns adopt (reuse the live lane) / launch (start one in the "
+            "project workdir) / blocked (ambiguous or under-specified). The "
+            "grandparent -> parent project-gateway transition entry; never selects "
+            "by active pane."
+        ),
+    )
+    adopt.add_argument(
+        "--repo",
+        required=True,
+        help="Workspace Git worktree root (repo_root authority).",
+    )
+    adopt.add_argument(
+        "--project",
+        required=True,
+        help="Adopted project scope id (redmine_project) to launch-or-adopt the gateway for.",
+    )
+    adopt.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Optional session or cockpit group to narrow candidates. Omit to "
+            "resolve across separate windows/sessions (the normal path)."
+        ),
+    )
+    adopt.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the structured LaunchOrAdoptDecision payload as JSON.",
+    )
+    adopt.set_defaults(func=cmd_project_gateway_adopt)
 
     handoff = gateway_sub.add_parser(
         "handoff",

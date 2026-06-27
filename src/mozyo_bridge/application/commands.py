@@ -541,6 +541,18 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
             status=breadcrumb.status,
         ).as_payload()
 
+    # Live project-gateway lane identity projection (#12708): the visible
+    # distinction the GK3500 smoke (#12698) lacked between the Cloud Drive
+    # project gateway and the GK3500 department root. Derived purely from each
+    # candidate's already-resolved identity (role provenance + #12658 project
+    # scope), display-only and never folded into the canonical `TargetRecord`
+    # routing projection (`to_dict`). JSON gains a `gateway` record per target,
+    # text appends a TARGET_KIND column.
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
+        classify_target_kind,
+        gateway_projection,
+    )
+
     # Single observation timestamp for this read; the pure attention read model
     # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
     # here once. Attention is an additive projection (#11952): JSON gains an
@@ -558,6 +570,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                 "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
                 "delegation": delegation_map[candidate.pane_id].as_payload(),
                 "delegation_window": _delegation_window_payload(candidate),
+                "gateway": gateway_projection(candidate),
             }
             for candidate in candidates
         ]
@@ -576,7 +589,13 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
         # run so the workspace (department) identity and the project scope are
         # visible simultaneously; `PROJECT` / `PROJECT_PATH` are `-` for a
         # single-repo workspace pane, preserving display compatibility.
-        "PROJECT\tPROJECT_PATH"
+        "PROJECT\tPROJECT_PATH\t"
+        # Live project-gateway lane identity (#12708). The final column names the
+        # derived gateway target_kind so a project gateway (`project_gateway`) is
+        # told apart from the department root (`workspace_root`), a worker
+        # (`worker`), or an unbindable pane (`unknown`) — the distinction the
+        # GK3500 smoke needed. Derived projection, never a routing key.
+        "TARGET_KIND"
     )
     for c in candidates:
         lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
@@ -611,6 +630,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     parent_cell,
                     project_cell,
                     c.project_path or "-",
+                    classify_target_kind(c),
                 ]
             )
         )
