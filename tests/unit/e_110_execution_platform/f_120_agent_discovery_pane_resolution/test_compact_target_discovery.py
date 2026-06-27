@@ -378,6 +378,41 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         # Root coordinator is its own top-of-tree window under any policy.
         self.assertTrue(by_pane["%1"]["delegation_window"]["window_separated"])
 
+    def test_gateway_projection_distinguishes_project_gateway_from_root(self) -> None:
+        # #12708: agents targets surfaces the live gateway identity. A
+        # project-scoped Codex projects `project_gateway`; a Codex with no project
+        # scope projects `workspace_root` (the department root the GK3500 smoke
+        # mistook for a gateway). Text gains a final TARGET_KIND column.
+        rc, out = self._run([
+            _pane("%gw", "mozyo-cockpit:0.0", window_name="codex",
+                  agent_role="codex", project_scope="giken-cloud-drive-management",
+                  project_path="projects/giken-cloud-drive-management",
+                  project_label="クラウドドライブ管理"),
+            _pane("%root", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="codex"),
+        ])
+        self.assertEqual(0, rc)
+        self.assertIn("\tTARGET_KIND", out)  # header column appended
+        lines = {ln.split("\t", 1)[0]: ln for ln in out.splitlines()}
+        self.assertTrue(lines["%gw"].endswith("\tproject_gateway"))
+        self.assertTrue(lines["%root"].endswith("\tworkspace_root"))
+
+    def test_json_gateway_record_flags_the_project_gateway(self) -> None:
+        # #12708: --json gains an additive `gateway` record per target.
+        rc, out = self._run([
+            _pane("%gw", "mozyo-cockpit:0.0", window_name="codex",
+                  agent_role="codex", project_scope="giken-cloud-drive-management",
+                  project_label="クラウドドライブ管理"),
+        ], as_json=True)
+        self.assertEqual(0, rc)
+        c = json.loads(out)[0]
+        self.assertEqual("project_gateway", c["gateway"]["target_kind"])
+        self.assertTrue(c["gateway"]["is_project_gateway"])
+        self.assertEqual("giken-cloud-drive-management", c["gateway"]["project_scope"])
+        # Non-authoritative: the gateway record is additive only, never folded
+        # into the canonical TargetRecord routing projection.
+        self.assertNotIn("gateway", c["identity"])
+
     def test_delegation_window_is_not_in_canonical_target_record(self) -> None:
         # Non-authoritative: the window projection rides as an additive sibling
         # only; the canonical TargetRecord (host/runtime/identity/repo/view) that
@@ -873,8 +908,10 @@ class AgentsTargetsDelegationColumnsTest(unittest.TestCase):
             _pane("%9", "mozyo-cockpit:0.1", window_name="codex", agent_role="claude"),
         ])
         self.assertEqual(0, rc)
-        # No @mozyo_lane_kind -> trailing KIND / DEPTH / PARENT cells are blank.
-        self.assertTrue(out.rstrip().endswith("\t-\t-\t-"))
+        # No delegation / project facts -> PARENT / PROJECT / PROJECT_PATH cells
+        # are blank; the #12708 TARGET_KIND column then names the derived kind
+        # (a Claude pane is a `worker`), so it is the final trailing column.
+        self.assertTrue(out.rstrip().endswith("\t-\t-\t-\tworker"))
 
     def test_json_adds_additive_delegation_record(self) -> None:
         rc, out = self._run(self._tree_panes(), as_json=True)

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6636
+    lines: 6656
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -99,6 +99,13 @@ allowlist:
       Git-root-preferring resolver, and project-scoped cockpit columns thread a
       `launch_cwd` (project workdir) through the 3 workspace-construction sites so
       a launched pane's cwd is under the project path.
+      Raised 6636 -> 6656 for the #12708 live project-gateway lane identity
+      projection in `cmd_agents_targets` (the additive JSON `gateway` record + the
+      appended TARGET_KIND text column distinguishing project_gateway /
+      workspace_root / worker; the classifier, identity, and launch-or-adopt
+      policy live in the new
+      `f_120_agent_discovery_pane_resolution/domain/project_gateway_identity.py`,
+      not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
