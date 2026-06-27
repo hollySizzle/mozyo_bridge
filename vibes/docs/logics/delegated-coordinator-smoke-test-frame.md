@@ -139,6 +139,36 @@ classical tests を通した後、実機 smoke は次だけを見る。
 実機 smoke は e2e acceptance であり、unit / integration test の代替ではない。実機 smoke
 で初めて profile disconnect や missing actuator を発見する状態は遅すぎる。
 
+### GK3500 rerun harness boundary
+
+#12698 の GK3500 探索 smoke は、route authority、role binding、contract refs、callback rail
+の欠落が混ざると、失敗理由を receiver の判断ミスとして誤分類しやすいことを示した。修正後
+rerun は #12709 を test issue とし、#12709 description と
+`delegated-coordinator-real-machine-acceptance.md` の `GK3500 ticketless rerun gate` を
+開始前に読む。
+
+product evidence として認めるもの:
+
+- grandparent が Redmine smoke issue / prior journal / expected route を読まず、routing
+  metadata だけで project gateway を分類または fail-closed する。
+- parent project gateway が明示 role と workflow contract を受け取り、domain 判断を
+  grandparent に横取りされず、必要なら Redmine anchor 境界を返す。
+- child / grandchild へ進む場合、Redmine anchor、callback target、no-dispatch reason が
+  durable record で replay できる。
+- callback / hands-off が pane 上の自然文ではなく、standard transport または durable anchor
+  で caller lane へ戻る。
+
+assisted hypothesis check に留めるもの:
+
+- operator が absolute doc path、role payload、manual Enter、pane focus、debug `%pane` を補って
+  receiver の理解だけを観測する run。
+- `mozyo-bridge message` / marker failure 後に raw text が composer に残った状態から続ける run。
+- transport gap を手作業で避けて role-binding だけを確認する run。
+
+assisted run は有用なら Redmine に記録するが、#12709 の product rerun PASS にはしない。
+同じ session 内で contaminated / assisted state が混ざった場合は、fresh session / fresh unit
+からやり直す。
+
 ## 推奨実装方針
 
 1. まず route orchestration を pure plan と side-effect executor に分ける。
@@ -164,6 +194,7 @@ classical tests を通した後、実機 smoke は次だけを見る。
 
 - `vibes/docs/logics/delegated-coordinator-cockpit-display.md`
 - `vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md`
+- `vibes/docs/logics/ticketless-project-gateway-runtime-ux.md`
 - `vibes/docs/specs/delegation-policy-project-config.md`
 - `vibes/docs/specs/delegated-coordinator-role-profile.md`
 - `vibes/docs/logics/role-profile-handoff-expansion.md`

@@ -69,6 +69,30 @@ Redmine #12499 の現在の合格目標は #12546 autonomous parent real-machine
 
 この順序は mozyo_bridge repo-local の運用順序であり、3 層 acceptance の普遍条件ではない。
 
+### GK3500 ticketless rerun gate
+
+Redmine #12698 の GK3500 IT Operations 探索 smoke で見えた欠落は、#12709
+`GK3500 修正後 祖父・親・子・孫 実機 smoke rerun` を rerun gate として扱う。
+#12709 は #12698 の続行ではなく、修正後に同じ philosophy で再実行するためのテスト issue
+である。#12709 を走らせる前に、少なくとも次の順序で blocker / prerequisite を解消する。
+
+1. #12708: project metadata から live `project_gateway` lane identity へ解決する設計を作る。
+2. #12706: ticketless transition payload に `current_role` / `allowed_actions` /
+   `forbidden_actions` を載せ、grandparent が parent gateway 判断を横取りしないようにする。
+3. #12700: workflow contract docs を受信側へ自動注入または確実に解決可能な ref として渡す。
+4. #12703: Redmine anchor が無い ticketless callback / hands-off を標準 rail で返せるようにする。
+5. #12705: LLM が marker / raw Enter / rollback の細部を判断しない `q-enter` 相当の submit
+   primitive を用意する。
+6. #12699: 相対 route 解決と cockpit-visible project gateway 起動を統合する。
+
+この順序は、version 名だけで優先順位を表現しない。Redmine relation と #12709 description を
+durable priority record とし、本書は test operator が同じ順序を読めるようにする reference である。
+
+上記を満たさずに operator が手で absolute path、role payload、pane focus、raw Enter を補った
+run は、仮説検査として価値があっても `assisted` である。transport / route resolver / payload
+injection が product として成立した evidence にはしない。明示 waiver なしに #12709 で
+`exploratory_pass` または acceptance 進行判断を出してはいけない。
+
 ## Parent Prompt Boundary
 
 親 project coordinator へ渡してよいもの:
@@ -84,12 +108,18 @@ Redmine #12499 の現在の合格目標は #12546 autonomous parent real-machine
 - mozyo_bridge を子として起動せよ、という期待答え。
 - 子 / 孫の具体 pane id、worktree path、lane id。
 - 既存 smoke management issue の PASS/FAIL journal。
+- 既存 smoke issue id、prior smoke の blocker、期待 route、分類済み project 名を、receiver の
+  ticketless 判断材料として先に渡すこと。
 - `delegated_coordinator` / `implementation_gateway` /
   `implementation_worker` を使えば合格、という test oracle。
 - 親が `project.yaml` を読んで判断すべき内容の先回り要約。
 
 これらを渡した run は、たとえ 3 層 window が開いても context-rich / harness-assisted run で
 あり、本命 autonomous parent smoke の PASS ではない。
+
+一方で、workflow contract refs、role boundary、callback target、禁止事項は test oracle では
+なく execution contract である。これらが runtime に自動注入されていない場合、receiver が
+正しく振る舞えないのは receiver の判断力不足ではなく harness / product contract 欠落として扱う。
 
 ## Expected Route
 
