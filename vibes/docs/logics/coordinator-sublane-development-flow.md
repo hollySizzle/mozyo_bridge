@@ -90,7 +90,7 @@ CLI 名、コード識別子、固有 provider 名だけを literal token とし
    - lane owner は pane id ではなく workflow role / route identity で表す。
    - `Codex` / `Claude` は provider であり role ではない、という語彙を最初に入れる。
    - #12675 / #12676 / #12677 で、祖父→親→子→孫の実機テスト前ワークフローを
-     PlantUML sequence、command family、fail condition、実機前監査へ分解する。
+     PlantUML sequence、transition surface、fail condition、実機前監査へ分解する。
 
 2. #12671 `DBベースのワークフロー状態とコマンド結果の次アクションを実装する`
    - mozyo DB に workflow state / pending delivery / route identity を持つ。
