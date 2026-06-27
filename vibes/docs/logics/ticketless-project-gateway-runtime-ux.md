@@ -129,6 +129,11 @@ function-like に書く。agent は swimlane を読めば、各境界でどの c
 swimlane 内の function 名は安定した設計語彙である。CLI command 名は今後変わってよいが、
 product-ready と呼ぶには、各 function と等価な command surface を実装する必要がある。
 
+Ticketless callback / hands-off の正本は下の sequence と matrix に置く。Redmine anchor が
+まだ無い phase でも callback 義務は残る。pane 上の自然文回答だけで停止することは callback
+ではなく、`consultation_result` / `no_dispatch` / `blocked` / `anchor_required` のいずれかを
+caller lane へ返す。
+
 ```plantuml
 @startuml
 title Ticketless Project Gateway Runtime UX
@@ -249,6 +254,17 @@ dispatch_redmine_anchored_worker(...)
   通常の governed workflow で worker へ implementation を渡す
   execution 前に durable anchor を要求する
 ```
+
+### Transition / Callback Matrix
+
+| transition | transition surface | durable anchor | success condition | fail condition |
+| --- | --- | --- | --- | --- |
+| 祖父 -> 親 | project gateway resolution + lane handoff | ticketless の分類段階では不要。implementation に進む前に parent 以降で要求する。 | grandparent が routing metadata だけで parent project gateway を一意に解決または起動し、ticketless consultation を parent へ渡す。 | classification ambiguous、project gateway missing / ambiguous、semantic route identity 不一致、手打ち `%pane` を route authority として採用、project Claude への direct send。 |
+| 親 -> 子 | delegated coordinator adoption + lane handoff | 必須。parent が implementation / domain probe 必要と判断した時点で Redmine issue / journal anchor を作成または選択する。 | parent は直接調査・実装せず、Redmine anchor と project identity を保持したまま child coordinator へ橋渡しする。 | Redmine anchor missing、parent direct investigation / implementation、grandchild への direct send、child coordinator の route identity 不一致、Claude 誤送信。 |
+| 子 -> 孫 | grandchild dispatch + worker realization | 必須。grandchild worker は Redmine anchor を読めない限り実行しない。 | child が grandchild dispatch の可否を記録し、dispatch する場合は implementation worker が Redmine-governed work として実装・検証する。 | no-dispatch reason 未記録、route depth / owning route 不整合、worker realization 不明、Redmine anchor missing、hidden subagent 採用、Claude 誤送信。 |
+| 孫 -> 子 | worker callback | 必須。implementation_done / review_request / blocked は Redmine journal を正本にする。 | grandchild が implementation_done / review_request / blocked を Redmine に記録し、child へ state pointer を返す。 | queue-enter 不達を durable record で回収しない、work log 本文を callback 正本にする、Redmine journal なしの完了主張、child 以外への direct callback。 |
+| 子 -> 親 | gateway callback | 必須。child は grandchild の結果または no-dispatch reason を Redmine anchor に紐づける。 | child が grandchild 結果を集約し、parent project gateway へ review-ready / blocked / no-dispatch state pointer を返す。 | parent callback missing、callback target identity 不明、queue-enter 不達を Redmine で再構成できない、parent issue close を child が代行。 |
+| 親 -> 祖父 | project gateway result callback / ticketless hands-off | ticketless no-dispatch では不要。implementation に進んだ場合は必須。 | parent が `consultation_result` / `no_dispatch` / `blocked` / `anchor_required` を grandparent へ返し、grandparent が transition result を記録する。 | pane 上の回答だけで停止する、parent が実装結果を保持したまま祖父へ返さない、callback transport missing を blocked として返さない、owner / grandparent へ work log を直接貼って durable anchor を欠く、親が close approval / review authority を代行。 |
 
 実装がこれらと同名の command ではなく低レベル primitive を公開する場合でも、agent が
 documentation search で command sequence を発明せずに同じ transition を実行できる
