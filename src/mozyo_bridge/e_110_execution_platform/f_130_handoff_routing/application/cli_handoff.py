@@ -59,6 +59,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_pro
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
     configure_ticketless_callback_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_q_enter import (
+    register_q_enter,
+)
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
@@ -125,10 +128,16 @@ def configure_handoff_parser(
     include_force: bool = True,
     target_required: bool = False,
     target_repo_required: bool = False,
+    source_required: bool = True,
 ) -> None:
     if include_to:
         parser_.add_argument("--to", required=True, choices=["claude", "codex"], help="Semantic receiver agent")
-    parser_.add_argument("--source", required=True, choices=sorted(SOURCES), help="Durable record source system")
+    parser_.add_argument(
+        "--source",
+        required=source_required,
+        choices=sorted(SOURCES),
+        help="Durable record source system",
+    )
     parser_.add_argument(
         "--kind",
         required=kind_required,
@@ -519,6 +528,8 @@ def register(sub) -> None:
     )
     configure_ticketless_callback_parser(handoff_ticketless)
     handoff_ticketless.set_defaults(func=cmd_handoff_ticketless_callback)
+
+    register_q_enter(handoff_sub)
 
     handoff_consult = handoff_sub.add_parser(
         "cross-workspace-consult",

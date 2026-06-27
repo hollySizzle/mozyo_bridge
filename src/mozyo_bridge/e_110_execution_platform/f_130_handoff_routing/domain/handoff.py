@@ -1398,6 +1398,7 @@ def build_delivery_record(
     role_profile_contract: Optional[str] = None,
     retry: Optional["QueueEnterRetryOutcome"] = None,
     activation: Optional["TargetActivationOutcome"] = None,
+    submit_lines: Optional[Sequence[str]] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -1527,6 +1528,16 @@ def build_delivery_record(
             "a tmux pane selection was used — no raw send-keys / paste-buffer / "
             "low-level type key injection as a recovery path."
         )
+    if submit_lines:
+        # Redmine #12705: additive q-enter front-door telemetry (composer-residue
+        # classification + the deterministic delivery id for duplicate
+        # prevention). Pre-rendered by the caller via
+        # `q_enter.submit_record_lines` (fixed tokens + the id, no free text), so
+        # this module stays a leaf the front door imports rather than the reverse.
+        # It documents front-door facts the transport outcome does not and never
+        # overrides `next_action`; the structured `(status, reason)` wire is
+        # unchanged.
+        lines.extend(submit_lines)
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
         # Wording Requirements. This note does NOT override `next_action`;

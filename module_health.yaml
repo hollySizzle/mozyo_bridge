@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6827
+    lines: 6857
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -125,6 +125,13 @@ allowlist:
       threads the callback through `build_notification_body` and the typed terminal
       `make_outcome` paths; the callback values + worker-dispatch refusal live in
       the new `f_130_handoff_routing/domain/ticketless_callback.py`, not here).
+      Raised 6827 -> 6857 for the #12705 LLM-facing q-enter / submit-complete
+      front-door telemetry wiring in `orchestrate_handoff` (the `_submit_lines_for`
+      helper + the `submit_lines` kwarg threaded into `_emit_outcome` at the three
+      post-typing emit sites). The front-door brain (intent -> rail / anchor
+      resolution, composer-residue classification, delivery-id) lives in the new
+      `f_130_handoff_routing/domain/q_enter.py` and the handler in
+      `f_130_handoff_routing/application/cli_handoff_q_enter.py`, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -180,7 +187,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1680
+    lines: 1691
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -227,6 +234,11 @@ allowlist:
       `build_delivery_record`. The callback values + worker-dispatch refusal live
       in the separate `domain/ticketless_callback.py` (kept out of this module), so
       only the anchor/outcome/record plumbing lands here.
+      Raised 1680 -> 1691 for the #12705 LLM-facing q-enter / submit-complete
+      additive `submit_lines` kwarg on `build_delivery_record` (the front door's
+      pre-rendered composer-residue + delivery-id block; the `DeliveryOutcome` wire
+      is unchanged). The residue classification + delivery-id derivation live in the
+      separate `domain/q_enter.py` (kept out of this module).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
