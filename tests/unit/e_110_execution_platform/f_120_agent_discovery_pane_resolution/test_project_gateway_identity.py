@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     CONFIDENCE_WEAK,
     ROLE_SOURCE_PANE_OPTION,
     VIEW_KIND_COCKPIT_PANE,
+    VIEW_KIND_NORMAL_WINDOW,
     TargetCandidate,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway import (
@@ -75,6 +76,7 @@ def _candidate(
     repo_root=REPO,
     project_scope=PROJECT,
     project_path=PROJECT_PATH,
+    view_kind=VIEW_KIND_COCKPIT_PANE,
 ):
     """A :class:`TargetCandidate` with project-gateway-shaped defaults."""
     return TargetCandidate(
@@ -96,7 +98,7 @@ def _candidate(
         repo_root=repo_root,
         cwd=f"{repo_root}/{project_path}" if project_path else repo_root,
         host="local",
-        view_kind=VIEW_KIND_COCKPIT_PANE,
+        view_kind=view_kind,
         branch="main",
         project_scope=project_scope,
         project_path=project_path,
@@ -323,6 +325,100 @@ class ProjectGatewayAdoptCliTest(unittest.TestCase):
         rc, out = self._run([_candidate("%w", role="claude")], scopes=[])
         self.assertEqual(0, rc)
         self.assertIn("action: launch", out)
+
+    def test_adopt_cockpit_lane_reports_green_path(self) -> None:
+        # Redmine #12699: adopting a cockpit-visible lane is green-path evidence.
+        rc, out = self._run([_candidate("%gw")], scopes=[_scope()])
+        self.assertEqual(0, rc)
+        self.assertIn("startup_evidence: cockpit_visible (green_path=True)", out)
+
+    def test_adopt_normal_window_lane_warns_not_green_path(self) -> None:
+        # Redmine #12699: a matching coordinator that is only a detached normal
+        # window is a real lane but NOT cockpit-visible green-path evidence. The
+        # command surfaces the warning, names the cockpit-visible startup, and
+        # fails closed (rc 1) so the detached lane is not accepted as the route.
+        rc, out = self._run(
+            [_candidate("%norm", view_kind=VIEW_KIND_NORMAL_WINDOW)], scopes=[_scope()]
+        )
+        self.assertEqual(1, rc)
+        self.assertIn("startup_evidence: detached_no_attach (green_path=False)", out)
+        self.assertIn("warning:", out)
+        self.assertIn("mozyo-bridge cockpit", out)
+
+    def test_launch_names_cockpit_visible_and_warns_detached(self) -> None:
+        rc, out = self._run([_candidate("%w", role="claude")], scopes=[_scope()])
+        self.assertEqual(0, rc)
+        self.assertIn("cockpit-visible Unit", out)
+        self.assertIn("--no-attach", out)
+
+    def test_json_includes_startup_evidence(self) -> None:
+        rc, out = self._run([_candidate("%gw")], scopes=[_scope()], as_json=True)
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        self.assertEqual(payload["startup_evidence"]["mode"], "cockpit_visible")
+        self.assertTrue(payload["startup_evidence"]["is_green_path"])
+
+    def test_json_normal_window_adopt_fails_closed(self) -> None:
+        # Redmine #12699 review rev2: JSON and text must agree — adopting a
+        # detached normal-window lane is not green-path, so rc 1 in JSON mode too.
+        rc, out = self._run(
+            [_candidate("%norm", view_kind=VIEW_KIND_NORMAL_WINDOW)],
+            scopes=[_scope()],
+            as_json=True,
+        )
+        self.assertEqual(1, rc)
+        payload = json.loads(out)
+        self.assertEqual(payload["action"], "adopt")
+        self.assertEqual(payload["startup_evidence"]["mode"], "detached_no_attach")
+        self.assertFalse(payload["startup_evidence"]["is_green_path"])
+
+
+class ProjectGatewayRoutePlanCliTest(unittest.TestCase):
+    """`project-gateway route-plan`: current-Unit relative delegation route (#12699)."""
+
+    def _run(self, candidates, *, from_role="grandparent_coordinator", as_json=False):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
+            cli_project_gateway,
+        )
+
+        args = argparse.Namespace(
+            from_role=from_role, repo=REPO, project=PROJECT, session=None, as_json=as_json
+        )
+        with patch.object(cli_project_gateway, "require_tmux"), \
+            patch.object(
+                cli_project_gateway, "_discover_candidates", return_value=candidates
+            ), \
+            contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = cli_project_gateway.cmd_project_gateway_route_plan(args)
+        return rc, out.getvalue()
+
+    def test_grandparent_adopt_cockpit_lane_is_green(self) -> None:
+        rc, out = self._run([_candidate("%gw")])
+        self.assertEqual(0, rc)
+        self.assertIn("grandparent(grandparent_coordinator) -> parent(project_gateway)", out)
+        self.assertIn("startup_evidence: cockpit_visible (green_path=True)", out)
+
+    def test_grandparent_missing_launch_is_cockpit_visible(self) -> None:
+        rc, out = self._run([_candidate("%w", role="claude")])
+        self.assertEqual(0, rc)
+        self.assertIn("cockpit", out)
+        self.assertIn("--no-attach", out)
+
+    def test_child_worker_is_anchor_gated(self) -> None:
+        rc, out = self._run(
+            [_candidate("%w", role="claude")], from_role="delegated_coordinator"
+        )
+        self.assertEqual(0, rc)
+        self.assertIn("grandchild(implementation_worker)", out)
+        self.assertIn("anchor_required: True", out)
+        self.assertIn("handoff send", out)
+
+    def test_json_payload(self) -> None:
+        rc, out = self._run([_candidate("%gw")], as_json=True)
+        self.assertEqual(0, rc)
+        payload = json.loads(out)
+        self.assertEqual(payload["step"]["target_binding"], "project_gateway")
+        self.assertTrue(payload["green_path"])
 
 
 if __name__ == "__main__":  # pragma: no cover
