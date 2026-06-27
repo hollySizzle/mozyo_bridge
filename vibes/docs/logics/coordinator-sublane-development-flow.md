@@ -77,40 +77,41 @@ structured field である。
 
 ### Roadmap US
 
-Redmine Version は semantic version number を含む名前にしない。Version 名は日付・優先度・
-run window を表す operational bucket とし、番号付き release name にしない。MCP には
+Redmine Version は semantic version number を含む名前にしない。Version 名は日本語を基本に、
+日付・優先度・作業窓を表す計画枠として付ける。番号付き release name にはしない。MCP には
 Version 作成と issue の Version 割り当て tool があるため、roadmap bucket は Redmine 上の
 Version として作成・割り当てる。一方で Version rename / lock / close / delete と
 Version 内 open leaf issue listing は #12651 で操作手段を確定する対象であり、誤作成や
-retirement cleanup はそこへ残す。
+retirement cleanup はそこへ残す。Redmine subject も日本語を基本にし、固定フィールド名、
+CLI 名、コード識別子、固有 provider 名だけを literal token として残す。
 
-1. #12670 `workflow lane ownership と transition function registry を設計する`
+1. #12670 `ワークフローのレーン所有と遷移関数レジストリを設計する`
    - PlantUML swimlane、lane registry、transition function contract を固定する。
    - lane owner は pane id ではなく workflow role / route identity で表す。
    - `Codex` / `Claude` は provider であり role ではない、という語彙を最初に入れる。
 
-2. #12671 `DB-backed workflow state と command result next_action を実装する`
+2. #12671 `DBベースのワークフロー状態とコマンド結果の次アクションを実装する`
    - mozyo DB に workflow state / pending delivery / route identity を持つ。
    - workflow-aware command result に `workflow.next_action` を含める。
    - `workflow resume` / `workflow action run` 相当の明示実行入口を持つ。
    - 自動 watcher ではなく、まず半自動・明示実行で duplicate / risk / fail-closed を固定する。
 
-3. #12672 `Redmine journal event source から pending workflow action を作る watcher を実装する`
+3. #12672 `Redmine履歴から保留ワークフローアクションを作る監視機構を実装する`
    - Redmine journal / issue update を event source として poll する。
    - 自然文 parse ではなく structured gate / marker を読む。
    - pending action 作成、duplicate suppression、missing / ambiguous route の fail-closed を固定する。
 
-4. #12673 `workflow role と runtime provider binding を分離する`
+4. #12673 `ワークフロー役割と実行プロバイダの対応を分離する`
    - workflow role から runtime provider への binding を config 化する。
    - DB / event schema は role を正本にし、provider は resolution result として扱う。
    - 表示では `auditor via codex` のように role と provider を分けて出す。
 
-5. #12603 `sublane の Git worktree lifecycle と統合ドキュメントを整備する`
+5. #12603 `サブレーンのGit作業木ライフサイクルと統合ドキュメントを整備する`
    - wrong-base lane、base commit、dependency branch、retire / merge policy を強化する。
    - workflow state / role binding が先に無い状態で worktree lifecycle だけを core 化しない。
    - Cockpit UI projection より前には lane / worktree lifecycle の hardening が必要である。
 
-6. #12674 `workflow state を Cockpit UI で追跡できる projection を設計する`
+6. #12674 `ワークフロー状態をCockpit UIで追跡できる投影を設計する`
    - UI は source of truth ではなく projection とする。
    - owner_role、provider、lane、next_action、blocked_reason、anchor を見せる。
    - WebSocket / live update は state model と watcher が固まった後に扱う。
