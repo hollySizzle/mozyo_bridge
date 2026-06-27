@@ -1,12 +1,12 @@
 """Ticketless transition role/action boundary payload (Redmine #12706).
 
-GK3500 exploratory smoke #12698 surfaced a lane-boundary defect: a receiver that
-could read the workflow contract docs classified a ticketless consultation into a
-project, then *also* made the parent project gateway's ``no_dispatch`` /
-``anchor_required`` decision itself. The receiver was effectively a grandparent
-(department-root) coordinator, whose only job is to classify the consultation and
-resolve / start / hand off to the parent project gateway — the project-domain
-``no_dispatch`` decision belongs to the gateway.
+This boundary guards a lane-boundary defect: a receiver that can read the workflow
+contract docs may classify a ticketless consultation into a project, then *also*
+make the parent project gateway's ``no_dispatch`` / ``anchor_required`` decision
+itself. Such a receiver is effectively a grandparent (department-root) coordinator,
+whose only job is to classify the consultation and resolve / start / hand off to
+the parent project gateway — the project-domain ``no_dispatch`` decision belongs to
+the gateway.
 
 The root cause was that the ticketless transition payload carried **no explicit
 role binding**, so the receiver inferred its lane role from pane / docs-readable
@@ -167,9 +167,9 @@ class TransitionRoleBoundary:
 
 
 # Builtin boundaries for the ticketless department-root -> project-gateway
-# transition. The grandparent boundary is the one #12698 needed: classify +
-# resolve/start/handoff are allowed, but the project-domain / parent-gateway
-# no_dispatch decision is forbidden. The project-gateway boundary is its
+# transition. The grandparent boundary allows classify + resolve/start/handoff
+# but forbids the project-domain / parent-gateway no_dispatch decision. The
+# project-gateway boundary is its
 # complement: it OWNS the project-domain / no_dispatch / anchor decisions the
 # grandparent must not pre-empt.
 #
@@ -226,7 +226,7 @@ TRANSITION_ROLE_BOUNDARIES: dict[str, TransitionRoleBoundary] = {
 
 TRANSITION_ROLE_TOKENS: tuple[str, ...] = tuple(TRANSITION_ROLE_BOUNDARIES.keys())
 
-# The two project-domain decisions that #12698 leaked across the boundary: they
+# The two project-domain decisions that must not leak across the boundary: they
 # are forbidden for the grandparent and owned by the project gateway. Pinned here
 # so a test can assert the boundary stays coherent (the grandparent must never be
 # allowed these, the gateway must always be).

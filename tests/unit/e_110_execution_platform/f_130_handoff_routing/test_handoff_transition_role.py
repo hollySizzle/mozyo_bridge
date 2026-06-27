@@ -1,7 +1,7 @@
 """Tests for the ticketless transition role/action boundary payload (Redmine #12706).
 
-GK3500 smoke #12698 surfaced a lane-boundary defect: a receiver inferred its lane
-role from docs-readable context and made the parent project gateway's
+The ticketless transition guards a lane-boundary defect: a receiver could infer
+its lane role from docs-readable context and make the parent project gateway's
 ``no_dispatch`` decision itself. The fix carries an explicit transition role/action
 boundary (``current_role`` / ``allowed_actions`` / ``forbidden_actions`` /
 ``handoff_target_role``) on the standard handoff transition payload and the durable
@@ -74,8 +74,8 @@ class ResolveTransitionRoleTest(unittest.TestCase):
         self.assertEqual(boundary.handoff_target_role, ROLE_PROJECT_GATEWAY)
 
     def test_project_domain_decision_crosses_the_boundary_correctly(self) -> None:
-        # The #12698 defect: the grandparent must NOT make the project-domain /
-        # no_dispatch decision; the project gateway OWNS it. Encode that invariant.
+        # The lane-boundary invariant: the grandparent must NOT make the
+        # project-domain / no_dispatch decision; the project gateway OWNS it.
         grandparent = resolve_transition_role(ROLE_GRANDPARENT_COORDINATOR)
         gateway = resolve_transition_role(ROLE_PROJECT_GATEWAY)
         for decision in PROJECT_DOMAIN_DECISIONS:
