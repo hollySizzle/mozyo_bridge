@@ -4,6 +4,23 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.9.2 - 2026-06-27
+
+`v0.9.1` からの **hotfix patch** で、production 配布手前の release preflight を green にするための 2 件の修正をまとめています。`src/**` の実行時挙動(`mozyo-bridge` / `mozyo` CLI の JSON / text 出力互換)は変更していません。
+
+### release tree-check の credential field-name false positive を除外(#12693)
+
+`release check tree` / artifact scan の credential classifier が、credential **名称** を参照しているだけの safe code(同名 keyword 引数の pass-through、`None` sentinel、digit を含まない snake_case identifier の代入)を literal credential と誤判定し、release を blocker にしていました。`_secret_value_is_real` の unquoted-identifier 除外を「digit を含まない bare identifier は名称参照」へ一般化し、文字列に埋め込まれた sentinel の末尾 quote を strip しました。digit / token punctuation を持つ real credential literal、および quoted literal の検出は弱めていません(#12175 の strict-fail test を維持)。regression test を追加しています。
+
+### CI release blocker の解消(#12692)
+
+`v0.9.1` 候補 head で GitHub Actions Test が red だった 8 件の unit failure(いずれも release-version とは無関係な cross-issue doc / scaffold drift)を解消しました。authored worktree-runbook と packaged scaffold copy の再 sync、distributed doc からの acceptance-fixture 識別子の neutralize、operating-model spine doc の required anchor 復元です。
+
+### リリース状況メモ
+
+- **version mirror**: `pyproject.toml` `[project].version` と `src/mozyo_bridge/__init__.py` `__version__` を `0.9.2` に確定(standalone commit)。
+- **production PyPI**: `skills/mozyo-bridge-agent/references/release.md` の Distribution Gates / Trusted Publishing に従い、TestPyPI rehearsal と fresh install validation、Codex / owner gate(親 #12695)を経てから判断します。本メモでは production publish / tag / GitHub Release を行いません。
+
 ## v0.9.1 - 2026-06-27
 
 `v0.9.0` から **229 commit** 進んだ現行 repo head を、新しい patch release `0.9.1` として production 配布候補に切り出した release です(#12687 / #12688)。公開配布物の最新は `0.9.0` でしたが、repo `main` はそこから大きく前進しており、operator が現行 head の公開配布を明示承認しました。version mirror(`pyproject.toml` `[project].version` と `src/mozyo_bridge/__init__.py` `__version__`)のみを `0.9.0` → `0.9.1` に更新する **standalone commit** を切り、code / docs content 変更とは混ぜていません。
