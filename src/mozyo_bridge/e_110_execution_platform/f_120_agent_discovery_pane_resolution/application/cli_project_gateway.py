@@ -207,6 +207,19 @@ def _startup_evidence_for(decision):
     return classify_startup_evidence()
 
 
+def _adopt_exit_code(decision, evidence) -> int:
+    """Unified adopt exit code shared by JSON and text mode (#12699 review rev2).
+
+    An ``adopt`` is success (rc 0) only when the resolved lane is cockpit-visible
+    green-path evidence; adopting a detached normal-window lane is rc 1 (it is not
+    the route). ``launch`` is rc 0 (forward), ``blocked`` is rc 1. JSON and text
+    must not disagree on this.
+    """
+    if decision.action == ACTION_ADOPT:
+        return 0 if evidence.is_green_path else 1
+    return 0 if decision.ok else 1
+
+
 def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
     """Resolve the launch-or-adopt decision for a project gateway lane (#12708).
 
@@ -232,7 +245,7 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
         payload = decision.as_payload()
         payload["startup_evidence"] = evidence.as_payload()
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if decision.ok else 1
+        return _adopt_exit_code(decision, evidence)
 
     print(f"action: {decision.action}")
     print(
@@ -276,7 +289,7 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
             f"--target-repo {identity.repo_root} --target-project {identity.project_scope} "
             "--source redmine --issue <id> --journal <id> --kind ticketless_consultation"
         )
-        return 0 if evidence.is_green_path else 1
+        return _adopt_exit_code(decision, evidence)
 
     if decision.action == ACTION_LAUNCH:
         # Name the cockpit-visible startup explicitly; the launch command itself

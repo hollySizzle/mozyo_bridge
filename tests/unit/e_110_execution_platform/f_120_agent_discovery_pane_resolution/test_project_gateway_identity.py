@@ -358,6 +358,20 @@ class ProjectGatewayAdoptCliTest(unittest.TestCase):
         self.assertEqual(payload["startup_evidence"]["mode"], "cockpit_visible")
         self.assertTrue(payload["startup_evidence"]["is_green_path"])
 
+    def test_json_normal_window_adopt_fails_closed(self) -> None:
+        # Redmine #12699 review rev2: JSON and text must agree — adopting a
+        # detached normal-window lane is not green-path, so rc 1 in JSON mode too.
+        rc, out = self._run(
+            [_candidate("%norm", view_kind=VIEW_KIND_NORMAL_WINDOW)],
+            scopes=[_scope()],
+            as_json=True,
+        )
+        self.assertEqual(1, rc)
+        payload = json.loads(out)
+        self.assertEqual(payload["action"], "adopt")
+        self.assertEqual(payload["startup_evidence"]["mode"], "detached_no_attach")
+        self.assertFalse(payload["startup_evidence"]["is_green_path"])
+
 
 class ProjectGatewayRoutePlanCliTest(unittest.TestCase):
     """`project-gateway route-plan`: current-Unit relative delegation route (#12699)."""
