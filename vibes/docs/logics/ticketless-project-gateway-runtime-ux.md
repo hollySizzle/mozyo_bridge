@@ -336,6 +336,24 @@ debug 中の operator hand correction は有用なことがあるが、product U
 operator が pane id をコピーした、window を手選択した、隠れた project context を与えた、
 といった補助で成立した run は green ではなく assisted として記録する。
 
+### 初回実機 run の扱い
+
+#12677 の実機前監査と #12695 / #12696 の `0.9.2` 公開配布物整備が完了した後でも、
+次に行う GK3500IT run は最初から full acceptance として扱わない。初回は
+**exploratory real-machine smoke** として、上記 acceptance 条件を満たせる観測点が実機で
+取れるかを確認する。
+
+探索 smoke では、開始前 snapshot と実行 prompt、transition ごとの観測点、停止条件、
+operator hand correction の有無、Redmine anchor 作成境界、route identity 解決結果を
+Redmine journal に残す。結果分類は `exploratory_pass` / `blocked` /
+`failed_acceptance` / `insufficient` / `contaminated` / `assisted` のいずれかとし、
+`exploratory_pass` は full acceptance PASS ではない。full acceptance へ進む場合は、
+探索 smoke の evidence を踏まえて acceptance gate または rerun 条件を別途記録する。
+
+探索 smoke でも不変条件は緩めない。`rclone` / Google Drive 実操作、parent / project_gateway
+による直接調査・実装、project Claude / grandchild への direct send、hidden subagent、
+手打ち `%pane` を route authority とする運用は fail condition のままである。
+
 ## 既存設計との関係
 
 `project-scoped-workspace-identity.md` は、monorepo project directory を fake Git repo に
