@@ -557,7 +557,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
-    purpose: "チケットなし相談で祖父 department_root_coordinator -> 親 project_gateway -> 子 delegated_coordinator / implementation_gateway -> 孫 implementation_worker の 4 層 UX と transition function contract を成立させる runtime 境界。親は直接調査・実装せず project gateway として Redmine anchor 付きで子へ橋渡しし、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。#12675 の祖父・親・子・孫 swimlane 正本。"
+    purpose: "チケットなし相談で抽象 lane `grandparent` -> `parent` -> `child` -> `grandchild` の 4 階層 UX と transition function contract を成立させる runtime 境界。GK3500 では grandparent=current binding `department_root_coordinator`、parent=`project_gateway`、child=`delegated_coordinator / implementation_gateway`、grandchild=`implementation_worker` として扱う。parent は直接調査・実装せず project gateway として Redmine anchor 付きで child へ橋渡しし、lane crossing command は sequence diagram の arrow label を正本にする。"
     audit_role: ticketless_project_gateway_runtime_ux_logic
     related_document_refs:
       - logic-coordinator-sublane-development-flow
