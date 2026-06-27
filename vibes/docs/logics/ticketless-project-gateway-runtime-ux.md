@@ -164,6 +164,39 @@ project gateway は implementation issue を作らない判断をしてよい。
 それが正常 outcome である。一方、implementation を dispatch するなら通常の
 Redmine-governed workflow が適用され、durable issue / journal anchor が必須になる。
 
+### プロジェクトゲートウェイの consultation callback 返却契約
+
+#12737 の正本である。project gateway が ticketless consultation を処理して結果に到達した
+とき、callback target が存在する限り、その結果を自身の pane の local 最終回答で停止せず、
+product callback primitive で caller lane へ返すことを normal-operation contract として固定
+する。
+
+- **callback target がある consultation result は product callback primitive で返す。** project
+  gateway が ticketless consultation を処理し、`consultation_result` / `no_dispatch` /
+  `blocked` / `anchor_required` のいずれかの結果に到達したら、その結果を caller lane へ次の
+  いずれかで返す。
+  - `mozyo-bridge handoff ticketless-callback ...` (Redmine anchor を carry しない structured
+    callback transport。`### Ticketless No-Anchor Callback Primitive`)。
+  - `mozyo-bridge handoff q-enter --intent consultation_callback ...` (LLM が rail / marker /
+    raw Enter を判断しない #12705 の LLM-facing front-door。同じ no-anchor rail に乗る)。
+- **local pane の最終回答は callback ではない。** pane 上に自然文の最終回答を書いて停止する
+  ことは、callback target が存在する限り workflow completion ではない (`### Grandparent /
+  Parent / Child / Grandchild Sequence` / matrix `親 -> 祖父` 行 fail condition と同一原則)。
+  上記 primitive のいずれかで structured callback を caller lane へ届けて初めて、project
+  gateway の ticketless 段階は完了扱いになる。
+- **worker dispatch の Redmine anchor 要件は緩めない。** 本契約は consultation 段階の *返却
+  経路* だけを固定する。実 worker execution / domain probe / implementation dispatch に進む
+  場合は従来どおり Redmine anchor を作成し、`handoff send --kind implementation_request
+  --source redmine --issue <id> --journal <id>` を使う。ticketless callback rail は anchored
+  worker dispatch decision を表現できず、fail closed する。
+- **operator / Codex による primitive の手動実行は product evidence ではない。** project
+  gateway 自身が autonomous に callback primitive を呼んだ run だけが acceptance evidence で
+  あり、operator / Codex が代理で `ticketless-callback` / `q-enter consultation_callback` を
+  打った run は `### 受け入れ判定の意味` の assisted として記録する。
+
+実 CLI flag / default / error wording は CLI help / parser / validation error を正本にする
+(`### Transition Contract Scope`)。本節は返却経路の lane boundary 契約だけを持つ。
+
 ## 意味的ターゲット解決の要件
 
 grandparent から parent project gateway への標準 route は、volatile な pane id なしで表現できなければ
@@ -380,6 +413,10 @@ queue-enter は delivery rail であり、task 完了 signal ではない。queu
 
 - 標準 primitive は `mozyo-bridge handoff ticketless-callback` とする。Redmine anchor を carry
   せず、偽装もしない。`--source` / `--issue` / `--journal` / `--task-id` を受け取らない。
+  LLM-facing front-door として `mozyo-bridge handoff q-enter --intent consultation_callback`
+  (#12705) も同じ no-anchor rail に乗り、同じ structured callback を返す。project gateway が
+  consultation result をこのどちらかで caller lane へ返すことは `### プロジェクトゲートウェイの
+  consultation callback 返却契約` (#12737) の必須返却経路である。
 - structured callback fields (`classification` / `dispatch_decision` / `next_action_owner` /
   `callback_reason` / `read_contract`、および classification/dispatch から導出する
   `redmine_anchor_required`) を **workflow result** として carry する。これは transport outcome

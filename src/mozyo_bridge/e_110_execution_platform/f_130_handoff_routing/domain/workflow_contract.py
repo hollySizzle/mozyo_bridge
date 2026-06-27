@@ -71,20 +71,30 @@ class WorkflowContractError(ValueError):
 # canonical checkout location (its redmine_project id), not a route oracle.
 MOZYO_BRIDGE_PROJECT_SUBDIR = "projects/giken-3800-mozyo-bridge"
 
-# Bumped only when the *composition* of a builtin bundle changes (a doc added /
-# removed / re-pathed). A receiver that pins this can detect bundle drift without
-# the bundle ever carrying a doc body. (Per-doc content versions are not invented
-# here — there is no durable source for them; the catalog ``contract_id`` is the
-# stable per-doc identity.)
-WORKFLOW_CONTRACT_SET_VERSION = 1
+# Bumped when the *composition* of a builtin bundle changes (a doc added /
+# removed / re-pathed) OR when an obligation token's semantics change, so a
+# receiver that pins this can detect bundle drift without the bundle ever carrying
+# a doc body. (Per-doc content versions are not invented here — there is no durable
+# source for them; the catalog ``contract_id`` is the stable per-doc identity.)
+# v2 (#12737): the ticketless callback obligation now names the product callback
+# *return path* (``ticketless-callback`` / ``q-enter consultation_callback``), so a
+# v1-pinning receiver must re-read it.
+WORKFLOW_CONTRACT_SET_VERSION = 2
 
 # Fixed obligation tokens (no operator free text) so they stay durable-record
 # safe. The receiver reads these as a normal-operation contract: read every
 # listed contract before acting, and hand the result back on the listed callback
 # states rather than leaving pane prose as the only evidence (#12700 j#66940).
 READ_OBLIGATION_ALL_BEFORE_ACTING = "read_all_listed_contracts_before_acting"
+# #12737 sharpens this from "callback these four result classes" to naming the
+# product *return path*: a ticketless consultation result is returned to the
+# caller lane through ``handoff ticketless-callback`` or ``handoff q-enter --intent
+# consultation_callback`` — not left as a local pane final answer when a callback
+# target exists. The worker-dispatch anchor gate is unchanged; only the
+# consultation-phase return path is named here.
 CALLBACK_OBLIGATION_TICKETLESS = (
-    "callback_consultation_result_no_dispatch_blocked_or_anchor_required"
+    "return_consultation_result_no_dispatch_blocked_or_anchor_required_via_"
+    "ticketless_callback_or_q_enter_consultation_callback"
 )
 CALLBACK_OBLIGATION_DELEGATED_CHILD = (
     "callback_implementation_done_review_request_or_blocked_to_delegation_parent"

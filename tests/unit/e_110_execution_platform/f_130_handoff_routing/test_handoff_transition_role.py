@@ -23,6 +23,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     make_outcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    GATEWAY_CALLBACK_PRIMITIVE_RETURN,
+    GATEWAY_LOCAL_ANSWER_NOT_CALLBACK,
     PROJECT_DOMAIN_DECISIONS,
     ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
@@ -81,6 +83,29 @@ class ResolveTransitionRoleTest(unittest.TestCase):
             self.assertNotIn(decision, grandparent.allowed_actions)
             self.assertIn(decision, gateway.allowed_actions)
             self.assertNotIn(decision, gateway.forbidden_actions)
+
+    def test_project_gateway_must_return_via_callback_primitive(self) -> None:
+        # #12737: the gateway returns its consultation result through the product
+        # callback primitive (ticketless-callback / q-enter consultation_callback)
+        # and must not treat a local pane answer as the callback. Encode both.
+        gateway = resolve_transition_role(ROLE_PROJECT_GATEWAY)
+        self.assertIn(GATEWAY_CALLBACK_PRIMITIVE_RETURN, gateway.allowed_actions)
+        self.assertNotIn(GATEWAY_CALLBACK_PRIMITIVE_RETURN, gateway.forbidden_actions)
+        self.assertIn(GATEWAY_LOCAL_ANSWER_NOT_CALLBACK, gateway.forbidden_actions)
+        self.assertNotIn(GATEWAY_LOCAL_ANSWER_NOT_CALLBACK, gateway.allowed_actions)
+
+    def test_local_answer_not_callback_is_gateway_only(self) -> None:
+        # The local-answer-not-callback prohibition belongs to the gateway (the
+        # lane that produces the consultation result), not the grandparent caller.
+        grandparent = resolve_transition_role(ROLE_GRANDPARENT_COORDINATOR)
+        self.assertNotIn(GATEWAY_LOCAL_ANSWER_NOT_CALLBACK, grandparent.forbidden_actions)
+        self.assertNotIn(GATEWAY_CALLBACK_PRIMITIVE_RETURN, grandparent.allowed_actions)
+
+    def test_worker_dispatch_anchor_action_is_unchanged(self) -> None:
+        # #12737 must not relax worker dispatch: the anchored worker-dispatch action
+        # stays an allowed gateway action and is not folded into the ticketless path.
+        gateway = resolve_transition_role(ROLE_PROJECT_GATEWAY)
+        self.assertIn("dispatch_redmine_anchored_worker", gateway.allowed_actions)
 
     def test_builtin_boundaries_keep_allowed_and_forbidden_disjoint(self) -> None:
         for boundary in TRANSITION_ROLE_BOUNDARIES.values():

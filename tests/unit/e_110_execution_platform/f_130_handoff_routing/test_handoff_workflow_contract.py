@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow
     MOZYO_BRIDGE_PROJECT_SUBDIR,
     READ_OBLIGATION_ALL_BEFORE_ACTING,
     WORKFLOW_CONTRACT_BUNDLES,
+    WORKFLOW_CONTRACT_SET_VERSION,
     WORKFLOW_CONTRACT_TOKENS,
     WorkflowContractBundle,
     WorkflowContractError,
@@ -74,6 +75,26 @@ class ResolveWorkflowContractTest(unittest.TestCase):
         )
         self.assertEqual(bundle.read_obligation, READ_OBLIGATION_ALL_BEFORE_ACTING)
         self.assertEqual(bundle.callback_obligation, CALLBACK_OBLIGATION_TICKETLESS)
+
+    def test_ticketless_callback_obligation_names_the_return_primitives(self) -> None:
+        # #12737: the ticketless callback obligation is no longer just "callback the
+        # result"; it names the product return path so the gateway returns it via
+        # `ticketless-callback` or `q-enter consultation_callback`, not a local pane
+        # answer. The token stays a fixed snake_case (durable-record safe) string.
+        self.assertIn("ticketless_callback", CALLBACK_OBLIGATION_TICKETLESS)
+        self.assertIn("q_enter_consultation_callback", CALLBACK_OBLIGATION_TICKETLESS)
+        self.assertEqual(
+            CALLBACK_OBLIGATION_TICKETLESS, CALLBACK_OBLIGATION_TICKETLESS.strip()
+        )
+        self.assertNotIn(" ", CALLBACK_OBLIGATION_TICKETLESS)
+
+    def test_builtin_bundles_pin_the_current_set_version(self) -> None:
+        # The #12737 obligation-semantics change bumped the set version to 2; every
+        # builtin bundle must carry the current version so a pinning receiver detects
+        # the drift and re-reads the obligation.
+        self.assertEqual(WORKFLOW_CONTRACT_SET_VERSION, 2)
+        for bundle in WORKFLOW_CONTRACT_BUNDLES.values():
+            self.assertEqual(bundle.contract_set_version, WORKFLOW_CONTRACT_SET_VERSION)
 
     def test_project_gateway_bundle_equips_the_delegated_child(self) -> None:
         bundle = resolve_workflow_contract(ROLE_PROJECT_GATEWAY)
