@@ -46,7 +46,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     RECORD_FORMAT_TEXT,
     RECORD_FORMATS,
     SOURCES,
+    SOURCE_TICKETLESS,
     TargetActivationOutcome,
+    TicketlessAnchor,
     build_delivery_record,
     build_execution_root,
     build_inactive_pane_fallback_command,
@@ -71,6 +73,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
     WorkflowContractError,
     resolve_workflow_contract,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
+    TicketlessCallback,
+    TicketlessCallbackError,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -4652,6 +4658,7 @@ def orchestrate_handoff(
     *,
     default_kind: str | None = None,
     require_receiver_binding: bool = False,
+    ticketless: bool = False,
 ) -> int:
     """High-level handoff/reply primitive.
 
@@ -4693,9 +4700,17 @@ def orchestrate_handoff(
     if receiver not in RECEIVERS:
         die(f"--to must be one of {sorted(RECEIVERS)}; got {receiver!r}")
 
-    source = getattr(args, "source", None)
-    if source not in SOURCES:
-        die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
+    if ticketless:
+        # Redmine #12703: the ticketless no-anchor callback rail carries no Redmine
+        # / Asana anchor, so it does not accept `--source` and is not in `SOURCES`.
+        # The source token is fixed to `ticketless` for the marker / outcome. This
+        # rail never reaches `normalize_anchor`, so the anchored send/reply rails'
+        # anchor requirement is untouched.
+        source = SOURCE_TICKETLESS
+    else:
+        source = getattr(args, "source", None)
+        if source not in SOURCES:
+            die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
 
     kind = getattr(args, "kind", None) or default_kind
     mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
@@ -4748,33 +4763,74 @@ def orchestrate_handoff(
 
     summary = getattr(args, "summary", None)
 
-    try:
-        anchor = normalize_anchor(
-            source,
-            task_id=getattr(args, "task_id", None),
-            comment_id=getattr(args, "comment_id", None),
-            anchor_url=getattr(args, "anchor_url", None),
-            issue=getattr(args, "issue", None),
-            journal=getattr(args, "journal", None),
+    # Redmine #12703: the structured ticketless callback result, built distinctly
+    # from the transport outcome. `None` for every anchored send/reply.
+    ticketless_callback_payload: TicketlessCallback | None = None
+
+    if ticketless:
+        # Build the structured callback result, then derive the no-anchor
+        # `TicketlessAnchor` from it. Construction fails closed (blocked /
+        # invalid_args) on an unknown token or — critically — on a dispatch
+        # decision that is an actual worker dispatch (which still requires a real
+        # Redmine anchor; the child -> grandchild boundary is not relaxed).
+        try:
+            ticketless_callback_payload = TicketlessCallback(
+                classification=getattr(args, "classification", None),
+                dispatch_decision=getattr(args, "dispatch_decision", None),
+                next_action_owner=getattr(args, "workflow_next_owner", None),
+                callback_reason=getattr(args, "callback_reason", None),
+                read_contract=getattr(args, "read_contract", None),
+            )
+        except TicketlessCallbackError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=None,
+                    anchor=None,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+        anchor = TicketlessAnchor(
+            classification=ticketless_callback_payload.classification,
+            dispatch_decision=ticketless_callback_payload.dispatch_decision,
         )
-    except AnchorError as exc:
-        _emit_outcome(
-            make_outcome(
-                status="blocked",
-                reason="invalid_anchor",
-                receiver=receiver,
-                target=None,
-                anchor=None,
-                mode=mode,
-                kind=kind,
-                notification_marker=None,
-                source=source,
-            ),
-            record_format=record_format,
-            command=record_command,
-        )
-        die(str(exc))
-        raise AssertionError("unreachable")
+    else:
+        try:
+            anchor = normalize_anchor(
+                source,
+                task_id=getattr(args, "task_id", None),
+                comment_id=getattr(args, "comment_id", None),
+                anchor_url=getattr(args, "anchor_url", None),
+                issue=getattr(args, "issue", None),
+                journal=getattr(args, "journal", None),
+            )
+        except AnchorError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_anchor",
+                    receiver=receiver,
+                    target=None,
+                    anchor=None,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
 
     target_arg = getattr(args, "target", None) or receiver
     try:
@@ -5623,6 +5679,7 @@ def orchestrate_handoff(
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
             workflow_contract=workflow_contract_bundle,
+            ticketless_callback=ticketless_callback_payload,
         )
     except AnchorError as exc:
         _emit_outcome(
@@ -5640,6 +5697,7 @@ def orchestrate_handoff(
                 role_profile=role_profile_resolution,
                 transition_role=transition_role_boundary,
                 workflow_contract=workflow_contract_bundle,
+                ticketless_callback=ticketless_callback_payload,
             ),
             record_format=record_format,
             command=record_command,
@@ -5677,6 +5735,7 @@ def orchestrate_handoff(
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
             workflow_contract=workflow_contract_bundle,
+            ticketless_callback=ticketless_callback_payload,
         )
         _emit_outcome(
             outcome,
@@ -5712,6 +5771,7 @@ def orchestrate_handoff(
             role_profile=role_profile_resolution,
             transition_role=transition_role_boundary,
             workflow_contract=workflow_contract_bundle,
+            ticketless_callback=ticketless_callback_payload,
         )
         _emit_outcome(
             outcome,
@@ -5785,6 +5845,7 @@ def orchestrate_handoff(
         # delivery that matters; #12700 adds the workflow-contract bundle alongside.
         transition_role=transition_role_boundary,
         workflow_contract=workflow_contract_bundle,
+        ticketless_callback=ticketless_callback_payload,
     )
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually
@@ -5846,6 +5907,25 @@ def cmd_handoff_send(args: argparse.Namespace) -> int:
 
 def cmd_handoff_reply(args: argparse.Namespace) -> int:
     return orchestrate_handoff(args, default_kind="reply")
+
+
+def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
+    """Standard ticketless no-anchor callback / hands-off primitive (Redmine #12703).
+
+    Returns a ticketless consultation hands-off result (``consultation_result`` /
+    ``no_dispatch`` / ``blocked`` / ``anchor_required``) to the caller lane over
+    the standard delivery rail (queue-enter / standard semantics, the same target
+    admission / repo-identity / cross-session gates), WITHOUT a Redmine anchor and
+    without fabricating one. The structured callback fields are carried as the
+    workflow *result* (``DeliveryOutcome.ticketless_callback``), recorded
+    distinctly from the transport outcome.
+
+    It does NOT touch the Redmine-governed ``handoff reply`` / ``reply`` rail
+    (those still require ``--issue`` + ``--journal``), and it fails closed if the
+    dispatch decision is an actual child -> grandchild worker dispatch (which still
+    requires a real anchor via ``handoff send``).
+    """
+    return orchestrate_handoff(args, default_kind="reply", ticketless=True)
 
 
 CONSULT_DEFAULT_KIND = "design_consultation"

@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
         WorkflowContractBundle,
     )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
+        TicketlessCallback,
+    )
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -35,6 +38,14 @@ KIND_LABELS: frozenset[str] = frozenset(
 SOURCE_ASANA = "asana"
 SOURCE_REDMINE = "redmine"
 SOURCES: frozenset[str] = frozenset({SOURCE_ASANA, SOURCE_REDMINE})
+
+# Redmine #12703: the ticketless no-anchor callback rail carries no Redmine /
+# Asana anchor. ``SOURCE_TICKETLESS`` is the marker/outcome source token for that
+# rail. It is deliberately NOT in ``SOURCES``: the anchored `handoff send` /
+# `reply` rails (and `normalize_anchor`) only accept asana / redmine, so a regular
+# send can never select the ticketless source to bypass the anchor requirement.
+# Only the dedicated ticketless-callback command builds a ``TicketlessAnchor``.
+SOURCE_TICKETLESS = "ticketless"
 
 MODE_STANDARD = "standard"
 MODE_PENDING = "pending"
@@ -348,7 +359,51 @@ class RedmineAnchor:
         return f"Redmine #{self.issue} journal #{self.journal}"
 
 
-NormalizedAnchor = AsanaAnchor | RedmineAnchor
+@dataclass(frozen=True)
+class TicketlessAnchor:
+    """Anchor for the ticketless no-anchor callback rail (Redmine #12703).
+
+    There is no Redmine issue/journal or Asana task here — the ticketless
+    consultation phase is kept anchor-free on purpose, and fabricating an anchor
+    to satisfy the reply rail is the issue's explicit prohibition. This value
+    object exists only so the standard delivery rail (marker / notification body /
+    structured outcome) works without a real ticket anchor: it carries the fixed
+    ``classification`` / ``dispatch_decision`` tokens that ride the greppable
+    landing marker, and its ``human_pointer`` states plainly that the structured
+    callback fields are the durable record. The full structured callback result
+    is carried separately on ``DeliveryOutcome.ticketless_callback`` so the
+    transport outcome and the workflow result stay distinct.
+    """
+
+    classification: str
+    dispatch_decision: str
+
+    @property
+    def source(self) -> str:
+        return SOURCE_TICKETLESS
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "classification": self.classification,
+            "dispatch_decision": self.dispatch_decision,
+        }
+
+    def marker_fields(self) -> list[tuple[str, str]]:
+        return [
+            ("classification", self.classification),
+            ("dispatch", self.dispatch_decision),
+        ]
+
+    def human_pointer(self) -> str:
+        return (
+            f"ticketless callback (classification={self.classification}, "
+            f"dispatch={self.dispatch_decision}); no Redmine anchor — the "
+            "structured callback fields are the durable record"
+        )
+
+
+NormalizedAnchor = AsanaAnchor | RedmineAnchor | TicketlessAnchor
 
 
 def normalize_anchor(
@@ -559,6 +614,7 @@ def build_notification_body(
     role_profile: Optional["RoleProfileResolution"] = None,
     transition_role: Optional["TransitionRoleBoundary"] = None,
     workflow_contract: Optional["WorkflowContractBundle"] = None,
+    ticketless_callback: Optional["TicketlessCallback"] = None,
 ) -> str:
     """Compose the pane text body that follows the landing marker.
 
@@ -594,10 +650,20 @@ def build_notification_body(
         raise AnchorError("--summary is required when --kind custom")
     intent = summary if summary else _default_body_for_kind(kind, receiver)
     pointer = anchor.human_pointer()
-    body = (
-        f"{intent}. {pointer} is the durable anchor; read it from the source-of-truth "
-        "system before acting."
-    )
+    if anchor.source == SOURCE_TICKETLESS:
+        # Redmine #12703: there is no ticket anchor to "read from the
+        # source-of-truth system"; the structured callback fields are the durable
+        # record. The ticketless lead sentence states that plainly instead of
+        # pointing the receiver at a nonexistent issue/journal.
+        body = (
+            f"{intent}. {pointer}; this is a ticketless no-anchor callback — read "
+            "the structured callback fields below, not a Redmine issue/journal."
+        )
+    else:
+        body = (
+            f"{intent}. {pointer} is the durable anchor; read it from the source-of-truth "
+            "system before acting."
+        )
     if execution_root is not None:
         body = f"{body} {execution_root.notification_clause()}"
     if role_profile is not None:
@@ -606,6 +672,8 @@ def build_notification_body(
         body = f"{body} {transition_role.pointer_clause()}."
     if workflow_contract is not None:
         body = f"{body} {workflow_contract.pointer_clause()}."
+    if ticketless_callback is not None:
+        body = f"{body} {ticketless_callback.pointer_clause()}."
     return body
 
 
@@ -678,6 +746,15 @@ class DeliveryOutcome:
     # never doc bodies. `None` when no bundle was injected (the explicit fallback);
     # the `project-gateway handoff` route auto-injects the grandparent bundle.
     workflow_contract: Optional[dict[str, Any]] = None
+    # Redmine #12703: structured ticketless no-anchor callback result fields
+    # (`classification` / `dispatch_decision` / `next_action_owner` /
+    # `callback_reason` / `read_contract` / `redmine_anchor_required`). This is the
+    # workflow *result* of a ticketless consultation hands-off, recorded distinctly
+    # from this transport outcome (status / reason / marker). Free-text-free (fixed
+    # tokens / a derived bool) and durable-record safe in full; no Redmine anchor is
+    # fabricated. `None` for every anchored send/reply (the explicit fallback); set
+    # only on the dedicated `handoff ticketless-callback` rail.
+    ticketless_callback: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1187,6 +1264,11 @@ def _anchor_pointer_or_dash(anchor_payload: Optional[dict[str, Any]]) -> str:
             f"Redmine #{anchor_payload.get('issue')} "
             f"journal #{anchor_payload.get('journal')}"
         )
+    if source == SOURCE_TICKETLESS:
+        # Redmine #12703: there is no ticket anchor; name the source plainly so the
+        # record never implies a fabricated issue/journal. The structured result is
+        # rendered by `_ticketless_callback_lines` below.
+        return "ticketless (no Redmine anchor — see ticketless callback below)"
     return "—"
 
 
@@ -1277,6 +1359,36 @@ def _workflow_contract_lines(workflow_contract: Optional[dict[str, Any]]) -> lis
     return lines
 
 
+def _ticketless_callback_lines(
+    ticketless_callback: Optional[dict[str, Any]],
+) -> list[str]:
+    """Render the structured ticketless no-anchor callback result (Redmine #12703).
+
+    Carries only fixed lower-snake-case tokens + a derived bool with no operator
+    free text, so the full consultation result is durable-record safe and rendered
+    in place — the receiver reads the result (and whether the next worker phase
+    needs a real Redmine anchor) without re-reading the pane. Returns a single
+    ``—`` line when no callback was injected (every anchored send/reply).
+    """
+    if not ticketless_callback:
+        return ["- Ticketless callback: —"]
+    classification = ticketless_callback.get("classification") or "—"
+    dispatch = ticketless_callback.get("dispatch_decision") or "—"
+    anchor_required = bool(ticketless_callback.get("redmine_anchor_required"))
+    owner = ticketless_callback.get("next_action_owner") or "—"
+    reason = ticketless_callback.get("callback_reason") or "—"
+    read_contract = ticketless_callback.get("read_contract") or "—"
+    return [
+        f"- Ticketless callback: classification `{classification}`, "
+        f"dispatch `{dispatch}`",
+        "  - Redmine anchor required (next worker phase): "
+        f"`{str(anchor_required).lower()}`",
+        f"  - Workflow next-action owner: `{owner}`",
+        f"  - Callback reason: `{reason}`",
+        f"  - Read contract: `{read_contract}`",
+    ]
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome",
     *,
@@ -1334,6 +1446,7 @@ def build_delivery_record(
         f"- Role profile: {_role_profile_pointer_or_dash(outcome.role_profile)}",
         *_transition_role_lines(outcome.transition_role),
         *_workflow_contract_lines(outcome.workflow_contract),
+        *_ticketless_callback_lines(outcome.ticketless_callback),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -1478,6 +1591,7 @@ def make_outcome(
     role_profile: Optional["RoleProfileResolution"] = None,
     transition_role: Optional["TransitionRoleBoundary"] = None,
     workflow_contract: Optional["WorkflowContractBundle"] = None,
+    ticketless_callback: Optional["TicketlessCallback"] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1506,6 +1620,9 @@ def make_outcome(
         ),
         workflow_contract=(
             workflow_contract.to_structured_dict() if workflow_contract else None
+        ),
+        ticketless_callback=(
+            ticketless_callback.to_structured_dict() if ticketless_callback else None
         ),
     )
 
@@ -1537,6 +1654,8 @@ __all__: Iterable[str] = (
     "SOURCES",
     "SOURCE_ASANA",
     "SOURCE_REDMINE",
+    "SOURCE_TICKETLESS",
+    "TicketlessAnchor",
     "STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE",
     "STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE",
     "StandardTargetAdmission",

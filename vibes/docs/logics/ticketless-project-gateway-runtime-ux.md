@@ -328,6 +328,36 @@ queue-enter は delivery rail であり、task 完了 signal ではない。queu
 未観測は、Redmine journal と callback sweep で回収可能でなければならない。pane 上の見た目、
 手打ち `%pane`、chat message、work log 本文は route authority / completion authority ではない。
 
+### Ticketless No-Anchor Callback Primitive
+
+#12703 の正本である。matrix の `親 -> 祖父` / `子 -> 親` ticketless hands-off 行のうち、
+**Redmine anchor を要しない consultation 段階の callback** を返す product-standard transport を
+定義する。GK3500 smoke #12698 では、receiver が `no_dispatch` の structured hands-off を作ったのに、
+標準 `handoff reply` / `reply` が Redmine anchor (`--issue` + `--journal`) 必須のため
+`invalid_anchor` で fail-closed し、低レベルの `mozyo-bridge message` しか残らなかった。
+
+- 標準 primitive は `mozyo-bridge handoff ticketless-callback` とする。Redmine anchor を carry
+  せず、偽装もしない。`--source` / `--issue` / `--journal` / `--task-id` を受け取らない。
+- structured callback fields (`classification` / `dispatch_decision` / `next_action_owner` /
+  `callback_reason` / `read_contract`、および classification/dispatch から導出する
+  `redmine_anchor_required`) を **workflow result** として carry する。これは transport outcome
+  (`status` / `reason` / `notification_marker`) とは別 field に記録する。
+- 標準 delivery rail (queue-enter / standard semantics、target admission / repo identity /
+  cross-session gate) をそのまま使う。delivery marker の source は `ticketless` で、
+  Redmine / Asana anchor rail とは混ざらない。
+- `classification` は `consultation_result` / `no_dispatch` / `blocked` / `anchor_required` の
+  4 つ。`dispatch_decision` は no-anchor-safe な `no_dispatch` / `hand_back_to_caller` /
+  `anchor_required_before_worker_dispatch` だけを許す。
+- **子 -> 孫 worker dispatch の anchor 要件は緩めない。** 実 worker execution / domain probe /
+  implementation dispatch を表す decision は ticketless rail で表現不能であり、CLI choice にも
+  domain layer にも無い。implementation に進む場合は Redmine anchor を作成して
+  `handoff send --kind implementation_request --source redmine --issue <id> --journal <id>` を使う。
+- 既存の Redmine-governed `handoff reply` / `reply` rail は不変で、引き続き `--issue` + `--journal`
+  を必須とする。
+
+実 CLI flag / default / error wording は CLI help / parser / validation error を正本にする
+(`### Transition Contract Scope`)。本節は lane boundary と fail-closed 状態の契約だけを持つ。
+
 ## 受け入れ判定の意味
 
 GK3500IT acceptance scenario は、次が満たされた場合だけ green とする。
