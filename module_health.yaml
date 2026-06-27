@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6389
+    lines: 6636
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -76,12 +76,35 @@ allowlist:
       `_activate_target_pane` / `_window_active_pane_id` helpers, threading the
       `TargetActivationOutcome` through the emit/persist paths; the admission /
       activation / policy types live in `domain/handoff.py`, not here).
+      Raised 6389 -> 6552 for the #12658 project-scoped cockpit identity wiring
+      (the `_resolve_project_scope_fields` helper + project-scope resolution
+      threaded through the three cockpit-workspace construction sites and
+      `_agents_target_candidates`, the appended PROJECT/PROJECT_PATH columns in
+      `cmd_agents_targets`, and the additive `target_project` handoff gate; the
+      discovery / cache / drift policy itself lives in the new
+      `f_110_workspace_session_identity/{domain,application}/project_*` modules,
+      not here).
+      Raised 6552 -> 6592 for the #12658 review j#66481 fixes in the
+      `target_project` handoff gate (require an explicit `--target-repo` gate
+      under `--target-project`, and verify a stamped pane-option scope's cwd is
+      under the stamped project path before trusting it).
+      Raised 6592 -> 6607 for the #12658 j#66499 scenario fix: project-scope
+      resolution prefers the real Git worktree root over a nested project-local
+      `.mozyo-bridge/scaffold.json` (via the new `resolve_workspace_root`) in
+      `_resolve_project_scope_fields` and the `target_project` gate, so cockpit
+      dry-run / handoff from a project subdir emit the Git root + a repo-relative
+      project path while non-git scaffold workspaces are preserved.
+      Raised 6607 -> 6636 for the #12658 j#66504/j#66505 fixes: the handoff
+      `--target-repo` / `--target-repo auto` repo gates also use the
+      Git-root-preferring resolver, and project-scoped cockpit columns thread a
+      `launch_cwd` (project workdir) through the 3 workspace-construction sites so
+      a launched pane's cwd is under the project path.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
-    lines: 2344
+    lines: 2482
     reason: >-
       Cockpit layout geometry/projection domain; dense but cohesive. Candidate
       to split along geometry vs projection responsibilities. Path re-keyed from
@@ -89,6 +112,20 @@ allowlist:
       Redmine-numbered layout move (old path kept as a sys.modules facade); the
       re-key lands in the same commit as the move per #12591 j#65488 atomicity.
       The module is byte-unchanged and the split itself is still owner #12321 scope.
+      Raised 2344 -> 2438 for the #12658 project-scoped cockpit identity additive
+      fields (`@mozyo_project_scope`/`@mozyo_project_path`/`@mozyo_project_label`
+      option constants, the project fields on `CockpitWorkspace`/`CockpitPane` +
+      their `as_dict` projections, and the project stamps in
+      `pane_identity_commands`). Additive only — single-repo columns are
+      byte-identical to pre-#12658.
+      Raised 2438 -> 2456 for the #12658 j#66505 fix: a `launch_cwd` field on
+      `CockpitWorkspace` + the `_launch_cwd` helper routes every pane-launch `-c`
+      to the project workdir for a project-scoped column (repo_root identity
+      unchanged), so a `--target-project` handoff to such a pane can pass.
+      Raised 2456 -> 2482 for the #12658 j#66513 fix: a `@mozyo_repo_root` option
+      constant + its stamp in `pane_identity_commands` so target discovery
+      preserves the parent workspace identity for a project-scoped pane whose cwd
+      is the project workdir.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

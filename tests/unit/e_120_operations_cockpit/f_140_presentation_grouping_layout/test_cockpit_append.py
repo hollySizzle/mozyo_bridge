@@ -57,6 +57,54 @@ class AppendPlannerTest(unittest.TestCase):
             any(c.argv[:2] == ("split-window", "-v") for c in plan.commands)
         )
 
+    def test_project_scope_is_stamped_and_repo_root_stays_distinct(self) -> None:
+        # Redmine #12658: a column summoned from inside an adopted monorepo project
+        # stamps `@mozyo_project_scope` / `@mozyo_project_path` / `@mozyo_project_label`
+        # on its panes, and the Git repo_root stays separate from the repo-relative
+        # project path in the plan JSON.
+        plan = build_cockpit_append_plan(
+            CockpitWorkspace(
+                "gk-3500-it-operations",
+                "gk-3500-it-operations",
+                "/ws/gk-3500-it-operations",
+                project_scope="giken-cloud-drive-management",
+                project_path="projects/giken-cloud-drive-management",
+                project_label="クラウドドライブ管理",
+            ),
+            anchor_pane="%7",
+            column_index=1,
+        )
+        scope_cmds = [
+            c for c in plan.commands
+            if "@mozyo_project_scope" in c.argv
+        ]
+        self.assertTrue(scope_cmds)
+        self.assertIn("giken-cloud-drive-management", scope_cmds[0].argv)
+        path_cmds = [c for c in plan.commands if "@mozyo_project_path" in c.argv]
+        self.assertIn("projects/giken-cloud-drive-management", path_cmds[0].argv)
+        label_cmds = [c for c in plan.commands if "@mozyo_project_label" in c.argv]
+        self.assertIn("クラウドドライブ管理", label_cmds[0].argv)
+        # The Git worktree root is stamped on `@mozyo_repo_root` (j#66513) so
+        # discovery preserves the parent workspace identity for a pane whose cwd is
+        # the project workdir.
+        repo_cmds = [c for c in plan.commands if "@mozyo_repo_root" in c.argv]
+        self.assertTrue(repo_cmds)
+        self.assertIn("/ws/gk-3500-it-operations", repo_cmds[0].argv)
+        # repo_root (Git) and project_path (repo-relative) are kept distinct.
+        pane0 = plan.as_dict()["panes"][0]
+        self.assertEqual(pane0["repo_root"], "/ws/gk-3500-it-operations")
+        self.assertEqual(pane0["project_path"], "projects/giken-cloud-drive-management")
+        self.assertNotEqual(pane0["repo_root"], pane0["project_path"])
+
+    def test_single_repo_column_stamps_no_project_options(self) -> None:
+        # No project scope -> no project stamp commands, so a single-repo column is
+        # byte-identical to pre-#12658 (display compatibility).
+        plan = self._plan()
+        self.assertFalse(
+            any("@mozyo_project_scope" in c.argv for c in plan.commands)
+        )
+        self.assertIsNone(plan.as_dict()["panes"][0]["project_scope"])
+
     def test_new_column_sized_to_fair_share_re_equalizes_widths(self) -> None:
         # Redmine #11854: a bare `split-window -h -f` grabs ~50% of the whole
         # window on every append, so the newest lane balloons and existing lanes

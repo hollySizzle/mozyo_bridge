@@ -398,6 +398,228 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         self.assertEqual("target_repo_mismatch", outcome["reason"])
         self.assertIn("target pane is not in the expected repo", stderr)
 
+    _GK_PROJECT_DOC = (
+        "schema_version: 1\n"
+        "project:\n"
+        "  redmine_project: giken-cloud-drive-management\n"
+        "  path: projects/giken-cloud-drive-management\n"
+        "  status: active\n"
+        "  display_label: \"クラウドドライブ管理\"\n"
+        "  runtime_identity:\n"
+        "    enabled: true\n"
+        "    parent_workspace: gk-3500-it-operations\n"
+    )
+
+    def _build_gk_monorepo(self, tmp_str):
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
+            project_discovery as pd,
+        )
+
+        pd.clear_discovery_cache()
+        repo = Path(tmp_str) / "gk-3500-it-operations"
+        proj = repo / "projects" / "giken-cloud-drive-management"
+        proj.mkdir(parents=True)
+        (repo / "pyproject.toml").write_text("", encoding="utf-8")
+        (proj / "project.yaml").write_text(self._GK_PROJECT_DOC, encoding="utf-8")
+        (proj / "src").mkdir()
+        return repo, proj
+
+    def test_target_project_mismatch_is_rejected(self) -> None:
+        # Redmine #12658: `--target-project` adds a project-scope gate ON TOP of
+        # the Git repo gate. A target in the correct repo but OUTSIDE the expected
+        # project path fails closed with `target_project_mismatch`.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, _proj = self._build_gk_monorepo(tmp_str)
+            outside = repo / "elsewhere"
+            outside.mkdir()
+            pane = {
+                "id": "%9",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(outside),  # in the repo, but not under the project
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%9",
+                    "--target-repo", str(repo),
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        self.assertFalse(
+            any(call[:2] == ("send-keys", "-t") for call in sent),
+            f"unexpected send-keys: {sent}",
+        )
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_project_mismatch", outcome["reason"])
+        self.assertIn("expected project scope", stderr)
+
+    def test_target_project_gate_passes_for_cwd_under_project(self) -> None:
+        # A target whose cwd IS under the expected project (and passes the repo
+        # gate) clears the project gate, then dies later on marker_timeout — never
+        # on the project gate.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, proj = self._build_gk_monorepo(tmp_str)
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(proj / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, _stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%8",
+                    "--target-repo", str(repo),
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                    "--landing-timeout", "0.01",
+                    "--submit-delay", "0",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        # Project gate passed; standard mode dies on marker_timeout, not the gate.
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+
+    def test_target_project_stamped_scope_outside_project_path_is_rejected(self) -> None:
+        # Redmine #12658 review j#66481 blocker 1: a STAMPED `@mozyo_project_scope`
+        # whose pane cwd is NOT under the stamped project path must not bypass the
+        # cwd-under-project condition — a stale/wrong option fails closed.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, _proj = self._build_gk_monorepo(tmp_str)
+            outside = repo / "elsewhere"
+            outside.mkdir()
+            pane = {
+                "id": "%9",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(outside),  # NOT under the stamped project path
+                "window_name": "claude",
+                "pane_active": "1",
+                "project_scope": "giken-cloud-drive-management",
+                "project_path": "projects/giken-cloud-drive-management",
+                "project_label": "クラウドドライブ管理",
+            }
+            _exc, sent, stdout, stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%9",
+                    "--target-repo", str(repo),
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        self.assertFalse(any(call[:2] == ("send-keys", "-t") for call in sent))
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("target_project_mismatch", outcome["reason"])
+
+    def test_target_project_requires_target_repo_gate(self) -> None:
+        # Redmine #12658 review j#66481 blocker 2: `--target-project` without an
+        # explicit `--target-repo` is rejected before any send — project scope must
+        # not be the sole identity gate.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, proj = self._build_gk_monorepo(tmp_str)
+            pane = {
+                "id": "%9",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(proj / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%9",
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        self.assertFalse(any(call[:2] == ("send-keys", "-t") for call in sent))
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("invalid_args", outcome["reason"])
+        self.assertIn("requires an explicit `--target-repo`", stderr)
+
+    def test_nested_project_scaffold_repo_gate_prefers_git_root(self) -> None:
+        # Redmine #12658 j#66504: a target pane inside a monorepo project subdir
+        # that carries its OWN `.mozyo-bridge/scaffold.json` must still gate against
+        # the Git worktree root — so an explicit `--target-repo <Git root>` passes
+        # the repo gate (and reaches the project gate) instead of fail-closing as
+        # `target_repo_mismatch`.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            repo, proj = self._build_gk_monorepo(tmp_str)
+            # Make the repo a real Git worktree root (the helper only writes
+            # pyproject.toml); the Git-preferring resolver keys off `.git`.
+            (repo / ".git").mkdir()
+            # Nested project-local scaffold marker inside the Git repo.
+            (proj / ".mozyo-bridge").mkdir()
+            (proj / ".mozyo-bridge" / "scaffold.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            pane = {
+                "id": "%8",
+                "location": "local:1.0",
+                "command": "claude",
+                "cwd": str(proj / "src"),
+                "window_name": "claude",
+                "pane_active": "1",
+            }
+            _exc, sent, stdout, _stderr = self.run_handoff(
+                [
+                    "handoff", "send", "--to", "claude", "--source", "redmine",
+                    "--issue", "12658", "--journal", "66460",
+                    "--kind", "implementation_request",
+                    "--target", "%8",
+                    "--target-repo", str(repo),  # the Git root, not the subdir
+                    "--target-project", "giken-cloud-drive-management",
+                    "--mode", "standard",
+                    "--landing-timeout", "0.01",
+                    "--submit-delay", "0",
+                ],
+                pane=pane,
+                sender_session="local",
+            )
+        outcome = json.loads(
+            [l for l in stdout.splitlines() if l.strip().startswith("{")][-1]
+        )
+        # Repo gate prefers the Git root -> passes; project gate passes (cwd under
+        # project); standard mode then dies on marker_timeout, NOT on either gate.
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("marker_timeout", outcome["reason"])
+
     def test_target_repo_gate_passes_for_scaffolded_non_git_workspace(self) -> None:
         # Redmine #11301: a non-git scaffolded workspace (only
         # `.mozyo-bridge/scaffold.json`) is a first-class identity root, so a

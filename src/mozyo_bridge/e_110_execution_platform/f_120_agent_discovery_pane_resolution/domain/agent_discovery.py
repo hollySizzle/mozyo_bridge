@@ -136,6 +136,15 @@ class AgentRecord:
     # Empty for panes outside a delegation tree.
     lane_kind: str = ""
     delegation_parent: str = ""
+    # Project-scoped cockpit identity (Redmine #12658), read from the pane's
+    # `@mozyo_project_scope` / `@mozyo_project_path` / `@mozyo_project_label`
+    # options. A monorepo project subdir is a routing / presentation scope *under*
+    # the workspace; these are projection metadata, never a routing identity (the
+    # `--target-repo` gate stays Git-repo-root-anchored). Empty for panes outside
+    # any adopted project scope -> single-repo display is unchanged.
+    project_scope: str = ""
+    project_path: str = ""
+    project_label: str = ""
     views: tuple[PaneView, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
@@ -157,6 +166,9 @@ class AgentRecord:
             "lane_label": self.lane_label,
             "lane_kind": self.lane_kind,
             "delegation_parent": self.delegation_parent,
+            "project_scope": self.project_scope,
+            "project_path": self.project_path,
+            "project_label": self.project_label,
             "views": [view.as_payload() for view in self.views],
         }
 
@@ -370,6 +382,14 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
             if resolution.confidence == CONFIDENCE_STRONG
             else AGENT_KIND_UNKNOWN
         )
+        # Authoritative Git worktree root (Redmine #12658 j#66513). A cockpit pane
+        # may carry a stamped `@mozyo_repo_root`; prefer it so a project-scoped
+        # pane (whose cwd is the project workdir) keeps its parent workspace
+        # identity instead of collapsing onto the project subdir. An unstamped pane
+        # (normal `mozyo`, pre-#12658) falls back to cwd-derived inference, so
+        # existing behavior is unchanged. ``cwd`` stays the real pane cwd for the
+        # project-scope gate.
+        stamped_repo_root = (pane.get("repo_root_stamp") or "").strip()
         records.append(
             AgentRecord(
                 pane_id=pane.get("id") or "",
@@ -380,7 +400,7 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 pane_active=(pane.get("pane_active") == "1"),
                 process=pane.get("command") or "",
                 cwd=cwd,
-                repo_root=infer_repo_root(cwd),
+                repo_root=stamped_repo_root or infer_repo_root(cwd),
                 agent_kind=agent_kind,
                 ambiguous=window_ambiguous or resolution.ambiguous,
                 role_source=resolution.role_source,
@@ -389,6 +409,9 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
                 lane_label=(pane.get("lane_label") or "").strip() or None,
                 lane_kind=(pane.get("lane_kind") or "").strip(),
                 delegation_parent=(pane.get("delegation_parent") or "").strip(),
+                project_scope=(pane.get("project_scope") or "").strip(),
+                project_path=(pane.get("project_path") or "").strip(),
+                project_label=(pane.get("project_label") or "").strip(),
             )
         )
     return records
@@ -612,6 +635,15 @@ class TargetCandidate:
     # handoff, exactly like the additive attention projection (#11952).
     lane_kind: str = ""
     delegation_parent: str = ""
+    # Project-scoped cockpit identity (Redmine #12658). A monorepo project subdir
+    # is a routing / presentation scope *under* the workspace identity; carried
+    # here so ``agents targets`` can show ``workspace_label`` and ``project_scope``
+    # simultaneously. Projection metadata only — never a routing key (the
+    # ``--target-repo`` gate stays Git-repo-root-anchored). Defaulted so existing
+    # constructors stay valid; empty for a single-repo workspace pane.
+    project_scope: str = ""
+    project_path: str = ""
+    project_label: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Nested canonical ``TargetRecord`` projection (Redmine #11907).
@@ -642,6 +674,12 @@ class TargetCandidate:
                 "role_source": self.role_source,
                 "confidence": self.confidence,
                 "ambiguous": self.ambiguous,
+                # Project scope rides under workspace identity (Redmine #12658):
+                # null for a single-repo workspace pane, so existing consumers see
+                # an additive key, never a changed one.
+                "project_scope": self.project_scope or None,
+                "project_path": self.project_path or None,
+                "project_label": self.project_label or None,
             },
             "repo": {
                 "label": self.repo_short,
@@ -684,6 +722,7 @@ def build_target_candidates(
     *,
     resolve_workspace: Callable[[str], tuple[str | None, str | None]] | None = None,
     resolve_branch: Callable[[str], str | None] | None = None,
+    resolve_project: Callable[[str | None, str], tuple[str, str, str] | None] | None = None,
     host: str = HOST_LOCAL,
 ) -> list[TargetCandidate]:
     """Project folded agent records into canonical target candidates (#11811, #11907).
@@ -721,12 +760,27 @@ def build_target_candidates(
             branch_cache[repo_root] = resolve_branch(repo_root)
         return branch_cache[repo_root]
 
+    def project_for(record: AgentRecord) -> tuple[str, str, str]:
+        # A stamped pane option (cockpit-managed pane) is authoritative; an
+        # un-stamped pane (normal `mozyo`) derives its scope from the cwd via the
+        # injected resolver so a pane running inside a project subdir still
+        # projects its scope. Empty triple when no project scope applies — the
+        # single-repo workspace stays unchanged.
+        if record.project_scope:
+            return (record.project_scope, record.project_path, record.project_label)
+        if resolve_project is not None and record.cwd:
+            derived = resolve_project(record.repo_root, record.cwd)
+            if derived is not None:
+                return derived
+        return ("", "", "")
+
     candidates: list[TargetCandidate] = []
     for record in records:
         if record.agent_kind == AGENT_KIND_UNKNOWN:
             continue
         workspace_id, workspace_label = workspace_for(record.repo_root)
         repo_short = Path(record.repo_root).name if record.repo_root else None
+        project_scope, project_path, project_label = project_for(record)
         candidates.append(
             TargetCandidate(
                 pane_id=record.pane_id,
@@ -751,6 +805,9 @@ def build_target_candidates(
                 branch=branch_for(record.repo_root),
                 lane_kind=record.lane_kind,
                 delegation_parent=record.delegation_parent,
+                project_scope=project_scope,
+                project_path=project_path,
+                project_label=project_label,
             )
         )
     return candidates

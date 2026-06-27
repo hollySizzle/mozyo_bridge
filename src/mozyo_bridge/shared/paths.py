@@ -63,6 +63,38 @@ def mozyo_bridge_home() -> Path:
     return Path(os.environ.get("MOZYO_BRIDGE_HOME", "~/.mozyo_bridge")).expanduser().resolve()
 
 
+def infer_git_worktree_root(start: str | Path | None) -> Path | None:
+    """Walk up from ``start`` to the nearest Git worktree root, or ``None``.
+
+    A Git worktree root carries a ``.git`` entry — a directory for the main
+    worktree, a file for a linked worktree — so this stops at the first ancestor
+    where ``.git`` exists. Unlike :func:`find_repo_root` / ``infer_repo_root``
+    (which also stop at non-git workspace markers such as
+    ``.mozyo-bridge/scaffold.json``), this resolver looks ONLY for the Git root.
+
+    Project-scoped identity (Redmine #12658 j#66499) needs this because a monorepo
+    project subdirectory may carry its own ``.mozyo-bridge/scaffold.json``: the
+    marker-based resolver would stop at the project subdir and collapse the
+    workspace identity onto the project. The Git worktree root is the workspace;
+    the nested scaffold marker only matters when there is no Git root above (a
+    genuinely non-git scaffolded workspace, Redmine #11301), which the caller
+    handles by falling back to the marker resolver. Returns ``None`` on an
+    unreadable path or when no ``.git`` is reachable.
+    """
+    if not start:
+        return None
+    try:
+        current = Path(start).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if current.is_file():
+        current = current.parent
+    for path in (current, *current.parents):
+        if (path / ".git").exists():
+            return path
+    return None
+
+
 def find_repo_root(start: Path | None = None) -> Path:
     current = Path(start or Path.cwd()).expanduser().resolve()
     if current.is_file():
