@@ -667,7 +667,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。標準フローは sequence diagram で lane crossing command を確定済み `mozyo-bridge handoff ...` CLI として固定する。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - rule-project-agent-workflow
@@ -689,7 +689,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/existing-project-sublane-adoption.md
-    purpose: 既存プロジェクトへ governed scaffold と sublane 運用を導入するための runbook。read-only preflight、root adoption、既存 routing / catalog の保持、verification、origin 到達性、callback recovery、Redmine close gate を再現可能な adoption 手順として定義する。
+    purpose: 既存プロジェクトへ governed scaffold と sublane 運用を導入するための runbook。read-only preflight、root adoption、既存 routing / catalog の保持、verification、origin 到達性、callback recovery、Redmine close gate を sequence diagram と確定済み `mozyo-bridge handoff ...` CLI で再現可能な adoption 手順として定義する。
     audit_role: existing_project_sublane_adoption_logic
     related_document_refs:
       - logic-scaffold-rules

@@ -298,62 +298,111 @@ deactivate Grandparent
 
 ```text
 classify_ticketless_consultation(...)
+  command_status: missing
+  existing_command: none
+  proposed_surface: mozyo-bridge project-gateway classify-ticketless --request <text> --constraints <json>
   grandparent に許可される action
   routing metadata だけを読む
   project-domain docs / web research / local probe / implementation prep を禁止する
 
 resolve_project_gateway(...)
+  command_status: missing
+  existing_command: none
+  partial_existing_command: mozyo-bridge agents targets --agent codex --json
+  proposed_surface: mozyo-bridge project-gateway resolve --repo-root <repo_root> --project-scope <project_scope> --role codex --target-kind project_gateway
   repo_root + project_scope + role で live project-gateway target を解決する
   target がちょうど 1 件なら返し、それ以外は fail-closed reason を返す
   active pane や copied %pane を authority として扱わない
 
 start_project_gateway(...)
+  command_status: missing
+  existing_command: none
+  partial_existing_commands:
+    - mozyo-bridge cockpit ...
+    - mozyo-bridge init codex
+  proposed_surface: mozyo-bridge project-gateway start --repo-root <repo_root> --project-scope <project_scope> --project-path <path> --project-label <label>
   project-scoped gateway unit を作成または focus する
   repo_root を Git authority として保つ
   project_scope / project_path / project_label を stamp する
   separate window/session projection を許可する
 
 handoff_to_project_gateway(...)
+  command_status: missing
+  existing_command: none
+  anchored_near_command: mozyo-bridge handoff send --to codex --target %<parent_gateway_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind custom --summary "<ticketless consultation>"
+  missing_reason: true ticketless source/kind と project_gateway semantic target resolver が未実装
   grandparent から解決済み parent project gateway へ ticketless consultation を送る
   semantic target identity を使う
   project Claude へ direct-send しない
 
 ensure_redmine_anchor(...)
+  command_status: missing
+  existing_command: none
+  missing_reason: mozyo-bridge CLI には Redmine issue / journal anchor 作成または選択 surface が無い
   durable issue/journal anchor を作成または選択する
   consultation が implementation へ変わる場合だけ必須
 
 dispatch_redmine_anchored_worker(...)
+  command_status: existing
+  command: mozyo-bridge handoff send --to claude --source redmine --issue <issue> --journal <journal> --kind implementation_request --target %<grandchild_claude_pane> --target-repo auto --role-profile implementation_worker --profile-field lane=<lane> --profile-field gateway_callback_target=<route>
   child から grandchild worker へ通常の governed workflow で implementation を渡す
   execution 前に durable anchor を要求する
 
 resolve_or_start_delegated_coordinator(...)
+  command_status: composed_existing
+  decision_command: mozyo-bridge handoff delegate-launch-adopt --launch-adopt-mode <disabled|adopt_existing|launch_new|launch_or_adopt> --target-repo <child_repo_root> --parent-coordinator-route <route> --child-project <id> --parent-issue <issue> --child-issue <issue> --source redmine --journal <journal> --json
+  note: read-only decision primitive。adopt 時は recommended handoff command を出す。launch actuator は別途必要。
   Redmine anchor に対応する child coordinator / implementation gateway を semantic identity で解決する
   target が無ければ project policy に従い起動または focus する
   複数候補、repo_root 不一致、role 不一致、project_scope 不一致は fail-closed にする
 
 handoff_to_child_coordinator(...)
+  command_status: existing
+  command: mozyo-bridge handoff send --to codex --target %<child_codex_pane> --target-repo <child_repo_root> --source redmine --issue <child_issue> --journal <journal> --kind implementation_request --role-profile delegated_coordinator --profile-field parent_project=<parent> --profile-field child_project=<child>
   parent project gateway から child coordinator へ Redmine anchored request を渡す
   ticketless text だけを渡さず、anchor と required_docs 解決入口を含める
   grandchild worker へ direct-send しない
 
 decide_grandchild_dispatch(...)
+  command_status: existing
+  dispatch_command: mozyo-bridge handoff delegate-grandchild-dispatch --enable-delegated-coordinator --enable-grandchild-dispatch --max-delegation-depth 2 --target-repo <grandchild_repo_root> --parent-coordinator-route <route> --owning-coordinator-route <route> --source redmine --journal <journal> --json
+  no_dispatch_command: mozyo-bridge handoff delegate-grandchild-dispatch --enable-delegated-coordinator --enable-grandchild-dispatch --max-delegation-depth 2 --no-dispatch <reason> --parent-coordinator-route <route> --owning-coordinator-route <route> --source redmine --journal <journal> --json
   child coordinator が grandchild implementation lane を使うか判断する
   default purpose は preserve_coordinator_context
   no-dispatch の場合は context-neutral か urgent minimal correction などの理由を durable record に残す
 
 resolve_or_start_implementation_worker(...)
+  command_status: composed_existing
+  dispatch_decision: mozyo-bridge handoff delegate-grandchild-dispatch ...
+  realization_stamp: mozyo-bridge handoff delegate-grandchild-stamp --lane kind=coordinator,unit=<unit>,parent=-,pane=%<pane> --lane kind=delegated_coordinator,unit=<unit>,parent=<parent_unit>,pane=%<pane> --lane kind=implementation,unit=<unit>,parent=<delegated_unit>,pane=%<pane> --grandchild-unit <workspace_id/lane_id> --realization <adopt|launch> [--apply]
+  realization_gate: mozyo-bridge handoff delegate-grandchild-gate --delegated-coordinator-unit <workspace_id/lane_id> --parent-issue <issue> --child-issue <issue>
+  note: worker Claude 自体の semantic start は単独 CLI 未確定。実現確認と stamp は既存。
   Redmine anchor に対応する grandchild implementation worker を semantic identity で解決または起動する
   hidden subagent や copied %pane を authority にしない
 
 callback_to_child_coordinator(...)
+  command_status: existing
+  implementation_done_command: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  review_request_command: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  reply_command: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind reply --summary "<state pointer>"
   grandchild worker が implementation_done / review_request / blocked を child coordinator へ返す
   callback は work log ではなく Redmine durable anchor への pointer とする
 
 callback_to_project_gateway(...)
+  command_status: existing
+  implementation_done_command: mozyo-bridge handoff send --to codex --target %<parent_gateway_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  review_request_command: mozyo-bridge handoff send --to codex --target %<parent_gateway_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  review_result_command: mozyo-bridge handoff send --to codex --target %<parent_gateway_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind review_result --summary "<state pointer>"
+  reply_command: mozyo-bridge handoff send --to codex --target %<parent_gateway_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind reply --summary "<state pointer>"
   child coordinator が implementation_done / review_request / blocked を parent gateway へ pointer として返す
   callback は work log ではなく Redmine durable anchor への pointer とする
 
 callback_to_grandparent(...)
+  command_status: existing
+  implementation_done_command: mozyo-bridge handoff send --to codex --target %<grandparent_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  review_request_command: mozyo-bridge handoff send --to codex --target %<grandparent_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  review_result_command: mozyo-bridge handoff send --to codex --target %<grandparent_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind review_result --summary "<state pointer>"
+  reply_command: mozyo-bridge handoff send --to codex --target %<grandparent_codex_pane> --target-repo auto --source redmine --issue <issue> --journal <journal> --kind reply --summary "<state pointer>"
   parent gateway が project gateway result を grandparent へ pointer として返す
   callback は work log ではなく Redmine durable anchor への pointer とする
 ```

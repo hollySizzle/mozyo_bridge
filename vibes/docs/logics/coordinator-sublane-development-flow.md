@@ -86,11 +86,11 @@ retirement cleanup はそこへ残す。Redmine subject も日本語を基本に
 CLI 名、コード識別子、固有 provider 名だけを literal token として残す。
 
 1. #12670 `ワークフローのレーン所有と遷移関数レジストリを設計する`
-   - PlantUML swimlane、lane registry、transition function contract を固定する。
+   - PlantUML sequence、lane registry、transition function contract を固定する。
    - lane owner は pane id ではなく workflow role / route identity で表す。
    - `Codex` / `Claude` は provider であり role ではない、という語彙を最初に入れる。
    - #12675 / #12676 / #12677 で、祖父→親→子→孫の実機テスト前ワークフローを
-     PlantUML swimlane、command family、fail condition、実機前監査へ分解する。
+     PlantUML sequence、command family、fail condition、実機前監査へ分解する。
 
 2. #12671 `DBベースのワークフロー状態とコマンド結果の次アクションを実装する`
    - mozyo DB に workflow state / pending delivery / route identity を持つ。
@@ -130,13 +130,13 @@ guardrail は書けばよいものではない。agent が迷った事実を dur
 
 新しい超大 rule を作る前に、管制塔は `$placement_decision()` の配置順を確認する。
 
-新規 rule / logic を増やす trigger は、actor / 責務 / 停止条件 / 検証責務が混ざる、同じ判断を複数文書へ重複しそうになる、swimlane なしでは責務境界が誤読される、表記ゆれで routing が壊れる場合に限る。「念のため」だけ、既存 spine へ短く足せるもの、入口文書 / router / skill reference への詳細複製、central 配布面を repo-local で恒久正本化することは hard stop とする。
+新規 rule / logic を増やす trigger は、actor / 責務 / 停止条件 / 検証責務が混ざる、同じ判断を複数文書へ重複しそうになる、sequence なしでは lane crossing command が誤読される、表記ゆれで routing が壊れる場合に限る。「念のため」だけ、既存 spine へ短く足せるもの、入口文書 / router / skill reference への詳細複製、central 配布面を repo-local で恒久正本化することは hard stop とする。
 
-flow 型 guardrail の書き方、PlantUML activity + swimlane の使い方、Markdown 補足境界、`$validate` / `$forbid` / `$record` primitive は `.mozyo-bridge/rules/llm_rule_authoring.md` を正本とする。この文書にはサブレーン開発フロー固有の判断だけを残す。
+flow 型 guardrail の一般 authoring rule、Markdown 補足境界、`$validate` / `$forbid` / `$record` primitive は `.mozyo-bridge/rules/llm_rule_authoring.md` を正本とする。ただし本 spine では lane crossing command の解釈幅を減らすため、標準フローの正本図は sequence diagram とし、activity + swimlane 図は併置しない。この文書にはサブレーン開発フロー固有の判断だけを残す。
 
 ## 役割
 
-詳細な実行責務は `標準フロー` の swimlane を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、管制塔 Codex = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、main lane Claude = read-only 調査 / 要約 / draft / design consultation 補助、target-lane Codex = cross-lane gateway / same-lane Claude handoff / callback、sublane Claude = bounded implementation / implementation_done / review_request である。
+詳細な実行責務と lane crossing command は `標準フロー` の sequence を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、管制塔 Codex = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、main lane Claude = read-only 調査 / 要約 / draft / design consultation 補助、target-lane Codex = cross-lane gateway / same-lane Claude handoff / callback、sublane Claude = bounded implementation / implementation_done / review_request である。
 
 ## 運用モデル
 
@@ -458,175 +458,72 @@ journal を source of truth とした callback sweep / recovery で行う。
 
 ## 標準フロー
 
-PlantUML の activity diagram + swimlane 記法で、誰が責務を持つかを明示する。管制塔と sublane の境界を読むための図なので、細かい retry path はここに複製しない。
+PlantUML sequence diagram で、lane crossing command と callback command を arrow label として固定する。管制塔と sublane の境界を読むための正本図なので、activity swimlane を併置しない。図が複数あると、差分が意図か drift かを LLM が判断する余地が増える。
 
-validation / 禁止事項 / durable record は、図の流れから離れた長い箇条書きにせず、必要に応じて `$validate` / `$forbid` / `$record` で近接させる。
+既存 CLI が確定している transition は実コマンドを arrow label に書く。未確定 command surface はこの標準フローでは正本化せず、該当 issue / design doc の `missing` として扱う。
 
 ```plantuml
-@startuml
-!procedure $validate($rule)
-:validate: $rule;
-!endprocedure
-!procedure $forbid($rule)
-:forbid: $rule;
-!endprocedure
-!procedure $record($anchor)
-:record: $anchor;
-!endprocedure
-!procedure $language_policy()
-:規約本文 / 見出し = 日本語;
-:literal token = fixed fields, gate, CLI option, code identifier, branch, path;
-$forbid("operator-facing 規約本文を英語のみで追加");
-!endprocedure
-!procedure $placement_decision()
-:placement = existing spine -> llm_rule_authoring -> docs_catalog_governance -> repo-local logic -> central preset issue;
-$forbid("入口文書 / router / skill reference へ詳細本文を複製");
-!endprocedure
-!procedure $work_unit()
-:work_unit = issue + branch + git worktree + lane + Codex pane + Claude pane;
-!endprocedure
-!procedure $callback_sweep()
-:classify missing callback = progress_without_callback / no_progress_after_handoff / callback_delivery_failed / callback_not_attempted;
-$record("callback sweep classification");
-!endprocedure
-!procedure $pipeline_admission()
-:classify active lanes = implementing / coordinator-blocking / retire_ready / idle;
-if (coordinator-blocking exists?) then (yes)
-  :drain coordinator-owned queue before optional dispatch;
-else (no)
-  :dispatch independent ready work when lane capacity remains;
-endif
-$validate("implementing lane alone does not serialize the coordinator");
-$record("pipeline dispatch or explicit serialization reason");
-!endprocedure
-!procedure $grandchild_dispatch()
-:purpose = preserve_coordinator_context (not work size);
-:dispatch when context-consuming = long diff / long test log / iterative trial / large journal reading / parent callback context;
-:avoid when context-neutral = read-only / ticket-only / small journal update;
-$validate("孫 dispatch trigger は context window 保護であり行数 threshold ではない");
-$record("context を消費し得る work を孫に出さなかった非自明判断のみ grandchild_dispatch: avoided + reason");
-!endprocedure
-!procedure $pipeline_fill_loop()
-:trigger = after dispatch / after callback drain / after review-owner-integration-close drain / after retirement drain / before next-action stop;
-:classify active lanes = implementing / coordinator-blocking / retire_ready / idle;
-if (coordinator-blocking exists?) then (yes)
-  :drain coordinator-owned queue first;
-else (no)
-  while (soft profile has capacity and independent ready work exists?)
-    :record dispatch decision;
-    :dispatch next sublane via target-lane Codex gateway;
-  endwhile
-endif
-$validate("one successful dispatch is not a coordinator stop condition");
-$validate("ready independent work requires dispatch or concrete serialization reason");
-$record("post_dispatch_fill_check / fill_decision");
-!endprocedure
-!procedure $retirement_contract()
-:retirement_state = retire_candidate / retire_ready / retain_until_downstream_consumed / retire_blocked / retired;
-:fields = retirement_state, lane, worktree, pane, redmine_issue_state, retain_reason, downstream_consumed, retire_blockers, safety_preflight, durable_anchor;
-:safety_preflight = redmine_closed, worktree_clean, origin_reachable, pending_prompt_absent, callback_drained, target_identity_known;
-:retire_blockers = active_lane, review_pending, owner_approval_pending, unresolved_callback, dirty_worktree, pending_prompt, unpushed_commit, unknown_target_identity;
-!endprocedure
-!procedure $close_contract()
-:close requires Review Gate + owner_close_approval + integration_disposition + Close Gate;
-:integration = merged / pushed + CI / patch-equivalent / explicit deferral / no-commit;
-$validate("Review approval と owner close approval を分離");
-$validate("commit-bearing work に integration disposition がある");
-!endprocedure
-!procedure $backlog_reconciliation()
-:collect owner intent / non-goal / future scope / later-stage / decision pending / private-consumer pressure;
-:trigger immediate classification when an agent proposes later /別 Version / follow-up / later-stage;
-:classify each residual = new issue / existing issue / explicit no-op / owner decision pending;
-$validate("agent が後続提案を会話だけに残さない");
-$validate("未分類の owner intent / deferred decision を残したまま全部完了と言わない");
-$record("backlog reconciliation disposition");
-!endprocedure
-!procedure $followup_contract()
-:drain callback / review / owner / integration / close / retirement;
-:run backlog reconciliation before declaring the workstream complete;
-:evaluate guardrail update;
-:propose Version / US -> classify each Version = container issue / owner decision pending -> Owner approval -> create Version / US;
-$record("follow-up planning decision");
-!endprocedure
+@startuml coordinator_sublane_standard_sequence
+title Coordinator / Sublane Standard Flow
 
-|管制塔 Codex|
-start
-:管制塔が prompt / marker / ticket ID を受け取る;
-$language_policy()
-$placement_decision()
-:Redmine issue / journal / Version / catalog docs を読む;
-$validate("pane / chat message を正本にしない");
-:作業形状を分類する;
+actor Owner
+participant "管制塔 Codex\ncoordinator" as Coordinator
+participant "target-lane Codex\nimplementation_gateway" as Gateway
+participant "sublane Claude\nimplementation_worker" as Worker
+database Redmine
+collections "repo docs / catalog" as Docs
+database "origin / CI" as Origin
 
-if (coordinator-owned 仕様決定が必要?) then (yes)
-  :管制塔が仕様決定を Redmine / cataloged doc に記録;
-  $record("coordinator-owned design decision");
-endif
+Owner -> Coordinator: prompt / marker / ticket id
+activate Coordinator
+Coordinator -> Redmine: read issue, journals, Version, parent / child state
+Coordinator -> Docs: mozyo-bridge docs resolve --format markdown <changed_path...>
+Coordinator -> Redmine: record dispatch decision / stop reason
 
-if (実装型?) then (yes)
-  $forbid("管制塔 Codex が通常実装 diff を直接作る");
-  $forbid("main lane Claude へ実装型 work を直接渡す");
-  $pipeline_admission()
-  $grandchild_dispatch()
-  $work_unit()
-  :sublane admission を判定;
-  if (dispatch 可能?) then (yes)
-    :dispatch decision を Redmine に記録;
-    $record("dispatch decision");
-    :target-lane Codex gateway へ handoff;
-    $pipeline_fill_loop()
-    |target-lane Codex|
-    $validate("cross-lane は target-lane Codex gateway 経由");
-    :target-lane Codex が same-lane Claude へ handoff;
-    |sublane Claude|
-    :sublane Claude が実装;
-    $forbid("coordinator-owned 仕様決定を実装 commit 内で黙って確定");
-    :Implementation Done / Review Request を記録;
-    $record("implementation_done / review_request");
-    |target-lane Codex|
-    :target-lane Codex が coordinator へ callback;
-    |管制塔 Codex|
-    $validate("callback は Redmine durable anchor への pointer");
-    $callback_sweep()
-    :管制塔が Review Gate を処理;
-    $pipeline_fill_loop()
-  else (no)
-    |管制塔 Codex|
-    :stop_and_drain / blocker / main_lane_exception を記録;
-    stop
-  endif
-else (no)
-  |管制塔 Codex|
-  :管制塔が owner-facing / audit / planning / design consultation として処理;
-endif
+alt coordinator_owned_or_audit_only
+  Coordinator -> Redmine: record design decision / review / planning / owner-action-needed
+else implementation_shaped_dispatch
+  Coordinator -> Coordinator: classify active lanes and pipeline admission
+  note right of Coordinator
+    forbid: coordinator creates normal implementation diff
+    forbid: main lane Claude receives implementation_request
+  end note
+  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <issue> --journal <journal> --kind implementation_request --target %<gateway_codex_pane> --target-repo auto --role-profile implementation_gateway --summary "<dispatch pointer>"
+  activate Gateway
+  Gateway -> Redmine: read durable anchor
+  Gateway -> Worker: mozyo-bridge handoff send --to claude --source redmine --issue <issue> --journal <journal> --kind implementation_request --target %<worker_claude_pane> --target-repo auto --role-profile implementation_worker --summary "<implementation pointer>"
+  activate Worker
+  Worker -> Redmine: read issue / journal
+  Worker -> Docs: mozyo-bridge docs resolve --format markdown <changed_path...>
+  Worker -> Worker: implement bounded diff and run verification
+  Worker -> Redmine: record implementation_done / review_request
+  alt implementation_done callback
+    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  else review_request callback
+    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  end
+  deactivate Worker
+  alt implementation_done callback
+    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  else review_request callback
+    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  end
+  deactivate Gateway
+end
 
-if (Review approved?) then (yes)
-  $close_contract()
-  :Close Gate を記録;
-  :US status を close;
-  :routine retirement 条件を確認;
-  if (retire_ready?) then (yes)
-    $retirement_contract()
-    :sublane を退役;
-  endif
-  $pipeline_fill_loop()
-  $backlog_reconciliation()
-  $followup_contract()
-  |Owner|
-  :後続 Version / US 提案を承認または差し戻す;
-  |管制塔 Codex|
-  :承認後に Version / US を作成;
-  :必要な仕様決定を記録;
-  :新規セッション prompt 例を issue ID 付きで提示;
-else (no)
-  |管制塔 Codex|
-  :findings を Redmine に記録;
-  $record("review findings");
-  |target-lane Codex|
-  :sublane Claude へ修正依頼;
-endif
-|管制塔 Codex|
-stop
+Coordinator -> Redmine: callback sweep / review target journals
+Coordinator -> Origin: git branch -r --contains <commit> / origin reachability check
+alt review_findings
+  Coordinator -> Redmine: record Review Gate findings
+  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <issue> --journal <review_journal> --kind review_result --target %<gateway_codex_pane> --target-repo auto --summary "<findings pointer>"
+else review_approved
+  Coordinator -> Redmine: record Review Gate
+  Coordinator -> Redmine: record owner_close_approval when allowed / owner decision when required
+  Coordinator -> Redmine: record integration disposition and Close Gate
+  Coordinator -> Redmine: record retirement / backlog reconciliation / follow-up planning
+  Coordinator --> Owner: follow-up Version / US proposal when owner approval is required
+end
+deactivate Coordinator
 @enduml
 ```
 

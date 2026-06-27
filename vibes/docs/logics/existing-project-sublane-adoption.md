@@ -48,46 +48,66 @@ Redmine #12423。既存プロジェクトへ mozyo-bridge の governed scaffold 
 ## 実行フロー
 
 ```plantuml
-@startuml existing_project_sublane_adoption
-start
-|管制塔 Codex|
-:Read Redmine parent / child issues and project docs;
-:Record read-only preflight journal;
-if (durable work system and governed preset are justified?) then (yes)
-  :Create or identify implementation child issue;
-  :Record dispatch decision and target lane identity;
-else (no)
-  :Record stop reason;
-  stop
-endif
+@startuml existing_project_sublane_adoption_sequence
+title Existing Project Sublane Adoption Sequence
 
-|target-lane Codex|
-:Read durable anchor from Redmine;
-:Confirm adoption target identity and same-lane Claude route;
-:Handoff to same-lane Claude;
+actor Owner
+participant "管制塔 Codex\ncoordinator" as Coordinator
+participant "target-lane Codex\nimplementation_gateway" as Gateway
+participant "sublane Claude\nimplementation_worker" as Worker
+database Redmine
+collections "repo docs / catalog" as Docs
+database "origin / CI" as Origin
 
-|sublane Claude|
-:Run scaffold/rules/catalog adoption steps;
-:Preserve existing routing and project-local docs;
-:Run verification;
-:Commit only adoption-scope files;
-:Record implementation_done and review_request;
+Owner -> Coordinator: adoption request / Redmine issue id
+activate Coordinator
+Coordinator -> Redmine: read parent / child issues and journals
+Coordinator -> Docs: mozyo-bridge docs resolve --format markdown <adoption_path...>
+Coordinator -> Redmine: record read-only preflight journal
 
-|target-lane Codex|
-:Send coordinator callback with issue, journal, state, commit hash;
-:Record callback outcome;
+alt governed preset not justified
+  Coordinator -> Redmine: record stop reason
+else adoption child issue ready
+  Coordinator -> Redmine: create or identify implementation child issue
+  Coordinator -> Redmine: record dispatch decision and target lane identity
+  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <child_issue> --journal <dispatch_journal> --kind implementation_request --target %<gateway_codex_pane> --target-repo auto --role-profile implementation_gateway --summary "<adoption dispatch>"
+  activate Gateway
+  Gateway -> Redmine: read durable anchor
+  Gateway -> Gateway: confirm adoption target identity and same-lane Claude route
+  Gateway -> Worker: mozyo-bridge handoff send --to claude --source redmine --issue <child_issue> --journal <dispatch_journal> --kind implementation_request --target %<worker_claude_pane> --target-repo auto --role-profile implementation_worker --summary "<adoption implementation>"
+  activate Worker
+  Worker -> Docs: mozyo-bridge docs resolve --format markdown <adoption_path...>
+  Worker -> Worker: mozyo-bridge scaffold status --target .
+  Worker -> Worker: run scaffold / rules / catalog adoption steps
+  Worker -> Worker: run verification and git diff --check
+  Worker -> Worker: git commit -m "<subject>" -m "Refs: Redmine #<child_issue>" -m "issue_<child_issue>"
+  Worker -> Redmine: record implementation_done / review_request
+  alt implementation_done callback
+    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <child_issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  else review_request callback
+    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <child_issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  end
+  deactivate Worker
 
-|管制塔 Codex|
-:Audit diff, journals, origin reachability, and verification;
-if (commit can be used as integration anchor?) then (yes)
-  :Record Review Gate and integration disposition;
-else (no)
-  :Record local-only / unreachable blocker;
-  stop
-endif
-:Request owner close approval when gates are satisfied;
-:Close child issues, then parent US;
-stop
+  alt implementation_done callback
+    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <child_issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+  else review_request callback
+    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <child_issue> --journal <journal> --kind review_request --summary "<state pointer>"
+  end
+  Gateway -> Redmine: record callback outcome
+  deactivate Gateway
+
+  Coordinator -> Redmine: audit diff, journals, and verification
+  Coordinator -> Origin: git branch -r --contains <commit>
+  alt commit local_only_or_unreachable
+    Coordinator -> Redmine: record local-only / unreachable blocker
+  else commit usable as integration anchor
+    Coordinator -> Redmine: record Review Gate and integration disposition
+    Coordinator -> Redmine: record owner_close_approval when allowed / owner decision when required
+    Coordinator -> Redmine: close child issues, then parent US
+  end
+end
+deactivate Coordinator
 @enduml
 ```
 
