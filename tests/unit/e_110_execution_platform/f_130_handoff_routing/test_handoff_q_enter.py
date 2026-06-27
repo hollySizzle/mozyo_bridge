@@ -48,6 +48,31 @@ class ResolveSubmitPlanTest(unittest.TestCase):
         with self.assertRaises(SubmitPlanError):
             resolve_submit_plan("consultation_callback", source="redmine")
 
+    def test_consultation_callback_rejects_each_stray_anchor_field(self) -> None:
+        # review j#67184: failing closed only on --source let an LLM pass
+        # --issue/--journal/--task-id without --source, which the ticketless rail
+        # then silently ignored. Every anchor field must fail closed.
+        for field in ("issue", "journal", "task", "comment", "anchor_url"):
+            with self.subTest(field=field):
+                with self.assertRaises(SubmitPlanError) as ctx:
+                    resolve_submit_plan(
+                        "consultation_callback", **{field: True}
+                    )
+                # The error names the stray flag so the next action is unambiguous.
+                self.assertIn("no ticket anchor", str(ctx.exception).lower())
+
+    def test_consultation_callback_rejects_issue_without_source(self) -> None:
+        # The exact reviewer reproduction: --issue/--journal with no --source.
+        with self.assertRaises(SubmitPlanError):
+            resolve_submit_plan(
+                "consultation_callback", issue=True, journal=True
+            )
+
+    def test_consultation_callback_clean_still_resolves(self) -> None:
+        # No anchor field at all still resolves to the ticketless rail.
+        plan = resolve_submit_plan("consultation_callback")
+        self.assertEqual(RAIL_TICKETLESS_CALLBACK, plan.rail)
+
     def test_worker_dispatch_with_redmine_anchor_resolves_anchored_send(self) -> None:
         plan = resolve_submit_plan(
             "worker_dispatch",

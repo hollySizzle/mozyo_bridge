@@ -172,6 +172,53 @@ class QEnterFrontDoorTest(unittest.TestCase):
         # The next action points the LLM at the no-anchor rail.
         self.assertIn("consultation_callback", front["guidance"])
 
+    def test_consultation_callback_with_stray_anchor_fails_closed_without_send(self) -> None:
+        # review j#67184: a ticketless intent carrying anchor fields (here --issue
+        # / --journal, with no --source) must fail closed at the front door — no
+        # pane send, no silent ignore of the anchor.
+        result, sent, stdout, _pane = self._run(
+            [
+                "handoff", "q-enter",
+                "--intent", "consultation_callback",
+                "--to", "codex", "--target", "%2",
+                "--issue", "12705", "--journal", "67184",
+                "--classification", "no_dispatch",
+                "--dispatch-decision", "hand_back_to_caller",
+                "--workflow-next-owner", "caller",
+                "--callback-reason", "no_dispatch_decided",
+                "--read-contract", "grandparent_coordinator",
+                "--mode", "standard",
+            ]
+        )
+        self.assertEqual(1, result)
+        self.assertEqual([], sent)
+        front = self._front_door(stdout)
+        self.assertTrue(front["blocked"])
+        self.assertFalse(front["dispatched"])
+        self.assertEqual("anchor_required", front["blocked_reason"])
+        # No transport outcome at all — the pane was never touched.
+        self.assertFalse(
+            any("status" in b and not b.get("q_enter") for b in self._json_blocks(stdout))
+        )
+
+    def test_consultation_callback_with_source_only_fails_closed_without_send(self) -> None:
+        result, sent, stdout, _pane = self._run(
+            [
+                "handoff", "q-enter",
+                "--intent", "consultation_callback",
+                "--to", "codex", "--target", "%2",
+                "--source", "redmine",
+                "--classification", "no_dispatch",
+                "--dispatch-decision", "hand_back_to_caller",
+                "--workflow-next-owner", "caller",
+                "--callback-reason", "no_dispatch_decided",
+                "--read-contract", "grandparent_coordinator",
+            ]
+        )
+        self.assertEqual(1, result)
+        self.assertEqual([], sent)
+        self.assertTrue(self._front_door(stdout)["blocked"])
+
     def test_worker_dispatch_with_anchor_dispatches_over_anchored_send(self) -> None:
         result, sent, stdout, pane_text = self._run(
             [

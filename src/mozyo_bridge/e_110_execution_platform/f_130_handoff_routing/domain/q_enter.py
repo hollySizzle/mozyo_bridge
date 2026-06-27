@@ -174,12 +174,14 @@ def resolve_submit_plan(
     The boolean flags say only *whether* each anchor field was supplied (the front
     door reads them off ``args``), keeping this module free of CLI / anchor parsing.
 
-    Fails closed (:class:`SubmitPlanError`) on an unknown intent, and on a
-    ``worker_dispatch`` / ``reply`` intent that lacks a complete ticket anchor —
-    the Redmine-governed worker-dispatch anchor requirement is not relaxed. The
-    error names the missing anchor and points at ``consultation_callback`` for the
-    genuinely-no-anchor hands-off case, so the LLM reads the next action instead of
-    rediscovering ``invalid_anchor`` by trial.
+    Fails closed (:class:`SubmitPlanError`) on an unknown intent, on a
+    ``worker_dispatch`` / ``reply`` intent that lacks a complete ticket anchor (the
+    Redmine-governed worker-dispatch anchor requirement is not relaxed), and on a
+    ``consultation_callback`` intent that carries ANY anchor field (it rides the
+    no-anchor rail and never carries one — a stray anchor is rejected, not silently
+    dropped). The error names the missing or stray anchor and points at the right
+    intent, so the LLM reads the next action instead of rediscovering
+    ``invalid_anchor`` by trial.
     """
     if not isinstance(intent, str) or not intent.strip():
         raise SubmitPlanError(
@@ -194,14 +196,30 @@ def resolve_submit_plan(
     if token == INTENT_CONSULTATION_CALLBACK:
         # The ticketless no-anchor callback rail (#12703). It never carries — and
         # never requires — a ticket anchor; the structured callback fields are the
-        # durable record. Refuse a stray anchor source so the LLM does not think it
-        # bought a Redmine-governed guarantee on this rail.
-        if source is not None:
+        # durable record. Fail closed on ANY anchor-like field (not only --source):
+        # the ticketless rail would otherwise silently ignore a stray --issue /
+        # --journal / --task-id, making the delivery record read as no-anchor while
+        # the caller believes it supplied one — exactly the ambiguity this front
+        # door is meant to remove (review j#67184). The LLM must read the next
+        # action, not have its anchor fields quietly dropped.
+        stray = [
+            flag
+            for flag, present in (
+                ("--source", source is not None),
+                ("--issue", issue),
+                ("--journal", journal),
+                ("--task-id", task),
+                ("--comment-id", comment),
+                ("--anchor-url", anchor_url),
+            )
+            if present
+        ]
+        if stray:
             raise SubmitPlanError(
                 "consultation_callback rides the ticketless no-anchor callback rail "
-                "and takes no --source; drop --source (and any --issue/--journal/"
-                "--task-id), or use --intent worker_dispatch / reply for an "
-                "anchored send"
+                "and carries NO ticket anchor; drop "
+                f"{', '.join(stray)}. If you mean to dispatch / reply against a "
+                "ticket anchor, use --intent worker_dispatch / reply instead"
             )
         return SubmitPlan(
             intent=token,
