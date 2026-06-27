@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
         TicketlessCallback,
     )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
+        TicketlessConsultation,
+    )
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -403,7 +406,56 @@ class TicketlessAnchor:
         )
 
 
-NormalizedAnchor = AsanaAnchor | RedmineAnchor | TicketlessAnchor
+@dataclass(frozen=True)
+class TicketlessConsultationAnchor:
+    """Anchor for the ticketless no-anchor FORWARD consultation rail (Redmine #12740).
+
+    The symmetric counterpart of :class:`TicketlessAnchor` (which rides the
+    *return* callback leg): there is no Redmine issue/journal or Asana task here —
+    the forward consultation phase is kept anchor-free on purpose, and fabricating
+    an anchor to satisfy the anchored send rail is the issue's explicit
+    prohibition. This value object exists only so the standard delivery rail
+    (marker / notification body / structured outcome) works without a real ticket
+    anchor: it carries the fixed ``consultation_kind`` / ``callback_to_role`` tokens
+    that ride the greppable landing marker (distinct from the callback rail's
+    ``classification`` / ``dispatch`` marker), and its ``human_pointer`` states
+    plainly that the structured consultation fields are the durable record. The full
+    structured forward payload is carried separately on
+    ``DeliveryOutcome.ticketless_consultation`` so the transport outcome and the
+    workflow request stay distinct.
+    """
+
+    consultation_kind: str
+    callback_to_role: str
+
+    @property
+    def source(self) -> str:
+        return SOURCE_TICKETLESS
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "consultation_kind": self.consultation_kind,
+            "callback_to_role": self.callback_to_role,
+        }
+
+    def marker_fields(self) -> list[tuple[str, str]]:
+        return [
+            ("consultation", self.consultation_kind),
+            ("callback_to", self.callback_to_role),
+        ]
+
+    def human_pointer(self) -> str:
+        return (
+            f"ticketless consultation (kind={self.consultation_kind}, "
+            f"callback_to={self.callback_to_role}); no Redmine anchor — the "
+            "structured consultation fields are the durable record"
+        )
+
+
+NormalizedAnchor = (
+    AsanaAnchor | RedmineAnchor | TicketlessAnchor | TicketlessConsultationAnchor
+)
 
 
 def normalize_anchor(
@@ -615,6 +667,7 @@ def build_notification_body(
     transition_role: Optional["TransitionRoleBoundary"] = None,
     workflow_contract: Optional["WorkflowContractBundle"] = None,
     ticketless_callback: Optional["TicketlessCallback"] = None,
+    ticketless_consultation: Optional["TicketlessConsultation"] = None,
 ) -> str:
     """Compose the pane text body that follows the landing marker.
 
@@ -651,13 +704,18 @@ def build_notification_body(
     intent = summary if summary else _default_body_for_kind(kind, receiver)
     pointer = anchor.human_pointer()
     if anchor.source == SOURCE_TICKETLESS:
-        # Redmine #12703: there is no ticket anchor to "read from the
-        # source-of-truth system"; the structured callback fields are the durable
-        # record. The ticketless lead sentence states that plainly instead of
-        # pointing the receiver at a nonexistent issue/journal.
+        # Redmine #12703 / #12740: there is no ticket anchor to "read from the
+        # source-of-truth system"; the structured ticketless fields are the durable
+        # record. The lead sentence states that plainly instead of pointing the
+        # receiver at a nonexistent issue/journal, and names whether this is the
+        # forward consultation leg (#12740) or the return callback leg (#12703).
+        if isinstance(anchor, TicketlessConsultationAnchor):
+            noun = "consultation"
+        else:
+            noun = "callback"
         body = (
-            f"{intent}. {pointer}; this is a ticketless no-anchor callback — read "
-            "the structured callback fields below, not a Redmine issue/journal."
+            f"{intent}. {pointer}; this is a ticketless no-anchor {noun} — read "
+            f"the structured {noun} fields below, not a Redmine issue/journal."
         )
     else:
         body = (
@@ -674,6 +732,8 @@ def build_notification_body(
         body = f"{body} {workflow_contract.pointer_clause()}."
     if ticketless_callback is not None:
         body = f"{body} {ticketless_callback.pointer_clause()}."
+    if ticketless_consultation is not None:
+        body = f"{body} {ticketless_consultation.pointer_clause()}."
     return body
 
 
@@ -755,6 +815,17 @@ class DeliveryOutcome:
     # fabricated. `None` for every anchored send/reply (the explicit fallback); set
     # only on the dedicated `handoff ticketless-callback` rail.
     ticketless_callback: Optional[dict[str, Any]] = None
+    # Redmine #12740: structured FORWARD ticketless no-anchor consultation fields
+    # (`consultation_kind` / `callback_to_role` / `callback_methods` /
+    # `read_contract` / `worker_dispatch_requires_anchor`). This is the workflow
+    # *request + return contract* of the department-root -> project-gateway forward
+    # consultation, recorded distinctly from this transport outcome and from the
+    # return-leg `ticketless_callback` above. Free-text-free (fixed tokens) and
+    # durable-record safe in full; no Redmine anchor is fabricated and the
+    # worker-dispatch anchor gate is not relaxed. `None` for every anchored
+    # send/reply and for the return-callback rail (the explicit fallback); set only
+    # on the dedicated `project-gateway consult` forward rail.
+    ticketless_consultation: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1265,9 +1336,15 @@ def _anchor_pointer_or_dash(anchor_payload: Optional[dict[str, Any]]) -> str:
             f"journal #{anchor_payload.get('journal')}"
         )
     if source == SOURCE_TICKETLESS:
-        # Redmine #12703: there is no ticket anchor; name the source plainly so the
-        # record never implies a fabricated issue/journal. The structured result is
-        # rendered by `_ticketless_callback_lines` below.
+        # Redmine #12703 / #12740: there is no ticket anchor; name the source
+        # plainly so the record never implies a fabricated issue/journal, and point
+        # at the matching structured block — the forward consultation (#12740,
+        # rendered by `_ticketless_consultation_lines`) or the return callback
+        # (#12703, rendered by `_ticketless_callback_lines`).
+        if anchor_payload.get("consultation_kind"):
+            return (
+                "ticketless (no Redmine anchor — see ticketless consultation below)"
+            )
         return "ticketless (no Redmine anchor — see ticketless callback below)"
     return "—"
 
@@ -1389,6 +1466,39 @@ def _ticketless_callback_lines(
     ]
 
 
+def _ticketless_consultation_lines(
+    ticketless_consultation: Optional[dict[str, Any]],
+) -> list[str]:
+    """Render the structured forward ticketless consultation (Redmine #12740).
+
+    Carries only fixed lower-snake-case tokens with no operator free text, so the
+    full forward request + return contract is durable-record safe and rendered in
+    place — the receiver gateway reads what is being consulted, which role to return
+    the result to, via which product primitives, and that the worker-dispatch anchor
+    gate is not relaxed — without re-reading the pane. Returns a single ``—`` line
+    when no forward consultation was injected (every anchored send/reply and the
+    return-callback rail).
+    """
+    if not ticketless_consultation:
+        return ["- Ticketless consultation: —"]
+    kind = ticketless_consultation.get("consultation_kind") or "—"
+    callback_to = ticketless_consultation.get("callback_to_role") or "—"
+    methods = ticketless_consultation.get("callback_methods") or []
+    read_contract = ticketless_consultation.get("read_contract") or "—"
+    anchor_rule = bool(
+        ticketless_consultation.get("worker_dispatch_requires_anchor")
+    )
+    methods_text = ", ".join(f"`{m}`" for m in methods) or "—"
+    return [
+        f"- Ticketless consultation: kind `{kind}`",
+        f"  - Return result to role: `{callback_to}`",
+        f"  - Return via: {methods_text}",
+        f"  - Read contract: `{read_contract}`",
+        "  - Worker dispatch requires Redmine anchor: "
+        f"`{str(anchor_rule).lower()}`",
+    ]
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome",
     *,
@@ -1448,6 +1558,7 @@ def build_delivery_record(
         *_transition_role_lines(outcome.transition_role),
         *_workflow_contract_lines(outcome.workflow_contract),
         *_ticketless_callback_lines(outcome.ticketless_callback),
+        *_ticketless_consultation_lines(outcome.ticketless_consultation),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -1603,6 +1714,7 @@ def make_outcome(
     transition_role: Optional["TransitionRoleBoundary"] = None,
     workflow_contract: Optional["WorkflowContractBundle"] = None,
     ticketless_callback: Optional["TicketlessCallback"] = None,
+    ticketless_consultation: Optional["TicketlessConsultation"] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1634,6 +1746,11 @@ def make_outcome(
         ),
         ticketless_callback=(
             ticketless_callback.to_structured_dict() if ticketless_callback else None
+        ),
+        ticketless_consultation=(
+            ticketless_consultation.to_structured_dict()
+            if ticketless_consultation
+            else None
         ),
     )
 
@@ -1667,6 +1784,7 @@ __all__: Iterable[str] = (
     "SOURCE_REDMINE",
     "SOURCE_TICKETLESS",
     "TicketlessAnchor",
+    "TicketlessConsultationAnchor",
     "STANDARD_TARGET_ADMISSION_ACTIVATE_INACTIVE",
     "STANDARD_TARGET_ADMISSION_RESTORE_PREVIOUS_ACTIVE",
     "StandardTargetAdmission",

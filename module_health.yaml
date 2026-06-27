@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6879
+    lines: 6930
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -140,6 +140,17 @@ allowlist:
       lane coexist instead of collapsing into a focus), and the `cockpit --json`
       payload projects `project_scope`. Pure read-model + matching-key change; no
       new domain module.
+      Raised 6879 -> 6930 for the #12740 forward ticketless no-anchor consultation
+      branch in `orchestrate_handoff`: a `ticketless_consultation` mode that builds
+      the `TicketlessConsultation` payload + `TicketlessConsultationAnchor` (fail-
+      closed on an unknown token, so a worker dispatch cannot ride this rail) and
+      threads the forward payload through `build_notification_body` and the typed
+      terminal `make_outcome` paths alongside the #12703 callback. The forward
+      consultation values + worker-dispatch anchor invariant live in the new
+      `f_130_handoff_routing/domain/ticketless_consultation.py`, and the
+      `project-gateway consult` handler in
+      `f_120_agent_discovery_pane_resolution/application/cli_project_gateway.py`,
+      not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -195,7 +206,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1691
+    lines: 1809
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -247,6 +258,18 @@ allowlist:
       pre-rendered composer-residue + delivery-id block; the `DeliveryOutcome` wire
       is unchanged). The residue classification + delivery-id derivation live in the
       separate `domain/q_enter.py` (kept out of this module).
+      Raised 1691 -> 1809 for the #12740 forward ticketless no-anchor consultation
+      rail: the `TicketlessConsultationAnchor` value object (so the standard
+      marker/body/outcome rail works for the FORWARD leg without a fabricated ticket
+      anchor), the `ticketless_consultation` field on `DeliveryOutcome` /
+      `make_outcome`, the consultation/callback lead-sentence discrimination +
+      pointer clause in `build_notification_body`, the forward-vs-callback
+      discrimination in `_anchor_pointer_or_dash`, and the
+      `_ticketless_consultation_lines` renderer + `- Ticketless consultation:` block
+      in `build_delivery_record`. The forward consultation values + worker-dispatch
+      anchor invariant live in the separate `domain/ticketless_consultation.py`
+      (kept out of this module), so only the anchor/outcome/record plumbing lands
+      here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
