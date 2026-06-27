@@ -78,9 +78,11 @@ structured field である。
 ### Roadmap US
 
 Redmine Version は semantic version number を含む名前にしない。Version 名は日付・優先度・
-run window を表す operational bucket とし、番号付き release name にしない。MCP には現時点で
-Version 作成 / rename / lock / close / delete tool がないため、実 Version 作成と移動は #12651
-で操作手段を確定してから行う。ここでは US と依存順を Redmine に残す。
+run window を表す operational bucket とし、番号付き release name にしない。MCP には
+Version 作成と issue の Version 割り当て tool があるため、roadmap bucket は Redmine 上の
+Version として作成・割り当てる。一方で Version rename / lock / close / delete と
+Version 内 open leaf issue listing は #12651 で操作手段を確定する対象であり、誤作成や
+retirement cleanup はそこへ残す。
 
 1. #12670 `workflow lane ownership と transition function registry を設計する`
    - PlantUML swimlane、lane registry、transition function contract を固定する。
