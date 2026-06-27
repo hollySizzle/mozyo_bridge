@@ -127,6 +127,142 @@ silently choose a pane because it happens to be active.
 Direct `%pane` addressing remains useful as a debug escape hatch. It is not the
 normal UX for the department-root to project-gateway route.
 
+## Swimlane Command Functions
+
+The workflow should be written as function-like lane transitions, not as vague
+activities with detached explanatory notes. Agents should be able to read the
+swimlane and understand which command contract is being exercised at each
+boundary.
+
+Function names in the swimlane are the stable design vocabulary. CLI command
+names may evolve, but the implementation must provide an equivalent command
+surface for each function before the flow can be considered product-ready.
+
+```plantuml
+@startuml
+title Ticketless Project Gateway Runtime UX
+
+|Operator|
+start
+:request = ticketless_consultation(
+  text,
+  constraints
+);
+
+|Department Root Coordinator|
+:project = classify_ticketless_consultation(
+  request=request,
+  allowed_reads="routing_metadata_only"
+);
+
+if (project is ambiguous?) then (yes)
+  :return_blocked(
+    reason="classification_ambiguous",
+    recovery_owner="operator"
+  );
+  stop
+endif
+
+:gateway = resolve_project_gateway(
+  repo_root=project.repo_root,
+  project_scope=project.scope,
+  role="codex",
+  target_kind="project_gateway"
+);
+
+if (gateway missing?) then (yes)
+  :gateway = start_project_gateway(
+    repo_root=project.repo_root,
+    project_scope=project.scope,
+    projection="separate_window_or_session"
+  );
+elseif (gateway ambiguous?) then (yes)
+  :return_blocked(
+    reason="gateway_target_ambiguous",
+    recovery_owner="operator"
+  );
+  stop
+endif
+
+:handoff_to_project_gateway(
+  request=request,
+  target=gateway,
+  kind="ticketless_consultation"
+);
+
+|Project Gateway|
+:receive_ticketless_consultation(
+  request=request,
+  source="department_root"
+);
+:decision = decide_implementation_need(
+  request=request,
+  allowed_reads="project_domain"
+);
+
+if (implementation needed?) then (yes)
+  :anchor = ensure_redmine_anchor(
+    reason="implementation_required"
+  );
+  :dispatch_redmine_anchored_worker(
+    anchor=anchor,
+    role="implementation_worker"
+  );
+else (no)
+  :reply_consultation_result(
+    source="department_root"
+  );
+endif
+
+|Implementation Worker|
+if (anchor exists?) then (yes)
+  :execute_redmine_governed_work(anchor);
+endif
+
+stop
+@enduml
+```
+
+### Function Contract
+
+These functions are not generic prose. Each one must map to a concrete CLI
+surface or to a fail-closed blocker that says which command is missing.
+
+```text
+classify_ticketless_consultation(...)
+  allowed root action
+  reads routing metadata only
+  forbids project-domain docs, web research, local probes, implementation prep
+
+resolve_project_gateway(...)
+  resolves a live project-gateway target by repo_root + project_scope + role
+  returns exactly one target or fail-closed reason
+  never treats active pane or copied %pane as authority
+
+start_project_gateway(...)
+  creates or focuses a project-scoped gateway unit
+  preserves repo_root as Git authority
+  stamps project_scope / project_path / project_label
+  allows separate window/session projection
+
+handoff_to_project_gateway(...)
+  sends ticketless consultation to the resolved project gateway
+  uses semantic target identity
+  does not direct-send to project Claude
+
+ensure_redmine_anchor(...)
+  creates or selects a durable issue/journal anchor
+  required only when consultation becomes implementation
+
+dispatch_redmine_anchored_worker(...)
+  hands implementation to a worker through the normal governed workflow
+  requires durable anchor before execution
+```
+
+If an implementation exposes lower-level primitives instead of these exact
+function names, it must still let an agent perform the same transitions without
+inventing command sequences from documentation search.
+
 ## Acceptance Meaning
 
 The GK3500IT acceptance scenario is green only when the following are true:
