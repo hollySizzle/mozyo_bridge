@@ -163,7 +163,8 @@ def _secret_value_is_real(value: str) -> bool:
         inner = raw[1:-1]
         quoted = True
     else:
-        inner = raw
+        # Strip a stray string delimiter (`None"` captured from `"api_key=None"`).
+        inner = raw.strip("\"'")
     if not inner:
         return False
     # A real credential carries alphanumeric content; punctuation-only values
@@ -180,16 +181,15 @@ def _secret_value_is_real(value: str) -> bool:
         return False
     if any(marker in lowered for marker in _SECRET_PLACEHOLDER_MARKERS):
         return False
-    # Unquoted name references are not values. A quoted value, or one mixing
-    # letters and digits (abc123) / token punctuation, is a literal.
+    # Unquoted name references are not values. A quoted value, or an unquoted
+    # one carrying digits (abc123) / token punctuation, is a literal.
     if not quoted:
-        # Bare identifiers: SCREAMING_SNAKE constants (API_KEY), all-letter
-        # identifiers (str).
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
-            if inner == inner.upper():
-                return False
-            if inner.isalpha() and inner == inner.lower():
-                return False
+        # A digit-free bare identifier is a name reference (constant, type,
+        # env/file var, same-name keyword pass-through); see Redmine #12693.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner) and not any(
+            ch.isdigit() for ch in inner
+        ):
+            return False
         # Dotted attribute references (os.environ, config.API_KEY).
         if _is_attribute_path_reference(inner):
             return False

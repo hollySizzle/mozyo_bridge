@@ -408,6 +408,35 @@ class SecretValueClassifierTest(unittest.TestCase):
                 msg=f"expected unsafe line: {line!r}",
             )
 
+    def test_12693_field_name_false_positives_are_safe(self) -> None:
+        # Redmine #12693: the concrete v0.9.1 release-gate false positives —
+        # a same-name keyword pass-through, a None sentinel inside a string,
+        # and a snake_case identifier assignment — name a credential field but
+        # carry no literal value, so they must not block the tree scan.
+        from mozyo_bridge.application import release as release_mod
+
+        safe_field_name_lines = (
+            "cache = RedmineContextCache(api_key=api_key, base_url=base_url)",
+            'self.assertIn("api_key=None", repr(creds))',
+            "api_key = env_key if env_key is not None else file_key",
+            "creds = Creds(client_secret=client_secret, host=host)",
+        )
+        for line in safe_field_name_lines:
+            self.assertFalse(
+                release_mod._secret_assignment_is_real(line),
+                msg=f"expected safe field-name line: {line!r}",
+            )
+
+        # Digit-free identifier values and a string-embedded None sentinel are
+        # references, not literals; a digit-bearing token stays a real secret so
+        # detection is not weakened.
+        for value in ("env_key", "file_key", "api_key", 'None"'):
+            self.assertFalse(
+                release_mod._secret_value_is_real(value),
+                msg=f"expected non-secret value: {value!r}",
+            )
+        self.assertTrue(release_mod._secret_value_is_real("ab" + "c123"))
+
     def test_real_secret_grep_line_filter_keeps_only_real_hits(self) -> None:
         from mozyo_bridge.application import release as release_mod
 
