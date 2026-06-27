@@ -557,7 +557,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
-    purpose: "チケットなし相談で部署ルート管制塔 -> プロジェクトゲートウェイ -> 実装ワーカーの 3 層 UX を成立させる runtime 境界。root と project gateway は別 window/session 表示でよく、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。#12675 の祖父・親・子・孫 swimlane 作成時に必ず読む。"
+    purpose: "チケットなし相談で祖父 department_root_coordinator -> 親 project_gateway -> 子 delegated_coordinator / implementation_gateway -> 孫 implementation_worker の 4 層 UX と transition function contract を成立させる runtime 境界。親は直接調査・実装せず project gateway として Redmine anchor 付きで子へ橋渡しし、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。#12675 の祖父・親・子・孫 swimlane 正本。"
     audit_role: ticketless_project_gateway_runtime_ux_logic
     related_document_refs:
       - logic-coordinator-sublane-development-flow
