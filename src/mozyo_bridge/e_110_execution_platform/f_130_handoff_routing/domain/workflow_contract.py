@@ -89,10 +89,9 @@ READ_OBLIGATION_ALL_BEFORE_ACTING = "read_all_listed_contracts_before_acting"
 # #12737 sharpens this from "callback these four result classes" to naming the
 # product *return path*: a ticketless consultation result is returned to the
 # caller lane through ``handoff ticketless-callback`` or ``handoff q-enter --intent
-# consultation_callback`` — not left as a local pane final answer. GK3500 #12709
-# observed the gateway reach a result but never invoke either primitive. The
-# worker-dispatch anchor gate is unchanged; only the consultation-phase return
-# path is named here.
+# consultation_callback`` — not left as a local pane final answer when a callback
+# target exists. The worker-dispatch anchor gate is unchanged; only the
+# consultation-phase return path is named here.
 CALLBACK_OBLIGATION_TICKETLESS = (
     "return_consultation_result_no_dispatch_blocked_or_anchor_required_via_"
     "ticketless_callback_or_q_enter_consultation_callback"

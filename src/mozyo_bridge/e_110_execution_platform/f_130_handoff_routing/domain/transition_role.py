@@ -173,10 +173,10 @@ class TransitionRoleBoundary:
 # complement: it OWNS the project-domain / no_dispatch / anchor decisions the
 # grandparent must not pre-empt.
 #
-# #12737 sharpens the project-gateway boundary's *return path*. GK3500 #12709
-# observed the gateway reach a consultation result but write only a local
-# "Root coordinator callback" answer in its own pane, never returning it to the
-# caller lane through the product callback primitive. So the gateway boundary now
+# #12737 sharpens the project-gateway boundary's *return path*: when the gateway
+# reaches a ticketless consultation result and a callback target exists, it must
+# return that result to the caller lane through the product callback primitive,
+# not stop at a local pane final answer. So the gateway boundary now
 # (a) names ``return_consultation_result_via_callback_primitive`` as an allowed
 # action — the result is returned via ``handoff ticketless-callback`` or ``handoff
 # q-enter --intent consultation_callback`` — and (b) forbids
