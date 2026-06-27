@@ -191,7 +191,7 @@ grandparent -> parent project-gateway route の通常 UX ではない。
 ## シーケンスと遷移関数
 
 workflow は、曖昧な activity と後付け note ではなく、lane 間 transition を
-function-like に書く。lane crossing は sequence diagram の arrow label と関数契約で
+function-like に書く。lane crossing は sequence diagram と transition command matrix で
 command family / semantic contract を読む。agent は sequence を読めば、どの actor から
 どの actor へ、どの command family で境界を越えるのかが一意に分かる状態でなければならない。
 
@@ -411,6 +411,33 @@ callback_to_grandparent(...)
 実装がこれらと同名の command ではなく低レベル primitive を公開する場合でも、agent が
 documentation search で command sequence を発明せずに同じ transition を実行できる
 必要がある。
+
+### Transition Command Matrix
+
+この matrix は #12676 の正本である。sequence の function を、command family、durable
+anchor、成功条件、失敗条件へ対応させる。CLI flag、必須 option、default、error wording の
+詳細は CLI help / parser / validation error を正本にし、この表では二重管理しない。
+
+| transition | command family / design surface | durable anchor | success condition | fail condition |
+| --- | --- | --- | --- | --- |
+| 祖父 -> 親 | `mozyo-bridge project-gateway resolve` / `mozyo-bridge project-gateway start` / `mozyo-bridge handoff send` | ticketless の分類段階では不要。implementation に進む前に parent 以降で要求する。 | grandparent が routing metadata だけで parent project gateway を一意に解決または起動し、ticketless consultation を parent へ渡す。 | classification ambiguous、project gateway missing / ambiguous、semantic route identity 不一致、手打ち `%pane` を route authority として採用、project Claude への direct send。 |
+| 親 -> 子 | `mozyo-bridge handoff delegate-launch-adopt` / `mozyo-bridge handoff send` | 必須。parent が implementation / domain probe 必要と判断した時点で Redmine issue / journal anchor を作成または選択する。 | parent は直接調査・実装せず、Redmine anchor と project identity を保持したまま child coordinator へ橋渡しする。 | Redmine anchor missing、parent direct investigation / implementation、grandchild への direct send、child coordinator の route identity 不一致、Claude 誤送信。 |
+| 子 -> 孫 | `mozyo-bridge handoff delegate-grandchild-dispatch` / `mozyo-bridge handoff delegate-grandchild-stamp` / `mozyo-bridge handoff delegate-grandchild-gate` / `mozyo-bridge handoff send` | 必須。grandchild worker は Redmine anchor を読めない限り実行しない。 | child が grandchild dispatch の可否を記録し、dispatch する場合は implementation worker が Redmine-governed work として実装・検証する。 | no-dispatch reason 未記録、route depth / owning route 不整合、worker realization 不明、Redmine anchor missing、hidden subagent 採用、Claude 誤送信。 |
+| 孫 -> 子 | `mozyo-bridge handoff reply` | 必須。implementation_done / review_request / blocked は Redmine journal を正本にする。 | grandchild が implementation_done / review_request / blocked を Redmine に記録し、child へ state pointer を返す。 | queue-enter 不達を durable record で回収しない、work log 本文を callback 正本にする、Redmine journal なしの完了主張、child 以外への direct callback。 |
+| 子 -> 親 | `mozyo-bridge handoff send` | 必須。child は grandchild の結果または no-dispatch reason を Redmine anchor に紐づける。 | child が grandchild 結果を集約し、parent project gateway へ review-ready / blocked / no-dispatch state pointer を返す。 | parent callback missing、callback target identity 不明、queue-enter 不達を Redmine で再構成できない、parent issue close を child が代行。 |
+| 親 -> 祖父 | `mozyo-bridge handoff send` | implementation に進んだ場合は必須。implementation 不要回答では ticketless consultation result を durable に要約する。 | parent が project gateway result を grandparent へ返し、grandparent が transition result を記録する。 | parent が実装結果を保持したまま祖父へ返さない、owner / grandparent へ work log を直接貼って durable anchor を欠く、親が close approval / review authority を代行。 |
+
+`handoff send` は lane crossing の transport family であり、送信先や state 種別の細部は
+CLI validation が決める。`project-gateway` は ticketless consultation を project-scoped gateway
+へ解決 / 起動する設計 surface であり、現時点では未実装 surface を含む。`cockpit` は gateway
+unit の projection / focus に使われ得る既存 family だが、project gateway semantic resolver の
+代替正本ではない。`workflow.next_action` 相当の判断は、各 transition の success / fail condition
+から次に owner / grandparent / parent / child / grandchild / CLI validation のどれが動くべきかを
+返す runtime decision として扱う。
+
+queue-enter は delivery rail であり、task 完了 signal ではない。queue-enter 不達または marker
+未観測は、Redmine journal と callback sweep で回収可能でなければならない。pane 上の見た目、
+手打ち `%pane`、chat message、work log 本文は route authority / completion authority ではない。
 
 ## 受け入れ判定の意味
 
