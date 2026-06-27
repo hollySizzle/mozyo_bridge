@@ -142,6 +142,39 @@ class HandoffCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(captured["target"], "%gw")
 
+    def test_found_auto_injects_grandparent_transition_role(self):
+        # Redmine #12706: project-gateway handoff IS the grandparent ->
+        # project-gateway transition, so a `found` resolution auto-injects the
+        # grandparent_coordinator boundary onto the standard payload (the operator
+        # never types it). The receiver gateway then owns the project-domain /
+        # no_dispatch decision the grandparent must not pre-empt.
+        captured = {}
+
+        def fake_orch(args):
+            captured["transition_role"] = getattr(args, "transition_role", None)
+            return 0
+
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%gw")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["transition_role"], "grandparent_coordinator")
+
+    def test_fail_closed_does_not_inject_transition_role(self):
+        # A non-found resolution does not deliver, so no boundary is injected; the
+        # args carry no transition_role for a route that never reached the gateway.
+        args = self._handoff_args()
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway.cmd_project_gateway_handoff(args)
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIsNone(getattr(args, "transition_role", None))
+
     def test_rejects_explicit_target(self):
         with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
             with self.assertRaises(SystemExit):

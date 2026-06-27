@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Sequence
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        TransitionRoleBoundary,
+    )
 
 
 # Public set of intent labels accepted by the new primitive. `custom` requires
@@ -551,6 +554,7 @@ def build_notification_body(
     receiver: str,
     execution_root: Optional["ExecutionRoot"] = None,
     role_profile: Optional["RoleProfileResolution"] = None,
+    transition_role: Optional["TransitionRoleBoundary"] = None,
 ) -> str:
     """Compose the pane text body that follows the landing marker.
 
@@ -567,6 +571,12 @@ def build_notification_body(
     ``tmux send-keys -l`` and the landing-marker gate greps the line), so the
     fully resolved multi-line contract lives in the durable delivery record, not
     the pane.
+
+    When ``transition_role`` is supplied (Redmine #12706), a trailing single-line
+    clause names the receiver's transition role and its handoff target so the
+    receiver never infers its lane role from ``%pane`` / active pane / docs-only
+    context. The full allowed/forbidden action boundary stays in the durable
+    delivery record, keeping the body single-line.
     """
     if kind not in KIND_LABELS:
         raise AnchorError(f"unknown handoff kind: {kind!r}; expected one of {sorted(KIND_LABELS)}")
@@ -582,6 +592,8 @@ def build_notification_body(
         body = f"{body} {execution_root.notification_clause()}"
     if role_profile is not None:
         body = f"{body} {role_profile.pointer_clause()}."
+    if transition_role is not None:
+        body = f"{body} {transition_role.pointer_clause()}."
     return body
 
 
@@ -634,6 +646,15 @@ class DeliveryOutcome:
     # the fully resolved contract body stays in the delivery record, not here.
     # `None` when no `--role-profile` was requested (the explicit fallback).
     role_profile: Optional[dict[str, Any]] = None
+    # Redmine #12706: explicit transition role/action boundary structured fields
+    # (`current_role` / `allowed_actions` / `forbidden_actions` /
+    # `handoff_target_role`) carried so the receiver reads its lane role/action
+    # boundary instead of inferring it from `%pane` / active pane / docs-only
+    # context. Free-text-free (fixed tokens) and durable-record safe in full.
+    # `None` when no transition role boundary was injected (the explicit
+    # fallback); the `project-gateway handoff` route auto-injects the
+    # grandparent_coordinator -> project_gateway boundary.
+    transition_role: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1175,6 +1196,30 @@ def _role_profile_pointer_or_dash(role_profile: Optional[dict[str, Any]]) -> str
     return pointer
 
 
+def _transition_role_lines(transition_role: Optional[dict[str, Any]]) -> list[str]:
+    """Render the structured transition role/action boundary (Redmine #12706).
+
+    Carries only fixed lower-snake-case tokens (role, handoff target, action
+    names) with no operator free text, so the full allowed/forbidden boundary is
+    durable-record safe and rendered in place — the receiver reads the boundary
+    it must respect without re-reading the pane or inferring its lane role.
+    Returns a single ``—`` line when no boundary was injected.
+    """
+    if not transition_role:
+        return ["- Transition role: —"]
+    current = transition_role.get("current_role") or "—"
+    target = transition_role.get("handoff_target_role") or "—"
+    allowed = transition_role.get("allowed_actions") or []
+    forbidden = transition_role.get("forbidden_actions") or []
+    allowed_text = ", ".join(f"`{a}`" for a in allowed) or "—"
+    forbidden_text = ", ".join(f"`{a}`" for a in forbidden) or "—"
+    return [
+        f"- Transition role: `{current}` — handoff target: `{target}`",
+        f"  - Allowed actions: {allowed_text}",
+        f"  - Forbidden actions: {forbidden_text}",
+    ]
+
+
 def build_delivery_record(
     outcome: "DeliveryOutcome",
     *,
@@ -1230,6 +1275,7 @@ def build_delivery_record(
         f"- Durable anchor: {_anchor_pointer_or_dash(outcome.anchor)}",
         f"- Target execution root: {_execution_root_pointer_or_dash(outcome.execution_root)}",
         f"- Role profile: {_role_profile_pointer_or_dash(outcome.role_profile)}",
+        *_transition_role_lines(outcome.transition_role),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
         f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
@@ -1372,6 +1418,7 @@ def make_outcome(
     source: Optional[str] = None,
     execution_root: Optional[ExecutionRoot] = None,
     role_profile: Optional["RoleProfileResolution"] = None,
+    transition_role: Optional["TransitionRoleBoundary"] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1395,6 +1442,9 @@ def make_outcome(
         notification_marker=notification_marker,
         execution_root=execution_root.to_dict() if execution_root else None,
         role_profile=role_profile.to_structured_dict() if role_profile else None,
+        transition_role=(
+            transition_role.to_structured_dict() if transition_role else None
+        ),
     )
 
 

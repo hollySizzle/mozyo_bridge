@@ -64,6 +64,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_pro
     parse_profile_fields,
     resolve_role_profile,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    TransitionRoleError,
+    resolve_transition_role,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
     SOURCE_HOME_REGISTRY,
@@ -5537,6 +5541,39 @@ def orchestrate_handoff(
         role_profile_resolution.resolved_text if role_profile_resolution else None
     )
 
+    # Redmine #12706: resolve the explicit transition role/action boundary before
+    # any pane send. The token is set programmatically by the routing command (the
+    # `project-gateway handoff` route injects `grandparent_coordinator` on a
+    # successful gateway resolution), never typed manually as product evidence.
+    # Fail closed (blocked / invalid_args) on an unknown token; omitting it is the
+    # explicit fallback of no role binding.
+    transition_role_boundary = None
+    transition_role_arg = getattr(args, "transition_role", None)
+    if transition_role_arg:
+        try:
+            transition_role_boundary = resolve_transition_role(transition_role_arg)
+        except TransitionRoleError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=target,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                    execution_root=execution_root,
+                    role_profile=role_profile_resolution,
+                ),
+                record_format=record_format,
+                command=record_command,
+                role_profile_contract=role_profile_contract,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+
     try:
         body = build_notification_body(
             anchor,
@@ -5545,6 +5582,7 @@ def orchestrate_handoff(
             receiver,
             execution_root=execution_root,
             role_profile=role_profile_resolution,
+            transition_role=transition_role_boundary,
         )
     except AnchorError as exc:
         _emit_outcome(
@@ -5560,6 +5598,7 @@ def orchestrate_handoff(
                 source=source,
                 execution_root=execution_root,
                 role_profile=role_profile_resolution,
+                transition_role=transition_role_boundary,
             ),
             record_format=record_format,
             command=record_command,
@@ -5595,6 +5634,7 @@ def orchestrate_handoff(
             notification_marker=marker,
             execution_root=execution_root,
             role_profile=role_profile_resolution,
+            transition_role=transition_role_boundary,
         )
         _emit_outcome(
             outcome,
@@ -5628,6 +5668,7 @@ def orchestrate_handoff(
             notification_marker=marker,
             execution_root=execution_root,
             role_profile=role_profile_resolution,
+            transition_role=transition_role_boundary,
         )
         _emit_outcome(
             outcome,
