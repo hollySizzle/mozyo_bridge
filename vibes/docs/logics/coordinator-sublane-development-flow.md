@@ -237,7 +237,7 @@ implementation-shaped work では sublane dispatch が default である。Main-
 
 ### Implementation Request Preflight
 
-`mozyo-bridge handoff send --kind implementation_request` を実行する直前に、管制塔は次の
+`mozyo-bridge handoff send` による `implementation_request` を実行する直前に、管制塔は次の
 preflight を同一 issue の durable record へ照合する。これは上記 `### Admission Rule`
 の実行時 checklist であり、別の正本を増やすものではない。
 
@@ -460,7 +460,7 @@ journal を source of truth とした callback sweep / recovery で行う。
 
 PlantUML sequence diagram で、lane crossing command と callback command を arrow label として固定する。管制塔と sublane の境界を読むための正本図なので、activity swimlane を併置しない。図が複数あると、差分が意図か drift かを LLM が判断する余地が増える。
 
-既存 CLI が確定している transition は実コマンドを arrow label に書く。未確定 command surface はこの標準フローでは正本化せず、該当 issue / design doc の `missing` として扱う。
+既存 CLI が確定している transition は command family を arrow label に書く。flag の完全な引数列は CLI parser / help / validation error を正本とし、この図には複製しない。未確定 command surface はこの標準フローでは正本化せず、該当 issue / design doc の `missing` として扱う。
 
 ```plantuml
 @startuml coordinator_sublane_standard_sequence
@@ -477,7 +477,7 @@ database "origin / CI" as Origin
 Owner -> Coordinator: prompt / marker / ticket id
 activate Coordinator
 Coordinator -> Redmine: read issue, journals, Version, parent / child state
-Coordinator -> Docs: mozyo-bridge docs resolve --format markdown <changed_path...>
+Coordinator -> Docs: mozyo-bridge docs resolve
 Coordinator -> Redmine: record dispatch decision / stop reason
 
 alt coordinator_owned_or_audit_only
@@ -488,34 +488,47 @@ else implementation_shaped_dispatch
     forbid: coordinator creates normal implementation diff
     forbid: main lane Claude receives implementation_request
   end note
-  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <issue> --journal <journal> --kind implementation_request --target %<gateway_codex_pane> --target-repo auto --role-profile implementation_gateway --summary "<dispatch pointer>"
+  Coordinator -> Gateway: mozyo-bridge handoff send
+  note right
+    semantic contract: source=redmine, kind=implementation_request,
+    target_role=implementation_gateway, summary points to durable anchor
+  end note
   activate Gateway
   Gateway -> Redmine: read durable anchor
-  Gateway -> Worker: mozyo-bridge handoff send --to claude --source redmine --issue <issue> --journal <journal> --kind implementation_request --target %<worker_claude_pane> --target-repo auto --role-profile implementation_worker --summary "<implementation pointer>"
+  Gateway -> Worker: mozyo-bridge handoff send
+  note right
+    semantic contract: source=redmine, kind=implementation_request,
+    target_role=implementation_worker, same-lane worker only
+  end note
   activate Worker
   Worker -> Redmine: read issue / journal
-  Worker -> Docs: mozyo-bridge docs resolve --format markdown <changed_path...>
+  Worker -> Docs: mozyo-bridge docs resolve
   Worker -> Worker: implement bounded diff and run verification
   Worker -> Redmine: record implementation_done / review_request
   alt implementation_done callback
-    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+    Worker -> Gateway: mozyo-bridge handoff reply
+    note right: semantic contract: kind=implementation_done, state pointer required
   else review_request callback
-    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+    Worker -> Gateway: mozyo-bridge handoff reply
+    note right: semantic contract: kind=review_request, state pointer required
   end
   deactivate Worker
   alt implementation_done callback
-    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+    Gateway -> Coordinator: mozyo-bridge handoff send
+    note right: semantic contract: target=coordinator, kind=implementation_done
   else review_request callback
-    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <issue> --journal <journal> --kind review_request --summary "<state pointer>"
+    Gateway -> Coordinator: mozyo-bridge handoff send
+    note right: semantic contract: target=coordinator, kind=review_request
   end
   deactivate Gateway
 end
 
 Coordinator -> Redmine: callback sweep / review target journals
-Coordinator -> Origin: git branch -r --contains <commit> / origin reachability check
+Coordinator -> Origin: origin reachability check
 alt review_findings
   Coordinator -> Redmine: record Review Gate findings
-  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <issue> --journal <review_journal> --kind review_result --target %<gateway_codex_pane> --target-repo auto --summary "<findings pointer>"
+  Coordinator -> Gateway: mozyo-bridge handoff send
+  note right: semantic contract: kind=review_result, target_role=implementation_gateway
 else review_approved
   Coordinator -> Redmine: record Review Gate
   Coordinator -> Redmine: record owner_close_approval when allowed / owner decision when required

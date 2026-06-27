@@ -47,6 +47,8 @@ Redmine #12423。既存プロジェクトへ mozyo-bridge の governed scaffold 
 
 ## 実行フロー
 
+Sequence diagram は lane crossing の向きと command family を固定する。flag の完全な引数列は CLI parser / help / validation error を正本とし、この runbook には複製しない。
+
 ```plantuml
 @startuml existing_project_sublane_adoption_sequence
 title Existing Project Sublane Adoption Sequence
@@ -62,7 +64,7 @@ database "origin / CI" as Origin
 Owner -> Coordinator: adoption request / Redmine issue id
 activate Coordinator
 Coordinator -> Redmine: read parent / child issues and journals
-Coordinator -> Docs: mozyo-bridge docs resolve --format markdown <adoption_path...>
+Coordinator -> Docs: mozyo-bridge docs resolve
 Coordinator -> Redmine: record read-only preflight journal
 
 alt governed preset not justified
@@ -70,35 +72,48 @@ alt governed preset not justified
 else adoption child issue ready
   Coordinator -> Redmine: create or identify implementation child issue
   Coordinator -> Redmine: record dispatch decision and target lane identity
-  Coordinator -> Gateway: mozyo-bridge handoff send --to codex --source redmine --issue <child_issue> --journal <dispatch_journal> --kind implementation_request --target %<gateway_codex_pane> --target-repo auto --role-profile implementation_gateway --summary "<adoption dispatch>"
+  Coordinator -> Gateway: mozyo-bridge handoff send
+  note right
+    semantic contract: source=redmine, kind=implementation_request,
+    target_role=implementation_gateway, adoption dispatch anchor required
+  end note
   activate Gateway
   Gateway -> Redmine: read durable anchor
   Gateway -> Gateway: confirm adoption target identity and same-lane Claude route
-  Gateway -> Worker: mozyo-bridge handoff send --to claude --source redmine --issue <child_issue> --journal <dispatch_journal> --kind implementation_request --target %<worker_claude_pane> --target-repo auto --role-profile implementation_worker --summary "<adoption implementation>"
+  Gateway -> Worker: mozyo-bridge handoff send
+  note right
+    semantic contract: source=redmine, kind=implementation_request,
+    target_role=implementation_worker, same-lane worker only
+  end note
   activate Worker
-  Worker -> Docs: mozyo-bridge docs resolve --format markdown <adoption_path...>
-  Worker -> Worker: mozyo-bridge scaffold status --target .
+  Worker -> Docs: mozyo-bridge docs resolve
+  Worker -> Worker: mozyo-bridge scaffold status
   Worker -> Worker: run scaffold / rules / catalog adoption steps
   Worker -> Worker: run verification and git diff --check
-  Worker -> Worker: git commit -m "<subject>" -m "Refs: Redmine #<child_issue>" -m "issue_<child_issue>"
+  Worker -> Worker: git commit
+  note right: semantic contract: Redmine reference trailer and issue token required
   Worker -> Redmine: record implementation_done / review_request
   alt implementation_done callback
-    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <child_issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+    Worker -> Gateway: mozyo-bridge handoff reply
+    note right: semantic contract: kind=implementation_done, state pointer required
   else review_request callback
-    Worker -> Gateway: mozyo-bridge handoff reply --to codex --source redmine --issue <child_issue> --journal <journal> --kind review_request --summary "<state pointer>"
+    Worker -> Gateway: mozyo-bridge handoff reply
+    note right: semantic contract: kind=review_request, state pointer required
   end
   deactivate Worker
 
   alt implementation_done callback
-    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <child_issue> --journal <journal> --kind implementation_done --summary "<state pointer>"
+    Gateway -> Coordinator: mozyo-bridge handoff send
+    note right: semantic contract: target=coordinator, kind=implementation_done
   else review_request callback
-    Gateway -> Coordinator: mozyo-bridge handoff send --to codex --target coordinator --mode standard --source redmine --issue <child_issue> --journal <journal> --kind review_request --summary "<state pointer>"
+    Gateway -> Coordinator: mozyo-bridge handoff send
+    note right: semantic contract: target=coordinator, kind=review_request
   end
   Gateway -> Redmine: record callback outcome
   deactivate Gateway
 
   Coordinator -> Redmine: audit diff, journals, and verification
-  Coordinator -> Origin: git branch -r --contains <commit>
+  Coordinator -> Origin: origin reachability check
   alt commit local_only_or_unreachable
     Coordinator -> Redmine: record local-only / unreachable blocker
   else commit usable as integration anchor
