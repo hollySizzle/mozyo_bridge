@@ -20,6 +20,17 @@
 - Redmine は durable な作業ログであり、実行単位は原則 UserStory / Task / Test /
   Bug issue である。
 - Issue は目的、作業対象、成果物、完了条件、必要な gate journal を持つ。
+- ユーザー向けの narrative、進捗報告、handoff summary、review summary、次アクション説明では、
+  Redmine issue / task を **ID だけで呼ばない**。必ず `#<id> <短い概要>` の形で書く。
+  例: `#12703 ticketless no-anchor callback transport`、
+  `#12700 workflow contract refs injection`。ID は durable anchor であり、
+  人間が記憶する作業名ではない。
+- 複数回同じ issue を列挙する短い表や log では、最初の出現で `#<id> <短い概要>` を示し、
+  以後の同一段落内では `#<id>` だけに省略してよい。ただし、段落・節・turn をまたいで
+  次アクションや blocker を説明する場合は再度概要を添える。
+- machine-readable surface では literal を保つ。commit trailer (`Refs: Redmine #<id>`,
+  `issue_<id>`)、CLI flag、JSON field、Redmine journal の構造化 field、branch 名、
+  file path はこの人間向け label rule の対象外である。
 - 作業が完了、block、scope 変更、handoff、review、owner close approval、close
   に進む場合は、該当 issue の journal を更新する。
 - chat message を durable な作業ログとして扱わない。
