@@ -4,6 +4,50 @@
 
 記載は Git の release commit と利用可能な tag を元にしています。一部の過去バージョンは release commit はありますが、現在の repository には対応する tag がありません。
 
+## v0.9.1 - 2026-06-27
+
+`v0.9.0` から **229 commit** 進んだ現行 repo head を、新しい patch release `0.9.1` として production 配布候補に切り出した release です(#12687 / #12688)。公開配布物の最新は `0.9.0` でしたが、repo `main` はそこから大きく前進しており、operator が現行 head の公開配布を明示承認しました。version mirror(`pyproject.toml` `[project].version` と `src/mozyo_bridge/__init__.py` `__version__`)のみを `0.9.0` → `0.9.1` に更新する **standalone commit** を切り、code / docs content 変更とは混ぜていません。
+
+この release の中身はほぼ **内部 architecture / governance の consolidation** であり、配布される runtime CLI(`mozyo-bridge` / `mozyo`)の操作面・JSON / text 出力互換は維持しています。一方で **package 内部の Python module path は大きく再編** されました(下記 layout 移行)。これは公開 API ではなく内部実装の再配置です。
+
+### source / test layout を Redmine-numbered bounded-context へ移行(#12488–#12632)
+
+最大の変更は、source tree と test tree を **bounded context = Redmine Feature** に対応した numbered package layout へ移行したことです。`src/mozyo_bridge/e_<order>_<epic>/f_<order>_<feature>/<layer>/<module>.py` の形へ揃え、移行途中で存在した `features/` root を廃止しました(#12622–#12632)。各 Epic lane(#12624–#12628)で source / test を移し、最終 integration(#12630)で merge topology と catalog 参照を整理、#12632 で top-level `domain/` / `infrastructure/` の residual を numbered path へ寄せて旧 facade を退役させています。test tree も type × bounded-context layout(#12488–#12494)へ移行しました。移行中は characterization / import-identity test で behavior 保存を確認しています。
+
+### delegated coordinator / grandchild dispatch(#12393–#12473, #12547–#12561)
+
+sublane 運用に、親 coordinator から子・孫レーンへ作業を委譲する **delegated coordinator** モデルを追加しました。role profile 語彙と境界(#12393–#12396)、delegation policy の project config knob と decision / callback / correction record(#12397 / #12398)、grandchild dispatch primitive と fail-closed gate(#12457 / #12458 / #12473)、cockpit 上の delegation tree 表示(#12454 / #12465–#12467)を整備し、route identity ledger と live executor(#12549–#12561)で実 pane 解決まで接続しています。
+
+### cockpit grouped UI / project-scoped identity(#12286–#12341, #12658, #12668)
+
+cockpit を project group 単位の Unit へ projection し(#12286–#12304)、同一 project の sublane を 1 つの tmux window へまとめる project group window(#12330)、grouped unit detail / command preview / freshness summary 表示(#12296 / #12297)を追加しました。あわせて、monorepo の project subdirectory を routing scope とする project-scoped workspace identity(#12658)と、project gateway を意味的に解決する resolver(#12668)を導入しています。
+
+### home-scoped state store と doctor inspector(#12304 / #12305, #12612)
+
+cockpit / delivery などの runtime state を home-scoped state store へ集約し、command 経由でのみ access する境界(#12304)と、legacy DB からの schema-aware migration / fail-closed 検証(#12305)を実装しました。`doctor` に read-only state inspector を追加し、executable surface(source / pipx / site-packages)と live feature を突き合わせる runtime fingerprint(#12612)を加えています。
+
+### module-health gate(#12321–#12324)
+
+CI に PyLint 相当の oversized-module gate を追加しました。`module_health.yaml` の allowlist と 1000 行 threshold を超えると CI が fail し、expiry-deadline 付きの regression policy(#12324)で allowlist の恒久化を防ぎます。
+
+### durable delivery record / OTel credential delivery(#12306, #12311, #12346 / #12347)
+
+handoff delivery record を durable に persist する opt-in seam(#12311)、credential-safe な Redmine delivery-record write transport(#12347)、launchd OTel receiver の Redmine key を home-scoped credential file 経由で配る経路(#12306)を追加しました。
+
+### handoff rail safety hardening(#12577, #12581, #12597)
+
+agent delivery / recovery として raw tmux pane mutation を行うことを禁止し(#12577)、queue-enter rail に Enter-only retry を入れ(#12581)、inactive な registered agent pane に対する standard_target_admission rail(#12597)を追加しました。
+
+### governance / docs(#11818, #12354–#12363, #12609, #12633–#12676)
+
+OSS 中立な response-language policy と日本語 workspace preference(#11818)、既存 project への sublane 採用 runbook 配布(#12354–#12363)、scaffold packaged runbook copies の authored source 同期(#12609)、Redmine version 命名 policy(#12633)、planning bucket を release version から decouple する整理(#12643)、ticketless gateway の docs 抽象化(#12667–#12676)などの governance / docs 更新を含みます。
+
+### リリース状況メモ
+
+- **配布実績**: なし。`0.9.1` の tag / GitHub Release / PyPI publish は本メモ時点で **未実施**。
+- **production PyPI**: `skills/mozyo-bridge-agent/references/release.md` の Distribution Gates / Trusted Publishing に従い、TestPyPI rehearsal と fresh install validation、Codex / owner gate(親 #12687)を経てから判断します。本メモでは production publish / tag / GitHub Release を行いません。
+- **local preflight**: 親 #12687 の release gate で実行・記録します。preflight blocker の disposition は #12687 の durable record を正本とします。
+
 ## v0.9.0 - 2026-06-19
 
 `0.9.0a1` の TestPyPI beta ラインから **production `0.9.0`** へ進めるための release notes です。`0.9.0a1` で配布した v0.9 baseline を production PyPI へ promotion する前段として、release preflight を blocker にしていた 2 件(#12235)を解消し、version mirror を `0.9.0` に確定(#12236)しています。`src/**` / `tests/**` の挙動本体は変更しておらず、既存 CLI の JSON / text 出力互換も壊していません。**tag / GitHub Release / production PyPI publish は本メモでは行わず**、親 #12192 の明示承認と別 gate のもとで beta acceptance 後に判断します。
