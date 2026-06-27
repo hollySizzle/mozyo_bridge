@@ -479,13 +479,13 @@ def register(sub) -> None:
     handoff_ticketless = handoff_sub.add_parser(
         "ticketless-callback",
         help=(
-            "Standard ticketless no-anchor callback / hands-off transport "
-            "(Redmine #12703): return a consultation result to the caller lane "
-            "without a Redmine anchor"
+            "Standard ticketless no-anchor callback / hands-off transport — return "
+            "a consultation result to the caller lane without a Redmine anchor"
         ),
         description=(
             "Standard product primitive for the ticketless consultation-phase "
-            "callback (Redmine #12703). GK3500 smoke #12698 surfaced that a "
+            "callback (#12703 ticketless no-anchor callback transport). "
+            "#12698 GK3500 ticketless exploratory smoke surfaced that a "
             "ticketless `no_dispatch` / consultation hands-off result could not be "
             "returned over `handoff reply`, which requires a Redmine anchor "
             "(`--issue` + `--journal`) and so failed closed with `invalid_anchor`. "

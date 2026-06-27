@@ -1,4 +1,4 @@
-"""CLI parser configuration for `handoff ticketless-callback` (Redmine #12703).
+"""CLI parser configuration for `handoff ticketless-callback` (#12703 ticketless no-anchor callback transport).
 
 Split out of :mod:`...application.cli_handoff` so the ticketless no-anchor
 callback rail's parser surface lives in its own module (keeping the shared
@@ -63,7 +63,8 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
         "--target-repo",
         dest="target_repo",
         help=(
-            "Optional cross-workspace identity gate (Redmine #10332): the target "
+            "Optional cross-workspace identity gate (#10332 cross-workspace handoff "
+            "identity gate): the target "
             "pane's cwd must resolve to this repo root, else the callback is "
             "rejected with `target_repo_mismatch`. Pass `auto` to infer the root "
             "from an explicit `%%pane` target's own cwd. Drop to skip the repo gate."
@@ -73,7 +74,8 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
         "--target-project",
         dest="target_project",
         help=(
-            "Optional project-scope gate (Redmine #12658), layered on top of "
+            "Optional project-scope gate (#12658 project-scoped cockpit identity), "
+            "layered on top of "
             "`--target-repo` (which it requires), never replacing it."
         ),
     )
@@ -121,7 +123,8 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
     parser_.add_argument(
         "--no-target-activation", dest="no_target_activation", action="store_true",
         help=(
-            "Disable standard_target_admission activation (Redmine #12597): an "
+            "Disable standard_target_admission activation (#12597 "
+            "standard_target_admission activation): an "
             "inactive registered agent pane stays fail-closed instead of being "
             "activated via tmux `select-pane`. Ignored under --mode standard/pending."
         ),
@@ -130,7 +133,8 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
         "--restore-previous-active", dest="restore_previous_active",
         action="store_true",
         help=(
-            "After activating an admitted inactive split (Redmine #12597), "
+            "After activating an admitted inactive split (#12597 "
+            "standard_target_admission activation), "
             "re-select the previously-active pane. Pane selection only."
         ),
     )
@@ -152,7 +156,7 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
 
 
 def configure_ticketless_callback_parser(parser_: argparse.ArgumentParser) -> None:
-    """Configure `handoff ticketless-callback` (Redmine #12703)."""
+    """Configure `handoff ticketless-callback` (#12703 ticketless no-anchor callback transport)."""
     _add_ticketless_delivery_options(parser_)
     parser_.add_argument(
         "--classification", required=True, choices=list(CLASSIFICATIONS),
@@ -190,6 +194,6 @@ def configure_ticketless_callback_parser(parser_: argparse.ArgumentParser) -> No
         help=(
             "Which workflow-contract set governed this result "
             "(`grandparent_coordinator` / `project_gateway`); resolvable via the "
-            "#12700 / #12706 transition-role tokens."
+            "#12700 workflow contract refs / #12706 transition role payload tokens."
         ),
     )
