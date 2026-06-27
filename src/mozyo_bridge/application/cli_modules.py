@@ -41,6 +41,9 @@ from mozyo_bridge.application import (
     cli_state,
     cli_workspace,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
+    cli_project_gateway,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     BuiltinCliModuleRegistry,
     CliCompositionConfig,
@@ -137,6 +140,19 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             ),
         ),
         cli_handoff.register,
+    ),
+    (
+        CliFamily(
+            name="project-gateway",
+            summary=(
+                "Semantic department-root -> project-gateway route family "
+                "(Redmine #12668): discover / start / handoff a project-scoped "
+                "gateway unit across separate window/session surfaces by identity, "
+                "fail-closed on missing/ambiguous, without a %pane copy."
+            ),
+            authorities=frozenset({"send_safety", "routing_authority"}),
+        ),
+        cli_project_gateway.register,
     ),
     (
         CliFamily(
