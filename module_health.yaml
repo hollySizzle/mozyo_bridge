@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6747
+    lines: 6827
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -119,6 +119,12 @@ allowlist:
       restoring the #12706 `transition_role` on the successful-delivery
       `make_outcome` it had been dropped from; the bundle values + resolver live in
       the new `f_130_handoff_routing/domain/workflow_contract.py`, not here).
+      Raised 6747 -> 6827 for the #12703 ticketless no-anchor callback rail in
+      `orchestrate_handoff` (the `ticketless=True` path builds a fail-closed
+      `TicketlessCallback` + `TicketlessAnchor` instead of `normalize_anchor`, and
+      threads the callback through `build_notification_body` and the typed terminal
+      `make_outcome` paths; the callback values + worker-dispatch refusal live in
+      the new `f_130_handoff_routing/domain/ticketless_callback.py`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -174,7 +180,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1561
+    lines: 1680
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -212,6 +218,15 @@ allowlist:
       `build_delivery_record`. The bundle values + resolver live in the separate
       `domain/workflow_contract.py` (kept out of this module), so only the
       outcome/record plumbing lands here.
+      Raised 1561 -> 1680 for the #12703 ticketless no-anchor callback rail: the
+      `SOURCE_TICKETLESS` token + the `TicketlessAnchor` value object (so the
+      standard marker/body/outcome rail works without a fabricated ticket anchor),
+      the `ticketless_callback` field on `DeliveryOutcome` / `make_outcome`, the
+      ticketless lead-sentence + pointer clause in `build_notification_body`, and
+      the `_ticketless_callback_lines` renderer + `- Ticketless callback:` block in
+      `build_delivery_record`. The callback values + worker-dispatch refusal live
+      in the separate `domain/ticketless_callback.py` (kept out of this module), so
+      only the anchor/outcome/record plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

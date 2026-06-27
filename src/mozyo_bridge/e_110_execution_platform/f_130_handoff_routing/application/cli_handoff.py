@@ -25,6 +25,7 @@ from mozyo_bridge.application.commands import (
     cmd_handoff_cross_workspace_consult,
     cmd_handoff_reply,
     cmd_handoff_send,
+    cmd_handoff_ticketless_callback,
     cmd_message,
     cmd_notify_claude,
     cmd_notify_claude_legacy_task,
@@ -55,6 +56,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     SOURCES,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import ROLE_PROFILE_TOKENS
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
+    configure_ticketless_callback_parser,
+)
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
@@ -471,6 +475,50 @@ def register(sub) -> None:
     )
     configure_handoff_parser(handoff_reply, kind_required=False)
     handoff_reply.set_defaults(func=cmd_handoff_reply)
+
+    handoff_ticketless = handoff_sub.add_parser(
+        "ticketless-callback",
+        help=(
+            "Standard ticketless no-anchor callback / hands-off transport — return "
+            "a consultation result to the caller lane without a Redmine anchor"
+        ),
+        description=(
+            "Standard product primitive for the ticketless consultation-phase "
+            "callback (#12703 ticketless no-anchor callback transport). "
+            "#12698 GK3500 ticketless exploratory smoke surfaced that a "
+            "ticketless `no_dispatch` / consultation hands-off result could not be "
+            "returned over `handoff reply`, which requires a Redmine anchor "
+            "(`--issue` + `--journal`) and so failed closed with `invalid_anchor`. "
+            "This rail carries the structured callback result "
+            "(`--classification` / `--dispatch-decision` / `--workflow-next-owner` "
+            "/ `--callback-reason` / `--read-contract`, with `redmine_anchor_"
+            "required` derived) over the SAME standard delivery rail (queue-enter "
+            "/ standard semantics, the same target-admission / repo-identity / "
+            "cross-session gates) WITHOUT a Redmine anchor and without fabricating "
+            "one. The transport outcome (status / reason / marker) is recorded "
+            "distinctly from the workflow result (the ticketless callback fields).\n\n"
+            "Boundary preserved: this does NOT touch the Redmine-governed "
+            "`handoff reply` / `reply` rail (those still require `--issue` + "
+            "`--journal`), and it fails closed if `--dispatch-decision` is an "
+            "actual child->grandchild worker dispatch — that still requires a real "
+            "Redmine anchor via `handoff send --kind implementation_request`."
+        ),
+        epilog=(
+            "Example (GK3500 grandparent gateway returns a no_dispatch result to "
+            "the caller Codex):\n"
+            "  mozyo-bridge handoff ticketless-callback \\\n"
+            "    --to codex --target %0 --target-repo auto \\\n"
+            "    --classification no_dispatch \\\n"
+            "    --dispatch-decision hand_back_to_caller \\\n"
+            "    --workflow-next-owner caller \\\n"
+            "    --callback-reason no_dispatch_decided \\\n"
+            "    --read-contract grandparent_coordinator \\\n"
+            "    --summary 'ticketless consultation: no implementation dispatch'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    configure_ticketless_callback_parser(handoff_ticketless)
+    handoff_ticketless.set_defaults(func=cmd_handoff_ticketless_callback)
 
     handoff_consult = handoff_sub.add_parser(
         "cross-workspace-consult",
