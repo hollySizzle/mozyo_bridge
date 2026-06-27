@@ -74,6 +74,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "notify-claude-legacy-task",
     "handoff",
     "reply",
+    "project-gateway",
     "init",
     "doctor",
     "sublane",
