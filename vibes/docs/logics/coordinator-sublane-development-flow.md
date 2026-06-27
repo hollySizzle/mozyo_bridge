@@ -29,7 +29,7 @@ owner / user は状況に応じて、同じ運用単位を `管制塔`、`メイ
 - close 済み sublane を退役させ、cockpit / worktree / agent context を残し続けない。
 - ルールを既存 guardrail へ追記し続けるのではなく、本 flow を参照 spine として使う。
 
-## Workflow Orchestration Roadmap
+## ワークフロー管制ロードマップ
 
 ### 背景
 
@@ -75,7 +75,7 @@ structured field である。
 - event watcher: Redmine journal update を event source として読み、mozyo DB の pending action に変換する。
 - UI: workflow truth ではなく projection。DB / Redmine / live target の read model を表示する。
 
-### Roadmap US
+### ロードマップUS
 
 Redmine Version は semantic version number を含む名前にしない。Version 名は日本語を基本に、
 日付・優先度・作業窓を表す計画枠として付ける。番号付き release name にはしない。MCP には
@@ -89,6 +89,8 @@ CLI 名、コード識別子、固有 provider 名だけを literal token とし
    - PlantUML swimlane、lane registry、transition function contract を固定する。
    - lane owner は pane id ではなく workflow role / route identity で表す。
    - `Codex` / `Claude` は provider であり role ではない、という語彙を最初に入れる。
+   - #12675 / #12676 / #12677 で、祖父→親→子→孫の実機テスト前ワークフローを
+     PlantUML swimlane、command family、fail condition、実機前監査へ分解する。
 
 2. #12671 `DBベースのワークフロー状態とコマンド結果の次アクションを実装する`
    - mozyo DB に workflow state / pending delivery / route identity を持つ。

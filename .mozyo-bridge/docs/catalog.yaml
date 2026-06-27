@@ -557,9 +557,10 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
-    purpose: "ticketless consultation で department root -> project gateway -> implementation worker の 3 層 UX を成立させる runtime 境界。root と project gateway は別 window/session 表示でよく、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。"
+    purpose: "チケットなし相談で部署ルート管制塔 -> プロジェクトゲートウェイ -> 実装ワーカーの 3 層 UX を成立させる runtime 境界。root と project gateway は別 window/session 表示でよく、標準 route は `%pane` 直指定ではなく semantic gateway discovery / launch / handoff で fail-closed に扱う。#12675 の祖父・親・子・孫 swimlane 作成時に必ず読む。"
     audit_role: ticketless_project_gateway_runtime_ux_logic
     related_document_refs:
+      - logic-coordinator-sublane-development-flow
       - logic-project-scoped-workspace-identity
       - logic-unit-target-model
       - logic-cross-project-cockpit-smoke-runbook
@@ -666,12 +667,13 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、workflow lane ownership / DB-backed next_action / event watcher / provider binding / Cockpit UI projection の後続 Version・US roadmap を定義する repo-local 開発フロー spine。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
+      - logic-ticketless-project-gateway-runtime-ux
       - spec-delegated-coordinator-role-profile
       - spec-delegated-coordinator-decision-records
       - logic-worktree-lifecycle-boundary
