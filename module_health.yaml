@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6656
+    lines: 6697
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -106,6 +106,12 @@ allowlist:
       policy live in the new
       `f_120_agent_discovery_pane_resolution/domain/project_gateway_identity.py`,
       not here).
+      Raised 6656 -> 6697 for the #12706 ticketless transition role/action
+      boundary wiring in `orchestrate_handoff` (fail-closed `resolve_transition_role`
+      of the `args.transition_role` token + threading the boundary through
+      `build_notification_body` and the typed terminal `make_outcome` paths; the
+      boundary values + resolver live in the new
+      `f_130_handoff_routing/domain/transition_role.py`, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -161,7 +167,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1449
+    lines: 1499
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -185,6 +191,13 @@ allowlist:
       `evaluate_standard_target_admission` minimal-admission evaluator, the
       durable-record-safe `TargetActivationOutcome`, and the `- Activation:` line
       in `build_delivery_record`.
+      Raised 1449 -> 1499 for the #12706 ticketless transition role/action
+      boundary wiring: the `transition_role` field on `DeliveryOutcome` /
+      `make_outcome`, the single-line pointer clause in `build_notification_body`,
+      and the `_transition_role_lines` renderer + `- Transition role:` block in
+      `build_delivery_record`. The boundary values + resolver live in the separate
+      `domain/transition_role.py` (kept out of this module), so only the
+      outcome/record plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

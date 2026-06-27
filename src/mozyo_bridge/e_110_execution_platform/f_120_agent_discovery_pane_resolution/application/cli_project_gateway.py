@@ -53,6 +53,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+    ROLE_GRANDPARENT_COORDINATOR,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
@@ -327,6 +330,17 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     # Inject the resolved pane and delegate to the gated handoff orchestrator. The
     # repo + project gates in orchestrate_handoff re-verify the resolved pane.
     args.target = resolution.selected.pane_id
+    # Redmine #12706: this command IS the grandparent (department-root) ->
+    # project-gateway transition, so auto-inject the grandparent_coordinator
+    # boundary onto the standard transition payload only now — after a successful
+    # `found` resolution (a fail-closed resolution above returns without
+    # delivering, so no boundary is injected on the no-deliver path). The receiver
+    # gateway reads `current_role=grandparent_coordinator` /
+    # `forbidden_actions=[project_domain_decision, parent_gateway_no_dispatch_decision, ...]`
+    # and so owns the project-domain / no_dispatch decision the grandparent must
+    # not pre-empt (the #12698 defect). The operator never types the role payload;
+    # the standard payload carries it.
+    args.transition_role = ROLE_GRANDPARENT_COORDINATOR
     return orchestrate_handoff(args)
 
 
