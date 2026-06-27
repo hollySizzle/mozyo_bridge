@@ -1833,8 +1833,12 @@ def _read_cockpit_columns(session: str, window: str | None = None):
     """Read a cockpit window's panes with their workspace+lane identity (#11803, #11820).
 
     Returns a list of ``{pane_id, workspace_id, role, lane_id, pane_left,
-    pane_width}`` (one per pane carrying the `@mozyo_workspace_id` user option),
-    or ``None`` when the window does not exist. ``window`` defaults to the shared
+    pane_width, project_scope, project_path, project_label}`` (one per pane
+    carrying the `@mozyo_workspace_id` user option), or ``None`` when the window
+    does not exist. The project triple (Redmine #12658 stamp) rides on the read
+    so duplicate / Unit-membership detection can distinguish a department-root
+    pane (empty ``project_scope``) from a project-scoped gateway pane that shares
+    the same Git root and lane (Redmine #12739). ``window`` defaults to the shared
     `cockpit` window. Pass an explicit window to read a Project Group window
     (#12330): a tmux **window id** (``@N``, server-globally unique) targets that
     exact window unambiguously and is used directly; any other value is taken as a
@@ -1873,7 +1877,9 @@ def _read_cockpit_columns(session: str, window: str | None = None):
             target,
             "-F",
             "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
-            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}",
+            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}"
+            "\t#{@mozyo_project_scope}\t#{@mozyo_project_path}"
+            "\t#{@mozyo_project_label}",
             check=False,
         )
     except (Exception, SystemExit):
@@ -1892,6 +1898,9 @@ def _read_cockpit_columns(session: str, window: str | None = None):
                     "lane_id": parts[3] if len(parts) >= 4 else "",
                     "pane_left": _as_int(parts[4]) if len(parts) >= 5 else 0,
                     "pane_width": _as_int(parts[5]) if len(parts) >= 6 else 0,
+                    "project_scope": parts[6] if len(parts) >= 7 else "",
+                    "project_path": parts[7] if len(parts) >= 8 else "",
+                    "project_label": parts[8] if len(parts) >= 9 else "",
                 }
             )
     return columns
@@ -3840,19 +3849,27 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     columns = _read_cockpit_columns(session)
     session_present = _cockpit_session_present(session)
 
-    # Duplicate detection compares `workspace_id + lane_id` (Redmine #11820):
-    # same workspace + same lane focuses the existing column; same workspace +
-    # different lane (a worktree / clone / relocated checkout) falls through to
-    # append as its own column. A pre-#11820 pane carries no lane id and
-    # normalizes to `default`, matching the `default` lane of a primary checkout.
+    # Duplicate detection compares `workspace_id + lane_id + project_scope`
+    # (Redmine #11820, #12739): same workspace + same lane + same project scope
+    # focuses the existing column; a different lane (a worktree / clone /
+    # relocated checkout) OR a different project scope falls through to append as
+    # its own column. The project scope is the #12658 stamp, so a department-root
+    # pane (empty `project_scope`) and a project-scoped gateway pane that share
+    # the same Git root and lane are distinct Units that can coexist (Redmine
+    # #12739) instead of the gateway launch collapsing into a focus of the root
+    # column. A pre-#11820 pane carries no lane id and normalizes to `default`,
+    # matching the `default` lane of a primary checkout; a pre-#12658 pane
+    # carries no project scope and normalizes to empty, matching a root launch.
     existing_codex = [c for c in (columns or []) if c.get("role") == "codex"]
     target_lane = normalize_lane(workspace.lane_id)
+    target_scope = (workspace.project_scope or "").strip()
     same = next(
         (
             c
             for c in existing_codex
             if c.get("workspace_id") == workspace.workspace_id
             and normalize_lane(c.get("lane_id")) == target_lane
+            and (c.get("project_scope") or "").strip() == target_scope
         ),
         None,
     )
@@ -4011,6 +4028,11 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
         payload["workspace_id"] = workspace.workspace_id
         payload["lane_id"] = normalize_lane(workspace.lane_id)
         payload["lane_label"] = workspace.lane_label
+        # Project scope rides the projection (Redmine #12739) so `cockpit --json`
+        # can show that a project-scoped launch appends a distinct Unit instead
+        # of focusing the department-root column. Empty for a root / single-repo
+        # workspace.
+        payload["project_scope"] = (workspace.project_scope or "").strip()
         payload["session"] = session
         payload["blocked"] = blocked_reason
         payload["adopt_advisory"] = (

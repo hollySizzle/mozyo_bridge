@@ -201,31 +201,44 @@ class ReadCockpitColumnsTest(unittest.TestCase):
     def test_parses_pane_identity_options(self) -> None:
         from mozyo_bridge.application import commands
 
-        # Mixed feed: newer panes carry lane id + geometry (#11820, #11849),
-        # pre-#11820 panes carry only 3 fields. Both parse; missing fields read
-        # as "" / 0 without IndexError.
+        # Mixed feed: newer panes carry lane id + geometry (#11820, #11849) and
+        # the project triple (#12658 / #12739); pre-#11820 panes carry only 3
+        # fields and a root pane carries an empty project_scope. All parse;
+        # missing fields read as "" / 0 without IndexError.
         out = (
-            "%1\twsA\tcodex\twkt-1\t41\t39\n"
-            "%2\twsA\tclaude\twkt-1\t41\t13\n"
+            "%1\twsA\tcodex\twkt-1\t41\t39\t\t\t\n"
+            "%2\twsA\tclaude\twkt-1\t41\t13\t\t\t\n"
             "%3\twsB\tcodex\n"
+            "%4\twsA\tcodex\twkt-1\t82\t39\tgiken-cloud-drive-management"
+            "\tprojects/giken-cloud-drive-management\tクラウドドライブ管理\n"
         )
         with patch.object(
             commands, "run_tmux",
             return_value=argparse.Namespace(returncode=0, stdout=out, stderr=""),
         ):
             cols = commands._read_cockpit_columns("mozyo-cockpit")
-        self.assertEqual(3, len(cols))
+        self.assertEqual(4, len(cols))
         self.assertEqual(
             {
                 "pane_id": "%1", "workspace_id": "wsA", "role": "codex",
                 "lane_id": "wkt-1", "pane_left": 41, "pane_width": 39,
+                "project_scope": "", "project_path": "", "project_label": "",
             },
             cols[0],
         )
-        # Legacy 3-field pane -> lane_id "" and geometry defaults to 0.
+        # Legacy 3-field pane -> lane_id "" + geometry 0 + empty project triple.
         self.assertEqual("", cols[2]["lane_id"])
         self.assertEqual(0, cols[2]["pane_left"])
         self.assertEqual(0, cols[2]["pane_width"])
+        self.assertEqual("", cols[2]["project_scope"])
+        self.assertEqual("", cols[2]["project_path"])
+        self.assertEqual("", cols[2]["project_label"])
+        # Project-scoped gateway pane -> the #12658 project triple parses.
+        self.assertEqual("giken-cloud-drive-management", cols[3]["project_scope"])
+        self.assertEqual(
+            "projects/giken-cloud-drive-management", cols[3]["project_path"]
+        )
+        self.assertEqual("クラウドドライブ管理", cols[3]["project_label"])
 
     def test_missing_session_returns_none(self) -> None:
         from mozyo_bridge.application import commands

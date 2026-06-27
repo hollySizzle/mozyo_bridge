@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6857
+    lines: 6879
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -132,6 +132,14 @@ allowlist:
       resolution, composer-residue classification, delivery-id) lives in the new
       `f_130_handoff_routing/domain/q_enter.py` and the handler in
       `f_130_handoff_routing/application/cli_handoff_q_enter.py`, not here.
+      Raised 6857 -> 6879 for the #12739 cockpit project-scope coexistence fix:
+      `_read_cockpit_columns` now reads the #12658 `@mozyo_project_scope` /
+      `_path` / `_label` pane triple, `cmd_cockpit`'s duplicate/focus `same`
+      lookup adds the normalized `project_scope` to the unit key (so a
+      department-root pane and a project-gateway pane sharing the same Git root +
+      lane coexist instead of collapsing into a focus), and the `cockpit --json`
+      payload projects `project_scope`. Pure read-model + matching-key change; no
+      new domain module.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

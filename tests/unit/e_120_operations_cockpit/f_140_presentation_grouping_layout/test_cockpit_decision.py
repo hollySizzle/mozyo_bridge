@@ -35,7 +35,8 @@ class CockpitDecisionTest(unittest.TestCase):
 
     @contextlib.contextmanager
     def _patched(
-        self, *, columns, ws_id="wsX", session_present=False, lane=None, advisory=None
+        self, *, columns, ws_id="wsX", session_present=False, lane=None, advisory=None,
+        project_scope="", project_path="", project_label="",
     ):
         from mozyo_bridge.application import commands
         from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
@@ -52,11 +53,25 @@ class CockpitDecisionTest(unittest.TestCase):
         advisory = advisory if advisory is not None else AdoptAdvisory(
             ws_id, DEFAULT_LANE, ADOPT_STATUS_NONE, (), None
         )
+
+        # Stub project-scope resolution (Redmine #12658 / #12739) so the
+        # decision tests control the launching workspace's project scope without
+        # reading the filesystem. Default empty scope == a department-root /
+        # single-repo launch (the pre-#12658 behavior), so existing tests are
+        # unchanged; a non-empty scope models a project-gateway launch.
+        def _scope_fields(_cwd, root):
+            return (
+                root,
+                (project_scope or None, project_path or None, project_label or None),
+                None,
+            )
+
         with patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_agent_launch_command", side_effect=lambda r, s, c, **_: f"{r}-cmd"), \
             patch.object(commands, "require_tmux"), \
             patch.object(commands, "_read_cockpit_columns", return_value=columns), \
             patch.object(commands, "_resolve_workspace_lane", return_value=lane), \
+            patch.object(commands, "_resolve_project_scope_fields", side_effect=_scope_fields), \
             patch.object(commands, "_cockpit_adopt_advisory", return_value=advisory), \
             patch.object(commands, "session_exists", return_value=session_present), \
             patch.object(commands, "run_tmux") as run_tmux, \
@@ -64,7 +79,8 @@ class CockpitDecisionTest(unittest.TestCase):
             yield run_tmux, execvp
 
     def _run(
-        self, args, columns, ws_id="wsX", session_present=False, lane=None, advisory=None
+        self, args, columns, ws_id="wsX", session_present=False, lane=None, advisory=None,
+        project_scope="", project_path="", project_label="",
     ):
         from mozyo_bridge.application.commands import cmd_cockpit
 
@@ -74,6 +90,9 @@ class CockpitDecisionTest(unittest.TestCase):
             session_present=session_present,
             lane=lane,
             advisory=advisory,
+            project_scope=project_scope,
+            project_path=project_path,
+            project_label=project_label,
         ) as (run_tmux, execvp):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 try:
@@ -398,6 +417,71 @@ class CockpitDecisionTest(unittest.TestCase):
         self.assertEqual("focus", payload["action"])
         self.assertEqual("lane-abc", payload["lane_id"])
         self.assertEqual("feature/x", payload["lane_label"])
+
+    # --- Project-scope-aware Unit coexistence (Redmine #12739). ---
+    # A department-root pane (empty project_scope) and a project-scoped gateway
+    # pane sharing the same Git root + lane are distinct Units that coexist,
+    # instead of the second launch collapsing into a focus of the first. Same
+    # workspace + lane + scope still focuses (no duplicate-launch regression).
+    def test_root_first_then_project_launch_appends_distinct_unit(self) -> None:
+        # Root pane exists (empty project_scope); launching the project gateway
+        # from the project workdir (scope=cloud-drive) must append a new Unit,
+        # not focus the root column.
+        cols = [
+            {"pane_id": "%100", "workspace_id": "wsX", "role": "codex",
+             "lane_id": "default", "project_scope": ""}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX",
+            project_scope="giken-cloud-drive-management",
+        )
+        self.assertIn("action=append", out)
+        self.assertIn("tmux split-window -h -f -l 50% -t %100", out)
+
+    def test_project_first_then_root_launch_appends_distinct_unit(self) -> None:
+        # Project gateway pane exists (scope=cloud-drive); launching from the
+        # GK3500 root (empty scope) must append a new root Unit, not focus the
+        # project column.
+        cols = [
+            {"pane_id": "%102", "workspace_id": "wsX", "role": "codex",
+             "lane_id": "default", "project_scope": "giken-cloud-drive-management"}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX", project_scope="",
+        )
+        self.assertIn("action=append", out)
+        self.assertIn("tmux split-window -h -f -l 50% -t %102", out)
+
+    def test_same_workspace_lane_and_project_scope_focuses(self) -> None:
+        # No regression: a truly duplicate project-gateway launch (same
+        # workspace + lane + project_scope) still focuses its existing column.
+        cols = [
+            {"pane_id": "%102", "workspace_id": "wsX", "role": "codex",
+             "lane_id": "default", "project_scope": "giken-cloud-drive-management"}
+        ]
+        out, _r, _e = self._run(
+            self._args(), columns=cols, ws_id="wsX",
+            project_scope="giken-cloud-drive-management",
+        )
+        self.assertIn("action=focus", out)
+        self.assertIn("tmux select-pane -t %102", out)
+
+    def test_json_exposes_project_scope_and_appends_for_distinct_scope(self) -> None:
+        # `cockpit --json` from the project workdir while the root exists reports
+        # an append action and the launching project_scope (acceptance: it no
+        # longer returns a focus on the root pane).
+        cols = [
+            {"pane_id": "%100", "workspace_id": "wsX", "role": "codex",
+             "lane_id": "default", "project_scope": ""}
+        ]
+        out, _r, _e = self._run(
+            self._args(dry_run=False, json_output=True),
+            columns=cols, ws_id="wsX",
+            project_scope="giken-cloud-drive-management",
+        )
+        payload = json.loads(out)
+        self.assertEqual("append", payload["action"])
+        self.assertEqual("giken-cloud-drive-management", payload["project_scope"])
 
 
 if __name__ == "__main__":
