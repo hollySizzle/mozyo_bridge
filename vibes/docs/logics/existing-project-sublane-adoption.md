@@ -47,7 +47,7 @@ Redmine #12423。既存プロジェクトへ mozyo-bridge の governed scaffold 
 
 ## 実行フロー
 
-Sequence diagram は lane crossing の向きと command family を固定する。flag の完全な引数列は CLI parser / help / validation error を正本とし、この runbook には複製しない。
+Sequence diagram は lane crossing の向きと責務境界を固定する。flag の完全な引数列は CLI parser / help / validation error を正本とし、この図には複製しない。
 
 ```plantuml
 @startuml existing_project_sublane_adoption_sequence
@@ -64,7 +64,7 @@ database "origin / CI" as Origin
 Owner -> Coordinator: adoption request / Redmine issue id
 activate Coordinator
 Coordinator -> Redmine: read parent / child issues and journals
-Coordinator -> Docs: mozyo-bridge docs resolve
+Coordinator -> Docs: resolve required docs
 Coordinator -> Redmine: record read-only preflight journal
 
 alt governed preset not justified
@@ -72,42 +72,42 @@ alt governed preset not justified
 else adoption child issue ready
   Coordinator -> Redmine: create or identify implementation child issue
   Coordinator -> Redmine: record dispatch decision and target lane identity
-  Coordinator -> Gateway: mozyo-bridge handoff send
+  Coordinator -> Gateway: dispatch adoption request
   note right
-    semantic contract: source=redmine, kind=implementation_request,
-    target_role=implementation_gateway, adoption dispatch anchor required
+    contract: adoption dispatch anchor required,
+    target is implementation_gateway
   end note
   activate Gateway
   Gateway -> Redmine: read durable anchor
   Gateway -> Gateway: confirm adoption target identity and same-lane Claude route
-  Gateway -> Worker: mozyo-bridge handoff send
+  Gateway -> Worker: forward bounded adoption work
   note right
-    semantic contract: source=redmine, kind=implementation_request,
-    target_role=implementation_worker, same-lane worker only
+    contract: same-lane worker only,
+    implementation scope stays bounded
   end note
   activate Worker
-  Worker -> Docs: mozyo-bridge docs resolve
-  Worker -> Worker: mozyo-bridge scaffold status
+  Worker -> Docs: resolve required docs
+  Worker -> Worker: check scaffold state
   Worker -> Worker: run scaffold / rules / catalog adoption steps
   Worker -> Worker: run verification and git diff --check
   Worker -> Worker: git commit
-  note right: semantic contract: Redmine reference trailer and issue token required
+  note right: contract: Redmine reference trailer and issue token required
   Worker -> Redmine: record implementation_done / review_request
   alt implementation_done callback
-    Worker -> Gateway: mozyo-bridge handoff reply
-    note right: semantic contract: kind=implementation_done, state pointer required
+    Worker -> Gateway: callback with implementation_done state
+    note right: contract: state pointer required
   else review_request callback
-    Worker -> Gateway: mozyo-bridge handoff reply
-    note right: semantic contract: kind=review_request, state pointer required
+    Worker -> Gateway: callback with review_request state
+    note right: contract: state pointer required
   end
   deactivate Worker
 
   alt implementation_done callback
-    Gateway -> Coordinator: mozyo-bridge handoff send
-    note right: semantic contract: target=coordinator, kind=implementation_done
+    Gateway -> Coordinator: callback with implementation_done state
+    note right: contract: coordinator receives state pointer
   else review_request callback
-    Gateway -> Coordinator: mozyo-bridge handoff send
-    note right: semantic contract: target=coordinator, kind=review_request
+    Gateway -> Coordinator: callback with review_request state
+    note right: contract: coordinator receives state pointer
   end
   Gateway -> Redmine: record callback outcome
   deactivate Gateway

@@ -130,13 +130,13 @@ guardrail は書けばよいものではない。agent が迷った事実を dur
 
 新しい超大 rule を作る前に、管制塔は `$placement_decision()` の配置順を確認する。
 
-新規 rule / logic を増やす trigger は、actor / 責務 / 停止条件 / 検証責務が混ざる、同じ判断を複数文書へ重複しそうになる、sequence なしでは lane crossing command が誤読される、表記ゆれで routing が壊れる場合に限る。「念のため」だけ、既存 spine へ短く足せるもの、入口文書 / router / skill reference への詳細複製、central 配布面を repo-local で恒久正本化することは hard stop とする。
+新規 rule / logic を増やす trigger は、actor / 責務 / 停止条件 / 検証責務が混ざる、同じ判断を複数文書へ重複しそうになる、sequence なしでは lane boundary が誤読される、表記ゆれで routing が壊れる場合に限る。「念のため」だけ、既存 spine へ短く足せるもの、入口文書 / router / skill reference への詳細複製、central 配布面を repo-local で恒久正本化することは hard stop とする。
 
-flow 型 guardrail の一般 authoring rule、Markdown 補足境界、`$validate` / `$forbid` / `$record` primitive は `.mozyo-bridge/rules/llm_rule_authoring.md` を正本とする。ただし本 spine では lane crossing command の解釈幅を減らすため、標準フローの正本図は sequence diagram とし、activity + swimlane 図は併置しない。この文書にはサブレーン開発フロー固有の判断だけを残す。
+flow 型 guardrail の一般 authoring rule、Markdown 補足境界、`$validate` / `$forbid` / `$record` primitive は `.mozyo-bridge/rules/llm_rule_authoring.md` を正本とする。ただし本 spine では lane boundary の解釈幅を減らすため、標準フローの正本図は sequence diagram とし、activity + swimlane 図は併置しない。この文書にはサブレーン開発フロー固有の判断だけを残す。
 
 ## 役割
 
-詳細な実行責務と lane crossing command は `標準フロー` の sequence を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、管制塔 Codex = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、main lane Claude = read-only 調査 / 要約 / draft / design consultation 補助、target-lane Codex = cross-lane gateway / same-lane Claude handoff / callback、sublane Claude = bounded implementation / implementation_done / review_request である。
+詳細な実行責務と lane boundary は `標準フロー` の sequence を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、管制塔 Codex = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、main lane Claude = read-only 調査 / 要約 / draft / design consultation 補助、target-lane Codex = cross-lane gateway / same-lane Claude handoff / callback、sublane Claude = bounded implementation / implementation_done / review_request である。
 
 ## 運用モデル
 
@@ -237,7 +237,7 @@ implementation-shaped work では sublane dispatch が default である。Main-
 
 ### Implementation Request Preflight
 
-`mozyo-bridge handoff send` による `implementation_request` を実行する直前に、管制塔は次の
+implementation_request delivery を実行する直前に、管制塔は次の
 preflight を同一 issue の durable record へ照合する。これは上記 `### Admission Rule`
 の実行時 checklist であり、別の正本を増やすものではない。
 
@@ -458,9 +458,9 @@ journal を source of truth とした callback sweep / recovery で行う。
 
 ## 標準フロー
 
-PlantUML sequence diagram で、lane crossing command と callback command を arrow label として固定する。管制塔と sublane の境界を読むための正本図なので、activity swimlane を併置しない。図が複数あると、差分が意図か drift かを LLM が判断する余地が増える。
+PlantUML sequence diagram で、lane boundary と callback boundary を固定する。管制塔と sublane の境界を読むための正本図なので、activity swimlane を併置しない。図が複数あると、差分が意図か drift かを LLM が判断する余地が増える。
 
-既存 CLI が確定している transition は command family を arrow label に書く。flag の完全な引数列は CLI parser / help / validation error を正本とし、この図には複製しない。未確定 command surface はこの標準フローでは正本化せず、該当 issue / design doc の `missing` として扱う。
+この図は CLI catalog ではない。transition の実コマンド名、flag、必須 option、error wording は CLI parser / help / validation error を正本とし、この図には複製しない。
 
 ```plantuml
 @startuml coordinator_sublane_standard_sequence
@@ -477,7 +477,7 @@ database "origin / CI" as Origin
 Owner -> Coordinator: prompt / marker / ticket id
 activate Coordinator
 Coordinator -> Redmine: read issue, journals, Version, parent / child state
-Coordinator -> Docs: mozyo-bridge docs resolve
+Coordinator -> Docs: resolve required docs
 Coordinator -> Redmine: record dispatch decision / stop reason
 
 alt coordinator_owned_or_audit_only
@@ -488,37 +488,37 @@ else implementation_shaped_dispatch
     forbid: coordinator creates normal implementation diff
     forbid: main lane Claude receives implementation_request
   end note
-  Coordinator -> Gateway: mozyo-bridge handoff send
+  Coordinator -> Gateway: dispatch implementation request
   note right
-    semantic contract: source=redmine, kind=implementation_request,
-    target_role=implementation_gateway, summary points to durable anchor
+    contract: durable anchor required,
+    target is implementation_gateway
   end note
   activate Gateway
   Gateway -> Redmine: read durable anchor
-  Gateway -> Worker: mozyo-bridge handoff send
+  Gateway -> Worker: forward bounded implementation work
   note right
-    semantic contract: source=redmine, kind=implementation_request,
-    target_role=implementation_worker, same-lane worker only
+    contract: same-lane worker only,
+    implementation scope stays bounded
   end note
   activate Worker
   Worker -> Redmine: read issue / journal
-  Worker -> Docs: mozyo-bridge docs resolve
+  Worker -> Docs: resolve required docs
   Worker -> Worker: implement bounded diff and run verification
   Worker -> Redmine: record implementation_done / review_request
   alt implementation_done callback
-    Worker -> Gateway: mozyo-bridge handoff reply
-    note right: semantic contract: kind=implementation_done, state pointer required
+    Worker -> Gateway: callback with implementation_done state
+    note right: contract: state pointer required
   else review_request callback
-    Worker -> Gateway: mozyo-bridge handoff reply
-    note right: semantic contract: kind=review_request, state pointer required
+    Worker -> Gateway: callback with review_request state
+    note right: contract: state pointer required
   end
   deactivate Worker
   alt implementation_done callback
-    Gateway -> Coordinator: mozyo-bridge handoff send
-    note right: semantic contract: target=coordinator, kind=implementation_done
+    Gateway -> Coordinator: callback with implementation_done state
+    note right: contract: coordinator receives state pointer
   else review_request callback
-    Gateway -> Coordinator: mozyo-bridge handoff send
-    note right: semantic contract: target=coordinator, kind=review_request
+    Gateway -> Coordinator: callback with review_request state
+    note right: contract: coordinator receives state pointer
   end
   deactivate Gateway
 end
@@ -527,8 +527,8 @@ Coordinator -> Redmine: callback sweep / review target journals
 Coordinator -> Origin: origin reachability check
 alt review_findings
   Coordinator -> Redmine: record Review Gate findings
-  Coordinator -> Gateway: mozyo-bridge handoff send
-  note right: semantic contract: kind=review_result, target_role=implementation_gateway
+  Coordinator -> Gateway: callback with review findings
+  note right: contract: findings point to durable record
 else review_approved
   Coordinator -> Redmine: record Review Gate
   Coordinator -> Redmine: record owner_close_approval when allowed / owner decision when required
