@@ -17,7 +17,7 @@ Some organizations operate at three visible levels:
 - implementation lane
 
 For a monorepo such as `gk-3500-it-operations`, the Git repository root is the
-department workspace, while `projects/giken-cloud-drive-management/` is a
+department workspace, while `projects/cloud-drive-management/` is a
 business project. If cockpit identity only follows the Git root, the project
 level disappears from the operator experience. That is not just cosmetic: it
 blurs who routed the consultation, which project gateway accepted it, and which
@@ -43,8 +43,8 @@ For a monorepo project, the target model should carry both identities:
 ```text
 repo_root        = /path/to/gk-3500-it-operations
 workspace_id     = stable identity for gk-3500-it-operations
-project_scope    = giken-cloud-drive-management
-project_path     = projects/giken-cloud-drive-management
+project_scope    = cloud-drive-management
+project_path     = projects/cloud-drive-management
 project_label    = クラウドドライブ管理
 lane_id          = default or issue lane
 role             = codex / claude
@@ -95,10 +95,10 @@ discovery_cache:
   generated_by: mozyo-bridge project discovery
   generated_at: "<timestamp>"
   entries:
-    - cache_key: "project:giken-cloud-drive-management@projects/giken-cloud-drive-management"
-      source: "projects/giken-cloud-drive-management/project.yaml"
-      path: "projects/giken-cloud-drive-management"
-      redmine_project: "giken-cloud-drive-management"
+    - cache_key: "project:cloud-drive-management@projects/cloud-drive-management"
+      source: "projects/cloud-drive-management/project.yaml"
+      path: "projects/cloud-drive-management"
+      redmine_project: "cloud-drive-management"
       display_label: "クラウドドライブ管理"
       runtime_identity_enabled: true
       fingerprint: "sha256:<project-yaml-fingerprint>"
@@ -157,7 +157,7 @@ Conceptual pane metadata:
 ```
 
 The project fields are not a substitute for repo preflight. A handoff target
-that claims `project_scope=giken-cloud-drive-management` but is not inside the
+that claims `project_scope=cloud-drive-management` but is not inside the
 expected Git repository must fail closed. A target inside the correct Git
 repository but outside the expected project path must also fail closed when a
 project scope gate is requested.
