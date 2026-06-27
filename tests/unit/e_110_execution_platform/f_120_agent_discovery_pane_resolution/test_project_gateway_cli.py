@@ -84,6 +84,16 @@ class ResolveCliTest(unittest.TestCase):
         self.assertIn("status: gateway_missing", text)
         self.assertIn("start_project_gateway", text)
         self.assertIn("mozyo-bridge cockpit", text)
+        # Start action is cwd-authority; must not misdirect via --repo (j#66626 b1).
+        self.assertNotIn("cockpit --repo", text)
+
+    def test_claude_worker_is_not_resolved_as_gateway(self):
+        # Only a Claude worker is up; the gateway role is fixed to codex, so this
+        # is gateway_missing, never a resolved Claude target (j#66626 blocker 2).
+        rc, text = self._run(_resolve_args(), [_candidate("%w", role="claude")])
+        self.assertEqual(rc, 1)
+        self.assertIn("role=codex", text)
+        self.assertNotIn("status: found", text)
 
     def test_ambiguous_lists_candidates(self):
         rc, text = self._run(
@@ -141,6 +151,17 @@ class HandoffCliTest(unittest.TestCase):
         with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
             with self.assertRaises(SystemExit):
                 cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args(target_repo="auto"))
+
+    def test_rejects_direct_claude_send(self):
+        # The gateway is a Codex unit; --to claude must fail closed before any
+        # resolution/delivery so the project Claude worker is never direct-sent
+        # (review j#66626 blocker 2).
+        with patch.object(cli_project_gateway, "_discover_candidates") as disc:
+            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+                with self.assertRaises(SystemExit):
+                    cli_project_gateway.cmd_project_gateway_handoff(self._handoff_args(to="claude"))
+        disc.assert_not_called()
+        orch.assert_not_called()
 
 
 if __name__ == "__main__":  # pragma: no cover

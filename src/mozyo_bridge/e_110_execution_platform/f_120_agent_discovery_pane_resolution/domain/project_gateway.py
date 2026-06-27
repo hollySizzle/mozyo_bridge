@@ -267,17 +267,28 @@ def resolve_project_gateway(
 def start_project_gateway_command(route: ProjectGatewayRoute, *, project_path: str | None = None) -> str:
     """Concrete ``start_project_gateway`` action for a ``gateway_missing`` outcome.
 
-    Names the standard startup command (Redmine #11803 cockpit launch) run from
-    the project workdir, which launches the project-scoped Codex/Claude panes and
-    stamps the #12658 separated ``@mozyo_repo_root`` + ``@mozyo_project_scope`` /
-    ``_path`` / ``_label`` identity. ``project_path`` is the repo-relative project
-    directory when known; otherwise the operator substitutes the workdir for the
-    adopted ``project_scope``. Separate window/session projection is expected and
-    is not a defect.
+    Names the standard startup command (Redmine #11803 cockpit launch) run **from
+    the project workdir**, which launches the project-scoped gateway panes and
+    stamps the #12658 separated ``@mozyo_repo_root`` (Git authority) +
+    ``@mozyo_project_scope`` / ``_path`` / ``_label`` identity.
+
+    The project workdir ``cwd`` is the authority: ``mozyo cockpit`` resolves the
+    project scope from its cwd and re-roots workspace identity to the Git root via
+    ``resolve_workspace_root`` (#12658). It must therefore be invoked with the cwd
+    set to the project workdir and **without** ``--repo <git-root>`` — passing the
+    Git root as ``--repo`` makes cockpit resolve the scope against the Git root
+    (where no project lives) and launch a plain root workspace column instead of a
+    project gateway (Redmine #12668 review j#66626 blocker 1).
+
+    ``project_path`` is the repo-relative project directory when known; otherwise
+    the operator substitutes the workdir for the adopted ``project_scope``.
+    Separate window/session projection is expected and is not a defect.
     """
     workdir = project_path or f"<workdir of project {route.project_scope}>"
     return (
-        f"cd {route.repo_root}/{workdir} && mozyo-bridge cockpit --repo {route.repo_root}  "
+        f"cd {route.repo_root}/{workdir} && mozyo-bridge cockpit  "
         f"# start_project_gateway(project_scope={route.project_scope}, "
-        "projection=separate_window_or_session)"
+        "projection=separate_window_or_session); cwd is the project-scope "
+        "authority — do NOT add --repo <git-root> (it launches a root column, "
+        "not a project gateway)"
     )

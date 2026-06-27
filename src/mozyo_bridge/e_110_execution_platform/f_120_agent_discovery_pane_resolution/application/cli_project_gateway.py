@@ -74,12 +74,19 @@ def _route_from_args(
 
 
 def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
-    """Resolve (read-only) the project gateway target by semantic identity."""
+    """Resolve (read-only) the project gateway target by semantic identity.
+
+    The project gateway role is fixed to ``codex`` (the design doc's
+    ``role="codex"`` route): a project gateway is a Codex coordinator unit, and
+    the implementation worker (Claude) is reached only after the gateway decides
+    implementation is needed. So this command never resolves a Claude target
+    (Redmine #12668 review j#66626 blocker 2).
+    """
     require_tmux()
     route = _route_from_args(
         repo_root=args.repo,
         project_scope=args.project,
-        role=args.role,
+        role=AGENT_KIND_CODEX,
         session=getattr(args, "session", None),
     )
     resolution = resolve_project_gateway(_discover_candidates(), route)
@@ -148,6 +155,21 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     the pane before delivery.
     """
     require_tmux()
+
+    # The project gateway role is codex (design doc `role="codex"` route). This
+    # command must NOT direct-send to the project Claude worker: the root ->
+    # project gateway -> implementation worker boundary requires the gateway
+    # (Codex) to decide implementation need and create the Redmine anchor first.
+    # Reject `--to claude` so the Redmine-anchor boundary cannot be bypassed
+    # (Redmine #12668 review j#66626 blocker 2).
+    if args.to != AGENT_KIND_CODEX:
+        die(
+            "`project-gateway handoff` delivers to the project gateway, which is a "
+            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
+            "worker (Claude) is reached only after the gateway creates a Redmine "
+            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
+            "the ticketless project gateway contract."
+        )
 
     if not args.target_repo or args.target_repo == "auto":
         die(
@@ -228,12 +250,8 @@ def register(sub) -> None:
         required=True,
         help="Adopted project scope id (redmine_project) to resolve the gateway for.",
     )
-    resolve.add_argument(
-        "--role",
-        default=AGENT_KIND_CODEX,
-        choices=["codex", "claude"],
-        help="Project gateway role (default codex).",
-    )
+    # No --role: the project gateway role is fixed to codex (design doc route).
+    # Resolving a Claude target is off-contract and removed (review j#66626).
     resolve.add_argument(
         "--session",
         default=None,
@@ -255,8 +273,10 @@ def register(sub) -> None:
         help=(
             "Resolve the project gateway by semantic identity (no %%pane copy) and "
             "deliver a ticketless consultation through the gated handoff "
-            "orchestrator. Requires --target-repo + --target-project; the role is "
-            "--to. Fails closed (no delivery) on missing / ambiguous resolution."
+            "orchestrator. Requires --target-repo + --target-project and --to codex "
+            "(the gateway is a Codex unit; --to claude is rejected so the project "
+            "Claude worker is never direct-sent). Fails closed (no delivery) on "
+            "missing / ambiguous resolution."
         ),
     )
     # Reuse the full handoff argument set; the route's repo/project/role come from

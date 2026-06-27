@@ -134,6 +134,14 @@ class ResolveProjectGatewayScenarios(unittest.TestCase):
         self.assertIn("mozyo-bridge cockpit", cmd)
         self.assertIn(PROJECT_PATH, cmd)
         self.assertIn(REPO, cmd)
+        # The cwd (project workdir) is the scope authority; passing --repo
+        # <git-root> would launch a root column, not a project gateway
+        # (review j#66626 blocker 1), so the cockpit invocation must NOT carry
+        # --repo (the runnable command, before any explanatory `#` comment).
+        runnable = cmd.split("#", 1)[0]
+        self.assertNotIn("--repo", runnable)
+        self.assertIn(f"cd {REPO}/{PROJECT_PATH}", runnable)
+        self.assertIn("mozyo-bridge cockpit", runnable)
 
     def test_missing_when_no_panes_at_all(self):
         res = resolve_project_gateway([], _route())
