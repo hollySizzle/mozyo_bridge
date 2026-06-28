@@ -43,11 +43,12 @@ smoke work (e.g. #12709) instead of relying on source-runtime or
 - Trigger: `workflow_run` on `Test` (`completed`, `branches: [main]`); the job
   publishes only when `workflow_run.conclusion == 'success'`.
 - Version: the job runs `scripts/compute_testpypi_dev_version.py`, which appends
-  a PEP 440 `.dev<UTC-timestamp>` segment to the committed
-  `pyproject.toml` version (e.g. `0.9.2.dev20260628090000`). The rewrite is
-  ephemeral in the CI checkout and is never committed, so repeated `main`
-  commits get unique, non-colliding TestPyPI versions while the committed
-  release version is untouched.
+  a PEP 440 `.dev<N>` segment to the committed `pyproject.toml` version. `N` is
+  a UTC timestamp concatenated with the triggering `Test` run's globally-unique
+  id (e.g. `0.9.2.dev20260628090000123456789`), so two `Test` runs completing in
+  the same second still produce distinct versions and never collide on TestPyPI.
+  The rewrite is ephemeral in the CI checkout and is never committed, so the
+  committed release version is untouched.
 - Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`,
   `id-token: write`). The automatic path stays in the same `testpypi.yml`
   workflow file as the manual dispatch so the existing TestPyPI pending
@@ -70,10 +71,16 @@ published TestPyPI dev artifact, then verify the CLI surface — not
 
 ```bash
 # Pin the EXACT version from the 'Publish to TestPyPI' run summary
-scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000
-# or, less reproducibly, the newest pre-release:
-scripts/install_testpypi_dev.sh latest
+scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000123456789
 ```
+
+Pass the exact dev version; `latest` is intentionally unsupported. The install
+uses TestPyPI as the primary index and PyPI as an extra-index for dependencies.
+pip considers the target package from both indexes, and a dev release sorts
+before the PyPI final, so an unpinned install could resolve the PyPI production
+release and taint smoke evidence. The exact dev version exists only on TestPyPI
+(PyPI never hosts dev releases), so pinning it guarantees the artifact comes
+from TestPyPI.
 
 The script installs with the pip backend (TestPyPI for `mozyo-bridge`, PyPI for
 dependencies, `--pre`, `--force`) and verifies the installed surface:

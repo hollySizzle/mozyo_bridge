@@ -45,7 +45,15 @@ jobs:
         # keeps the committed release version for exact-version validation.
         if: github.event_name == 'workflow_run'
         run: |
-          DEV_NUMBER="$(date -u +%Y%m%d%H%M%S)"
+          # Collision-proof unique dev segment: a UTC timestamp (readable,
+          # time-ordered) concatenated with the triggering `Test` run's
+          # globally-unique id. Two `Test` runs that complete in the same second
+          # still differ by run id; a re-run of the same run fires later so the
+          # timestamp differs. Both parts are all-digits, so the result is a
+          # valid PEP 440 `.devN` segment.
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          RUN_ID="${{ github.event.workflow_run.id }}"
+          DEV_NUMBER="${TS}${RUN_ID}"
           DEV_VERSION="$(python scripts/compute_testpypi_dev_version.py --dev-number "$DEV_NUMBER" --write)"
           echo "Computed dev version: $DEV_VERSION"
           {

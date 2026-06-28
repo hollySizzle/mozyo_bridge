@@ -11,21 +11,30 @@ set -eu
 # It NEVER publishes anything; it only installs locally and reads CLI help.
 #
 # Usage:
-#   scripts/install_testpypi_dev.sh <version>   # pin an exact dev version
-#   scripts/install_testpypi_dev.sh latest      # newest pre-release on TestPyPI
+#   scripts/install_testpypi_dev.sh <version>   # pin the exact dev version
 #
-# Pin the EXACT version (recommended for smoke evidence). Read the intended
-# version, and the commit SHA it maps to, from the source CI run's job summary
+# You MUST pass the exact dev version (e.g. 0.9.2.dev20260628090000123456789).
+# Read it, and the commit SHA it maps to, from the source CI run's job summary
 # in the "Publish to TestPyPI" workflow (see references/release.md).
+#
+# Why exact-only (no `latest`): this install uses TestPyPI as --index-url and
+# PyPI as --extra-index-url so dependencies still resolve from PyPI. pip
+# considers candidates for the TARGET package from BOTH indexes, and a dev
+# release (0.9.2.devN) sorts BEFORE the PyPI final (0.9.2). An unpinned install
+# could therefore resolve the PyPI production release instead of the intended
+# TestPyPI dev artifact and silently taint smoke evidence. Pinning the exact
+# dev version is safe because that version exists ONLY on TestPyPI (production
+# PyPI never hosts dev releases), so the target can only resolve from TestPyPI.
 
 usage() {
   cat <<USAGE
-Usage: $0 <version|latest>
+Usage: $0 <version>
 
-  <version>  Exact PEP 440 dev version to install, e.g. 0.9.2.dev20260628090000
-  latest     Install the newest pre-release available on TestPyPI
+  <version>  Exact PEP 440 dev version to install, e.g.
+             0.9.2.dev20260628090000123456789
 
-Recommended: pin the exact version so smoke evidence ties to one commit SHA.
+Pass the exact version from the 'Publish to TestPyPI' run summary so smoke
+evidence ties to one commit SHA. 'latest' is intentionally unsupported.
 USAGE
 }
 
@@ -49,17 +58,30 @@ if ! command -v pipx >/dev/null 2>&1; then
 fi
 
 if [ "$version" = "latest" ]; then
-  spec="mozyo-bridge"
-  echo "Installing the newest TestPyPI pre-release of mozyo-bridge (latest)."
-  echo "Note: pin an exact version for reproducible smoke evidence."
-else
-  spec="mozyo-bridge==$version"
-  echo "Installing TestPyPI dev artifact: $spec"
+  echo "error: 'latest' is not supported; pass the exact dev version." >&2
+  echo "       An unpinned install can resolve the PyPI production release" >&2
+  echo "       instead of the intended TestPyPI dev artifact." >&2
+  echo >&2
+  usage >&2
+  exit 64
 fi
 
+case "$version" in
+  *.dev*) : ;;  # looks like a dev release; proceed
+  *)
+    echo "warning: '$version' has no '.dev' segment; this runbook targets" >&2
+    echo "         TestPyPI dev artifacts. Continuing with the exact pin." >&2
+    ;;
+esac
+
+spec="mozyo-bridge==$version"
+echo "Installing TestPyPI dev artifact: $spec"
+
 # Force the pip backend so TestPyPI serves mozyo-bridge while PyPI still serves
-# its dependencies. --pre lets pip resolve dev releases. --force reinstalls /
-# updates the existing pipx app in place on the normal PATH.
+# its dependencies. The exact dev version exists ONLY on TestPyPI (PyPI never
+# hosts dev releases), so the target resolves from TestPyPI even though PyPI is
+# an extra-index for dependencies. --pre lets pip accept the pre-release;
+# --force reinstalls / updates the existing pipx app in place on the normal PATH.
 pipx install \
   --force \
   --backend pip \
