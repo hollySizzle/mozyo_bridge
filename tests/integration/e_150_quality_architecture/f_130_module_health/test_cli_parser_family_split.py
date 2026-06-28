@@ -75,6 +75,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "handoff",
     "reply",
     "project-gateway",
+    "workflow",
     "init",
     "doctor",
     "sublane",
