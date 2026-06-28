@@ -142,6 +142,36 @@ durable_anchor: <redmine_or_ticketless_pointer_or_none>
 5. anchored worker dispatch は Redmine anchor ready state に限定して委譲する。
 6. help / docs で `workflow step` を標準入口、既存 primitive を内部 / compatibility / debug として分類する。
 
+## GK3500 を `workflow step` で駆動するシーケンス
+
+通常 smoke では、各 visible lane で AI が同じ `mozyo-bridge workflow step` を叩くだけでよい。
+command family、rail、pane、role transition を AI が選ばない。各 lane の current
+identity (`@mozyo_lane_kind` stamp / project scope / provider binding) から lane role を
+解き、one-step-down transition を内部 primitive に委譲するか、fail-closed で次 owner を返す。
+
+| step | lane (current binding) | `workflow step` の解決 | `execution` / `next_owner` / 内部 primitive |
+| --- | --- | --- | --- |
+| 1 | grandparent (`department_root_coordinator`) | inventory 内の唯一の cockpit-visible project gateway を解決し、ticketless consultation を forward する。gateway 0 件 / 複数件 / detached は fail-closed。 | `ready` (consultation_ready) / `parent` / `project-gateway consult` |
+| 2 | parent (`project_gateway`) | same-lane self-fence 付きで child coordinator を解決し、ticketless work-intake を forward する。domain/design は答えない。same-lane / missing / ambiguous は fail-closed。 | `ready` (work_intake_ready) / `child` / `project-gateway child-intake` |
+| 3 | child (`delegated_coordinator`) | worker dispatch の Redmine anchor 要件を検出する。anchor 未決定なら `anchor_required` で停止 (child decision required)。 | `blocked` (anchor_required) / `child` / なし |
+| 4 | grandchild (`implementation_worker`) | anchor を読んで実装 state を進める。anchor が無ければ `worker_runs_without_anchor` で停止し、child へ blocked callback を返す。 | `no_op` (redmine_work_ready) / `grandchild` / なし |
+| callback | project_gateway / delegated_coordinator | 既に決まった consultation/work-intake 結果を caller lane へ no-anchor callback rail で返す。 | `ready` (callback_ready) / `caller` / `handoff ticketless-callback` |
+
+step 3 の anchor 決定 (Redmine issue 作成 / 選択) は `workflow step` が代行しない。child が
+anchor を決めた後、その already-determined anchor を渡す escape (`--issue` / `--journal`) で
+anchored worker dispatch が表現できるが、標準 arg-free surface では `anchor_required` に
+fail-closed する。これは `## 禁止される自動実行` の Redmine issue 作成・選択判断、および
+anchor なし worker dispatch 禁止と整合する。
+
+`--dry-run` は各 step の解決結果 (`state` / `next_action` / `execution` / `reason` /
+`next_owner` / `primitive` / `durable_anchor`) を mutate せずに返す。`--json` は同じ envelope を
+1 個の JSON object として返す。実 flag / state / reason token は CLI help / tests を正本にする。
+
+primitive (`project-gateway consult` / `child-intake` / `handoff send` /
+`ticketless-callback` / `q-enter` / `delegate-*`) は internal / compatibility / debug surface
+として残るが、通常 smoke では選ばせない。`%pane` / `q-enter` / `queue-enter` / `--mode` は
+標準 surface に出さない。
+
 ## 関連正本
 
 - `vibes/docs/logics/ticketless-project-gateway-runtime-ux.md`
