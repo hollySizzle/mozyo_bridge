@@ -9,10 +9,16 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
-from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.application.commands_common import (
+    config_path_from_args,
     repo_root_from_args,
     scaffold_target_from_args,
+)
+from mozyo_bridge.application.commands_tmux_ui import (
+    cmd_config,
+    cmd_tmux_ui_install,
+    cmd_tmux_ui_status,
+    cmd_tmux_ui_uninstall,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KINDS,
@@ -142,12 +148,7 @@ from mozyo_bridge.shared.paths import (
     default_tmux_conf,
     find_repo_root,
     normalize_path_unicode,
-    resolve_repo_root,
 )
-
-
-def config_path_from_args(args: argparse.Namespace) -> str:
-    return str(Path(getattr(args, "config_path", None) or default_tmux_conf(repo_root_from_args(args))).expanduser())
 
 
 def queue_path_from_args(args: argparse.Namespace) -> Path:
@@ -664,97 +665,15 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config(args: argparse.Namespace) -> int:
-    require_tmux()
-    path = args.path or config_path_from_args(args)
-    source_tmux_conf(path)
-    print(f"loaded tmux config: {Path(path).expanduser()}")
-    return 0
-
-
-def _tmux_ui_repo_root(args: argparse.Namespace) -> Path:
-    return resolve_repo_root(getattr(args, "repo", None))
-
-
-def _tmux_ui_host_conf(args: argparse.Namespace) -> Path:
-    return tmux_ui_module.resolve_host_tmux_conf(getattr(args, "tmux_conf", None))
-
-
-def cmd_tmux_ui_install(args: argparse.Namespace) -> int:
-    repo_root = _tmux_ui_repo_root(args)
-    tmux_conf = _tmux_ui_host_conf(args)
-    try:
-        result = tmux_ui_module.apply_install(
-            repo_root=repo_root,
-            tmux_conf=tmux_conf,
-            force=bool(getattr(args, "force", False)),
-            dry_run=bool(getattr(args, "dry_run", False)),
-            backup=bool(getattr(args, "backup", False)),
-        )
-    except tmux_ui_module.TmuxUiError as exc:
-        die(str(exc))
-        return 2  # unreachable; die() raises SystemExit
-    suffix = " (dry-run)" if result.dry_run else ""
-    if result.action == "noop":
-        print(
-            f"tmux-ui install: already wired to {result.expected_snippet} "
-            f"in {result.tmux_conf}; no change"
-        )
-    else:
-        print(
-            f"tmux-ui install: {result.action} managed block in "
-            f"{result.tmux_conf} → {result.expected_snippet}{suffix}"
-        )
-        if result.previous_source_path and result.action == "replaced":
-            print(f"  previous source path: {result.previous_source_path}")
-        if result.backup_path:
-            print(f"  backup written: {result.backup_path}")
-    return 0
-
-
-def cmd_tmux_ui_uninstall(args: argparse.Namespace) -> int:
-    tmux_conf = _tmux_ui_host_conf(args)
-    try:
-        result = tmux_ui_module.apply_uninstall(
-            tmux_conf=tmux_conf,
-            dry_run=bool(getattr(args, "dry_run", False)),
-            backup=bool(getattr(args, "backup", False)),
-        )
-    except tmux_ui_module.TmuxUiError as exc:
-        die(str(exc))
-        return 2  # unreachable
-    suffix = " (dry-run)" if result.dry_run else ""
-    if result.action == "noop":
-        print(
-            f"tmux-ui uninstall: no managed block found in {result.tmux_conf}; "
-            "nothing to do"
-        )
-    else:
-        print(f"tmux-ui uninstall: removed managed block from {result.tmux_conf}{suffix}")
-        if result.backup_path:
-            print(f"  backup written: {result.backup_path}")
-    return 0
-
-
-def cmd_tmux_ui_status(args: argparse.Namespace) -> int:
-    repo_root = _tmux_ui_repo_root(args)
-    tmux_conf = _tmux_ui_host_conf(args)
-    info = tmux_ui_module.compute_status(repo_root, tmux_conf)
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(_json.dumps(info, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if info["state"] != tmux_ui_module.STATE_DRIFT else 1
-    print(f"tmux-ui status: {info['state']}")
-    print(f"  tmux_conf: {info['tmux_conf']} (exists={info['tmux_conf_exists']})")
-    print(
-        f"  expected_snippet: {info['expected_snippet']} (exists={info['snippet_exists']})"
-    )
-    if info.get("current_source_path"):
-        print(f"  current_source_path: {info['current_source_path']}")
-    if info.get("drift_reason"):
-        print(f"  drift_reason: {info['drift_reason']}")
-    return 0 if info["state"] != tmux_ui_module.STATE_DRIFT else 1
+# The ``tmux-ui-config`` and ``tmux-ui install/uninstall/status`` command
+# handlers were relocated to :mod:`mozyo_bridge.application.commands_tmux_ui`
+# as the OOP-first first-conversion tranche (Redmine #12749 / #12638 / #12785):
+# a ``TmuxControlPort`` (port-adapter), an ``ApplyTmuxConfigUseCase`` (use case
+# with port injection + fake-port test), and typed request/result value objects
+# replace the old naked ``require_tmux`` / ``source_tmux_conf`` procedural
+# handlers. They are re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_config`` / ``cmd_tmux_ui_*`` and the
+# cli_cockpit parser registrar keep their identity and ``func.__name__``.
 
 
 def cmd_id(_: argparse.Namespace) -> int:

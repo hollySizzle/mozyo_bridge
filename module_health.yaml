@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6983
+    lines: 6902
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -162,6 +162,16 @@ allowlist:
       resolver in `f_120_.../domain/child_intake_route.py`, and the
       `project-gateway child-intake` handler in
       `f_120_.../application/cli_project_gateway_child_intake.py`, not here.
+      Lowered 6983 -> 6902 for the #12749 OOP-first first-conversion tranche: the
+      `tmux-ui-config` / `tmux-ui install|uninstall|status` command family moved
+      to the new `application/commands_tmux_ui.py` (typed request/result value
+      objects + an `ApplyTmuxConfigUseCase` taking the new
+      `application/tmux_control_port.py` `TmuxControlPort` by injection, with a
+      fake-port test) and `config_path_from_args` moved to `commands_common.py`.
+      `commands.py` re-exports the `cmd_*` entry points so the public import /
+      monkeypatch / parser-binding surface is unchanged. Baseline ratcheted to the
+      post-extraction size; residual procedural orchestration (cockpit / handoff /
+      agents / status / notify / init) is carried to #12638 / #12785.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
