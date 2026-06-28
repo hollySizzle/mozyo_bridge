@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
     cli_project_gateway,
+    cli_project_gateway_child_intake,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     CONFIDENCE_STRONG,
@@ -326,6 +327,145 @@ class ConsultCliTest(unittest.TestCase):
                     cli_project_gateway.cmd_project_gateway_consult(self._consult_args(to="claude"))
         disc.assert_not_called()
         orch.assert_not_called()
+
+
+@patch.object(cli_project_gateway_child_intake, "require_tmux", lambda: None)
+class ChildIntakeCliTest(unittest.TestCase):
+    """`project-gateway child-intake` — the forward no-anchor work-intake (#12748)."""
+
+    def _intake_args(self, **overrides):
+        base = dict(
+            to="codex", target_repo=REPO, target_project=PROJECT, target=None,
+            from_pane="%parent", work_shape=None, gateway_session=None, as_json=False,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_resolved_delivers_no_anchor_work_intake(self):
+        captured = {}
+
+        def fake_orch(args, **kwargs):
+            captured["target"] = args.target
+            captured["ticketless"] = kwargs.get("ticketless")
+            captured["ticketless_work_intake"] = kwargs.get("ticketless_work_intake")
+            captured["default_kind"] = kwargs.get("default_kind")
+            captured["work_shape"] = getattr(args, "work_shape", None)
+            captured["callback_to_role"] = getattr(args, "callback_to_role", None)
+            captured["callback_methods"] = getattr(args, "callback_methods", None)
+            captured["read_contract"] = getattr(args, "read_contract", None)
+            # This leg injects NO transition_role / workflow_contract boundary.
+            captured["transition_role"] = getattr(args, "transition_role", None)
+            captured["workflow_contract"] = getattr(args, "workflow_contract", None)
+            # The forward rail must never fabricate a Redmine anchor.
+            captured["source"] = getattr(args, "source", None)
+            captured["issue"] = getattr(args, "issue", None)
+            captured["journal"] = getattr(args, "journal", None)
+            return 0
+
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates",
+                          return_value=[_candidate("%parent"), _candidate("%child")]):
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(self._intake_args())
+        self.assertEqual(rc, 0)
+        # The resolved CHILD pane is injected, never the caller's own (%parent).
+        self.assertEqual(captured["target"], "%child")
+        self.assertTrue(captured["ticketless"])
+        self.assertTrue(captured["ticketless_work_intake"])
+        self.assertEqual(captured["default_kind"], "design_consultation")
+        self.assertEqual(captured["work_shape"], "domain_design_work_intake")
+        # The child returns to the parent gateway and acts under its own contract.
+        self.assertEqual(captured["callback_to_role"], "project_gateway")
+        self.assertEqual(captured["read_contract"], "delegated_coordinator")
+        self.assertEqual(
+            captured["callback_methods"],
+            ["ticketless_callback", "q_enter_consultation_callback"],
+        )
+        # No #12706 boundary on this leg (the envelope carries the contract).
+        self.assertIsNone(captured["transition_role"])
+        self.assertIsNone(captured["workflow_contract"])
+        # No Redmine anchor was fabricated on the forward leg.
+        self.assertIsNone(captured["source"])
+        self.assertIsNone(captured["issue"])
+        self.assertIsNone(captured["journal"])
+
+    def test_same_lane_fails_closed_no_delivery(self):
+        # The only coordinator lane is the caller itself -> same_lane; do not adopt
+        # the parent as its own child, and do not deliver.
+        out = io.StringIO()
+        args = self._intake_args()
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates",
+                          return_value=[_candidate("%parent")]):
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(args)
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIn("status: same_lane", out.getvalue())
+        # No work-intake payload was injected on the fail-closed path.
+        self.assertIsNone(getattr(args, "read_contract", None))
+
+    def test_missing_child_fails_closed(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude")]):
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(self._intake_args())
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIn("status: child_missing", out.getvalue())
+
+    def test_ambiguous_child_fails_closed(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates",
+                          return_value=[_candidate("%parent"), _candidate("%c1"), _candidate("%c2")]):
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(self._intake_args())
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIn("status: child_ambiguous", out.getvalue())
+
+    def test_requires_from_pane_self_fence(self):
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates") as disc:
+            with self.assertRaises(SystemExit):
+                cli_project_gateway_child_intake.cmd_project_gateway_child_intake(
+                    self._intake_args(from_pane=None)
+                )
+        disc.assert_not_called()
+
+    def test_rejects_explicit_target_pane_authority(self):
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates", return_value=[]):
+            with self.assertRaises(SystemExit):
+                cli_project_gateway_child_intake.cmd_project_gateway_child_intake(
+                    self._intake_args(target="%99")
+                )
+
+    def test_rejects_direct_claude_send(self):
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates") as disc:
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff") as orch:
+                with self.assertRaises(SystemExit):
+                    cli_project_gateway_child_intake.cmd_project_gateway_child_intake(
+                        self._intake_args(to="claude")
+                    )
+        disc.assert_not_called()
+        orch.assert_not_called()
+
+    def test_explicit_work_shape_is_forwarded(self):
+        captured = {}
+
+        def fake_orch(args, **kwargs):
+            captured["work_shape"] = getattr(args, "work_shape", None)
+            return 0
+
+        with patch.object(cli_project_gateway_child_intake, "_discover_candidates",
+                          return_value=[_candidate("%parent"), _candidate("%child")]):
+            with patch.object(cli_project_gateway_child_intake, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(
+                    self._intake_args(work_shape="implementation_work_intake")
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["work_shape"], "implementation_work_intake")
 
 
 if __name__ == "__main__":  # pragma: no cover
