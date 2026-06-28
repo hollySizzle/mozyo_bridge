@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     TARGET_KIND_PROJECT_GATEWAY,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
+    TARGET_KIND_WORKER,
     classify_target_kind,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
@@ -68,6 +69,15 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
+)
+
+# The pending-callback leg derives the `handoff ticketless-callback` rail's required
+# fields from the lane's already-determined classification (#12703). The mapping +
+# fail-closed error live in a sibling leaf so this module stays under the
+# module-health line cap; re-exported below so callers import them from here.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_callback import (
+    WorkflowStepError,
+    callback_rail_fields,
 )
 
 # The delegated-coordinator-tree display kinds (the `@mozyo_lane_kind` projection
@@ -126,6 +136,8 @@ REASON_CHILD_MISSING = "child_missing"
 REASON_CHILD_AMBIGUOUS = "child_ambiguous"
 REASON_SAME_LANE_CHILD_ROUTE = "same_lane_child_route"
 REASON_WORKER_DISPATCH_READY = "worker_dispatch_ready"
+REASON_WORKER_MISSING = "worker_missing"
+REASON_WORKER_AMBIGUOUS = "worker_ambiguous"
 REASON_ANCHOR_REQUIRED = "anchor_required"
 REASON_REDMINE_WORK_READY = "redmine_work_ready"
 REASON_WORKER_RUNS_WITHOUT_ANCHOR = "worker_runs_without_anchor"
@@ -240,6 +252,13 @@ class WorkflowStepOutcome:
     repo_root: str = ""
     project_scope: str = ""
     self_pane: str = ""
+    # Determined-callback execution wiring (only set on the pending-callback leg):
+    # ``callback_classification`` is the lane's determined result class, and
+    # ``callback_to_role`` is the caller lane role the callback returns to. The CLI
+    # derives the full ticketless-callback rail fields from these (see
+    # :func:`callback_rail_fields`).
+    callback_classification: str = ""
+    callback_to_role: str = ""
     detail: str = ""
 
     @property
@@ -253,16 +272,21 @@ class WorkflowStepOutcome:
 
     @property
     def executable(self) -> bool:
-        """True when a non-dry-run CLI run may dispatch the named forward primitive.
+        """True when a non-dry-run CLI run may dispatch the named primitive.
 
-        Only the no-anchor forward / callback legs are auto-executable; the
-        anchored worker dispatch, the grandchild Redmine-work no-op, and every
-        blocked outcome are not (they are the child's / worker's / owner's action).
+        Every ``ready`` leg the design lets ``workflow step`` perform is executable:
+        the no-anchor consultation / work-intake forwards, the determined ticketless
+        callback, and the anchored worker dispatch (allowed only because the route
+        reached ``ready`` — the child lane reaches it solely when an already-available
+        Redmine anchor was supplied and a unique grandchild worker resolved). The
+        grandchild Redmine-work ``no_op`` and every ``blocked`` outcome are not
+        executable (they are the worker's / owner's / operator's action).
         """
         return self.execution == EXECUTION_READY and self.primitive in (
             PRIMITIVE_CONSULT,
             PRIMITIVE_CHILD_INTAKE,
             PRIMITIVE_TICKETLESS_CALLBACK,
+            PRIMITIVE_HANDOFF_SEND,
         )
 
     def as_payload(self) -> dict[str, object]:
@@ -279,6 +303,8 @@ class WorkflowStepOutcome:
             "repo_root": self.repo_root,
             "project_scope": self.project_scope,
             "self_pane": self.self_pane,
+            "callback_classification": self.callback_classification,
+            "callback_to_role": self.callback_to_role,
             "ok": self.ok,
             "detail": self.detail,
         }
@@ -432,15 +458,61 @@ def _blocked_lane(lane: WorkflowLane) -> WorkflowStepOutcome:
     )
 
 
+def _callback_to_role_for_lane(lane: WorkflowLane, pending: PendingCallback) -> str:
+    """The caller lane role a callback returns to (derived from the current lane).
+
+    A project gateway returns up to the grandparent coordinator; a delegated
+    coordinator returns up to the project gateway. The ticketless callback
+    ``read_contract`` only resolves ``grandparent_coordinator`` / ``project_gateway``
+    (#12700 / #12706), so this maps to one of those. An explicit
+    ``pending.callback_to_role`` that is a valid read-contract token wins.
+    """
+    if pending.callback_to_role in (ROLE_GRANDPARENT_COORDINATOR, ROLE_PROJECT_GATEWAY):
+        # The caller supplied a concrete read-contract role; only override the
+        # default placeholder, not an explicit project_gateway return.
+        if not (
+            pending.callback_to_role == ROLE_GRANDPARENT_COORDINATOR
+            and lane.caller_role == ROLE_DELEGATED_COORDINATOR
+        ):
+            return pending.callback_to_role
+    if lane.caller_role == ROLE_DELEGATED_COORDINATOR:
+        return ROLE_PROJECT_GATEWAY
+    return ROLE_GRANDPARENT_COORDINATOR
+
+
 def _callback_outcome(
     lane: WorkflowLane, pending: PendingCallback
 ) -> WorkflowStepOutcome:
-    """Route an already-determined callback back to the caller lane (#12737)."""
+    """Route an already-determined callback back to the caller lane (#12737).
+
+    The classification must be one the no-anchor callback rail carries
+    (:func:`callback_rail_fields`); an off-rail classification fails closed rather
+    than fabricating a callback. ``callback_to_role`` is derived from the current
+    lane (a gateway returns to the grandparent, a delegated coordinator to the
+    gateway) and is the rail's ``read_contract``.
+    """
+    callback_to_role = _callback_to_role_for_lane(lane, pending)
+    try:
+        callback_rail_fields(pending.classification)
+    except WorkflowStepError as exc:
+        return WorkflowStepOutcome(
+            state=STATE_PENDING_CALLBACK,
+            next_action=str(exc),
+            execution=EXECUTION_BLOCKED,
+            reason=REASON_CALLBACK_READY,
+            next_owner=OWNER_OPERATOR,
+            primitive=PRIMITIVE_NONE,
+            caller_role=lane.caller_role or "",
+            self_pane=lane.self_pane,
+            repo_root=lane.repo_root,
+            project_scope=lane.project_scope,
+            detail=str(exc),
+        )
     return WorkflowStepOutcome(
         state=STATE_PENDING_CALLBACK,
         next_action=(
             "return the determined consultation/work-intake result to the caller "
-            f"lane ({pending.callback_to_role}) via the no-anchor callback rail "
+            f"lane ({callback_to_role}) via the no-anchor callback rail "
             "(handoff ticketless-callback); do not stop at a local pane answer"
         ),
         execution=EXECUTION_READY,
@@ -452,6 +524,8 @@ def _callback_outcome(
         self_pane=lane.self_pane,
         repo_root=lane.repo_root,
         project_scope=lane.project_scope,
+        callback_classification=pending.classification,
+        callback_to_role=callback_to_role,
         detail=pending.detail
         or f"pending callback classification={pending.classification!r}",
     )
@@ -630,8 +704,41 @@ def _parent_outcome(
     )
 
 
+def _resolve_unique_worker(
+    candidates: list[TargetCandidate], lane: WorkflowLane
+) -> tuple[str, Optional[TargetCandidate]]:
+    """Resolve the unique grandchild implementation worker for the child lane.
+
+    A worker is a Claude implementation lane (:data:`TARGET_KIND_WORKER`) in the
+    child's own ``repo_root``, excluding the child's own pane. When the worker
+    carries a project scope it must match the child's. Returns ``("worker_resolved",
+    cand)`` for exactly one match, ``("worker_missing", None)`` for none, and
+    ``("worker_ambiguous", None)`` for more than one — never a guess. The worker is
+    an existing lane (it is dispatched against the anchor, never launched here).
+    """
+    workers = [
+        cand
+        for cand in candidates
+        if cand.pane_id != lane.self_pane
+        and classify_target_kind(cand) == TARGET_KIND_WORKER
+        and (cand.repo_root or "").strip() == lane.repo_root
+        and (
+            not (cand.project_scope or "").strip()
+            or (cand.project_scope or "").strip() == lane.project_scope
+        )
+    ]
+    if not workers:
+        return "worker_missing", None
+    if len(workers) > 1:
+        return "worker_ambiguous", None
+    return "worker_resolved", workers[0]
+
+
 def _child_outcome(
-    lane: WorkflowLane, *, anchor: Optional[WorkflowAnchor]
+    lane: WorkflowLane,
+    candidates: list[TargetCandidate],
+    *,
+    anchor: Optional[WorkflowAnchor],
 ) -> WorkflowStepOutcome:
     """Child -> grandchild: anchor-gated worker dispatch (never invents an anchor)."""
     base = dict(
@@ -658,19 +765,51 @@ def _child_outcome(
             durable_anchor="none",
             **base,
         )
-    # An anchor is already available: the anchored worker dispatch is expressible.
-    # It is still not auto-executed by the standard surface (the standard arg-free
-    # CLI never supplies an anchor); the `handoff send` primitive carries it.
+
+    # An anchor is already available: resolve the grandchild worker and execute the
+    # anchored dispatch. Fail closed (do not launch a worker, do not guess) when no
+    # unique worker lane exists — that is the child's decision (launch one, then
+    # step again), not ``workflow step``'s.
+    status, worker = _resolve_unique_worker(candidates, lane)
+    if status != "worker_resolved" or worker is None:
+        reason = (
+            REASON_WORKER_AMBIGUOUS
+            if status == "worker_ambiguous"
+            else REASON_WORKER_MISSING
+        )
+        next_action = (
+            "multiple grandchild implementation workers match; `workflow step` will "
+            "not guess. Disambiguate (narrow with --session) or dispatch explicitly "
+            "with `handoff send`"
+            if status == "worker_ambiguous"
+            else (
+                "no grandchild implementation worker lane is live for this anchor; "
+                "launch the worker lane, then step again (the worker is dispatched "
+                "against the anchor, never launched by workflow step)"
+            )
+        )
+        return WorkflowStepOutcome(
+            next_action=next_action,
+            execution=EXECUTION_BLOCKED,
+            reason=reason,
+            next_owner=OWNER_CHILD,
+            primitive=PRIMITIVE_NONE,
+            durable_anchor=anchor.pointer(),
+            **base,
+        )
+
     return WorkflowStepOutcome(
         next_action=(
             "dispatch the implementation worker on the standard Redmine-anchored "
-            f"rail for {anchor.pointer()} (handoff send --source redmine --kind "
-            "implementation_request)"
+            f"rail for {anchor.pointer()} (handoff send --to claude --source redmine "
+            "--kind implementation_request); the anchor and worker are already "
+            "available so the route is forward-executable"
         ),
         execution=EXECUTION_READY,
         reason=REASON_WORKER_DISPATCH_READY,
         next_owner=OWNER_GRANDCHILD,
         primitive=PRIMITIVE_HANDOFF_SEND,
+        target_pane=worker.pane_id,
         durable_anchor=anchor.pointer(),
         **base,
     )
@@ -755,7 +894,7 @@ def resolve_workflow_step(
     if lane.caller_role == ROLE_PROJECT_GATEWAY:
         return _parent_outcome(lane, candidates, session=session)
     if lane.caller_role == ROLE_DELEGATED_COORDINATOR:
-        return _child_outcome(lane, anchor=anchor)
+        return _child_outcome(lane, candidates, anchor=anchor)
     if lane.caller_role == ROLE_IMPLEMENTATION_WORKER:
         return _grandchild_outcome(lane, anchor=anchor)
 
@@ -796,6 +935,8 @@ __all__ = (
     "REASON_CHILD_AMBIGUOUS",
     "REASON_SAME_LANE_CHILD_ROUTE",
     "REASON_WORKER_DISPATCH_READY",
+    "REASON_WORKER_MISSING",
+    "REASON_WORKER_AMBIGUOUS",
     "REASON_ANCHOR_REQUIRED",
     "REASON_REDMINE_WORK_READY",
     "REASON_WORKER_RUNS_WITHOUT_ANCHOR",
@@ -803,6 +944,8 @@ __all__ = (
     "REASON_SELF_LANE_UNRESOLVED",
     "REASON_LANE_ROLE_UNRESOLVED",
     "REASON_UNSAFE_PROVIDER_BINDING",
+    "WorkflowStepError",
+    "callback_rail_fields",
     "WorkflowAnchor",
     "PendingCallback",
     "WorkflowLane",

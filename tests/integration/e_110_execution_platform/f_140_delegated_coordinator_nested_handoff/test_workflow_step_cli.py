@@ -26,6 +26,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.application import commands
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
     cli_project_gateway,
@@ -74,7 +75,14 @@ def _cand(pane_id, *, role="codex", project_scope="", lane_kind=""):
 
 
 def _args(**overrides):
-    base = dict(dry_run=False, as_json=False, session=None, issue=None, journal=None)
+    base = dict(
+        dry_run=False,
+        as_json=False,
+        session=None,
+        issue=None,
+        journal=None,
+        callback=None,
+    )
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -197,6 +205,120 @@ class ExecuteForwardLegTest(unittest.TestCase):
         self.assertEqual(payload["execution"], "executed")
         self.assertEqual(payload["primitive_rc"], 0)
         self.assertIn("primitive_output", payload)
+
+
+class StandardSurfaceHelpTest(unittest.TestCase):
+    """Redmine #12755 review j#67579 finding 3: standard help is the three-command surface."""
+
+    def _step_help(self) -> str:
+        parser = build_parser()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                parser.parse_args(["workflow", "step", "--help"])
+        except SystemExit:
+            pass
+        return buf.getvalue()
+
+    def test_help_shows_only_dry_run_and_json(self):
+        help_text = self._step_help()
+        self.assertIn("--dry-run", help_text)
+        self.assertIn("--json", help_text)
+
+    def test_help_hides_debug_and_escape_knobs(self):
+        help_text = self._step_help()
+        for hidden in ("--session", "--issue", "--journal", "--callback"):
+            self.assertNotIn(hidden, help_text)
+
+    def test_hidden_knobs_still_parse(self):
+        # SUPPRESS hides from --help but the flags stay functional.
+        parser = build_parser()
+        ns = parser.parse_args(
+            ["workflow", "step", "--issue", "12755", "--journal", "67549", "--callback", "blocked"]
+        )
+        self.assertEqual(ns.issue, "12755")
+        self.assertEqual(ns.journal, "67549")
+        self.assertEqual(ns.callback, "blocked")
+
+
+class ExecuteWorkerDispatchTest(unittest.TestCase):
+    """The child lane dispatches the anchored `handoff send` when anchor + worker resolve."""
+
+    def test_worker_dispatch_is_executed(self):
+        child = _cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator")
+        worker = _cand("%wk", role="claude", project_scope=PROJECT)
+        captured: dict[str, object] = {}
+
+        def fake_orchestrate(args, **kwargs):
+            captured["target"] = getattr(args, "target", None)
+            captured["to"] = getattr(args, "to", None)
+            captured["kind"] = getattr(args, "kind", None)
+            captured["source"] = getattr(args, "source", None)
+            captured["issue"] = getattr(args, "issue", None)
+            captured["journal"] = getattr(args, "journal", None)
+            return 0
+
+        out = io.StringIO()
+        with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "current_pane", lambda: "%self"
+        ), patch.object(
+            cli_workflow, "_discover_candidates", return_value=[child, worker]
+        ), patch.object(
+            commands, "orchestrate_handoff", side_effect=fake_orchestrate
+        ), contextlib.redirect_stdout(out):
+            rc = cli_workflow.cmd_workflow_step(_args(issue="12755", journal="67549"))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["target"], "%wk")
+        self.assertEqual(captured["to"], "claude")
+        self.assertEqual(captured["kind"], "implementation_request")
+        self.assertEqual(captured["source"], "redmine")
+        self.assertEqual(captured["issue"], "12755")
+        self.assertEqual(captured["journal"], "67549")
+        self.assertIn("execution: executed", out.getvalue())
+
+    def test_worker_missing_fails_closed_without_dispatch(self):
+        child = _cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator")
+        with patch.object(commands, "orchestrate_handoff") as orch:
+            rc, text = _run(_args(issue="12755"), [child])
+        orch.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertIn("worker_missing", text)
+
+
+class ExecuteCallbackTest(unittest.TestCase):
+    """A determined callback dispatches `handoff ticketless-callback` internally."""
+
+    def test_callback_is_executed_with_derived_fields(self):
+        gateway = _cand("%self", project_scope=PROJECT)
+        captured: dict[str, object] = {}
+
+        def fake_orchestrate(args, **kwargs):
+            captured["to"] = getattr(args, "to", None)
+            captured["classification"] = getattr(args, "classification", None)
+            captured["dispatch_decision"] = getattr(args, "dispatch_decision", None)
+            captured["read_contract"] = getattr(args, "read_contract", None)
+            captured["ticketless"] = kwargs.get("ticketless")
+            return 0
+
+        out = io.StringIO()
+        with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "current_pane", lambda: "%self"
+        ), patch.object(
+            cli_workflow, "_discover_candidates", return_value=[gateway]
+        ), patch.object(
+            commands, "orchestrate_handoff", side_effect=fake_orchestrate
+        ), contextlib.redirect_stdout(out):
+            rc = cli_workflow.cmd_workflow_step(_args(callback="blocked"))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["to"], "codex")
+        self.assertEqual(captured["classification"], "blocked")
+        self.assertEqual(captured["dispatch_decision"], "hand_back_to_caller")
+        # The project gateway returns up to the grandparent coordinator.
+        self.assertEqual(captured["read_contract"], "grandparent_coordinator")
+        self.assertTrue(captured["ticketless"])
+        self.assertIn("execution: executed", out.getvalue())
 
 
 if __name__ == "__main__":

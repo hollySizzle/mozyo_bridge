@@ -51,7 +51,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_SAME_LANE_CHILD_ROUTE,
     REASON_SELF_LANE_UNRESOLVED,
     REASON_UNSAFE_PROVIDER_BINDING,
+    REASON_WORKER_AMBIGUOUS,
     REASON_WORKER_DISPATCH_READY,
+    REASON_WORKER_MISSING,
     REASON_WORKER_RUNS_WITHOUT_ANCHOR,
     REASON_WORK_INTAKE_READY,
     STATE_CHILD_WORKER_DISPATCH,
@@ -62,6 +64,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STATE_PENDING_CALLBACK,
     PendingCallback,
     WorkflowAnchor,
+    WorkflowStepError,
+    callback_rail_fields,
     classify_workflow_lane,
     resolve_workflow_step,
 )
@@ -233,8 +237,13 @@ class ChildStepTest(unittest.TestCase):
     def _child(self):
         return _cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator")
 
+    def _worker(self, pane="%wk"):
+        return _cand(pane, role="claude", project_scope=PROJECT)
+
     def test_no_anchor_fails_closed_anchor_required(self):
-        out = resolve_workflow_step([self._child()], self_pane="%self")
+        out = resolve_workflow_step(
+            [self._child(), self._worker()], self_pane="%self"
+        )
         self.assertEqual(out.state, STATE_CHILD_WORKER_DISPATCH)
         self.assertEqual(out.execution, EXECUTION_BLOCKED)
         self.assertEqual(out.reason, REASON_ANCHOR_REQUIRED)
@@ -243,9 +252,9 @@ class ChildStepTest(unittest.TestCase):
         self.assertEqual(out.durable_anchor, "none")
         self.assertFalse(out.executable)
 
-    def test_with_anchor_worker_dispatch_ready(self):
+    def test_with_anchor_and_worker_dispatch_ready_executable(self):
         out = resolve_workflow_step(
-            [self._child()],
+            [self._child(), self._worker()],
             self_pane="%self",
             anchor=WorkflowAnchor(issue="12755", journal="67549"),
         )
@@ -253,9 +262,30 @@ class ChildStepTest(unittest.TestCase):
         self.assertEqual(out.reason, REASON_WORKER_DISPATCH_READY)
         self.assertEqual(out.next_owner, OWNER_GRANDCHILD)
         self.assertEqual(out.primitive, PRIMITIVE_HANDOFF_SEND)
+        self.assertEqual(out.target_pane, "%wk")
         self.assertEqual(out.durable_anchor, "redmine:issue=12755:journal=67549")
-        # Anchored worker dispatch is NOT auto-executed by the standard surface.
+        # The anchored worker dispatch IS auto-executable once anchor + worker resolve.
+        self.assertTrue(out.executable)
+
+    def test_with_anchor_but_no_worker_fails_closed(self):
+        out = resolve_workflow_step(
+            [self._child()],
+            self_pane="%self",
+            anchor=WorkflowAnchor(issue="12755"),
+        )
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_WORKER_MISSING)
+        self.assertEqual(out.next_owner, OWNER_CHILD)
         self.assertFalse(out.executable)
+
+    def test_with_anchor_but_ambiguous_workers_fails_closed(self):
+        out = resolve_workflow_step(
+            [self._child(), self._worker("%wk1"), self._worker("%wk2")],
+            self_pane="%self",
+            anchor=WorkflowAnchor(issue="12755"),
+        )
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_WORKER_AMBIGUOUS)
 
 
 class GrandchildStepTest(unittest.TestCase):
@@ -280,19 +310,29 @@ class GrandchildStepTest(unittest.TestCase):
 
 
 class CallbackStepTest(unittest.TestCase):
-    def test_pending_callback_routes_to_caller(self):
+    def test_pending_callback_routes_to_caller_executable(self):
         out = resolve_workflow_step(
             [_cand("%self", project_scope=PROJECT)],
             self_pane="%self",
-            pending_callback=PendingCallback(
-                classification="blocked", callback_to_role="grandparent_coordinator"
-            ),
+            pending_callback=PendingCallback(classification="blocked"),
         )
         self.assertEqual(out.state, STATE_PENDING_CALLBACK)
         self.assertEqual(out.execution, EXECUTION_READY)
         self.assertEqual(out.reason, REASON_CALLBACK_READY)
         self.assertEqual(out.next_owner, OWNER_CALLER)
         self.assertEqual(out.primitive, PRIMITIVE_TICKETLESS_CALLBACK)
+        self.assertEqual(out.callback_classification, "blocked")
+        # A project gateway returns up to the grandparent coordinator.
+        self.assertEqual(out.callback_to_role, "grandparent_coordinator")
+        self.assertTrue(out.executable)
+
+    def test_callback_from_child_returns_to_project_gateway(self):
+        out = resolve_workflow_step(
+            [_cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator")],
+            self_pane="%self",
+            pending_callback=PendingCallback(classification="no_dispatch"),
+        )
+        self.assertEqual(out.callback_to_role, "project_gateway")
 
     def test_callback_takes_priority_over_forward_step(self):
         # A pending callback is routed even on a lane that would otherwise forward.
@@ -302,6 +342,23 @@ class CallbackStepTest(unittest.TestCase):
             pending_callback=PendingCallback(classification="anchor_required"),
         )
         self.assertEqual(out.state, STATE_PENDING_CALLBACK)
+
+    def test_off_rail_classification_fails_closed(self):
+        # review_ready is an anchored review path, not a no-anchor callback class.
+        out = resolve_workflow_step(
+            [_cand("%self", project_scope=PROJECT)],
+            self_pane="%self",
+            pending_callback=PendingCallback(classification="review_ready"),
+        )
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.primitive, PRIMITIVE_NONE)
+
+    def test_callback_rail_fields_mapping(self):
+        fields = callback_rail_fields("anchor_required")
+        self.assertEqual(fields["dispatch_decision"], "anchor_required_before_worker_dispatch")
+        self.assertEqual(fields["workflow_next_owner"], "caller")
+        with self.assertRaises(WorkflowStepError):
+            callback_rail_fields("review_ready")
 
 
 class BlockedLaneTest(unittest.TestCase):
