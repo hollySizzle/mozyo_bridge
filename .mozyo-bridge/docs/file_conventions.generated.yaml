@@ -155,6 +155,19 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: test runtime profiling and slow-test budget source
+  patterns:
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_runtime.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_runtime.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_runtime.py
+  - test_runtime_budget.yaml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/test-runtime-profiling-policy.md と @vibes/docs/logics/tests-placement-discovery-policy.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: otel event store, receiver, and activity model source
   patterns:
   - src/mozyo_bridge/otel_store.py

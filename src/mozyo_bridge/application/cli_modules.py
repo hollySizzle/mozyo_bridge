@@ -254,10 +254,11 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
         CliFamily(
             name="tests",
             summary=(
-                "test verification helpers family (Redmine #12752): "
-                "module-to-test impact resolver mapping changed source paths to "
-                "focused test targets for local/CI reuse. Read-only; no routing, "
-                "approval, or close authority."
+                "test verification helpers family (Redmine #12752 / #12754): "
+                "module-to-test impact resolver (`tests resolve`) and test "
+                "runtime profiling against the slow-test budget (`tests profile`) "
+                "for local/CI reuse. Read-only; no routing, approval, or close "
+                "authority."
             ),
         ),
         cli_test_impact.register,
