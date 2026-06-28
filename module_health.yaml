@@ -217,7 +217,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1939
+    lines: 1706
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -293,6 +293,16 @@ allowlist:
       domain, child owns the anchor decision) live in the separate
       `domain/ticketless_work_intake.py` (kept out of this module), so only the
       anchor/outcome/record plumbing lands here.
+      Lowered 1939 -> 1706 by #12750: the three ticketless no-anchor anchor models
+      (`SOURCE_TICKETLESS` + `TicketlessAnchor` / `TicketlessConsultationAnchor` /
+      `TicketlessWorkIntakeAnchor`) moved to the new `domain/ticketless_anchors.py`,
+      and the ticketless record rendering (`_ticketless_{callback,consultation,
+      work_intake}_lines` + the `_anchor_pointer_or_dash` ticketless branch) moved to
+      the new `domain/ticketless_record_rendering.py`. `handoff.py` imports and
+      re-exports the anchor symbols (identity preserved for `commands.py` / the
+      ticketless tests) and delegates the rendering, so the Redmine-anchored vs
+      ticketless-no-anchor boundary is now physically explicit and this module no
+      longer grows per ticketless field.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
