@@ -1,11 +1,25 @@
 name: Publish to TestPyPI
 
 on:
+  # Manual exact-version publish (release-candidate check): builds the version
+  # committed in pyproject.toml.
   workflow_dispatch:
+  # Automatic dev publish: after the required `Test` checks pass on `main`,
+  # publish a unique PEP 440 `.devN` artifact so the normal-PATH pipx runtime
+  # can be aligned to `main` without source-runtime or ad-hoc reinstalls.
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+    branches: [main]
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Manual dispatch always runs; the automatic path runs only when the
+    # triggering `Test` run on `main` actually succeeded (never on failure).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     environment: testpypi
     permissions:
       contents: read
@@ -13,6 +27,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # On the automatic path, check out the exact commit that passed CI so
+          # the artifact maps to a known SHA. Manual dispatch uses its own ref.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -21,6 +39,32 @@ jobs:
 
       - name: Install build tools
         run: python -m pip install build
+
+      - name: Compute unique dev version
+        # Only the automatic main-CI path rewrites the version. Manual dispatch
+        # keeps the committed release version for exact-version validation.
+        if: github.event_name == 'workflow_run'
+        run: |
+          # Collision-proof unique dev segment: a UTC timestamp (readable,
+          # time-ordered) concatenated with the triggering `Test` run's
+          # globally-unique id. Two `Test` runs that complete in the same second
+          # still differ by run id; a re-run of the same run fires later so the
+          # timestamp differs. Both parts are all-digits, so the result is a
+          # valid PEP 440 `.devN` segment.
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          RUN_ID="${{ github.event.workflow_run.id }}"
+          DEV_NUMBER="${TS}${RUN_ID}"
+          DEV_VERSION="$(python scripts/compute_testpypi_dev_version.py --dev-number "$DEV_NUMBER" --write)"
+          echo "Computed dev version: $DEV_VERSION"
+          {
+            echo "### TestPyPI dev publish"
+            echo ""
+            echo "- version: \`$DEV_VERSION\`"
+            echo "- commit: \`${{ github.event.workflow_run.head_sha }}\`"
+            echo "- source CI run: ${{ github.event.workflow_run.html_url }}"
+            echo ""
+            echo "Record this version <-> commit mapping with the smoke evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build package
         run: python -m build
