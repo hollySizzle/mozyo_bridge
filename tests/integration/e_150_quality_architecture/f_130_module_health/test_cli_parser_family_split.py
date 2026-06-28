@@ -92,6 +92,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "state",
     "release",
     "health",
+    "tests",
 ]
 
 

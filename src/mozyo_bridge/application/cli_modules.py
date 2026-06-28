@@ -49,6 +49,9 @@ from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_r
     CliCompositionConfig,
     CliFamily,
 )
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (
+    cli_test_impact,
+)
 
 # Each entry is (CliFamily description, registrar). The registrar takes the
 # top-level subparsers action and adds this family's subparsers. The order is
@@ -226,6 +229,18 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             ),
         ),
         cli_module_health.register,
+    ),
+    (
+        CliFamily(
+            name="tests",
+            summary=(
+                "test verification helpers family (Redmine #12752): "
+                "module-to-test impact resolver mapping changed source paths to "
+                "focused test targets for local/CI reuse. Read-only; no routing, "
+                "approval, or close authority."
+            ),
+        ),
+        cli_test_impact.register,
     ),
 )
 
