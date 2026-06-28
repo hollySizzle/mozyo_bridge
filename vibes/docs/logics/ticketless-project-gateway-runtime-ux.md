@@ -515,6 +515,11 @@ runtime command-family exploration を始め、smoke evidence が濁る。
   (`delegated_coordinator`) を semantic identity で解決し、Redmine anchor を carry せず、
   偽装もせず work-intake を届ける。`--source` / `--issue` / `--journal` / `--task-id` を
   受け取らない。
+- **位置づけ: 内部 primitive / compatibility surface であって、通常 user-facing standard
+  entrypoint ではない。** #12755 の設計では agent の通常入口は将来 `workflow step` の単一
+  standard command に統合される。`project-gateway child-intake` は親 -> 子 leg の product
+  primitive を固定するものであり、その単一入口が内部で dispatch する compatibility surface
+  として扱う。docs / CLI help は本 primitive を通常の標準入口として読ませない。
 - **semantic route identity で child を解決し、active / copied `%pane` を route authority
   にしない。** child は project gateway と同型の live identity (strong project-scoped
   Codex) なので、caller の自レーンを除外したうえで解決する。`--from-pane` は caller 自身の

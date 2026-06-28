@@ -212,23 +212,83 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
     )
 
 
+# Help overrides for the shared-ticketless-helper options whose default (callback
+# rail) wording is wrong for the parent -> child FORWARD work-intake leg (Redmine
+# #12748 review j#67514 finding 1). Keyed by argparse ``dest``.
+_CHILD_INTAKE_HELP_OVERRIDES: dict[str, str] = {
+    "to": (
+        "Semantic receiver: the CHILD / implementation coordinator, a Codex unit. "
+        "Use `--to codex`; `--to claude` is rejected — the grandchild worker is "
+        "reached only after the child mints a Redmine anchor, never direct-sent here."
+    ),
+    "target": (
+        "Not used by child-intake. The child pane is resolved by semantic identity "
+        "(--target-repo + --target-project), never an explicit %%pane; passing "
+        "`--target` is rejected (a copied %%pane is not the route authority)."
+    ),
+    "target_repo": (
+        "Required: the workspace Git worktree root. With --target-project it is the "
+        "semantic route that resolves the child coordinator (not `auto`, which needs "
+        "an explicit %%pane)."
+    ),
+    "target_project": (
+        "Required: the adopted project scope id (redmine_project). Layered on "
+        "--target-repo, it resolves the single child coordinator lane by identity."
+    ),
+}
+
+
+def _override_child_intake_help(parser_: argparse.ArgumentParser) -> None:
+    """Rewrite the callback-rail help on the shared options for the work-intake leg.
+
+    The shared ``_add_ticketless_delivery_options`` helper is authored for the
+    ``ticketless-callback`` return rail, so its ``--to`` / ``--target`` /
+    ``--target-repo`` / ``--target-project`` help describes the *caller lane the
+    callback returns to*. On the parent -> child forward work-intake leg ``--to`` is
+    the child coordinator, ``--target`` is rejected, and the target-* gates are
+    required and ARE the semantic route. Rewrite those action help strings so
+    ``--help`` presents the forward work-intake model, not the callback model
+    (Redmine #12748 review j#67514). Validation already fails closed; this only
+    corrects the human-facing surface.
+    """
+    for action in parser_._actions:  # noqa: SLF001 - argparse exposes actions here
+        override = _CHILD_INTAKE_HELP_OVERRIDES.get(action.dest)
+        if override is not None:
+            action.help = override
+
+
 def register_child_intake(gateway_sub) -> None:
     """Register the ``project-gateway child-intake`` subcommand onto ``gateway_sub``."""
     child_intake = gateway_sub.add_parser(
         "child-intake",
+        description=(
+            "Forward a no-anchor ticketless work-intake from the project gateway "
+            "(parent) to the child / implementation coordinator. `--to` is the CHILD "
+            "Codex coordinator; `--target` is not used (the child is resolved by the "
+            "--target-repo + --target-project semantic route); `--from-pane` is the "
+            "caller's own lane, a same-lane self-fence only. This is the internal "
+            "primitive / compatibility surface for the parent -> child intake leg "
+            "that the future single standard agent entrypoint (`workflow step`) "
+            "dispatches to — not a separate normal user-facing entrypoint."
+        ),
         help=(
-            "Forward a no-anchor ticketless work-intake from the project gateway to "
-            "the child / implementation coordinator (Redmine #12748). The "
-            "one-step-down sibling of `consult`: the parent must NOT answer the "
-            "domain/design itself; it routes the work to the child as ticketless "
-            "work-intake and the CHILD owns the Redmine anchor create/select/blocked "
-            "decision. Resolves the child by semantic identity with a same-lane guard "
-            "(--from-pane is the caller's own lane, a self-fence so the child cannot "
-            "resolve back to the parent lane — NOT the target authority). Requires "
-            "--target-repo + --target-project and --to codex. Fails closed (no "
-            "delivery) on same-lane / missing / ambiguous child route. Delivers "
-            "WITHOUT a Redmine anchor and without fabricating one; the worker-dispatch "
-            "/ implementation / domain-probe Redmine-anchor gate is NOT relaxed."
+            "Forward a no-anchor ticketless work-intake from the project gateway "
+            "(parent) to the child / implementation coordinator. The one-step-down "
+            "sibling of `consult`: the parent must NOT answer the domain/design "
+            "itself; it routes the work to the child as ticketless work-intake and "
+            "the CHILD owns the Redmine anchor create/select/blocked decision. "
+            "Resolves the child by semantic identity (--target-repo + "
+            "--target-project) with a same-lane guard (--from-pane is the caller's "
+            "OWN lane, a self-fence so the child cannot resolve back to the parent "
+            "lane — NOT the target authority). Delivers to the child Codex "
+            "coordinator (--to codex); fails closed (no delivery) on same-lane / "
+            "missing / ambiguous child route, and delivers WITHOUT a Redmine anchor "
+            "and without fabricating one (the worker-dispatch / implementation / "
+            "domain-probe Redmine-anchor gate is NOT relaxed). This is the product "
+            "primitive for the parent -> child intake leg; it is the internal "
+            "primitive / compatibility surface that the future single standard agent "
+            "entrypoint (`workflow step`) dispatches to, not a separate normal "
+            "user-facing entrypoint."
         ),
     )
     # Reuse the ticketless delivery knobs (no --source / --issue / --journal anchor
@@ -236,6 +296,14 @@ def register_child_intake(gateway_sub) -> None:
     # --target-repo / --target-project / --to, --target is resolved (not typed), and
     # the forward work-intake payload is injected programmatically on child_resolved.
     _add_ticketless_delivery_options(child_intake)
+    # The shared ticketless helper writes callback-rail help for `--to` / `--target`
+    # / `--target-repo` / `--target-project` (it is reused by the `ticketless-callback`
+    # return rail). On the parent -> child FORWARD work-intake leg those models are
+    # different: `--to` is the CHILD coordinator (codex), `--target` is rejected, and
+    # the two target-* gates are REQUIRED and ARE the semantic route. Override the
+    # help on those actions so the human-facing surface is not the callback model
+    # (Redmine #12748 review j#67514 finding 1); validation already fails closed.
+    _override_child_intake_help(child_intake)
     child_intake.add_argument(
         "--from-pane",
         dest="from_pane",
