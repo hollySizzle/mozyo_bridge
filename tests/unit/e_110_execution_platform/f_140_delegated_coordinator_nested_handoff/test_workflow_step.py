@@ -41,7 +41,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PRIMITIVE_NONE,
     PRIMITIVE_TICKETLESS_CALLBACK,
     REASON_ANCHOR_REQUIRED,
+    REASON_CALLBACK_NOT_APPLICABLE,
+    REASON_CALLBACK_OFF_RAIL,
     REASON_CALLBACK_READY,
+    REASON_CALLER_AMBIGUOUS,
+    REASON_CALLER_MISSING,
     REASON_CHILD_AMBIGUOUS,
     REASON_CONSULTATION_READY,
     REASON_GATEWAY_AMBIGUOUS,
@@ -310,9 +314,17 @@ class GrandchildStepTest(unittest.TestCase):
 
 
 class CallbackStepTest(unittest.TestCase):
-    def test_pending_callback_routes_to_caller_executable(self):
+    def _grandparent(self, pane="%gp"):
+        # The caller a project gateway returns up to: a strong Codex with no scope.
+        return _cand(pane)
+
+    def _gateway_caller(self, pane="%pgw"):
+        # The caller a delegated coordinator returns up to: a project gateway.
+        return _cand(pane, project_scope=PROJECT)
+
+    def test_pending_callback_routes_to_resolved_caller_executable(self):
         out = resolve_workflow_step(
-            [_cand("%self", project_scope=PROJECT)],
+            [_cand("%self", project_scope=PROJECT), self._grandparent()],
             self_pane="%self",
             pending_callback=PendingCallback(classification="blocked"),
         )
@@ -322,35 +334,82 @@ class CallbackStepTest(unittest.TestCase):
         self.assertEqual(out.next_owner, OWNER_CALLER)
         self.assertEqual(out.primitive, PRIMITIVE_TICKETLESS_CALLBACK)
         self.assertEqual(out.callback_classification, "blocked")
-        # A project gateway returns up to the grandparent coordinator.
+        # A project gateway returns up to the grandparent coordinator; the resolved
+        # caller pane is carried for the explicit --target.
         self.assertEqual(out.callback_to_role, "grandparent_coordinator")
+        self.assertEqual(out.target_pane, "%gp")
         self.assertTrue(out.executable)
 
-    def test_callback_from_child_returns_to_project_gateway(self):
+    def test_callback_from_child_returns_to_project_gateway_pane(self):
         out = resolve_workflow_step(
-            [_cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator")],
+            [
+                _cand("%self", project_scope=PROJECT, lane_kind="delegated_coordinator"),
+                self._gateway_caller(),
+            ],
             self_pane="%self",
             pending_callback=PendingCallback(classification="no_dispatch"),
         )
         self.assertEqual(out.callback_to_role, "project_gateway")
+        self.assertEqual(out.target_pane, "%pgw")
+        self.assertTrue(out.executable)
+
+    def test_caller_missing_fails_closed(self):
+        out = resolve_workflow_step(
+            [_cand("%self", project_scope=PROJECT)],  # no grandparent caller present
+            self_pane="%self",
+            pending_callback=PendingCallback(classification="blocked"),
+        )
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_CALLER_MISSING)
+        self.assertFalse(out.executable)
+
+    def test_caller_ambiguous_fails_closed(self):
+        out = resolve_workflow_step(
+            [
+                _cand("%self", project_scope=PROJECT),
+                self._grandparent("%gp1"),
+                self._grandparent("%gp2"),
+            ],
+            self_pane="%self",
+            pending_callback=PendingCallback(classification="blocked"),
+        )
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_CALLER_AMBIGUOUS)
+
+    def test_callback_at_grandparent_not_applicable(self):
+        # The grandparent is the terminal recorder; it has no ticketless caller above.
+        out = resolve_workflow_step(
+            [_cand("%self"), _cand("%gw", project_scope=PROJECT)],
+            self_pane="%self",
+            pending_callback=PendingCallback(classification="blocked"),
+        )
+        self.assertEqual(out.state, STATE_PENDING_CALLBACK)
+        self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_CALLBACK_NOT_APPLICABLE)
 
     def test_callback_takes_priority_over_forward_step(self):
         # A pending callback is routed even on a lane that would otherwise forward.
         out = resolve_workflow_step(
-            [_cand("%self"), _cand("%gw", project_scope=PROJECT)],
+            [
+                _cand("%self", project_scope=PROJECT),  # would otherwise child-intake
+                _cand("%child", project_scope=PROJECT),
+                self._grandparent(),
+            ],
             self_pane="%self",
             pending_callback=PendingCallback(classification="anchor_required"),
         )
         self.assertEqual(out.state, STATE_PENDING_CALLBACK)
+        self.assertEqual(out.primitive, PRIMITIVE_TICKETLESS_CALLBACK)
 
     def test_off_rail_classification_fails_closed(self):
         # review_ready is an anchored review path, not a no-anchor callback class.
         out = resolve_workflow_step(
-            [_cand("%self", project_scope=PROJECT)],
+            [_cand("%self", project_scope=PROJECT), self._grandparent()],
             self_pane="%self",
             pending_callback=PendingCallback(classification="review_ready"),
         )
         self.assertEqual(out.execution, EXECUTION_BLOCKED)
+        self.assertEqual(out.reason, REASON_CALLBACK_OFF_RAIL)
         self.assertEqual(out.primitive, PRIMITIVE_NONE)
 
     def test_callback_rail_fields_mapping(self):

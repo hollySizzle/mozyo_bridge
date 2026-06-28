@@ -289,12 +289,14 @@ class ExecuteWorkerDispatchTest(unittest.TestCase):
 class ExecuteCallbackTest(unittest.TestCase):
     """A determined callback dispatches `handoff ticketless-callback` internally."""
 
-    def test_callback_is_executed_with_derived_fields(self):
+    def test_callback_is_executed_with_resolved_caller_target(self):
         gateway = _cand("%self", project_scope=PROJECT)
+        grandparent = _cand("%gp")  # caller: strong codex, no scope
         captured: dict[str, object] = {}
 
         def fake_orchestrate(args, **kwargs):
             captured["to"] = getattr(args, "to", None)
+            captured["target"] = getattr(args, "target", None)
             captured["classification"] = getattr(args, "classification", None)
             captured["dispatch_decision"] = getattr(args, "dispatch_decision", None)
             captured["read_contract"] = getattr(args, "read_contract", None)
@@ -305,7 +307,7 @@ class ExecuteCallbackTest(unittest.TestCase):
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
-            cli_workflow, "_discover_candidates", return_value=[gateway]
+            cli_workflow, "_discover_candidates", return_value=[gateway, grandparent]
         ), patch.object(
             commands, "orchestrate_handoff", side_effect=fake_orchestrate
         ), contextlib.redirect_stdout(out):
@@ -313,12 +315,25 @@ class ExecuteCallbackTest(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(captured["to"], "codex")
+        # The caller lane is resolved and passed as an explicit --target (no implicit
+        # same-session codex fallback) — Redmine #12755 review j#67585.
+        self.assertEqual(captured["target"], "%gp")
         self.assertEqual(captured["classification"], "blocked")
         self.assertEqual(captured["dispatch_decision"], "hand_back_to_caller")
         # The project gateway returns up to the grandparent coordinator.
         self.assertEqual(captured["read_contract"], "grandparent_coordinator")
         self.assertTrue(captured["ticketless"])
         self.assertIn("execution: executed", out.getvalue())
+
+    def test_callback_caller_missing_fails_closed_without_dispatch(self):
+        # No caller lane present: must fail closed, never fall back to a same-session
+        # codex target.
+        gateway = _cand("%self", project_scope=PROJECT)
+        with patch.object(commands, "orchestrate_handoff") as orch:
+            rc, text = _run(_args(callback="blocked"), [gateway])
+        orch.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertIn("caller_missing", text)
 
 
 if __name__ == "__main__":

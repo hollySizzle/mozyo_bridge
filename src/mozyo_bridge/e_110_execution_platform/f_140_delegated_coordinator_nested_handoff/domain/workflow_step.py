@@ -58,7 +58,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     TARGET_KIND_PROJECT_GATEWAY,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
-    TARGET_KIND_WORKER,
     classify_target_kind,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
@@ -78,6 +77,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_callback import (
     WorkflowStepError,
     callback_rail_fields,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_resolve import (
+    resolve_caller_target,
+    resolve_unique_worker,
 )
 
 # The delegated-coordinator-tree display kinds (the `@mozyo_lane_kind` projection
@@ -142,6 +145,10 @@ REASON_ANCHOR_REQUIRED = "anchor_required"
 REASON_REDMINE_WORK_READY = "redmine_work_ready"
 REASON_WORKER_RUNS_WITHOUT_ANCHOR = "worker_runs_without_anchor"
 REASON_CALLBACK_READY = "callback_ready"
+REASON_CALLBACK_OFF_RAIL = "callback_off_rail"
+REASON_CALLER_MISSING = "caller_missing"
+REASON_CALLER_AMBIGUOUS = "caller_ambiguous"
+REASON_CALLBACK_NOT_APPLICABLE = "callback_not_applicable"
 REASON_SELF_LANE_UNRESOLVED = "self_lane_unresolved"
 REASON_LANE_ROLE_UNRESOLVED = "lane_role_unresolved"
 REASON_UNSAFE_PROVIDER_BINDING = "unsafe_provider_binding"
@@ -481,38 +488,94 @@ def _callback_to_role_for_lane(lane: WorkflowLane, pending: PendingCallback) -> 
 
 
 def _callback_outcome(
-    lane: WorkflowLane, pending: PendingCallback
+    lane: WorkflowLane,
+    candidates: list[TargetCandidate],
+    pending: PendingCallback,
 ) -> WorkflowStepOutcome:
     """Route an already-determined callback back to the caller lane (#12737).
 
-    The classification must be one the no-anchor callback rail carries
-    (:func:`callback_rail_fields`); an off-rail classification fails closed rather
-    than fabricating a callback. ``callback_to_role`` is derived from the current
-    lane (a gateway returns to the grandparent, a delegated coordinator to the
-    gateway) and is the rail's ``read_contract``.
+    Two gates before the callback is executable, both fail-closed:
+
+    1. the classification must be one the no-anchor callback rail carries
+       (:func:`callback_rail_fields`); an off-rail class (e.g. ``review_ready``)
+       blocks rather than fabricating a callback;
+    2. the caller lane it returns *up* to must resolve to a unique semantic target
+       (:func:`_resolve_caller_target`) — never an implicit same-session ``codex``
+       label. ``caller_missing`` / ``caller_ambiguous`` / ``caller_not_applicable``
+       block with the responsible next owner.
+
+    ``callback_to_role`` is the rail's ``read_contract`` (a gateway returns to the
+    grandparent, a delegated coordinator to the gateway); ``target_pane`` is the
+    resolved caller pane the CLI passes as an explicit ``--target``.
     """
+    base = dict(
+        state=STATE_PENDING_CALLBACK,
+        caller_role=lane.caller_role or "",
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=lane.project_scope,
+    )
     callback_to_role = _callback_to_role_for_lane(lane, pending)
     try:
         callback_rail_fields(pending.classification)
     except WorkflowStepError as exc:
         return WorkflowStepOutcome(
-            state=STATE_PENDING_CALLBACK,
             next_action=str(exc),
             execution=EXECUTION_BLOCKED,
-            reason=REASON_CALLBACK_READY,
+            reason=REASON_CALLBACK_OFF_RAIL,
             next_owner=OWNER_OPERATOR,
             primitive=PRIMITIVE_NONE,
-            caller_role=lane.caller_role or "",
-            self_pane=lane.self_pane,
-            repo_root=lane.repo_root,
-            project_scope=lane.project_scope,
             detail=str(exc),
+            **base,
         )
+
+    status, caller = resolve_caller_target(
+        candidates,
+        self_pane=lane.self_pane,
+        caller_role=lane.caller_role,
+        repo_root=lane.repo_root,
+        project_scope=lane.project_scope,
+    )
+    if status != "caller_resolved" or caller is None:
+        reason = {
+            "caller_missing": REASON_CALLER_MISSING,
+            "caller_ambiguous": REASON_CALLER_AMBIGUOUS,
+        }.get(status, REASON_CALLBACK_NOT_APPLICABLE)
+        next_action = {
+            "caller_missing": (
+                "no caller lane is live to return the callback to; the callback "
+                f"returns up to the {callback_to_role}. Bring up the caller lane or "
+                "return the result on its own rail"
+            ),
+            "caller_ambiguous": (
+                "multiple caller lanes match; `workflow step` will not guess which "
+                f"{callback_to_role} to return to. Disambiguate (narrow with "
+                "--session) before the callback"
+            ),
+        }.get(
+            status,
+            (
+                "this lane has no ticketless caller to return a callback to (a "
+                "grandparent records the result; a worker replies on the anchored "
+                "rail). Record the result locally instead"
+            ),
+        )
+        return WorkflowStepOutcome(
+            next_action=next_action,
+            execution=EXECUTION_BLOCKED,
+            reason=reason,
+            next_owner=OWNER_OPERATOR,
+            primitive=PRIMITIVE_NONE,
+            callback_classification=pending.classification,
+            callback_to_role=callback_to_role,
+            detail=f"caller resolution: {status}",
+            **base,
+        )
+
     return WorkflowStepOutcome(
-        state=STATE_PENDING_CALLBACK,
         next_action=(
-            "return the determined consultation/work-intake result to the caller "
-            f"lane ({callback_to_role}) via the no-anchor callback rail "
+            "return the determined consultation/work-intake result to the resolved "
+            f"caller lane ({callback_to_role}) via the no-anchor callback rail "
             "(handoff ticketless-callback); do not stop at a local pane answer"
         ),
         execution=EXECUTION_READY,
@@ -520,14 +583,12 @@ def _callback_outcome(
         next_owner=OWNER_CALLER,
         primitive=PRIMITIVE_TICKETLESS_CALLBACK,
         durable_anchor="none",
-        caller_role=lane.caller_role or "",
-        self_pane=lane.self_pane,
-        repo_root=lane.repo_root,
-        project_scope=lane.project_scope,
+        target_pane=caller.pane_id,
         callback_classification=pending.classification,
         callback_to_role=callback_to_role,
         detail=pending.detail
         or f"pending callback classification={pending.classification!r}",
+        **base,
     )
 
 
@@ -704,36 +765,6 @@ def _parent_outcome(
     )
 
 
-def _resolve_unique_worker(
-    candidates: list[TargetCandidate], lane: WorkflowLane
-) -> tuple[str, Optional[TargetCandidate]]:
-    """Resolve the unique grandchild implementation worker for the child lane.
-
-    A worker is a Claude implementation lane (:data:`TARGET_KIND_WORKER`) in the
-    child's own ``repo_root``, excluding the child's own pane. When the worker
-    carries a project scope it must match the child's. Returns ``("worker_resolved",
-    cand)`` for exactly one match, ``("worker_missing", None)`` for none, and
-    ``("worker_ambiguous", None)`` for more than one — never a guess. The worker is
-    an existing lane (it is dispatched against the anchor, never launched here).
-    """
-    workers = [
-        cand
-        for cand in candidates
-        if cand.pane_id != lane.self_pane
-        and classify_target_kind(cand) == TARGET_KIND_WORKER
-        and (cand.repo_root or "").strip() == lane.repo_root
-        and (
-            not (cand.project_scope or "").strip()
-            or (cand.project_scope or "").strip() == lane.project_scope
-        )
-    ]
-    if not workers:
-        return "worker_missing", None
-    if len(workers) > 1:
-        return "worker_ambiguous", None
-    return "worker_resolved", workers[0]
-
-
 def _child_outcome(
     lane: WorkflowLane,
     candidates: list[TargetCandidate],
@@ -770,7 +801,12 @@ def _child_outcome(
     # anchored dispatch. Fail closed (do not launch a worker, do not guess) when no
     # unique worker lane exists — that is the child's decision (launch one, then
     # step again), not ``workflow step``'s.
-    status, worker = _resolve_unique_worker(candidates, lane)
+    status, worker = resolve_unique_worker(
+        candidates,
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=lane.project_scope,
+    )
     if status != "worker_resolved" or worker is None:
         reason = (
             REASON_WORKER_AMBIGUOUS
@@ -887,7 +923,7 @@ def resolve_workflow_step(
         return _blocked_lane(lane)
 
     if pending_callback is not None:
-        return _callback_outcome(lane, pending_callback)
+        return _callback_outcome(lane, candidates, pending_callback)
 
     if lane.caller_role == ROLE_GRANDPARENT_COORDINATOR:
         return _grandparent_outcome(lane, candidates)
@@ -941,6 +977,10 @@ __all__ = (
     "REASON_REDMINE_WORK_READY",
     "REASON_WORKER_RUNS_WITHOUT_ANCHOR",
     "REASON_CALLBACK_READY",
+    "REASON_CALLBACK_OFF_RAIL",
+    "REASON_CALLER_MISSING",
+    "REASON_CALLER_AMBIGUOUS",
+    "REASON_CALLBACK_NOT_APPLICABLE",
     "REASON_SELF_LANE_UNRESOLVED",
     "REASON_LANE_ROLE_UNRESOLVED",
     "REASON_UNSAFE_PROVIDER_BINDING",

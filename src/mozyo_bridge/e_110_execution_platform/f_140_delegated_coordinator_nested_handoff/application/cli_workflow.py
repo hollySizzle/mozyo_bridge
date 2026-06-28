@@ -174,10 +174,14 @@ def _primitive_argv(
         return argv
     if outcome.primitive == PRIMITIVE_TICKETLESS_CALLBACK:
         # Determined no-anchor callback back to the caller lane (a Codex coordinator).
+        # The caller pane was resolved semantically by the state machine and is passed
+        # as an explicit --target so delivery never falls back to an implicit
+        # same-session `codex` label (Redmine #12755 review j#67585).
         fields = callback_rail_fields(outcome.callback_classification)
         argv = [
             "handoff", "ticketless-callback",
             "--to", "codex",
+            "--target", outcome.target_pane,
             "--target-repo", outcome.repo_root,
             "--classification", fields["classification"],
             "--dispatch-decision", fields["dispatch_decision"],
