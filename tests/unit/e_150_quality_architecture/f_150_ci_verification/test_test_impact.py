@@ -240,6 +240,35 @@ class AggregatePlanTest(unittest.TestCase):
         # The focused selection is still reported even while recommending full.
         self.assertTrue(plan.selected_tests)
 
+    def test_known_context_with_no_tests_escalates_to_full(self) -> None:
+        # Regression (Codex j#67568 finding 2): a numbered source in a context
+        # that holds no test files at all must not report selected/empty (which
+        # a runner reads as fail-open) — escalate to the full suite.
+        plan = resolve_impact(
+            ["src/mozyo_bridge/e_999_new_context/f_110_new_feature/domain/new_module.py"],
+            test_files=(),
+        )
+        res = plan.resolutions[0]
+        self.assertEqual(res.status, UNMAPPED)
+        self.assertEqual(res.fallback.kind, FALLBACK_FULL)
+        self.assertEqual(plan.recommendation, "full")
+        self.assertEqual(plan.selected_tests, ())
+        self.assertEqual(plan.fallback.kind, FALLBACK_FULL)
+
+    def test_empty_selection_backstops_to_full(self) -> None:
+        # Defense-in-depth: even if some resolution path produced an empty
+        # selection while looking "mappable", the aggregate never returns
+        # selected with nothing to run.
+        plan = resolve_impact(
+            ["src/mozyo_bridge/e_110_execution_platform/__init__.py"],
+            test_files=TEST_FILES,
+        )
+        # __init__ is "other" -> unmapped -> full (covered), but assert the
+        # aggregate never yields selected+empty.
+        self.assertFalse(
+            plan.recommendation == "selected" and not plan.selected_tests
+        )
+
     def test_empty_change_set_recommends_full(self) -> None:
         plan = resolve_impact([], test_files=TEST_FILES)
         self.assertEqual(plan.recommendation, "full")
@@ -331,10 +360,13 @@ class CommandHandlerTest(unittest.TestCase):
         # The repo's own module-health test should resolve as a direct target.
         self.assertIn("test_module_health.py", out)
 
-    def test_targets_format_full_prints_tests_root(self) -> None:
+    def test_targets_format_full_is_unittest_runner_ready(self) -> None:
+        # Regression (Codex j#67568 finding 1): a bare `tests` dir is not a
+        # valid `python -m unittest` argument and runs nothing. The full
+        # fallback must emit the discover form so the documented pipe works.
         rc, out = self._run(paths=["README.md"], format="targets")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.strip(), "tests")
+        self.assertEqual(out.strip().splitlines(), ["discover", "-s", "tests"])
 
     def test_json_format_emits_recommendation(self) -> None:
         rc, out = self._run(paths=["README.md"], format="json")

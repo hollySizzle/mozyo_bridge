@@ -263,11 +263,27 @@ def _resolve_numbered(target: SourceTarget, test_files: tuple[str, ...]) -> Test
 
     # Context known, but no direct test for this module: do not fail open.
     roots = _existing_context_roots(target, test_files)
+    context = target.epic + (f"/{target.feature}" if target.feature else "")
+
+    # A "neighbor" fallback that can offer neither a neighbor test nor a runnable
+    # root would hand the runner an empty set — which is fail-open. The context
+    # holds no tests at all, so we cannot focus: escalate this path to the full
+    # suite so the aggregate plan escalates too.
+    if not neighbors and not roots:
+        reason = (
+            f"bounded context {context} has no test files for module "
+            f"'{target.module_stem}'; run the full suite"
+        )
+        return TestImpact(
+            path=target.path,
+            status=UNMAPPED,
+            fallback=Fallback(kind=FALLBACK_FULL, reason=reason, roots=(TESTS_ROOT,)),
+            notes=("known context but no tests present",),
+        )
+
     reason = (
         f"no direct {direct_name} for module '{target.module_stem}' "
-        f"in {target.epic}"
-        + (f"/{target.feature}" if target.feature else "")
-        + "; run bounded-context neighbor tests"
+        f"in {context}; run bounded-context neighbor tests"
     )
     return TestImpact(
         path=target.path,
@@ -395,6 +411,22 @@ def resolve_impact(paths: list[str], *, test_files: tuple[str, ...]) -> ImpactPl
             selected_tests=tuple(selected),
             recommendation="full",
             fallback=Fallback(kind=FALLBACK_FULL, reason=reason, roots=(TESTS_ROOT,)),
+        )
+
+    # Backstop: if the focused resolution somehow yields nothing runnable, never
+    # report "selected" with an empty set (which a runner reads as fail-open).
+    # Escalate to the full suite instead.
+    if not selected:
+        return ImpactPlan(
+            resolutions=resolutions,
+            selected_tests=(),
+            recommendation="full",
+            fallback=Fallback(
+                kind=FALLBACK_FULL,
+                reason="focused resolution produced no runnable test targets; "
+                "escalating to full suite",
+                roots=(TESTS_ROOT,),
+            ),
         )
 
     return ImpactPlan(

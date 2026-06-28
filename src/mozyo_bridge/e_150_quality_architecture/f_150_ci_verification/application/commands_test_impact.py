@@ -10,10 +10,12 @@ The three output formats cover the "usable from CI and local" acceptance:
 
 - ``text`` — human review of the per-path mapping and any fallback reason;
 - ``json`` — machine consumption (the full :class:`ImpactPlan` dict);
-- ``targets`` — newline-separated test roots/files for direct piping, e.g.
+- ``targets`` — newline-separated ``python -m unittest`` arguments for direct
+  piping, e.g.
   ``mozyo-bridge tests resolve --staged --format targets | xargs python -m unittest``;
-  a ``full`` recommendation prints the ``tests`` root so CI never silently runs
-  an empty (fail-open) set.
+  a ``full`` recommendation prints ``discover -s tests`` (a bare directory is not
+  a valid unittest argument) so the pipe actually runs the whole suite and CI
+  never silently runs an empty (fail-open) set.
 """
 
 from __future__ import annotations
@@ -47,10 +49,18 @@ def _collect_paths(args: argparse.Namespace, repo_root) -> list[str]:
 
 
 def _plan_targets(plan: ImpactPlan) -> list[str]:
-    """Runner-ready targets: the full root on a fail-closed full recommendation."""
+    """Runner-ready ``python -m unittest`` arguments.
+
+    On a focused recommendation the selected test files are already valid
+    ``unittest`` arguments. On a fail-closed full recommendation a bare
+    directory is **not** a valid ``unittest`` argument (``python -m unittest
+    tests`` runs nothing), so emit the ``discover -s <root>`` form that actually
+    walks the full suite.
+    """
     if plan.recommendation == "full":
         roots = plan.fallback.roots if plan.fallback else (TESTS_ROOT,)
-        return list(roots) or [TESTS_ROOT]
+        root = roots[0] if roots else TESTS_ROOT
+        return ["discover", "-s", root]
     return list(plan.selected_tests)
 
 

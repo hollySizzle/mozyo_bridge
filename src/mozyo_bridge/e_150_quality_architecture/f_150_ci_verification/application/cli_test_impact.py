@@ -71,8 +71,8 @@ def register(sub) -> None:
         default="text",
         help=(
             "Output format: 'text' (human review), 'json' (full plan), or "
-            "'targets' (newline-separated runner targets; a full recommendation "
-            "prints the tests root)."
+            "'targets' (newline-separated `python -m unittest` arguments; a full "
+            "recommendation prints `discover -s tests`)."
         ),
     )
     resolve.set_defaults(func=cmd_tests_resolve)
