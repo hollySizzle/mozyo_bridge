@@ -59,8 +59,16 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
+    _add_ticketless_delivery_options,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
+    ROLE_PROJECT_GATEWAY,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
+    CALLBACK_METHODS,
+    CONSULTATION_PROJECT_DOMAIN,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
@@ -130,12 +138,20 @@ def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
             f"window={sel.window_name} repo={sel.repo_short} "
             f"project_scope={sel.project_scope}"
         )
-        # The normal, pane-id-free route to deliver to the resolved gateway.
+        # The normal, pane-id-free routes to deliver to the resolved gateway.
+        # Redmine #12740: the no-anchor consultation phase uses `project-gateway
+        # consult` (forward ticketless rail, no Redmine anchor); anchored worker
+        # work uses `project-gateway handoff` once a real Redmine anchor exists.
         print(
-            "next: handoff_to_project_gateway -> "
+            "next (no-anchor consultation): consult_project_gateway -> "
+            f"mozyo-bridge project-gateway consult --to {route.role} "
+            f"--target-repo {route.repo_root} --target-project {route.project_scope}"
+        )
+        print(
+            "next (anchored worker work): handoff_to_project_gateway -> "
             f"mozyo-bridge project-gateway handoff --to {route.role} "
             f"--target-repo {route.repo_root} --target-project {route.project_scope} "
-            "--source redmine --issue <id> --journal <id> --kind ticketless_consultation"
+            "--source redmine --issue <id> --journal <id> --kind implementation_request"
         )
         return 0
 
@@ -282,12 +298,20 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
                 "cd <project workdir> && mozyo-bridge cockpit (NOT a detached "
                 "--no-attach normal session, NOT a cockpit --json preview)"
             )
-        # The normal, pane-id-free route to deliver to the adopted gateway.
+        # The normal, pane-id-free routes to deliver to the adopted gateway.
+        # Redmine #12740: the no-anchor consultation phase uses `project-gateway
+        # consult` (forward ticketless rail, no Redmine anchor); anchored worker
+        # work uses `project-gateway handoff` once a real Redmine anchor exists.
         print(
-            "next: handoff_to_project_gateway -> "
+            "next (no-anchor consultation): consult_project_gateway -> "
+            f"mozyo-bridge project-gateway consult --to {identity.role} "
+            f"--target-repo {identity.repo_root} --target-project {identity.project_scope}"
+        )
+        print(
+            "next (anchored worker work): handoff_to_project_gateway -> "
             f"mozyo-bridge project-gateway handoff --to {identity.role} "
             f"--target-repo {identity.repo_root} --target-project {identity.project_scope} "
-            "--source redmine --issue <id> --journal <id> --kind ticketless_consultation"
+            "--source redmine --issue <id> --journal <id> --kind implementation_request"
         )
         return _adopt_exit_code(decision, evidence)
 
@@ -411,6 +435,110 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     # successful `found` resolution; the operator never types it.
     args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
     return orchestrate_handoff(args)
+
+
+def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
+    """Forward a no-anchor ticketless consultation to the project gateway (#12740).
+
+    The forward (department-root -> project-gateway) counterpart of the return
+    ``handoff ticketless-callback`` rail. It resolves the single project gateway by
+    semantic identity (the same fail-closed ``--target-repo`` + ``--target-project``
+    + ``--to codex`` resolution as ``project-gateway handoff``), then delivers the
+    consultation through the gated :func:`orchestrate_handoff` **without a Redmine
+    anchor and without fabricating one** — closing the GK3500 rerun blocker where
+    the root coordinator had found exactly one gateway but the anchored
+    ``handoff send --source redmine`` failed closed with ``invalid_anchor`` and raw
+    pane typing was correctly refused.
+
+    The Redmine-anchor gate for worker dispatch / implementation / domain probe is
+    NOT relaxed: this rail forwards a *consultation* only (no anchor, no dispatch
+    token), and the structured payload restates the invariant so the receiver
+    gateway mints a real Redmine anchor before dispatching a worker. The receiver
+    gets the transition role/action boundary (#12706) and workflow-contract refs
+    (#12700) auto-injected on ``found``, plus the forward consultation's callback
+    return contract (which role to return to, via which product primitives) so it
+    can return a structured result via ``ticketless-callback`` / ``q-enter
+    consultation_callback`` (#12703 / #12705 / #12737). Fails closed (no delivery,
+    no payload injected) when no unique project gateway exists.
+    """
+    require_tmux()
+
+    # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
+    # implementation worker (Claude) is reached only after the gateway mints a
+    # Redmine anchor, so a direct project-Claude consultation send is forbidden.
+    if args.to != AGENT_KIND_CODEX:
+        die(
+            "`project-gateway consult` delivers to the project gateway, which is a "
+            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
+            "worker (Claude) is reached only after the gateway creates a Redmine "
+            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
+            "the ticketless project gateway contract."
+        )
+
+    if not args.target_repo or args.target_repo == "auto":
+        die(
+            "`project-gateway consult` resolves the pane semantically, so it needs "
+            "a concrete `--target-repo <git-root>` (not `auto`, which requires an "
+            "explicit %pane). Pass the workspace Git root."
+        )
+    if not args.target_project:
+        die(
+            "`project-gateway consult` requires `--target-project <project_scope>` "
+            "to resolve the project gateway. To gate on the Git repo root only, use "
+            "`handoff ticketless-callback` with an explicit `--target`."
+        )
+    if getattr(args, "target", None):
+        die(
+            "`project-gateway consult` selects the pane by semantic identity; do "
+            "not pass `--target %pane`. The forward consultation never carries a "
+            "pane id to the ticketless receiver."
+        )
+
+    route = _route_from_args(
+        repo_root=args.target_repo,
+        project_scope=args.target_project,
+        role=args.to,
+        session=getattr(args, "gateway_session", None),
+    )
+    resolution = resolve_project_gateway(_discover_candidates(), route)
+
+    if resolution.status != STATUS_FOUND or resolution.selected is None:
+        # Fail closed; do not deliver and inject no forward-consultation payload.
+        # Reuse the read-only renderer for the operator-facing classification.
+        resolve_args = argparse.Namespace(
+            repo=route.repo_root,
+            project=route.project_scope,
+            role=route.role,
+            session=route.session,
+            as_json=getattr(args, "as_json", False),
+        )
+        return cmd_project_gateway_resolve(resolve_args)
+
+    # Inject the resolved pane and the forward-consultation payload, then delegate
+    # to the gated no-anchor orchestrator. The repo + project gates in
+    # orchestrate_handoff re-verify the resolved pane before any send.
+    args.target = resolution.selected.pane_id
+    # Redmine #12706 / #12700: this command IS the grandparent (department-root) ->
+    # project-gateway transition, so auto-inject the grandparent_coordinator
+    # transition boundary and workflow-contract bundle on `found` (the operator
+    # never types the role payload), exactly like `project-gateway handoff`.
+    args.transition_role = ROLE_GRANDPARENT_COORDINATOR
+    args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
+    # Redmine #12740: the forward consultation payload, built programmatically (not
+    # operator-typed) so it is product evidence, not a hand-asserted role payload.
+    # The root forwards a project-domain consultation, asks the gateway to return
+    # the result to the grandparent_coordinator lane via either no-anchor return
+    # primitive, and names the project_gateway role contract the gateway acts under.
+    args.consultation_kind = CONSULTATION_PROJECT_DOMAIN
+    args.callback_to_role = ROLE_GRANDPARENT_COORDINATOR
+    args.callback_methods = list(CALLBACK_METHODS)
+    args.read_contract = ROLE_PROJECT_GATEWAY
+    return orchestrate_handoff(
+        args,
+        default_kind="design_consultation",
+        ticketless=True,
+        ticketless_consultation=True,
+    )
 
 
 def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
@@ -628,3 +756,39 @@ def register(sub) -> None:
         help="On a fail-closed resolution, emit the GatewayResolution payload as JSON.",
     )
     handoff.set_defaults(func=cmd_project_gateway_handoff)
+
+    consult = gateway_sub.add_parser(
+        "consult",
+        help=(
+            "Forward a no-anchor ticketless consultation to the project gateway "
+            "(Redmine #12740). Resolves the gateway by semantic identity (no %%pane "
+            "copy), then delivers WITHOUT a Redmine anchor and without fabricating "
+            "one — the forward counterpart of `handoff ticketless-callback`. "
+            "Requires --target-repo + --target-project and --to codex. The "
+            "worker-dispatch / implementation / domain-probe Redmine-anchor gate is "
+            "NOT relaxed (this rail forwards a consultation only). Fails closed (no "
+            "delivery) on missing / ambiguous resolution. Use the anchored "
+            "`project-gateway handoff` once a Redmine anchor exists for worker work."
+        ),
+    )
+    # Reuse the ticketless delivery knobs (no --source / --issue / --journal anchor
+    # flags, no --kind): the route's repo/project/role come from
+    # --target-repo / --target-project / --to, --target is resolved (not typed),
+    # and the forward consultation payload is injected programmatically on `found`.
+    _add_ticketless_delivery_options(consult)
+    consult.add_argument(
+        "--gateway-session",
+        dest="gateway_session",
+        default=None,
+        help=(
+            "Optional session or cockpit group to narrow the gateway resolution to "
+            "one candidate. Omit to resolve across separate windows/sessions."
+        ),
+    )
+    consult.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="On a fail-closed resolution, emit the GatewayResolution payload as JSON.",
+    )
+    consult.set_defaults(func=cmd_project_gateway_consult)

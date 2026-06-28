@@ -224,5 +224,109 @@ class HandoffCliTest(unittest.TestCase):
         orch.assert_not_called()
 
 
+class ConsultCliTest(unittest.TestCase):
+    """`project-gateway consult` — the forward no-anchor consultation (#12740)."""
+
+    def _consult_args(self, **overrides):
+        base = dict(
+            to="codex", target_repo=REPO, target_project=PROJECT, target=None,
+            gateway_session=None, as_json=False,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_refuses_when_missing_does_not_deliver(self):
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway.cmd_project_gateway_consult(self._consult_args())
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIn("gateway_missing", out.getvalue())
+
+    def test_found_delivers_no_anchor_consultation(self):
+        captured = {}
+
+        def fake_orch(args, **kwargs):
+            captured["target"] = args.target
+            captured["ticketless"] = kwargs.get("ticketless")
+            captured["ticketless_consultation"] = kwargs.get("ticketless_consultation")
+            captured["default_kind"] = kwargs.get("default_kind")
+            captured["consultation_kind"] = getattr(args, "consultation_kind", None)
+            captured["callback_to_role"] = getattr(args, "callback_to_role", None)
+            captured["callback_methods"] = getattr(args, "callback_methods", None)
+            captured["read_contract"] = getattr(args, "read_contract", None)
+            captured["transition_role"] = getattr(args, "transition_role", None)
+            captured["workflow_contract"] = getattr(args, "workflow_contract", None)
+            # The forward rail must never fabricate a Redmine anchor.
+            captured["source"] = getattr(args, "source", None)
+            captured["issue"] = getattr(args, "issue", None)
+            captured["journal"] = getattr(args, "journal", None)
+            return 0
+
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%gw")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway.cmd_project_gateway_consult(self._consult_args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["target"], "%gw")
+        self.assertTrue(captured["ticketless"])
+        self.assertTrue(captured["ticketless_consultation"])
+        self.assertEqual(captured["default_kind"], "design_consultation")
+        # The forward consultation payload is injected programmatically.
+        self.assertEqual(captured["consultation_kind"], "project_domain_consultation")
+        self.assertEqual(captured["callback_to_role"], "grandparent_coordinator")
+        self.assertEqual(
+            captured["callback_methods"],
+            ["ticketless_callback", "q_enter_consultation_callback"],
+        )
+        self.assertEqual(captured["read_contract"], "project_gateway")
+        # The same transition boundary + workflow contract auto-inject as handoff.
+        self.assertEqual(captured["transition_role"], "grandparent_coordinator")
+        self.assertEqual(captured["workflow_contract"], "grandparent_coordinator")
+        # No Redmine anchor was fabricated on the forward leg.
+        self.assertIsNone(captured["source"])
+        self.assertIsNone(captured["issue"])
+        self.assertIsNone(captured["journal"])
+
+    def test_fail_closed_does_not_inject_consultation_payload(self):
+        args = self._consult_args()
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude")]):
+            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway.cmd_project_gateway_consult(args)
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIsNone(getattr(args, "consultation_kind", None))
+        self.assertIsNone(getattr(args, "transition_role", None))
+
+    def test_rejects_explicit_target_pane_authority(self):
+        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+            with self.assertRaises(SystemExit):
+                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target="%99"))
+
+    def test_rejects_auto_target_repo(self):
+        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+            with self.assertRaises(SystemExit):
+                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target_repo="auto"))
+
+    def test_rejects_missing_target_project(self):
+        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+            with self.assertRaises(SystemExit):
+                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target_project=None))
+
+    def test_rejects_direct_claude_send(self):
+        with patch.object(cli_project_gateway, "_discover_candidates") as disc:
+            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+                with self.assertRaises(SystemExit):
+                    cli_project_gateway.cmd_project_gateway_consult(self._consult_args(to="claude"))
+        disc.assert_not_called()
+        orch.assert_not_called()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
