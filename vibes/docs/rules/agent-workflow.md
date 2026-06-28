@@ -101,6 +101,13 @@
 - Codex が誤って通常開発 task を直接実装した場合、その実行は task の正規完了に数えない。確認 task 中であれば自律フロー反映確認の成功条件にも数えない。
 - 上記の誤実装が発生した場合、対象 issue を未完了に戻し、誤実装の事実、影響範囲、後続対応(採用・破棄・再実装)の判断を Redmine に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。この correction flow は、検証対象の確認 issue に限らず、すべての通常開発 issue に適用する。
 
+## Architecture Boundary For Modularization
+
+- `src/**` / `tests/**` の分割・整理・新規設計を伴う通常開発では、単なる free function のファイル移動だけを architecture 改善として扱わない。対象 path の catalog resolve で `vibes/docs/logics/object-oriented-architecture-policy.md` を読み、command handler / use case / domain policy / value object / port-adapter のどこを改善する作業かを Redmine に記録する。
+- OOP-first は「すべてを class にする」ことではない。pure deterministic helper、serialization helper、局所 validation は function のままでよい。一方で、外部副作用、複数 step の状態遷移、workflow authority / routing / approval / send safety、test double を必要とする境界は named object / typed result / Protocol port へ寄せる。
+- `argparse.Namespace`、dict payload、raw subprocess / tmux / Redmine calls を use case deep layer へ流し続ける変更は、分割後も procedural coupling が残っているものとして residual を記録する。今回の scope で解消しない場合は、対応する OOP-first follow-up issue (例: #12638 / child task) へ明示的に引き継ぐ。
+- Codex review では、line count や module count だけで承認しない。authority-bearing orchestration が handler / use case / port boundary に近づいたか、または未対応 residual が durable issue に接続されているかを確認する。
+
 ## Codex Pre-Edit Classification Gate
 
 Codex は `apply_patch`、新規 file 作成、既存 file 更新、git commit の前に、対象変更がどの実装主体に属するかを分類する。分類を作業後に思い出して correction する運用を標準にしない。

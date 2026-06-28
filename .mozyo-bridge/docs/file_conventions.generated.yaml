@@ -47,8 +47,8 @@ rules:
   patterns:
   - src/mozyo_bridge/**/*.py
   severity: warn
-  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/logics/object-oriented-architecture-policy.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -104,9 +104,10 @@ rules:
   - src/mozyo_bridge/application/cli.py
   - src/mozyo_bridge/application/commands.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/safety.md
-    と @vibes/docs/logics/scaffold-rules.md と @vibes/docs/logics/release-helper-contract.md と @vibes/docs/logics/tmux-send-safety-contract.md
-    と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/runtime-observability-boundary.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @vibes/docs/logics/refactor-split-strategy.md
+    と @vibes/docs/logics/object-oriented-architecture-policy.md と @skills/mozyo-bridge-agent/references/safety.md と @vibes/docs/logics/scaffold-rules.md
+    と @vibes/docs/logics/release-helper-contract.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/logics/runtime-observability-boundary.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

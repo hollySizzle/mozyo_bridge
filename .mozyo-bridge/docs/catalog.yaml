@@ -1107,6 +1107,7 @@ file_conventions:
     document_refs:
       - spec-project-map
       - rule-project-agent-workflow
+      - logic-object-oriented-architecture-policy
       - skill-workflow-reference
 
   - id: fc-delegated-coordinator-runtime-source
@@ -1170,6 +1171,8 @@ file_conventions:
     document_refs:
       - spec-project-map
       - rule-project-agent-workflow
+      - logic-refactor-split-strategy
+      - logic-object-oriented-architecture-policy
       - skill-safety-reference
       - logic-scaffold-rules
       - logic-release-helper-contract
