@@ -81,6 +81,29 @@ class TimingTestResult(unittest.TextTestResult):
         super().addSkip(test, reason)
         self._outcomes[id(test)] = OUTCOME_SKIPPED
 
+    def addSubTest(
+        self, test: unittest.TestCase, subtest: unittest.TestCase, outcome: object
+    ) -> None:
+        # unittest reports each `with self.subTest(...)` block here, not via
+        # add{Success,Failure,Error}. A passing subtest has outcome=None and the
+        # parent's addSuccess still fires; but when a subtest FAILS, addSuccess
+        # is never called for the parent, so without this override stopTest would
+        # fall back to OUTCOME_PASSED and the summary would mis-record a failing
+        # test as passed (Redmine #12754 review j#67789). Record the parent's
+        # outcome as failed/errored so outcome_counts matches the suite verdict.
+        super().addSubTest(test, subtest, outcome)
+        if outcome is None:
+            return
+        if issubclass(outcome[0], test.failureException):
+            new_outcome = OUTCOME_FAILED
+        else:
+            new_outcome = OUTCOME_ERRORED
+        # An error is more severe than a failure: never downgrade an already
+        # errored parent to failed when a later subtest only fails.
+        if self._outcomes.get(id(test)) == OUTCOME_ERRORED:
+            return
+        self._outcomes[id(test)] = new_outcome
+
     def addExpectedFailure(self, test: unittest.TestCase, err: object) -> None:
         super().addExpectedFailure(test, err)
         # An expected failure is a passing outcome for the suite.

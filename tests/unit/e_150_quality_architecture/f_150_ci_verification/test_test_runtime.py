@@ -291,6 +291,65 @@ class TimingTestResultTest(unittest.TestCase):
         for timing in result.timings:
             self.assertGreaterEqual(timing.duration, 0.0)
 
+    def _run_one(self, case_cls, method):
+        suite = unittest.TestSuite([case_cls(method)])
+        runner = unittest.TextTestRunner(
+            stream=io.StringIO(), verbosity=0, resultclass=TimingTestResult
+        )
+        return runner.run(suite)
+
+    def test_failing_subtest_is_recorded_failed_not_passed(self) -> None:
+        # Regression for Redmine #12754 review j#67789: a failing subTest() must
+        # not be summarized as passed. unittest skips addSuccess for the parent
+        # when a subtest fails, so the outcome must come from addSubTest.
+        class _SubtestFail(unittest.TestCase):
+            def test_subtest_failure(self) -> None:
+                for i in range(3):
+                    with self.subTest(i=i):
+                        self.assertNotEqual(i, 1)  # fails on i == 1
+
+        result = self._run_one(_SubtestFail, "test_subtest_failure")
+        self.assertFalse(result.wasSuccessful())
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(len(result.timings), 1)
+        self.assertEqual(result.timings[0].outcome, OUTCOME_FAILED)
+        # And it propagates into the summary's outcome_counts.
+        summary = summarize(result.timings, budget=RuntimeBudget())
+        self.assertEqual(summary.outcome_counts[OUTCOME_FAILED], 1)
+        self.assertEqual(summary.outcome_counts[OUTCOME_PASSED], 0)
+
+    def test_erroring_subtest_is_recorded_errored(self) -> None:
+        class _SubtestError(unittest.TestCase):
+            def test_subtest_error(self) -> None:
+                with self.subTest(step="boom"):
+                    raise RuntimeError("boom")  # not an assertion -> errored
+
+        result = self._run_one(_SubtestError, "test_subtest_error")
+        self.assertFalse(result.wasSuccessful())
+        self.assertEqual(result.timings[0].outcome, OUTCOME_ERRORED)
+
+    def test_error_subtest_takes_precedence_over_failure(self) -> None:
+        class _SubtestMixed(unittest.TestCase):
+            def test_mixed(self) -> None:
+                with self.subTest(kind="fail"):
+                    self.assertTrue(False)
+                with self.subTest(kind="error"):
+                    raise RuntimeError("boom")
+
+        result = self._run_one(_SubtestMixed, "test_mixed")
+        self.assertEqual(result.timings[0].outcome, OUTCOME_ERRORED)
+
+    def test_all_passing_subtests_recorded_passed(self) -> None:
+        class _SubtestPass(unittest.TestCase):
+            def test_all_pass(self) -> None:
+                for i in range(3):
+                    with self.subTest(i=i):
+                        self.assertGreaterEqual(i, 0)
+
+        result = self._run_one(_SubtestPass, "test_all_pass")
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(result.timings[0].outcome, OUTCOME_PASSED)
+
 
 class _FakeResult:
     def __init__(self, successful: bool) -> None:
