@@ -20,6 +20,10 @@ from mozyo_bridge.application.commands_tmux_ui import (
     cmd_tmux_ui_status,
     cmd_tmux_ui_uninstall,
 )
+from mozyo_bridge.application.commands_agents import (
+    _attention_for_candidate,
+    cmd_agents_attention_project,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KINDS,
     AGENT_KIND_CLAUDE,
@@ -259,48 +263,6 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     return 0
 
 
-# Reason code for the conservative pre-wiring attention projection (#11952):
-def _attention_for_candidate(candidate, observed_at: str):
-    """Derive a conservative :class:`AttentionRecord` for one target (#11952).
-
-    First read-only exposure of the #11951 attention read model. No durable
-    attention source is wired yet, so this never fabricates an
-    owner/review/blocked/stalled signal: it only distinguishes a cleanly
-    identified target (``healthy``, reason ``no_attention_source``) from one
-    whose identity itself is ambiguous / unreadable (``unknown``). Later
-    extraction tasks feed real durable / observed signals into the same pure
-    :func:`derive_attention`; this stays an additive projection and is never used
-    for routing / target selection. Delegates to the shared
-    :func:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.conservative_attention` so this and the
-    cockpit ``/api/units`` join (#12007) cannot drift.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-        CONFIDENCE_NONE,
-        ROLE_SOURCE_UNKNOWN,
-    )
-    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
-        ROLE_CLAUDE,
-        ROLE_CODEX,
-        conservative_attention,
-    )
-
-    identity_readable = (
-        candidate.role in (ROLE_CLAUDE, ROLE_CODEX)
-        and candidate.confidence != CONFIDENCE_NONE
-        and candidate.role_source != ROLE_SOURCE_UNKNOWN
-    )
-    return conservative_attention(
-        observed_at=observed_at,
-        role=candidate.role,
-        identity_readable=identity_readable,
-        contradictory=bool(candidate.ambiguous),
-        host=candidate.host or "local",
-        workspace_id=candidate.workspace_id or "",
-        lane_id=candidate.lane_id or "default",
-        pane_id=candidate.pane_id,
-    )
-
-
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
@@ -383,99 +345,17 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
     )
 
 
-def cmd_agents_attention_project(args: argparse.Namespace) -> int:
-    """Project derived attention onto tmux pane user options (Redmine #11954).
-
-    Writes a re-derivable **projection cache** of the #11951 ``AttentionRecord``
-    (derived conservatively, #11952) onto each discovered target's tmux pane user
-    options: ``@mozyo_attention_state`` / ``@mozyo_attention_severity`` /
-    ``@mozyo_attention_reason`` / ``@mozyo_attention_updated_at``.
-
-    Boundaries:
-
-    - **Projection cache only.** The source of truth stays the durable state /
-      the ``derive_attention`` read model; these user options are a cache that
-      can be deleted and re-derived. They are never consulted for routing /
-      handoff preflight / target resolution.
-    - **Safe by default.** Default is a preview (no tmux mutation) that prints
-      the exact ``set-option`` plan per pane; ``--apply`` performs the writes
-      best-effort (a failed option write never aborts the run, like other
-      best-effort projections). ``--dry-run`` forces preview and wins over
-      ``--apply``.
-    - **No color / ``agent-ui.conf`` / iTerm changes** here — this task only
-      writes the machine-readable user options; rendering them is a later task.
-    """
-    from mozyo_bridge.application.attention_projection import (
-        build_attention_option_plan,
-    )
-
-    require_tmux()
-    candidates = _agents_target_candidates(args)
-
-    from datetime import datetime, timezone
-
-    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # Safe default: preview unless --apply is given; --dry-run always wins.
-    apply = bool(getattr(args, "apply", False)) and not bool(
-        getattr(args, "dry_run", False)
-    )
-
-    # Apply (when requested) happens here once, before any output branch, so
-    # `--json --apply` and text `--apply` perform identical writes and both
-    # report the true outcome — the JSON branch must never claim ``applied`` while
-    # mutating nothing (Redmine #11954 review #58539). Preview never writes.
-    # ``applied_ok`` is True/False per target only when a write was attempted, and
-    # None in preview.
-    plans = []
-    for c in candidates:
-        record = _attention_for_candidate(c, observed_at)
-        commands_plan = build_attention_option_plan(c.pane_id, record)
-        applied_ok: bool | None = None
-        if apply:
-            applied_ok = True
-            for argv in commands_plan:
-                if run_tmux(*argv, check=False).returncode != 0:
-                    # Best-effort: a failed option write is recorded, not raised
-                    # (projection-cache posture); the run still finishes.
-                    applied_ok = False
-        plans.append((c, record, commands_plan, applied_ok))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [
-            {
-                "pane_id": c.pane_id,
-                "attention": record.as_payload(),
-                "applied": apply,
-                "applied_ok": applied_ok,
-                "plan": [list(argv) for argv in commands_plan],
-            }
-            for c, record, commands_plan, applied_ok in plans
-        ]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    if not plans:
-        print("no agent targets discovered; nothing to project")
-        return 0
-
-    for c, record, commands_plan, applied_ok in plans:
-        label = (
-            f"{c.pane_id or '-'} {record.attention_state}/{record.severity} "
-            f"({record.reason_code})"
-        )
-        if not apply:
-            print(f"(dry-run) {label}")
-            for argv in commands_plan:
-                print("  tmux " + " ".join(argv))
-            continue
-        print(
-            f"projected {label}"
-            if applied_ok
-            else f"warning: partial projection {label}"
-        )
-    return 0
+# ``cmd_agents_attention_project`` (and the shared ``_attention_for_candidate``
+# helper) were relocated to :mod:`mozyo_bridge.application.commands_agents` as the
+# OOP-first attention-projection tranche (Redmine #12749 / #12638 / #12785): the
+# tmux pane-option *write* now goes through a ``TmuxOptionWriterPort`` driven by a
+# ``ProjectAttentionUseCase`` returning typed ``AttentionProjectionEntry`` value
+# objects (fake-port tested), replacing the naked ``run_tmux`` apply loop. Both are
+# re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_agents_attention_project`` /
+# ``_attention_for_candidate`` keep their identity. The shared
+# ``_agents_target_candidates`` discovery pipeline and the ``agents list`` /
+# ``agents targets`` read handlers below remain here (residual to #12638 / #12785).
 
 
 def cmd_agents_targets(args: argparse.Namespace) -> int:

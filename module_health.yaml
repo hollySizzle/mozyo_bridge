@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6902
+    lines: 6782
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -172,6 +172,16 @@ allowlist:
       monkeypatch / parser-binding surface is unchanged. Baseline ratcheted to the
       post-extraction size; residual procedural orchestration (cockpit / handoff /
       agents / status / notify / init) is carried to #12638 / #12785.
+      Lowered 6902 -> 6782 for the #12749 second OOP-first tranche: the `agents
+      attention-project` handler + the shared `_attention_for_candidate` helper
+      moved to the new `application/commands_agents.py`, with the tmux pane-option
+      *write* behind the new `application/tmux_option_port.py` `TmuxOptionWriterPort`
+      driven by a `ProjectAttentionUseCase` returning typed `AttentionProjectionEntry`
+      value objects (fake-port test; the old `commands.run_tmux` monkeypatch seam for
+      this write is retired). `commands.py` re-exports both symbols (identity / parser
+      binding / `_attention_for_candidate` import preserved). The shared
+      `_agents_target_candidates` discovery pipeline and the `agents list` / `agents
+      targets` read handlers remain here as residual to #12638 / #12785.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
