@@ -32,6 +32,64 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 7. Treat internal beta distribution as complete after TestPyPI install validation.
 8. Decide production PyPI release separately and only when explicitly requested.
 
+## Automated TestPyPI Dev Publish (main CI)
+
+`.github/workflows/testpypi.yml` publishes a unique TestPyPI dev artifact
+automatically after the `Test` workflow succeeds on `main` (Redmine #12756).
+This keeps a normal-PATH-installable artifact aligned with `main` for real
+smoke work (e.g. #12709) instead of relying on source-runtime or
+`PYTHONPATH=src`.
+
+- Trigger: `workflow_run` on `Test` (`completed`, `branches: [main]`); the job
+  publishes only when `workflow_run.conclusion == 'success'`.
+- Version: the job runs `scripts/compute_testpypi_dev_version.py`, which appends
+  a PEP 440 `.dev<UTC-timestamp>` segment to the committed
+  `pyproject.toml` version (e.g. `0.9.2.dev20260628090000`). The rewrite is
+  ephemeral in the CI checkout and is never committed, so repeated `main`
+  commits get unique, non-colliding TestPyPI versions while the committed
+  release version is untouched.
+- Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`,
+  `id-token: write`). The automatic path stays in the same `testpypi.yml`
+  workflow file as the manual dispatch so the existing TestPyPI pending
+  publisher (workflow `testpypi.yml`) keeps authorizing it. No local PyPI
+  tokens.
+- Manual `workflow_dispatch` is unchanged: it builds the committed (static)
+  release version for exact-version release-candidate validation.
+- Evidence: the dev-publish job writes the `version` and `commit` SHA (plus the
+  source CI run URL) to the workflow run's job summary. Read the mapping there.
+
+Production PyPI stays separate. This workflow never publishes to production
+PyPI, never tags, and never creates a GitHub Release (the production
+`publish.yml` runs on `release: published`).
+
+## Local pipx Dev Runtime Alignment
+
+Align the normal-PATH pipx runtime (default `~/.local/bin/mozyo-bridge`) with a
+published TestPyPI dev artifact, then verify the CLI surface — not
+`--version` alone:
+
+```bash
+# Pin the EXACT version from the 'Publish to TestPyPI' run summary
+scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000
+# or, less reproducibly, the newest pre-release:
+scripts/install_testpypi_dev.sh latest
+```
+
+The script installs with the pip backend (TestPyPI for `mozyo-bridge`, PyPI for
+dependencies, `--pre`, `--force`) and verifies the installed surface:
+
+- `mozyo-bridge --version` and `mozyo --version` (required)
+- `mozyo-bridge project-gateway consult --help` (required)
+- `mozyo-bridge workflow step --help` (future #12755 — reported PENDING, not a
+  failure, against artifacts built before it ships)
+
+To tie smoke evidence to a commit: record BOTH the installed
+`mozyo-bridge --version` string AND the commit SHA it maps to (from the
+`Publish to TestPyPI` run summary) in the Redmine smoke-evidence journal. The
+version alone is insufficient — different `main`, TestPyPI, and PyPI builds can
+share a base version string while shipping different command/preset/skill
+content.
+
 ## Release Artifact Guardrails
 
 Do not rely on `mozyo-bridge --version` alone. It reports the package version
