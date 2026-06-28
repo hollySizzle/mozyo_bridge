@@ -151,8 +151,8 @@ product evidence として認めるもの:
 
 - grandparent が Redmine smoke issue / prior journal / expected route を読まず、routing
   metadata だけで project gateway を分類または fail-closed する。
-- parent project gateway が明示 role と workflow contract を受け取り、domain 判断を
-  grandparent に横取りされず、必要なら Redmine anchor 境界を返す。
+- parent project gateway が明示 role と workflow contract を受け取り、domain/design 判断を
+  自身でも grandparent でも吸収せず、Redmine anchor 境界を作って child coordinator へ橋渡しする。
 - child / grandchild へ進む場合、Redmine anchor、callback target、no-dispatch reason が
   durable record で replay できる。
 - callback / hands-off が pane 上の自然文ではなく、standard transport または durable anchor

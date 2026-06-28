@@ -160,19 +160,21 @@ Full PASS に必要な条件:
   `implementation_worker` として delivery record に残る。
 - Redmine journal から baseline、parent decision、child handoff、grandchild realization、
   worker confirmation、callback outcome を replay できる。
-- ticketless consultation が `implementation_not_needed`、`no_dispatch`、`blocked`、
-  `anchor_required` で止まる場合でも、receiver が caller lane へ structured
-  `consultation_result` / hands-off を返している。pane 上の自然文回答だけを callback
-  evidence にしていない。
+- ticketless consultation が `blocked` / `anchor_required` で止まる場合でも、receiver が caller
+  lane へ structured hands-off を返している。pane 上の自然文回答だけを callback evidence にしていない。
+- parent project gateway が domain/design answer を吸収せず、domain 判断が必要な相談を
+  Redmine anchor 付きで child coordinator へ渡している。親が `implementation_not_needed` /
+  `no_dispatch` を domain/design 判断として返して閉じた run は full PASS ではない。
 - stale pane / stale worktree / stale journal を success evidence に使っていない。
 - direct cross-project Claude send と hidden subagent を使っていない。
 
 ## Failure Classification
 
 - `failed_acceptance`: 親が自律 delegation できない、子 / 孫 window が必要なのに起動しない、
-  direct Claude send など invariant 違反がある。
+  parent が domain/design answer を吸収する、direct Claude send など invariant 違反がある。
 - `insufficient`: 3 層 projection の一部だけ見えたが、外部親 project 起点の autonomous route
-  ではない、または parent prompt に test oracle が混入している。
+  ではない、parent prompt に test oracle が混入している、または parent が child coordinator
+  へ渡さず design-level answer だけで相談を閉じている。
 - `contaminated`: receiver が禁止された management issue / prior smoke / injected route
   context を読んだ。
 - `blocked`: required tool / pane / config / durable work system が不足し、PASS/FAIL を判断
