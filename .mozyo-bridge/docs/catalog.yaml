@@ -570,6 +570,37 @@ documents:
       - rule-docs-catalog-governance
       - spec-project-map
 
+  - id: logic-workflow-step-command-design
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workflow-step-command-design.md
+    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、Redmine issue 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
+    audit_role: workflow_step_command_design_logic
+    related_document_refs:
+      - logic-ticketless-project-gateway-runtime-ux
+      - logic-workflow-command-as-is
+      - logic-project-scoped-workspace-identity
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - logic-coordinator-sublane-development-flow
+      - rule-project-agent-workflow
+      - rule-docs-catalog-governance
+      - spec-project-map
+
+  - id: logic-workflow-command-as-is
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workflow-command-as-is.html
+    purpose: "workflow / handoff / project-gateway command surface の as-is と to-be 対比を人間向け HTML で説明する補助資料。通常入口、引数、route 解決、祖父→親、親→子、子→孫、callback、pane ID、delivery rail、debug command、失敗時の扱いを表で整理する。設計方針の正本は `logic-workflow-step-command-design`。"
+    audit_role: workflow_command_as_is_logic
+    related_document_refs:
+      - logic-workflow-step-command-design
+      - logic-ticketless-project-gateway-runtime-ux
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - rule-docs-catalog-governance
+      - spec-project-map
+
   - id: logic-acceptance-rerun-protocol
     type: logic
     status: active
@@ -1499,3 +1530,18 @@ file_conventions:
       - logic-ack-completion-receiver-state
       - logic-autonomous-ticket-entrypoint
       - skill-safety-reference
+
+  - id: fc-workflow-step-command-docs
+    name: workflow step command design and command taxonomy docs
+    patterns:
+      - vibes/docs/logics/workflow-step-command-design.md
+      - vibes/docs/logics/workflow-command-as-is.html
+      - vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
+    severity: block
+    document_refs:
+      - logic-workflow-step-command-design
+      - logic-workflow-command-as-is
+      - logic-ticketless-project-gateway-runtime-ux
+      - spec-route-identity-ledger
+      - logic-tmux-send-safety-contract
+      - rule-project-agent-workflow

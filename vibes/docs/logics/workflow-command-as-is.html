@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mozyo-bridge workflow command as-is</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #5d6878;
+      --line: #d9dee7;
+      --accent: #176b87;
+      --warn: #9a5b00;
+      --bad: #a33232;
+      --good: #287146;
+      --code: #eef3f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 20px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 32px 0 12px;
+      font-size: 21px;
+      letter-spacing: 0;
+    }
+    h3 {
+      margin: 20px 0 8px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+    p { margin: 8px 0; }
+    .lead {
+      color: var(--muted);
+      max-width: 900px;
+    }
+    .notice {
+      border-left: 4px solid var(--accent);
+      background: var(--panel);
+      padding: 12px 14px;
+      margin: 18px 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 14px 0 24px;
+    }
+    .box {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 120px;
+    }
+    .box strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+    .tag {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-size: 12px;
+      color: var(--muted);
+      background: #fff;
+      white-space: nowrap;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      margin: 12px 0 22px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #eef2f5;
+      font-size: 13px;
+      color: #26323f;
+    }
+    tr:last-child td { border-bottom: 0; }
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    .flow {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+      line-height: 1.55;
+    }
+    .bad { color: var(--bad); font-weight: 600; }
+    .warn { color: var(--warn); font-weight: 600; }
+    .good { color: var(--good); font-weight: 600; }
+    ul { padding-left: 22px; }
+    @media (max-width: 820px) {
+      .grid { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+      h1 { font-size: 25px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>mozyo-bridge workflow command as-is</h1>
+    <p class="lead">
+      現状の workflow / handoff / project-gateway コマンド体系を、通常運用で AI が何を見てしまうかという観点で整理する。
+      これは to-be 設計ではなく、#12755 Add role-based workflow dispatch command without pane-id selection の前提となる as-is 説明である。
+    </p>
+  </header>
+
+  <section>
+    <h2>一言でいう現状</h2>
+    <div class="notice">
+      現状は「標準入口」「専門 primitive」「delivery rail」「debug pane I/O」が同じ CLI 階層に見えている。
+      そのため AI が本来 mozyo-bridge に任せるべき route / pane / rail 選択を、自分で判断し始める余地がある。
+    </div>
+    <div class="grid">
+      <div class="box">
+        <strong>route は意味的に解ける</strong>
+        <p><code>project-gateway route-plan</code> や <code>consult</code> は semantic identity を使う方向に進んでいる。</p>
+      </div>
+      <div class="box">
+        <strong>入口が分裂している</strong>
+        <p><code>project-gateway</code>、<code>handoff</code>、<code>q-enter</code>、<code>delegate-*</code> を利用者が選ぶ形になっている。</p>
+      </div>
+      <div class="box">
+        <strong>pane / rail が漏れている</strong>
+        <p><code>%pane</code>、<code>--target</code>、<code>--mode</code> が通常候補に見え、debug と標準運用の境界が薄い。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>コマンド分類</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>分類</th>
+          <th>as-is コマンド</th>
+          <th>意味合い</th>
+          <th>通常 AI が選ぶべきか</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="tag">project gateway primitive</span></td>
+          <td><code>project-gateway resolve</code><br><code>project-gateway adopt</code><br><code>project-gateway route-plan</code></td>
+          <td>project gateway / one-step-down route を semantic identity で read-only 解決する。</td>
+          <td><span class="warn">状況確認では使う</span>。ただし標準実行入口として毎回 AI が選ぶには細かすぎる。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">ticketless forward</span></td>
+          <td><code>project-gateway consult</code><br><code>project-gateway child-intake</code> (#12748 branch)</td>
+          <td>Redmine anchor なしで、祖父から親、親から子へ ticketless な相談 / intake を送る。</td>
+          <td><span class="warn">現状は選んでいる</span>。to-be では <code>workflow step</code> が内部で選ぶべき。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">anchored handoff</span></td>
+          <td><code>handoff send</code><br><code>handoff reply</code><br><code>reply</code><br><code>project-gateway handoff</code></td>
+          <td>Redmine / Asana anchor に紐づく標準 agent 通知。worker dispatch など anchor 必須の実作業に使う。</td>
+          <td><span class="warn">実装依頼では使う</span>。ただし lane role 判定は上位 command が持つべき。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">ticketless callback</span></td>
+          <td><code>handoff ticketless-callback</code><br><code>handoff q-enter --intent consultation_callback</code></td>
+          <td>Redmine anchor なしで blocked / anchor_required / consultation_result を caller lane に返す。</td>
+          <td><span class="warn">現状は候補に出る</span>。to-be では callback rail として内部化するべき。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">rail selector</span></td>
+          <td><code>handoff q-enter</code></td>
+          <td>intent から delivery rail と anchor requirement を選ぶ LLM-facing front door。</td>
+          <td><span class="bad">通常入口としてはまだ低すぎる</span>。<code>--target</code> / <code>--mode</code> / rail 語彙が見えすぎる。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">delegation helper</span></td>
+          <td><code>handoff delegate-launch-adopt</code><br><code>handoff delegate-grandchild-dispatch</code><br><code>handoff delegate-grandchild-stamp</code><br><code>handoff delegate-grandchild-gate</code></td>
+          <td>delegated coordinator / grandchild lane の launch/adopt 判定、stamp、gate 判定を行う詳細 primitive。</td>
+          <td><span class="bad">通常 AI が直接選ぶには細かい</span>。state machine 内部の部品に寄せるべき。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">compatibility</span></td>
+          <td><code>notify-codex</code><br><code>notify-claude</code><br><code>notify-*-legacy-task</code></td>
+          <td>過去互換 wrapper。標準 handoff primitive に乗るものと、退役 queue cleanup 用が混在する。</td>
+          <td><span class="bad">新規標準フローでは選ばない</span>。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">debug pane I/O</span></td>
+          <td><code>read</code><br><code>message</code><br><code>type</code><br><code>keys</code><br><code>%pane</code></td>
+          <td>pane inspect / raw message / raw typing / key-send。operator debug 用。</td>
+          <td><span class="bad">workflow delivery evidence にしない</span>。標準 recovery にも使わない。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>as-is の祖父・親・子・孫フロー</h2>
+    <div class="flow">Operator / ticketless request
+  -> grandparent lane
+       uses: project-gateway route-plan
+       then: project-gateway consult
+
+  -> parent project_gateway lane
+       should not answer domain/design
+       uses: project-gateway route-plan --from-role project_gateway
+       then: project-gateway child-intake (#12748 branch)
+
+  -> child delegated_coordinator lane
+       decides create/select/block Redmine anchor
+       if anchor ready:
+         uses: handoff send --source redmine --kind implementation_request
+
+  -> grandchild implementation_worker lane
+       executes Redmine-governed work
+       records implementation_done / review_request
+       returns via anchored reply/callback path
+
+  -> child -> parent -> grandparent
+       uses: handoff ticketless-callback
+       or: handoff q-enter --intent consultation_callback</div>
+  </section>
+
+  <section>
+    <h2>as-is の無理が出る箇所</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>問題</th>
+          <th>具体例</th>
+          <th>起きる失敗</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>AI が command family を選ぶ必要がある</td>
+          <td><code>consult</code> か <code>child-intake</code> か <code>q-enter</code> かを実行時に探索する。</td>
+          <td>smoke evidence に runtime command exploration が混ざる。</td>
+        </tr>
+        <tr>
+          <td>AI が role 判断を吸収しやすい</td>
+          <td>親が child に渡す前に domain/design answer や no-dispatch を判断する。</td>
+          <td>親は交通整理だけという役割境界が崩れる。</td>
+        </tr>
+        <tr>
+          <td>pane / rail が表に出る</td>
+          <td><code>--target %pane</code>、<code>--from-pane</code>、<code>--mode queue-enter</code> を人間や AI が扱う。</td>
+          <td>semantic identity ではなく pane ID / rail 選択が evidence に見える。</td>
+        </tr>
+        <tr>
+          <td>read-only と side-effect が混在する</td>
+          <td><code>route-plan</code> は read-only、<code>consult</code> は delivery、<code>stamp</code> は mutation。</td>
+          <td>一歩進めたいだけなのに、どれが安全な一歩かを AI が判断する。</td>
+        </tr>
+        <tr>
+          <td>callback が自然文回答と混同されやすい</td>
+          <td>pane 上に返事を書いて止まり、<code>ticketless-callback</code> を呼ばない。</td>
+          <td>caller lane が durable に結果を受け取れない。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>客観的な評価</h2>
+    <p>
+      as-is は部品としてはかなり揃っている。特に semantic route resolution、ticketless callback、
+      root-to-project consultation、parent-to-child intake はそれぞれ必要な primitive である。
+      ただし、AI / operator 向けの標準 UX としては command が多すぎる。
+    </p>
+    <p>
+      問題は primitive の存在ではなく、primitive が通常入口として露出していることにある。
+      AI に <code>q-enter</code>、<code>queue-enter</code>、<code>%pane</code>、<code>delegate-*</code> を選ばせる限り、
+      workflow は「mozyo が自動解決する」状態にならない。
+    </p>
+  </section>
+
+  <section>
+    <h2>as-is / to-be 対比</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>観点</th>
+          <th>as-is</th>
+          <th>to-be</th>
+          <th>狙い</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>通常入口</td>
+          <td><code>project-gateway consult</code>、<code>child-intake</code>、<code>handoff send</code>、<code>q-enter</code> などを状況ごとに選ぶ。</td>
+          <td><code>mozyo-bridge workflow step</code> を基本入口にする。</td>
+          <td>AI / operator が command family を選ばず、mozyo が state から一歩を解決する。</td>
+        </tr>
+        <tr>
+          <td>引数</td>
+          <td><code>--to</code>、<code>--target</code>、<code>--target-repo</code>、<code>--target-project</code>、<code>--mode</code>、<code>--from-pane</code> などが通常候補に出る。</td>
+          <td>原則引数なし。必要時だけ <code>--dry-run</code>、<code>--json</code>、<code>--confirm</code>。</td>
+          <td>role / pane / rail / project identity の解決を CLI 側へ閉じ込める。</td>
+        </tr>
+        <tr>
+          <td>route 解決</td>
+          <td>AI が <code>route-plan</code> をいつ使うか判断する。</td>
+          <td><code>workflow step</code> が current lane role と durable gate から必要な route-plan を内部実行する。</td>
+          <td>route 解決を事前手順ではなく state machine の一部にする。</td>
+        </tr>
+        <tr>
+          <td>祖父→親</td>
+          <td><code>project-gateway route-plan</code> + <code>project-gateway consult</code>。</td>
+          <td><code>workflow step</code> が parent gateway を解決し、ticketless consultation を送る。</td>
+          <td>祖父は project-domain 判断をせず、routing だけを安全に進める。</td>
+        </tr>
+        <tr>
+          <td>親→子</td>
+          <td><code>project-gateway route-plan --from-role project_gateway</code> + <code>project-gateway child-intake</code>。</td>
+          <td><code>workflow step</code> が child coordinator route を解決し、ticketless work-intake を送る。</td>
+          <td>親が domain/design 判断を吸収せず、交通整理だけ行う。</td>
+        </tr>
+        <tr>
+          <td>子→孫</td>
+          <td>子が anchor を確保後、<code>handoff send --source redmine --kind implementation_request</code> を選ぶ。</td>
+          <td><code>workflow step</code> が anchor 有無を検査し、anchor ready の場合だけ worker dispatch primitive を内部実行する。</td>
+          <td>worker dispatch の Redmine anchor 必須条件を CLI が fail-closed に守る。</td>
+        </tr>
+        <tr>
+          <td>callback</td>
+          <td><code>handoff ticketless-callback</code> と <code>handoff q-enter --intent consultation_callback</code> を選ぶ。</td>
+          <td><code>workflow step</code> が pending callback を検出して標準 callback rail を内部実行する。</td>
+          <td>pane 上の自然文回答で停止する失敗を減らす。</td>
+        </tr>
+        <tr>
+          <td>pane ID</td>
+          <td><code>%pane</code> が <code>--target</code> や <code>--from-pane</code> として通常説明に出る。</td>
+          <td>pane ID は cache / self-fence / debug evidence に限定し、route authority にしない。</td>
+          <td>semantic identity による fail-closed routing を徹底する。</td>
+        </tr>
+        <tr>
+          <td>delivery rail</td>
+          <td><code>queue-enter</code>、<code>standard</code>、<code>pending</code> を利用者が見て選べる。</td>
+          <td>rail は <code>workflow step</code> 内部の transport decision。通常 help では前面に出さない。</td>
+          <td>AI が raw Enter / marker / rollback を判断しない。</td>
+        </tr>
+        <tr>
+          <td>debug command</td>
+          <td><code>read</code>、<code>message</code>、<code>type</code>、<code>keys</code> が同じ top-level に並ぶ。</td>
+          <td>debug/operator namespace または help 上の明確な debug 分類へ退避する。</td>
+          <td>標準 delivery と pane mutation を混同しない。</td>
+        </tr>
+        <tr>
+          <td>失敗時</td>
+          <td>AI が別 command family を探索し、raw pane 操作や debug delivery に流れやすい。</td>
+          <td><code>workflow step</code> が <code>blocked</code> / <code>anchor_required</code> / <code>ambiguous</code> と次 owner を返して止まる。</td>
+          <td>失敗時も evidence を汚さず、durable record に戻す。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>to-be への示唆</h2>
+    <div class="notice">
+      as-is の自然な整理先は、通常 AI が <code>mozyo-bridge workflow step</code> だけを叩く形である。
+      <code>step</code> は現在の lane / Redmine gate / route identity / pending callback を読み、
+      安全に進められる 1 step だけ進め、判断が必要なら fail-closed で止まる。
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>to-be 階層</th>
+          <th>役割</th>
+          <th>as-is で吸収されるもの</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>workflow step</code></td>
+          <td>AI / operator の標準入口。引数なしを基本にする。</td>
+          <td><code>route-plan</code>、<code>consult</code>、<code>child-intake</code>、<code>ticketless-callback</code>、<code>handoff send</code></td>
+        </tr>
+        <tr>
+          <td><code>workflow status</code></td>
+          <td>現在 state と next action の read-only 表示。</td>
+          <td>個別の <code>route-plan</code> / pane read / manual Redmine sweep の一部</td>
+        </tr>
+        <tr>
+          <td>primitive / debug</td>
+          <td>互換、詳細検証、operator debug。</td>
+          <td><code>handoff q-enter</code>、<code>delegate-*</code>、<code>read/type/message/keys</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>

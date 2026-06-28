@@ -447,3 +447,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: workflow step command design and command taxonomy docs
+  patterns:
+  - vibes/docs/logics/workflow-step-command-design.md
+  - vibes/docs/logics/workflow-command-as-is.html
+  - vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/workflow-step-command-design.md と @vibes/docs/logics/workflow-command-as-is.html
+    と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/logics/tmux-send-safety-contract.md
+    と @vibes/docs/rules/agent-workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
