@@ -1,0 +1,44 @@
+# Test runtime budget (Redmine #12754).
+#
+# Read by `mozyo-bridge tests profile`. This file is the single, repo-root
+# location for the slow-test threshold AND the slow-test exception record, so
+# "which tests are allowed to be slow, and why" lives in one reviewable place
+# instead of scattered across test code. See
+# vibes/docs/logics/test-runtime-profiling-policy.md for the full contract.
+#
+# Behavior (acceptance #2 / #4):
+#   - a test whose measured duration is >= `slow_test_threshold_seconds` is
+#     *slow*;
+#   - a slow test listed under `exceptions` is `exempt` (an intentional,
+#     justified integration-style cost) — reported, not a violation;
+#   - a slow test NOT listed is a `violation` — reported by default, and able to
+#     fail an opt-in enforcing lane (`tests profile --enforce`);
+#   - slowness NEVER changes a test's pass/fail outcome. Profiling is additive,
+#     so a normal run is not made flaky by timing variance (reliability is not
+#     reduced). Enforcement is opt-in, off by default.
+#
+# A missing file resolves to the built-in default threshold with no exceptions
+# (the profiler runs before this budget is authored). A malformed file fails
+# closed so a broken budget never silently disables the slow-test signal.
+
+# Slow-test threshold in seconds. The built-in default is 1.0s (a unit test
+# slower than a second is worth surfacing). Raise per-test costs via `exceptions`
+# rather than raising this global value, which would hide every regression under
+# it.
+slow_test_threshold_seconds: 1.0
+
+# Slow-test exception allowlist. Each entry records a test that is allowed to
+# exceed the threshold and WHY (so the cost is a recorded decision, not silent
+# drift). Required fields: `test_id` (the unittest dotted id, as printed by
+# `tests profile`) and `reason`. `owner_issue` is optional but recommended.
+#
+# Example:
+#   exceptions:
+#     - test_id: "scenarios.test_turnkey_e2e.TurnkeyAcceptanceTest.test_full_flow"
+#       reason: "integration-style end-to-end flow; spins up real discovery"
+#       owner_issue: 12754
+#
+# Empty for now: the current unit suite has no test over the threshold. Add
+# entries as integration-style tests land, and prune `stale budget exceptions`
+# that `tests profile` reports (a listed test that is no longer slow).
+exceptions: []

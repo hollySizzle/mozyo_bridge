@@ -1042,6 +1042,17 @@ documents:
     related_document_refs:
       - spec-project-map
 
+  - id: logic-test-runtime-profiling-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/test-runtime-profiling-policy.md
+    purpose: "test runtime profiling と slow-test budget (Redmine #12754) の設計正本。`mozyo-bridge tests profile` の runtime summary、repo-root `test_runtime_budget.yaml` の slow-test threshold + 例外記録の置き場、verbose output の lane 別方針、profiling が通常テストの信頼性を落とさない不変条件 (verdict は suite が正本 / enforcement は opt-in)。"
+    audit_role: test_runtime_profiling_policy_logic
+    related_document_refs:
+      - logic-tests-placement-discovery-policy
+      - logic-module-health-gate
+      - spec-project-map
+
 file_conventions:
   - id: fc-agent-routers
     name: agent entrypoint routers
@@ -1208,6 +1219,19 @@ file_conventions:
     severity: block
     document_refs:
       - logic-module-health-gate
+      - spec-project-map
+
+  - id: fc-test-runtime-budget-source
+    name: test runtime profiling and slow-test budget source
+    patterns:
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_runtime.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_runtime.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_runtime.py
+      - test_runtime_budget.yaml
+    severity: block
+    document_refs:
+      - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
       - spec-project-map
 
   - id: fc-otel-event-store-source

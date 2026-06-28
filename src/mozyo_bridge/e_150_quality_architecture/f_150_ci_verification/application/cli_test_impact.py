@@ -1,21 +1,28 @@
-"""CLI parser registration for the ``tests`` family (Redmine #12752).
+"""CLI parser registration for the ``tests`` family (Redmine #12752 / #12754).
 
-Registers a thin top-level ``tests`` command with one subcommand:
+Registers a thin top-level ``tests`` command with the test-verification
+subcommands:
 
 - ``tests resolve`` — map changed source paths (explicit args, or git-derived
   via ``--staged`` / ``--all-changed``) to direct + bounded-context neighbor
-  tests, with a fail-closed full/neighbor fallback for unmapped paths.
+  tests, with a fail-closed full/neighbor fallback for unmapped paths
+  (Redmine #12752).
+- ``tests profile`` — run the suite with per-test timing and print a runtime
+  summary against the slow-test budget (Redmine #12754); registered from
+  :mod:`...application.cli_test_runtime`.
 
-The family is deliberately minimal: one subcommand, read-only, no routing /
-approval authority. New ``tests`` subcommands and the broader workflow-step
-command surface are coordinated with Redmine #12755; this lane adds only the
-impact resolver. Handlers live in :mod:`...application.commands_test_impact`;
-this module only wires the parser, matching the ``health`` family shape.
+The family stays read-only with no routing / approval authority. Handlers live
+in :mod:`...application.commands_test_impact` and
+:mod:`...application.commands_test_runtime`; this module wires the parser,
+matching the ``health`` family shape.
 """
 
 from __future__ import annotations
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_runtime import (
+    register_profile,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_impact import (
     cmd_tests_resolve,
 )
@@ -76,3 +83,5 @@ def register(sub) -> None:
         ),
     )
     resolve.set_defaults(func=cmd_tests_resolve)
+
+    register_profile(tests_sub)
