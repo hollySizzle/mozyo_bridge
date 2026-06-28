@@ -56,6 +56,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     cockpit_visible_from_candidate,
     resolve_relative_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_child_intake import (
+    register_child_intake,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
@@ -792,3 +795,10 @@ def register(sub) -> None:
         help="On a fail-closed resolution, emit the GatewayResolution payload as JSON.",
     )
     consult.set_defaults(func=cmd_project_gateway_consult)
+
+    # Redmine #12748: the parent -> child no-anchor work-intake leg. Its handler +
+    # parser live in `cli_project_gateway_child_intake` (extracted to keep this
+    # registrar module under the module-health line cap, like the
+    # `cli_handoff_ticketless` / `cli_handoff_q_enter` splits); register it here so
+    # the whole `project-gateway` subcommand tree is assembled in one place.
+    register_child_intake(gateway_sub)

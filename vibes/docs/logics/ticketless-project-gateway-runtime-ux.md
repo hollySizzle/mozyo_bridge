@@ -381,6 +381,11 @@ else child_intake_required
     fail if route resolves back to same parent lane
   end note
   Parent -> Child: handoff_ticketless_work_intake(ticketless_consultation, project_identity)
+  note right
+    primitive: project-gateway child-intake
+    no Redmine anchor; child owns the anchor decision
+    fail closed if route resolves back to the same parent lane
+  end note
 end
 
 activate Child
@@ -441,7 +446,7 @@ anchor、成功条件、失敗条件へ対応させる。CLI flag、必須 optio
 | transition | front-door primitive | durable anchor | success condition | fail condition |
 | --- | --- | --- | --- | --- |
 | 祖父 -> 親 | `project-gateway route-plan --from-role grandparent_coordinator` + `project-gateway consult` | ticketless の分類段階では不要。implementation に進む前に parent 以降で要求する。 | grandparent が routing metadata だけで parent project gateway を一意に解決または起動し、ticketless consultation を parent へ渡す。 | classification ambiguous、project gateway missing / ambiguous、semantic route identity 不一致、手打ち `%pane` を route authority として採用、project Claude への direct send、runtime command-family exploration を green evidence とする。 |
-| 親 -> 子 | `project-gateway route-plan --from-role project_gateway` + ticketless work-intake route | 親 -> 子の intake では不要。child が work shape を見て作業化する時点で作成または選択する。 | parent は直接調査・設計回答・実装判断をせず、project identity と ticketless consultation を child coordinator へ橋渡しする。 | parent direct design answer / investigation / implementation、Redmine anchor missing だけを理由に祖父へ返す、grandchild への direct send、child coordinator の route identity 不一致、route が parent 自身へ戻る、Claude 誤送信。 |
+| 親 -> 子 | `project-gateway route-plan --from-role project_gateway` + `project-gateway child-intake` | 親 -> 子の intake では不要。child が work shape を見て作業化する時点で作成または選択する。 | parent は直接調査・設計回答・実装判断をせず、project identity と ticketless work-intake を child coordinator へ橋渡しする。 | parent direct design answer / investigation / implementation、Redmine anchor missing だけを理由に祖父へ返す、grandchild への direct send、child coordinator の route identity 不一致、route が parent 自身へ戻る、Claude 誤送信。 |
 | 子 anchor intake | Redmine anchor creation / selection | child が domain/design/pilot/implementation work と判断した時点で必須。 | child が相談を作業単位に切る必要性を判断し、必要なら Redmine issue を作成または既存 issue / journal を選択する。作業化不要なら durable reason を記録する。 | child が anchor 判断をせず worker へ進む、anchor framing / 権限不足を blocked として返さない、親へ判断を戻す、owner close / review authority を代行。 |
 | 子 -> 孫 | `handoff send --source redmine --kind implementation_request` | 必須。grandchild worker は Redmine anchor を読めない限り実行しない。 | child が grandchild dispatch の可否を記録し、dispatch する場合は implementation worker が Redmine-governed work として実装・検証する。 | no-dispatch reason 未記録、route depth / owning route 不整合、worker realization 不明、Redmine anchor missing、hidden subagent 採用、Claude 誤送信。 |
 | 孫 -> 子 | Redmine-governed callback / reply rail | 必須。implementation_done / review_request / blocked は Redmine journal を正本にする。 | grandchild が implementation_done / review_request / blocked を Redmine に記録し、child へ state pointer を返す。 | queue-enter 不達を durable record で回収しない、work log 本文を callback 正本にする、Redmine journal なしの完了主張、child 以外への direct callback。 |
@@ -492,6 +497,47 @@ queue-enter は delivery rail であり、task 完了 signal ではない。queu
   `handoff send --kind implementation_request --source redmine --issue <id> --journal <id>` を使う。
 - 既存の Redmine-governed `handoff reply` / `reply` rail は不変で、引き続き `--issue` + `--journal`
   を必須とする。
+
+実 CLI flag / default / error wording は CLI help / parser / validation error を正本にする
+(`### Transition Contract Scope`)。本節は lane boundary と fail-closed 状態の契約だけを持つ。
+
+### Ticketless No-Anchor Work-Intake Primitive
+
+#12748 の正本である。matrix の `親 -> 子` 行 ticketless work-intake を、Redmine anchor
+を要しない product-standard delivery primitive として固定する。`### Ticketless No-Anchor
+Callback Primitive` (#12703) が *返却経路* を、`project-gateway consult` (#12740) が
+祖父 -> 親の *forward consultation* を埋めたのに対し、本 primitive は親 -> 子の *forward
+work-intake* を埋める。これが無いと、親 -> 子は concept-level route のままで、受信側が
+runtime command-family exploration を始め、smoke evidence が濁る。
+
+- 標準 primitive は `mozyo-bridge project-gateway child-intake` とする。`project-gateway
+  consult` の one-step-down sibling であり、child / implementation gateway
+  (`delegated_coordinator`) を semantic identity で解決し、Redmine anchor を carry せず、
+  偽装もせず work-intake を届ける。`--source` / `--issue` / `--journal` / `--task-id` を
+  受け取らない。
+- **semantic route identity で child を解決し、active / copied `%pane` を route authority
+  にしない。** child は project gateway と同型の live identity (strong project-scoped
+  Codex) なので、caller の自レーンを除外したうえで解決する。`--from-pane` は caller 自身の
+  lane id であり、**same-lane self-fence 専用** (child が parent 自身のレーンへ戻らないため)
+  であって、target を addressing する authority ではない。
+- **same-lane / missing / ambiguous は fail closed する。** child route が parent gateway 自身の
+  レーンへ戻る場合 (`same_lane`)、distinct child が存在しない場合 (`child_missing`)、複数の
+  distinct child が一致する場合 (`child_ambiguous`) は配送せず、次の安全な action を示す。
+  parent を自分の child として adopt しない。
+- **child が Redmine anchor 作成・選択・blocked を判断する。** 親は anchor を作らず、anchor が
+  無いことだけを理由に `anchor_required` を返さない。structured work-intake fields
+  (`work_shape` / `callback_to_role` / `callback_methods` / `read_contract` /
+  `anchor_decision_owner`、および固定 invariant `worker_dispatch_requires_anchor` /
+  `parent_must_not_answer_domain` / `child_owns_anchor_decision`) を **workflow request** として
+  carry し、transport outcome (`status` / `reason` / `notification_marker`) とは別 field に
+  記録する。delivery marker の source は `ticketless`。
+- **子 -> 孫 worker dispatch の anchor 要件は緩めない。** 実 worker execution / domain probe /
+  implementation dispatch を表す decision は本 work-intake rail で表現不能 (anchor も dispatch
+  token も無い)。child は実装に進む場合 Redmine anchor を作成し
+  `handoff send --kind implementation_request --source redmine --issue <id> --journal <id>` を使う。
+- child -> 親、親 -> 祖父の callback は `### Ticketless No-Anchor Callback Primitive` /
+  `### プロジェクトゲートウェイの consultation callback 返却契約` の no-anchor 返却経路を使い、
+  偽の Redmine anchor を要しない。
 
 実 CLI flag / default / error wording は CLI help / parser / validation error を正本にする
 (`### Transition Contract Scope`)。本節は lane boundary と fail-closed 状態の契約だけを持つ。

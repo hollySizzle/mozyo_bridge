@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6930
+    lines: 6983
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -151,6 +151,17 @@ allowlist:
       `project-gateway consult` handler in
       `f_120_agent_discovery_pane_resolution/application/cli_project_gateway.py`,
       not here.
+      Raised 6930 -> 6983 for the #12748 forward ticketless parent -> child
+      work-intake branch in `orchestrate_handoff`: a `ticketless_work_intake` mode
+      that builds the `TicketlessWorkIntake` payload + `TicketlessWorkIntakeAnchor`
+      (fail-closed on an unknown token; a worker dispatch cannot ride this rail) and
+      threads the forward payload through `build_notification_body` and the typed
+      terminal `make_outcome` paths alongside the #12740 consultation / #12703
+      callback. The work-intake values + invariants live in the new
+      `f_130_handoff_routing/domain/ticketless_work_intake.py`, the same-lane child
+      resolver in `f_120_.../domain/child_intake_route.py`, and the
+      `project-gateway child-intake` handler in
+      `f_120_.../application/cli_project_gateway_child_intake.py`, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -206,7 +217,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1809
+    lines: 1939
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -270,6 +281,18 @@ allowlist:
       anchor invariant live in the separate `domain/ticketless_consultation.py`
       (kept out of this module), so only the anchor/outcome/record plumbing lands
       here.
+      Raised 1809 -> 1939 for the #12748 forward ticketless parent -> child
+      work-intake rail: the `TicketlessWorkIntakeAnchor` value object (so the
+      standard marker/body/outcome rail works for the parent -> child leg without a
+      fabricated ticket anchor), the `ticketless_work_intake` field on
+      `DeliveryOutcome` / `make_outcome`, the work-intake noun branch + pointer
+      clause in `build_notification_body`, the work-intake discrimination in
+      `_anchor_pointer_or_dash`, and the `_ticketless_work_intake_lines` renderer +
+      `- Ticketless work-intake:` block in `build_delivery_record`. The work-intake
+      values + invariants (worker dispatch stays anchor-gated, parent must not answer
+      domain, child owns the anchor decision) live in the separate
+      `domain/ticketless_work_intake.py` (kept out of this module), so only the
+      anchor/outcome/record plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

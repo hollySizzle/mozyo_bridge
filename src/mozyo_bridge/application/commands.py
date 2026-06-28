@@ -50,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     TargetActivationOutcome,
     TicketlessAnchor,
     TicketlessConsultationAnchor,
+    TicketlessWorkIntakeAnchor,
     build_delivery_record,
     build_execution_root,
     build_inactive_pane_fallback_command,
@@ -82,6 +83,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
     TicketlessConsultation,
     TicketlessConsultationError,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
+    TicketlessWorkIntake,
+    TicketlessWorkIntakeError,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
     submit_record_lines,
@@ -4714,6 +4719,7 @@ def orchestrate_handoff(
     require_receiver_binding: bool = False,
     ticketless: bool = False,
     ticketless_consultation: bool = False,
+    ticketless_work_intake: bool = False,
 ) -> int:
     """High-level handoff/reply primitive.
 
@@ -4825,8 +4831,50 @@ def orchestrate_handoff(
     # built distinctly from the transport outcome and from the return-leg callback
     # above. `None` unless `ticketless_consultation=True`.
     ticketless_consultation_payload: TicketlessConsultation | None = None
+    # Redmine #12748: the structured forward ticketless work-intake (parent -> child
+    # forward leg), built distinctly from the transport outcome and from the
+    # grandparent->parent consultation / return callback above. `None` unless
+    # `ticketless_work_intake=True`.
+    ticketless_work_intake_payload: TicketlessWorkIntake | None = None
 
-    if ticketless and ticketless_consultation:
+    if ticketless and ticketless_work_intake:
+        # Redmine #12748: build the structured FORWARD work-intake payload, then
+        # derive the no-anchor `TicketlessWorkIntakeAnchor` from it. Construction
+        # fails closed (blocked / invalid_args) on an unknown token or an empty /
+        # unknown callback-method set. No anchor is fabricated (the child owns the
+        # anchor create/select/blocked decision) and the worker-dispatch anchor gate
+        # is not relaxed (a worker dispatch is not expressible on this work-intake
+        # rail; the payload restates the invariants for the child).
+        try:
+            ticketless_work_intake_payload = TicketlessWorkIntake(
+                work_shape=getattr(args, "work_shape", None),
+                callback_to_role=getattr(args, "callback_to_role", None),
+                callback_methods=getattr(args, "callback_methods", None),
+                read_contract=getattr(args, "read_contract", None),
+            )
+        except TicketlessWorkIntakeError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="invalid_args",
+                    receiver=receiver,
+                    target=None,
+                    anchor=None,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+        anchor = TicketlessWorkIntakeAnchor(
+            work_shape=ticketless_work_intake_payload.work_shape,
+            callback_to_role=ticketless_work_intake_payload.callback_to_role,
+        )
+    elif ticketless and ticketless_consultation:
         # Redmine #12740: build the structured FORWARD consultation payload, then
         # derive the no-anchor `TicketlessConsultationAnchor` from it. Construction
         # fails closed (blocked / invalid_args) on an unknown token or an empty /
@@ -5776,6 +5824,7 @@ def orchestrate_handoff(
             workflow_contract=workflow_contract_bundle,
             ticketless_callback=ticketless_callback_payload,
             ticketless_consultation=ticketless_consultation_payload,
+            ticketless_work_intake=ticketless_work_intake_payload,
         )
     except AnchorError as exc:
         _emit_outcome(
@@ -5795,6 +5844,7 @@ def orchestrate_handoff(
                 workflow_contract=workflow_contract_bundle,
                 ticketless_callback=ticketless_callback_payload,
                 ticketless_consultation=ticketless_consultation_payload,
+                ticketless_work_intake=ticketless_work_intake_payload,
             ),
             record_format=record_format,
             command=record_command,
@@ -5834,6 +5884,7 @@ def orchestrate_handoff(
             workflow_contract=workflow_contract_bundle,
             ticketless_callback=ticketless_callback_payload,
             ticketless_consultation=ticketless_consultation_payload,
+            ticketless_work_intake=ticketless_work_intake_payload,
         )
         _emit_outcome(
             outcome,
@@ -5872,6 +5923,7 @@ def orchestrate_handoff(
             workflow_contract=workflow_contract_bundle,
             ticketless_callback=ticketless_callback_payload,
             ticketless_consultation=ticketless_consultation_payload,
+            ticketless_work_intake=ticketless_work_intake_payload,
         )
         _emit_outcome(
             outcome,
@@ -5948,6 +6000,7 @@ def orchestrate_handoff(
         workflow_contract=workflow_contract_bundle,
         ticketless_callback=ticketless_callback_payload,
         ticketless_consultation=ticketless_consultation_payload,
+        ticketless_work_intake=ticketless_work_intake_payload,
     )
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually
