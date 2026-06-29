@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6472
+    lines: 6455
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -201,8 +201,16 @@ allowlist:
       unchanged). `cmd_agents_targets` reaches the residual discovery seam through
       the call-time `_discover_candidates` helper (so the `commands.*` discovery
       patches still apply) and its availability guard is now `commands_agents.require_tmux`
-      (4 test patch sites migrated). The legacy `list` (`cmd_list`) handler and the
-      `commands`-owned leaf reads remain residual to #12638 / #12785.
+      (4 test patch sites migrated).
+      Lowered 6472 -> 6455 for the #12749 fifth tranche: the legacy read-only `list`
+      handler (`cmd_list`) moved to `commands_agents.py` (re-exported as
+      `commands.cmd_list`; cli_core / cli parser binding unchanged). Its
+      `require_tmux` / `pane_lines` guard is now bound in `commands_agents`, so its one
+      test (`test_cmd_list_emits_window_column_in_place_of_label`) patches
+      `commands_agents.require_tmux` / `commands_agents.pane_lines`. The
+      `commands`-owned leaf reads (`resolve_canonical_session` / `_probe_checkout_facts`)
+      and the remaining orchestration (cockpit / handoff / status / notify / init)
+      stay residual to #12638 / #12785.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

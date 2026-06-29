@@ -67,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     fold_agents_by_pane,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
+    pane_lines,
     require_tmux,
 )
 from mozyo_bridge.shared.errors import die
@@ -572,6 +573,32 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
                     project_cell,
                     c.project_path or "-",
                     classify_target_kind(c),
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    """Legacy flat pane dump (the original ``list`` surface).
+
+    Read-only TARGET/LOCATION/PROCESS/WINDOW/CWD table over the live tmux panes.
+    Kept verbatim and re-exported as ``commands.cmd_list`` so existing scripts that
+    scrape this output and the ``list`` parser binding are unchanged; superseded
+    for agent routing by ``agents list`` / ``agents targets`` but retained for
+    compatibility.
+    """
+    require_tmux()
+    print("TARGET\tLOCATION\tPROCESS\tWINDOW\tCWD")
+    for pane in pane_lines():
+        print(
+            "\t".join(
+                [
+                    pane["id"],
+                    pane["location"],
+                    pane["command"],
+                    pane.get("window_name") or "-",
+                    pane["cwd"],
                 ]
             )
         )

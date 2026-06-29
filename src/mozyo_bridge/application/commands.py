@@ -26,6 +26,7 @@ from mozyo_bridge.application.commands_agents import (
     cmd_agents_attention_project,
     cmd_agents_list,
     cmd_agents_targets,
+    cmd_list,
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -169,24 +170,6 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
     """
     optional = bool(getattr(args, "config_path_was_default", False))
     return source_tmux_conf(config_path_from_args(args), optional=optional)
-
-
-def cmd_list(_: argparse.Namespace) -> int:
-    require_tmux()
-    print("TARGET\tLOCATION\tPROCESS\tWINDOW\tCWD")
-    for pane in pane_lines():
-        print(
-            "\t".join(
-                [
-                    pane["id"],
-                    pane["location"],
-                    pane["command"],
-                    pane.get("window_name") or "-",
-                    pane["cwd"],
-                ]
-            )
-        )
-    return 0
 
 
 def _agents_target_candidates(args: argparse.Namespace) -> list:
