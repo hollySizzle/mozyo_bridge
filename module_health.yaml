@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1743
+    lines: 1707
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -413,6 +413,29 @@ allowlist:
       specifications (the drift verdict authority no longer needs a real checkout
       / stale-install topology). The remaining broad `doctor_*_section` collector
       bodies stay residual to #12638.
+      Lowered 1743 -> 1707 for the #12853 doctor scaffold section collector
+      boundary tranche: the `doctor_scaffold_section` collector's three
+      responsibilities — the external read (`doctor_target` / `doctor_home`
+      argument resolution + the `scaffold_status` manifest/central-state scan),
+      the authority-bearing verdict (section status + the remediation
+      next_action), and the legacy section dict assembly — moved behind the typed
+      boundary in `doctor_scaffold.py` (the `ScaffoldSectionVerdict` value object,
+      the pure `evaluate_scaffold_section` domain policy that owns the
+      manifest-missing/invalid/clean/drifted branching and the remediation-command
+      wording, the `ScaffoldReads` port + `LiveScaffoldReads` adapter, and the
+      `ScaffoldSectionUseCase`). `doctor_scaffold_section` is now a thin handler
+      composing the use case at call time; `LiveScaffoldReads` resolves
+      `doctor_target` / `doctor_home` / `scaffold_status` through the `doctor`
+      module at call time, so the existing scaffold section integration tests
+      (which patch `doctor.scaffold_status` / pass crafted namespaces) are
+      unchanged. The `scaffold_status` / `scaffold_state` reads stay sourced from
+      `mozyo_bridge.scaffold.rules` (still used by `doctor` helpers), and the
+      `PRESETS` import stays (re-exported for `doctor_instruction`); the policy
+      imports `PRESETS` from `mozyo_bridge.scaffold.rules` directly.
+      `test_doctor_scaffold` adds fake-port use-case + pure verdict-policy
+      specifications (the scaffold verdict authority no longer needs a real
+      scaffolded checkout / drifted-manifest topology). The remaining broad
+      `doctor_*_section` collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

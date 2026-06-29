@@ -38,6 +38,10 @@ from mozyo_bridge.application.doctor_rules import (
     LiveRulesReads,
     RulesSectionUseCase,
 )
+from mozyo_bridge.application.doctor_scaffold import (
+    LiveScaffoldReads,
+    ScaffoldSectionUseCase,
+)
 from mozyo_bridge.application.doctor_health import (
     LiveDoctorSections,
     RunDoctorUseCase,
@@ -322,64 +326,24 @@ def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
-    target = doctor_target(args)
-    home = doctor_home(args)
-    home_suffix = f" --home {home}" if home is not None else ""
-    detail = scaffold_status(target, home=home)
-    manifest = detail.get("manifest")
-    central_status = detail.get("central_status")
-    next_action: list[str] = []
+    """Report the per-repo scaffold readiness for ``mozyo-bridge``.
 
-    if manifest == "missing":
-        section_status = "missing"
-        next_action.append(
-            f"mozyo-bridge scaffold apply <{'|'.join(PRESETS)}> --target "
-            + str(target)
-            + home_suffix
-        )
-    elif manifest == "invalid":
-        section_status = "invalid"
-        next_action.append(
-            "regenerate manifest with `mozyo-bridge scaffold apply <preset> --target "
-            + str(target)
-            + home_suffix
-            + " --backup`"
-        )
-    elif detail.get("clean"):
-        section_status = "ok"
-    else:
-        section_status = "drifted"
-        preset_label = detail.get("preset") or "<preset>"
-        if central_status == "missing":
-            if home is not None:
-                next_action.append(f"mozyo-bridge rules install --home {home}")
-            else:
-                next_action.append("mozyo-bridge rules install")
-        elif central_status in {"drifted-content", "drifted-version", "ok-version-only"}:
-            next_action.append(
-                "mozyo-bridge scaffold apply "
-                + str(preset_label)
-                + " --target "
-                + str(target)
-                + home_suffix
-                + " --backup"
-            )
-        if any(row.get("status") != "ok" for row in detail.get("files", [])):
-            next_action.append(
-                "review router files; rerun `mozyo-bridge scaffold apply "
-                + str(preset_label)
-                + " --target "
-                + str(target)
-                + home_suffix
-                + " --backup` to restore"
-            )
+    Read-only: it never installs or repairs. ``missing`` when the target has no
+    scaffold manifest, ``invalid`` when the manifest is unusable, ``ok`` when the
+    scaffold is clean, ``drifted`` otherwise — with the matching operator
+    remediation ``next_action`` guidance (``--home``-qualified when a custom home
+    was diagnosed).
 
-    return {
-        "status": section_status,
-        "target": str(target),
-        "detail": detail,
-        "next_action": next_action,
-    }
+    Thin handler: the external read (``doctor_target`` / ``doctor_home`` argument
+    resolution + the ``scaffold_status`` manifest/central-state scan), the
+    authority-bearing verdict (section status + the remediation next_action), and
+    the legacy section dict assembly now live behind the typed boundary in
+    ``doctor_scaffold`` (#12853). ``LiveScaffoldReads`` drives the scaffold read
+    through the ``doctor`` module at call time, ``ScaffoldSectionUseCase`` applies
+    the pure ``evaluate_scaffold_section`` policy, and the legacy section dict is
+    preserved byte-for-byte.
+    """
+    return ScaffoldSectionUseCase(LiveScaffoldReads(args)).execute()
 
 
 CLAUDE_NAGGER_DIRNAME = ".claude-nagger"
