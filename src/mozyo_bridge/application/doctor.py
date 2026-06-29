@@ -22,6 +22,10 @@ from typing import Any
 import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.application.doctor_launch_policy import (
+    LaunchPolicySectionUseCase,
+    LiveLaunchPolicyReads,
+)
 from mozyo_bridge.application.doctor_health import (
     LiveDoctorSections,
     RunDoctorUseCase,
@@ -623,53 +627,15 @@ def doctor_claude_launch_policy_section() -> dict[str, Any]:
     holds an invalid value (which would hard-error at actual launch). The
     policy is non-retroactive, so this describes future panes only —
     already-running panes keep whatever mode they started with.
+
+    Thin handler: the external read (``describe_launch_policy``) and the
+    authority-bearing verdict (status + next_action) now live behind the typed
+    boundary in ``doctor_launch_policy`` (#12835). ``LiveLaunchPolicyReads``
+    drives the read at call time, ``LaunchPolicySectionUseCase`` applies the
+    pure ``evaluate_launch_policy_section`` policy, and the legacy section dict
+    is preserved byte-for-byte.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
-        SOURCE_ENV_INVALID,
-        SOURCE_ENV_OVERRIDE,
-        describe_launch_policy,
-    )
-
-    policy = describe_launch_policy()
-    next_action: list[str] = []
-
-    if policy["source"] == SOURCE_ENV_INVALID:
-        status = "warning"
-        next_action.append(
-            f"{policy['env_var']}={policy['env_value']!r} is not a valid Claude "
-            "permission mode; future cockpit / sublane Claude panes will fail to "
-            "launch until it is unset or set to a valid mode (auto recommended)"
-        )
-    elif policy["reproducible_auto"]:
-        status = "ok"
-    else:
-        # Either an explicit non-auto env override, or no auto policy at all.
-        status = "warning"
-        if policy["source"] == SOURCE_ENV_OVERRIDE:
-            next_action.append(
-                f"{policy['env_var']}={policy['env_value']!r} overrides the cockpit "
-                "auto policy; future cockpit / sublane Claude panes will launch "
-                f"`--permission-mode {policy['effective_mode']}` instead of auto. "
-                "Unset it to restore reproducible auto mode"
-            )
-        else:
-            next_action.append(
-                "future cockpit / sublane Claude panes will not launch in auto "
-                "mode; this build has no auto launch policy configured"
-            )
-
-    return {
-        "status": status,
-        "scope": "future cockpit / sublane managed Claude panes (non-retroactive)",
-        "effective_mode": policy["effective_mode"],
-        "source": policy["source"],
-        "reproducible_auto": policy["reproducible_auto"],
-        "env_var": policy["env_var"],
-        "env_present": policy["env_present"],
-        "env_value": policy["env_value"],
-        "policy_default": policy["policy_default"],
-        "next_action": next_action,
-    }
+    return LaunchPolicySectionUseCase(LiveLaunchPolicyReads()).execute()
 
 
 def _in_tmux() -> bool:
