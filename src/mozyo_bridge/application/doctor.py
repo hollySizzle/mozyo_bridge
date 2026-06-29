@@ -22,6 +22,10 @@ from typing import Any
 import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.application.doctor_codex_skill import (
+    CodexSkillSectionUseCase,
+    LiveCodexSkillReads,
+)
 from mozyo_bridge.application.doctor_launch_policy import (
     LaunchPolicySectionUseCase,
     LiveLaunchPolicyReads,
@@ -291,27 +295,21 @@ def _check_skill_dir(skill_dir: Path) -> dict[str, Any]:
 
 
 def doctor_codex_skill_section() -> dict[str, Any]:
-    home = codex_skill_home()
-    skill_dir = home / "skills" / "mozyo-bridge-agent"
-    info = _check_skill_dir(skill_dir)
-    next_action: list[str] = []
-    if not info["present"]:
-        status = "missing"
-        next_action.append(CODEX_SKILL_INSTALL_HINT)
-    elif info["references_missing"]:
-        status = "incomplete"
-        next_action.append("re-run scripts/install_codex_skill.sh to sync references")
-    else:
-        status = "ok"
-    return {
-        "status": status,
-        "home": str(home),
-        "skill_dir": info["path"],
-        "skill_md": info["skill_md"],
-        "present": info["present"],
-        "references_missing": info["references_missing"],
-        "next_action": next_action,
-    }
+    """Report the Codex skill install state for ``mozyo-bridge``.
+
+    Read-only: it never installs or repairs. ``missing`` when no ``SKILL.md`` is
+    present under the Codex skill home, ``incomplete`` when the skill is present
+    but shared references are absent, ``ok`` otherwise — with the matching
+    operator ``next_action`` guidance.
+
+    Thin handler: the external read (``codex_skill_home`` / ``_check_skill_dir``)
+    and the authority-bearing verdict (status + next_action) now live behind the
+    typed boundary in ``doctor_codex_skill`` (#12836). ``LiveCodexSkillReads``
+    drives the filesystem read at call time, ``CodexSkillSectionUseCase`` applies
+    the pure ``evaluate_codex_skill_section`` policy, and the legacy section dict
+    is preserved byte-for-byte.
+    """
+    return CodexSkillSectionUseCase(LiveCodexSkillReads()).execute()
 
 
 def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:

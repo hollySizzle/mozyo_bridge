@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1797
+    lines: 1795
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -337,6 +337,23 @@ allowlist:
       env-patching section tests are unchanged. `test_doctor_launch_policy`
       adds fake-port use-case + pure verdict-policy specifications (the verdict
       authority no longer needs `os.environ` patching). The remaining broad
+      `doctor_*_section` collector bodies stay residual to #12638.
+      Lowered 1797 -> 1795 for the #12836 doctor section collector boundary
+      tranche: the `doctor_codex_skill_section` collector's three
+      responsibilities — the external filesystem read (`codex_skill_home` /
+      `_check_skill_dir`), the authority-bearing verdict (section status +
+      next_action), and the legacy section dict assembly — moved behind the
+      typed boundary in `doctor_codex_skill.py` (the `CodexSkillSectionVerdict`
+      value object, the pure `evaluate_codex_skill_section` domain policy, the
+      `CodexSkillReads` port + `LiveCodexSkillReads` adapter, and the
+      `CodexSkillSectionUseCase`). `doctor_codex_skill_section` is now a thin
+      handler composing the use case at call time; `LiveCodexSkillReads`
+      resolves the `doctor` filesystem helpers and the shared
+      `CODEX_SKILL_INSTALL_HINT` guidance (still imported by
+      `doctor_instruction`) at call time, so the existing `CODEX_HOME`-seeding
+      section tests are unchanged. `test_doctor_codex_skill` adds fake-port
+      use-case + pure verdict-policy specifications (the verdict authority no
+      longer needs temp-dir skill seeding or env patching). The remaining broad
       `doctor_*_section` collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
