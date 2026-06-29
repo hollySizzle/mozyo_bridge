@@ -34,6 +34,10 @@ from mozyo_bridge.application.doctor_launch_policy import (
     LaunchPolicySectionUseCase,
     LiveLaunchPolicyReads,
 )
+from mozyo_bridge.application.doctor_rules import (
+    LiveRulesReads,
+    RulesSectionUseCase,
+)
 from mozyo_bridge.application.doctor_health import (
     LiveDoctorSections,
     RunDoctorUseCase,
@@ -254,27 +258,22 @@ def doctor_cli_section(target: Path | None = None) -> dict[str, Any]:
 
 
 def doctor_rules_section(home: Path | None) -> dict[str, Any]:
-    rows = rules_status(home)
-    any_bad = any(row["status"] != "ok" for row in rows)
-    home_path = str(
-        home
-        or Path(os.environ.get("MOZYO_BRIDGE_HOME") or "~/.mozyo_bridge").expanduser()
-    )
-    next_action: list[str] = []
-    if any_bad:
-        # When the diagnosed home is a custom path (passed via --home), reflect
-        # it in the next action so a fresh tester or CI can execute the
-        # suggestion verbatim and have it target the same home.
-        if home is not None:
-            next_action.append(f"mozyo-bridge rules install --home {home}")
-        else:
-            next_action.append("mozyo-bridge rules install")
-    return {
-        "status": "ok" if not any_bad else "missing-or-outdated",
-        "home": home_path,
-        "presets": rows,
-        "next_action": next_action,
-    }
+    """Report the central rules-preset install state for ``mozyo-bridge``.
+
+    Read-only: it never installs or repairs. ``ok`` when every installed preset
+    row is ``ok``; ``missing-or-outdated`` when any preset row is not ``ok`` —
+    with the matching ``mozyo-bridge rules install`` next_action guidance
+    (``--home``-qualified when a custom home was diagnosed).
+
+    Thin handler: the external read (``rules_status`` preset scan +
+    ``MOZYO_BRIDGE_HOME`` home resolution), the authority-bearing verdict (status
+    + next_action), and the legacy section dict assembly now live behind the
+    typed boundary in ``doctor_rules`` (#12844). ``LiveRulesReads`` drives the
+    preset read at call time and resolves the ``--home``-aware install command,
+    ``RulesSectionUseCase`` applies the pure ``evaluate_rules_section`` policy,
+    and the legacy section dict is preserved byte-for-byte.
+    """
+    return RulesSectionUseCase(LiveRulesReads(home)).execute()
 
 
 def _check_skill_dir(skill_dir: Path) -> dict[str, Any]:
