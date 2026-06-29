@@ -45,10 +45,34 @@ decomposed into a typed boundary owned here —
   pure policy over the reads port; ``LiveStatusCockpitMembership`` now wires it
   over the live reads, preserving the ``StatusCockpitMembershipPort`` shape.
 
-Residual to #12638 (explicitly carried, not resolved here): the
-``return cmd_doctor(args)`` doctor tail stays in ``commands.py`` — the handler
-delegates to it as an explicit tail rather than this tranche owning the broad
-doctor module. Read-only boundary: no send-keys / paste-buffer routing.
+#12831 (this tranche) isolates the ``cmd_status`` -> ``cmd_doctor(args)`` tail
+delegation that #12830 carried as a #12638 residual. The doctor tail is the
+status command's *continuation*: after the status block is rendered, the
+command's exit code is the doctor command's. That continuation is now a typed
+boundary owned here —
+
+* :class:`StatusContinuationResult` — the value object carrying the doctor
+  tail's ``exit_code``, so the status command's exit code is a typed result
+  rather than a bare ``int`` threaded out of a free-function call.
+* :class:`StatusDoctorContinuation` / :class:`LiveStatusDoctorContinuation` —
+  the doctor continuation behind one injectable port; the live adapter owns the
+  ``argparse.Namespace`` and routes to ``commands.cmd_doctor`` *at call time*,
+  so the existing ``test_cmd_status_*`` integration tests that patch
+  ``commands.run_doctor`` / ``commands.format_doctor_text`` still drive the live
+  doctor while the status command no longer hands the namespace to a naked
+  ``cmd_doctor(args)`` call.
+* :class:`StatusCommandHandler` now owns the continuation as a collaborator and
+  exposes :meth:`StatusCommandHandler.continue_with_doctor`, so the doctor tail
+  is driven by a fake continuation in unit tests instead of monkeypatching the
+  ``commands.*`` doctor helpers. The thin ``cmd_status`` adapter renders +
+  prints the report, then runs the continuation (preserving the stdout order:
+  status block first, doctor output second).
+
+Residual to #12638 (explicitly carried, not resolved here): the broad
+``cmd_doctor`` / ``run_doctor`` body still lives in ``commands.py`` /
+``doctor.py``; this tranche cuts only the status->doctor continuation boundary,
+not the doctor command's own decomposition. Read-only boundary: no send-keys /
+paste-buffer routing.
 """
 
 from __future__ import annotations
@@ -440,6 +464,55 @@ def render_status_report(
     return "".join(out)
 
 
+@dataclass(frozen=True)
+class StatusContinuationResult:
+    """Typed result of the ``status`` command's doctor-tail continuation.
+
+    ``cmd_status`` renders its block and then defers its exit code to the doctor
+    command (``return cmd_doctor(args)``). That deferred exit code is carried
+    here as a value object, so the status command's contract is "render, then
+    yield this continuation's ``exit_code``" rather than a bare ``int`` returned
+    from a naked free-function call.
+    """
+
+    exit_code: int
+
+
+@runtime_checkable
+class StatusDoctorContinuation(Protocol):
+    """The doctor-tail continuation the status command defers its exit to.
+
+    ``run`` executes the doctor command (which prints the doctor block to
+    stdout) and returns a :class:`StatusContinuationResult` carrying its exit
+    code. Behind a port so the status handler is driven by a fake continuation
+    in unit tests instead of monkeypatching the ``commands.*`` doctor helpers.
+    """
+
+    def run(self) -> "StatusContinuationResult":
+        ...
+
+
+class LiveStatusDoctorContinuation:
+    """Live adapter for :class:`StatusDoctorContinuation`.
+
+    Owns the ``argparse.Namespace`` and routes to ``commands.cmd_doctor`` *at
+    call time*, so the existing ``test_cmd_status_*`` integration tests that
+    patch ``commands.run_doctor`` / ``commands.format_doctor_text`` still drive
+    the live doctor through this continuation, while the status command no longer
+    hands the namespace to a bare ``cmd_doctor(args)`` call. Read-only boundary:
+    the doctor command's body is unchanged; only the tail delegation moved behind
+    this port.
+    """
+
+    def __init__(self, args: "argparse.Namespace") -> None:
+        self._args = args
+
+    def run(self) -> StatusContinuationResult:
+        from mozyo_bridge.application import commands as _commands
+
+        return StatusContinuationResult(exit_code=_commands.cmd_doctor(self._args))
+
+
 class StatusCommandHandler:
     """Command handler for ``status`` — typed request in, typed report out.
 
@@ -447,16 +520,24 @@ class StatusCommandHandler:
     cockpit-membership projection (over a :class:`StatusCockpitMembershipPort`),
     and the pure :func:`render_status_report` into one ``handle`` step. It owns
     no stdout and no ``argparse.Namespace``; the thin ``cmd_status`` adapter
-    prints the result and runs the residual doctor tail.
+    prints the result and then runs the doctor-tail continuation.
+
+    The doctor tail is held as the :class:`StatusDoctorContinuation` collaborator
+    and exposed via :meth:`continue_with_doctor`, so the status command's exit
+    code is a typed continuation result the adapter runs *after* printing the
+    report (preserving the stdout order). ``handle`` never touches the
+    continuation, so rendering stays side-effect free.
     """
 
     def __init__(
         self,
         sessions: Optional[StatusSessionPort] = None,
         membership: Optional[StatusCockpitMembershipPort] = None,
+        continuation: Optional[StatusDoctorContinuation] = None,
     ) -> None:
         self._sessions = sessions if sessions is not None else LiveStatusSession()
         self._membership = membership
+        self._continuation = continuation
 
     def handle(self, request: StatusCommandRequest) -> StatusReport:
         view = ResolveSessionStatusUseCase(self._sessions).resolve(
@@ -464,3 +545,15 @@ class StatusCommandHandler:
         )
         membership = self._membership.resolve() if self._membership is not None else None
         return StatusReport(report_text=render_status_report(view, membership))
+
+    def continue_with_doctor(self) -> StatusContinuationResult:
+        """Run the doctor-tail continuation and return its typed result.
+
+        Raises ``RuntimeError`` when no continuation was injected — the live
+        ``cmd_status`` adapter always provides a
+        :class:`LiveStatusDoctorContinuation`; render-only handler tests that
+        never call this construct the handler without one.
+        """
+        if self._continuation is None:
+            raise RuntimeError("StatusCommandHandler has no doctor continuation")
+        return self._continuation.run()

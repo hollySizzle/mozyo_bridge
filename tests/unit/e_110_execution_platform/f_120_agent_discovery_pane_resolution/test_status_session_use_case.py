@@ -1,5 +1,5 @@
 """Fake-port specification for the status session-read + command-handler
-boundary (Redmine #12825 / #12785).
+boundary (Redmine #12831 / #12830 / #12825 / #12785).
 
 #12785 migrated the status present/missing agent-window logic off the
 ``commands.*`` monkeypatch seam: the existence / window-enumeration /
@@ -33,12 +33,15 @@ from mozyo_bridge.application.commands_status import (  # noqa: E402
     CockpitMembershipIdentity,
     CockpitMembershipProjection,
     LiveStatusCockpitMembershipReads,
+    LiveStatusDoctorContinuation,
     ResolveSessionStatusUseCase,
     SessionStatusView,
     StatusCockpitMembershipPort,
     StatusCockpitMembershipReads,
     StatusCommandHandler,
     StatusCommandRequest,
+    StatusContinuationResult,
+    StatusDoctorContinuation,
     StatusQuery,
     StatusReport,
     match_cockpit_membership,
@@ -436,6 +439,98 @@ class StatusCockpitMembershipReadsContractTest(unittest.TestCase):
         self.assertIsInstance(
             LiveStatusCockpitMembershipReads(), StatusCockpitMembershipReads
         )
+
+
+# --- #12831 status -> doctor tail continuation boundary --------------------
+#
+# #12831 isolated the procedural ``cmd_status`` -> ``cmd_doctor(args)`` tail
+# delegation (the status command's exit-code continuation) behind a typed
+# boundary in ``commands_status.py``: a value object
+# (``StatusContinuationResult``), a port (``StatusDoctorContinuation``) with a
+# live adapter routing to ``commands.cmd_doctor`` at call time, and a
+# ``StatusCommandHandler.continue_with_doctor`` collaborator. The specs below
+# drive that continuation with a fake, so the status command's deferral of its
+# exit code to the doctor tail is asserted WITHOUT monkeypatching the
+# ``commands.*`` doctor helpers (``commands.cmd_doctor`` / ``commands.run_doctor``
+# / ``commands.format_doctor_text``) the procedural tail forced tests to patch.
+
+
+class _FakeDoctorContinuation:
+    """Fake :class:`StatusDoctorContinuation`: a scripted exit code + call count.
+
+    Replaces the ``commands.*`` doctor-helper monkeypatch the procedural
+    ``return cmd_doctor(args)`` tail required: ``run`` returns a scripted
+    :class:`StatusContinuationResult` and counts its invocations, so a handler
+    test can pin that rendering never runs the continuation and that
+    ``continue_with_doctor`` defers to the port exactly once.
+    """
+
+    def __init__(self, exit_code: int) -> None:
+        self._exit_code = exit_code
+        self.run_calls = 0
+
+    def run(self) -> StatusContinuationResult:
+        self.run_calls += 1
+        return StatusContinuationResult(exit_code=self._exit_code)
+
+
+class StatusDoctorContinuationContractTest(unittest.TestCase):
+    def test_fake_and_live_continuation_satisfy_port(self) -> None:
+        self.assertIsInstance(_FakeDoctorContinuation(0), StatusDoctorContinuation)
+        self.assertIsInstance(
+            LiveStatusDoctorContinuation(object()), StatusDoctorContinuation
+        )
+
+
+class StatusContinuationTest(unittest.TestCase):
+    """The handler defers its exit code to the doctor-tail continuation."""
+
+    def test_continue_with_doctor_returns_port_result_without_patching_commands(
+        self,
+    ) -> None:
+        sessions = _FakeStatusSession(exists=True, windows=["zsh"])
+        continuation = _FakeDoctorContinuation(exit_code=1)
+        handler = StatusCommandHandler(sessions=sessions, continuation=continuation)
+        result = handler.continue_with_doctor()
+        self.assertIsInstance(result, StatusContinuationResult)
+        self.assertEqual(1, result.exit_code)
+        self.assertEqual(1, continuation.run_calls)
+
+    def test_handle_render_never_runs_the_continuation(self) -> None:
+        # Rendering the status block is side-effect free: it must not run the
+        # doctor tail (the adapter prints the report before the continuation).
+        sessions = _FakeStatusSession(exists=True, windows=["zsh"])
+        continuation = _FakeDoctorContinuation(exit_code=0)
+        handler = StatusCommandHandler(sessions=sessions, continuation=continuation)
+        handler.handle(StatusCommandRequest(session="agents"))
+        self.assertEqual(0, continuation.run_calls)
+
+    def test_continue_with_doctor_without_continuation_raises(self) -> None:
+        # Render-only handler tests construct the handler with no continuation;
+        # asking for the doctor tail then is a programming error, not a silent 0.
+        handler = StatusCommandHandler(sessions=_FakeStatusSession(exists=False))
+        with self.assertRaises(RuntimeError):
+            handler.continue_with_doctor()
+
+
+class LiveStatusDoctorContinuationTest(unittest.TestCase):
+    """The live adapter routes to ``commands.cmd_doctor`` at call time."""
+
+    def test_run_routes_to_commands_cmd_doctor_and_wraps_exit_code(self) -> None:
+        # Call-time routing is what keeps the existing ``test_cmd_status_*``
+        # integration tests (which patch ``commands.run_doctor`` /
+        # ``commands.format_doctor_text``) driving the live doctor through this
+        # continuation. Here we patch the seam one level up — ``commands.cmd_doctor``
+        # — to confirm the adapter forwards the namespace and wraps the int.
+        from unittest.mock import patch
+
+        sentinel_args = object()
+        with patch(
+            "mozyo_bridge.application.commands.cmd_doctor", return_value=7
+        ) as cmd_doctor:
+            result = LiveStatusDoctorContinuation(sentinel_args).run()
+        self.assertEqual(StatusContinuationResult(exit_code=7), result)
+        cmd_doctor.assert_called_once_with(sentinel_args)
 
 
 if __name__ == "__main__":
