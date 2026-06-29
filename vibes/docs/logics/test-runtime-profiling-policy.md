@@ -121,10 +121,16 @@ profiling が通常テストの信頼性を落とさないための不変条件:
 
 ## CI 接続
 
-`.github/workflows/test.yml` の test step を `mozyo-bridge tests profile`
-(default lane) に置き換える。これ一つで「テスト実行 (gate) + runtime summary」を
-同時に得る (二重実行しない)。CI は fresh `pip install .` 後に走るので installed ==
-working tree であり、in-process discovery と `python -m unittest` の差は出ない。
+`.github/workflows/test.yml` の **full lane** の test step が
+`mozyo-bridge tests profile` (default lane)。これ一つで「テスト実行 (gate) +
+runtime summary」を同時に得る (二重実行しない)。CI は fresh `pip install .` 後に
+走るので installed == working tree であり、in-process discovery と
+`python -m unittest` の差は出ない。
+
+quick / full のレーン分割 (Redmine #12753) では、`tests profile` は全件を担う
+**full lane** 専用。PR の **quick lane** は `tests resolve` で affected subset のみ
+走らせる (full discover は走らせない)。詳細は
+`ci-quick-full-lane-policy.md` を参照。
 
 local で working-tree の src を測るときは editable install (`pip install -e .`)
 または `python3 -m mozyo_bridge tests profile` を使う (他の `mozyo-bridge` CLI と

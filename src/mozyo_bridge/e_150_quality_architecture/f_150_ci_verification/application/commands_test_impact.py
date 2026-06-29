@@ -1,9 +1,10 @@
 """Command handler for ``mozyo-bridge tests resolve`` (Redmine #12752).
 
-Thin glue: resolve the changed paths (explicit args or git-derived via the same
-``--staged`` / ``--all-changed`` selection the docs impact gate uses), call the
-pure resolver, and render text / JSON / a runner-ready target list. All mapping
-logic lives in the pure
+Thin glue: resolve the changed paths (explicit args; or git-derived via the same
+``--staged`` / ``--all-changed`` selection the docs impact gate uses; or
+``--base REF`` for a merge-base diff against a branch, which is how the CI quick
+lane reuses this resolver), call the pure resolver, and render text / JSON / a
+runner-ready target list. All mapping logic lives in the pure
 :mod:`mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_impact`.
 
 The three output formats cover the "usable from CI and local" acceptance:
@@ -24,7 +25,10 @@ import argparse
 import json as _json
 import sys
 
-from mozyo_bridge.docs_tools.impact import git_changed_paths
+from mozyo_bridge.docs_tools.impact import (
+    git_changed_paths,
+    git_changed_paths_since,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_impact import (
     TESTS_ROOT,
     ImpactPlan,
@@ -41,6 +45,9 @@ def _collect_paths(args: argparse.Namespace, repo_root) -> list[str]:
     explicit = list(getattr(args, "paths", []) or [])
     if explicit:
         return explicit
+    base = getattr(args, "base", None)
+    if base:
+        return git_changed_paths_since(repo_root, base)
     return git_changed_paths(
         repo_root,
         staged=bool(getattr(args, "staged", False)),

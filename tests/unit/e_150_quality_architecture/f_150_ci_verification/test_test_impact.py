@@ -33,9 +33,13 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_i
     parse_source_target,
     resolve_impact,
 )
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (  # noqa: E402
+    commands_test_impact,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.commands_test_impact import (  # noqa: E402
     cmd_tests_resolve,
 )
+from mozyo_bridge.docs_tools.impact import git_changed_paths_since  # noqa: E402
 
 # A small synthetic mirror tree for the execution_platform / delegated
 # coordinator feature.
@@ -334,6 +338,66 @@ class ListTestFilesTest(unittest.TestCase):
             self.assertEqual(list_test_files(Path(tmp)), ())
 
 
+def _git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _init_repo(root: Path) -> None:
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    _git(root, "checkout", "-q", "-b", "main")
+
+
+class GitChangedPathsSinceTest(unittest.TestCase):
+    """The CI counterpart to working-tree change derivation (#12753).
+
+    The merge-base (three-dot) diff lists what the branch ADDED since ``base``,
+    not commits that landed on ``base`` after the branch started, and applies
+    the same skip filtering as the working-tree path.
+    """
+
+    def test_three_dot_diff_lists_only_branch_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_repo(root)
+            (root / "base.txt").write_text("base")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "base")
+
+            # A commit lands on main AFTER the feature branch forks.
+            _git(root, "checkout", "-q", "-b", "feature")
+            (root / "feature.py").write_text("x = 1")
+            sub = root / "src" / "pkg"
+            sub.mkdir(parents=True)
+            (sub / "mod.py").write_text("y = 2")
+            (root / "junk.pyc").write_text("")  # skipped suffix
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "feature work")
+
+            _git(root, "checkout", "-q", "main")
+            (root / "unrelated_on_main.txt").write_text("z")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "later on main")
+            _git(root, "checkout", "-q", "feature")
+
+            changed = git_changed_paths_since(root, "main")
+
+        self.assertIn("feature.py", changed)
+        self.assertIn("src/pkg/mod.py", changed)
+        # Branch did not touch main's later commit, and .pyc is filtered.
+        self.assertNotIn("unrelated_on_main.txt", changed)
+        self.assertNotIn("junk.pyc", changed)
+
+
 class CommandHandlerTest(unittest.TestCase):
     def _run(self, **kwargs) -> tuple[int, str]:
         args = argparse.Namespace(
@@ -341,12 +405,34 @@ class CommandHandlerTest(unittest.TestCase):
             paths=kwargs.get("paths", []),
             staged=False,
             all_changed=False,
+            base=kwargs.get("base", None),
             format=kwargs.get("format", "text"),
         )
         buf = io.StringIO()
         with redirect_stdout(buf):
             rc = cmd_tests_resolve(args)
         return rc, buf.getvalue()
+
+    def test_base_routes_through_merge_base_diff(self) -> None:
+        # With no explicit PATHS, --base derives changed paths from the
+        # merge-base diff (the CI quick-lane entry point), not the working tree.
+        captured: dict[str, object] = {}
+
+        def fake_since(repo_root, base):
+            captured["base"] = base
+            return ["README.md"]
+
+        original = commands_test_impact.git_changed_paths_since
+        commands_test_impact.git_changed_paths_since = fake_since
+        try:
+            rc, out = self._run(base="origin/main", format="targets")
+        finally:
+            commands_test_impact.git_changed_paths_since = original
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["base"], "origin/main")
+        # README.md is unmapped -> fail-closed full -> discover form.
+        self.assertEqual(out.strip().splitlines(), ["discover", "-s", "tests"])
 
     def test_targets_format_prints_selected(self) -> None:
         rc, out = self._run(

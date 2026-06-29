@@ -28,6 +28,16 @@ def _should_skip_path(path: str) -> bool:
     return Path(path).suffix in IGNORED_SUFFIXES
 
 
+def _dedup_changed(lines: list[str], seen: set[str], paths: list[str]) -> None:
+    """Append cleaned, de-duplicated, non-ignored ``lines`` onto ``paths``."""
+    for line in lines:
+        path = line.strip()
+        if not path or path in seen or _should_skip_path(path):
+            continue
+        seen.add(path)
+        paths.append(path)
+
+
 def git_changed_paths(
     repo_root: Path,
     *,
@@ -53,12 +63,28 @@ def git_changed_paths(
     seen: set[str] = set()
     for command in commands:
         output = subprocess.check_output(command, cwd=repo_root, text=True)
-        for line in output.splitlines():
-            path = line.strip()
-            if not path or path in seen or _should_skip_path(path):
-                continue
-            seen.add(path)
-            paths.append(path)
+        _dedup_changed(output.splitlines(), seen, paths)
+    return paths
+
+
+def git_changed_paths_since(repo_root: Path, base: str) -> list[str]:
+    """Return repo-relative paths changed on the current branch since ``base``.
+
+    Uses the three-dot ``git diff <base>...HEAD`` form, so only the changes
+    introduced since the merge-base with ``base`` are listed — the set a pull
+    request adds, not unrelated commits that landed on ``base`` meanwhile. This
+    is the CI counterpart to :func:`git_changed_paths` (which reads the working
+    tree / index); both feed the same impact resolver, so the focused-test
+    selection is identical whether the diff is derived locally or in CI against
+    the merge target. The same skip/dedup filtering is applied.
+    """
+    output = subprocess.check_output(
+        ["git", "diff", "--name-only", f"{base}...HEAD"],
+        cwd=repo_root,
+        text=True,
+    )
+    paths: list[str] = []
+    _dedup_changed(output.splitlines(), set(), paths)
     return paths
 
 
