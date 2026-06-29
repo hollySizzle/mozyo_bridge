@@ -54,6 +54,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_fill_decision,
     register_fill_decision,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_runtime import (
+    cmd_workflow_runtime,
+    register_runtime,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
@@ -288,14 +292,17 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
 
 
 def register(sub) -> None:
-    """Register the ``workflow`` family (``step`` / ``fill-decision`` / ``admission``).
+    """Register ``workflow`` (``step`` / ``fill-decision`` / ``admission`` / ``runtime``).
 
     ``workflow step`` (Redmine #12755) advances one safe workflow step;
     ``workflow fill-decision`` (Redmine #12855) reports the advisory Post-Dispatch
     Fill Loop decision for an already-classified lane set; ``workflow admission``
     (Redmine #12856) is the Redmine-aware companion that classifies each lane from its
-    durable-record facts first. The fill-decision / admission subcommands are registered
-    from their sibling modules so this file stays focused on the step state machine.
+    durable-record facts first; ``workflow runtime`` (Redmine #12857) is the stateful
+    slice that replays an ordered durable event log (with duplicate suppression) into
+    current lane state and the overall next action. The fill-decision / admission /
+    runtime subcommands are registered from their sibling modules so this file stays
+    focused on the step state machine.
     """
     workflow = sub.add_parser(
         "workflow",
@@ -316,6 +323,7 @@ def register(sub) -> None:
     workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
     register_fill_decision(workflow_sub)
     register_admission(workflow_sub)
+    register_runtime(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",
@@ -388,5 +396,6 @@ __all__ = (
     "cmd_workflow_step",
     "cmd_workflow_fill_decision",
     "cmd_workflow_admission",
+    "cmd_workflow_runtime",
     "register",
 )
