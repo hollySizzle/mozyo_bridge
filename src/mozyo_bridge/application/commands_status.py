@@ -1,5 +1,5 @@
 """status command family — OOP-first session-read + command-handler boundary
-(Redmine #12825 / #12785 / #12638 / #12749).
+(Redmine #12830 / #12825 / #12785 / #12638 / #12749).
 
 #12785 (the first tranche) pulled the ``status`` command's three external
 session reads — session existence, window enumeration, and the agent-pane
@@ -19,8 +19,7 @@ OOP-first command-handler boundary:
   :class:`SessionStatusView` and the cockpit-membership projection into the
   exact stdout block (byte-preserving), with no ``print`` side effect.
 * :class:`StatusCockpitMembershipPort` / :class:`LiveStatusCockpitMembership` —
-  the cockpit-membership projection (``_status_repo_cockpit_membership``, still
-  resident in ``commands.py``) behind an injectable port so the handler is
+  the cockpit-membership projection behind an injectable port so the handler is
   driven by a fake policy, not a ``commands.*`` monkeypatch.
 * :class:`StatusReport` — the typed result the handler returns (the rendered
   block); the thin ``cmd_status`` adapter prints it and delegates the doctor
@@ -28,12 +27,28 @@ OOP-first command-handler boundary:
 * :class:`StatusCommandHandler` — composes the session-read use case, the
   membership port, and the pure renderer into one typed ``handle`` step.
 
+#12830 (this tranche) resolves the ``_status_repo_cockpit_membership`` residual
+that #12825 carried in ``commands.py``: the procedural projection body is
+decomposed into a typed boundary owned here —
+
+* :class:`CockpitMembershipIdentity` — the value object the projection threads
+  from the live identity reads (workspace id + lane) into both the pure match
+  policy and the absent-record construction.
+* :func:`match_cockpit_membership` — the *pure* domain policy selecting this
+  repo's loaded cockpit record by workspace id + normalized lane, unit tested
+  with fake workspace records (no live read, no ``commands.*`` monkeypatch).
+* :class:`StatusCockpitMembershipReads` / :class:`LiveStatusCockpitMembershipReads`
+  — the cockpit reads (identity / membership collection / absent record) behind
+  one injectable port; the live adapter routes to the ``commands.*`` cockpit
+  helpers *at call time* so the existing cockpit monkeypatch tests are intact.
+* :class:`CockpitMembershipProjection` — the tolerant use case composing the
+  pure policy over the reads port; ``LiveStatusCockpitMembership`` now wires it
+  over the live reads, preserving the ``StatusCockpitMembershipPort`` shape.
+
 Residual to #12638 (explicitly carried, not resolved here): the
-``_status_repo_cockpit_membership`` projection body and the
-``return cmd_doctor(args)`` doctor tail stay in ``commands.py`` — the handler
-reaches them through the live adapter / an explicit tail delegation rather than
-owning the broad cockpit / doctor modules. Read-only boundary: no send-keys /
-paste-buffer routing.
+``return cmd_doctor(args)`` doctor tail stays in ``commands.py`` — the handler
+delegates to it as an explicit tail rather than this tranche owning the broad
+doctor module. Read-only boundary: no send-keys / paste-buffer routing.
 """
 
 from __future__ import annotations
@@ -170,23 +185,193 @@ class StatusCockpitMembershipPort(Protocol):
         ...
 
 
-class LiveStatusCockpitMembership:
-    """Live adapter for the cockpit-membership projection.
+@dataclass(frozen=True)
+class CockpitMembershipIdentity:
+    """Resolved identity inputs for this repo's cockpit-membership lookup.
 
-    Wraps the tolerant ``_status_repo_cockpit_membership(args)`` projection that
-    is still resident in ``commands.py`` (residual to #12638), reached through
-    the ``commands`` module *at call time* so the residual — and the tests that
-    patch the cockpit reads behind it — stay intact while the handler gains a
-    fake-able policy seam.
+    The value object the projection threads from the live identity reads (the
+    canonical session + the workspace lane) into both the pure match policy and
+    the absent-record construction, so neither re-reads the session.
+    ``workspace_id`` + ``target_lane`` key the lookup; ``repo_root`` /
+    ``lane_label`` / ``fallback_label`` (the canonical session name) seed the
+    absent record when this repo is not loaded in the cockpit.
+    """
+
+    repo_root: str
+    workspace_id: str
+    target_lane: str
+    lane_label: "Optional[str]" = None
+    fallback_label: str = ""
+
+
+def match_cockpit_membership(
+    workspaces, identity: CockpitMembershipIdentity
+) -> "Optional[WorkspaceMembership]":
+    """Select this repo's loaded cockpit membership record (pure domain policy).
+
+    Picks the workspace whose id matches and whose lane normalizes to the repo's
+    ``target_lane`` — the same keyed match the procedural projection inlined,
+    lifted to a pure function so it is unit tested with fake workspace records
+    (no live cockpit read, no ``commands.*`` monkeypatch). Returns ``None`` when
+    this repo is not among the loaded cockpit workspaces; the use case then asks
+    the reads port for the absent record.
+    """
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+        normalize_lane,
+    )
+
+    return next(
+        (
+            w
+            for w in workspaces
+            if w.workspace_id == identity.workspace_id
+            and normalize_lane(w.lane_id) == identity.target_lane
+        ),
+        None,
+    )
+
+
+@runtime_checkable
+class StatusCockpitMembershipReads(Protocol):
+    """The live cockpit reads the membership projection is driven by.
+
+    Splits the I/O the procedural ``_status_repo_cockpit_membership`` inlined —
+    identity resolution, the loaded-cockpit collection, and the absent-record
+    construction — behind one injectable port, so
+    :class:`CockpitMembershipProjection` is exercised with a fake reads object
+    instead of monkeypatching the ``commands.*`` cockpit helpers.
+    """
+
+    def resolve_identity(self, repo) -> "CockpitMembershipIdentity":
+        ...
+
+    def collect_workspaces(self) -> tuple:
+        ...
+
+    def absent_membership(
+        self, identity: "CockpitMembershipIdentity"
+    ) -> "WorkspaceMembership":
+        ...
+
+
+class CockpitMembershipProjection:
+    """Project this repo's cockpit membership over a reads port (tolerant).
+
+    Owns the orchestration the procedural ``_status_repo_cockpit_membership``
+    inlined: resolve the repo identity, collect the loaded cockpit workspaces,
+    run the pure :func:`match_cockpit_membership` policy, and fall back to the
+    port's absent record only when this repo is not loaded (preserving the
+    original's "no registry read on a hit"). Tolerant: any read / resolution
+    failure degrades to ``None`` so ``status`` never aborts on the projection,
+    exactly as the procedural body did.
+    """
+
+    def __init__(self, reads: StatusCockpitMembershipReads) -> None:
+        self._reads = reads
+
+    def resolve(self, repo) -> "Optional[WorkspaceMembership]":
+        try:
+            identity = self._reads.resolve_identity(repo)
+            match = match_cockpit_membership(self._reads.collect_workspaces(), identity)
+            if match is None:
+                match = self._reads.absent_membership(identity)
+            return match
+        except (Exception, SystemExit):
+            return None
+
+
+class LiveStatusCockpitMembershipReads:
+    """Live adapter for :class:`StatusCockpitMembershipReads`.
+
+    Implements the reads by routing to the ``commands.*`` cockpit helpers
+    (``resolve_canonical_session`` / ``_resolve_workspace_lane`` /
+    ``_collect_cockpit_membership`` / ``_resolve_registry_facts``) *at call
+    time*, so the existing cockpit monkeypatch / integration tests that patch
+    those names keep driving the live path while the projection orchestration
+    itself moved out of ``commands.py`` and into
+    :class:`CockpitMembershipProjection`.
+    """
+
+    def resolve_identity(self, repo) -> "CockpitMembershipIdentity":
+        import os
+        from pathlib import Path
+
+        from mozyo_bridge.application import commands as _commands
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+            normalize_lane,
+        )
+
+        repo_root = str(Path(repo or os.getcwd()).expanduser().resolve())
+        canon = _commands.resolve_canonical_session(repo_root)
+        workspace_id = getattr(canon, "workspace_id", None) or canon.name
+        lane = _commands._resolve_workspace_lane(
+            repo_root, getattr(canon, "workspace_id", None)
+        )
+        return CockpitMembershipIdentity(
+            repo_root=repo_root,
+            workspace_id=workspace_id,
+            target_lane=normalize_lane(lane.lane_id),
+            lane_label=lane.lane_label,
+            fallback_label=canon.name,
+        )
+
+    def collect_workspaces(self) -> tuple:
+        from mozyo_bridge.application import commands as _commands
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+            COCKPIT_SESSION_DEFAULT,
+        )
+
+        return _commands._collect_cockpit_membership(COCKPIT_SESSION_DEFAULT).workspaces
+
+    def absent_membership(
+        self, identity: "CockpitMembershipIdentity"
+    ) -> "WorkspaceMembership":
+        from mozyo_bridge.application import commands as _commands
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+            infer_repo_root,
+        )
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+            absent_membership,
+        )
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+            COCKPIT_SESSION_DEFAULT,
+        )
+
+        facts = _commands._resolve_registry_facts(identity.workspace_id)
+        label = facts.label if facts.registry_present else identity.fallback_label
+        return absent_membership(
+            session=COCKPIT_SESSION_DEFAULT,
+            workspace_id=identity.workspace_id,
+            label=label,
+            repo_root=infer_repo_root(identity.repo_root) or identity.repo_root,
+            lane_id=identity.target_lane,
+            lane_label=identity.lane_label,
+            registry_present=facts.registry_present,
+            anchor_present=facts.anchor_present,
+            registry_canonical_path=facts.repo_root,
+        )
+
+
+class LiveStatusCockpitMembership:
+    """Live adapter for the :class:`StatusCockpitMembershipPort`.
+
+    Composes :class:`CockpitMembershipProjection` over the live
+    :class:`LiveStatusCockpitMembershipReads`, resolving the repo from the
+    ``argparse.Namespace`` once. (#12830 decomposed the former
+    ``commands._status_repo_cockpit_membership`` projection body into the
+    projection / reads-port / identity value object here; this class keeps the
+    same ``StatusCockpitMembershipPort`` shape so ``StatusCommandHandler`` and
+    the live ``cmd_status`` wiring are unchanged, and the live reads still route
+    through ``commands.*`` at call time so the cockpit tests are intact.)
     """
 
     def __init__(self, args: "argparse.Namespace") -> None:
         self._args = args
 
     def resolve(self) -> "Optional[WorkspaceMembership]":
-        from mozyo_bridge.application import commands as _commands
-
-        return _commands._status_repo_cockpit_membership(self._args)
+        return CockpitMembershipProjection(LiveStatusCockpitMembershipReads()).resolve(
+            getattr(self._args, "repo", None)
+        )
 
 
 def render_status_report(
