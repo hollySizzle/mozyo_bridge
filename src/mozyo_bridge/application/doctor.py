@@ -22,6 +22,11 @@ from typing import Any
 import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.application.doctor_health import (
+    LiveDoctorSections,
+    RunDoctorUseCase,
+    UNHEALTHY_SECTION_STATUSES,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
@@ -52,15 +57,11 @@ CLAUDE_GLOBAL_SKILL_INSTALL_HINT = (
     "/scripts/install_claude_skill.sh | MOZYO_BRIDGE_CLAUDE_SCOPE=global sh"
 )
 
-BAD_SECTION_STATUSES = {
-    "missing",
-    "missing-or-outdated",
-    "outdated",
-    "incomplete",
-    "invalid",
-    "drifted",
-    "error",
-}
+# Canonical "hard bad" section statuses now live in ``doctor_health`` as the
+# verdict policy's input set. Re-exported here so existing importers
+# (``doctor_instruction``) and ``doctor.BAD_SECTION_STATUSES`` references keep
+# resolving unchanged.
+BAD_SECTION_STATUSES = UNHEALTHY_SECTION_STATUSES
 
 
 def codex_skill_home() -> Path:
@@ -1530,36 +1531,14 @@ def doctor_state_store_section(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
-    tmux_section = doctor_tmux_section(args)
-    # Attach the governed-preset tmux-ui artifact state to the existing
-    # tmux section so the diagnostic surface stays small. The artifact
-    # status is independent of tmux server availability — operators
-    # without a running tmux server still need to know whether the
-    # `.mozyo-bridge/tmux/agent-ui.conf` snippet landed on the target.
-    tmux_section["artifact"] = doctor_tmux_ui_artifact_info(doctor_target(args))
-    sections: dict[str, dict[str, Any]] = {
-        "cli": doctor_cli_section(doctor_target(args)),
-        "rules": doctor_rules_section(doctor_home(args)),
-        "codex_skill": doctor_codex_skill_section(),
-        "claude_skill": doctor_claude_skill_section(args),
-        "scaffold": doctor_scaffold_section(args),
-        "workspace_registry": doctor_workspace_registry_section(args),
-        "state_store": doctor_state_store_section(args),
-        "claude_nagger": doctor_claude_nagger_section(args),
-        "claude_launch_policy": doctor_claude_launch_policy_section(),
-        "tmux": tmux_section,
-        "otel": doctor_otel_section(args),
-    }
-    ok = True
-    for section in sections.values():
-        status = section.get("status")
-        if status in BAD_SECTION_STATUSES:
-            ok = False
-            break
-        if status == "warning":
-            ok = False
-            break
-    return {"ok": ok, "sections": sections}
+    # Thin handler: the section orchestration (external reads) and the
+    # authority-bearing health verdict now live behind the typed boundary in
+    # ``doctor_health`` (#12833). ``LiveDoctorSections`` drives the section
+    # collectors at call time (so existing ``patch(...doctor.doctor_*_section)``
+    # integration tests are unchanged), ``RunDoctorUseCase`` applies the pure
+    # ``evaluate_doctor_health`` policy, and the legacy result shape is
+    # preserved byte-for-byte for the CLI / JSON / ``format_doctor_text`` paths.
+    return RunDoctorUseCase(LiveDoctorSections(args)).execute()
 
 
 def _format_skill_block(name: str, info: dict[str, Any], indent: str) -> list[str]:
