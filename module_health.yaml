@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6026
+    lines: 6025
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -240,6 +240,17 @@ allowlist:
       and session command families now live in the `f_110` package; the remaining
       `commands.py` orchestration (cockpit / handoff / status / notify / init) stays
       residual to #12638 / #12785.
+      Lowered 6026 -> 6025 for the #12785 first OOP-first command-boundary tranche:
+      the `status` session-read boundary (existence / window enumeration / pane
+      capture + present-missing agent-window classification) moved behind
+      `StatusSessionPort` + `ResolveSessionStatusUseCase` (`status_session_port.py` /
+      `commands_status.py`); `cmd_status` stays here as a thin handler driving the
+      use case via `LiveStatusSession` (the live adapter routes the three reads
+      through `commands.*` at call time, so the existing status monkeypatch
+      integration tests are unchanged). The new fake-port unit test
+      (`test_status_session_use_case`) is the monkeypatch -> fake-port migration for
+      that boundary. The `cmd_doctor` tail and `_status_repo_cockpit_membership`
+      cockpit projection stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
