@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application import commands
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
-    cli_project_gateway,
+    cli_project_gateway_consult,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     CONFIDENCE_STRONG,
@@ -168,11 +168,11 @@ class ExecuteForwardLegTest(unittest.TestCase):
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
         ), patch.object(
-            cli_project_gateway, "require_tmux", lambda: None
+            cli_project_gateway_consult, "require_tmux", lambda: None
         ), patch.object(
-            cli_project_gateway, "_discover_candidates", return_value=[gateway]
+            cli_project_gateway_consult, "_discover_candidates", return_value=[gateway]
         ), patch.object(
-            cli_project_gateway, "orchestrate_handoff", side_effect=fake_orchestrate
+            cli_project_gateway_consult, "orchestrate_handoff", side_effect=fake_orchestrate
         ), contextlib.redirect_stdout(out):
             rc = cli_workflow.cmd_workflow_step(_args())
 
@@ -192,11 +192,11 @@ class ExecuteForwardLegTest(unittest.TestCase):
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
         ), patch.object(
-            cli_project_gateway, "require_tmux", lambda: None
+            cli_project_gateway_consult, "require_tmux", lambda: None
         ), patch.object(
-            cli_project_gateway, "_discover_candidates", return_value=[gateway]
+            cli_project_gateway_consult, "_discover_candidates", return_value=[gateway]
         ), patch.object(
-            cli_project_gateway, "orchestrate_handoff", side_effect=lambda a, **k: 0
+            cli_project_gateway_consult, "orchestrate_handoff", side_effect=lambda a, **k: 0
         ), contextlib.redirect_stdout(io.StringIO()) as out:
             rc = cli_workflow.cmd_workflow_step(_args(as_json=True))
 

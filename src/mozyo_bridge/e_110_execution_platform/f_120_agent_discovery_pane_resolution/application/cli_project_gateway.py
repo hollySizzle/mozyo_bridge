@@ -9,14 +9,25 @@ without an operator-copied ``%pane``:
 - ``project-gateway resolve`` — read-only. Resolves the single project gateway
   target by ``--repo`` + ``--project`` + ``--role`` (+ optional ``--session``)
   and prints it, or a fail-closed ``gateway_missing`` / ``gateway_target_ambiguous``
-  / ``selector_gap`` classification with the next safe action (the concrete
-  ``start_project_gateway`` command for a missing gateway, the matching
-  candidates for an ambiguous one).
+  / ``selector_gap`` classification with the next safe action.
 - ``project-gateway handoff`` — resolves the gateway the same way, then delivers
   a ticketless consultation through the existing gated ``orchestrate_handoff``
   with the resolved pane injected as ``--target``. The operator never types a
   pane id; the Git ``--target-repo`` + project ``--target-project`` gates still
   re-verify the resolved pane (defense in depth).
+
+This module is the ``project-gateway`` **registrar**: it owns the ``adopt`` /
+``route-plan`` / ``handoff`` handlers and assembles the whole subcommand tree.
+The other subcommand families live in bounded sibling modules so each
+subcommand's change impact is localized (Redmine #12751):
+
+- ``resolve`` (and the shared read-only resolution core — candidate discovery,
+  route construction, and the fail-closed renderer) lives in
+  :mod:`...application.cli_project_gateway_resolve`;
+- ``consult`` (forward no-anchor consultation, #12740) lives in
+  :mod:`...application.cli_project_gateway_consult`;
+- ``child-intake`` (forward no-anchor work-intake, #12748) lives in
+  :mod:`...application.cli_project_gateway_child_intake`.
 
 Discovery + delivery primitives are reused from the existing modules
 (``_agents_target_candidates`` / ``orchestrate_handoff``) so this never grows a
@@ -30,7 +41,6 @@ import argparse
 import json as _json
 
 from mozyo_bridge.application.commands import (
-    _agents_target_candidates,
     orchestrate_handoff,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -38,13 +48,10 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway import (
     STATUS_FOUND,
-    ProjectGatewayRoute,
     resolve_project_gateway,
-    start_project_gateway_command,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
     ACTION_ADOPT,
-    ACTION_BLOCKED,
     ACTION_LAUNCH,
     GatewayLaneIdentity,
     gateway_lane_identity_from_scope,
@@ -56,130 +63,28 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     cockpit_visible_from_candidate,
     resolve_relative_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
+    _discover_candidates,
+    _route_from_args,
+    register_resolve,
+    render_gateway_resolution,
+)
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_consult import (
+    register_consult,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_child_intake import (
     register_child_intake,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (
     configure_handoff_parser,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_ticketless import (
-    _add_ticketless_delivery_options,
-)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
-    ROLE_PROJECT_GATEWAY,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
-    CALLBACK_METHODS,
-    CONSULTATION_PROJECT_DOMAIN,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
 from mozyo_bridge.shared.errors import die
-
-
-def _discover_candidates() -> list:
-    """All classified target candidates across every session (no pre-filter).
-
-    Discovery is intentionally unfiltered: the resolver applies the
-    role / repo / project / session predicates itself so its near-miss reasons
-    stay visible (a session pre-filter would hide cross-session gateways, which
-    are the normal separate-window/session path). Patched in tests.
-    """
-    return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
-
-
-def _route_from_args(
-    *, repo_root: str, project_scope: str, role: str, session: str | None
-) -> ProjectGatewayRoute:
-    return ProjectGatewayRoute(
-        repo_root=repo_root,
-        project_scope=project_scope,
-        role=role,
-        session=session,
-    )
-
-
-def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
-    """Resolve (read-only) the project gateway target by semantic identity.
-
-    The project gateway role is fixed to ``codex`` (the design doc's
-    ``role="codex"`` route): a project gateway is a Codex coordinator unit, and
-    the implementation worker (Claude) is reached only after the gateway decides
-    implementation is needed. So this command never resolves a Claude target
-    (Redmine #12668 review j#66626 blocker 2).
-    """
-    require_tmux()
-    route = _route_from_args(
-        repo_root=args.repo,
-        project_scope=args.project,
-        role=AGENT_KIND_CODEX,
-        session=getattr(args, "session", None),
-    )
-    resolution = resolve_project_gateway(_discover_candidates(), route)
-
-    if getattr(args, "as_json", False):
-        print(_json.dumps(resolution.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if resolution.ok else 1
-
-    print(f"status: {resolution.status}")
-    print(
-        "route: "
-        f"role={route.role} repo_root={route.repo_root} "
-        f"project_scope={route.project_scope} "
-        f"session={route.session or '<any>'} target_kind={route.target_kind}"
-    )
-    if resolution.detail:
-        print(f"detail: {resolution.detail}")
-
-    if resolution.ok and resolution.selected is not None:
-        sel = resolution.selected
-        print(
-            "gateway: "
-            f"pane_id={sel.pane_id} session={sel.session} "
-            f"window={sel.window_name} repo={sel.repo_short} "
-            f"project_scope={sel.project_scope}"
-        )
-        # The normal, pane-id-free routes to deliver to the resolved gateway.
-        # Redmine #12740: the no-anchor consultation phase uses `project-gateway
-        # consult` (forward ticketless rail, no Redmine anchor); anchored worker
-        # work uses `project-gateway handoff` once a real Redmine anchor exists.
-        print(
-            "next (no-anchor consultation): consult_project_gateway -> "
-            f"mozyo-bridge project-gateway consult --to {route.role} "
-            f"--target-repo {route.repo_root} --target-project {route.project_scope}"
-        )
-        print(
-            "next (anchored worker work): handoff_to_project_gateway -> "
-            f"mozyo-bridge project-gateway handoff --to {route.role} "
-            f"--target-repo {route.repo_root} --target-project {route.project_scope} "
-            "--source redmine --issue <id> --journal <id> --kind implementation_request"
-        )
-        return 0
-
-    if resolution.matched:
-        print("matched (ambiguous — refuse to auto-select):")
-        for cand in resolution.matched:
-            print(f"  - pane_id={cand.pane_id} session={cand.session} window={cand.window_name}")
-        print("resolve by adding --session <session-or-cockpit-group> to narrow to one.")
-        return 1
-
-    # gateway_missing / selector_gap: name the concrete start action + near misses.
-    # Redmine #12699: the start action is a cockpit-visible Unit, not a detached
-    # --no-attach normal session and not a cockpit --json preview.
-    print("next: start_project_gateway (cockpit-visible Unit) ->")
-    print(f"  {start_project_gateway_command(route)}")
-    if resolution.near_misses:
-        print("near misses (why each pane was not the gateway):")
-        for near in resolution.near_misses:
-            cand = near.candidate
-            print(
-                f"  - pane_id={cand.pane_id} role={cand.role} "
-                f"repo={cand.repo_short} project_scope={cand.project_scope or '<none>'} "
-                f"reason={near.reason}"
-            )
-    return 1
 
 
 def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity:
@@ -403,16 +308,12 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     resolution = resolve_project_gateway(_discover_candidates(), route)
 
     if resolution.status != STATUS_FOUND or resolution.selected is None:
-        # Fail closed; do not deliver. Reuse the read-only renderer for the
-        # operator-facing classification + next action.
-        resolve_args = argparse.Namespace(
-            repo=route.repo_root,
-            project=route.project_scope,
-            role=route.role,
-            session=route.session,
-            as_json=getattr(args, "as_json", False),
+        # Fail closed; do not deliver. Reuse the shared pure renderer over the
+        # already-computed resolution for the operator-facing classification +
+        # next action (no second discovery scan).
+        return render_gateway_resolution(
+            resolution, route, as_json=getattr(args, "as_json", False)
         )
-        return cmd_project_gateway_resolve(resolve_args)
 
     # Inject the resolved pane and delegate to the gated handoff orchestrator. The
     # repo + project gates in orchestrate_handoff re-verify the resolved pane.
@@ -438,110 +339,6 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     # successful `found` resolution; the operator never types it.
     args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
     return orchestrate_handoff(args)
-
-
-def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
-    """Forward a no-anchor ticketless consultation to the project gateway (#12740).
-
-    The forward (department-root -> project-gateway) counterpart of the return
-    ``handoff ticketless-callback`` rail. It resolves the single project gateway by
-    semantic identity (the same fail-closed ``--target-repo`` + ``--target-project``
-    + ``--to codex`` resolution as ``project-gateway handoff``), then delivers the
-    consultation through the gated :func:`orchestrate_handoff` **without a Redmine
-    anchor and without fabricating one** — closing the GK3500 rerun blocker where
-    the root coordinator had found exactly one gateway but the anchored
-    ``handoff send --source redmine`` failed closed with ``invalid_anchor`` and raw
-    pane typing was correctly refused.
-
-    The Redmine-anchor gate for worker dispatch / implementation / domain probe is
-    NOT relaxed: this rail forwards a *consultation* only (no anchor, no dispatch
-    token), and the structured payload restates the invariant so the receiver
-    gateway mints a real Redmine anchor before dispatching a worker. The receiver
-    gets the transition role/action boundary (#12706) and workflow-contract refs
-    (#12700) auto-injected on ``found``, plus the forward consultation's callback
-    return contract (which role to return to, via which product primitives) so it
-    can return a structured result via ``ticketless-callback`` / ``q-enter
-    consultation_callback`` (#12703 / #12705 / #12737). Fails closed (no delivery,
-    no payload injected) when no unique project gateway exists.
-    """
-    require_tmux()
-
-    # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
-    # implementation worker (Claude) is reached only after the gateway mints a
-    # Redmine anchor, so a direct project-Claude consultation send is forbidden.
-    if args.to != AGENT_KIND_CODEX:
-        die(
-            "`project-gateway consult` delivers to the project gateway, which is a "
-            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
-            "worker (Claude) is reached only after the gateway creates a Redmine "
-            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
-            "the ticketless project gateway contract."
-        )
-
-    if not args.target_repo or args.target_repo == "auto":
-        die(
-            "`project-gateway consult` resolves the pane semantically, so it needs "
-            "a concrete `--target-repo <git-root>` (not `auto`, which requires an "
-            "explicit %pane). Pass the workspace Git root."
-        )
-    if not args.target_project:
-        die(
-            "`project-gateway consult` requires `--target-project <project_scope>` "
-            "to resolve the project gateway. To gate on the Git repo root only, use "
-            "`handoff ticketless-callback` with an explicit `--target`."
-        )
-    if getattr(args, "target", None):
-        die(
-            "`project-gateway consult` selects the pane by semantic identity; do "
-            "not pass `--target %pane`. The forward consultation never carries a "
-            "pane id to the ticketless receiver."
-        )
-
-    route = _route_from_args(
-        repo_root=args.target_repo,
-        project_scope=args.target_project,
-        role=args.to,
-        session=getattr(args, "gateway_session", None),
-    )
-    resolution = resolve_project_gateway(_discover_candidates(), route)
-
-    if resolution.status != STATUS_FOUND or resolution.selected is None:
-        # Fail closed; do not deliver and inject no forward-consultation payload.
-        # Reuse the read-only renderer for the operator-facing classification.
-        resolve_args = argparse.Namespace(
-            repo=route.repo_root,
-            project=route.project_scope,
-            role=route.role,
-            session=route.session,
-            as_json=getattr(args, "as_json", False),
-        )
-        return cmd_project_gateway_resolve(resolve_args)
-
-    # Inject the resolved pane and the forward-consultation payload, then delegate
-    # to the gated no-anchor orchestrator. The repo + project gates in
-    # orchestrate_handoff re-verify the resolved pane before any send.
-    args.target = resolution.selected.pane_id
-    # Redmine #12706 / #12700: this command IS the grandparent (department-root) ->
-    # project-gateway transition, so auto-inject the grandparent_coordinator
-    # transition boundary and workflow-contract bundle on `found` (the operator
-    # never types the role payload), exactly like `project-gateway handoff`.
-    args.transition_role = ROLE_GRANDPARENT_COORDINATOR
-    args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
-    # Redmine #12740: the forward consultation payload, built programmatically (not
-    # operator-typed) so it is product evidence, not a hand-asserted role payload.
-    # The root forwards a project-domain consultation, asks the gateway to return
-    # the result to the grandparent_coordinator lane via either no-anchor return
-    # primitive, and names the project_gateway role contract the gateway acts under.
-    args.consultation_kind = CONSULTATION_PROJECT_DOMAIN
-    args.callback_to_role = ROLE_GRANDPARENT_COORDINATOR
-    args.callback_methods = list(CALLBACK_METHODS)
-    args.read_contract = ROLE_PROJECT_GATEWAY
-    return orchestrate_handoff(
-        args,
-        default_kind="design_consultation",
-        ticketless=True,
-        ticketless_consultation=True,
-    )
 
 
 def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
@@ -601,42 +398,11 @@ def register(sub) -> None:
     )
     gateway_sub = gateway.add_subparsers(dest="project_gateway_command", required=True)
 
-    resolve = gateway_sub.add_parser(
-        "resolve",
-        help=(
-            "Read-only: resolve the single project gateway target by semantic "
-            "identity, or return a fail-closed gateway_missing / "
-            "gateway_target_ambiguous / selector_gap with the next safe action. "
-            "Never selects by active pane."
-        ),
-    )
-    resolve.add_argument(
-        "--repo",
-        required=True,
-        help="Workspace Git worktree root (repo_root authority).",
-    )
-    resolve.add_argument(
-        "--project",
-        required=True,
-        help="Adopted project scope id (redmine_project) to resolve the gateway for.",
-    )
-    # No --role: the project gateway role is fixed to codex (design doc route).
-    # Resolving a Claude target is off-contract and removed (review j#66626).
-    resolve.add_argument(
-        "--session",
-        default=None,
-        help=(
-            "Optional session or cockpit group to narrow candidates. Omit to "
-            "resolve across separate windows/sessions (the normal path)."
-        ),
-    )
-    resolve.add_argument(
-        "--json",
-        action="store_true",
-        dest="as_json",
-        help="Emit the structured GatewayResolution payload as JSON.",
-    )
-    resolve.set_defaults(func=cmd_project_gateway_resolve)
+    # Redmine #12751: the read-only `resolve` subcommand + the shared resolution
+    # core (discovery / route construction / fail-closed renderer) live in
+    # `cli_project_gateway_resolve`; register it here so the whole tree is
+    # assembled in one place.
+    register_resolve(gateway_sub)
 
     adopt = gateway_sub.add_parser(
         "adopt",
@@ -760,41 +526,11 @@ def register(sub) -> None:
     )
     handoff.set_defaults(func=cmd_project_gateway_handoff)
 
-    consult = gateway_sub.add_parser(
-        "consult",
-        help=(
-            "Forward a no-anchor ticketless consultation to the project gateway "
-            "(Redmine #12740). Resolves the gateway by semantic identity (no %%pane "
-            "copy), then delivers WITHOUT a Redmine anchor and without fabricating "
-            "one — the forward counterpart of `handoff ticketless-callback`. "
-            "Requires --target-repo + --target-project and --to codex. The "
-            "worker-dispatch / implementation / domain-probe Redmine-anchor gate is "
-            "NOT relaxed (this rail forwards a consultation only). Fails closed (no "
-            "delivery) on missing / ambiguous resolution. Use the anchored "
-            "`project-gateway handoff` once a Redmine anchor exists for worker work."
-        ),
-    )
-    # Reuse the ticketless delivery knobs (no --source / --issue / --journal anchor
-    # flags, no --kind): the route's repo/project/role come from
-    # --target-repo / --target-project / --to, --target is resolved (not typed),
-    # and the forward consultation payload is injected programmatically on `found`.
-    _add_ticketless_delivery_options(consult)
-    consult.add_argument(
-        "--gateway-session",
-        dest="gateway_session",
-        default=None,
-        help=(
-            "Optional session or cockpit group to narrow the gateway resolution to "
-            "one candidate. Omit to resolve across separate windows/sessions."
-        ),
-    )
-    consult.add_argument(
-        "--json",
-        action="store_true",
-        dest="as_json",
-        help="On a fail-closed resolution, emit the GatewayResolution payload as JSON.",
-    )
-    consult.set_defaults(func=cmd_project_gateway_consult)
+    # Redmine #12740 / #12751: the forward no-anchor consultation leg. Its handler +
+    # parser live in `cli_project_gateway_consult` (bounded extraction so consult's
+    # change impact is localized and it has an independent test target); register it
+    # here so the whole `project-gateway` subcommand tree is assembled in one place.
+    register_consult(gateway_sub)
 
     # Redmine #12748: the parent -> child no-anchor work-intake leg. Its handler +
     # parser live in `cli_project_gateway_child_intake` (extracted to keep this
