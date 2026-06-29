@@ -73,6 +73,17 @@ def register(sub) -> None:
         help="Use unstaged + untracked changes (instead of unstaged-only).",
     )
     resolve.add_argument(
+        "--base",
+        metavar="REF",
+        default=None,
+        help=(
+            "Derive changed paths from `git diff <REF>...HEAD` (merge-base diff) "
+            "instead of the working tree. This is the CI lane's entry point: the "
+            "quick lane diffs against the PR merge target, so local and CI feed "
+            "the identical resolver. Ignored when explicit PATHS are given."
+        ),
+    )
+    resolve.add_argument(
         "--format",
         choices=("text", "json", "targets"),
         default="text",
