@@ -22,6 +22,10 @@ from typing import Any
 import mozyo_bridge
 from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.application.doctor_claude_skill import (
+    ClaudeSkillSectionUseCase,
+    LiveClaudeSkillReads,
+)
 from mozyo_bridge.application.doctor_codex_skill import (
     CodexSkillSectionUseCase,
     LiveCodexSkillReads,
@@ -313,64 +317,27 @@ def doctor_codex_skill_section() -> dict[str, Any]:
 
 
 def doctor_claude_skill_section(args: argparse.Namespace) -> dict[str, Any]:
-    global_home = claude_skill_global_home()
-    global_dir = global_home / "skills" / "mozyo-bridge-agent"
-    global_info = _check_skill_dir(global_dir)
+    """Report the Claude skill install state for ``mozyo-bridge``.
 
-    project_dir = claude_skill_project_dir(args)
-    project_skill_dir = project_dir / ".claude" / "skills" / "mozyo-bridge-agent"
-    project_info = _check_skill_dir(project_skill_dir)
+    Read-only: it never installs or repairs. Inspects the three Claude skill
+    surfaces (personal/global skill home, project-local ``.claude`` skill dir,
+    plugin marketplace cache) and reports the section ``status`` with the
+    matching precedence ``warnings`` and operator ``next_action`` guidance —
+    ``plugin-managed`` when only the plugin cache supplies the skill, ``missing``
+    when nothing is installed, ``incomplete`` when shared references are absent,
+    ``warning`` on the legacy global+project precedence collision, ``ok``
+    otherwise.
 
-    plugin_info = _check_plugin_install(claude_plugin_skill_root(global_home))
-
-    warnings: list[str] = []
-    if global_info["present"] and project_info["present"]:
-        warnings.append(
-            "personal/global Claude skill at "
-            + global_info["path"]
-            + " overrides project skill at "
-            + project_info["path"]
-            + " (Claude Code precedence: personal > project)"
-        )
-
-    next_action: list[str] = []
-    status = "ok"
-    if not global_info["present"] and not project_info["present"]:
-        if plugin_info["present"]:
-            # plugin marketplace install is the source of the skill; no legacy
-            # install hint should be emitted. Treated as healthy and excluded
-            # from BAD_SECTION_STATUSES so the overall doctor result stays ok.
-            status = "plugin-managed"
-        else:
-            status = "missing"
-            next_action.append(CLAUDE_GLOBAL_SKILL_INSTALL_HINT)
-    elif global_info["present"] and global_info["references_missing"]:
-        status = "incomplete"
-        next_action.append(
-            "re-run scripts/install_claude_skill.sh to sync the global skill references"
-        )
-    elif (
-        not global_info["present"]
-        and project_info["present"]
-        and project_info["references_missing"]
-    ):
-        status = "incomplete"
-        next_action.append(
-            "re-run scripts/install_claude_skill.sh against this project to sync references"
-        )
-    elif warnings:
-        status = "warning"
-
-    return {
-        "status": status,
-        "global_home": str(global_home),
-        "global": global_info,
-        "project_dir": str(project_dir),
-        "project": project_info,
-        "plugin": plugin_info,
-        "warnings": warnings,
-        "next_action": next_action,
-    }
+    Thin handler: the external reads (``claude_skill_global_home`` /
+    ``claude_skill_project_dir`` / ``claude_plugin_skill_root`` /
+    ``_check_skill_dir`` / ``_check_plugin_install``) and the authority-bearing
+    verdict (status + warnings + next_action) now live behind the typed boundary
+    in ``doctor_claude_skill`` (#12843). ``LiveClaudeSkillReads`` drives the
+    filesystem reads at call time, ``ClaudeSkillSectionUseCase`` applies the pure
+    ``evaluate_claude_skill_section`` policy, and the legacy section dict is
+    preserved byte-for-byte.
+    """
+    return ClaudeSkillSectionUseCase(LiveClaudeSkillReads(args)).execute()
 
 
 def doctor_scaffold_section(args: argparse.Namespace) -> dict[str, Any]:
