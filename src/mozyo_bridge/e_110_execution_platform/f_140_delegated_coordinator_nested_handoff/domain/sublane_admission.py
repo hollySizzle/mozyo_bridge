@@ -183,9 +183,9 @@ def classify_lane_state(signal: LaneSignal) -> str:
        :data:`LANE_STATE_RETIRE_READY`;
     8. no gate -> :data:`LANE_STATE_IDLE`.
 
-    Fail-closed: any gate outside :data:`GATE_KINDS` classifies to
-    :data:`LANE_STATE_BLOCKED` so the preflight drains an unreadable lane rather than
-    dispatching past it.
+    Fail-closed: any gate outside :data:`GATE_KINDS`, or any ``callback_state`` outside
+    :data:`CALLBACK_STATES`, classifies to :data:`LANE_STATE_BLOCKED` so the preflight
+    drains an unreadable lane rather than dispatching past it.
     """
     gate = signal.latest_gate
 
@@ -194,6 +194,10 @@ def classify_lane_state(signal: LaneSignal) -> str:
         return LANE_STATE_BLOCKED
 
     # 2. callback failure / due — a dispatch happened but the durable pointer is broken.
+    # An unrecognized callback state is fail-closed to blocked (like an unknown gate): a
+    # lane whose callback disposition we cannot read is drained, never dispatched past.
+    if signal.callback_state not in CALLBACK_STATES:
+        return LANE_STATE_BLOCKED
     if signal.callback_state == CALLBACK_DELIVERY_FAILED:
         return LANE_STATE_CALLBACK_DELIVERY_FAILED
     if signal.callback_state == CALLBACK_DUE:

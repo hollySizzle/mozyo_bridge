@@ -168,6 +168,38 @@ class ClassifyBlockingTest(unittest.TestCase):
         # Fail-closed: an unrecognized gate is drained, not dispatched past.
         self.assertEqual(classify_lane_state(_signal(gate="nonsense")), LANE_STATE_BLOCKED)
 
+    def test_unknown_callback_state_fails_closed_to_blocked(self):
+        # Fail-closed (Review Gate j#68559 finding 1): a lane whose callback disposition
+        # we cannot read must be drained, never dispatched past — even when its gate
+        # would otherwise classify as implementing / review_waiting.
+        self.assertEqual(
+            classify_lane_state(_signal(gate=GATE_START, callback_state="unknown")),
+            LANE_STATE_BLOCKED,
+        )
+        self.assertEqual(
+            classify_lane_state(
+                _signal(
+                    gate=GATE_REVIEW,
+                    review_conclusion=REVIEW_PENDING,
+                    callback_state="bogus",
+                )
+            ),
+            LANE_STATE_BLOCKED,
+        )
+
+    def test_unknown_callback_lane_is_not_over_dispatched(self):
+        # End-to-end: an unknown-callback lane is coordinator-blocking, so a set that
+        # otherwise has ready work + capacity stops and drains rather than dispatching.
+        inputs = SublaneAdmissionInputs(
+            lane_signals=(_signal(issue="12856", gate=GATE_START, callback_state="weird"),),
+            ready_independent_work=1,
+            capacity_remaining=2,
+        )
+        outcome = evaluate_sublane_admission(inputs)
+        self.assertFalse(outcome.should_dispatch)
+        self.assertEqual(outcome.admission_decision, ADMISSION_STOP_AND_DRAIN)
+        self.assertIn("12856", outcome.fill.coordinator_blocking)
+
     def test_callback_delivery_failed_is_coordinator_blocking(self):
         self.assertIn(LANE_STATE_CALLBACK_DELIVERY_FAILED, COORDINATOR_BLOCKING_STATES)
 
