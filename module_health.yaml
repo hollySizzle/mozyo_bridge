@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6369
+    lines: 6125
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -219,8 +219,18 @@ allowlist:
       Both re-exported via `commands.py` so the cli / cli_workspace / cli_session
       parser bindings and the workspace/session test imports are unchanged; neither
       handler touches a `commands.*`-patched primitive, so no test patch migration was
-      needed. The `workspace register` / `workspace inspect` and the remaining
-      `cmd_session_*` handlers stay residual to #12638 / #12785.
+      needed.
+      Lowered 6369 -> 6125 for the #12749 seventh tranche: the remaining read-only
+      session / workspace identity handlers moved into the `f_110` numbered package
+      — `cmd_session_name` / `cmd_session_boundary_prompt` / `cmd_session_pane_decision`
+      into `commands_session.py`, and `cmd_workspace_inspect` into `commands_workspace.py`.
+      All re-exported via `commands.py` (cli / cli_session / cli_workspace bindings and
+      the test_workspace_registry / test_session_boundary imports unchanged). None
+      relies on a `commands.*`-patched primitive (resolve_canonical_session etc. are
+      real or patched at the `workspace_registry` source), so no test patch migration
+      was needed. The write surfaces `cmd_session_vscode_settings` / `cmd_workspace_register`
+      and the remaining orchestration (cockpit / handoff / status / notify / init) stay
+      residual to #12638 / #12785.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

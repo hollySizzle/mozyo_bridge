@@ -1,14 +1,14 @@
-"""Command handlers for the workspace command family (defaults + list).
+"""Command handlers for the workspace command family (defaults + list + inspect).
 
 Split out of ``application/commands.py`` (Redmine #12142). ``commands.py``
 re-exports these so existing imports / patch targets keep working.
 ``cmd_workspace_defaults`` moved first (#12142); the read-only
-``cmd_workspace_list`` inventory surface was carried here next as part of the
-``commands.py`` decomposition (Redmine #12749 / #12638 / #12785) — the "later
-wave" the original docstring noted. The ``workspace register`` / ``workspace
-inspect`` handlers stay in ``commands.py`` for now (residual to #12638 / #12785).
-Behavior-preserving: handler bodies (with their lazy local imports) are moved
-verbatim.
+``cmd_workspace_list`` and ``cmd_workspace_inspect`` identity surfaces were
+carried here next as part of the ``commands.py`` decomposition (Redmine #12749 /
+#12638 / #12785) — the "later wave" the original docstring noted. The write
+surface ``workspace register`` stays in ``commands.py`` for now (residual to
+#12638 / #12785). Behavior-preserving: handler bodies (with their lazy local
+imports) are moved verbatim.
 """
 from __future__ import annotations
 
@@ -89,5 +89,110 @@ def cmd_workspace_list(args: argparse.Namespace) -> int:
         print(
             f"{record.canonical_session}\t{record.project_name}\t"
             f"{record.display_path}\t{record.last_seen or '-'}"
+        )
+    return 0
+
+
+def cmd_workspace_inspect(args: argparse.Namespace) -> int:
+    """Show how this workspace's identity resolves (#11429). Read-only.
+
+    Surfaces all three identity layers side by side — home-registry row,
+    workspace-local anchor, and the path-derived fallback — plus the
+    effective resolution, so registry/anchor drift is visible before it
+    bites a handoff gate.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name as _derive
+    from mozyo_bridge.workspace_registry import (
+        ANCHOR_LEGACY_RELATIVE,
+        ANCHOR_RELATIVE,
+        anchor_path,
+        anchor_resolution,
+        legacy_anchor_path,
+        load_workspace_by_path,
+        read_anchor,
+        registry_path,
+        resolve_canonical_session,
+    )
+
+    repo_root = repo_root_from_args(args)
+    record = load_workspace_by_path(repo_root)
+    anchor = read_anchor(repo_root)
+    anchor_names = anchor_resolution(repo_root)
+    derived = _derive(repo_root)
+    resolved = resolve_canonical_session(repo_root)
+
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "repo_root": str(resolved.repo_root),
+            "registry_path": str(registry_path()),
+            "anchor_path": str(anchor_path(resolved.repo_root)),
+            "anchor_legacy_path": str(legacy_anchor_path(resolved.repo_root)),
+            "anchor_name_state": (
+                "both"
+                if anchor_names.both_exist
+                else "legacy"
+                if anchor_names.using_legacy
+                else "new"
+                if anchor_names.new_exists
+                else "none"
+            ),
+            "registered": record.as_payload() if record else None,
+            "anchor": anchor,
+            "derived_fallback": {
+                "name": derived.name,
+                "source": derived.source,
+                "identifier": derived.identifier,
+            },
+            "resolved": {
+                "name": resolved.name,
+                "source": resolved.source,
+                "workspace_id": resolved.workspace_id,
+            },
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print(f"repo_root: {resolved.repo_root}")
+    print(f"resolved session: {resolved.name} (source: {resolved.source})")
+    if record:
+        print(
+            f"registry: {record.canonical_session} "
+            f"(workspace_id {record.workspace_id}, last_seen {record.last_seen or '-'})"
+        )
+    else:
+        print(f"registry: not registered in {registry_path()}")
+    if anchor:
+        anchor_loc = (
+            legacy_anchor_path(resolved.repo_root)
+            if anchor_names.using_legacy
+            else anchor_path(resolved.repo_root)
+        )
+        print(
+            f"anchor: {anchor['canonical_session']} "
+            f"(workspace_id {anchor['workspace_id']}) at {anchor_loc}"
+        )
+    else:
+        print(f"anchor: none at {anchor_path(resolved.repo_root)}")
+    print(f"derived fallback: {derived.name} (source: {derived.source})")
+    if anchor_names.both_exist:
+        print(
+            f"warning: both {ANCHOR_RELATIVE.as_posix()} and "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
+            f"authoritative — remove the legacy "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} (no silent merge)."
+        )
+    elif anchor_names.using_legacy:
+        print(
+            f"warning: anchor uses the legacy name "
+            f"{ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge workspace "
+            f"register` to migrate it to {ANCHOR_RELATIVE.as_posix()}."
+        )
+    if record and anchor and record.workspace_id != anchor["workspace_id"]:
+        print(
+            "warning: registry row and anchor disagree on workspace_id; "
+            "re-run `mozyo-bridge workspace register` to reconcile "
+            "(the anchor wins)."
         )
     return 0

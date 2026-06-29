@@ -30,10 +30,14 @@ from mozyo_bridge.application.commands_agents import (
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
+    cmd_workspace_inspect,
     cmd_workspace_list,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_session import (
+    cmd_session_boundary_prompt,
     cmd_session_list,
+    cmd_session_name,
+    cmd_session_pane_decision,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
@@ -5985,36 +5989,6 @@ def cmd_instruction_install(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
-def cmd_session_name(args: argparse.Namespace) -> int:
-    """Print the tmux session name for the repo (Redmine #10796, #11429).
-
-    Resolves the repo root from ``--repo`` (default cwd) and resolves the
-    session name registry-first: the canonical session name registered in the
-    home registry (or the workspace-local anchor) wins; a never-registered
-    workspace falls back to deriving a collision-safe ASCII name (preferring
-    the workspace-defaults Redmine identifier, otherwise a hash-suffixed
-    repo-path fallback). Prints it on a single line for shell use. ``--json``
-    emits the name plus its resolution source and workspace id. Read-only:
-    does not touch tmux, Redmine, or write to disk.
-    """
-    repo_root = repo_root_from_args(args)
-    result = resolve_canonical_session(repo_root)
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "name": result.name,
-            "source": result.source,
-            "identifier": result.identifier,
-            "repo_root": str(result.repo_root),
-            "workspace_id": result.workspace_id,
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    print(result.name)
-    return 0
-
-
 def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
 
@@ -6067,119 +6041,6 @@ def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_session_boundary_prompt(args: argparse.Namespace) -> int:
-    """Emit the compact next-session boundary prompt (Redmine #12122).
-
-    Renders a pasteable prompt a Codex session hands the operator / next Codex
-    session so the next session re-anchors from the durable Redmine journal plus
-    repo / execution root, not from pane scrollback or window/session naming.
-    The repo is referenced by its **portable** canonical session name (resolved
-    from ``--repo``); the absolute repo root and execution-root workdir appear
-    only in ``--json`` so a pasted prompt never carries a private absolute path
-    (``vibes/docs/rules/public-private-boundary.md``). Pure / read-only towards
-    tmux, git, and Redmine.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
-        BoundaryPrompt,
-        SessionBoundaryError,
-        build_boundary_prompt,
-        classify_boundary,
-    )
-
-    repo_root = repo_root_from_args(args)
-    session = resolve_canonical_session(repo_root)
-
-    execution_root = None
-    exec_root_arg = getattr(args, "execution_root", None)
-    if exec_root_arg:
-        workdir_abs = str(Path(exec_root_arg).expanduser().resolve())
-        execution_root = build_execution_root(
-            workdir_abs, repo_root_abs=str(repo_root)
-        )
-
-    signals = tuple(getattr(args, "signal", None) or ())
-    try:
-        if signals:
-            # Validate the signal vocabulary up front so a typo fails loudly
-            # instead of being pasted into a next-session prompt.
-            classify_boundary(signals)
-        prompt = BoundaryPrompt(
-            issue=str(args.issue),
-            journal=str(args.journal),
-            repo_pointer=session.name,
-            parent_issue=getattr(args, "parent", None),
-            commit=getattr(args, "commit", None),
-            target_lane=getattr(args, "target_lane", None),
-            execution_root=execution_root,
-            gate_state=getattr(args, "gate", None),
-            verification_state=getattr(args, "verification", None),
-            residual_risks=tuple(getattr(args, "residual", None) or ()),
-            pending_action=getattr(args, "pending_action", None),
-            next_actor=getattr(args, "next_actor", None),
-            signals=signals,
-        )
-    except SessionBoundaryError as exc:
-        die(str(exc))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = prompt.to_dict()
-        # The structured outcome is allowed to carry runtime absolutes (the
-        # execution_root.workdir already does); add the repo root here so an
-        # automation consumer can resolve the checkout. Pasteable text never
-        # gets these.
-        payload["repo_root"] = str(repo_root)
-        payload["prompt_markdown"] = build_boundary_prompt(prompt)
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    print(build_boundary_prompt(prompt))
-    return 0
-
-
-def cmd_session_pane_decision(args: argparse.Namespace) -> int:
-    """Decide the guarded Claude-pane lifecycle action (Redmine #12122).
-
-    Encodes the parent US (#12113) acceptance criteria: default lean to a new
-    pane, reuse only same-lane, orphan is non-destructive, and kill/discard is
-    blocked whenever unfinished durable state is present (dirty diff, running
-    process, pending approval, unrecorded journal) or no owner kill approval has
-    been recorded. Exits non-zero (3) when the decision is ``blocked`` so an
-    operator's ``&&`` chain cannot silently proceed to a kill. Pure / read-only.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
-        PaneLifecycleState,
-        SessionBoundaryError,
-        decide_pane_lifecycle,
-    )
-
-    state = PaneLifecycleState(
-        requested=getattr(args, "requested", None) or "new",
-        same_lane=getattr(args, "same_lane", False),
-        dirty_diff=getattr(args, "dirty_diff", False),
-        running_process=getattr(args, "running_process", False),
-        pending_approval=getattr(args, "pending_approval", False),
-        unrecorded_journal=getattr(args, "unrecorded_journal", False),
-        owner_approved_kill=getattr(args, "owner_approved_kill", False),
-    )
-    try:
-        decision = decide_pane_lifecycle(state)
-    except SessionBoundaryError as exc:
-        die(str(exc))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(_json.dumps(decision.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(f"decision: {decision.decision}")
-        if decision.blockers:
-            print("blockers: " + ", ".join(decision.blockers))
-        print(f"rationale: {decision.rationale}")
-    return 3 if decision.is_blocked else 0
-
-
 def cmd_workspace_register(args: argparse.Namespace) -> int:
     """Register (or refresh) this workspace in the home registry (#11429).
 
@@ -6226,111 +6087,6 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     print(f"  anchor:            {result.anchor_path}")
     for note in result.notes:
         print(f"  note: {note}")
-    return 0
-
-
-def cmd_workspace_inspect(args: argparse.Namespace) -> int:
-    """Show how this workspace's identity resolves (#11429). Read-only.
-
-    Surfaces all three identity layers side by side — home-registry row,
-    workspace-local anchor, and the path-derived fallback — plus the
-    effective resolution, so registry/anchor drift is visible before it
-    bites a handoff gate.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name as _derive
-    from mozyo_bridge.workspace_registry import (
-        ANCHOR_LEGACY_RELATIVE,
-        ANCHOR_RELATIVE,
-        anchor_path,
-        anchor_resolution,
-        legacy_anchor_path,
-        load_workspace_by_path,
-        read_anchor,
-        registry_path,
-        resolve_canonical_session,
-    )
-
-    repo_root = repo_root_from_args(args)
-    record = load_workspace_by_path(repo_root)
-    anchor = read_anchor(repo_root)
-    anchor_names = anchor_resolution(repo_root)
-    derived = _derive(repo_root)
-    resolved = resolve_canonical_session(repo_root)
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "repo_root": str(resolved.repo_root),
-            "registry_path": str(registry_path()),
-            "anchor_path": str(anchor_path(resolved.repo_root)),
-            "anchor_legacy_path": str(legacy_anchor_path(resolved.repo_root)),
-            "anchor_name_state": (
-                "both"
-                if anchor_names.both_exist
-                else "legacy"
-                if anchor_names.using_legacy
-                else "new"
-                if anchor_names.new_exists
-                else "none"
-            ),
-            "registered": record.as_payload() if record else None,
-            "anchor": anchor,
-            "derived_fallback": {
-                "name": derived.name,
-                "source": derived.source,
-                "identifier": derived.identifier,
-            },
-            "resolved": {
-                "name": resolved.name,
-                "source": resolved.source,
-                "workspace_id": resolved.workspace_id,
-            },
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    print(f"repo_root: {resolved.repo_root}")
-    print(f"resolved session: {resolved.name} (source: {resolved.source})")
-    if record:
-        print(
-            f"registry: {record.canonical_session} "
-            f"(workspace_id {record.workspace_id}, last_seen {record.last_seen or '-'})"
-        )
-    else:
-        print(f"registry: not registered in {registry_path()}")
-    if anchor:
-        anchor_loc = (
-            legacy_anchor_path(resolved.repo_root)
-            if anchor_names.using_legacy
-            else anchor_path(resolved.repo_root)
-        )
-        print(
-            f"anchor: {anchor['canonical_session']} "
-            f"(workspace_id {anchor['workspace_id']}) at {anchor_loc}"
-        )
-    else:
-        print(f"anchor: none at {anchor_path(resolved.repo_root)}")
-    print(f"derived fallback: {derived.name} (source: {derived.source})")
-    if anchor_names.both_exist:
-        print(
-            f"warning: both {ANCHOR_RELATIVE.as_posix()} and "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
-            f"authoritative — remove the legacy "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} (no silent merge)."
-        )
-    elif anchor_names.using_legacy:
-        print(
-            f"warning: anchor uses the legacy name "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge workspace "
-            f"register` to migrate it to {ANCHOR_RELATIVE.as_posix()}."
-        )
-    if record and anchor and record.workspace_id != anchor["workspace_id"]:
-        print(
-            "warning: registry row and anchor disagree on workspace_id; "
-            "re-run `mozyo-bridge workspace register` to reconcile "
-            "(the anchor wins)."
-        )
     return 0
 
 
