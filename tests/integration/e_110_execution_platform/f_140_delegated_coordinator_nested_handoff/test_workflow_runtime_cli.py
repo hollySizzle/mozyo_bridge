@@ -86,6 +86,71 @@ class DuplicateSuppressionTest(unittest.TestCase):
         self.assertIn("owner_role: auditor", text)
 
 
+class IdOmissionRegressionTest(unittest.TestCase):
+    """Review Gate j#68580 finding 1: omitting ``id=`` must not collapse distinct events.
+
+    Two genuinely-distinct journal events for the same issue + gate (different facts) must
+    both apply — last-applied-event-per-issue wins — instead of the later one being
+    falsely suppressed as a duplicate.
+    """
+
+    def test_same_issue_same_gate_different_facts_without_id_both_apply(self):
+        rc, text = _run(
+            [
+                "workflow",
+                "runtime",
+                "--event",
+                "12857:review,conclusion=pending",
+                "--event",
+                "12857:review,conclusion=approved",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        # The later approved review wins -> owner aggregation, NOT review_waiting.
+        self.assertIn("next_action: aggregate_owner_approval", text)
+        self.assertIn("12857 -> owner_waiting", text)
+        self.assertIn("suppressed=<none>", text)
+
+    def test_same_issue_same_gate_without_id_json_reflects_latest(self):
+        rc, text = _run(
+            [
+                "workflow",
+                "runtime",
+                "--event",
+                "12857:review,conclusion=pending",
+                "--event",
+                "12857:review,conclusion=approved",
+                "--json",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        payload = json.loads(text)
+        self.assertEqual(payload["state"]["suppressed_event_ids"], [])
+        self.assertEqual(len(payload["state"]["applied_event_ids"]), 2)
+        self.assertEqual(
+            payload["next_action"]["action"], "aggregate_owner_approval"
+        )
+        self.assertEqual(
+            payload["state"]["lane_actions"][0]["state_class"], "owner_waiting"
+        )
+
+    def test_explicit_shared_id_still_suppressed(self):
+        # The duplicate-suppression feature stays intact for a real shared durable anchor.
+        rc, text = _run(
+            [
+                "workflow",
+                "runtime",
+                "--event",
+                "12857:review_request,id=12857:j1",
+                "--event",
+                "12857:review_request,id=12857:j1",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("applied=['12857:j1']", text)
+        self.assertIn("suppressed=['12857:j1']", text)
+
+
 class JsonTest(unittest.TestCase):
     def test_json_carries_state_and_next_action(self):
         rc, text = _run(

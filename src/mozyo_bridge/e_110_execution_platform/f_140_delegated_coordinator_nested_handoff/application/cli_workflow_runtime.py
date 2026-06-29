@@ -28,6 +28,7 @@ durable event log is idempotent.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json as _json
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
@@ -65,8 +66,11 @@ def _parse_event(spec: str) -> LaneEvent:
     optional event facts:
 
     - ``id=`` the durable anchor (journal pointer, e.g. ``12857:68572``) that makes
-      replay idempotent. Omitted, it defaults to ``ISSUE:GATE`` — adequate for a single
-      replay but supply an explicit ``id=`` to make duplicate suppression meaningful.
+      replay idempotent. Omitted here, the event id is left empty and a *unique*
+      synthetic id is assigned per supplied event later (:func:`_assign_event_ids`), so an
+      ``id=``-less event is never falsely suppressed against another event that happens to
+      share its issue / gate. Duplicate suppression therefore applies only across events
+      that share an explicit ``id=`` durable anchor.
     - ``conclusion=`` pending|approved|changes_requested (only used for a ``review`` gate)
     - ``callback=`` none|due|delivery_failed
     - ``commit=`` 0|1 (commit-bearing work)
@@ -145,11 +149,9 @@ def _parse_event(spec: str) -> LaneEvent:
                 "/ commit / integrated / open / blocker)"
             )
 
-    # Default the durable anchor to ISSUE:GATE when omitted: deterministic for a single
-    # replay; an explicit id= is what makes duplicate suppression across replays useful.
-    if not event_id:
-        event_id = f"{issue}:{gate}"
-
+    # Leave the durable anchor empty when ``id=`` is omitted; a unique synthetic id is
+    # assigned per supplied event by :func:`_assign_event_ids` so two distinct events that
+    # share an issue / gate (e.g. a pending then an approved review) are NOT collapsed.
     return LaneEvent(
         event_id=event_id,
         issue=issue,
@@ -163,8 +165,32 @@ def _parse_event(spec: str) -> LaneEvent:
     )
 
 
+def _assign_event_ids(events: tuple[LaneEvent, ...]) -> tuple[LaneEvent, ...]:
+    """Give every ``id=``-less event a unique synthetic durable anchor (CLI layer).
+
+    Events parsed with an explicit ``id=`` keep it verbatim — duplicate suppression across
+    a shared explicit anchor is the intended feature. Events without one are each a
+    *distinct* supplied event (we cannot know two of them are the same durable fact), so
+    each gets a unique synthetic id (its supplied position) that cannot be confused with
+    another event's. The synthetic id is guarded against an (unlikely) clash with an
+    explicit anchor so it never accidentally suppresses, or is suppressed by, a real one.
+    """
+    used = {event.event_id for event in events if event.event_id}
+    assigned: list[LaneEvent] = []
+    for index, event in enumerate(events):
+        if event.event_id:
+            assigned.append(event)
+            continue
+        synthetic = f"#event-{index}"
+        while synthetic in used:
+            synthetic = f"#{synthetic}"
+        used.add(synthetic)
+        assigned.append(dataclasses.replace(event, event_id=synthetic))
+    return tuple(assigned)
+
+
 def _state_from_args(args: argparse.Namespace) -> WorkflowRuntimeState:
-    events = tuple(getattr(args, "event", None) or ())
+    events = _assign_event_ids(tuple(getattr(args, "event", None) or ()))
     return evaluate_workflow_runtime(
         events,
         ready_independent_work=int(getattr(args, "ready_independent", 0) or 0),
@@ -257,8 +283,9 @@ def register_runtime(workflow_sub) -> None:
             "One durable lane event as ISSUE:GATE (repeatable, applied in order). GATE is "
             "a durable gate kind (none / start / progress / implementation_done / "
             "review_request / review / owner_close_approval / close / blocked). Optional "
-            "comma modifiers: id=<durable anchor> (e.g. 12857:68572; defaults to "
-            "ISSUE:GATE; same id is suppressed on replay), "
+            "comma modifiers: id=<durable anchor> (e.g. 12857:68572; the same id is "
+            "suppressed on replay; omit it and each supplied event is treated as a "
+            "distinct event so it is never falsely suppressed), "
             "conclusion=pending|approved|changes_requested (for a 'review' gate), "
             "callback=none|due|delivery_failed, commit=0|1, integrated=0|1, open=0|1 "
             "(default 1), blocker=0|1. The last applied event per issue is its current "
