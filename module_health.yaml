@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1762
+    lines: 1761
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -375,6 +375,21 @@ allowlist:
       section tests are unchanged. `test_doctor_claude_skill` adds fake-port
       use-case + pure verdict-policy specifications (the verdict authority no
       longer needs temp-dir skill seeding or env patching). The remaining broad
+      `doctor_*_section` collector bodies stay residual to #12638.
+      Lowered 1762 -> 1761 for the #12844 doctor rules section collector boundary
+      tranche: the `doctor_rules_section` collector's three responsibilities —
+      the external read (`rules_status` preset scan + `MOZYO_BRIDGE_HOME` home
+      resolution), the authority-bearing verdict (section status + next_action),
+      and the legacy section dict assembly — moved behind the typed boundary in
+      `doctor_rules.py` (the `RulesSectionVerdict` value object, the pure
+      `evaluate_rules_section` domain policy, the `RulesReads` port +
+      `LiveRulesReads` adapter, and the `RulesSectionUseCase`).
+      `doctor_rules_section` is now a thin handler composing the use case at call
+      time; `LiveRulesReads` resolves the `doctor` `rules_status` helper and the
+      `--home`-aware install command at call time, so the existing preset-install
+      / `--home` section tests are unchanged. `test_doctor_rules` adds fake-port
+      use-case + pure verdict-policy specifications (the verdict authority no
+      longer needs real preset installs or env seeding). The remaining broad
       `doctor_*_section` collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
