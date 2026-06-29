@@ -306,10 +306,25 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1852
+    lines: 1831
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
+      Lowered 1852 -> 1831 for the #12833 doctor command body boundary tranche:
+      the `run_doctor` body's two responsibilities — the section orchestration
+      (external reads) and the authority-bearing health verdict (which becomes
+      the doctor exit code) — moved behind the typed boundary in
+      `doctor_health.py` (the `DoctorHealthVerdict` value object, the pure
+      `evaluate_doctor_health` domain policy, the `DoctorSectionReads` port +
+      `LiveDoctorSections` adapter, and the `RunDoctorUseCase`). `run_doctor`
+      is now a thin handler composing the use case; `LiveDoctorSections` drives
+      the section collectors through the `doctor` module at call time, so the
+      existing `patch(...doctor.doctor_*_section)` integration tests are
+      unchanged. `BAD_SECTION_STATUSES` is re-exported from `doctor_health`
+      (`doctor_instruction` importer unchanged). `test_doctor_health` adds the
+      fake-port use-case + pure verdict-policy specifications (the verdict
+      authority no longer needs section-collector monkeypatching). The broad
+      `cmd_doctor` / `run_doctor` collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
