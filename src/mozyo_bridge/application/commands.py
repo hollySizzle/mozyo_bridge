@@ -29,6 +29,11 @@ from mozyo_bridge.application.commands_agents import (
     cmd_list,
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
+from mozyo_bridge.application.status_session_port import LiveStatusSession
+from mozyo_bridge.application.commands_status import (
+    ResolveSessionStatusUseCase,
+    StatusQuery,
+)
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
     cmd_workspace_inspect,
     cmd_workspace_list,
@@ -3747,26 +3752,20 @@ def resolve_status_session(args: argparse.Namespace) -> str:
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
     session = resolve_status_session(args)
-    if session_exists(session):
+    # OOP-first session-read boundary (Redmine #12785): the existence / window /
+    # pane reads and present-missing classification live behind StatusSessionPort
+    # + ResolveSessionStatusUseCase (commands_status); the cmd_doctor tail and
+    # cockpit-membership projection below stay residual to #12638.
+    view = ResolveSessionStatusUseCase(LiveStatusSession()).resolve(
+        StatusQuery(session=session)
+    )
+    if view.present:
         print(f"session: {session}")
-        windows = list_session_windows(session)
-        agent_windows = [name for name in windows if name in AGENT_LABELS]
-        if agent_windows:
-            result = run_tmux(
-                "list-panes",
-                "-s",
-                "-t",
-                session,
-                "-F",
-                "#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t"
-                "#{pane_current_command}\t#{pane_current_path}",
-                check=False,
-            )
+        if view.has_agent_windows:
             print("WINDOW\tNAME\tTARGET\tACTIVE\tPROCESS\tCWD")
-            if result.returncode == 0:
-                print(result.stdout, end="")
-            missing = [agent for agent in AGENT_LABELS if agent not in agent_windows]
-            for agent in sorted(missing):
+            if view.panes_ok:
+                print(view.panes_text, end="")
+            for agent in view.missing_agents:
                 print(
                     f"  {agent} window missing; run `mozyo` to create it, "
                     f"or `mozyo-bridge init {agent}` from the right pane to rename it."
