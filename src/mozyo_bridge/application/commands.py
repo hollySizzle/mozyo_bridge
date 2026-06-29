@@ -29,6 +29,12 @@ from mozyo_bridge.application.commands_agents import (
     cmd_list,
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
+    cmd_workspace_list,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_session import (
+    cmd_session_list,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
@@ -6009,69 +6015,6 @@ def cmd_session_name(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_session_list(args: argparse.Namespace) -> int:
-    """Cross-workspace session inventory (Redmine #11422).
-
-    Lists every tmux pane folded by ``pane_id`` (Redmine #11628: grouped
-    sessions are views of one agent, not extra rows) together with the
-    workspace identity its repo root resolves to (registry → anchor →
-    derivation, NFC-normalized per Redmine #11625). The live tmux runtime is
-    the source of truth; each runtime listing refreshes the SQLite cache in
-    ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite``, and when tmux
-    is unavailable the cache is served instead, explicitly marked stale.
-    Read-only towards tmux and the workspace registry.
-    """
-    from mozyo_bridge.session_inventory import take_inventory
-
-    snapshot = take_inventory()
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(
-            _json.dumps(
-                snapshot.as_payload(), ensure_ascii=False, indent=2, sort_keys=True
-            )
-        )
-        return 0
-    for note in snapshot.notes:
-        print(f"note: {note}", file=sys.stderr)
-    if snapshot.stale:
-        print(
-            f"stale: cached snapshot from {snapshot.collected_at or 'unknown'} "
-            "(tmux runtime unavailable)",
-            file=sys.stderr,
-        )
-    print(
-        "PANE\tSESSION\tWINDOW\tKIND\tACTIVITY\tPROCESS\tWORKSPACE\t"
-        "REPO_ROOT\tOTHER_VIEWS"
-    )
-    for record in snapshot.records:
-        workspace = record.workspace
-        workspace_label = "-"
-        if workspace is not None:
-            workspace_label = workspace.project_name or workspace.canonical_session
-        other_views = ",".join(
-            view.session for view in record.views if not view.canonical
-        )
-        activity = record.activity or {}
-        print(
-            "\t".join(
-                [
-                    record.pane_id or "-",
-                    record.session or "-",
-                    record.window_name or "-",
-                    record.agent_kind,
-                    activity.get("state") or "unknown",
-                    record.process or "-",
-                    workspace_label,
-                    record.repo_root or "-",
-                    other_views or "-",
-                ]
-            )
-        )
-    return 0
-
-
 def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
     """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
 
@@ -6283,35 +6226,6 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     print(f"  anchor:            {result.anchor_path}")
     for note in result.notes:
         print(f"  note: {note}")
-    return 0
-
-
-def cmd_workspace_list(args: argparse.Namespace) -> int:
-    """List registered workspaces from the home registry (#11429). Read-only."""
-    from mozyo_bridge.workspace_registry import list_workspaces, registry_path
-
-    records = list_workspaces()
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "registry_path": str(registry_path()),
-            "workspaces": [record.as_payload() for record in records],
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    if not records:
-        print(
-            f"no workspaces registered in {registry_path()} "
-            "(run `mozyo-bridge workspace register` from a workspace root)"
-        )
-        return 0
-    print("SESSION\tNAME\tPATH\tLAST_SEEN")
-    for record in records:
-        print(
-            f"{record.canonical_session}\t{record.project_name}\t"
-            f"{record.display_path}\t{record.last_seen or '-'}"
-        )
     return 0
 
 
