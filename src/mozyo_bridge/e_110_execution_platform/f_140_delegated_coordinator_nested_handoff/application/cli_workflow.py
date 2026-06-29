@@ -46,6 +46,10 @@ from mozyo_bridge.application.commands import (
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_admission import (
+    cmd_workflow_admission,
+    register_admission,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_fill import (
     cmd_workflow_fill_decision,
     register_fill_decision,
@@ -284,12 +288,14 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
 
 
 def register(sub) -> None:
-    """Register the ``workflow`` family (``step`` / ``fill-decision``) onto ``sub``.
+    """Register the ``workflow`` family (``step`` / ``fill-decision`` / ``admission``).
 
     ``workflow step`` (Redmine #12755) advances one safe workflow step;
     ``workflow fill-decision`` (Redmine #12855) reports the advisory Post-Dispatch
-    Fill Loop decision. The fill-decision subcommand is registered from its sibling
-    module so this file stays focused on the step state machine.
+    Fill Loop decision for an already-classified lane set; ``workflow admission``
+    (Redmine #12856) is the Redmine-aware companion that classifies each lane from its
+    durable-record facts first. The fill-decision / admission subcommands are registered
+    from their sibling modules so this file stays focused on the step state machine.
     """
     workflow = sub.add_parser(
         "workflow",
@@ -299,7 +305,9 @@ def register(sub) -> None:
             "lane identity + durable gate + route identity and either executes the "
             "next safe routing/transport action or fails closed with the next owner "
             "and reason. `workflow fill-decision` reports the advisory Post-Dispatch "
-            "Fill Loop decision (Redmine #12855). The standard surface hides %%pane / "
+            "Fill Loop decision (Redmine #12855); `workflow admission` classifies each "
+            "lane from its durable-record facts first, then reports the same advisory "
+            "admission/fill decision (Redmine #12856). The standard surface hides %%pane / "
             "q-enter / queue-enter / --mode; the existing project-gateway / handoff "
             "primitives stay as internal / compatibility / debug surfaces. See "
             "vibes/docs/logics/workflow-step-command-design.md."
@@ -307,6 +315,7 @@ def register(sub) -> None:
     )
     workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
     register_fill_decision(workflow_sub)
+    register_admission(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",
@@ -375,4 +384,9 @@ def register(sub) -> None:
     step.set_defaults(func=cmd_workflow_step)
 
 
-__all__ = ("cmd_workflow_step", "cmd_workflow_fill_decision", "register")
+__all__ = (
+    "cmd_workflow_step",
+    "cmd_workflow_fill_decision",
+    "cmd_workflow_admission",
+    "register",
+)
