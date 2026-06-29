@@ -263,11 +263,11 @@ class AgentsTargetsCommandTest(unittest.TestCase):
     def _run(self, panes, *, as_json=False, session=None, agent=None,
              workspace_id="wsA", label="mozyo-bridge", repo_root="/work/repo",
              branch="issue_11907"):
-        from mozyo_bridge.application import commands
+        from mozyo_bridge.application import commands, commands_agents
 
         canon = argparse.Namespace(name=label, workspace_id=workspace_id)
         args = argparse.Namespace(session=session, agent=agent, as_json=as_json)
-        with patch.object(commands, "require_tmux"), \
+        with patch.object(commands_agents, "require_tmux"), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
@@ -486,7 +486,7 @@ class AgentsTargetsUnregisteredDefaultsTest(unittest.TestCase):
         self.addCleanup(env_patch.stop)
 
     def _run(self):
-        from mozyo_bridge.application import commands
+        from mozyo_bridge.application import commands, commands_agents
         from mozyo_bridge import workspace_registry
 
         args = argparse.Namespace(session=None, agent=None, as_json=False)
@@ -494,7 +494,7 @@ class AgentsTargetsUnregisteredDefaultsTest(unittest.TestCase):
         # so the test fails loudly if the hot path ever reaches it again. The
         # registry is empty (fresh home) and the repo is unregistered, so the
         # only thing standing between discovery and a hang is the fix.
-        with patch.object(commands, "require_tmux"), \
+        with patch.object(commands_agents, "require_tmux"), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
                   return_value=[_pane("%9", "mozyo-cockpit:0.1",
                                       window_name="codex", agent_role="claude",
@@ -545,11 +545,11 @@ class AgentsTargetsAttentionTest(unittest.TestCase):
     """
 
     def _run(self, panes, *, as_json=False):
-        from mozyo_bridge.application import commands
+        from mozyo_bridge.application import commands, commands_agents
 
         canon = argparse.Namespace(name="mozyo-bridge", workspace_id="wsA")
         args = argparse.Namespace(session=None, agent=None, as_json=as_json)
-        with patch.object(commands, "require_tmux"), \
+        with patch.object(commands_agents, "require_tmux"), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
                   return_value="/work/repo"), \
@@ -874,11 +874,11 @@ class AgentsTargetsDelegationColumnsTest(unittest.TestCase):
 
     def _run(self, panes, *, as_json=False, workspace_id="wsA",
              label="mozyo-bridge", repo_root="/work/repo", branch="issue_12466"):
-        from mozyo_bridge.application import commands
+        from mozyo_bridge.application import commands, commands_agents
 
         canon = argparse.Namespace(name=label, workspace_id=workspace_id)
         args = argparse.Namespace(session=None, agent=None, as_json=as_json)
-        with patch.object(commands, "require_tmux"), \
+        with patch.object(commands_agents, "require_tmux"), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root", return_value=repo_root), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \

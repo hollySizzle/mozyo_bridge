@@ -24,16 +24,15 @@ from mozyo_bridge.application.commands_agents import (
     ResolveAgentTargetsUseCase,
     _attention_for_candidate,
     cmd_agents_attention_project,
+    cmd_agents_list,
+    cmd_agents_targets,
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-    AGENT_KINDS,
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     ROLE_SOURCE_WINDOW_NAME,
-    discover_agents,
-    filter_agents,
     infer_repo_root,
     project_preflight_target,
 )
@@ -190,80 +189,6 @@ def cmd_list(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_agents_list(args: argparse.Namespace) -> int:
-    """Cross-session agent discovery surface (Redmine #10332, #11628).
-
-    Emits one row per ``pane_id`` — the agent identity key (Redmine #11628):
-    a pane that belongs to several grouped tmux sessions is ONE agent whose
-    memberships are folded into ``views``; the top-level session / window
-    fields describe the canonical view (the session matching the workspace's
-    canonical session name, resolved registry → anchor → derivation). Each
-    row carries the structured fields a sender needs to name an explicit
-    cross-workspace handoff target: session, window name and index, pane id
-    and index, active flag, classified ``agent_kind`` (``claude`` /
-    ``codex`` / ``unknown``), foreground process, inferred ``repo_root``
-    (walked up via REPO_ROOT_MARKERS from the pane's ``cwd``), the pane's
-    ``cwd``, and an ``ambiguous`` flag when any view's ``(session,
-    window_name)`` pair spans multiple windows in its session. ``--session``
-    matches the canonical session or any grouped view.
-
-    Read-only. Does not change tmux state, does not interact with
-    Asana / Redmine, and is intentionally separate from the legacy ``list`` /
-    ``status`` surfaces so existing scripts that scrape those outputs keep
-    working. Single tmux server assumed; a multi-server deployment would
-    key on ``(socket, pane_id)``.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
-
-    require_tmux()
-    agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
-    session_filter = getattr(args, "session", None)
-    records = filter_agents(
-        fold_agents_by_pane(
-            discover_agents(),
-            resolve_canonical=lambda root: resolve_canonical_session(root).name,
-        ),
-        session=session_filter,
-        agent_kind=agent_filter,
-    )
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [record.to_dict() for record in records]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    print(
-        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tROLE_SOURCE\tCONFIDENCE\t"
-        "PROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS\tOTHER_VIEWS"
-    )
-    for record in records:
-        other_views = ",".join(
-            view.session for view in record.views if not view.canonical
-        )
-        print(
-            "\t".join(
-                [
-                    record.session or "-",
-                    record.window_name or "-",
-                    record.window_index or "-",
-                    record.pane_id or "-",
-                    "1" if record.pane_active else "0",
-                    record.agent_kind,
-                    record.role_source,
-                    record.confidence,
-                    record.process or "-",
-                    record.repo_root or "-",
-                    record.cwd or "-",
-                    "1" if record.ambiguous else "0",
-                    other_views or "-",
-                ]
-            )
-        )
-    return 0
-
-
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
@@ -298,191 +223,16 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
 # ``agents targets`` read handlers below remain here (residual to #12638 / #12785).
 
 
-def cmd_agents_targets(args: argparse.Namespace) -> int:
-    """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
-
-    Read-only. Prints the classified agent panes as candidate handoff targets
-    with just the fields needed to pick an explicit ``pane_id`` without parsing
-    titles: role + resolver provenance (``role_source`` / ``confidence`` /
-    ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
-    repo identifier, current branch, liveness, location, and the projection
-    ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
-    and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
-    original column order and appends ``VIEW_KIND`` / ``BRANCH`` and the additive
-    ``ATTENTION`` / ``REASON`` columns (#11952); ``--json`` renders the nested
-    canonical ``TargetRecord`` projection (host / runtime / identity / repo /
-    view) plus an additive ``attention`` record — a projection, never a saved
-    file. Attention is a conservative read-only projection (#11951 read model):
-    no durable attention source is wired yet, so a cleanly-identified target
-    derives ``healthy`` (reason ``no_attention_source``) and an ambiguous /
-    unreadable one derives ``unknown`` — never a fabricated owner/review signal,
-    and never used for routing. Builds on the same
-    ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
-    the two never drift, and resolves workspace identity through the registry →
-    anchor → derivation chain. Compact text hides absolute paths (basename
-    only); ``--json`` carries ``repo_root`` / ``cwd`` (the exposure ``agents
-    list`` already allows). Listing is non-selecting: same-role candidates stay
-    distinguishable by workspace / lane / pane and the caller must name the
-    explicit pane, so a natural name never auto-crosses a safety boundary. Live
-    tmux remains the liveness source (``active``); registry / anchor are
-    identity hints only.
-    """
-    require_tmux()
-    candidates = _agents_target_candidates(args)
-
-    # Delegated-coordinator-tree display projection (#12466), consuming the
-    # closed #12465 `delegation_projection` foundation. Derived once across all
-    # candidates because depth / root are a function of the whole parent chain;
-    # display-only and never a routing key. JSON gains a `delegation` record per
-    # target, text appends KIND / DEPTH / PARENT columns.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import (
-        delegation_cells,
-        derive_targets_delegation,
-    )
-
-    delegation_map = derive_targets_delegation(candidates)
-
-    # Desired delegated-coordinator window-separation policy (#12467), an additive
-    # `delegation_window` JSON projection alongside the #12466 `delegation` record
-    # (which stays byte-identical). `delegation_window_policy` is a repo-local
-    # display preference, so it is read per distinct repo (memoized) from
-    # `.mozyo-bridge/config.yaml` and resolved per candidate against the #12466
-    # breadcrumb. Display-only and fail-soft: any load / parse failure falls back
-    # to the documented default (`separate`) and never blocks this read-only
-    # table, and the resolved fields are never folded into the canonical
-    # `TargetRecord` routing projection (`to_dict`).
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
-        DEFAULT_DELEGATION_WINDOW_POLICY,
-        resolve_delegation_window_display,
-    )
-
-    _window_policy_by_repo: dict[object, str] = {}
-
-    def _delegation_window_policy_for(repo_root: object) -> str:
-        if repo_root in _window_policy_by_repo:
-            return _window_policy_by_repo[repo_root]
-        policy = DEFAULT_DELEGATION_WINDOW_POLICY
-        if repo_root:
-            try:
-                from mozyo_bridge.application.repo_local_config_loader import (
-                    load_repo_local_config,
-                )
-
-                policy = (
-                    load_repo_local_config(repo_root)
-                    .presentation.grouping.delegation_window_policy
-                )
-            except Exception:  # noqa: BLE001 - fail-soft read-only display
-                policy = DEFAULT_DELEGATION_WINDOW_POLICY
-        _window_policy_by_repo[repo_root] = policy
-        return policy
-
-    def _delegation_window_payload(candidate) -> dict:
-        breadcrumb = delegation_map[candidate.pane_id]
-        unit = f"{candidate.workspace_id or ''}/{candidate.lane_id or ''}"
-        return resolve_delegation_window_display(
-            _delegation_window_policy_for(candidate.repo_root),
-            lane_kind=breadcrumb.lane_kind,
-            delegation_depth=breadcrumb.delegation_depth,
-            delegation_unit=unit,
-            delegation_root=breadcrumb.delegation_root,
-            status=breadcrumb.status,
-        ).as_payload()
-
-    # Live project-gateway lane identity projection (#12708): the visible
-    # distinction the GK3500 smoke (#12698) lacked between the Cloud Drive
-    # project gateway and the GK3500 department root. Derived purely from each
-    # candidate's already-resolved identity (role provenance + #12658 project
-    # scope), display-only and never folded into the canonical `TargetRecord`
-    # routing projection (`to_dict`). JSON gains a `gateway` record per target,
-    # text appends a TARGET_KIND column.
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
-        classify_target_kind,
-        gateway_projection,
-    )
-
-    # Single observation timestamp for this read; the pure attention read model
-    # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
-    # here once. Attention is an additive projection (#11952): JSON gains an
-    # `attention` key per target, text appends ATTENTION / REASON columns.
-    from datetime import datetime, timezone
-
-    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [
-            {
-                **candidate.to_dict(),
-                "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
-                "delegation": delegation_map[candidate.pane_id].as_payload(),
-                "delegation_window": _delegation_window_payload(candidate),
-                "gateway": gateway_projection(candidate),
-            }
-            for candidate in candidates
-        ]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    # Compatibility-preserving text projection (#11907, #11952, #12466): the
-    # original column run (PANE..WINDOW) keeps its order so existing parsers stay
-    # valid; VIEW_KIND / BRANCH (#11907), ATTENTION / REASON (#11952) and the
-    # delegation KIND / DEPTH / PARENT breadcrumb (#12466) are appended. KIND /
-    # DEPTH / PARENT are a derived projection, never a routing key.
-    print(
-        "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON\tKIND\tDEPTH\tPARENT\t"
-        # Project-scoped cockpit identity (#12658). Appended after the existing
-        # run so the workspace (department) identity and the project scope are
-        # visible simultaneously; `PROJECT` / `PROJECT_PATH` are `-` for a
-        # single-repo workspace pane, preserving display compatibility.
-        "PROJECT\tPROJECT_PATH\t"
-        # Live project-gateway lane identity (#12708). The final column names the
-        # derived gateway target_kind so a project gateway (`project_gateway`) is
-        # told apart from the department root (`workspace_root`), a worker
-        # (`worker`), or an unbindable pane (`unknown`) — the distinction the
-        # GK3500 smoke needed. Derived projection, never a routing key.
-        "TARGET_KIND"
-    )
-    for c in candidates:
-        lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
-        attention = _attention_for_candidate(c, observed_at)
-        kind_cell, depth_cell, parent_cell = delegation_cells(
-            delegation_map.get(c.pane_id)
-        )
-        # Show the human label when present, else the redmine project id; the
-        # repo-relative project path rides in its own column (never an absolute
-        # private path).
-        project_cell = c.project_label or c.project_scope or "-"
-        print(
-            "\t".join(
-                [
-                    c.pane_id or "-",
-                    c.role,
-                    c.role_source,
-                    c.confidence,
-                    "1" if c.ambiguous else "0",
-                    c.workspace_label or c.workspace_id or "-",
-                    lane,
-                    c.repo_short or "-",
-                    "1" if c.active else "0",
-                    c.session or "-",
-                    c.window_name or "-",
-                    c.view_kind,
-                    c.branch or "-",
-                    attention.attention_state,
-                    attention.reason_code,
-                    kind_cell,
-                    depth_cell,
-                    parent_cell,
-                    project_cell,
-                    c.project_path or "-",
-                    classify_target_kind(c),
-                ]
-            )
-        )
-    return 0
+# The ``agents list`` / ``agents targets`` render handlers (and the attention
+# projection earlier) were relocated to
+# :mod:`mozyo_bridge.application.commands_agents` (Redmine #12749 / #12638 /
+# #12785). They are re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_agents_list`` / ``cmd_agents_targets``
+# and the cli / cli_agents parser registrar keep their identity and
+# ``func.__name__``. The thin ``_agents_target_candidates`` discovery wrapper
+# (driving ``ResolveAgentTargetsUseCase`` via the ``AgentDiscoveryPort``) stays
+# here as the shared seam the delegated-coordinator / project-gateway callers and
+# their tests import.
 
 
 # The ``tmux-ui-config`` and ``tmux-ui install/uninstall/status`` command
