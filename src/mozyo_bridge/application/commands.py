@@ -9,20 +9,43 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
-from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.application.commands_common import (
+    config_path_from_args,
     repo_root_from_args,
     scaffold_target_from_args,
 )
+from mozyo_bridge.application.commands_tmux_ui import (
+    cmd_config,
+    cmd_tmux_ui_install,
+    cmd_tmux_ui_status,
+    cmd_tmux_ui_uninstall,
+)
+from mozyo_bridge.application.commands_agents import (
+    ResolveAgentTargetsUseCase,
+    _attention_for_candidate,
+    cmd_agents_attention_project,
+    cmd_agents_list,
+    cmd_agents_targets,
+    cmd_list,
+)
+from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
+    cmd_workspace_inspect,
+    cmd_workspace_list,
+    cmd_workspace_register,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_session import (
+    cmd_session_boundary_prompt,
+    cmd_session_list,
+    cmd_session_name,
+    cmd_session_pane_decision,
+    cmd_session_vscode_settings,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-    AGENT_KINDS,
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     ROLE_SOURCE_WINDOW_NAME,
-    build_target_candidates,
-    discover_agents,
-    filter_agents,
     infer_repo_root,
     project_preflight_target,
 )
@@ -142,12 +165,7 @@ from mozyo_bridge.shared.paths import (
     default_tmux_conf,
     find_repo_root,
     normalize_path_unicode,
-    resolve_repo_root,
 )
-
-
-def config_path_from_args(args: argparse.Namespace) -> str:
-    return str(Path(getattr(args, "config_path", None) or default_tmux_conf(repo_root_from_args(args))).expanduser())
 
 
 def queue_path_from_args(args: argparse.Namespace) -> Path:
@@ -166,595 +184,61 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
     return source_tmux_conf(config_path_from_args(args), optional=optional)
 
 
-def cmd_list(_: argparse.Namespace) -> int:
-    require_tmux()
-    print("TARGET\tLOCATION\tPROCESS\tWINDOW\tCWD")
-    for pane in pane_lines():
-        print(
-            "\t".join(
-                [
-                    pane["id"],
-                    pane["location"],
-                    pane["command"],
-                    pane.get("window_name") or "-",
-                    pane["cwd"],
-                ]
-            )
-        )
-    return 0
-
-
-def cmd_agents_list(args: argparse.Namespace) -> int:
-    """Cross-session agent discovery surface (Redmine #10332, #11628).
-
-    Emits one row per ``pane_id`` — the agent identity key (Redmine #11628):
-    a pane that belongs to several grouped tmux sessions is ONE agent whose
-    memberships are folded into ``views``; the top-level session / window
-    fields describe the canonical view (the session matching the workspace's
-    canonical session name, resolved registry → anchor → derivation). Each
-    row carries the structured fields a sender needs to name an explicit
-    cross-workspace handoff target: session, window name and index, pane id
-    and index, active flag, classified ``agent_kind`` (``claude`` /
-    ``codex`` / ``unknown``), foreground process, inferred ``repo_root``
-    (walked up via REPO_ROOT_MARKERS from the pane's ``cwd``), the pane's
-    ``cwd``, and an ``ambiguous`` flag when any view's ``(session,
-    window_name)`` pair spans multiple windows in its session. ``--session``
-    matches the canonical session or any grouped view.
-
-    Read-only. Does not change tmux state, does not interact with
-    Asana / Redmine, and is intentionally separate from the legacy ``list`` /
-    ``status`` surfaces so existing scripts that scrape those outputs keep
-    working. Single tmux server assumed; a multi-server deployment would
-    key on ``(socket, pane_id)``.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
-
-    require_tmux()
-    agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
-    session_filter = getattr(args, "session", None)
-    records = filter_agents(
-        fold_agents_by_pane(
-            discover_agents(),
-            resolve_canonical=lambda root: resolve_canonical_session(root).name,
-        ),
-        session=session_filter,
-        agent_kind=agent_filter,
-    )
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [record.to_dict() for record in records]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    print(
-        "SESSION\tWINDOW\tIDX\tPANE\tACTIVE\tKIND\tROLE_SOURCE\tCONFIDENCE\t"
-        "PROCESS\tREPO_ROOT\tCWD\tAMBIGUOUS\tOTHER_VIEWS"
-    )
-    for record in records:
-        other_views = ",".join(
-            view.session for view in record.views if not view.canonical
-        )
-        print(
-            "\t".join(
-                [
-                    record.session or "-",
-                    record.window_name or "-",
-                    record.window_index or "-",
-                    record.pane_id or "-",
-                    "1" if record.pane_active else "0",
-                    record.agent_kind,
-                    record.role_source,
-                    record.confidence,
-                    record.process or "-",
-                    record.repo_root or "-",
-                    record.cwd or "-",
-                    "1" if record.ambiguous else "0",
-                    other_views or "-",
-                ]
-            )
-        )
-    return 0
-
-
-# Reason code for the conservative pre-wiring attention projection (#11952):
-def _attention_for_candidate(candidate, observed_at: str):
-    """Derive a conservative :class:`AttentionRecord` for one target (#11952).
-
-    First read-only exposure of the #11951 attention read model. No durable
-    attention source is wired yet, so this never fabricates an
-    owner/review/blocked/stalled signal: it only distinguishes a cleanly
-    identified target (``healthy``, reason ``no_attention_source``) from one
-    whose identity itself is ambiguous / unreadable (``unknown``). Later
-    extraction tasks feed real durable / observed signals into the same pure
-    :func:`derive_attention`; this stays an additive projection and is never used
-    for routing / target selection. Delegates to the shared
-    :func:`~mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention.conservative_attention` so this and the
-    cockpit ``/api/units`` join (#12007) cannot drift.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-        CONFIDENCE_NONE,
-        ROLE_SOURCE_UNKNOWN,
-    )
-    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
-        ROLE_CLAUDE,
-        ROLE_CODEX,
-        conservative_attention,
-    )
-
-    identity_readable = (
-        candidate.role in (ROLE_CLAUDE, ROLE_CODEX)
-        and candidate.confidence != CONFIDENCE_NONE
-        and candidate.role_source != ROLE_SOURCE_UNKNOWN
-    )
-    return conservative_attention(
-        observed_at=observed_at,
-        role=candidate.role,
-        identity_readable=identity_readable,
-        contradictory=bool(candidate.ambiguous),
-        host=candidate.host or "local",
-        workspace_id=candidate.workspace_id or "",
-        lane_id=candidate.lane_id or "default",
-        pane_id=candidate.pane_id,
-    )
-
-
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Used by ``agents targets`` and the attention projection (#11954) so the two
-    read the same classified candidates (identity / lane / workspace / branch)
-    and never drift. Read-only: ``discover_agents`` → ``fold_agents_by_pane`` with
-    registry-resolved workspace identity and a tolerant branch probe; validates
-    ``--agent`` and applies ``--session`` / ``--agent`` filters.
+    Thin wrapper: the discovery orchestration was extracted to
+    :class:`mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`,
+    which depends on the injected
+    :class:`mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
+    instead of the four naked external reads (live discovery / canonical session /
+    git checkout probe / project scope) — the OOP-first read-discovery tranche
+    (Redmine #12749 / #12638 / #12785). This wrapper keeps the public name so the
+    ``agents targets`` / attention handlers and the delegated-coordinator /
+    project-gateway callers that ``from ...commands import _agents_target_candidates``
+    (and the tests that patch ``commands._agents_target_candidates``) are unchanged.
+    Behavior-preserving.
     """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
-
-    agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
-    session_filter = getattr(args, "session", None)
-
-    canonical_cache: dict[str, object] = {}
-
-    def _canonical(repo_root: str):
-        # ``derive_unregistered=False``: this is a read-only discovery hot path
-        # (``agents targets`` / the attention projection, #11954). A pane in a
-        # never-registered workspace must degrade to the path-hash fallback
-        # rather than open its workspace-local defaults, which can block the
-        # whole listing when that file is a dataless CloudStorage placeholder
-        # (Redmine #12038). Registered panes resolve from registry/anchor and
-        # are unaffected.
-        if repo_root not in canonical_cache:
-            canonical_cache[repo_root] = resolve_canonical_session(
-                repo_root, derive_unregistered=False
-            )
-        return canonical_cache[repo_root]
-
-    records = filter_agents(
-        fold_agents_by_pane(
-            discover_agents(),
-            resolve_canonical=lambda root: _canonical(root).name,
-        ),
-        session=session_filter,
-        agent_kind=agent_filter,
-    )
-
-    def resolve_workspace(repo_root: str):
-        canon = _canonical(repo_root)
-        return (getattr(canon, "workspace_id", None), getattr(canon, "name", None))
-
-    branch_cache: dict[str, str | None] = {}
-
-    def resolve_branch(repo_root: str):
-        # Reuse the tolerant lane-identity git probe (#11820) so a non-git /
-        # detached checkout degrades to ``None`` instead of raising; cached per
-        # distinct repo root.
-        if repo_root not in branch_cache:
-            branch_cache[repo_root] = _probe_checkout_facts(repo_root).get("branch")
-        return branch_cache[repo_root]
-
-    # Project-scoped cockpit identity (Redmine #12658). A pane that already carries
-    # a stamped `@mozyo_project_scope` option (cockpit-managed) is authoritative;
-    # an un-stamped pane (normal `mozyo`) derives its scope from its cwd via the
-    # bounded project discovery so a pane running inside an adopted monorepo
-    # project still projects `project_scope` in `agents targets`. Read-only and
-    # fail-soft: any discovery error degrades to no project scope.
-    def resolve_project(repo_root: str | None, cwd: str):
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-                project_scope_for_cwd,
-            )
-
-            scope = project_scope_for_cwd(cwd, repo_root)
-        except Exception:  # noqa: BLE001 - read-only display, never block the listing
-            return None
-        if scope is None:
-            return None
-        return (scope.scope, scope.path, scope.label)
-
-    return build_target_candidates(
-        records,
-        resolve_workspace=resolve_workspace,
-        resolve_branch=resolve_branch,
-        resolve_project=resolve_project,
+    return ResolveAgentTargetsUseCase(LiveAgentDiscovery()).resolve(
+        agent_filter=getattr(args, "agent", None),
+        session_filter=getattr(args, "session", None),
     )
 
 
-def cmd_agents_attention_project(args: argparse.Namespace) -> int:
-    """Project derived attention onto tmux pane user options (Redmine #11954).
-
-    Writes a re-derivable **projection cache** of the #11951 ``AttentionRecord``
-    (derived conservatively, #11952) onto each discovered target's tmux pane user
-    options: ``@mozyo_attention_state`` / ``@mozyo_attention_severity`` /
-    ``@mozyo_attention_reason`` / ``@mozyo_attention_updated_at``.
-
-    Boundaries:
-
-    - **Projection cache only.** The source of truth stays the durable state /
-      the ``derive_attention`` read model; these user options are a cache that
-      can be deleted and re-derived. They are never consulted for routing /
-      handoff preflight / target resolution.
-    - **Safe by default.** Default is a preview (no tmux mutation) that prints
-      the exact ``set-option`` plan per pane; ``--apply`` performs the writes
-      best-effort (a failed option write never aborts the run, like other
-      best-effort projections). ``--dry-run`` forces preview and wins over
-      ``--apply``.
-    - **No color / ``agent-ui.conf`` / iTerm changes** here — this task only
-      writes the machine-readable user options; rendering them is a later task.
-    """
-    from mozyo_bridge.application.attention_projection import (
-        build_attention_option_plan,
-    )
-
-    require_tmux()
-    candidates = _agents_target_candidates(args)
-
-    from datetime import datetime, timezone
-
-    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # Safe default: preview unless --apply is given; --dry-run always wins.
-    apply = bool(getattr(args, "apply", False)) and not bool(
-        getattr(args, "dry_run", False)
-    )
-
-    # Apply (when requested) happens here once, before any output branch, so
-    # `--json --apply` and text `--apply` perform identical writes and both
-    # report the true outcome — the JSON branch must never claim ``applied`` while
-    # mutating nothing (Redmine #11954 review #58539). Preview never writes.
-    # ``applied_ok`` is True/False per target only when a write was attempted, and
-    # None in preview.
-    plans = []
-    for c in candidates:
-        record = _attention_for_candidate(c, observed_at)
-        commands_plan = build_attention_option_plan(c.pane_id, record)
-        applied_ok: bool | None = None
-        if apply:
-            applied_ok = True
-            for argv in commands_plan:
-                if run_tmux(*argv, check=False).returncode != 0:
-                    # Best-effort: a failed option write is recorded, not raised
-                    # (projection-cache posture); the run still finishes.
-                    applied_ok = False
-        plans.append((c, record, commands_plan, applied_ok))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [
-            {
-                "pane_id": c.pane_id,
-                "attention": record.as_payload(),
-                "applied": apply,
-                "applied_ok": applied_ok,
-                "plan": [list(argv) for argv in commands_plan],
-            }
-            for c, record, commands_plan, applied_ok in plans
-        ]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    if not plans:
-        print("no agent targets discovered; nothing to project")
-        return 0
-
-    for c, record, commands_plan, applied_ok in plans:
-        label = (
-            f"{c.pane_id or '-'} {record.attention_state}/{record.severity} "
-            f"({record.reason_code})"
-        )
-        if not apply:
-            print(f"(dry-run) {label}")
-            for argv in commands_plan:
-                print("  tmux " + " ".join(argv))
-            continue
-        print(
-            f"projected {label}"
-            if applied_ok
-            else f"warning: partial projection {label}"
-        )
-    return 0
+# ``cmd_agents_attention_project`` (and the shared ``_attention_for_candidate``
+# helper) were relocated to :mod:`mozyo_bridge.application.commands_agents` as the
+# OOP-first attention-projection tranche (Redmine #12749 / #12638 / #12785): the
+# tmux pane-option *write* now goes through a ``TmuxOptionWriterPort`` driven by a
+# ``ProjectAttentionUseCase`` returning typed ``AttentionProjectionEntry`` value
+# objects (fake-port tested), replacing the naked ``run_tmux`` apply loop. Both are
+# re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_agents_attention_project`` /
+# ``_attention_for_candidate`` keep their identity. The shared
+# ``_agents_target_candidates`` discovery pipeline and the ``agents list`` /
+# ``agents targets`` read handlers below remain here (residual to #12638 / #12785).
 
 
-def cmd_agents_targets(args: argparse.Namespace) -> int:
-    """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
-
-    Read-only. Prints the classified agent panes as candidate handoff targets
-    with just the fields needed to pick an explicit ``pane_id`` without parsing
-    titles: role + resolver provenance (``role_source`` / ``confidence`` /
-    ``ambiguous``, #11822), workspace id + label, checkout lane (#11820), a short
-    repo identifier, current branch, liveness, location, and the projection
-    ``view_kind`` (``cockpit_pane`` / ``normal_window``, #11907) so normal local
-    and cockpit targets read with one ``TargetRecord`` vocabulary. Text keeps the
-    original column order and appends ``VIEW_KIND`` / ``BRANCH`` and the additive
-    ``ATTENTION`` / ``REASON`` columns (#11952); ``--json`` renders the nested
-    canonical ``TargetRecord`` projection (host / runtime / identity / repo /
-    view) plus an additive ``attention`` record — a projection, never a saved
-    file. Attention is a conservative read-only projection (#11951 read model):
-    no durable attention source is wired yet, so a cleanly-identified target
-    derives ``healthy`` (reason ``no_attention_source``) and an ambiguous /
-    unreadable one derives ``unknown`` — never a fabricated owner/review signal,
-    and never used for routing. Builds on the same
-    ``discover_agents`` → ``fold_agents_by_pane`` pipeline as ``agents list`` so
-    the two never drift, and resolves workspace identity through the registry →
-    anchor → derivation chain. Compact text hides absolute paths (basename
-    only); ``--json`` carries ``repo_root`` / ``cwd`` (the exposure ``agents
-    list`` already allows). Listing is non-selecting: same-role candidates stay
-    distinguishable by workspace / lane / pane and the caller must name the
-    explicit pane, so a natural name never auto-crosses a safety boundary. Live
-    tmux remains the liveness source (``active``); registry / anchor are
-    identity hints only.
-    """
-    require_tmux()
-    candidates = _agents_target_candidates(args)
-
-    # Delegated-coordinator-tree display projection (#12466), consuming the
-    # closed #12465 `delegation_projection` foundation. Derived once across all
-    # candidates because depth / root are a function of the whole parent chain;
-    # display-only and never a routing key. JSON gains a `delegation` record per
-    # target, text appends KIND / DEPTH / PARENT columns.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import (
-        delegation_cells,
-        derive_targets_delegation,
-    )
-
-    delegation_map = derive_targets_delegation(candidates)
-
-    # Desired delegated-coordinator window-separation policy (#12467), an additive
-    # `delegation_window` JSON projection alongside the #12466 `delegation` record
-    # (which stays byte-identical). `delegation_window_policy` is a repo-local
-    # display preference, so it is read per distinct repo (memoized) from
-    # `.mozyo-bridge/config.yaml` and resolved per candidate against the #12466
-    # breadcrumb. Display-only and fail-soft: any load / parse failure falls back
-    # to the documented default (`separate`) and never blocks this read-only
-    # table, and the resolved fields are never folded into the canonical
-    # `TargetRecord` routing projection (`to_dict`).
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
-        DEFAULT_DELEGATION_WINDOW_POLICY,
-        resolve_delegation_window_display,
-    )
-
-    _window_policy_by_repo: dict[object, str] = {}
-
-    def _delegation_window_policy_for(repo_root: object) -> str:
-        if repo_root in _window_policy_by_repo:
-            return _window_policy_by_repo[repo_root]
-        policy = DEFAULT_DELEGATION_WINDOW_POLICY
-        if repo_root:
-            try:
-                from mozyo_bridge.application.repo_local_config_loader import (
-                    load_repo_local_config,
-                )
-
-                policy = (
-                    load_repo_local_config(repo_root)
-                    .presentation.grouping.delegation_window_policy
-                )
-            except Exception:  # noqa: BLE001 - fail-soft read-only display
-                policy = DEFAULT_DELEGATION_WINDOW_POLICY
-        _window_policy_by_repo[repo_root] = policy
-        return policy
-
-    def _delegation_window_payload(candidate) -> dict:
-        breadcrumb = delegation_map[candidate.pane_id]
-        unit = f"{candidate.workspace_id or ''}/{candidate.lane_id or ''}"
-        return resolve_delegation_window_display(
-            _delegation_window_policy_for(candidate.repo_root),
-            lane_kind=breadcrumb.lane_kind,
-            delegation_depth=breadcrumb.delegation_depth,
-            delegation_unit=unit,
-            delegation_root=breadcrumb.delegation_root,
-            status=breadcrumb.status,
-        ).as_payload()
-
-    # Live project-gateway lane identity projection (#12708): the visible
-    # distinction the GK3500 smoke (#12698) lacked between the Cloud Drive
-    # project gateway and the GK3500 department root. Derived purely from each
-    # candidate's already-resolved identity (role provenance + #12658 project
-    # scope), display-only and never folded into the canonical `TargetRecord`
-    # routing projection (`to_dict`). JSON gains a `gateway` record per target,
-    # text appends a TARGET_KIND column.
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (
-        classify_target_kind,
-        gateway_projection,
-    )
-
-    # Single observation timestamp for this read; the pure attention read model
-    # is clock-free (caller-supplied `observed_at`), so the I/O layer stamps it
-    # here once. Attention is an additive projection (#11952): JSON gains an
-    # `attention` key per target, text appends ATTENTION / REASON columns.
-    from datetime import datetime, timezone
-
-    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = [
-            {
-                **candidate.to_dict(),
-                "attention": _attention_for_candidate(candidate, observed_at).as_payload(),
-                "delegation": delegation_map[candidate.pane_id].as_payload(),
-                "delegation_window": _delegation_window_payload(candidate),
-                "gateway": gateway_projection(candidate),
-            }
-            for candidate in candidates
-        ]
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    # Compatibility-preserving text projection (#11907, #11952, #12466): the
-    # original column run (PANE..WINDOW) keeps its order so existing parsers stay
-    # valid; VIEW_KIND / BRANCH (#11907), ATTENTION / REASON (#11952) and the
-    # delegation KIND / DEPTH / PARENT breadcrumb (#12466) are appended. KIND /
-    # DEPTH / PARENT are a derived projection, never a routing key.
-    print(
-        "PANE\tROLE\tROLE_SOURCE\tCONF\tAMBIG\tWORKSPACE\tLANE\tREPO\tACTIVE\t"
-        "SESSION\tWINDOW\tVIEW_KIND\tBRANCH\tATTENTION\tREASON\tKIND\tDEPTH\tPARENT\t"
-        # Project-scoped cockpit identity (#12658). Appended after the existing
-        # run so the workspace (department) identity and the project scope are
-        # visible simultaneously; `PROJECT` / `PROJECT_PATH` are `-` for a
-        # single-repo workspace pane, preserving display compatibility.
-        "PROJECT\tPROJECT_PATH\t"
-        # Live project-gateway lane identity (#12708). The final column names the
-        # derived gateway target_kind so a project gateway (`project_gateway`) is
-        # told apart from the department root (`workspace_root`), a worker
-        # (`worker`), or an unbindable pane (`unknown`) — the distinction the
-        # GK3500 smoke needed. Derived projection, never a routing key.
-        "TARGET_KIND"
-    )
-    for c in candidates:
-        lane = c.lane_id if not c.lane_label else f"{c.lane_id}({c.lane_label})"
-        attention = _attention_for_candidate(c, observed_at)
-        kind_cell, depth_cell, parent_cell = delegation_cells(
-            delegation_map.get(c.pane_id)
-        )
-        # Show the human label when present, else the redmine project id; the
-        # repo-relative project path rides in its own column (never an absolute
-        # private path).
-        project_cell = c.project_label or c.project_scope or "-"
-        print(
-            "\t".join(
-                [
-                    c.pane_id or "-",
-                    c.role,
-                    c.role_source,
-                    c.confidence,
-                    "1" if c.ambiguous else "0",
-                    c.workspace_label or c.workspace_id or "-",
-                    lane,
-                    c.repo_short or "-",
-                    "1" if c.active else "0",
-                    c.session or "-",
-                    c.window_name or "-",
-                    c.view_kind,
-                    c.branch or "-",
-                    attention.attention_state,
-                    attention.reason_code,
-                    kind_cell,
-                    depth_cell,
-                    parent_cell,
-                    project_cell,
-                    c.project_path or "-",
-                    classify_target_kind(c),
-                ]
-            )
-        )
-    return 0
+# The ``agents list`` / ``agents targets`` render handlers (and the attention
+# projection earlier) were relocated to
+# :mod:`mozyo_bridge.application.commands_agents` (Redmine #12749 / #12638 /
+# #12785). They are re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_agents_list`` / ``cmd_agents_targets``
+# and the cli / cli_agents parser registrar keep their identity and
+# ``func.__name__``. The thin ``_agents_target_candidates`` discovery wrapper
+# (driving ``ResolveAgentTargetsUseCase`` via the ``AgentDiscoveryPort``) stays
+# here as the shared seam the delegated-coordinator / project-gateway callers and
+# their tests import.
 
 
-def cmd_config(args: argparse.Namespace) -> int:
-    require_tmux()
-    path = args.path or config_path_from_args(args)
-    source_tmux_conf(path)
-    print(f"loaded tmux config: {Path(path).expanduser()}")
-    return 0
-
-
-def _tmux_ui_repo_root(args: argparse.Namespace) -> Path:
-    return resolve_repo_root(getattr(args, "repo", None))
-
-
-def _tmux_ui_host_conf(args: argparse.Namespace) -> Path:
-    return tmux_ui_module.resolve_host_tmux_conf(getattr(args, "tmux_conf", None))
-
-
-def cmd_tmux_ui_install(args: argparse.Namespace) -> int:
-    repo_root = _tmux_ui_repo_root(args)
-    tmux_conf = _tmux_ui_host_conf(args)
-    try:
-        result = tmux_ui_module.apply_install(
-            repo_root=repo_root,
-            tmux_conf=tmux_conf,
-            force=bool(getattr(args, "force", False)),
-            dry_run=bool(getattr(args, "dry_run", False)),
-            backup=bool(getattr(args, "backup", False)),
-        )
-    except tmux_ui_module.TmuxUiError as exc:
-        die(str(exc))
-        return 2  # unreachable; die() raises SystemExit
-    suffix = " (dry-run)" if result.dry_run else ""
-    if result.action == "noop":
-        print(
-            f"tmux-ui install: already wired to {result.expected_snippet} "
-            f"in {result.tmux_conf}; no change"
-        )
-    else:
-        print(
-            f"tmux-ui install: {result.action} managed block in "
-            f"{result.tmux_conf} → {result.expected_snippet}{suffix}"
-        )
-        if result.previous_source_path and result.action == "replaced":
-            print(f"  previous source path: {result.previous_source_path}")
-        if result.backup_path:
-            print(f"  backup written: {result.backup_path}")
-    return 0
-
-
-def cmd_tmux_ui_uninstall(args: argparse.Namespace) -> int:
-    tmux_conf = _tmux_ui_host_conf(args)
-    try:
-        result = tmux_ui_module.apply_uninstall(
-            tmux_conf=tmux_conf,
-            dry_run=bool(getattr(args, "dry_run", False)),
-            backup=bool(getattr(args, "backup", False)),
-        )
-    except tmux_ui_module.TmuxUiError as exc:
-        die(str(exc))
-        return 2  # unreachable
-    suffix = " (dry-run)" if result.dry_run else ""
-    if result.action == "noop":
-        print(
-            f"tmux-ui uninstall: no managed block found in {result.tmux_conf}; "
-            "nothing to do"
-        )
-    else:
-        print(f"tmux-ui uninstall: removed managed block from {result.tmux_conf}{suffix}")
-        if result.backup_path:
-            print(f"  backup written: {result.backup_path}")
-    return 0
-
-
-def cmd_tmux_ui_status(args: argparse.Namespace) -> int:
-    repo_root = _tmux_ui_repo_root(args)
-    tmux_conf = _tmux_ui_host_conf(args)
-    info = tmux_ui_module.compute_status(repo_root, tmux_conf)
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(_json.dumps(info, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if info["state"] != tmux_ui_module.STATE_DRIFT else 1
-    print(f"tmux-ui status: {info['state']}")
-    print(f"  tmux_conf: {info['tmux_conf']} (exists={info['tmux_conf_exists']})")
-    print(
-        f"  expected_snippet: {info['expected_snippet']} (exists={info['snippet_exists']})"
-    )
-    if info.get("current_source_path"):
-        print(f"  current_source_path: {info['current_source_path']}")
-    if info.get("drift_reason"):
-        print(f"  drift_reason: {info['drift_reason']}")
-    return 0 if info["state"] != tmux_ui_module.STATE_DRIFT else 1
+# The ``tmux-ui-config`` and ``tmux-ui install/uninstall/status`` command
+# handlers were relocated to :mod:`mozyo_bridge.application.commands_tmux_ui`
+# as the OOP-first first-conversion tranche (Redmine #12749 / #12638 / #12785):
+# a ``TmuxControlPort`` (port-adapter), an ``ApplyTmuxConfigUseCase`` (use case
+# with port injection + fake-port test), and typed request/result value objects
+# replace the old naked ``require_tmux`` / ``source_tmux_conf`` procedural
+# handlers. They are re-exported at the top of this module so
+# ``mozyo_bridge.application.commands.cmd_config`` / ``cmd_tmux_ui_*`` and the
+# cli_cockpit parser registrar keep their identity and ``func.__name__``.
 
 
 def cmd_id(_: argparse.Namespace) -> int:
@@ -6505,447 +5989,6 @@ def cmd_instruction_install(args: argparse.Namespace) -> int:
     else:
         print(format_instruction_install_text(result))
     return 0 if result["ok"] else 1
-
-
-def cmd_session_name(args: argparse.Namespace) -> int:
-    """Print the tmux session name for the repo (Redmine #10796, #11429).
-
-    Resolves the repo root from ``--repo`` (default cwd) and resolves the
-    session name registry-first: the canonical session name registered in the
-    home registry (or the workspace-local anchor) wins; a never-registered
-    workspace falls back to deriving a collision-safe ASCII name (preferring
-    the workspace-defaults Redmine identifier, otherwise a hash-suffixed
-    repo-path fallback). Prints it on a single line for shell use. ``--json``
-    emits the name plus its resolution source and workspace id. Read-only:
-    does not touch tmux, Redmine, or write to disk.
-    """
-    repo_root = repo_root_from_args(args)
-    result = resolve_canonical_session(repo_root)
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "name": result.name,
-            "source": result.source,
-            "identifier": result.identifier,
-            "repo_root": str(result.repo_root),
-            "workspace_id": result.workspace_id,
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    print(result.name)
-    return 0
-
-
-def cmd_session_list(args: argparse.Namespace) -> int:
-    """Cross-workspace session inventory (Redmine #11422).
-
-    Lists every tmux pane folded by ``pane_id`` (Redmine #11628: grouped
-    sessions are views of one agent, not extra rows) together with the
-    workspace identity its repo root resolves to (registry → anchor →
-    derivation, NFC-normalized per Redmine #11625). The live tmux runtime is
-    the source of truth; each runtime listing refreshes the SQLite cache in
-    ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/inventory.sqlite``, and when tmux
-    is unavailable the cache is served instead, explicitly marked stale.
-    Read-only towards tmux and the workspace registry.
-    """
-    from mozyo_bridge.session_inventory import take_inventory
-
-    snapshot = take_inventory()
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(
-            _json.dumps(
-                snapshot.as_payload(), ensure_ascii=False, indent=2, sort_keys=True
-            )
-        )
-        return 0
-    for note in snapshot.notes:
-        print(f"note: {note}", file=sys.stderr)
-    if snapshot.stale:
-        print(
-            f"stale: cached snapshot from {snapshot.collected_at or 'unknown'} "
-            "(tmux runtime unavailable)",
-            file=sys.stderr,
-        )
-    print(
-        "PANE\tSESSION\tWINDOW\tKIND\tACTIVITY\tPROCESS\tWORKSPACE\t"
-        "REPO_ROOT\tOTHER_VIEWS"
-    )
-    for record in snapshot.records:
-        workspace = record.workspace
-        workspace_label = "-"
-        if workspace is not None:
-            workspace_label = workspace.project_name or workspace.canonical_session
-        other_views = ",".join(
-            view.session for view in record.views if not view.canonical
-        )
-        activity = record.activity or {}
-        print(
-            "\t".join(
-                [
-                    record.pane_id or "-",
-                    record.session or "-",
-                    record.window_name or "-",
-                    record.agent_kind,
-                    activity.get("state") or "unknown",
-                    record.process or "-",
-                    workspace_label,
-                    record.repo_root or "-",
-                    other_views or "-",
-                ]
-            )
-        )
-    return 0
-
-
-def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
-    """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
-
-    Sets ``tmux-integrated.sessionName`` in ``<repo>/.vscode/settings.json`` to
-    the resolved session name (registered canonical identity first, derived
-    collision-safe name as fallback), so the VS Code `tmux-integrated`
-    extension stops sanitizing the workspace basename down to a low-information
-    ``____``-style name. Only the **workspace-local** settings file is ever
-    touched — user-global settings (which can carry credentials) are never
-    read or written. Without ``--write`` it prints what would be set;
-    ``--write`` applies it. An existing settings file with comments/trailing
-    commas (JSONC) is refused rather than clobbered.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
-        VSCODE_SESSION_NAME_KEY,
-        VSCODE_SETTINGS_RELATIVE,
-        merge_vscode_session_name,
-    )
-
-    repo_root = repo_root_from_args(args)
-    result = resolve_canonical_session(repo_root)
-    settings_path = repo_root / VSCODE_SETTINGS_RELATIVE
-    existing = (
-        settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    )
-
-    if not getattr(args, "write", False):
-        verb = "would update" if existing is not None else "would create"
-        print(
-            f'{verb} {settings_path}: "{VSCODE_SESSION_NAME_KEY}": "{result.name}"'
-        )
-        print(
-            "re-run with --write to apply (workspace-local only; "
-            "user-global VS Code settings are never touched)"
-        )
-        return 0
-
-    try:
-        new_text = merge_vscode_session_name(existing, result.name)
-    except ValueError as exc:
-        die(
-            f"{settings_path} is not plain JSON ({exc}); it likely contains "
-            "comments or trailing commas (JSONC). Add "
-            f'"{VSCODE_SESSION_NAME_KEY}": "{result.name}" by hand to avoid '
-            "clobbering the existing content."
-        )
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(new_text, encoding="utf-8")
-    print(f'wrote "{VSCODE_SESSION_NAME_KEY}": "{result.name}" to {settings_path}')
-    return 0
-
-
-def cmd_session_boundary_prompt(args: argparse.Namespace) -> int:
-    """Emit the compact next-session boundary prompt (Redmine #12122).
-
-    Renders a pasteable prompt a Codex session hands the operator / next Codex
-    session so the next session re-anchors from the durable Redmine journal plus
-    repo / execution root, not from pane scrollback or window/session naming.
-    The repo is referenced by its **portable** canonical session name (resolved
-    from ``--repo``); the absolute repo root and execution-root workdir appear
-    only in ``--json`` so a pasted prompt never carries a private absolute path
-    (``vibes/docs/rules/public-private-boundary.md``). Pure / read-only towards
-    tmux, git, and Redmine.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
-        BoundaryPrompt,
-        SessionBoundaryError,
-        build_boundary_prompt,
-        classify_boundary,
-    )
-
-    repo_root = repo_root_from_args(args)
-    session = resolve_canonical_session(repo_root)
-
-    execution_root = None
-    exec_root_arg = getattr(args, "execution_root", None)
-    if exec_root_arg:
-        workdir_abs = str(Path(exec_root_arg).expanduser().resolve())
-        execution_root = build_execution_root(
-            workdir_abs, repo_root_abs=str(repo_root)
-        )
-
-    signals = tuple(getattr(args, "signal", None) or ())
-    try:
-        if signals:
-            # Validate the signal vocabulary up front so a typo fails loudly
-            # instead of being pasted into a next-session prompt.
-            classify_boundary(signals)
-        prompt = BoundaryPrompt(
-            issue=str(args.issue),
-            journal=str(args.journal),
-            repo_pointer=session.name,
-            parent_issue=getattr(args, "parent", None),
-            commit=getattr(args, "commit", None),
-            target_lane=getattr(args, "target_lane", None),
-            execution_root=execution_root,
-            gate_state=getattr(args, "gate", None),
-            verification_state=getattr(args, "verification", None),
-            residual_risks=tuple(getattr(args, "residual", None) or ()),
-            pending_action=getattr(args, "pending_action", None),
-            next_actor=getattr(args, "next_actor", None),
-            signals=signals,
-        )
-    except SessionBoundaryError as exc:
-        die(str(exc))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = prompt.to_dict()
-        # The structured outcome is allowed to carry runtime absolutes (the
-        # execution_root.workdir already does); add the repo root here so an
-        # automation consumer can resolve the checkout. Pasteable text never
-        # gets these.
-        payload["repo_root"] = str(repo_root)
-        payload["prompt_markdown"] = build_boundary_prompt(prompt)
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    print(build_boundary_prompt(prompt))
-    return 0
-
-
-def cmd_session_pane_decision(args: argparse.Namespace) -> int:
-    """Decide the guarded Claude-pane lifecycle action (Redmine #12122).
-
-    Encodes the parent US (#12113) acceptance criteria: default lean to a new
-    pane, reuse only same-lane, orphan is non-destructive, and kill/discard is
-    blocked whenever unfinished durable state is present (dirty diff, running
-    process, pending approval, unrecorded journal) or no owner kill approval has
-    been recorded. Exits non-zero (3) when the decision is ``blocked`` so an
-    operator's ``&&`` chain cannot silently proceed to a kill. Pure / read-only.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_boundary import (
-        PaneLifecycleState,
-        SessionBoundaryError,
-        decide_pane_lifecycle,
-    )
-
-    state = PaneLifecycleState(
-        requested=getattr(args, "requested", None) or "new",
-        same_lane=getattr(args, "same_lane", False),
-        dirty_diff=getattr(args, "dirty_diff", False),
-        running_process=getattr(args, "running_process", False),
-        pending_approval=getattr(args, "pending_approval", False),
-        unrecorded_journal=getattr(args, "unrecorded_journal", False),
-        owner_approved_kill=getattr(args, "owner_approved_kill", False),
-    )
-    try:
-        decision = decide_pane_lifecycle(state)
-    except SessionBoundaryError as exc:
-        die(str(exc))
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        print(_json.dumps(decision.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(f"decision: {decision.decision}")
-        if decision.blockers:
-            print("blockers: " + ", ".join(decision.blockers))
-        print(f"rationale: {decision.rationale}")
-    return 3 if decision.is_blocked else 0
-
-
-def cmd_workspace_register(args: argparse.Namespace) -> int:
-    """Register (or refresh) this workspace in the home registry (#11429).
-
-    The explicit, manual write surface of the workspace registry (smart
-    ``init`` also registers via the same :func:`register_workspace` API since
-    Redmine #11427): upserts the registry
-    row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
-    rewrites the workspace-local anchor
-    (``<repo>/.mozyo-bridge/workspace-anchor.json``; the legacy
-    ``workspace.json`` stays readable but is never written). Idempotent: re-running keeps
-    the existing workspace id and canonical session name; when the home
-    registry was lost, the anchor restores the same identity. The canonical
-    session name is derived from the path only on first registration.
-    """
-    from mozyo_bridge.workspace_registry import register_workspace
-
-    repo_root = repo_root_from_args(args)
-    result = register_workspace(
-        repo_root, project_name=getattr(args, "name", None)
-    )
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "outcome": result.outcome,
-            "registry_path": str(result.registry_path),
-            "anchor_path": str(result.anchor_path),
-            "workspace": result.record.as_payload(),
-            "notes": list(result.notes),
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    record = result.record
-    print(
-        f"{result.outcome}: workspace '{record.project_name}' "
-        f"({record.display_path})"
-    )
-    print(f"  workspace_id:      {record.workspace_id}")
-    print(f"  canonical_session: {record.canonical_session}")
-    if record.preset:
-        version = f" {record.preset_version}" if record.preset_version else ""
-        print(f"  preset:            {record.preset}{version}")
-    print(f"  registry:          {result.registry_path}")
-    print(f"  anchor:            {result.anchor_path}")
-    for note in result.notes:
-        print(f"  note: {note}")
-    return 0
-
-
-def cmd_workspace_list(args: argparse.Namespace) -> int:
-    """List registered workspaces from the home registry (#11429). Read-only."""
-    from mozyo_bridge.workspace_registry import list_workspaces, registry_path
-
-    records = list_workspaces()
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "registry_path": str(registry_path()),
-            "workspaces": [record.as_payload() for record in records],
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    if not records:
-        print(
-            f"no workspaces registered in {registry_path()} "
-            "(run `mozyo-bridge workspace register` from a workspace root)"
-        )
-        return 0
-    print("SESSION\tNAME\tPATH\tLAST_SEEN")
-    for record in records:
-        print(
-            f"{record.canonical_session}\t{record.project_name}\t"
-            f"{record.display_path}\t{record.last_seen or '-'}"
-        )
-    return 0
-
-
-def cmd_workspace_inspect(args: argparse.Namespace) -> int:
-    """Show how this workspace's identity resolves (#11429). Read-only.
-
-    Surfaces all three identity layers side by side — home-registry row,
-    workspace-local anchor, and the path-derived fallback — plus the
-    effective resolution, so registry/anchor drift is visible before it
-    bites a handoff gate.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import derive_session_name as _derive
-    from mozyo_bridge.workspace_registry import (
-        ANCHOR_LEGACY_RELATIVE,
-        ANCHOR_RELATIVE,
-        anchor_path,
-        anchor_resolution,
-        legacy_anchor_path,
-        load_workspace_by_path,
-        read_anchor,
-        registry_path,
-        resolve_canonical_session,
-    )
-
-    repo_root = repo_root_from_args(args)
-    record = load_workspace_by_path(repo_root)
-    anchor = read_anchor(repo_root)
-    anchor_names = anchor_resolution(repo_root)
-    derived = _derive(repo_root)
-    resolved = resolve_canonical_session(repo_root)
-
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "repo_root": str(resolved.repo_root),
-            "registry_path": str(registry_path()),
-            "anchor_path": str(anchor_path(resolved.repo_root)),
-            "anchor_legacy_path": str(legacy_anchor_path(resolved.repo_root)),
-            "anchor_name_state": (
-                "both"
-                if anchor_names.both_exist
-                else "legacy"
-                if anchor_names.using_legacy
-                else "new"
-                if anchor_names.new_exists
-                else "none"
-            ),
-            "registered": record.as_payload() if record else None,
-            "anchor": anchor,
-            "derived_fallback": {
-                "name": derived.name,
-                "source": derived.source,
-                "identifier": derived.identifier,
-            },
-            "resolved": {
-                "name": resolved.name,
-                "source": resolved.source,
-                "workspace_id": resolved.workspace_id,
-            },
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    print(f"repo_root: {resolved.repo_root}")
-    print(f"resolved session: {resolved.name} (source: {resolved.source})")
-    if record:
-        print(
-            f"registry: {record.canonical_session} "
-            f"(workspace_id {record.workspace_id}, last_seen {record.last_seen or '-'})"
-        )
-    else:
-        print(f"registry: not registered in {registry_path()}")
-    if anchor:
-        anchor_loc = (
-            legacy_anchor_path(resolved.repo_root)
-            if anchor_names.using_legacy
-            else anchor_path(resolved.repo_root)
-        )
-        print(
-            f"anchor: {anchor['canonical_session']} "
-            f"(workspace_id {anchor['workspace_id']}) at {anchor_loc}"
-        )
-    else:
-        print(f"anchor: none at {anchor_path(resolved.repo_root)}")
-    print(f"derived fallback: {derived.name} (source: {derived.source})")
-    if anchor_names.both_exist:
-        print(
-            f"warning: both {ANCHOR_RELATIVE.as_posix()} and "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
-            f"authoritative — remove the legacy "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()} (no silent merge)."
-        )
-    elif anchor_names.using_legacy:
-        print(
-            f"warning: anchor uses the legacy name "
-            f"{ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge workspace "
-            f"register` to migrate it to {ANCHOR_RELATIVE.as_posix()}."
-        )
-    if record and anchor and record.workspace_id != anchor["workspace_id"]:
-        print(
-            "warning: registry row and anchor disagree on workspace_id; "
-            "re-run `mozyo-bridge workspace register` to reconcile "
-            "(the anchor wins)."
-        )
-    return 0
 
 
 # --- Compatibility facade: handlers split into family modules (#12142, #12154). ---

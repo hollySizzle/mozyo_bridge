@@ -20,6 +20,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from types import SimpleNamespace
+
 from mozyo_bridge.application import attention_projection
 from mozyo_bridge.application.attention_projection import (
     ATTENTION_REASON_OPTION,
@@ -28,7 +30,36 @@ from mozyo_bridge.application.attention_projection import (
     ATTENTION_UPDATED_AT_OPTION,
     build_attention_option_plan,
 )
+from mozyo_bridge.application.commands_agents import (
+    AttentionProjectionEntry,
+    ProjectAttentionUseCase,
+)
+from mozyo_bridge.application.tmux_option_port import (
+    LiveTmuxOptionWriter,
+    TmuxOptionWriterPort,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionInputs, derive_attention
+
+
+class _RecordingOptionWriter:
+    """Fake :class:`TmuxOptionWriterPort` that records applied argv.
+
+    Replaces the previous ``patch.object(commands, "run_tmux")`` monkeypatch seam
+    for the attention-projection write boundary (Redmine #12785): the side effect
+    is now injected as a port, so the test asserts the recorded writes instead of
+    patching a module-level function.
+    """
+
+    def __init__(self, fail_option=None):
+        self.writes: list[tuple] = []
+        self._fail_option = fail_option
+
+    def set_option(self, argv):
+        argv = tuple(argv)
+        self.writes.append(argv)
+        if self._fail_option and len(argv) >= 5 and argv[4] == self._fail_option:
+            return False
+        return True
 
 
 def _pane(pane_id, location, *, command="node", cwd="/work/repo",
@@ -112,31 +143,30 @@ class AttentionProjectCommandTest(unittest.TestCase):
     def _run(self, panes, *, apply=False, dry_run=False, as_json=False,
              fail_option=None):
         from mozyo_bridge.application import commands
+        from mozyo_bridge.application import commands_agents
 
         canon = argparse.Namespace(name="mozyo-bridge", workspace_id="wsA")
         args = argparse.Namespace(
             session=None, agent=None, apply=apply, dry_run=dry_run, as_json=as_json
         )
-        calls: list[tuple] = []
+        # The tmux pane-option write boundary is now a port: inject a recording
+        # fake instead of patching ``commands.run_tmux`` (Redmine #12749 / #12785).
+        # The discovery deps the residual ``_agents_target_candidates`` reads stay
+        # patched on ``commands``; the availability guard moved with the handler to
+        # ``commands_agents``.
+        writer = _RecordingOptionWriter(fail_option=fail_option)
 
-        def fake_run_tmux(*tmux_args, **_):
-            calls.append(tmux_args)
-            # Optionally simulate a single failing option write.
-            rc = 1 if (fail_option and len(tmux_args) >= 5
-                       and tmux_args[4] == fail_option) else 0
-            return argparse.Namespace(returncode=rc, stdout="", stderr="")
-
-        with patch.object(commands, "require_tmux"), \
+        with patch.object(commands_agents, "require_tmux"), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines", return_value=panes), \
             patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
                   return_value="/work/repo"), \
             patch.object(commands, "resolve_canonical_session", return_value=canon), \
             patch.object(commands, "_probe_checkout_facts",
                          return_value={"branch": "main"}), \
-            patch.object(commands, "run_tmux", side_effect=fake_run_tmux), \
+            patch.object(commands_agents, "LiveTmuxOptionWriter", return_value=writer), \
             contextlib.redirect_stdout(io.StringIO()) as out:
             rc = commands.cmd_agents_attention_project(args)
-        return rc, out.getvalue(), calls
+        return rc, out.getvalue(), writer.writes
 
     def test_default_is_preview_and_writes_nothing(self) -> None:
         rc, out, calls = self._run([
@@ -252,6 +282,67 @@ class AttentionProjectCommandTest(unittest.TestCase):
         self.assertEqual(0, rc)
         self.assertIn("no agent targets", out)
         self.assertEqual([], calls)
+
+
+class ProjectAttentionUseCaseFakePortTest(unittest.TestCase):
+    """Drive the use case directly through a fake writer port (Redmine #12785).
+
+    No discovery patch, no real tmux: the apply / preview / best-effort-failure
+    contract is expressed against the injected :class:`TmuxOptionWriterPort`.
+    """
+
+    def _candidate(self, pane_id="%9"):
+        return SimpleNamespace(
+            role="claude",
+            confidence="strong",
+            role_source="process",
+            ambiguous=False,
+            host="local",
+            workspace_id="wsA",
+            lane_id="default",
+            pane_id=pane_id,
+        )
+
+    def test_fake_writer_satisfies_port(self) -> None:
+        self.assertIsInstance(_RecordingOptionWriter(), TmuxOptionWriterPort)
+        self.assertIsInstance(LiveTmuxOptionWriter(), TmuxOptionWriterPort)
+
+    def test_preview_writes_nothing(self) -> None:
+        writer = _RecordingOptionWriter()
+        entries = ProjectAttentionUseCase(writer).execute(
+            [self._candidate()], "2026-06-15T00:00:00Z", apply=False
+        )
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(len(entries), 1)
+        self.assertIsInstance(entries[0], AttentionProjectionEntry)
+        self.assertIsNone(entries[0].applied_ok)  # preview attempted no write
+        self.assertEqual(len(entries[0].plan), 4)
+
+    def test_apply_writes_all_set_options_and_reports_ok(self) -> None:
+        writer = _RecordingOptionWriter()
+        entries = ProjectAttentionUseCase(writer).execute(
+            [self._candidate()], "2026-06-15T00:00:00Z", apply=True
+        )
+        self.assertEqual(len(writer.writes), 4)
+        self.assertEqual({argv[0] for argv in writer.writes}, {"set-option"})
+        for argv in writer.writes:
+            self.assertEqual(argv[:4], ("set-option", "-p", "-t", "%9"))
+        self.assertTrue(entries[0].applied_ok)
+
+    def test_partial_failure_attempts_all_but_reports_not_ok(self) -> None:
+        writer = _RecordingOptionWriter(fail_option=ATTENTION_STATE_OPTION)
+        entries = ProjectAttentionUseCase(writer).execute(
+            [self._candidate()], "2026-06-15T00:00:00Z", apply=True
+        )
+        self.assertEqual(len(writer.writes), 4)  # best-effort: all attempted
+        self.assertFalse(entries[0].applied_ok)
+
+    def test_entry_value_object_is_frozen(self) -> None:
+        entry = ProjectAttentionUseCase(_RecordingOptionWriter()).execute(
+            [self._candidate()], "t", apply=False
+        )[0]
+        with self.assertRaises(Exception):
+            entry.pane_id = "%x"  # type: ignore[misc]
 
 
 if __name__ == "__main__":

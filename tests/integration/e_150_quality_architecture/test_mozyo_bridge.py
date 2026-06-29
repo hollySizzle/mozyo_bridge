@@ -2957,8 +2957,8 @@ class CommandTest(unittest.TestCase):
                 "pane_active": "1",
             },
         ]
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch("mozyo_bridge.application.commands.pane_lines", return_value=panes), \
+        with patch("mozyo_bridge.application.commands_agents.require_tmux"), \
+            patch("mozyo_bridge.application.commands_agents.pane_lines", return_value=panes), \
             contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(0, cmd_list(argparse.Namespace()))
 

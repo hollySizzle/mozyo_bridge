@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6983
+    lines: 6026
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -162,6 +162,84 @@ allowlist:
       resolver in `f_120_.../domain/child_intake_route.py`, and the
       `project-gateway child-intake` handler in
       `f_120_.../application/cli_project_gateway_child_intake.py`, not here.
+      Lowered 6983 -> 6902 for the #12749 OOP-first first-conversion tranche: the
+      `tmux-ui-config` / `tmux-ui install|uninstall|status` command family moved
+      to the new `application/commands_tmux_ui.py` (typed request/result value
+      objects + an `ApplyTmuxConfigUseCase` taking the new
+      `application/tmux_control_port.py` `TmuxControlPort` by injection, with a
+      fake-port test) and `config_path_from_args` moved to `commands_common.py`.
+      `commands.py` re-exports the `cmd_*` entry points so the public import /
+      monkeypatch / parser-binding surface is unchanged. Baseline ratcheted to the
+      post-extraction size; residual procedural orchestration (cockpit / handoff /
+      agents / status / notify / init) is carried to #12638 / #12785.
+      Lowered 6902 -> 6782 for the #12749 second OOP-first tranche: the `agents
+      attention-project` handler + the shared `_attention_for_candidate` helper
+      moved to the new `application/commands_agents.py`, with the tmux pane-option
+      *write* behind the new `application/tmux_option_port.py` `TmuxOptionWriterPort`
+      driven by a `ProjectAttentionUseCase` returning typed `AttentionProjectionEntry`
+      value objects (fake-port test; the old `commands.run_tmux` monkeypatch seam for
+      this write is retired). `commands.py` re-exports both symbols (identity / parser
+      binding / `_attention_for_candidate` import preserved). The shared
+      `_agents_target_candidates` discovery pipeline and the `agents list` / `agents
+      targets` read handlers remain here as residual to #12638 / #12785.
+      Lowered 6782 -> 6722 for the #12749 third OOP-first tranche (read-discovery):
+      the `_agents_target_candidates` candidate pipeline orchestration moved to the
+      new `ResolveAgentTargetsUseCase` (in `commands_agents.py`) depending on the new
+      `application/agent_discovery_port.py` `AgentDiscoveryPort` (discover / canonical
+      session / checkout facts / project scope) with a `LiveAgentDiscovery` adapter
+      and a fake-port use-case test. `commands._agents_target_candidates` is now a thin
+      wrapper (public name kept for the 6 delegated-coordinator / project-gateway
+      importers and the tests that patch it); behavior byte-identical. The live adapter
+      still routes the `commands`-owned leaf reads (`resolve_canonical_session` /
+      `_probe_checkout_facts`) at call time as a documented compatibility bridge —
+      relocating those leaf reads and the `agents list/targets` render handlers stays
+      residual to #12638 / #12785.
+      Lowered 6722 -> 6472 for the #12749 fourth OOP-first tranche: the `agents
+      list` / `agents targets` render handlers (`cmd_agents_list` /
+      `cmd_agents_targets`) moved to `commands_agents.py` (behavior-preserving;
+      re-exported so the cli / cli_agents parser bindings and import identities are
+      unchanged). `cmd_agents_targets` reaches the residual discovery seam through
+      the call-time `_discover_candidates` helper (so the `commands.*` discovery
+      patches still apply) and its availability guard is now `commands_agents.require_tmux`
+      (4 test patch sites migrated).
+      Lowered 6472 -> 6455 for the #12749 fifth tranche: the legacy read-only `list`
+      handler (`cmd_list`) moved to `commands_agents.py` (re-exported as
+      `commands.cmd_list`; cli_core / cli parser binding unchanged). Its
+      `require_tmux` / `pane_lines` guard is now bound in `commands_agents`, so its one
+      test (`test_cmd_list_emits_window_column_in_place_of_label`) patches
+      `commands_agents.require_tmux` / `commands_agents.pane_lines`. The
+      `commands`-owned leaf reads (`resolve_canonical_session` / `_probe_checkout_facts`)
+      and the remaining orchestration (cockpit / handoff / status / notify / init)
+      stay residual to #12638 / #12785.
+      Lowered 6455 -> 6369 for the #12749 sixth tranche: the read-only inventory
+      list handlers `cmd_workspace_list` and `cmd_session_list` moved into the
+      `f_110_workspace_session_identity` numbered package (the documented "later
+      wave" — `cmd_workspace_list` joined `commands_workspace.py` next to
+      `cmd_workspace_defaults`; `cmd_session_list` opened a new `commands_session.py`).
+      Both re-exported via `commands.py` so the cli / cli_workspace / cli_session
+      parser bindings and the workspace/session test imports are unchanged; neither
+      handler touches a `commands.*`-patched primitive, so no test patch migration was
+      needed.
+      Lowered 6369 -> 6125 for the #12749 seventh tranche: the remaining read-only
+      session / workspace identity handlers moved into the `f_110` numbered package
+      — `cmd_session_name` / `cmd_session_boundary_prompt` / `cmd_session_pane_decision`
+      into `commands_session.py`, and `cmd_workspace_inspect` into `commands_workspace.py`.
+      All re-exported via `commands.py` (cli / cli_session / cli_workspace bindings and
+      the test_workspace_registry / test_session_boundary imports unchanged). None
+      relies on a `commands.*`-patched primitive (resolve_canonical_session etc. are
+      real or patched at the `workspace_registry` source), so no test patch migration
+      was needed.
+      Lowered 6125 -> 6026 for the #12749 eighth tranche: the low-risk write-surface
+      handlers moved into the `f_110` numbered package — `cmd_workspace_register` into
+      `commands_workspace.py` (completing the workspace family) and
+      `cmd_session_vscode_settings` into `commands_session.py` (completing the session
+      family). Both re-exported via `commands.py` (cli / cli_session / cli_workspace
+      bindings + test_workspace_registry import unchanged); neither touches a
+      `commands.*`-patched primitive (file / registry writes are real or through
+      lazy domain imports), so no test patch migration was needed. The full workspace
+      and session command families now live in the `f_110` package; the remaining
+      `commands.py` orchestration (cockpit / handoff / status / notify / init) stays
+      residual to #12638 / #12785.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
