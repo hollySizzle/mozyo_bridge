@@ -23,6 +23,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from types import SimpleNamespace
+
+from mozyo_bridge.application.agent_discovery_port import (
+    AgentDiscoveryPort,
+    LiveAgentDiscovery,
+)
+from mozyo_bridge.application.commands_agents import ResolveAgentTargetsUseCase
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AgentRecord,
     build_target_candidates,
@@ -924,6 +931,92 @@ class AgentsTargetsDelegationColumnsTest(unittest.TestCase):
         self.assertEqual("wsA/deleg", deleg["delegation_parent"])
         self.assertEqual("wsA/root", deleg["delegation_root"])
         self.assertEqual("derived", deleg["status"])
+
+
+class _FakeAgentDiscovery:
+    """Fake :class:`AgentDiscoveryPort` for use-case specs (Redmine #12785).
+
+    Replaces the read-discovery monkeypatch seam (``commands.resolve_canonical_session``
+    / ``commands._probe_checkout_facts`` + live discovery): the four external reads
+    are injected, so ``ResolveAgentTargetsUseCase`` is exercised without patching
+    the ``commands`` module. ``discover`` builds raw records from explicit panes
+    (``discover_agents`` accepts a panes argument), so no live tmux read occurs.
+    """
+
+    def __init__(self, panes, *, canon, branch, project=None):
+        self._panes = panes
+        self._canon = canon
+        self._branch = branch
+        self._project = project
+
+    def discover(self):
+        return discover_agents(self._panes)
+
+    def canonical_session(self, repo_root):
+        return self._canon
+
+    def checkout_facts(self, repo_root):
+        return {"branch": self._branch}
+
+    def project_scope(self, cwd, repo_root):
+        return self._project
+
+
+class ResolveAgentTargetsUseCaseFakePortTest(unittest.TestCase):
+    def test_fake_and_live_satisfy_port(self) -> None:
+        fake = _FakeAgentDiscovery([], canon=None, branch=None)
+        self.assertIsInstance(fake, AgentDiscoveryPort)
+        self.assertIsInstance(LiveAgentDiscovery(), AgentDiscoveryPort)
+
+    def test_invalid_agent_filter_dies_before_discovery(self) -> None:
+        use_case = ResolveAgentTargetsUseCase(
+            _FakeAgentDiscovery([], canon=None, branch=None)
+        )
+        with self.assertRaises(SystemExit):
+            use_case.resolve(agent_filter="bogus", session_filter=None)
+
+    def test_resolves_candidate_through_injected_port(self) -> None:
+        canon = SimpleNamespace(name="mozyo-bridge", workspace_id="wsA")
+        discovery = _FakeAgentDiscovery(
+            [
+                _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                      agent_role="claude", lane_id="lane-abc", lane_label="feature/x"),
+            ],
+            canon=canon,
+            branch="main",
+        )
+        # infer_repo_root is a fold internal (filesystem walk), not the external
+        # discovery boundary; stub it so the fold has a deterministic repo root.
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
+            return_value="/work/repo",
+        ):
+            cands = ResolveAgentTargetsUseCase(discovery).resolve(
+                agent_filter=None, session_filter=None
+            )
+        self.assertEqual(1, len(cands))
+        c = cands[0]
+        self.assertEqual("%9", c.pane_id)
+        self.assertEqual("claude", c.role)
+        # workspace from canonical_session port read; branch from checkout_facts port.
+        self.assertEqual("wsA", c.workspace_id)
+        self.assertEqual("mozyo-bridge", c.workspace_label)
+        self.assertEqual("main", c.branch)
+
+    def test_unknown_panes_yield_no_candidates(self) -> None:
+        discovery = _FakeAgentDiscovery(
+            [_pane("%1", "s:0.0", window_name="shell", command="zsh")],
+            canon=SimpleNamespace(name="mozyo-bridge", workspace_id="wsA"),
+            branch=None,
+        )
+        with patch(
+            "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
+            return_value="/work/repo",
+        ):
+            cands = ResolveAgentTargetsUseCase(discovery).resolve(
+                agent_filter=None, session_filter=None
+            )
+        self.assertEqual([], cands)
 
 
 if __name__ == "__main__":

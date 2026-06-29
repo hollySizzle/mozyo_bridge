@@ -39,14 +39,94 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from mozyo_bridge.application.agent_discovery_port import (
+    AgentDiscoveryPort,
+    LiveAgentDiscovery,
+)
 from mozyo_bridge.application.attention_projection import build_attention_option_plan
 from mozyo_bridge.application.tmux_option_port import (
     LiveTmuxOptionWriter,
     TmuxOptionWriterPort,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+    AGENT_KINDS,
+    build_target_candidates,
+    filter_agents,
+    fold_agents_by_pane,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
+from mozyo_bridge.shared.errors import die
+
+
+class ResolveAgentTargetsUseCase:
+    """Resolve discovered agent panes into classified ``TargetRecord`` candidates.
+
+    The shared read pipeline behind ``agents targets`` and the attention
+    projection (#11811 / #11907): ``discover`` → ``fold_agents_by_pane`` (with
+    registry-resolved canonical session) → ``filter`` → ``build_target_candidates``
+    with workspace / branch / project-scope resolvers. The four external reads are
+    taken through the injected :class:`AgentDiscoveryPort`, so this orchestration
+    is decoupled from live tmux / registry / git / project-discovery and is
+    unit-testable with a fake port. Pure classification stays in the domain.
+
+    Behavior-preserving relative to the former ``_agents_target_candidates``: the
+    canonical-session lookup is cached and shared between the fold's
+    ``resolve_canonical`` and the workspace resolver; the branch probe is cached
+    per repo root; project-scope resolution is fail-soft (the adapter degrades to
+    ``None``). ``commands._agents_target_candidates`` is now a thin wrapper around
+    this use case with a :class:`LiveAgentDiscovery`.
+    """
+
+    def __init__(self, discovery: AgentDiscoveryPort) -> None:
+        self._discovery = discovery
+
+    def resolve(self, *, agent_filter, session_filter) -> list:
+        if agent_filter is not None and agent_filter not in AGENT_KINDS:
+            die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+
+        canonical_cache: dict[str, object] = {}
+
+        def _canonical(repo_root: str):
+            if repo_root not in canonical_cache:
+                canonical_cache[repo_root] = self._discovery.canonical_session(repo_root)
+            return canonical_cache[repo_root]
+
+        records = filter_agents(
+            fold_agents_by_pane(
+                self._discovery.discover(),
+                resolve_canonical=lambda root: _canonical(root).name,
+            ),
+            session=session_filter,
+            agent_kind=agent_filter,
+        )
+
+        def resolve_workspace(repo_root: str):
+            canon = _canonical(repo_root)
+            return (getattr(canon, "workspace_id", None), getattr(canon, "name", None))
+
+        branch_cache: dict[str, str | None] = {}
+
+        def resolve_branch(repo_root: str):
+            if repo_root not in branch_cache:
+                branch_cache[repo_root] = self._discovery.checkout_facts(repo_root).get(
+                    "branch"
+                )
+            return branch_cache[repo_root]
+
+        def resolve_project(repo_root: str | None, cwd: str):
+            scope = self._discovery.project_scope(cwd, repo_root)
+            if scope is None:
+                return None
+            return (scope.scope, scope.path, scope.label)
+
+        return build_target_candidates(
+            records,
+            resolve_workspace=resolve_workspace,
+            resolve_branch=resolve_branch,
+            resolve_project=resolve_project,
+        )
 
 
 # Reason code for the conservative pre-wiring attention projection (#11952):

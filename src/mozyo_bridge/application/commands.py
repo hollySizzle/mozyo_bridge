@@ -21,16 +21,17 @@ from mozyo_bridge.application.commands_tmux_ui import (
     cmd_tmux_ui_uninstall,
 )
 from mozyo_bridge.application.commands_agents import (
+    ResolveAgentTargetsUseCase,
     _attention_for_candidate,
     cmd_agents_attention_project,
 )
+from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KINDS,
     AGENT_KIND_CLAUDE,
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     ROLE_SOURCE_WINDOW_NAME,
-    build_target_candidates,
     discover_agents,
     filter_agents,
     infer_repo_root,
@@ -266,82 +267,21 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Used by ``agents targets`` and the attention projection (#11954) so the two
-    read the same classified candidates (identity / lane / workspace / branch)
-    and never drift. Read-only: ``discover_agents`` → ``fold_agents_by_pane`` with
-    registry-resolved workspace identity and a tolerant branch probe; validates
-    ``--agent`` and applies ``--session`` / ``--agent`` filters.
+    Thin wrapper: the discovery orchestration was extracted to
+    :class:`mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`,
+    which depends on the injected
+    :class:`mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
+    instead of the four naked external reads (live discovery / canonical session /
+    git checkout probe / project scope) — the OOP-first read-discovery tranche
+    (Redmine #12749 / #12638 / #12785). This wrapper keeps the public name so the
+    ``agents targets`` / attention handlers and the delegated-coordinator /
+    project-gateway callers that ``from ...commands import _agents_target_candidates``
+    (and the tests that patch ``commands._agents_target_candidates``) are unchanged.
+    Behavior-preserving.
     """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
-
-    agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
-    session_filter = getattr(args, "session", None)
-
-    canonical_cache: dict[str, object] = {}
-
-    def _canonical(repo_root: str):
-        # ``derive_unregistered=False``: this is a read-only discovery hot path
-        # (``agents targets`` / the attention projection, #11954). A pane in a
-        # never-registered workspace must degrade to the path-hash fallback
-        # rather than open its workspace-local defaults, which can block the
-        # whole listing when that file is a dataless CloudStorage placeholder
-        # (Redmine #12038). Registered panes resolve from registry/anchor and
-        # are unaffected.
-        if repo_root not in canonical_cache:
-            canonical_cache[repo_root] = resolve_canonical_session(
-                repo_root, derive_unregistered=False
-            )
-        return canonical_cache[repo_root]
-
-    records = filter_agents(
-        fold_agents_by_pane(
-            discover_agents(),
-            resolve_canonical=lambda root: _canonical(root).name,
-        ),
-        session=session_filter,
-        agent_kind=agent_filter,
-    )
-
-    def resolve_workspace(repo_root: str):
-        canon = _canonical(repo_root)
-        return (getattr(canon, "workspace_id", None), getattr(canon, "name", None))
-
-    branch_cache: dict[str, str | None] = {}
-
-    def resolve_branch(repo_root: str):
-        # Reuse the tolerant lane-identity git probe (#11820) so a non-git /
-        # detached checkout degrades to ``None`` instead of raising; cached per
-        # distinct repo root.
-        if repo_root not in branch_cache:
-            branch_cache[repo_root] = _probe_checkout_facts(repo_root).get("branch")
-        return branch_cache[repo_root]
-
-    # Project-scoped cockpit identity (Redmine #12658). A pane that already carries
-    # a stamped `@mozyo_project_scope` option (cockpit-managed) is authoritative;
-    # an un-stamped pane (normal `mozyo`) derives its scope from its cwd via the
-    # bounded project discovery so a pane running inside an adopted monorepo
-    # project still projects `project_scope` in `agents targets`. Read-only and
-    # fail-soft: any discovery error degrades to no project scope.
-    def resolve_project(repo_root: str | None, cwd: str):
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-                project_scope_for_cwd,
-            )
-
-            scope = project_scope_for_cwd(cwd, repo_root)
-        except Exception:  # noqa: BLE001 - read-only display, never block the listing
-            return None
-        if scope is None:
-            return None
-        return (scope.scope, scope.path, scope.label)
-
-    return build_target_candidates(
-        records,
-        resolve_workspace=resolve_workspace,
-        resolve_branch=resolve_branch,
-        resolve_project=resolve_project,
+    return ResolveAgentTargetsUseCase(LiveAgentDiscovery()).resolve(
+        agent_filter=getattr(args, "agent", None),
+        session_filter=getattr(args, "session", None),
     )
 
 
