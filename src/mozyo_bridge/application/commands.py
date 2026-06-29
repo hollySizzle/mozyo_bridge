@@ -32,12 +32,14 @@ from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
     cmd_workspace_inspect,
     cmd_workspace_list,
+    cmd_workspace_register,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_session import (
     cmd_session_boundary_prompt,
     cmd_session_list,
     cmd_session_name,
     cmd_session_pane_decision,
+    cmd_session_vscode_settings,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     AGENT_KIND_CLAUDE,
@@ -5987,107 +5989,6 @@ def cmd_instruction_install(args: argparse.Namespace) -> int:
     else:
         print(format_instruction_install_text(result))
     return 0 if result["ok"] else 1
-
-
-def cmd_session_vscode_settings(args: argparse.Namespace) -> int:
-    """Pin the workspace-local VS Code `tmux-integrated` session name (#10796).
-
-    Sets ``tmux-integrated.sessionName`` in ``<repo>/.vscode/settings.json`` to
-    the resolved session name (registered canonical identity first, derived
-    collision-safe name as fallback), so the VS Code `tmux-integrated`
-    extension stops sanitizing the workspace basename down to a low-information
-    ``____``-style name. Only the **workspace-local** settings file is ever
-    touched — user-global settings (which can carry credentials) are never
-    read or written. Without ``--write`` it prints what would be set;
-    ``--write`` applies it. An existing settings file with comments/trailing
-    commas (JSONC) is refused rather than clobbered.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
-        VSCODE_SESSION_NAME_KEY,
-        VSCODE_SETTINGS_RELATIVE,
-        merge_vscode_session_name,
-    )
-
-    repo_root = repo_root_from_args(args)
-    result = resolve_canonical_session(repo_root)
-    settings_path = repo_root / VSCODE_SETTINGS_RELATIVE
-    existing = (
-        settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    )
-
-    if not getattr(args, "write", False):
-        verb = "would update" if existing is not None else "would create"
-        print(
-            f'{verb} {settings_path}: "{VSCODE_SESSION_NAME_KEY}": "{result.name}"'
-        )
-        print(
-            "re-run with --write to apply (workspace-local only; "
-            "user-global VS Code settings are never touched)"
-        )
-        return 0
-
-    try:
-        new_text = merge_vscode_session_name(existing, result.name)
-    except ValueError as exc:
-        die(
-            f"{settings_path} is not plain JSON ({exc}); it likely contains "
-            "comments or trailing commas (JSONC). Add "
-            f'"{VSCODE_SESSION_NAME_KEY}": "{result.name}" by hand to avoid '
-            "clobbering the existing content."
-        )
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(new_text, encoding="utf-8")
-    print(f'wrote "{VSCODE_SESSION_NAME_KEY}": "{result.name}" to {settings_path}')
-    return 0
-
-
-def cmd_workspace_register(args: argparse.Namespace) -> int:
-    """Register (or refresh) this workspace in the home registry (#11429).
-
-    The explicit, manual write surface of the workspace registry (smart
-    ``init`` also registers via the same :func:`register_workspace` API since
-    Redmine #11427): upserts the registry
-    row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
-    rewrites the workspace-local anchor
-    (``<repo>/.mozyo-bridge/workspace-anchor.json``; the legacy
-    ``workspace.json`` stays readable but is never written). Idempotent: re-running keeps
-    the existing workspace id and canonical session name; when the home
-    registry was lost, the anchor restores the same identity. The canonical
-    session name is derived from the path only on first registration.
-    """
-    from mozyo_bridge.workspace_registry import register_workspace
-
-    repo_root = repo_root_from_args(args)
-    result = register_workspace(
-        repo_root, project_name=getattr(args, "name", None)
-    )
-    if getattr(args, "as_json", False):
-        import json as _json
-
-        payload = {
-            "outcome": result.outcome,
-            "registry_path": str(result.registry_path),
-            "anchor_path": str(result.anchor_path),
-            "workspace": result.record.as_payload(),
-            "notes": list(result.notes),
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    record = result.record
-    print(
-        f"{result.outcome}: workspace '{record.project_name}' "
-        f"({record.display_path})"
-    )
-    print(f"  workspace_id:      {record.workspace_id}")
-    print(f"  canonical_session: {record.canonical_session}")
-    if record.preset:
-        version = f" {record.preset_version}" if record.preset_version else ""
-        print(f"  preset:            {record.preset}{version}")
-    print(f"  registry:          {result.registry_path}")
-    print(f"  anchor:            {result.anchor_path}")
-    for note in result.notes:
-        print(f"  note: {note}")
-    return 0
 
 
 # --- Compatibility facade: handlers split into family modules (#12142, #12154). ---

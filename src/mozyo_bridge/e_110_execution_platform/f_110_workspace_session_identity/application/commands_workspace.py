@@ -1,14 +1,14 @@
-"""Command handlers for the workspace command family (defaults + list + inspect).
+"""Command handlers for the whole workspace command family.
 
 Split out of ``application/commands.py`` (Redmine #12142). ``commands.py``
 re-exports these so existing imports / patch targets keep working.
 ``cmd_workspace_defaults`` moved first (#12142); the read-only
-``cmd_workspace_list`` and ``cmd_workspace_inspect`` identity surfaces were
-carried here next as part of the ``commands.py`` decomposition (Redmine #12749 /
-#12638 / #12785) — the "later wave" the original docstring noted. The write
-surface ``workspace register`` stays in ``commands.py`` for now (residual to
-#12638 / #12785). Behavior-preserving: handler bodies (with their lazy local
-imports) are moved verbatim.
+``cmd_workspace_list`` / ``cmd_workspace_inspect`` identity surfaces and then the
+``cmd_workspace_register`` write surface were carried here as part of the
+``commands.py`` decomposition (Redmine #12749 / #12638 / #12785) — the "later
+wave" the original docstring noted. The full ``workspace`` command family now
+lives here. Behavior-preserving: handler bodies (with their lazy local imports)
+are moved verbatim.
 """
 from __future__ import annotations
 
@@ -195,4 +195,53 @@ def cmd_workspace_inspect(args: argparse.Namespace) -> int:
             "re-run `mozyo-bridge workspace register` to reconcile "
             "(the anchor wins)."
         )
+    return 0
+
+
+def cmd_workspace_register(args: argparse.Namespace) -> int:
+    """Register (or refresh) this workspace in the home registry (#11429).
+
+    The explicit, manual write surface of the workspace registry (smart
+    ``init`` also registers via the same :func:`register_workspace` API since
+    Redmine #11427): upserts the registry
+    row in ``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/registry.sqlite`` and
+    rewrites the workspace-local anchor
+    (``<repo>/.mozyo-bridge/workspace-anchor.json``; the legacy
+    ``workspace.json`` stays readable but is never written). Idempotent: re-running keeps
+    the existing workspace id and canonical session name; when the home
+    registry was lost, the anchor restores the same identity. The canonical
+    session name is derived from the path only on first registration.
+    """
+    from mozyo_bridge.workspace_registry import register_workspace
+
+    repo_root = repo_root_from_args(args)
+    result = register_workspace(
+        repo_root, project_name=getattr(args, "name", None)
+    )
+    if getattr(args, "as_json", False):
+        import json as _json
+
+        payload = {
+            "outcome": result.outcome,
+            "registry_path": str(result.registry_path),
+            "anchor_path": str(result.anchor_path),
+            "workspace": result.record.as_payload(),
+            "notes": list(result.notes),
+        }
+        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    record = result.record
+    print(
+        f"{result.outcome}: workspace '{record.project_name}' "
+        f"({record.display_path})"
+    )
+    print(f"  workspace_id:      {record.workspace_id}")
+    print(f"  canonical_session: {record.canonical_session}")
+    if record.preset:
+        version = f" {record.preset_version}" if record.preset_version else ""
+        print(f"  preset:            {record.preset}{version}")
+    print(f"  registry:          {result.registry_path}")
+    print(f"  anchor:            {result.anchor_path}")
+    for note in result.notes:
+        print(f"  note: {note}")
     return 0
