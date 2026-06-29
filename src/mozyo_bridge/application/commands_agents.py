@@ -22,24 +22,25 @@ attention-project`` command into the policy's object boundaries
 
 Subsequent tranches added to this module: the read-discovery boundary
 (:class:`ResolveAgentTargetsUseCase` over the
-:class:`~mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`) and the
+:class:`~mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`), the
 ``agents list`` / ``agents targets`` render handlers (:func:`cmd_agents_list` /
-:func:`cmd_agents_targets`), moved here behavior-preserving.
+:func:`cmd_agents_targets`), and the legacy ``list`` pane dump (:func:`cmd_list`),
+all moved here behavior-preserving.
 
 Compatibility: ``commands.py`` re-exports :func:`cmd_agents_attention_project`,
-:func:`cmd_agents_list`, :func:`cmd_agents_targets` and
+:func:`cmd_agents_list`, :func:`cmd_agents_targets`, :func:`cmd_list` and
 :func:`_attention_for_candidate` so the ``mozyo_bridge.application.commands.*``
-identities (cli / cli_agents parser registrar; the
+identities (cli / cli_agents / cli_core parser registrars; the
 ``commands._attention_for_candidate`` import a discovery test relies on) are
 unchanged. The thin ``commands._agents_target_candidates`` wrapper stays in
 ``commands.py`` as the shared discovery seam the delegated-coordinator /
 project-gateway callers and their tests import; this module's handlers reach it
 through :func:`_discover_candidates` (a call-time import) so those patch points are
-preserved. The ``agents list`` / ``agents targets`` handlers call the tmux
-availability guard ``require_tmux`` bound in this module, so their tests patch
-``commands_agents.require_tmux``. Relocating the residual ``commands``-owned leaf
-reads (``resolve_canonical_session`` / ``_probe_checkout_facts``) and the legacy
-``list`` handler stays carried to #12638 / #12785.
+preserved. The handlers call the tmux availability guard ``require_tmux`` (and
+``pane_lines`` for :func:`cmd_list`) bound in this module, so their tests patch
+``commands_agents.require_tmux`` / ``commands_agents.pane_lines``. Relocating the
+residual ``commands``-owned leaf reads (``resolve_canonical_session`` /
+``_probe_checkout_facts``) out of ``commands.py`` stays carried to #12638 / #12785.
 """
 
 from __future__ import annotations
