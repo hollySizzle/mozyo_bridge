@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1761
+    lines: 1743
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -391,6 +391,28 @@ allowlist:
       use-case + pure verdict-policy specifications (the verdict authority no
       longer needs real preset installs or env seeding). The remaining broad
       `doctor_*_section` collector bodies stay residual to #12638.
+      Lowered 1761 -> 1743 for the #12845 doctor CLI section collector boundary
+      tranche: the `doctor_cli_section` collector's three responsibilities — the
+      external reads (running `__version__` / `mozyo-bridge` executable on PATH /
+      `mozyo_bridge` package path / `sys.executable` / expected subcommands plus
+      the `repo_local_source_drift` detection), the authority-bearing verdict
+      (section status + the drift warning message), and the legacy section dict
+      assembly — moved behind the typed boundary in `doctor_cli.py` (the
+      `CliSectionVerdict` value object, the pure `evaluate_cli_section` domain
+      policy that owns the drift warning message, the `CliReads` port +
+      `LiveCliReads` adapter, and the `CliSectionUseCase`). `doctor_cli_section`
+      is now a thin handler composing the use case at call time; `LiveCliReads`
+      introspects the running package and resolves `repo_local_source_drift`
+      through the `doctor` module at call time, so the existing
+      checkout-topology section / `repo_local_source_drift` integration tests are
+      unchanged. The source-drift *detection* helpers (`repo_local_source_drift`
+      / `_read_source_version` / `REPO_LOCAL_INVOCATION`) stay in `doctor.py` as
+      the reusable read concern (still imported by `doctor_runtime`); the now-dead
+      `shutil` / `sys` / `mozyo_bridge` / `__version__` imports were dropped.
+      `test_doctor_cli` adds fake-port use-case + pure verdict-policy
+      specifications (the drift verdict authority no longer needs a real checkout
+      / stale-install topology). The remaining broad `doctor_*_section` collector
+      bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
