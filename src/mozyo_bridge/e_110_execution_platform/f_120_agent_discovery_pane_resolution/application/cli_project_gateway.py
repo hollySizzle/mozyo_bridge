@@ -63,15 +63,35 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     cockpit_visible_from_candidate,
     resolve_relative_route,
 )
+# Redmine #12751: the resolve / consult handler bodies moved to bounded sibling
+# modules, but the pre-split public import surface of this module included the
+# `cmd_project_gateway_resolve` / `cmd_project_gateway_consult` handler symbols
+# (CLI handler modules are an import / patch seam). Re-export them here so
+# `from ...cli_project_gateway import cmd_project_gateway_*` keeps resolving to the
+# same handler objects (compat facade; Review Gate j#68486 finding 1).
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
     _discover_candidates,
     _route_from_args,
+    cmd_project_gateway_resolve,
     register_resolve,
     render_gateway_resolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_consult import (
+    cmd_project_gateway_consult,
     register_consult,
 )
+
+# Compat facade: the moved handler symbols are re-exported for the pre-#12751
+# public import path. Listed in `__all__` so the re-exports are an explicit part
+# of this module's surface (not dead imports).
+__all__ = [
+    "cmd_project_gateway_adopt",
+    "cmd_project_gateway_consult",
+    "cmd_project_gateway_handoff",
+    "cmd_project_gateway_resolve",
+    "cmd_project_gateway_route_plan",
+    "register",
+]
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_child_intake import (
     register_child_intake,
 )

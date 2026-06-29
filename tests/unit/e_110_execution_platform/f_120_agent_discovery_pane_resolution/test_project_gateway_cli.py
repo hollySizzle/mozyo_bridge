@@ -598,5 +598,36 @@ class RegistrationTest(unittest.TestCase):
         self.assertIs(ns.func, cli_project_gateway_consult.cmd_project_gateway_consult)
 
 
+class PublicImportCompatTest(unittest.TestCase):
+    """Pre-#12751 public import surface is preserved (Review Gate j#68486 finding 1).
+
+    The resolve / consult handler bodies moved to sibling modules, but the
+    registrar was previously the import / patch seam for the
+    `cmd_project_gateway_resolve` / `cmd_project_gateway_consult` handler symbols,
+    so `from ...cli_project_gateway import cmd_project_gateway_*` must keep
+    resolving to the same handler objects.
+    """
+
+    def test_registrar_reexports_moved_handlers(self):
+        self.assertIs(
+            cli_project_gateway.cmd_project_gateway_resolve,
+            cli_project_gateway_resolve.cmd_project_gateway_resolve,
+        )
+        self.assertIs(
+            cli_project_gateway.cmd_project_gateway_consult,
+            cli_project_gateway_consult.cmd_project_gateway_consult,
+        )
+
+    def test_registrar_keeps_in_place_handlers(self):
+        # The handlers that stayed in the registrar remain importable from it.
+        for name in (
+            "cmd_project_gateway_adopt",
+            "cmd_project_gateway_handoff",
+            "cmd_project_gateway_route_plan",
+            "register",
+        ):
+            self.assertTrue(hasattr(cli_project_gateway, name), name)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
