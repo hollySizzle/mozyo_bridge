@@ -1,9 +1,13 @@
-"""CLI surface for the semantic project-gateway route (Redmine #12668).
+"""CLI surface for the semantic project-gateway route (Redmine #12668 / #12751).
 
-Pins ``project-gateway resolve`` (read-only text + JSON) and the
-``project-gateway handoff`` fail-closed behavior with discovery mocked, so the
-command layer's classification + exit codes + no-deliver-on-fail-closed contract
-are covered without touching tmux. The pure resolver scenarios live in
+Pins ``project-gateway resolve`` (read-only text + JSON), ``handoff``,
+``consult``, and ``child-intake`` fail-closed behavior with discovery mocked, so
+the command layer's classification + exit codes + no-deliver-on-fail-closed
+contract are covered without touching tmux. After the Redmine #12751
+modularization each subcommand family lives in its own module, so the resolve /
+consult / child-intake tests patch + call their own module directly while the
+registrar (`cli_project_gateway`) still owns `handoff` and assembles the tree
+(`RegistrationTest`). The pure resolver scenarios live in
 ``test_project_gateway_resolution``.
 """
 
@@ -24,6 +28,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
     cli_project_gateway,
     cli_project_gateway_child_intake,
+    cli_project_gateway_consult,
+    cli_project_gateway_resolve,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     CONFIDENCE_STRONG,
@@ -56,13 +62,15 @@ def _resolve_args(**overrides):
     return argparse.Namespace(**base)
 
 
-@patch.object(cli_project_gateway, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway_resolve, "require_tmux", lambda: None)
 class ResolveCliTest(unittest.TestCase):
+    # Redmine #12751: the read-only resolve handler + the shared resolution core
+    # moved to `cli_project_gateway_resolve`; patch/call that module directly.
     def _run(self, args, candidates):
         out = io.StringIO()
-        with patch.object(cli_project_gateway, "_discover_candidates", return_value=candidates):
+        with patch.object(cli_project_gateway_resolve, "_discover_candidates", return_value=candidates):
             with contextlib.redirect_stdout(out):
-                rc = cli_project_gateway.cmd_project_gateway_resolve(args)
+                rc = cli_project_gateway_resolve.cmd_project_gateway_resolve(args)
         return rc, out.getvalue()
 
     def test_found_text(self):
@@ -225,8 +233,15 @@ class HandoffCliTest(unittest.TestCase):
         orch.assert_not_called()
 
 
+@patch.object(cli_project_gateway_consult, "require_tmux", lambda: None)
 class ConsultCliTest(unittest.TestCase):
-    """`project-gateway consult` — the forward no-anchor consultation (#12740)."""
+    """`project-gateway consult` — the forward no-anchor consultation (#12740).
+
+    Redmine #12751: the consult handler moved to its own bounded module
+    `cli_project_gateway_consult` with this independent test target; patch/call that
+    module directly. The fail-closed paths render through the shared pure renderer
+    over the already-computed resolution (no second discovery scan).
+    """
 
     def _consult_args(self, **overrides):
         base = dict(
@@ -238,14 +253,43 @@ class ConsultCliTest(unittest.TestCase):
 
     def test_refuses_when_missing_does_not_deliver(self):
         out = io.StringIO()
-        with patch.object(cli_project_gateway, "_discover_candidates",
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
                           return_value=[_candidate("%w", role="claude")]):
-            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff") as orch:
                 with contextlib.redirect_stdout(out):
-                    rc = cli_project_gateway.cmd_project_gateway_consult(self._consult_args())
+                    rc = cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args())
         self.assertEqual(rc, 1)
         orch.assert_not_called()
         self.assertIn("gateway_missing", out.getvalue())
+
+    def test_ambiguous_fails_closed_no_delivery(self):
+        # Two distinct gateway lanes -> ambiguous; refuse to auto-select and do not
+        # deliver (the same fail-closed contract as `resolve` / `handoff`).
+        out = io.StringIO()
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
+                          return_value=[_candidate("%gw1", session="a"), _candidate("%gw2", session="b")]):
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args())
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        self.assertIn("status: gateway_target_ambiguous", out.getvalue())
+
+    def test_fail_closed_json_emits_resolution_payload(self):
+        # --json on a fail-closed resolution emits the structured GatewayResolution
+        # payload (the shared renderer over the already-computed resolution).
+        out = io.StringIO()
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude")]):
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff") as orch:
+                with contextlib.redirect_stdout(out):
+                    rc = cli_project_gateway_consult.cmd_project_gateway_consult(
+                        self._consult_args(as_json=True)
+                    )
+        self.assertEqual(rc, 1)
+        orch.assert_not_called()
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["status"], "gateway_missing")
 
     def test_found_delivers_no_anchor_consultation(self):
         captured = {}
@@ -267,10 +311,10 @@ class ConsultCliTest(unittest.TestCase):
             captured["journal"] = getattr(args, "journal", None)
             return 0
 
-        with patch.object(cli_project_gateway, "_discover_candidates",
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
                           return_value=[_candidate("%gw")]):
-            with patch.object(cli_project_gateway, "orchestrate_handoff", side_effect=fake_orch):
-                rc = cli_project_gateway.cmd_project_gateway_consult(self._consult_args())
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args())
         self.assertEqual(rc, 0)
         self.assertEqual(captured["target"], "%gw")
         self.assertTrue(captured["ticketless"])
@@ -292,39 +336,61 @@ class ConsultCliTest(unittest.TestCase):
         self.assertIsNone(captured["issue"])
         self.assertIsNone(captured["journal"])
 
+    def test_found_injects_resolved_pane_not_caller(self):
+        # Among several candidates the single matching gateway pane is injected,
+        # never some other discovered lane.
+        captured = {}
+
+        def fake_orch(args, **kwargs):
+            captured["target"] = args.target
+            return 0
+
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
+                          return_value=[_candidate("%w", role="claude"), _candidate("%gw")]):
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff", side_effect=fake_orch):
+                rc = cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["target"], "%gw")
+
     def test_fail_closed_does_not_inject_consultation_payload(self):
         args = self._consult_args()
         out = io.StringIO()
-        with patch.object(cli_project_gateway, "_discover_candidates",
+        with patch.object(cli_project_gateway_consult, "_discover_candidates",
                           return_value=[_candidate("%w", role="claude")]):
-            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff") as orch:
                 with contextlib.redirect_stdout(out):
-                    rc = cli_project_gateway.cmd_project_gateway_consult(args)
+                    rc = cli_project_gateway_consult.cmd_project_gateway_consult(args)
         self.assertEqual(rc, 1)
         orch.assert_not_called()
         self.assertIsNone(getattr(args, "consultation_kind", None))
         self.assertIsNone(getattr(args, "transition_role", None))
+        self.assertIsNone(getattr(args, "workflow_contract", None))
+        self.assertIsNone(getattr(args, "read_contract", None))
 
     def test_rejects_explicit_target_pane_authority(self):
-        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+        with patch.object(cli_project_gateway_consult, "_discover_candidates") as disc:
             with self.assertRaises(SystemExit):
-                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target="%99"))
+                cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args(target="%99"))
+        # The pane-authority refusal is a pre-resolution validation gate.
+        disc.assert_not_called()
 
     def test_rejects_auto_target_repo(self):
-        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+        with patch.object(cli_project_gateway_consult, "_discover_candidates") as disc:
             with self.assertRaises(SystemExit):
-                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target_repo="auto"))
+                cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args(target_repo="auto"))
+        disc.assert_not_called()
 
     def test_rejects_missing_target_project(self):
-        with patch.object(cli_project_gateway, "_discover_candidates", return_value=[]):
+        with patch.object(cli_project_gateway_consult, "_discover_candidates") as disc:
             with self.assertRaises(SystemExit):
-                cli_project_gateway.cmd_project_gateway_consult(self._consult_args(target_project=None))
+                cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args(target_project=None))
+        disc.assert_not_called()
 
     def test_rejects_direct_claude_send(self):
-        with patch.object(cli_project_gateway, "_discover_candidates") as disc:
-            with patch.object(cli_project_gateway, "orchestrate_handoff") as orch:
+        with patch.object(cli_project_gateway_consult, "_discover_candidates") as disc:
+            with patch.object(cli_project_gateway_consult, "orchestrate_handoff") as orch:
                 with self.assertRaises(SystemExit):
-                    cli_project_gateway.cmd_project_gateway_consult(self._consult_args(to="claude"))
+                    cli_project_gateway_consult.cmd_project_gateway_consult(self._consult_args(to="claude"))
         disc.assert_not_called()
         orch.assert_not_called()
 
@@ -466,6 +532,101 @@ class ChildIntakeCliTest(unittest.TestCase):
                 )
         self.assertEqual(rc, 0)
         self.assertEqual(captured["work_shape"], "implementation_work_intake")
+
+
+class RegistrationTest(unittest.TestCase):
+    """The `project-gateway` subcommand tree is assembled in one place (#12751).
+
+    Pins that the registrar wires every subcommand family (including the extracted
+    `resolve` / `consult` / `child-intake` modules) and that their handler bindings
+    + read-only flags survive parsing, so the modularization preserves the parser
+    help / validation surface.
+    """
+
+    def _gateway_subparser_names(self):
+        parser = argparse.ArgumentParser(prog="mozyo-bridge")
+        sub = parser.add_subparsers(dest="command")
+        cli_project_gateway.register(sub)
+        # `sub` is the `_SubParsersAction`; its `.choices` hold the registered
+        # parsers. The single `project-gateway` parser holds the family subparsers.
+        gateway_parser = sub.choices["project-gateway"]
+        family = next(
+            a for a in gateway_parser._actions  # noqa: SLF001 - argparse exposes choices here
+            if isinstance(a, argparse._SubParsersAction)  # noqa: SLF001
+        )
+        return parser, family.choices
+
+    def test_all_subcommands_registered_in_one_place(self):
+        _, names = self._gateway_subparser_names()
+        self.assertEqual(
+            set(names),
+            {"resolve", "adopt", "route-plan", "handoff", "consult", "child-intake"},
+        )
+
+    def test_subcommands_bind_their_extracted_handlers(self):
+        _, names = self._gateway_subparser_names()
+        # The extracted modules own their handlers; the registrar wires them.
+        self.assertIs(
+            names["resolve"].get_default("func"),
+            cli_project_gateway_resolve.cmd_project_gateway_resolve,
+        )
+        self.assertIs(
+            names["consult"].get_default("func"),
+            cli_project_gateway_consult.cmd_project_gateway_consult,
+        )
+        self.assertIs(
+            names["child-intake"].get_default("func"),
+            cli_project_gateway_child_intake.cmd_project_gateway_child_intake,
+        )
+
+    def test_resolve_parses_read_only_flags(self):
+        parser, _ = self._gateway_subparser_names()
+        ns = parser.parse_args(
+            ["project-gateway", "resolve", "--repo", REPO, "--project", PROJECT, "--json"]
+        )
+        self.assertTrue(ns.as_json)
+        self.assertIs(ns.func, cli_project_gateway_resolve.cmd_project_gateway_resolve)
+
+    def test_consult_parses_semantic_route_flags(self):
+        parser, _ = self._gateway_subparser_names()
+        ns = parser.parse_args(
+            ["project-gateway", "consult", "--to", "codex",
+             "--target-repo", REPO, "--target-project", PROJECT]
+        )
+        self.assertEqual(ns.to, "codex")
+        self.assertEqual(ns.target_project, PROJECT)
+        self.assertIs(ns.func, cli_project_gateway_consult.cmd_project_gateway_consult)
+
+
+class PublicImportCompatTest(unittest.TestCase):
+    """Pre-#12751 public import surface is preserved (Review Gate j#68486 finding 1).
+
+    The resolve / consult handler bodies moved to sibling modules, but the
+    registrar was previously the import / patch seam for the
+    `cmd_project_gateway_resolve` / `cmd_project_gateway_consult` handler symbols,
+    so `from ...cli_project_gateway import cmd_project_gateway_*` must keep
+    resolving to the same handler objects.
+    """
+
+    def test_registrar_reexports_moved_handlers(self):
+        self.assertIs(
+            cli_project_gateway.cmd_project_gateway_resolve,
+            cli_project_gateway_resolve.cmd_project_gateway_resolve,
+        )
+        self.assertIs(
+            cli_project_gateway.cmd_project_gateway_consult,
+            cli_project_gateway_consult.cmd_project_gateway_consult,
+        )
+
+    def test_registrar_keeps_in_place_handlers(self):
+        # The handlers that stayed in the registrar remain importable from it.
+        for name in (
+            "cmd_project_gateway_adopt",
+            "cmd_project_gateway_handoff",
+            "cmd_project_gateway_route_plan",
+            "register",
+        ):
+            self.assertTrue(hasattr(cli_project_gateway, name), name)
 
 
 if __name__ == "__main__":  # pragma: no cover
