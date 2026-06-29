@@ -32,6 +32,7 @@ from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.application.status_session_port import LiveStatusSession
 from mozyo_bridge.application.commands_status import (
     LiveStatusCockpitMembership,
+    LiveStatusDoctorContinuation,
     StatusCommandHandler,
     StatusCommandRequest,
 )
@@ -3698,23 +3699,22 @@ def resolve_status_session(args: argparse.Namespace) -> str:
 
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
-    # OOP-first command-handler boundary (Redmine #12830, atop #12825 / #12785):
-    # resolve the session once, then hand a typed StatusCommandRequest to the
-    # handler. The handler composes the session-read use case (StatusSessionPort)
-    # and the cockpit-membership projection (StatusCockpitMembershipPort) and
-    # returns a StatusReport whose pre-rendered text this thin adapter prints
-    # verbatim. #12830 decomposed the former _status_repo_cockpit_membership
-    # projection body into commands_status.py's CockpitMembershipProjection /
-    # reads-port / identity value object; LiveStatusCockpitMembership wires the
-    # live reads through commands.* at call time. Residual to #12638 (explicitly
-    # carried): the doctor tail below stays in commands.py as an explicit tail
-    # delegation rather than this tranche moving the broad doctor module.
-    report = StatusCommandHandler(
+    # OOP-first command boundary (Redmine #12831, atop #12830 / #12825 / #12785):
+    # the handler composes the session-read use case (StatusSessionPort), the
+    # cockpit-membership projection (StatusCockpitMembershipPort), and the
+    # doctor-tail continuation (StatusDoctorContinuation) — all in
+    # commands_status.py. This thin adapter prints the rendered StatusReport, then
+    # defers the exit code to the continuation. #12831 isolated the
+    # `cmd_doctor(args)` tail behind that typed port + StatusContinuationResult VO
+    # (live adapter routes to cmd_doctor at call time; broad doctor body = #12638).
+    handler = StatusCommandHandler(
         sessions=LiveStatusSession(),
         membership=LiveStatusCockpitMembership(args),
-    ).handle(StatusCommandRequest(session=resolve_status_session(args)))
+        continuation=LiveStatusDoctorContinuation(args),
+    )
+    report = handler.handle(StatusCommandRequest(session=resolve_status_session(args)))
     print(report.report_text, end="")
-    return cmd_doctor(args)
+    return handler.continue_with_doctor().exit_code
 
 
 def notify_agent(args: argparse.Namespace, agent: str) -> int:
