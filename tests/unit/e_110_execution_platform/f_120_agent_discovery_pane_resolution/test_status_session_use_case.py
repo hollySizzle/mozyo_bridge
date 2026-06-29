@@ -30,13 +30,18 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.commands_status import (  # noqa: E402
+    CockpitMembershipIdentity,
+    CockpitMembershipProjection,
+    LiveStatusCockpitMembershipReads,
     ResolveSessionStatusUseCase,
     SessionStatusView,
     StatusCockpitMembershipPort,
+    StatusCockpitMembershipReads,
     StatusCommandHandler,
     StatusCommandRequest,
     StatusQuery,
     StatusReport,
+    match_cockpit_membership,
     render_status_report,
 )
 from mozyo_bridge.application.status_session_port import (  # noqa: E402
@@ -257,6 +262,180 @@ class StatusCommandHandlerTest(unittest.TestCase):
 class StatusCockpitMembershipPortContractTest(unittest.TestCase):
     def test_fake_membership_port_satisfies_protocol(self) -> None:
         self.assertIsInstance(_FakeMembershipPort(None), StatusCockpitMembershipPort)
+
+
+# --- #12830 cockpit-membership projection boundary -------------------------
+#
+# #12830 decomposed the procedural ``commands._status_repo_cockpit_membership``
+# into a typed boundary in ``commands_status.py``: a value object
+# (``CockpitMembershipIdentity``), a pure domain policy
+# (``match_cockpit_membership``), a reads port
+# (``StatusCockpitMembershipReads``), and the tolerant
+# ``CockpitMembershipProjection`` use case. The specs below drive that boundary
+# with a fake reads object and fake workspace records, so the projection's
+# match / absent-fallback / tolerance behavior is asserted without patching the
+# ``commands.*`` cockpit helpers (``resolve_canonical_session`` /
+# ``_resolve_workspace_lane`` / ``_collect_cockpit_membership`` /
+# ``_resolve_registry_facts``) the procedural body forced tests to monkeypatch.
+
+
+class _FakeWorkspace:
+    """Minimal stand-in for a loaded-cockpit ``WorkspaceMembership`` record.
+
+    Only the fields the pure match policy keys on (``workspace_id`` /
+    ``lane_id``) plus a ``member`` marker for assertions.
+    """
+
+    def __init__(self, *, workspace_id, lane_id, member=True):
+        self.workspace_id = workspace_id
+        self.lane_id = lane_id
+        self.member = member
+
+
+class _FakeMembershipReads:
+    """Fake :class:`StatusCockpitMembershipReads`: scripted reads + call counts.
+
+    Replaces the ``commands.*`` cockpit-helper monkeypatch the procedural
+    projection required: ``resolve_identity`` / ``collect_workspaces`` /
+    ``absent_membership`` are scripted, and each can be told to raise so the
+    projection's tolerance is exercised. ``absent_calls`` pins that a match hit
+    never builds the absent record (the original's "no registry read on a hit").
+    """
+
+    def __init__(
+        self,
+        *,
+        identity,
+        workspaces=(),
+        absent=None,
+        raise_on=None,
+    ):
+        self._identity = identity
+        self._workspaces = list(workspaces)
+        self._absent = absent
+        self._raise_on = raise_on or set()
+        self.absent_calls = 0
+        self.absent_identity = None
+
+    def _maybe_raise(self, name):
+        if name in self._raise_on:
+            raise RuntimeError(f"boom: {name}")
+
+    def resolve_identity(self, repo):
+        self._maybe_raise("resolve_identity")
+        return self._identity
+
+    def collect_workspaces(self):
+        self._maybe_raise("collect_workspaces")
+        return tuple(self._workspaces)
+
+    def absent_membership(self, identity):
+        self.absent_calls += 1
+        self.absent_identity = identity
+        self._maybe_raise("absent_membership")
+        return self._absent
+
+
+def _identity(*, workspace_id="wsA", target_lane="default"):
+    return CockpitMembershipIdentity(
+        repo_root="/repo/alpha",
+        workspace_id=workspace_id,
+        target_lane=target_lane,
+        lane_label=None,
+        fallback_label="alpha",
+    )
+
+
+class MatchCockpitMembershipPolicyTest(unittest.TestCase):
+    """The pure match policy selects by workspace id + normalized lane."""
+
+    def test_selects_workspace_by_id_and_normalized_lane(self) -> None:
+        match = _FakeWorkspace(workspace_id="wsA", lane_id="default")
+        other = _FakeWorkspace(workspace_id="wsB", lane_id="default", member=False)
+        result = match_cockpit_membership([other, match], _identity(workspace_id="wsA"))
+        self.assertIs(match, result)
+
+    def test_empty_lane_id_normalizes_to_default_and_matches(self) -> None:
+        # ``normalize_lane('')`` collapses to the ``default`` lane, so a record
+        # carrying a blank lane matches a repo on the default lane.
+        match = _FakeWorkspace(workspace_id="wsA", lane_id="")
+        result = match_cockpit_membership([match], _identity(target_lane="default"))
+        self.assertIs(match, result)
+
+    def test_lane_mismatch_yields_no_match(self) -> None:
+        rec = _FakeWorkspace(workspace_id="wsA", lane_id="feature-x")
+        self.assertIsNone(
+            match_cockpit_membership([rec], _identity(target_lane="default"))
+        )
+
+    def test_workspace_id_mismatch_yields_no_match(self) -> None:
+        rec = _FakeWorkspace(workspace_id="wsZ", lane_id="default")
+        self.assertIsNone(
+            match_cockpit_membership([rec], _identity(workspace_id="wsA"))
+        )
+
+    def test_no_workspaces_yields_no_match(self) -> None:
+        self.assertIsNone(match_cockpit_membership([], _identity()))
+
+
+class CockpitMembershipProjectionTest(unittest.TestCase):
+    """The tolerant use case composes the pure policy over a fake reads port."""
+
+    def test_match_hit_returns_record_without_building_absent(self) -> None:
+        hit = _FakeWorkspace(workspace_id="wsA", lane_id="default")
+        reads = _FakeMembershipReads(
+            identity=_identity(workspace_id="wsA"),
+            workspaces=[hit],
+            absent=_FakeMembership(member=False),
+        )
+        result = CockpitMembershipProjection(reads).resolve("/repo/alpha")
+        self.assertIs(hit, result)
+        # Behavior-preserving: a match never asks the port for the absent record.
+        self.assertEqual(0, reads.absent_calls)
+
+    def test_no_match_falls_back_to_absent_record(self) -> None:
+        absent = _FakeMembership(member=False)
+        identity = _identity(workspace_id="wsZ")
+        reads = _FakeMembershipReads(
+            identity=identity,
+            workspaces=[_FakeWorkspace(workspace_id="wsA", lane_id="default")],
+            absent=absent,
+        )
+        result = CockpitMembershipProjection(reads).resolve("/repo/zeta")
+        self.assertIs(absent, result)
+        self.assertEqual(1, reads.absent_calls)
+        # The absent record is built from the resolved identity, not re-read.
+        self.assertIs(identity, reads.absent_identity)
+
+    def test_identity_read_failure_degrades_to_none(self) -> None:
+        reads = _FakeMembershipReads(
+            identity=_identity(), raise_on={"resolve_identity"}
+        )
+        self.assertIsNone(CockpitMembershipProjection(reads).resolve("/repo/alpha"))
+
+    def test_collect_failure_degrades_to_none(self) -> None:
+        reads = _FakeMembershipReads(
+            identity=_identity(), raise_on={"collect_workspaces"}
+        )
+        self.assertIsNone(CockpitMembershipProjection(reads).resolve("/repo/alpha"))
+
+    def test_absent_build_failure_degrades_to_none(self) -> None:
+        reads = _FakeMembershipReads(
+            identity=_identity(workspace_id="wsZ"),
+            workspaces=[],
+            raise_on={"absent_membership"},
+        )
+        self.assertIsNone(CockpitMembershipProjection(reads).resolve("/repo/zeta"))
+
+
+class StatusCockpitMembershipReadsContractTest(unittest.TestCase):
+    def test_fake_and_live_reads_satisfy_port(self) -> None:
+        self.assertIsInstance(
+            _FakeMembershipReads(identity=_identity()), StatusCockpitMembershipReads
+        )
+        self.assertIsInstance(
+            LiveStatusCockpitMembershipReads(), StatusCockpitMembershipReads
+        )
 
 
 if __name__ == "__main__":

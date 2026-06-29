@@ -2512,60 +2512,6 @@ def _handle_cockpit_status(
     return 0 if match.ok else 1
 
 
-def _status_repo_cockpit_membership(args: argparse.Namespace):
-    """This repo's cockpit membership record for `status` (#12341, read-only, tolerant).
-
-    `mozyo-bridge status --repo <repo>` describes a *normal* agent session and
-    historically only warned "agent window missing", which an operator can mis-read
-    as "not in the cockpit either" (#12339). This resolves the repo's workspace
-    identity and looks it up in the shared cockpit session so `status` can state
-    cockpit membership explicitly. Tolerant: any resolution / tmux failure degrades
-    to ``None`` (the caller simply omits the line) so `status` never aborts on it.
-    """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
-        COCKPIT_SESSION_DEFAULT,
-        normalize_lane,
-    )
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import absent_membership
-
-    try:
-        repo = getattr(args, "repo", None) or os.getcwd()
-        repo_root = str(Path(repo).expanduser().resolve())
-        canon = resolve_canonical_session(repo_root)
-        workspace_id = getattr(canon, "workspace_id", None) or canon.name
-        lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
-        target_lane = normalize_lane(lane.lane_id)
-        report = _collect_cockpit_membership(COCKPIT_SESSION_DEFAULT)
-        match = next(
-            (
-                w
-                for w in report.workspaces
-                if w.workspace_id == workspace_id
-                and normalize_lane(w.lane_id) == target_lane
-            ),
-            None,
-        )
-        if match is None:
-            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
-
-            facts = _resolve_registry_facts(workspace_id)
-            label = facts.label if facts.registry_present else canon.name
-            match = absent_membership(
-                session=COCKPIT_SESSION_DEFAULT,
-                workspace_id=workspace_id,
-                label=label,
-                repo_root=infer_repo_root(repo_root) or repo_root,
-                lane_id=target_lane,
-                lane_label=lane.lane_label,
-                registry_present=facts.registry_present,
-                anchor_present=facts.anchor_present,
-                registry_canonical_path=facts.repo_root,
-            )
-        return match
-    except (Exception, SystemExit):
-        return None
-
-
 def _read_cockpit_pane_runtime(session: str, pane_id: str) -> dict:
     """Read one cockpit pane's cwd / foreground process / lane label (#12133, read-only).
 
@@ -3752,16 +3698,17 @@ def resolve_status_session(args: argparse.Namespace) -> str:
 
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
-    # OOP-first command-handler boundary (Redmine #12825, atop #12785): resolve
-    # the session once, then hand a typed StatusCommandRequest to the handler.
-    # The handler composes the session-read use case (StatusSessionPort) and the
-    # cockpit-membership projection (StatusCockpitMembershipPort) and returns a
-    # StatusReport whose pre-rendered text this thin adapter prints verbatim.
-    # Residual to #12638 (explicitly carried): the _status_repo_cockpit_membership
-    # projection body and the doctor tail below stay in commands.py — the live
-    # membership adapter reaches the former, and the doctor delegation is an
-    # explicit tail, rather than this tranche moving the broad cockpit / doctor
-    # modules.
+    # OOP-first command-handler boundary (Redmine #12830, atop #12825 / #12785):
+    # resolve the session once, then hand a typed StatusCommandRequest to the
+    # handler. The handler composes the session-read use case (StatusSessionPort)
+    # and the cockpit-membership projection (StatusCockpitMembershipPort) and
+    # returns a StatusReport whose pre-rendered text this thin adapter prints
+    # verbatim. #12830 decomposed the former _status_repo_cockpit_membership
+    # projection body into commands_status.py's CockpitMembershipProjection /
+    # reads-port / identity value object; LiveStatusCockpitMembership wires the
+    # live reads through commands.* at call time. Residual to #12638 (explicitly
+    # carried): the doctor tail below stays in commands.py as an explicit tail
+    # delegation rather than this tranche moving the broad doctor module.
     report = StatusCommandHandler(
         sessions=LiveStatusSession(),
         membership=LiveStatusCockpitMembership(args),
