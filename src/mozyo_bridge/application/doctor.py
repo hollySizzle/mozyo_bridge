@@ -12,19 +12,19 @@ import argparse
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
-import mozyo_bridge
-from mozyo_bridge import __version__
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.application.doctor_claude_skill import (
     ClaudeSkillSectionUseCase,
     LiveClaudeSkillReads,
+)
+from mozyo_bridge.application.doctor_cli import (
+    CliSectionUseCase,
+    LiveCliReads,
 )
 from mozyo_bridge.application.doctor_codex_skill import (
     CodexSkillSectionUseCase,
@@ -218,43 +218,25 @@ def repo_local_source_drift(
 
 
 def doctor_cli_section(target: Path | None = None) -> dict[str, Any]:
-    package_path = Path(mozyo_bridge.__file__).resolve().parent
-    executable = shutil.which("mozyo-bridge")
-    section: dict[str, Any] = {
-        "status": "ok",
-        "version": __version__,
-        "executable": executable or "",
-        "package_path": str(package_path),
-        "python": sys.executable,
-        "subcommands": list(EXPECTED_SUBCOMMANDS),
-        "next_action": [],
-    }
-    if target is not None:
-        drift = repo_local_source_drift(target, package_path, __version__)
-        if drift is not None:
-            # Any drift inside a checkout warrants the warning: the running CLI
-            # is not the repo-local source, so it may lag the checkout's
-            # commits regardless of whether the version string matches
-            # (Redmine #11855 review j#57416).
-            section["status"] = "warning"
-            source_label = drift["source_version"] or "version unknown"
-            message = (
-                "running mozyo-bridge is the installed CLI "
-                f"(version {__version__}) but this checkout has repo-local "
-                f"source (src/mozyo_bridge {source_label}); during active "
-                "development run the repo-local CLI instead: "
-                f"{drift['repo_local_invocation']} <args>"
-            )
-            if drift["relation"] == "same-version":
-                # The originating case: equal version, different commits. Spell
-                # it out so an equal-version match is not mistaken for parity.
-                message += (
-                    " (same version string does not guarantee the same commits "
-                    "during dogfooding; the install can lack newer subcommands)"
-                )
-            section["source_drift"] = drift
-            section["next_action"].append(message)
-    return section
+    """Report the running ``mozyo-bridge`` CLI install state (+ source drift).
+
+    Read-only: it never installs or repairs. ``ok`` when the running CLI is the
+    whole story; ``warning`` when a checkout's repo-local source under
+    ``src/mozyo_bridge`` differs from the running install (active-development /
+    dogfooding case), with the repo-local-invocation guidance as next_action.
+
+    Thin handler: the external reads (running ``__version__`` / executable /
+    package path / ``sys.executable`` / expected subcommands + the
+    ``repo_local_source_drift`` detection), the authority-bearing verdict (status
+    + the drift warning message), and the legacy section dict assembly now live
+    behind the typed boundary in ``doctor_cli`` (#12845). ``LiveCliReads`` drives
+    the running-package introspection and resolves ``repo_local_source_drift``
+    at call time, ``CliSectionUseCase`` applies the pure ``evaluate_cli_section``
+    policy, and the legacy section dict is preserved byte-for-byte. The
+    source-drift *detection* helper (``repo_local_source_drift`` /
+    ``_read_source_version``) stays here as the reusable read concern.
+    """
+    return CliSectionUseCase(LiveCliReads(target)).execute()
 
 
 def doctor_rules_section(home: Path | None) -> dict[str, Any]:
