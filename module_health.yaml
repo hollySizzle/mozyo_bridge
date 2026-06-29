@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1831
+    lines: 1797
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -323,8 +323,21 @@ allowlist:
       unchanged. `BAD_SECTION_STATUSES` is re-exported from `doctor_health`
       (`doctor_instruction` importer unchanged). `test_doctor_health` adds the
       fake-port use-case + pure verdict-policy specifications (the verdict
-      authority no longer needs section-collector monkeypatching). The broad
-      `cmd_doctor` / `run_doctor` collector bodies stay residual to #12638.
+      authority no longer needs section-collector monkeypatching).
+      Lowered 1831 -> 1797 for the #12835 doctor section collector boundary
+      tranche: the `doctor_claude_launch_policy_section` collector's two
+      responsibilities — the external read (`describe_launch_policy`) and the
+      authority-bearing verdict (section status + next_action) — moved behind
+      the typed boundary in `doctor_launch_policy.py` (the
+      `LaunchPolicySectionVerdict` value object, the pure
+      `evaluate_launch_policy_section` domain policy, the `LaunchPolicyReads`
+      port + `LiveLaunchPolicyReads` adapter, and the
+      `LaunchPolicySectionUseCase`). `doctor_claude_launch_policy_section` is
+      now a thin handler composing the use case at call time, so the existing
+      env-patching section tests are unchanged. `test_doctor_launch_policy`
+      adds fake-port use-case + pure verdict-policy specifications (the verdict
+      authority no longer needs `os.environ` patching). The remaining broad
+      `doctor_*_section` collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
