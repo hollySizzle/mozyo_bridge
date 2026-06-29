@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 6025
+    lines: 5984
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -251,6 +251,18 @@ allowlist:
       (`test_status_session_use_case`) is the monkeypatch -> fake-port migration for
       that boundary. The `cmd_doctor` tail and `_status_repo_cockpit_membership`
       cockpit projection stay residual to #12638.
+      Lowered 6025 -> 5984 for the #12825 second tranche: the remaining `cmd_status`
+      orchestration moved into an OOP-first command-handler boundary in
+      `commands_status.py` (`StatusCommandHandler` consuming a typed
+      `StatusCommandRequest`, the cockpit projection behind `StatusCockpitMembershipPort`
+      / `LiveStatusCockpitMembership`, a pure byte-preserving `render_status_report`,
+      and a typed `StatusReport` result). `cmd_status` is now a thin adapter:
+      resolve the session, drive the handler, print the report text, delegate the
+      doctor tail. The `_status_repo_cockpit_membership` projection body and the
+      `cmd_doctor` tail stay residual to #12638; the handler reaches the former via
+      the live adapter (call-time `commands.*` routing, so the cockpit-membership
+      integration tests are unchanged). `test_status_session_use_case` adds the
+      fake-policy handler + pure-renderer specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

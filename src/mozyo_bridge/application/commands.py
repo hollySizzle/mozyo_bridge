@@ -31,8 +31,9 @@ from mozyo_bridge.application.commands_agents import (
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.application.status_session_port import LiveStatusSession
 from mozyo_bridge.application.commands_status import (
-    ResolveSessionStatusUseCase,
-    StatusQuery,
+    LiveStatusCockpitMembership,
+    StatusCommandHandler,
+    StatusCommandRequest,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
     cmd_workspace_inspect,
@@ -3751,63 +3752,21 @@ def resolve_status_session(args: argparse.Namespace) -> str:
 
 def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
-    session = resolve_status_session(args)
-    # OOP-first session-read boundary (Redmine #12785): the existence / window /
-    # pane reads and present-missing classification live behind StatusSessionPort
-    # + ResolveSessionStatusUseCase (commands_status); the cmd_doctor tail and
-    # cockpit-membership projection below stay residual to #12638.
-    view = ResolveSessionStatusUseCase(LiveStatusSession()).resolve(
-        StatusQuery(session=session)
-    )
-    if view.present:
-        print(f"session: {session}")
-        if view.has_agent_windows:
-            print("WINDOW\tNAME\tTARGET\tACTIVE\tPROCESS\tCWD")
-            if view.panes_ok:
-                print(view.panes_text, end="")
-            for agent in view.missing_agents:
-                print(
-                    f"  {agent} window missing; run `mozyo` to create it, "
-                    f"or `mozyo-bridge init {agent}` from the right pane to rename it."
-                )
-        else:
-            print(
-                "  no agent windows in this session. "
-                "Run `mozyo` from the repo to create one window per agent, "
-                "or `mozyo-bridge init claude|codex` from an existing pane to rename "
-                "its window into an agent target."
-            )
-    else:
-        print(f"session: {session} (missing)")
-    # Cockpit membership is a separate axis from this normal session's agent
-    # windows (Redmine #12341): a workspace can be absent here yet loaded as a
-    # cockpit column, so state it explicitly instead of leaving the "agent window
-    # missing" note above to be mis-read as "not in the cockpit either" (#12339).
-    membership = _status_repo_cockpit_membership(args)
-    if membership is not None:
-        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_SESSION_DEFAULT
-
-        if membership.member:
-            print(
-                f"cockpit: workspace {membership.label!r} IS loaded in cockpit "
-                f"{COCKPIT_SESSION_DEFAULT!r} (window {membership.window or '-'}, "
-                f"codex={membership.codex_pane or '-'} "
-                f"claude={membership.claude_pane or '-'}, "
-                f"geometry={membership.geometry_status}); see "
-                "`mozyo-bridge cockpit status --repo .`."
-            )
-        else:
-            print(
-                f"cockpit: workspace {membership.label!r} is NOT loaded in cockpit "
-                f"{COCKPIT_SESSION_DEFAULT!r}; any `agent window missing` note above "
-                "is about this normal session, not cockpit membership. Add it with "
-                "`mozyo cockpit`, or inspect with `mozyo-bridge cockpit list`."
-            )
-        print(
-            "  (cockpit membership is a display/liveness projection, not Redmine "
-            "workflow / approval / close truth.)"
-        )
-    print("")
+    # OOP-first command-handler boundary (Redmine #12825, atop #12785): resolve
+    # the session once, then hand a typed StatusCommandRequest to the handler.
+    # The handler composes the session-read use case (StatusSessionPort) and the
+    # cockpit-membership projection (StatusCockpitMembershipPort) and returns a
+    # StatusReport whose pre-rendered text this thin adapter prints verbatim.
+    # Residual to #12638 (explicitly carried): the _status_repo_cockpit_membership
+    # projection body and the doctor tail below stay in commands.py — the live
+    # membership adapter reaches the former, and the doctor delegation is an
+    # explicit tail, rather than this tranche moving the broad cockpit / doctor
+    # modules.
+    report = StatusCommandHandler(
+        sessions=LiveStatusSession(),
+        membership=LiveStatusCockpitMembership(args),
+    ).handle(StatusCommandRequest(session=resolve_status_session(args)))
+    print(report.report_text, end="")
     return cmd_doctor(args)
 
 
