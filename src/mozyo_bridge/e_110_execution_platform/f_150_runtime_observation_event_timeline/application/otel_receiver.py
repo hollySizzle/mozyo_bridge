@@ -324,7 +324,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         # loopback-only bind. Imported lazily so pure-receiver usage does
         # not pay for the inventory stack.
         if self.path == "/":
-            from mozyo_bridge.application.cockpit_page import (
+            from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_page import (
                 INDEX_HTML_TEMPLATE,
             )
 
@@ -365,7 +365,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             # network); the observation clock is stamped here at the I/O layer.
             from datetime import datetime, timezone
 
-            from mozyo_bridge.application.cockpit_payload import (
+            from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (
                 attach_attention,
                 attach_observation,
             )
@@ -395,7 +395,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
             # broken grouping config is visible, never silently defaulted.
             from datetime import datetime, timezone
 
-            from mozyo_bridge.application.cockpit_payload import (
+            from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (
                 grouped_units_payload,
             )
             from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
@@ -546,7 +546,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         originates from the served page. Failures are explanatory JSON,
         never silent or destructive.
         """
-        from mozyo_bridge.application.cockpit_actions import (
+        from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
             CockpitActionError,
             jump_to_unit,
             reveal_in_finder,
@@ -587,7 +587,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         preflight narrows the live match by it and only fails closed when no pane
         carries that lane (a *missing* target).
         """
-        from mozyo_bridge.application.cockpit_actions import (
+        from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
             CockpitActionError,
             grouped_jump,
             grouped_reveal,
@@ -636,7 +636,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         first-class identity selector (Redmine #12293), resolved by narrowing the
         live match and only unavailable when no pane carries that lane.
         """
-        from mozyo_bridge.application.cockpit_actions import (
+        from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
             grouped_action_preview,
         )
 

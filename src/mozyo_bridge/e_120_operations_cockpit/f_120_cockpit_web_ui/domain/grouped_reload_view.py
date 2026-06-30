@@ -36,7 +36,7 @@ Sidecar Observer Scope Split``):
   workflow gate (owner approval / review / routing / close / completion stay with
   the Redmine durable record) and authorizes no side effect — a grouped Unit
   action re-resolves its target through the action-time live preflight in
-  :mod:`mozyo_bridge.application.cockpit_ui` regardless of this view's freshness
+  :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui` regardless of this view's freshness
   (:data:`GROUPED_RELOAD_DIAGNOSTIC_ONLY_NOTE`).
 - **Fail-safe freshness, never ``healthy`` from a degraded snapshot.** The
   freshness fields and ``reload_required`` are read straight from the read

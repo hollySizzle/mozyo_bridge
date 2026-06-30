@@ -27,7 +27,7 @@ import sys
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
-from mozyo_bridge.application.commands_state import (
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.commands_state import (
     cmd_state_cleanup,
     cmd_state_inspect,
     cmd_state_migrate,

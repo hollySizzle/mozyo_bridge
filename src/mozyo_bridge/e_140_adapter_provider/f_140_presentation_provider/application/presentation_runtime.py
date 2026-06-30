@@ -1,7 +1,7 @@
 """Runtime resolution of the built-in presentation surface selection (Redmine #12251).
 
 This is the presentation analogue of
-:mod:`mozyo_bridge.application.provider_runtime` (Redmine #12249): it connects
+:mod:`mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.provider_runtime` (Redmine #12249): it connects
 the internal presentation-selection layer
 (:class:`~mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config.PresentationSelectionConfig`,
 Redmine #12189) to a real runtime surface — the configured projection *surface*
@@ -53,10 +53,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mozyo_bridge.application.text_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.text_attention_presentation_provider import (
     TEXT_ATTENTION_PRESENTATION_PROVIDER,
 )
-from mozyo_bridge.application.tmux_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
 )
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import PresentationProvider

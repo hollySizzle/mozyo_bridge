@@ -26,7 +26,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider
     ProviderRegistryError,
     ProviderSelectionConfig,
 )
-from mozyo_bridge.application.tmux_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.tmux_attention_presentation_provider import (
     PROVIDER_NAME as TMUX_PRESENTATION_PROVIDER_NAME,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider import (

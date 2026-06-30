@@ -28,7 +28,7 @@ def cmd_otel_serve(args: argparse.Namespace) -> int:
     extra. Best-effort by contract: events sent while the receiver is
     down are lost; the store is a cache, not a source of truth.
     """
-    from mozyo_bridge.application.otel_receiver import OtelReceiverError, serve
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import OtelReceiverError, serve
 
     try:
         serve(
@@ -272,7 +272,7 @@ def cmd_otel_launchd(args: argparse.Namespace) -> int:
     import json as _json
     import sys as _sys
 
-    from mozyo_bridge.application import otel_launchd
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import otel_launchd
 
     if _sys.platform != "darwin" and getattr(args, "launchd_command", "") != "status":
         die("launchd management is macOS-only")

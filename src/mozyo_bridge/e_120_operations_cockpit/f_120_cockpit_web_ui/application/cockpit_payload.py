@@ -2,15 +2,15 @@
 
 Split out of ``cockpit_ui`` (Redmine #12323) so the read-only served-API payload
 projections no longer share a module with UI rendering
-(:mod:`mozyo_bridge.application.cockpit_page`) or the side-effecting action /
-preflight bridge (:mod:`mozyo_bridge.application.cockpit_actions`). This module
+(:mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_page`) or the side-effecting action /
+preflight bridge (:mod:`mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions`). This module
 owns only the data the cockpit endpoints serve: the flat units payload and its
 additive join layers (attention, runtime-observation freshness), and the grouped
 read-model display payload.
 
 Every projection here is read-only and public-safe: it never moves a workflow
 gate, never authorizes a side effect (those re-preflight live in
-:mod:`mozyo_bridge.application.cockpit_actions`), and a stale / unreadable
+:mod:`mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions`), and a stale / unreadable
 snapshot degrades to a fail-closed display state rather than reading as current.
 The grouped rows carry identity + role presence only — never a pane / target —
 so acting on one still re-resolves its candidate Unit live.
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mozyo_bridge.application.cockpit_actions import DEFAULT_HOST, DEFAULT_LANE
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import DEFAULT_HOST, DEFAULT_LANE
 from mozyo_bridge.session_inventory import take_inventory
 
 
@@ -131,7 +131,7 @@ def attach_observation(payload: dict, snapshot, *, now) -> dict:
 
     The envelope is derived from the same inventory snapshot the rows are built
     from (``snapshot``), via the one mapping
-    :func:`~mozyo_bridge.application.commands_runtime_observation.snapshot_from_inventory`
+    :func:`~mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.commands_runtime_observation.snapshot_from_inventory`
     the ``observe reload`` CLI uses, so the GUI and CLI never disagree about
     freshness.
 
@@ -141,7 +141,7 @@ def attach_observation(payload: dict, snapshot, *, now) -> dict:
     review, routing, close, or completion (those stay with the Redmine durable
     record); it never authorizes a side-effecting action (those run their own
     action-time live preflight in
-    :func:`~mozyo_bridge.application.cockpit_actions._resolve_record`); and a
+    :func:`~mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions._resolve_record`); and a
     stale / unreadable snapshot derives ``reload_required`` / ``unknown``, never
     ``healthy``. The visible "stale" label rides in ``freshness``, so the
     snapshot can still be shown without reading as current.
@@ -152,7 +152,7 @@ def attach_observation(payload: dict, snapshot, *, now) -> dict:
     time, no path / secret. Cockpit-layer only, like the Redmine and attention
     joins — the ``session list`` CLI payload stays observation-free.
     """
-    from mozyo_bridge.application.commands_runtime_observation import (
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.commands_runtime_observation import (
         snapshot_from_inventory,
     )
 
@@ -223,7 +223,7 @@ def observed_units_from_inventory(snapshot, *, observation):
     contradicted** row (``live_runtime_conflict``): it is shown but reads
     ``needs_reload`` / unactionable, so its action affordances are disabled and the
     operator must use an explicit pane target.
-    :func:`~mozyo_bridge.application.cockpit_actions._resolve_unit_target` still
+    :func:`~mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions._resolve_unit_target` still
     fails closed on the same per-lane ambiguity, so this is defense in depth, not
     the only guard. The lane identity is a display / split fact only; it never
     becomes routing, approval, or close authority.
@@ -323,7 +323,7 @@ def grouped_units_payload(
     """
     from datetime import datetime, timezone
 
-    from mozyo_bridge.application.commands_runtime_observation import (
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.commands_runtime_observation import (
         snapshot_from_inventory,
     )
     from mozyo_bridge.application.repo_local_config_loader import (

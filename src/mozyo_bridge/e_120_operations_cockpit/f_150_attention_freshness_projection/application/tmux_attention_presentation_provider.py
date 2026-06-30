@@ -30,7 +30,7 @@ built-in classification, not an extension point.
 
 from __future__ import annotations
 
-from mozyo_bridge.application.attention_projection import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection import (
     ATTENTION_REASON_OPTION,
     ATTENTION_SEVERITY_OPTION,
     ATTENTION_STATE_OPTION,

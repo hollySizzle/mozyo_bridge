@@ -5908,7 +5908,7 @@ def cmd_instruction_install(args: argparse.Namespace) -> int:
 # --- Compatibility facade: handlers split into family modules (#12142, #12154). ---
 # Re-export so existing imports and monkeypatch targets
 # (`mozyo_bridge.application.commands.cmd_*`) keep resolving.
-from mozyo_bridge.application.commands_otel import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.commands_otel import (  # noqa: E402
     _events_store,
     _render_timeline,
     cmd_events_query,
@@ -5919,10 +5919,10 @@ from mozyo_bridge.application.commands_otel import (  # noqa: E402
     cmd_otel_serve,
     cmd_otel_status,
 )
-from mozyo_bridge.application.commands_runtime_observation import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.commands_runtime_observation import (  # noqa: E402
     cmd_observe_reload,
 )
-from mozyo_bridge.application.commands_docs_scaffold import (  # noqa: E402
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.commands_docs_scaffold import (  # noqa: E402
     cmd_docs_audit_impact,
     cmd_docs_generate,
     cmd_docs_resolve,
@@ -5935,6 +5935,6 @@ from mozyo_bridge.application.commands_docs_scaffold import (  # noqa: E402
     cmd_scaffold_diff,
     cmd_scaffold_status,
 )
-from mozyo_bridge.application.commands_workspace import (  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (  # noqa: E402
     cmd_workspace_defaults,
 )

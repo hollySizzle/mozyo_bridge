@@ -1,6 +1,6 @@
 """Served cockpit API payload-assembly contract tests (Redmine #12323 split).
 
-Focused on :mod:`mozyo_bridge.application.cockpit_payload`: the read-only
+Focused on :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload`: the read-only
 served-API projections, independent of the HTTP server, the HTML page, and the
 action / preflight bridge. Split out of ``test_cockpit_ui`` and
 ``test_grouped_served_cockpit`` (#12323) so the payload contract is tested by
@@ -31,11 +31,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_actions import (
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
     CockpitActionError,
     candidate_unit_selector,
 )
-from mozyo_bridge.application.cockpit_payload import (
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (
     attach_attention,
     attach_observation,
     grouped_units_payload,
@@ -64,7 +64,7 @@ from mozyo_bridge.session_inventory import (
 
 # The payload builders import take_inventory into the cockpit_payload namespace,
 # so patch it there (not at session_inventory).
-COCKPIT_PAYLOAD = "mozyo_bridge.application.cockpit_payload"
+COCKPIT_PAYLOAD = "mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload"
 
 
 def pane(pane_id: str, session: str, agent: str, cwd: str = "") -> dict:

@@ -27,20 +27,22 @@ from collections.abc import Mapping
 from typing import Callable, Optional
 
 from mozyo_bridge.application import (
-    cli_agents,
-    cli_cockpit,
     cli_core,
-    cli_docs_scaffold,
-    cli_handoff,
-    cli_module_health,
-    cli_observability,
-    cli_presentation,
-    cli_release,
     cli_runtime_config,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
     cli_session,
-    cli_state,
     cli_workspace,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import cli_agents
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import cli_handoff
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import cli_observability
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application import cli_state
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import cli_cockpit
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application import cli_presentation
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application import cli_docs_scaffold
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import cli_release
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.application import cli_module_health
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
     cli_project_gateway,
 )

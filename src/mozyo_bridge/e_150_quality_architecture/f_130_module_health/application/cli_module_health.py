@@ -7,14 +7,14 @@ Registers the top-level ``health`` command with two subcommands:
 - ``health check`` — the oversized-module gate; exits non-zero when a new
   oversized module appears or an allowlisted module grows past its baseline.
 
-Handlers live in :mod:`mozyo_bridge.application.commands_module_health`; this
+Handlers live in :mod:`mozyo_bridge.e_150_quality_architecture.f_130_module_health.application.commands_module_health`; this
 module only wires the parser, matching the split used by the other CLI families
 (see ``cli_state`` for the reference shape).
 """
 from __future__ import annotations
 
 from mozyo_bridge.application.cli_common import add_repo_option
-from mozyo_bridge.application.commands_module_health import (
+from mozyo_bridge.e_150_quality_architecture.f_130_module_health.application.commands_module_health import (
     cmd_health_check,
     cmd_health_report,
 )

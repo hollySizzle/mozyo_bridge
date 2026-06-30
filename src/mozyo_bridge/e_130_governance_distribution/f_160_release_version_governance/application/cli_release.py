@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 
 from mozyo_bridge.application.cli_common import add_repo_option
-from mozyo_bridge.application.release import (
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import (
     cmd_release_bump,
     cmd_release_check_artifact,
     cmd_release_check_drift,

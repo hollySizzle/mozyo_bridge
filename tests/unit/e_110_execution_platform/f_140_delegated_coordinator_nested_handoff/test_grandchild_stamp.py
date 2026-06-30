@@ -7,7 +7,7 @@ Covers the pure stamp-plan resolver
 off-contract kind), the grandchild acceptance shape (a depth-2 `implementation`
 lane), and the pure `set-option -p` plan that stamps only the two options the
 discovery read path consumes. Also covers the CLI actuator
-(:mod:`mozyo_bridge.application.grandchild_stamp`): lane-spec parsing,
+(:mod:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_stamp`): lane-spec parsing,
 preview-by-default / `--apply` / `--dry-run`, the JSON surface, and the
 replayable realization record.
 
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.application.grandchild_stamp import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_stamp import (
     _parse_lane_spec,
     cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
@@ -592,7 +592,7 @@ def _gate_args(**over) -> argparse.Namespace:
 
 
 class CmdGateTest(unittest.TestCase):
-    _PATCH = "mozyo_bridge.application.grandchild_stamp._discover_delegation_units"
+    _PATCH = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_stamp._discover_delegation_units"
 
     def _run(self, args):
         buf = io.StringIO()

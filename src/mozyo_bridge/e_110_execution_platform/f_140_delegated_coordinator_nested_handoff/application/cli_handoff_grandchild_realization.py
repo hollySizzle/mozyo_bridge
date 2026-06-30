@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 
-from mozyo_bridge.application.grandchild_stamp import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_stamp import (
     cmd_handoff_grandchild_gate,
     cmd_handoff_grandchild_stamp,
 )

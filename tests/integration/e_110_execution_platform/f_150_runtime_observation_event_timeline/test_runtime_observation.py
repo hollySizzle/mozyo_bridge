@@ -24,7 +24,7 @@ import sys
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
-from mozyo_bridge.application import commands_runtime_observation as cro
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import commands_runtime_observation as cro
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain import runtime_observation as ro
 

@@ -4,8 +4,8 @@ The single self-contained document the daemon serves at ``/`` for the cockpit
 Web UI. Split out of ``cockpit_ui`` (#12323) so UI / rendering changes no longer
 share a module with served-API payload assembly or the action-time preflight
 bridge: this module owns only the page markup + front-end script, the payload
-contract lives in :mod:`mozyo_bridge.application.cockpit_payload`, and the
-side-effecting actions live in :mod:`mozyo_bridge.application.cockpit_actions`.
+contract lives in :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload`, and the
+side-effecting actions live in :mod:`mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions`.
 
 The page is a single self-contained document: no external assets, no
 CDN, nothing fetched off-host — consistent with the loopback-only and
