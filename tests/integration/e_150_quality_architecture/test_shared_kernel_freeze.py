@@ -73,6 +73,12 @@ def _imported_modules(source: str) -> list[str]:
             # imports (level > 0) stay inside the shared package.
             if node.level == 0 and node.module:
                 names.append(node.module)
+                # `from mozyo_bridge import core` imports the submodule
+                # `mozyo_bridge.core`, but the bare module name `mozyo_bridge`
+                # is not forbidden on its own. Reconstruct each imported target
+                # as `<module>.<name>` so package-root-form upward imports are
+                # caught too (e.g. `from mozyo_bridge import application`).
+                names.extend(f"{node.module}.{alias.name}" for alias in node.names)
     return names
 
 
@@ -94,6 +100,30 @@ class SharedKernelFreezeTest(unittest.TestCase):
             "remove a kernel module, update FROZEN_SHARED_MODULES together with "
             "vibes/docs/logics/shared-kernel-freeze.md and justify it in review.",
         )
+
+    def test_guardrail_detects_package_root_form_imports(self) -> None:
+        # Regression (Redmine #12640 j#69194 finding 1): `from mozyo_bridge
+        # import core` / `... import application` must be caught, not just the
+        # dotted `from mozyo_bridge.core import ...` form.
+        sample = (
+            "from mozyo_bridge import core\n"
+            "from mozyo_bridge import application as app\n"
+        )
+        forbidden = sorted({n for n in _imported_modules(sample) if _is_forbidden(n)})
+        self.assertEqual(["mozyo_bridge.application", "mozyo_bridge.core"], forbidden)
+
+    def test_guardrail_allows_shared_internal_and_stdlib_imports(self) -> None:
+        # No false positives: stdlib, shared-internal absolute, and relative
+        # imports a kernel module may legitimately use stay allowed.
+        sample = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "from mozyo_bridge.shared import paths\n"
+            "from mozyo_bridge.shared.paths import resolve_repo_root\n"
+            "from . import errors\n"
+        )
+        forbidden = sorted({n for n in _imported_modules(sample) if _is_forbidden(n)})
+        self.assertEqual([], forbidden)
 
     def test_kernel_modules_do_not_import_bounded_contexts(self) -> None:
         offenders: dict[str, list[str]] = {}
