@@ -38,11 +38,14 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import DelegationConfig
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+    DEFAULT_MANAGE_WORKTREE,
+    DEFAULT_MERGE_ON_RETIRE,
     DEFAULT_PRESENTATION_SURFACE,
     REPO_LOCAL_CONFIG_VERSION,
     PresentationSelectionConfig,
     RepoLocalConfig,
     RepoLocalConfigError,
+    SublaneIntegrationConfig,
 )
 
 
@@ -480,6 +483,100 @@ class DelegationWiringTest(unittest.TestCase):
                     }
                 }
             )
+
+
+class SublaneIntegrationConfigTest(unittest.TestCase):
+    """The sublane Git worktree / retire-merge policy knob (Redmine #12604)."""
+
+    def test_default_is_behavior_preserving(self) -> None:
+        default = SublaneIntegrationConfig.default()
+        self.assertEqual(default.manage_worktree, DEFAULT_MANAGE_WORKTREE)
+        self.assertEqual(default.merge_on_retire, DEFAULT_MERGE_ON_RETIRE)
+        self.assertIsNone(default.integration_branch)
+        self.assertEqual(RepoLocalConfig.default().sublane_integration, default)
+
+    def test_none_and_empty_resolve_to_default(self) -> None:
+        self.assertEqual(
+            SublaneIntegrationConfig.from_record(None),
+            SublaneIntegrationConfig.default(),
+        )
+        self.assertEqual(
+            SublaneIntegrationConfig.from_record({}),
+            SublaneIntegrationConfig.default(),
+        )
+
+    def test_missing_block_keeps_default(self) -> None:
+        config = RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}})
+        self.assertEqual(
+            config.sublane_integration, SublaneIntegrationConfig.default()
+        )
+
+    def test_full_record_maps_each_field(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {
+                "sublane_integration": {
+                    "manage_worktree": False,
+                    "integration_branch": "main",
+                    "merge_on_retire": False,
+                }
+            }
+        )
+        si = config.sublane_integration
+        self.assertFalse(si.manage_worktree)
+        self.assertEqual(si.integration_branch, "main")
+        self.assertFalse(si.merge_on_retire)
+
+    def test_explicit_supported_version_accepted(self) -> None:
+        config = SublaneIntegrationConfig.from_record(
+            {"version": REPO_LOCAL_CONFIG_VERSION, "merge_on_retire": False}
+        )
+        self.assertFalse(config.merge_on_retire)
+
+    def test_non_bool_manage_worktree_fails_closed(self) -> None:
+        # ``1`` must not silently read as True — the fail-closed boundary.
+        for bad in (1, 0, "true", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    SublaneIntegrationConfig.from_record({"manage_worktree": bad})
+
+    def test_non_bool_merge_on_retire_fails_closed(self) -> None:
+        for bad in (1, 0, "false"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    SublaneIntegrationConfig.from_record({"merge_on_retire": bad})
+
+    def test_empty_or_non_string_integration_branch_fails_closed(self) -> None:
+        for bad in ("", "   ", 5, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    SublaneIntegrationConfig.from_record({"integration_branch": bad})
+
+    def test_unknown_key_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            SublaneIntegrationConfig.from_record({"merge_on_retyre": True})
+
+    def test_invariant_authority_shaped_key_fails_closed(self) -> None:
+        # The owner-approval / close / callback invariants cannot be smuggled in as
+        # config keys — a boundary-shaped key is rejected by the closed schema.
+        for boundary_key in (
+            "owner_approval",
+            "close_on_retire",
+            "callback_target",
+            "send_on_retire",
+        ):
+            with self.subTest(boundary_key=boundary_key):
+                with self.assertRaises(RepoLocalConfigError):
+                    RepoLocalConfig.from_record(
+                        {"sublane_integration": {boundary_key: True}}
+                    )
+
+    def test_non_mapping_record_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"sublane_integration": ["main"]})
+
+    def test_unsupported_version_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            SublaneIntegrationConfig.from_record({"version": 2})
 
 
 if __name__ == "__main__":
