@@ -218,6 +218,24 @@ class FailClosedTest(unittest.TestCase):
             source.read_version_issues("248")
         self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
 
+    def test_negative_total_count_with_empty_page_fails_closed(self) -> None:
+        # Regression (j#69440): a negative total_count must not be trusted as
+        # "already covered" (0 >= -1) and short-circuit an empty read to a
+        # complete/empty Version. It is a malformed page shape -> transport_error.
+        opener = _RecordingOpener([{"issues": [], "total_count": -1}])
+        with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
+            _source(opener).read_version_issues("248")
+        self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
+
+    def test_negative_total_count_with_issues_fails_closed(self) -> None:
+        # Regression (j#69440): the non-empty variant of the reviewer's repro —
+        # a negative total_count must fail closed before completeness compare,
+        # never returning the page as a trusted complete snapshot.
+        opener = _RecordingOpener([{"issues": [_issue(1)], "total_count": -1}])
+        with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
+            _source(opener).read_version_issues("248")
+        self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
+
     def test_non_object_body_fails_closed(self) -> None:
         source = _source(_RecordingOpener([[1, 2, 3]]))
         with self.assertRaises(RedmineVersionReadUnavailable) as ctx:

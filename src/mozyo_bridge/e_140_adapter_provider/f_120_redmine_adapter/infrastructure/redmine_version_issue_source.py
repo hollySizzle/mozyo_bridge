@@ -177,9 +177,16 @@ class LiveRedmineVersionIssueSource:
                     reason=READ_TRANSPORT_ERROR,
                 )
             total = body.get("total_count")
-            if not isinstance(total, int) or isinstance(total, bool):
+            # total_count must be a non-negative integer. A negative count is a
+            # malformed Redmine page shape, and crucially must not be trusted as
+            # "already covered": `len(collected) >= total` would be true for any
+            # negative total and short-circuit a partial/empty read to success
+            # (the #12651 negative-count fail-open lineage, j#69343 / #12923
+            # j#69440). bool is an int subclass, so reject it explicitly too.
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
                 raise RedmineVersionReadUnavailable(
-                    "Redmine returned a malformed issues page (no total_count)",
+                    "Redmine returned a malformed issues page "
+                    "(missing or negative total_count)",
                     reason=READ_TRANSPORT_ERROR,
                 )
             page_issues = [entry for entry in issues if isinstance(entry, Mapping)]
