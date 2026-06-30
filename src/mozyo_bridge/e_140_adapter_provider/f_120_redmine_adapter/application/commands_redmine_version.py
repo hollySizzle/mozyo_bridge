@@ -106,25 +106,23 @@ def _resolve_state(args: argparse.Namespace) -> VersionState:
         raise VersionOperationError(
             f"version #{version_id} not found in snapshot {versions_json}"
         )
-    # Inline fallback: build the state from explicit counts/name/status. The
-    # count args default to None ("not provided"); counts are only trusted when
-    # all three are supplied, otherwise counts_known stays False so a
-    # count-dependent operation (delete/close/lock) fails closed.
-    raw_counts = (
-        getattr(args, "issues_count", None),
-        getattr(args, "open_issues_count", None),
-        getattr(args, "closed_issues_count", None),
-    )
-    counts_known = all(c is not None for c in raw_counts)
-    return VersionState(
-        version_id=version_id,
-        name=str(getattr(args, "name", "") or ""),
-        status=str(getattr(args, "status", "") or "").strip().lower(),
-        issues_count=int(raw_counts[0] or 0),
-        open_issues_count=int(raw_counts[1] or 0),
-        closed_issues_count=int(raw_counts[2] or 0),
-        counts_known=counts_known,
-    )
+    # Inline fallback: build the state from explicit counts/name/status. Route it
+    # through VersionState.from_mapping so the counts_known / non-negative parse
+    # rule is enforced in exactly one place — an omitted count leaves the key out
+    # (counts_known stays False), and a supplied-but-invalid count (e.g. negative)
+    # fails the same validation a snapshot would.
+    entry: dict[str, object] = {"id": version_id}
+    name = getattr(args, "name", None)
+    if name is not None:
+        entry["name"] = name
+    status = getattr(args, "status", None)
+    if status is not None:
+        entry["status"] = status
+    for key in ("issues_count", "open_issues_count", "closed_issues_count"):
+        value = getattr(args, key, None)
+        if value is not None:
+            entry[key] = value
+    return VersionState.from_mapping(entry)
 
 
 def _versions_entries(payload: object) -> list[Mapping[str, object]]:

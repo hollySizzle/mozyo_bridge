@@ -315,14 +315,18 @@ def _operator_ui_step(
 
 
 def _coerce_count(value: object) -> int | None:
-    """Parse an issue-count field to an int, or ``None`` when it is missing or
-    not an integer. ``None`` keeps ``counts_known`` false so a malformed count is
-    never trusted as a genuine ``0`` by a destructive preflight."""
+    """Parse an issue-count field to a **non-negative** int, or ``None`` when it
+    is missing, not an integer, or negative. ``None`` keeps ``counts_known``
+    false so a malformed count (non-numeric or a nonsensical negative) is never
+    trusted as a genuine ``0`` by a destructive preflight."""
     if isinstance(value, bool):  # bool is an int subclass; reject it explicitly
         return None
     if isinstance(value, int):
-        return value
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
+        parsed: int = value
+    else:
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+    # A Redmine issue count is never negative; treat it as malformed/untrusted.
+    return parsed if parsed >= 0 else None

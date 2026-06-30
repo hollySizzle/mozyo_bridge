@@ -246,6 +246,60 @@ class PreflightCliTest(_SnapshotCase):
         self.assertIn("counts_required", out)
         self.assertNotIn("DELETE /versions/999.json", out)
 
+    def test_inline_negative_count_fails_closed(self) -> None:
+        # Regression (j#69343): an inline negative count must not be trusted; the
+        # delete preflight must fail closed rather than treat it as <= empty.
+        code, out = self._run(
+            [
+                "redmine-version",
+                "preflight",
+                "--version-id",
+                "999",
+                "--op",
+                "delete",
+                "--confirm",
+                "delete:999",
+                "--issues-count",
+                "-1",
+                "--open-issues-count",
+                "0",
+                "--closed-issues-count",
+                "0",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("counts_required", out)
+        self.assertNotIn("DELETE /versions/999.json", out)
+
+    def test_snapshot_negative_count_fails_closed(self) -> None:
+        bad = Path(self._tmp.name) / "neg_counts.json"
+        bad.write_text(
+            json.dumps(
+                {
+                    "versions": [
+                        {"id": "999", "name": "neg", "status": "open", "issues_count": -2, "open_issues_count": 0, "closed_issues_count": 0}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, out = self._run(
+            [
+                "redmine-version",
+                "preflight",
+                "--version-id",
+                "999",
+                "--op",
+                "delete",
+                "--versions-json",
+                str(bad),
+                "--confirm",
+                "delete:999",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("counts_required", out)
+
     def test_unknown_version_in_snapshot_fails_closed(self) -> None:
         code, _ = self._run(
             [

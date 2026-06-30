@@ -348,6 +348,41 @@ class VersionStateParseTest(unittest.TestCase):
         )
         self.assertFalse(state.counts_known)
 
+    def test_from_mapping_with_negative_count_is_counts_unknown(self) -> None:
+        # Regression (j#69343): a negative count is nonsensical/malformed and
+        # must not be trusted as known (a negative also slips past `> 0`, so it
+        # would otherwise let delete pass).
+        state = VersionState.from_mapping(
+            {
+                "id": "999",
+                "status": "open",
+                "issues_count": -1,
+                "open_issues_count": 0,
+                "closed_issues_count": 0,
+            }
+        )
+        self.assertFalse(state.counts_known)
+        decision = decide_version_operation(
+            VersionOperationRequest(
+                operation="delete", state=state, confirmation="delete:999"
+            )
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("counts_required", decision.blocked_reasons)
+        self.assertIsNone(decision.rest_step)
+
+    def test_from_mapping_with_negative_string_count_is_counts_unknown(self) -> None:
+        state = VersionState.from_mapping(
+            {
+                "id": "999",
+                "status": "open",
+                "issues_count": 0,
+                "open_issues_count": "-3",
+                "closed_issues_count": 0,
+            }
+        )
+        self.assertFalse(state.counts_known)
+
     def test_from_mapping_with_string_numeric_counts_is_known(self) -> None:
         # Real list_versions returns numeric strings sometimes; these parse fine.
         state = VersionState.from_mapping(
