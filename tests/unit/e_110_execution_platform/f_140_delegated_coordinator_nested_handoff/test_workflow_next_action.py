@@ -32,8 +32,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RouteCandidate,
     WorkflowCommandResult,
     derive_workflow_next_action,
+    expected_provider_for,
     render_command_result_journal,
+    render_command_result_text,
     risk_policy_for,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
     ACTION_AGGREGATE_OWNER_APPROVAL,
@@ -229,6 +234,66 @@ class EnvelopeTest(unittest.TestCase):
         self.assertIn("requires_confirmation:", text)
         self.assertIn("route_identity:", text)
         self.assertNotIn("%", text)  # no pane id in the durable record
+
+
+class RoleProviderBindingIntegrationTest(unittest.TestCase):
+    """#12673: the next action carries the role-canonical owner AND its bound provider,
+    and the route selection / display resolve through the (overridable) binding — never a
+    provider-fixed codex/claude assumption."""
+
+    def _review_state(self):
+        return _state(
+            [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
+        )
+
+    def test_default_binding_surfaces_provider_alongside_role(self):
+        # review_request -> perform_review owned by the auditor role -> codex provider.
+        na = derive_workflow_next_action(self._review_state())
+        self.assertEqual(na.owner_role, "auditor")
+        self.assertEqual(na.provider, "codex")
+        self.assertEqual(na.role_provider, "auditor via codex")
+        # payload keeps role and provider as separate (role-canonical) fields.
+        payload = na.as_payload()
+        self.assertEqual(payload["owner_role"], "auditor")
+        self.assertEqual(payload["provider"], "codex")
+
+    def test_expected_provider_for_default_and_override(self):
+        self.assertEqual(expected_provider_for("auditor"), "codex")
+        self.assertEqual(expected_provider_for("implementer"), "claude")
+        rebound = RoleProviderBinding.default().with_overrides({"auditor": "grok"})
+        self.assertEqual(expected_provider_for("auditor", binding=rebound), "grok")
+
+    def test_override_rebinds_route_selection_not_provider_fixed(self):
+        # With auditor rebound to claude, the auditor action now selects the claude
+        # (worker-provider) route — proving route identity is not fixed to codex.
+        rebound = RoleProviderBinding.default().with_overrides({"auditor": "claude"})
+        na = derive_workflow_next_action(
+            self._review_state(),
+            issue_routes={
+                "12671": [
+                    RouteCandidate("codex", "route=g ws=ws1 lane=default role=codex pane_name=gateway"),
+                    RouteCandidate("claude", "route=w ws=ws1 lane=default role=claude pane_name=worker"),
+                ]
+            },
+            binding=rebound,
+        )
+        self.assertEqual(na.provider, "claude")
+        self.assertIn("pane_name=worker", na.route_identity)
+        self.assertEqual(na.blocked_reason, "")
+
+    def test_override_flows_into_display_wording(self):
+        rebound = RoleProviderBinding.default().with_overrides({"auditor": "grok"})
+        na = derive_workflow_next_action(
+            self._review_state(),
+            issue_routes={
+                "12671": [RouteCandidate("grok", "route=x ws=ws1 lane=default role=grok pane_name=p")]
+            },
+            binding=rebound,
+        )
+        text = render_command_result_text(WorkflowCommandResult(state=self._review_state(), next_action=na))
+        self.assertIn("role_provider: auditor via grok", text)
+        self.assertIn("provider: grok", text)
+        self.assertNotIn("%", text)  # no pane id leaks into the display
 
 
 if __name__ == "__main__":  # pragma: no cover
