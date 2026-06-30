@@ -47,11 +47,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_CONCLUSIONS,
     REVIEW_PENDING,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
+    RouteIdentity,
+    RouteIdentityError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_next_action import (
+    RouteCandidate,
+    WorkflowCommandResult,
+    derive_workflow_next_action,
+    render_command_result_journal,
+    render_command_result_text,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
     LaneEvent,
-    WorkflowRuntimeState,
     evaluate_workflow_runtime,
-    render_runtime_journal,
 )
 
 
@@ -266,15 +275,42 @@ def _advisory_inputs(args: argparse.Namespace) -> dict:
     }
 
 
-def _state_from_args(args: argparse.Namespace) -> WorkflowRuntimeState:
-    inputs = _advisory_inputs(args)
-    return evaluate_workflow_runtime(
-        _events_from_args(args),
-        ready_independent_work=inputs[META_READY_INDEPENDENT],
-        ready_overlapping_work=inputs[META_READY_OVERLAP],
-        capacity_remaining=inputs[META_CAPACITY],
-        owner_or_release_gate_active=inputs[META_OWNER_OR_RELEASE_GATE],
+def _command_result_from_args(args: argparse.Namespace) -> WorkflowCommandResult:
+    """Build the enriched ``workflow.{state,next_action}`` command result (#12671).
+
+    The same enriched envelope ``workflow resume`` returns: the replayed state plus the
+    next action enriched with route_identity / anchor / risk_level / requires_confirmation
+    / blocked_reason. Route candidates come from the supplied ``--route-identity`` specs
+    (provider role + public-safe pointer; a malformed identity is skipped so its lane fails
+    closed), and each lane's anchor is its latest supplied event id. No pane id is emitted.
+    """
+    events = _events_from_args(args)
+    state = evaluate_workflow_runtime(
+        events,
+        ready_independent_work=int(getattr(args, "ready_independent", 0) or 0),
+        ready_overlapping_work=int(getattr(args, "ready_overlap", 0) or 0),
+        capacity_remaining=int(getattr(args, "capacity", 0) or 0),
+        owner_or_release_gate_active=bool(getattr(args, "owner_or_release_gate", False)),
     )
+
+    issue_routes: dict[str, list[RouteCandidate]] = {}
+    for rec in getattr(args, "route_identity", None) or ():
+        try:
+            identity = RouteIdentity.from_record(rec)
+        except RouteIdentityError:
+            continue
+        issue_routes.setdefault(str(rec.get("issue", "")).strip(), []).append(
+            RouteCandidate(provider_role=identity.role, pointer=identity.public_pointer())
+        )
+
+    issue_anchors: dict[str, str] = {}
+    for event in events:
+        issue_anchors[event.issue] = event.event_id
+
+    next_action = derive_workflow_next_action(
+        state, issue_routes=issue_routes, issue_anchors=issue_anchors
+    )
+    return WorkflowCommandResult(state=state, next_action=next_action)
 
 
 def _persist_runtime(args: argparse.Namespace) -> None:
@@ -300,52 +336,31 @@ def _persist_runtime(args: argparse.Namespace) -> None:
     )
 
 
-def _print_state_text(state: WorkflowRuntimeState) -> None:
-    nxt = state.next_action
-    print(f"next_action: {nxt.action}")
-    print(f"owner_role: {nxt.owner_role}")
-    print(f"target_issue: {nxt.target_issue or '<none>'}")
-    print(f"admission_decision: {state.admission_decision}")
-    print(f"fill_decision: {state.fill_decision}")
-    print(f"advisory: {str(state.advisory).lower()}")
-    if state.lane_actions:
-        for row in state.lane_actions:
-            print(
-                f"lane: {row.issue} -> {row.state_class} "
-                f"=> {row.action} ({row.owner_role})"
-            )
-    else:
-        print("lane: <none>")
-    print(
-        "events: "
-        f"applied={list(state.applied_event_ids) or '<none>'} "
-        f"suppressed={list(state.suppressed_event_ids) or '<none>'}"
-    )
-    print(f"reason: {nxt.reason}")
-
-
 def cmd_workflow_runtime(args: argparse.Namespace) -> int:
-    """Replay the supplied event log and report state + next_action (advisory; #12857).
+    """Replay the supplied event log and report the enriched command result (#12857/#12671).
 
     Builds the event log from ``--event`` specs, folds it with duplicate suppression,
     classifies the resulting lane state via the #12856 authority, and emits exactly one
-    envelope: a text summary, one JSON object with ``--json`` (``workflow.state`` +
-    ``workflow.next_action`` shape), or the durable record markdown with ``--journal``.
-    Always returns 0: the result is advisory and never blocks.
+    enriched ``workflow.{state,next_action}`` envelope (the same shape ``workflow resume``
+    returns): a text summary, one JSON object with ``--json``, or the durable record
+    markdown with ``--journal``. The next action carries route_identity / anchor /
+    risk_level / requires_confirmation / blocked_reason; ``--route-identity`` supplies the
+    candidate routes. With ``--persist`` the events / routes / advisory inputs are also
+    written to the mozyo DB. Always returns 0: the result is advisory and never blocks.
     """
     if getattr(args, "persist", False):
         _persist_runtime(args)
-    state = _state_from_args(args)
+    result = _command_result_from_args(args)
     if getattr(args, "as_journal", False):
-        print(render_runtime_journal(state))
+        print(render_command_result_journal(result))
     elif getattr(args, "as_json", False):
         print(
             _json.dumps(
-                state.as_payload(), ensure_ascii=False, indent=2, sort_keys=True
+                result.as_payload(), ensure_ascii=False, indent=2, sort_keys=True
             )
         )
     else:
-        _print_state_text(state)
+        print(render_command_result_text(result))
     return 0
 
 

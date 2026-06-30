@@ -48,8 +48,12 @@ coordinator-blocking rather than dispatchable:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
+    ROLE_CLAUDE,
+    ROLE_CODEX,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
     ACTION_AGGREGATE_OWNER_APPROVAL,
     ACTION_AWAIT_IMPLEMENTATION,
@@ -64,6 +68,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_RESOLVE_BLOCKER,
     ACTION_RESOLVE_OWNER_OR_RELEASE_GATE,
     ACTION_RETIRE_LANE,
+    ROLE_AUDITOR,
+    ROLE_COORDINATOR,
+    ROLE_IMPLEMENTER,
+    ROLE_OWNER,
     WorkflowRuntimeState,
 )
 
@@ -152,6 +160,60 @@ _ROUTING_ACTIONS: frozenset[str] = frozenset(
 )
 
 
+# ---------------------------------------------------------------------------
+# Owner-role -> expected runtime provider for route selection. The next action's
+# ``owner_role`` is an abstract workflow role; a persisted route identity carries a
+# concrete provider (``codex`` / ``claude``). A lane usually has BOTH a gateway
+# (codex) route and a worker (claude) route, so a route must be chosen by who owns
+# the action, not by an arbitrary key order. This is the MVP default binding
+# (gateway/coordination/audit -> codex, implementation -> claude); making it
+# config-driven is #12673. A route whose provider does not match the expected
+# provider for the owner is NOT selected — the action fails closed rather than
+# pointing at the wrong lane member (review j#68908 finding 1).
+_OWNER_ROLE_EXPECTED_PROVIDER: dict[str, str] = {
+    ROLE_COORDINATOR: ROLE_CODEX,
+    ROLE_AUDITOR: ROLE_CODEX,
+    ROLE_OWNER: ROLE_CODEX,
+    ROLE_IMPLEMENTER: ROLE_CLAUDE,
+}
+
+
+@dataclass(frozen=True)
+class RouteCandidate:
+    """One persisted route for a lane: its provider role + public-safe pointer.
+
+    ``provider_role`` is the concrete runtime provider the route resolves to
+    (``codex`` / ``claude``); ``pointer`` is the public-safe identity pointer
+    (:meth:`RouteIdentity.public_pointer`, no pane id). Candidates for one issue are
+    supplied in **recorded order** (oldest first) so selection can be a deterministic
+    last-write-wins among the provider-matching routes.
+    """
+
+    provider_role: str
+    pointer: str
+
+
+def _resolve_route(
+    action: str, owner_role: str, candidates: Sequence[RouteCandidate]
+) -> str:
+    """Select the route pointer for a routing action, fail-closed (pure).
+
+    Returns the public pointer of the most-recently-recorded candidate whose provider
+    matches the owner_role's expected provider; returns ``""`` (unresolved) when the
+    owner has no expected provider, or no candidate matches it. An unresolved routing
+    action is failed closed by :func:`derive_workflow_next_action`. Non-routing actions
+    never call this.
+    """
+    expected = _OWNER_ROLE_EXPECTED_PROVIDER.get(owner_role)
+    if expected is None:
+        return ""
+    matching = [c for c in candidates if c.provider_role == expected]
+    if not matching:
+        return ""
+    # Deterministic last-write-wins among provider-matching routes (recorded order).
+    return matching[-1].pointer
+
+
 def risk_policy_for(action: str) -> tuple[str, bool, str, str]:
     """Map an action token to ``(risk_level, requires_confirmation, suggested, blocked)``.
 
@@ -217,38 +279,45 @@ class WorkflowNextAction:
 def derive_workflow_next_action(
     state: WorkflowRuntimeState,
     *,
-    issue_route_pointers: Mapping[str, str] | None = None,
+    issue_routes: Mapping[str, Sequence[RouteCandidate]] | None = None,
     issue_anchors: Mapping[str, str] | None = None,
 ) -> WorkflowNextAction:
     """Enrich the #12857 overall next action into a command-result ``next_action`` (pure).
 
-    ``issue_route_pointers`` maps a lane's Redmine issue id to its **public-safe** route
-    pointer (e.g. :meth:`RouteIdentity.public_pointer`; never a pane id). ``issue_anchors``
-    maps a lane's issue id to its durable Redmine anchor (``issue:journal``). Both default
-    to empty — a caller with no persisted route / anchor still gets a well-formed (if
-    route-blocked) next action.
+    ``issue_routes`` maps a lane's Redmine issue id to its persisted route candidates
+    (each a provider role + public-safe pointer, in recorded order; never a pane id).
+    ``issue_anchors`` maps a lane's issue id to its durable Redmine anchor
+    (``issue:journal``). Both default to empty — a caller with no persisted route / anchor
+    still gets a well-formed (if route-blocked) next action.
 
-    The risk / confirmation / suggested-command come from :func:`risk_policy_for`; a
-    lane-targeted routing action whose route pointer is missing is escalated to
-    ``requires_confirmation=True`` with :data:`BLOCKED_ROUTE_IDENTITY_UNRESOLVED` and at
-    least :data:`RISK_HIGH` (fail-closed: do not recommend delivering to an unknown live
-    target).
+    For a lane-targeted **routing** action, the route is selected by the action's
+    ``owner_role`` (:func:`_resolve_route`: the most-recent provider-matching candidate),
+    never by an arbitrary key order, so an auditor/coordinator action is never pointed at a
+    worker route. The risk / confirmation / suggested-command come from
+    :func:`risk_policy_for`; a routing action whose route does not resolve (no candidate,
+    or none matching the owner's provider) is escalated to ``requires_confirmation=True``
+    with :data:`BLOCKED_ROUTE_IDENTITY_UNRESOLVED` and at least :data:`RISK_HIGH`
+    (fail-closed: never deliver to an unknown / mismatched live target).
     """
-    routes = issue_route_pointers or {}
+    routes = issue_routes or {}
     anchors = issue_anchors or {}
     nxt = state.next_action
 
     risk, confirm, suggested, blocked = risk_policy_for(nxt.action)
 
     target = nxt.target_issue
-    route_identity = routes.get(target, "") if target else ""
     anchor = anchors.get(target, "") if target else ""
 
-    # Fail closed when a lane-targeted routing action has no resolved live route.
-    if not blocked and nxt.action in _ROUTING_ACTIONS and not route_identity:
-        blocked = BLOCKED_ROUTE_IDENTITY_UNRESOLVED
-        confirm = True
-        risk = _escalate(risk, RISK_HIGH)
+    route_identity = ""
+    if target and nxt.action in _ROUTING_ACTIONS:
+        route_identity = _resolve_route(
+            nxt.action, nxt.owner_role, routes.get(target, ())
+        )
+        # Fail closed when a lane-targeted routing action has no resolved live route.
+        if not blocked and not route_identity:
+            blocked = BLOCKED_ROUTE_IDENTITY_UNRESOLVED
+            confirm = True
+            risk = _escalate(risk, RISK_HIGH)
 
     return WorkflowNextAction(
         action=nxt.action,
@@ -287,6 +356,44 @@ class WorkflowCommandResult:
                 "next_action": self.next_action.as_payload(),
             }
         }
+
+
+def render_command_result_text(result: WorkflowCommandResult) -> str:
+    """Render the enriched command result as a public-safe human summary (pure).
+
+    Shared by ``workflow runtime`` and ``workflow resume`` so both workflow-aware
+    surfaces print the same enriched fields. Keeps the ``next_action: <action>`` line for
+    continuity with the #12857 runtime text. No pane id is emitted.
+    """
+    na = result.next_action
+    state = result.state
+    lines = [
+        f"next_action: {na.action}",
+        f"owner_role: {na.owner_role}",
+        f"target_issue: {na.target_issue or '<none>'}",
+        f"route_identity: {na.route_identity or '<unresolved>'}",
+        f"anchor: {na.anchor or '<none>'}",
+        f"risk_level: {na.risk_level}",
+        f"requires_confirmation: {str(na.requires_confirmation).lower()}",
+        f"blocked_reason: {na.blocked_reason or '<none>'}",
+        f"suggested_command: {na.suggested_command or '<none>'}",
+        f"admission_decision: {state.admission_decision}",
+        f"fill_decision: {state.fill_decision}",
+    ]
+    if state.lane_actions:
+        lines.extend(
+            f"lane: {row.issue} -> {row.state_class} => {row.action} ({row.owner_role})"
+            for row in state.lane_actions
+        )
+    else:
+        lines.append("lane: <none>")
+    lines.append(
+        "events: "
+        f"applied={list(state.applied_event_ids) or '<none>'} "
+        f"suppressed={list(state.suppressed_event_ids) or '<none>'}"
+    )
+    lines.append(f"reason: {na.reason}")
+    return "\n".join(lines)
 
 
 def render_command_result_journal(result: WorkflowCommandResult) -> str:
@@ -330,8 +437,10 @@ __all__ = (
     "BLOCKED_UNKNOWN_ACTION",
     "BLOCKED_ROUTE_IDENTITY_UNRESOLVED",
     "risk_policy_for",
+    "RouteCandidate",
     "WorkflowNextAction",
     "derive_workflow_next_action",
     "WorkflowCommandResult",
+    "render_command_result_text",
     "render_command_result_journal",
 )

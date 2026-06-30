@@ -45,9 +45,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RouteIdentity,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_next_action import (
+    RouteCandidate,
     WorkflowCommandResult,
     derive_workflow_next_action,
     render_command_result_journal,
+    render_command_result_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
     LaneEvent,
@@ -107,23 +109,28 @@ def assemble_command_result(
 
     - the event rows replay (with #12857 duplicate suppression) into per-lane state and
       the overall next action;
-    - the route rows become the issue -> **public-safe** route pointer map (no pane id);
-      a route whose stable identity is malformed is skipped rather than failing the whole
-      resume (it simply leaves that lane's route unresolved, which fails closed downstream);
+    - the route rows become the issue -> route-candidate map (provider role + **public-safe**
+      pointer, in recorded order, no pane id); a route whose stable identity is malformed is
+      skipped rather than failing the whole resume. Selection by owner_role + fail-closed on
+      no provider match happens in :func:`derive_workflow_next_action`;
     - the latest persisted event id per issue is that lane's durable anchor;
     - the advisory meta reproduces the ready-work / capacity / owner-gate inputs.
     """
     events = [_event_from_row(row) for row in event_rows]
 
-    issue_route_pointers: dict[str, str] = {}
+    # issue -> route candidates in recorded order (read_route_identities orders by
+    # recorded_at). The next action selects among them by its owner_role.
+    issue_routes: dict[str, list[RouteCandidate]] = {}
     for row in route_rows:
         try:
             identity = RouteIdentity.from_record(row.as_record())
         except ValueError:
-            # A malformed persisted identity must not abort the whole resume; leave the
-            # lane's route unresolved so the next action fails closed for that lane only.
+            # A malformed persisted identity must not abort the whole resume; skip it so
+            # the lane's route stays unresolved (fails closed downstream) for that row only.
             continue
-        issue_route_pointers[row.issue] = identity.public_pointer()
+        issue_routes.setdefault(row.issue, []).append(
+            RouteCandidate(provider_role=identity.role, pointer=identity.public_pointer())
+        )
 
     # Latest persisted event per issue (rows arrive in apply order) is the lane's anchor.
     issue_anchors: dict[str, str] = {}
@@ -139,7 +146,7 @@ def assemble_command_result(
     )
     next_action = derive_workflow_next_action(
         state,
-        issue_route_pointers=issue_route_pointers,
+        issue_routes=issue_routes,
         issue_anchors=issue_anchors,
     )
     return WorkflowCommandResult(state=state, next_action=next_action)
@@ -157,31 +164,6 @@ def _store_from_args(args: argparse.Namespace) -> WorkflowRuntimeStore:
     raw = (getattr(args, "store_path", None) or "").strip()
     path = Path(raw) if raw else workflow_runtime_store_path()
     return WorkflowRuntimeStore(path=path)
-
-
-def _print_result_text(result: WorkflowCommandResult) -> None:
-    na = result.next_action
-    state = result.state
-    print(f"action: {na.action}")
-    print(f"owner_role: {na.owner_role}")
-    print(f"target_issue: {na.target_issue or '<none>'}")
-    print(f"route_identity: {na.route_identity or '<unresolved>'}")
-    print(f"anchor: {na.anchor or '<none>'}")
-    print(f"risk_level: {na.risk_level}")
-    print(f"requires_confirmation: {str(na.requires_confirmation).lower()}")
-    print(f"blocked_reason: {na.blocked_reason or '<none>'}")
-    print(f"suggested_command: {na.suggested_command or '<none>'}")
-    print(f"admission_decision: {state.admission_decision}")
-    print(f"fill_decision: {state.fill_decision}")
-    if state.lane_actions:
-        for row in state.lane_actions:
-            print(
-                f"lane: {row.issue} -> {row.state_class} "
-                f"=> {row.action} ({row.owner_role})"
-            )
-    else:
-        print("lane: <none>")
-    print(f"reason: {na.reason}")
 
 
 def cmd_workflow_resume(args: argparse.Namespace) -> int:
@@ -203,7 +185,7 @@ def cmd_workflow_resume(args: argparse.Namespace) -> int:
             )
         )
     else:
-        _print_result_text(result)
+        print(render_command_result_text(result))
     return 0
 
 

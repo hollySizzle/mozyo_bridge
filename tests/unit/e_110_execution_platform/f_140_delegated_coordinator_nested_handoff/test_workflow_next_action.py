@@ -29,6 +29,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RISK_HIGH,
     RISK_LOW,
     RISK_NONE,
+    RouteCandidate,
     WorkflowCommandResult,
     derive_workflow_next_action,
     render_command_result_journal,
@@ -91,13 +92,15 @@ class DeriveTest(unittest.TestCase):
         self.assertTrue(na.requires_confirmation)
 
     def test_routing_action_resolves_route_and_anchor(self):
-        # review_request -> perform_review (a routing action) with a resolved route.
+        # review_request -> perform_review (auditor routing action); auditor expects codex.
         state = _state(
             [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
         )
         na = derive_workflow_next_action(
             state,
-            issue_route_pointers={"12671": "route=r1 ws=ws1 lane=default role=codex pane_name=gw"},
+            issue_routes={
+                "12671": [RouteCandidate("codex", "route=r1 ws=ws1 lane=default role=codex pane_name=gw")]
+            },
             issue_anchors={"12671": "12671:68864"},
         )
         self.assertEqual(na.action, ACTION_PERFORM_REVIEW)
@@ -111,13 +114,63 @@ class DeriveTest(unittest.TestCase):
         state = _state(
             [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
         )
-        na = derive_workflow_next_action(state)  # no route pointers supplied
+        na = derive_workflow_next_action(state)  # no routes supplied
         self.assertEqual(na.action, ACTION_PERFORM_REVIEW)
         self.assertEqual(na.blocked_reason, BLOCKED_ROUTE_IDENTITY_UNRESOLVED)
         self.assertTrue(na.requires_confirmation)
         # The medium-risk review is escalated to at least high when route is unresolved.
         self.assertEqual(na.risk_level, RISK_HIGH)
         self.assertTrue(na.is_blocked)
+
+    def test_owner_aware_selection_picks_provider_match_not_key_order(self):
+        # An auditor action with BOTH a worker(claude) and a gateway(codex) route for the
+        # same issue must select the codex route, never the (alphabetically earlier) worker.
+        state = _state(
+            [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
+        )
+        na = derive_workflow_next_action(
+            state,
+            issue_routes={
+                "12671": [
+                    RouteCandidate("claude", "route=z-worker ws=ws1 lane=default role=claude pane_name=worker"),
+                    RouteCandidate("codex", "route=a-gateway ws=ws1 lane=default role=codex pane_name=gateway"),
+                ]
+            },
+        )
+        self.assertEqual(na.action, ACTION_PERFORM_REVIEW)
+        self.assertIn("pane_name=gateway", na.route_identity)
+        self.assertEqual(na.blocked_reason, "")
+
+    def test_owner_aware_selection_last_write_wins_among_matching(self):
+        # Two codex routes for the issue: the most-recently-recorded (last) one wins.
+        state = _state(
+            [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
+        )
+        na = derive_workflow_next_action(
+            state,
+            issue_routes={
+                "12671": [
+                    RouteCandidate("codex", "route=old ws=ws1 lane=default role=codex pane_name=old"),
+                    RouteCandidate("codex", "route=new ws=ws1 lane=default role=codex pane_name=new"),
+                ]
+            },
+        )
+        self.assertIn("pane_name=new", na.route_identity)
+
+    def test_owner_route_provider_mismatch_fails_closed(self):
+        # Only a worker(claude) route exists for an auditor action -> no provider match.
+        state = _state(
+            [LaneEvent(event_id="12671:68864", issue="12671", gate="review_request", commit_bearing=True)]
+        )
+        na = derive_workflow_next_action(
+            state,
+            issue_routes={
+                "12671": [RouteCandidate("claude", "route=w ws=ws1 lane=default role=claude pane_name=worker")]
+            },
+        )
+        self.assertEqual(na.route_identity, "")
+        self.assertEqual(na.blocked_reason, BLOCKED_ROUTE_IDENTITY_UNRESOLVED)
+        self.assertTrue(na.requires_confirmation)
 
     def test_owner_waiting_aggregates_owner_approval(self):
         state = _state(
@@ -127,7 +180,9 @@ class DeriveTest(unittest.TestCase):
         )
         na = derive_workflow_next_action(
             state,
-            issue_route_pointers={"12671": "route=r1 ws=ws1 lane=default role=codex pane_name=gw"},
+            issue_routes={
+                "12671": [RouteCandidate("codex", "route=r1 ws=ws1 lane=default role=codex pane_name=gw")]
+            },
             issue_anchors={"12671": "r"},
         )
         self.assertEqual(na.action, ACTION_AGGREGATE_OWNER_APPROVAL)
@@ -164,7 +219,9 @@ class EnvelopeTest(unittest.TestCase):
         )
         na = derive_workflow_next_action(
             state,
-            issue_route_pointers={"12671": "route=r1 ws=ws1 lane=default role=codex pane_name=gw"},
+            issue_routes={
+                "12671": [RouteCandidate("codex", "route=r1 ws=ws1 lane=default role=codex pane_name=gw")]
+            },
             issue_anchors={"12671": "12671:68864"},
         )
         text = render_command_result_journal(WorkflowCommandResult(state=state, next_action=na))

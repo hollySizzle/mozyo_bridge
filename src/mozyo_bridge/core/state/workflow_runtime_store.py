@@ -459,7 +459,14 @@ class WorkflowRuntimeStore:
             conn.close()
 
     def read_route_identities(self) -> tuple[WorkflowRouteRow, ...]:
-        """Return the persisted route identities (route_id order); empty if absent."""
+        """Return the persisted route identities in **recorded order**; empty if absent.
+
+        Ordered by ``(recorded_at, rowid)`` so the most-recently-written route for an issue
+        sorts last — the deterministic last-write-wins order route selection relies on
+        (an upsert advances ``recorded_at``, so a re-persisted route is treated as the most
+        recent). Not ``route_id`` order, which is arbitrary and would silently pick the
+        wrong same-issue route (review j#68908 finding 1).
+        """
         conn = self._connect_ro()
         if conn is None:
             return ()
@@ -467,7 +474,7 @@ class WorkflowRuntimeStore:
             rows = conn.execute(
                 "SELECT route_id, issue, workspace_id, lane_id, role, pane_name, "
                 "last_seen_pane_id, observed_at FROM workflow_route_identities "
-                "ORDER BY route_id"
+                "ORDER BY recorded_at, rowid"
             ).fetchall()
         finally:
             conn.close()

@@ -116,6 +116,35 @@ class PersistResumeLoopTest(_StoreCase):
         self.assertIn("lane: 12671 -> owner_waiting", text)
 
 
+class SameIssueRouteSelectionTest(_StoreCase):
+    def test_auditor_action_selects_gateway_not_worker_route(self):
+        # j#68908 finding 1: persisting a worker(claude) route then a gateway(codex) route
+        # for the same issue must NOT make an auditor action point at the worker route.
+        rc, _ = _run(
+            [
+                "workflow", "runtime",
+                "--event", "12671:review_request,id=12671:68864,commit=1",
+                "--persist", "--store-path", self.store_path,
+                "--route-identity",
+                "route_id=z-worker,issue=12671,ws=ws1,role=claude,pane_name=worker,pane_id=%20",
+                "--route-identity",
+                "route_id=a-gateway,issue=12671,ws=ws1,role=codex,pane_name=gateway,pane_id=%17",
+                "--json",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        rc2, text = _run(["workflow", "resume", "--store-path", self.store_path, "--json"])
+        self.assertEqual(rc2, 0)
+        na = json.loads(text)["workflow"]["next_action"]
+        self.assertEqual(na["action"], "perform_review")
+        self.assertEqual(na["owner_role"], "auditor")
+        self.assertIn("pane_name=gateway", na["route_identity"])
+        self.assertNotIn("worker", na["route_identity"])
+        self.assertEqual(na["blocked_reason"], "")
+        self.assertNotIn("%17", text)
+        self.assertNotIn("%20", text)
+
+
 class FailClosedRouteTest(_StoreCase):
     def test_routing_action_without_persisted_route_fails_closed(self):
         # Persist an event that yields a routing action (review_request -> perform_review)
