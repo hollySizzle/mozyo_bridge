@@ -314,7 +314,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1510
+    lines: 1443
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -529,6 +529,30 @@ allowlist:
       module that imports it). `test_doctor_tmux` adds fake-port use-case + pure
       verdict-policy specifications (the tmux verdict authority no longer needs a
       real tmux server / pane topology). The remaining broad `doctor_*_section`
+      collector bodies stay residual to #12638.
+      Lowered 1510 -> 1443 for the #12892 doctor OTel receiver-health /
+      observation-gap section collector boundary tranche: the
+      `doctor_otel_section` collector's three responsibilities — the external
+      read (the OTel store path/existence/`counts()`, the receiver `/healthz`
+      probe, the `summarize_activity` observed-pair scan, and the tmux agent
+      discovery that folds panes via `discover_agents` / `fold_agents_by_pane`),
+      the authority-bearing verdict (the receiver-unreachable note, the
+      observation-gap detection, and the `unobserved_agents` list + gap note),
+      and the legacy section dict assembly — moved behind the typed boundary in
+      `doctor_otel.py` (the pure `evaluate_otel_section` domain policy that owns
+      the whole verdict + dict assembly from a read-view alone, the
+      `OtelDoctorReads` port + `LiveOtelDoctorReads` adapter, and the
+      `OtelSectionUseCase`). `doctor_otel_section` is now a thin handler
+      composing the use case; `LiveOtelDoctorReads` reduces the folded
+      `AgentRecord` objects to plain dicts and imports `try_pane_lines` at call
+      time, so the existing OTel doctor characterization test (which patches
+      `...tmux_client.try_pane_lines`) is unchanged, and it preserves the legacy
+      try/except so a failed discovery read collapses to `gap_check_error`
+      (diagnosis never takes doctor down). A down receiver is reported, not
+      raised — OTLP is push-based so it is lost BY DESIGN, not an error.
+      `test_doctor_otel` adds fake-port use-case + pure verdict-policy
+      specifications (the OTel verdict authority no longer needs a real store /
+      HTTP receiver / tmux topology). The remaining broad `doctor_*_section`
       collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
