@@ -574,8 +574,20 @@ top-level technical-layer residual を最終形に残さない方針 (top-level 
   全 active import を numbered path へ repoint した。facade は indirection のみで behavior を
   持たず、repoint は attribute / monkeypatch 等価性を保つ。
 - **tests/docs/generated 同期**: 35 facade file を削除し、import repoint を同一 commit に含めた。
-  facade は catch-all `fc-package-source` に乗っていたため catalog / `file_conventions.generated.yaml`
-  変更は不要 (`generate-file-conventions --check` / `docs validate --check-file-coverage` green)。
+  35 件の大半は catch-all `fc-package-source` に乗るため catalog 変更不要だが、**8 件は明示
+  `fc-*` entry に file path で列挙されていた** (`fc-delegated-coordinator-runtime-source` の
+  `cli_handoff` / `delegation_launch_adopt` / `grandchild_dispatch` / `grandchild_stamp`、
+  `fc-otel-event-store-source` の `otel_receiver` / `otel_launchd`、
+  `fc-cockpit-grouped-projection-source` の `otel_receiver`、
+  `fc-state-store-source` の `cli_state` / `commands_state`、
+  `fc-handoff-notification-source` の `cli_handoff`)。これらは Sublane conflict-point 表の
+  「明示 `fc-*` entry の module を動かす場合は re-point」原則に従い、retired top-level path を
+  対応する numbered application home (`e_<order>/f_<order>/application/<mod>.py`) へ repoint し、
+  `file_conventions.generated.yaml` を再生成した (`generate-file-conventions --check` /
+  `docs validate --check-file-coverage` / `audit-impact --check-generated` green)。
+  doc prose 内の旧 path 言及 (例: `cockpit-web-ui.md` / `otel-event-store.md` の「実装は …」記述)
+  は #12631/#12632 が `domain/` で残したものと同じ tolerated baseline であり、governance gate
+  surface ではないため本 US では触れない (machine-readable な catalog/generated のみ正本同期対象)。
 - **retained compatibility surface**: 無し。35 件全てを retire。残置 compat surface が無いため
   `fallback-retirement-ledger.md` への新規 entry は不要。
 
