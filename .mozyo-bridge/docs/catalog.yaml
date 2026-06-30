@@ -562,6 +562,27 @@ documents:
       - logic-event-timeline-source
       - logic-tmux-send-safety-contract
       - logic-delegated-coordinator-cockpit-display
+      - logic-workflow-cockpit-projection
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-workflow-cockpit-projection
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/workflow-cockpit-projection.md
+    purpose: "workflow runtime state (#12671 next_action / #12672 watcher / #12673 role-provider binding / #12857 stateful runtime) を Cockpit UI へ read-only な projection として見せる read model / 責務境界の設計正本。owner_role / provider / lane / next_action / blocked_reason / anchor を WorkflowNextAction の写しとして Unit-keyed (pane_id ではなく issue/lane) に additive 投影し、Redmine=durable / workflow-runtime.sqlite=runtime state / live tmux=liveness の三層を崩さない。attention_state とは分担 (coarse triage vs fine next-action carrier) し drift させない。WebSocket / live update は state model 確定後の follow-up。design-only で実装は分割する。"
+    audit_role: workflow_cockpit_projection_logic
+    related_document_refs:
+      - logic-cockpit-attention-state
+      - logic-cockpit-web-ui
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-managed-state-model
+      - logic-runtime-observability-boundary
+      - logic-workflow-step-command-design
+      - logic-coordinator-sublane-development-flow
+      - spec-route-identity-ledger
+      - rule-llm-rule-authoring
       - rule-public-private-boundary
       - spec-project-map
 
@@ -629,6 +650,7 @@ documents:
       - logic-ticketless-project-gateway-runtime-ux
       - logic-workflow-command-as-is
       - logic-project-scoped-workspace-identity
+      - logic-workflow-cockpit-projection
       - spec-route-identity-ledger
       - logic-tmux-send-safety-contract
       - logic-coordinator-sublane-development-flow
@@ -975,6 +997,7 @@ documents:
       - logic-otel-event-store
       - logic-session-inventory
       - logic-iterm-webviewer-presentation-boundary
+      - logic-workflow-cockpit-projection
       - spec-project-map
 
   - id: logic-executive-terminal-setup
