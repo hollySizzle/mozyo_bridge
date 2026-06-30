@@ -314,7 +314,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1443
+    lines: 1084
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -554,6 +554,41 @@ allowlist:
       specifications (the OTel verdict authority no longer needs a real store /
       HTTP receiver / tmux topology). The remaining broad `doctor_*_section`
       collector bodies stay residual to #12638.
+      Lowered 1443 -> 1084 for the #12893 doctor state-store inspector section
+      collector boundary tranche: the `collect_state_store` /
+      `doctor_state_store_section` collector's two responsibilities — the
+      external read (the strictly read-only SQLite probing of the legacy
+      per-kind files and the future single DB via a `file:...?mode=ro` URI:
+      `PRAGMA user_version` / `sqlite_master` / `PRAGMA integrity_check` and the
+      conditional `state_schema_components` metadata read), and the verdict
+      policy (per-component status `missing`/`ok`/`warning`/`invalid`/`error`,
+      the authoritative-vs-cache schema-version branching, the single-DB
+      container-version + metadata-table + partial-migration branching, and the
+      section roll-up where `missing` ranks as `ok`) — moved behind the typed
+      boundary in `doctor_state_store.py` (the `StateStoreReads` port +
+      `LiveStateStoreReads` adapter that owns every `sqlite3` call, the
+      `inspect_legacy_component` / `inspect_single_db` / `evaluate_state_store_section`
+      verdict policy that re-assembles the legacy dict byte-for-byte, and the
+      `StateStoreSectionUseCase`). Unlike the other `doctor_*` section adapters
+      this section's reads are conditional (the metadata read only happens once
+      the container/table checks pass), so the inspection domain orchestrates the
+      reads through the injected port rather than a flat eager read-view — a flat
+      view would have to replicate the verdict branches in the adapter. `doctor.py`
+      keeps `collect_state_store` as a thin composition root so the existing
+      public facade is preserved unchanged: `commands_state` imports
+      `collect_state_store` from `doctor` and the inspector characterization test
+      imports it (and the `STATE_STORE_SINGLE_DB_*` container constants
+      re-exported from `doctor`) from `doctor`. The legacy component registry,
+      the recovery vocabulary, and the read-only SQLite probes moved to the
+      boundary module; the now-dead `sqlite3` import and the unused
+      `RECOVERY_APPEND_ONLY` / `RECOVERY_REBUILDABLE` / `COMPONENTS` /
+      `RECOVERY_AUTHORITATIVE` imports were dropped from `doctor.py`.
+      `test_doctor_state_store` adds fake-port verdict-policy specifications over
+      a synthetic `StateStoreReads` (the verdict authority no longer needs a real
+      SQLite file / home topology, and the conditional-read sequence is pinned by
+      asserting the metadata read is reached only when the container/table checks
+      pass). The remaining broad `doctor_*_section` collector bodies stay
+      residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
