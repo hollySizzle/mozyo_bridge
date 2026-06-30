@@ -13,14 +13,24 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import cli_modules
 from mozyo_bridge.application.cli import build_parser, main
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_version_issue_source import (
+    READ_CREDENTIAL_MISSING,
+    RedmineVersionReadUnavailable,
+)
+
+_BUILDER = (
+    "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.application."
+    "commands_redmine_version.live_version_issue_source_from_env"
+)
 
 
 def _top_level_subcommands(parser: argparse.ArgumentParser) -> set[str]:
@@ -118,6 +128,72 @@ class ListOpenLeafCliTest(_SnapshotCase):
         self.assertEqual(code, 0)
         payload = json.loads(out)
         self.assertEqual(payload["open_leaf_count"], 1)
+
+
+class _FakeLiveSource:
+    """A stand-in ``RedmineVersionIssueSource`` for the CLI --live path."""
+
+    def __init__(self, issues=None, error=None):
+        self._issues = issues or []
+        self._error = error
+
+    def read_version_issues(self, version_id):
+        if self._error is not None:
+            raise self._error
+        return self._issues
+
+
+class ListOpenLeafLiveCliTest(_SnapshotCase):
+    def test_live_success_enumerates_open_leaves(self) -> None:
+        live = _FakeLiveSource(
+            issues=[
+                {"id": 900, "tracker": {"name": "UserStory"}, "status": {"name": "x", "is_closed": False}},
+                {"id": 901, "tracker": {"name": "Task"}, "status": {"name": "x", "is_closed": False}, "parent": {"id": 900}},
+            ]
+        )
+        with mock.patch(_BUILDER, return_value=live):
+            code, out = self._run(
+                ["redmine-version", "list-open-leaf", "--version-id", "248", "--live", "--json"]
+            )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["open_leaf_count"], 1)  # #901; #900 is a node
+
+    def test_live_unavailable_blocks_nonzero_not_silent_empty(self) -> None:
+        # Fail-closed: a credential/provider gap surfaces an explicit reason on a
+        # non-zero exit and is never rendered as an empty Version (0 leaves, ok).
+        live = _FakeLiveSource(
+            error=RedmineVersionReadUnavailable(
+                "no Redmine API key in the trusted environment",
+                reason=READ_CREDENTIAL_MISSING,
+            )
+        )
+        buf = io.StringIO()
+        with mock.patch(_BUILDER, return_value=live), redirect_stderr(buf):
+            code, out = self._run(
+                ["redmine-version", "list-open-leaf", "--version-id", "248", "--live"]
+            )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")  # nothing printed to stdout: not a "0 leaves" report
+        self.assertIn(READ_CREDENTIAL_MISSING, buf.getvalue())
+
+    def test_live_and_issues_json_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            main(
+                [
+                    "redmine-version",
+                    "list-open-leaf",
+                    "--version-id",
+                    "248",
+                    "--live",
+                    "--issues-json",
+                    str(self.issues_path),
+                ]
+            )
+
+    def test_a_source_is_required(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            main(["redmine-version", "list-open-leaf", "--version-id", "248"])
 
 
 class PreflightCliTest(_SnapshotCase):

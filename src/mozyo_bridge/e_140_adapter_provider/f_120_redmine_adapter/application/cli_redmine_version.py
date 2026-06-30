@@ -51,22 +51,38 @@ def register(sub) -> None:
         help=(
             "Enumerate the open leaf issues of a Version from a flat "
             "issues.json snapshot (the read model the MCP US-only surface "
-            "cannot produce)."
+            "cannot produce), or from a read-only live Redmine read with --live."
         ),
     )
     leaves.add_argument(
         "--version-id",
         required=True,
         metavar="ID",
-        help="Redmine Version id the snapshot was exported for.",
+        help="Redmine Version id the snapshot was exported for / to read live.",
     )
-    leaves.add_argument(
+    # Exactly one input source: a static operator-exported snapshot, or an
+    # explicit opt-in read-only live read. --live performs a network call, so it
+    # must be asked for; without it the command stays snapshot-only and offline.
+    source = leaves.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--issues-json",
-        required=True,
         metavar="PATH",
         help=(
             "Path to a GET /issues.json?fixed_version_id=<id> export "
             '(``{"issues": [...]}`` or a bare list of issue mappings).'
+        ),
+    )
+    source.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help=(
+            "Read the Version's issues live and read-only via "
+            "GET /issues.json?fixed_version_id=<id>&status_id=* against the "
+            "trusted Redmine (MOZYO_REDMINE_URL/MOZYO_REDMINE_API_KEY or the "
+            "home credential file). Fails closed with an explicit reason and a "
+            "non-zero exit when no credential/provider is available; never "
+            "treats an unreadable Version as empty. Performs no Version write."
         ),
     )
     _add_json_option(leaves)
