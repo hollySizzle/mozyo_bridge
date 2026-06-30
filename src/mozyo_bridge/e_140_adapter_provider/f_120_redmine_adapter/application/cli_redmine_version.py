@@ -118,15 +118,19 @@ def register(sub) -> None:
         help="Path to a list_versions(status=all) export to resolve the Version "
         "state by id.",
     )
-    # Inline-state fallback when no snapshot is supplied.
+    # Inline-state fallback when no snapshot is supplied. Counts default to None
+    # ("not provided"); a count-dependent op (delete/close/lock) needs either
+    # --versions-json or all three counts, else it fails closed (counts_required).
     preflight.add_argument("--name", metavar="NAME", help="Version name (inline state).")
     preflight.add_argument("--status", metavar="STATUS", help="open|locked|closed (inline state).")
-    preflight.add_argument("--issues-count", type=int, default=0, help="Total issues (inline state).")
     preflight.add_argument(
-        "--open-issues-count", type=int, default=0, help="Open issues (inline state)."
+        "--issues-count", type=int, default=None, help="Total issues (inline state)."
     )
     preflight.add_argument(
-        "--closed-issues-count", type=int, default=0, help="Closed issues (inline state)."
+        "--open-issues-count", type=int, default=None, help="Open issues (inline state)."
+    )
+    preflight.add_argument(
+        "--closed-issues-count", type=int, default=None, help="Closed issues (inline state)."
     )
     _add_json_option(preflight)
     preflight.set_defaults(func=cmd_redmine_version_preflight)

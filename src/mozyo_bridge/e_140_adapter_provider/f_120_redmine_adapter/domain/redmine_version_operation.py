@@ -74,13 +74,23 @@ class VersionState:
     issues_count: int
     open_issues_count: int
     closed_issues_count: int
+    # Whether the issue counts above are an authoritative reading or absent
+    # placeholders. Defaults to ``False`` (fail-closed): an operation whose
+    # safety depends on the counts (delete / close / lock) is blocked until the
+    # counts are known, so a missing/defaulted ``0`` can never be mistaken for a
+    # genuinely empty Version. The id-only / inline construction paths must set
+    # this explicitly; only a fully-populated reading sets it ``True``.
+    counts_known: bool = False
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "VersionState":
-        """Parse one ``list_versions`` entry. Fail-closed on a missing id."""
+        """Parse one ``list_versions`` entry. Fail-closed on a missing id, and
+        ``counts_known`` only when all three count fields are present."""
         version_id = str(payload.get("id", "")).strip()
         if not version_id:
             raise VersionOperationError("version entry has no id")
+        count_keys = ("issues_count", "open_issues_count", "closed_issues_count")
+        counts_known = all(key in payload for key in count_keys)
         return cls(
             version_id=version_id,
             name=str(payload.get("name", "") or ""),
@@ -88,6 +98,7 @@ class VersionState:
             issues_count=_as_int(payload.get("issues_count")),
             open_issues_count=_as_int(payload.get("open_issues_count")),
             closed_issues_count=_as_int(payload.get("closed_issues_count")),
+            counts_known=counts_known,
         )
 
 
@@ -203,7 +214,11 @@ def decide_version_operation(
             reasons.append("already_closed")
         if op == "lock" and status == "locked":
             reasons.append("already_locked")
-        if state.open_issues_count > 0:
+        if not state.counts_known:
+            # The open-issue guard below trusts open_issues_count; an absent /
+            # defaulted reading must not be read as "no open issues".
+            reasons.append("counts_required")
+        elif state.open_issues_count > 0:
             if request.allow_open_issues:
                 warnings.append("open_issues_present")
             else:
@@ -215,9 +230,18 @@ def decide_version_operation(
             # An old numbered Version kept as a historical record is close/lock
             # territory, never delete.
             reasons.append("historical_protected")
-        if state.issues_count > 0:
-            # Delete is the only irreversible operation: allow it solely for a
-            # truly empty Version (no open and no closed issues).
+        if not state.counts_known:
+            # Delete is irreversible: never derive "empty" from a missing /
+            # defaulted count. Require an authoritative reading first.
+            reasons.append("counts_required")
+        elif (
+            state.issues_count > 0
+            or state.open_issues_count > 0
+            or state.closed_issues_count > 0
+        ):
+            # Allow delete solely for a truly empty Version. Check all three
+            # counts so an inconsistent snapshot (e.g. issues_count==0 while
+            # open_issues_count>0) still blocks.
             reasons.append("version_not_empty")
 
     allowed = not reasons

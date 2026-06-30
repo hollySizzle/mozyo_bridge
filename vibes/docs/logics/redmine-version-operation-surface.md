@@ -24,12 +24,18 @@ domain + port を置く。
 - **rename**: `new_name` 必須・現名と異なること・`classify_version_name` が
   `package_numbered` (`^v?\d+\.\d+...`) を返す名前は `new_name_package_numbered` で blocked。
   これが #12643 の「Redmine Version 名 = planning bucket、package 版番号にしない」を機械強制する。
-- **close / lock**: `open_issues_count > 0` は既定 blocked (`open_issues_present`);
-  明示 `allow_open_issues` で許可するが warning を残す。既 closed/locked への再操作は blocked。
-  未知 status は fail-closed。
-- **delete (唯一の不可逆操作)**: `issues_count == 0` (open も closed も 0) の真に空な
-  Version のみ許可。非空は `version_not_empty`、`historical_protected` 指定は
-  `historical_protected` で blocked (歴史保持は close/lock 領域、delete しない)。
+- **close / lock**: counts 未確認 (`counts_known=False`) は `counts_required` で blocked
+  (欠落/default の `open_issues_count=0` を「open issue 無し」と誤読しない)。counts 既知で
+  `open_issues_count > 0` は既定 blocked (`open_issues_present`); 明示 `allow_open_issues`
+  で許可するが warning を残す。既 closed/locked への再操作は blocked。未知 status は fail-closed。
+- **delete (唯一の不可逆操作)**: counts 未確認は `counts_required` で blocked
+  (欠落/default count を「空」と解釈しない fail-closed)。counts 既知かつ
+  `issues_count == 0` **かつ** `open_issues_count == 0` **かつ** `closed_issues_count == 0`
+  の真に空な Version のみ許可 (三者確認で矛盾 snapshot も blocked)。非空は `version_not_empty`、
+  `historical_protected` 指定は `historical_protected` で blocked (歴史保持は close/lock 領域)。
+  `VersionState.counts_known` は既定 False (fail-closed); `from_mapping` は 3 count field
+  全て存在時のみ True、CLI inline は 3 count 全指定時のみ True、`--versions-json` は
+  list_versions の count を信頼する。
 - 全 guard 通過時のみ `rest_step` (`PUT/DELETE /versions/<id>.json`) と
   `operator_ui_step` を出す。pure・network 無し・mutation 無し。
 

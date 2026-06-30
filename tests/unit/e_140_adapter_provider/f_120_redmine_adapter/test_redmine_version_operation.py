@@ -34,6 +34,7 @@ def _state(
     issues_count=0,
     open_issues_count=0,
     closed_issues_count=0,
+    counts_known=True,
 ) -> VersionState:
     return VersionState(
         version_id=version_id,
@@ -42,6 +43,7 @@ def _state(
         issues_count=issues_count,
         open_issues_count=open_issues_count,
         closed_issues_count=closed_issues_count,
+        counts_known=counts_known,
     )
 
 
@@ -132,6 +134,42 @@ class DeleteGuardTest(unittest.TestCase):
         decision = decide_version_operation(request)
         self.assertFalse(decision.allowed)
         self.assertIn("historical_protected", decision.blocked_reasons)
+
+    def test_delete_with_unknown_counts_fails_closed(self) -> None:
+        # Regression (j#69311 finding 1): a missing/defaulted count must never be
+        # read as an empty Version for the one irreversible operation.
+        request = VersionOperationRequest(
+            operation="delete",
+            state=_state(counts_known=False),
+            confirmation="delete:281",
+        )
+        decision = decide_version_operation(request)
+        self.assertFalse(decision.allowed)
+        self.assertIn("counts_required", decision.blocked_reasons)
+        self.assertNotIn("version_not_empty", decision.blocked_reasons)
+        self.assertIsNone(decision.rest_step)
+
+    def test_delete_blocked_when_open_count_nonzero_but_issues_count_zero(self) -> None:
+        # Inconsistent snapshot: issues_count==0 but open_issues_count>0 must
+        # still block (all three counts are checked).
+        request = VersionOperationRequest(
+            operation="delete",
+            state=_state(issues_count=0, open_issues_count=3, closed_issues_count=0),
+            confirmation="delete:281",
+        )
+        decision = decide_version_operation(request)
+        self.assertFalse(decision.allowed)
+        self.assertIn("version_not_empty", decision.blocked_reasons)
+
+    def test_delete_blocked_when_only_closed_count_nonzero(self) -> None:
+        request = VersionOperationRequest(
+            operation="delete",
+            state=_state(issues_count=0, open_issues_count=0, closed_issues_count=5),
+            confirmation="delete:281",
+        )
+        decision = decide_version_operation(request)
+        self.assertFalse(decision.allowed)
+        self.assertIn("version_not_empty", decision.blocked_reasons)
 
 
 class RenameGuardTest(unittest.TestCase):
@@ -231,6 +269,28 @@ class CloseLockGuardTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("unknown_status:bogus", decision.blocked_reasons)
 
+    def test_close_with_unknown_counts_fails_closed(self) -> None:
+        # Regression (j#69311): the open-issue guard trusts open_issues_count, so
+        # an absent reading must block rather than assume zero open issues.
+        request = VersionOperationRequest(
+            operation="close",
+            state=_state(counts_known=False),
+            confirmation="close:281",
+        )
+        decision = decide_version_operation(request)
+        self.assertFalse(decision.allowed)
+        self.assertIn("counts_required", decision.blocked_reasons)
+
+    def test_lock_with_unknown_counts_fails_closed(self) -> None:
+        request = VersionOperationRequest(
+            operation="lock",
+            state=_state(counts_known=False),
+            confirmation="lock:281",
+        )
+        decision = decide_version_operation(request)
+        self.assertFalse(decision.allowed)
+        self.assertIn("counts_required", decision.blocked_reasons)
+
 
 class VersionStateParseTest(unittest.TestCase):
     def test_from_mapping_parses_list_versions_entry(self) -> None:
@@ -247,6 +307,11 @@ class VersionStateParseTest(unittest.TestCase):
         self.assertEqual(state.version_id, "248")
         self.assertEqual(state.status, "open")
         self.assertEqual(state.open_issues_count, 4)
+        self.assertTrue(state.counts_known)
+
+    def test_from_mapping_without_counts_is_counts_unknown(self) -> None:
+        state = VersionState.from_mapping({"id": "281", "name": "bucket", "status": "open"})
+        self.assertFalse(state.counts_known)
 
     def test_from_mapping_without_id_fails_closed(self) -> None:
         with self.assertRaises(VersionOperationError):

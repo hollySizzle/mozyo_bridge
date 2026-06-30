@@ -173,6 +173,47 @@ class PreflightCliTest(_SnapshotCase):
         self.assertEqual(code, 1)
         self.assertIn("close:281", out)
 
+    def test_inline_delete_without_counts_fails_closed(self) -> None:
+        # Regression (j#69311): no --versions-json and no inline counts must not
+        # let an irreversible delete preflight pass on defaulted-zero counts.
+        code, out = self._run(
+            [
+                "redmine-version",
+                "preflight",
+                "--version-id",
+                "999",
+                "--op",
+                "delete",
+                "--confirm",
+                "delete:999",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("counts_required", out)
+        self.assertNotIn("DELETE /versions/999.json", out)
+
+    def test_inline_delete_with_all_counts_zero_allows(self) -> None:
+        code, out = self._run(
+            [
+                "redmine-version",
+                "preflight",
+                "--version-id",
+                "999",
+                "--op",
+                "delete",
+                "--confirm",
+                "delete:999",
+                "--issues-count",
+                "0",
+                "--open-issues-count",
+                "0",
+                "--closed-issues-count",
+                "0",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("DELETE /versions/999.json", out)
+
     def test_unknown_version_in_snapshot_fails_closed(self) -> None:
         code, _ = self._run(
             [

@@ -106,14 +106,24 @@ def _resolve_state(args: argparse.Namespace) -> VersionState:
         raise VersionOperationError(
             f"version #{version_id} not found in snapshot {versions_json}"
         )
-    # Inline fallback: build the state from explicit counts/name/status.
+    # Inline fallback: build the state from explicit counts/name/status. The
+    # count args default to None ("not provided"); counts are only trusted when
+    # all three are supplied, otherwise counts_known stays False so a
+    # count-dependent operation (delete/close/lock) fails closed.
+    raw_counts = (
+        getattr(args, "issues_count", None),
+        getattr(args, "open_issues_count", None),
+        getattr(args, "closed_issues_count", None),
+    )
+    counts_known = all(c is not None for c in raw_counts)
     return VersionState(
         version_id=version_id,
         name=str(getattr(args, "name", "") or ""),
         status=str(getattr(args, "status", "") or "").strip().lower(),
-        issues_count=int(getattr(args, "issues_count", 0) or 0),
-        open_issues_count=int(getattr(args, "open_issues_count", 0) or 0),
-        closed_issues_count=int(getattr(args, "closed_issues_count", 0) or 0),
+        issues_count=int(raw_counts[0] or 0),
+        open_issues_count=int(raw_counts[1] or 0),
+        closed_issues_count=int(raw_counts[2] or 0),
+        counts_known=counts_known,
     )
 
 
