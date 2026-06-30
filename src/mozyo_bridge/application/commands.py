@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
+from mozyo_bridge.application.doctor_command import DoctorCommandUseCase
 from mozyo_bridge.application.commands_common import (
     config_path_from_args,
     repo_root_from_args,
@@ -5728,14 +5729,13 @@ def cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    result = run_doctor(args)
-    if getattr(args, "json", False):
-        import json as _json
-
-        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_doctor_text(result))
-    return 0 if result["ok"] else 1
+    # Thin handler: the doctor run, the json/text rendering decision, and the
+    # exit-code mapping live behind the ``doctor_command`` boundary (#12927).
+    # ``run_doctor`` / ``format_doctor_text`` are passed as this module's globals
+    # resolved at call time, so the ``commands.*`` monkeypatch tests are unchanged.
+    outcome = DoctorCommandUseCase(run_doctor, format_doctor_text).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
 
 
 def cmd_doctor_instruction(args: argparse.Namespace) -> int:
