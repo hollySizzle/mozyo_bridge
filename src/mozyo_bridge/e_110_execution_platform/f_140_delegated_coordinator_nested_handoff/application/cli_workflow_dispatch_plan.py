@@ -138,7 +138,15 @@ def _build_plan(args: argparse.Namespace) -> LaneSetDispatchPlan:
         issues_payload=issues_payload,
         versions_payload=versions_payload,
     )
-    resolution = provider.resolve_bucket((getattr(args, "bucket_id", None) or "").strip())
+    bucket_name = (getattr(args, "bucket_name", None) or "").strip()
+    if bucket_name:
+        # Name path (#12920 review j#69495): resolve the Version by displayed name from the
+        # snapshot, failing closed on an ambiguous name. The id path is unchanged.
+        resolution = provider.resolve_bucket_by_name(bucket_name)
+    else:
+        resolution = provider.resolve_bucket(
+            (getattr(args, "bucket_id", None) or "").strip()
+        )
     mode = _MODE_BY_FLAG[getattr(args, "mode", "dry-run")]
     return build_dispatch_plan(
         resolution,
@@ -219,7 +227,9 @@ def register_dispatch_plan(workflow_sub) -> None:
         description=(
             "Generate the read-only lane-set dispatch plan for a Redmine Version bucket "
             "(Redmine #12920). Reads a supplied issues snapshot (--issues-json, optionally "
-            "--versions-json), resolves the bucket via the #12919 fixed_version provider, "
+            "--versions-json), resolves the bucket by Version id (--bucket-id) or name "
+            "(--bucket-name, fails closed on an ambiguous name) via the #12919 "
+            "fixed_version provider, "
             "enumerates its open leaf issues, and classifies each candidate as "
             "dispatchable / standby / blocked / needs_owner_decision via the #12921 "
             "risk-based admission policy against the active lanes (--lane-signal "
@@ -241,12 +251,24 @@ def register_dispatch_plan(workflow_sub) -> None:
             "nothing, never mutates, never auto-dispatches."
         ),
     )
-    dispatch_plan.add_argument(
+    # The bucket selector: a Redmine Version id OR name (acceptance condition). Exactly one
+    # is required; a name is resolved from the snapshot and fails closed on ambiguity.
+    selector = dispatch_plan.add_mutually_exclusive_group(required=True)
+    selector.add_argument(
         "--bucket-id",
-        required=True,
         dest="bucket_id",
         metavar="VERSION_ID",
         help="The Redmine Version id whose bucket to plan (the fixed_version id).",
+    )
+    selector.add_argument(
+        "--bucket-name",
+        dest="bucket_name",
+        metavar="VERSION_NAME",
+        help=(
+            "The Redmine Version name whose bucket to plan (resolved from the snapshot's "
+            "versions / embedded fixed_version names; exact match, fails closed on an "
+            "ambiguous name that maps to multiple Version ids)."
+        ),
     )
     dispatch_plan.add_argument(
         "--issues-json",

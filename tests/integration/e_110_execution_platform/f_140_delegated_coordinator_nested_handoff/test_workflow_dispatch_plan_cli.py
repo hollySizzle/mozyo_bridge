@@ -190,6 +190,57 @@ class PlanTest(unittest.TestCase):
         self.assertIn("## Lane-set dispatch plan", out)
         self.assertIn("counts_by_classification:", out)
 
+    def test_resolve_by_name(self):
+        # Version name resolves from the issues' embedded fixed_version name ("枠"),
+        # even without a --versions-json snapshot (acceptance: id/name selector).
+        rc, out = _run(
+            ["workflow", "dispatch-plan", "--bucket-name", "枠", "--issues-json", self.issues]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: true", out)
+        self.assertIn("bucket_id: 292", out)
+        self.assertIn("candidate: 1", out)
+
+    def test_unknown_name_is_unresolved(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-name",
+                "存在しない枠",
+                "--issues-json",
+                self.issues,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: false", out)
+        self.assertIn("bucket_skip: bucket_not_found", out)
+
+    def test_ambiguous_name_fails_closed(self):
+        versions = _write(
+            self.tmp,
+            "versions.json",
+            {"versions": [{"id": 292, "name": "重複枠"}, {"id": 293, "name": "重複枠"}]},
+        )
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-name",
+                "重複枠",
+                "--issues-json",
+                self.issues,
+                "--versions-json",
+                versions,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        # An ambiguous name is never guessed -> unresolved, ambiguous_source skip.
+        self.assertIn("resolved: false", out)
+        self.assertIn("bucket_skip: ambiguous_source", out)
+        self.assertIn("292", out)
+        self.assertIn("293", out)
+
     def test_missing_bucket_is_unresolved(self):
         rc, out = _run(
             ["workflow", "dispatch-plan", "--bucket-id", "999", "--issues-json", self.issues]
@@ -231,10 +282,26 @@ class PlanTest(unittest.TestCase):
 
 
 class ParsingTest(unittest.TestCase):
-    def test_bucket_id_required(self):
+    def test_a_bucket_selector_is_required(self):
         parser = build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["workflow", "dispatch-plan", "--issues-json", "x.json"])
+
+    def test_bucket_id_and_name_are_mutually_exclusive(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "workflow",
+                    "dispatch-plan",
+                    "--issues-json",
+                    "x.json",
+                    "--bucket-id",
+                    "292",
+                    "--bucket-name",
+                    "枠",
+                ]
+            )
 
     def test_issues_json_required(self):
         parser = build_parser()

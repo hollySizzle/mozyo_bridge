@@ -191,6 +191,89 @@ class FailClosedSkipTest(unittest.TestCase):
         )
 
 
+class ResolveBucketByNameTest(unittest.TestCase):
+    """Version *name* selector (Redmine #12920 review j#69495), fail-closed on ambiguity."""
+
+    def test_name_resolves_to_same_bucket_as_id(self) -> None:
+        provider = RedmineFixedVersionLaneBucketProvider(
+            issues_payload={"issues": [_issue(1, parent=100)]}, versions_payload=_VERSIONS
+        )
+        by_name = provider.resolve_bucket_by_name("ワークフロー管制基盤整備枠")
+        self.assertTrue(by_name.resolved)
+        assert by_name.bucket is not None
+        # Byte-identical to the id path (delegates to resolve_bucket).
+        self.assertEqual(
+            by_name.bucket.as_dict(), provider.resolve_bucket("292").bucket.as_dict()
+        )
+
+    def test_name_from_embedded_fixed_version_without_versions_payload(self) -> None:
+        # Name resolves from the issues' embedded fixed_version name even with no versions.
+        issues = {
+            "issues": [
+                {
+                    "id": 1,
+                    "status": {"name": "新規", "is_closed": False},
+                    "fixed_version": {"id": 292, "name": "枠"},
+                }
+            ]
+        }
+        provider = RedmineFixedVersionLaneBucketProvider(issues_payload=issues)
+        resolution = provider.resolve_bucket_by_name("枠")
+        self.assertTrue(resolution.resolved)
+        self.assertEqual(resolution.bucket.bucket_id, "292")
+
+    def test_unknown_name_is_not_found(self) -> None:
+        provider = RedmineFixedVersionLaneBucketProvider(
+            issues_payload=[_issue(1)], versions_payload=_VERSIONS
+        )
+        resolution = provider.resolve_bucket_by_name("存在しない枠")
+        self.assertFalse(resolution.resolved)
+        self.assertEqual(resolution.skip.reason, SKIP_BUCKET_NOT_FOUND)
+
+    def test_ambiguous_name_fails_closed(self) -> None:
+        # Two distinct ids share one name -> ambiguous, never guessed.
+        versions = {
+            "versions": [
+                {"id": 292, "name": "重複枠", "status": "open"},
+                {"id": 293, "name": "重複枠", "status": "open"},
+            ]
+        }
+        provider = RedmineFixedVersionLaneBucketProvider(
+            issues_payload=[_issue(1)], versions_payload=versions
+        )
+        resolution = provider.resolve_bucket_by_name("重複枠")
+        self.assertFalse(resolution.resolved)
+        self.assertEqual(resolution.skip.reason, SKIP_AMBIGUOUS_SOURCE)
+        # The ambiguity detail names both colliding ids for the journal.
+        self.assertIn("292", resolution.skip.detail)
+        self.assertIn("293", resolution.skip.detail)
+
+    def test_empty_name_is_ambiguous(self) -> None:
+        self.assertEqual(
+            RedmineFixedVersionLaneBucketProvider()
+            .resolve_bucket_by_name("   ")
+            .skip.reason,
+            SKIP_AMBIGUOUS_SOURCE,
+        )
+
+    def test_same_id_and_name_in_both_sources_is_not_ambiguous(self) -> None:
+        # The same (id, name) appearing in both versions and embedded fixed_version is one
+        # distinct id -> resolves, not ambiguous.
+        issues = {
+            "issues": [
+                {
+                    "id": 1,
+                    "status": {"name": "新規", "is_closed": False},
+                    "fixed_version": {"id": 292, "name": "ワークフロー管制基盤整備枠"},
+                }
+            ]
+        }
+        provider = RedmineFixedVersionLaneBucketProvider(
+            issues_payload=issues, versions_payload=_VERSIONS
+        )
+        self.assertTrue(provider.resolve_bucket_by_name("ワークフロー管制基盤整備枠").resolved)
+
+
 class ResolveIssueBucketTest(unittest.TestCase):
     def test_issue_with_no_fixed_version(self) -> None:
         provider = RedmineFixedVersionLaneBucketProvider(
