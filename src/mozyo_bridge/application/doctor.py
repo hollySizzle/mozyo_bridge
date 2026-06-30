@@ -54,7 +54,15 @@ from mozyo_bridge.application.doctor_health import (
     RunDoctorUseCase,
     UNHEALTHY_SECTION_STATUSES,
 )
-from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import AGENT_LABELS, is_agent_process, pane_lines
+from mozyo_bridge.application.doctor_tmux import (
+    LiveTmuxPaneHealthReads,
+    TmuxSectionUseCase,
+)
+# ``pane_lines`` is resolved by ``LiveTmuxPaneHealthReads`` through this module at
+# call time (the existing ``doctor.pane_lines`` / ``doctor.run_tmux`` /
+# ``doctor.subprocess`` section integration tests patch these names); ``run_tmux``
+# is also used directly by ``doctor_session_section``.
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import pane_lines
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
 from mozyo_bridge.shared.paths import mozyo_bridge_home
@@ -471,139 +479,15 @@ def _in_tmux() -> bool:
     return bool(os.environ.get("TMUX") or os.environ.get("TMUX_PANE"))
 
 
-def _cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:
-    if not cwd:
-        return True
-    try:
-        Path(cwd).expanduser().resolve().relative_to(repo_root.resolve())
-    except ValueError:
-        return False
-    return True
-
-
 def doctor_tmux_section(args: argparse.Namespace) -> dict[str, Any]:
-    info: dict[str, Any] = {
-        "status": "skipped",
-        "next_action": [],
-        "tmux_pane": os.environ.get("TMUX_PANE", ""),
-    }
-    if subprocess.run(["sh", "-c", "command -v tmux >/dev/null 2>&1"]).returncode != 0:
-        info["status"] = "missing"
-        info["detail"] = "tmux not installed"
-        info["next_action"] = ["install tmux to use mozyo-bridge pane notifications"]
-        return info
-    list_result = run_tmux("list-panes", "-a", "-F", "#{pane_id}", check=False)
-    if list_result.returncode != 0:
-        # Not running under a tmux server. Doctor stays usable outside tmux.
-        info["status"] = "skipped"
-        info["detail"] = (
-            "not connected to a tmux server (run `mozyo` to start the repo session)"
-        )
-        return info
-    panes = pane_lines()
-    info["panes_total"] = len(list_result.stdout.splitlines())
-    info["agent_windows"] = {}
-    info["warnings"] = []
-    next_actions: list[str] = []
+    """Diagnose tmux pane health for the doctor report (#12881 boundary).
 
-    # Scope agent checks to the current tmux session. Cross-session panes
-    # are legitimate when the operator keeps parallel project sessions open.
-    pane_env = os.environ.get("TMUX_PANE") or ""
-    current_session: str | None = None
-    if pane_env:
-        for pane in panes:
-            if pane["id"] == pane_env:
-                location = pane.get("location") or ""
-                current_session = location.split(":", 1)[0] or None
-                break
-    info["current_session"] = current_session or ""
-
-    bad = False
-    repo_root_raw = getattr(args, "repo", None) or "."
-    repo_root = Path(repo_root_raw).expanduser().resolve()
-
-    session_panes = (
-        [
-            pane
-            for pane in panes
-            if (pane.get("location") or "").split(":", 1)[0] == current_session
-        ]
-        if current_session is not None
-        else []
-    )
-
-    for agent in sorted(AGENT_LABELS):
-        window_panes = [pane for pane in session_panes if pane.get("window_name") == agent]
-        window_indexes = {
-            (pane.get("location") or "").split(":", 1)[1].split(".", 1)[0]
-            for pane in window_panes
-            if ":" in (pane.get("location") or "")
-        }
-        if current_session is None:
-            window_entry: dict[str, Any] = {"status": "unscoped"}
-        elif not window_panes:
-            window_entry = {"status": "missing", "session": current_session}
-            bad = True
-            next_actions.append(
-                f"run `mozyo` from the repo, or `mozyo-bridge init {agent}` from the pane "
-                f"you want to be `{agent}`"
-            )
-        elif len(window_indexes) > 1:
-            window_entry = {
-                "status": "duplicate",
-                "session": current_session,
-                "windows": sorted(window_indexes),
-            }
-            bad = True
-            next_actions.append(
-                f"resolve duplicate `{agent}` windows in session '{current_session}'; "
-                "tmux tolerates duplicates but the resolver does not"
-            )
-        else:
-            active = next(
-                (p for p in window_panes if p.get("pane_active") == "1"),
-                window_panes[0],
-            )
-            command = Path(active.get("command") or "").name
-            window_status = "ok" if is_agent_process(command) else "not-agent-process"
-            window_entry = {
-                "status": window_status,
-                "session": current_session,
-                "window": next(iter(window_indexes), ""),
-                "id": active["id"],
-                "process": command,
-                "cwd": active.get("cwd", ""),
-            }
-            if window_status != "ok":
-                bad = True
-                next_actions.append(
-                    f"`{agent}` window in session '{current_session}' is running "
-                    f"`{command or '-'}`; start the agent CLI or `mozyo-bridge init "
-                    f"{agent}` on the pane that is"
-                )
-            if agent == "claude" and window_status == "ok":
-                project_skills_dir = repo_root / ".claude" / "skills"
-                if project_skills_dir.exists() and not _cwd_is_under_repo(
-                    active.get("cwd", ""), repo_root
-                ):
-                    info["warnings"].append(
-                        {
-                            "kind": "claude_pane_cwd_outside_repo",
-                            "cwd": active.get("cwd", "") or "-",
-                            "repo": str(repo_root),
-                        }
-                    )
-                    bad = True
-        info["agent_windows"][agent] = window_entry
-
-    # De-dupe while preserving order so repeated suggestions (e.g. both
-    # agents missing → both producing the bare-`mozyo` hint) collapse.
-    seen: set[str] = set()
-    info["next_action"] = [
-        action for action in next_actions if not (action in seen or seen.add(action))
-    ]
-    info["status"] = "ok" if not bad else "warning"
-    return info
+    Thin handler over :class:`~mozyo_bridge.application.doctor_tmux.TmuxSectionUseCase`:
+    the external read (tmux availability, pane snapshot, env scope, checkout
+    probe) lives in :class:`LiveTmuxPaneHealthReads` and the verdict / legacy
+    section dict assembly in the pure ``evaluate_tmux_section`` policy.
+    """
+    return TmuxSectionUseCase(LiveTmuxPaneHealthReads(args)).execute()
 
 
 def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
