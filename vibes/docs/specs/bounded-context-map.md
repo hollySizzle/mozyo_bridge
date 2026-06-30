@@ -214,6 +214,11 @@ repo を 6 つの bounded context へ分ける。各 context は Redmine Epic 1 
 - 主要 tests: `tests/test_scaffold.py`、`test_docs_canonical_workspace.py`、`test_bootstrap_install_docs.py`、`test_release_helpers.py`。
 - 注: これらの surface 編集権限は中央 preset `### パス別編集権限` と `### Repo-Local Guardrail Autonomous Lane`
   に従う。本 context への対応づけは編集権限を上書きしない。
+- scaffold boundary 確定 (#12641): `src/mozyo_bridge/scaffold/**` の論理所有は本 context の Feature
+  #12519 `f_120_scaffold_preset` に pin する。physical path は packaging (`package-data` glob /
+  `importlib.resources` anchor) 結合のため numbered layout の明示的例外として top-level に据え置く
+  (justified residual)。決定正本と move-enabling conditions は
+  `vibes/docs/logics/scaffold-boundary.md` を読む。
 
 ### `adapter_provider`
 
