@@ -25,7 +25,12 @@ from typing import Mapping
 
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.domain.redmine_version_enumeration import (
     MappingRedmineVersionIssueSource,
+    VersionLeafEnumeration,
     enumerate_from_source,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_version_issue_source import (
+    RedmineVersionReadUnavailable,
+    live_version_issue_source_from_env,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.domain.redmine_version_operation import (
     VersionOperationError,
@@ -56,19 +61,42 @@ def _print_json(payload: object) -> None:
 
 
 def cmd_redmine_version_list_open_leaf(args: argparse.Namespace) -> int:
-    """Enumerate the open leaf issues of a Version from an issues.json snapshot."""
+    """Enumerate the open leaf issues of a Version.
+
+    Reads from a static operator-exported ``issues.json`` snapshot, or — with the
+    explicit ``--live`` opt-in — from a read-only live Redmine read. The live
+    path fails closed with an explicit reason and a non-zero exit when no
+    credential / provider is available, so an unreadable Version is never
+    rendered as an empty one.
+    """
     version_id = str(getattr(args, "version_id", "") or "").strip()
     if not version_id:
         return _fail("--version-id is required")
-    try:
-        payload = _load_json(args.issues_json)
-    except VersionOperationError as exc:
-        return _fail(str(exc))
 
-    source = MappingRedmineVersionIssueSource(payload)
-    enumeration = enumerate_from_source(source, version_id)
+    if bool(getattr(args, "live", False)):
+        try:
+            source = live_version_issue_source_from_env()
+            enumeration = enumerate_from_source(source, version_id)
+        except RedmineVersionReadUnavailable as exc:
+            # Fail closed: surface the explicit reason and a non-zero exit rather
+            # than reporting a silent empty Version (#12923 acceptance).
+            return _fail(f"live read unavailable ({exc.reason}): {exc}")
+    else:
+        try:
+            payload = _load_json(args.issues_json)
+        except VersionOperationError as exc:
+            return _fail(str(exc))
+        source = MappingRedmineVersionIssueSource(payload)
+        enumeration = enumerate_from_source(source, version_id)
 
-    if bool(getattr(args, "as_json", False)):
+    return _render_enumeration(enumeration, version_id, bool(getattr(args, "as_json", False)))
+
+
+def _render_enumeration(
+    enumeration: VersionLeafEnumeration, version_id: str, as_json: bool
+) -> int:
+    """Print the open-leaf enumeration as JSON or human-readable text."""
+    if as_json:
         _print_json(enumeration.as_dict())
         return 0
 
