@@ -23,7 +23,7 @@ allowlist records — another reason the native gate is the better fit here.
 
 Everything in this module is pure (filesystem reads only, no argparse, no
 process exit); the CLI handlers in
-:mod:`mozyo_bridge.application.commands_module_health` render and exit.
+:mod:`mozyo_bridge.e_150_quality_architecture.f_130_module_health.application.commands_module_health` render and exit.
 """
 
 from __future__ import annotations

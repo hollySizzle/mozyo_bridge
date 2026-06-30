@@ -40,9 +40,9 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import cli as cli_module
-from mozyo_bridge.application import presentation_runtime as presentation_runtime_module
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.application import presentation_runtime as presentation_runtime_module
 from mozyo_bridge.application.cli import main
-from mozyo_bridge.application.presentation_runtime import (
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.application.presentation_runtime import (
     PresentationRuntimeError,
     resolve_presentation_provider,
 )
@@ -50,10 +50,10 @@ from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
 )
-from mozyo_bridge.application.text_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.text_attention_presentation_provider import (
     TEXT_ATTENTION_PRESENTATION_PROVIDER,
 )
-from mozyo_bridge.application.tmux_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
 )
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (

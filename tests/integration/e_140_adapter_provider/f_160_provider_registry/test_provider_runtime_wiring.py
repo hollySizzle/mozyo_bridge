@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import cli as cli_module
 from mozyo_bridge.application.cli import main
-from mozyo_bridge.application.provider_runtime import resolve_builtin_providers
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.provider_runtime import resolve_builtin_providers
 from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,

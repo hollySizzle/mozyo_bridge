@@ -55,7 +55,7 @@ from mozyo_bridge.application.agent_discovery_port import (
     AgentDiscoveryPort,
     LiveAgentDiscovery,
 )
-from mozyo_bridge.application.attention_projection import build_attention_option_plan
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection import build_attention_option_plan
 from mozyo_bridge.application.tmux_option_port import (
     LiveTmuxOptionWriter,
     TmuxOptionWriterPort,

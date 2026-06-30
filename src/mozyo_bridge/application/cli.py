@@ -23,19 +23,21 @@ from mozyo_bridge.application.instruction_doctor import (
     PROFILE_REDMINE_CODEX,
 )
 from mozyo_bridge.application import (
-    cli_agents,
-    cli_cockpit,
     cli_core,
-    cli_docs_scaffold,
-    cli_handoff,
     cli_modules,
-    cli_observability,
-    cli_release,
     cli_runtime_config,
+)
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
     cli_session,
     cli_workspace,
 )
-from mozyo_bridge.application.sublane_diagnostics import (
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import cli_agents
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import cli_handoff
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import cli_observability
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import cli_cockpit
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application import cli_docs_scaffold
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import cli_release
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_diagnostics import (
     cmd_sublane_callback_recovery,
     cmd_sublane_readiness,
 )
@@ -44,11 +46,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CALLBACK_CHOICES,
 )
 from mozyo_bridge.application.cli_common import add_repo_option
-from mozyo_bridge.application.presentation_runtime import (
+from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.application.presentation_runtime import (
     PresentationRuntimeError,
     resolve_presentation_provider,
 )
-from mozyo_bridge.application.provider_runtime import resolve_builtin_providers
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.provider_runtime import resolve_builtin_providers
 from mozyo_bridge.application.repo_local_config_loader import (
     CONFIG_FILE_RELPATH,
     load_repo_local_config,
@@ -73,7 +75,7 @@ from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, res
 # the #12138 scope guard "do not retire legacy import paths" applied to
 # ``cli.py``; it does not affect parser behavior.
 from mozyo_bridge.application.cli_common import add_scaffold_target_option  # noqa: F401,E402
-from mozyo_bridge.application.cli_handoff import (  # noqa: F401,E402
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (  # noqa: F401,E402
     add_legacy_notify_options,
     add_notify_delivery_options,
     add_notify_options,
@@ -142,7 +144,7 @@ from mozyo_bridge.application.commands import (  # noqa: F401,E402
     cmd_workspace_list,
     cmd_workspace_register,
 )
-from mozyo_bridge.application.release import (  # noqa: F401,E402
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import (  # noqa: F401,E402
     cmd_release_bump,
     cmd_release_check_artifact,
     cmd_release_check_drift,

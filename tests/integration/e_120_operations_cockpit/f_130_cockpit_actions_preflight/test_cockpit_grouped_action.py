@@ -36,13 +36,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_actions import (
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
     CockpitActionError,
     candidate_unit_selector,
     grouped_jump,
     grouped_reveal,
 )
-from mozyo_bridge.application.otel_receiver import build_server
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import build_server
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
     UNIT_STATUS_CONTRADICTED,
     UNIT_STATUS_OBSERVED,
@@ -59,7 +59,7 @@ from mozyo_bridge.session_inventory import (
     WorkspaceIdentity,
 )
 
-COCKPIT_UI = "mozyo_bridge.application.cockpit_actions"
+COCKPIT_UI = "mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions"
 
 
 def _record(

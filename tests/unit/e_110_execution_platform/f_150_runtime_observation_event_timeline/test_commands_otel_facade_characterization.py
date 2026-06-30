@@ -1,8 +1,10 @@
 """Characterize the otel/event command-handler facade split (Redmine #12154).
 
 The OTel / event-timeline handlers were moved out of the giant
-``application/commands.py`` into the focused ``application/commands_otel``
-family module. ``commands.py`` re-exports them so the historical import and
+``application/commands.py`` into the focused ``commands_otel`` family module
+(now homed at the Redmine-numbered
+``e_110_execution_platform.f_150_runtime_observation_event_timeline.application``
+path). ``commands.py`` re-exports them so the historical import and
 monkeypatch surface (``mozyo_bridge.application.commands.cmd_otel_*`` /
 ``cmd_events_*``) keeps resolving.
 
@@ -26,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application import commands as commands_facade
-from mozyo_bridge.application import commands_otel
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import commands_otel
 
 # The full re-export surface the facade must preserve. Public handlers plus the
 # two private renderer/store helpers that were importable as
@@ -64,9 +66,9 @@ class OtelFacadeCompatibilityTest(unittest.TestCase):
         # Behavior-preserving move means the definitions now physically live in
         # the commands_otel family module, not that they are aliases pointing
         # back at commands. Redmine #12624 (US #12622) relocated that family body
-        # into the Redmine-numbered execution_platform layout; the legacy import
-        # path ``mozyo_bridge.application.commands_otel`` stays valid via the
-        # ``sys.modules`` facade, so ``__module__`` now reports the numbered home.
+        # into the Redmine-numbered execution_platform layout; Redmine #12639
+        # retired the top-level ``mozyo_bridge.application.commands_otel`` facade,
+        # so ``__module__`` reports the numbered home directly.
         for name in MOVED_SYMBOLS:
             with self.subTest(symbol=name):
                 self.assertEqual(

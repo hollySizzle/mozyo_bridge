@@ -41,25 +41,25 @@ class ReleaseHelperParserTest(unittest.TestCase):
 
     def test_release_check_tree(self) -> None:
         args = self.parse("release", "check", "tree")
-        from mozyo_bridge.application.release import cmd_release_check_tree
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_tree
 
         self.assertIs(args.func, cmd_release_check_tree)
 
     def test_release_check_scaffold(self) -> None:
         args = self.parse("release", "check", "scaffold")
-        from mozyo_bridge.application.release import cmd_release_check_scaffold
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_scaffold
 
         self.assertIs(args.func, cmd_release_check_scaffold)
 
     def test_release_check_artifact(self) -> None:
         args = self.parse("release", "check", "artifact")
-        from mozyo_bridge.application.release import cmd_release_check_artifact
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_artifact
 
         self.assertIs(args.func, cmd_release_check_artifact)
 
     def test_release_check_drift(self) -> None:
         args = self.parse("release", "check", "drift")
-        from mozyo_bridge.application.release import cmd_release_check_drift
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_drift
 
         self.assertIs(args.func, cmd_release_check_drift)
 
@@ -68,7 +68,7 @@ class ReleaseHelperParserTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.parse("release", "check", "workflow")
         args = self.parse("release", "check", "workflow", "--run-id", "42")
-        from mozyo_bridge.application.release import cmd_release_check_workflow
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_workflow
 
         self.assertIs(args.func, cmd_release_check_workflow)
         self.assertEqual("42", args.run_id)
@@ -78,7 +78,7 @@ class ReleaseHelperParserTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.parse("release", "workflow", "runs")
         args = self.parse("release", "workflow", "runs", "--workflow", "testpypi.yml")
-        from mozyo_bridge.application.release import cmd_release_workflow_runs
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_workflow_runs
 
         self.assertIs(args.func, cmd_release_workflow_runs)
         self.assertEqual("testpypi.yml", args.workflow)
@@ -100,7 +100,7 @@ class ReleaseHelperParserTest(unittest.TestCase):
             "--timeout",
             "30",
         )
-        from mozyo_bridge.application.release import cmd_release_workflow_wait
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_workflow_wait
 
         self.assertIs(args.func, cmd_release_workflow_wait)
         self.assertEqual("42", args.run_id)
@@ -160,7 +160,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
         )
 
     def test_clean_tree_returns_zero(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -173,7 +173,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: clean", out.getvalue())
 
     def test_personal_path_in_tracked_file_is_blocker(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -188,7 +188,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: blocker", out.getvalue())
 
     def test_secret_value_shape_in_tracked_file_is_blocker(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -203,7 +203,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: blocker", out.getvalue())
 
     def test_secret_guidance_words_do_not_block_tree_check(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -220,7 +220,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertIn("result: clean", out.getvalue())
 
     def test_pathspec_excludes_skip_generated_trees(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -242,7 +242,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
         # leaked values. Env reads, type annotations, keyword/identifier
         # defaults, constant references, and explicit non-secret sentinels must
         # all pass the tree check cleanly.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         false_positives = "\n".join(
             (
@@ -267,7 +267,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
     def test_real_secret_among_identifier_code_still_blocks(self) -> None:
         # Mixing safe identifier lines with one real literal credential must
         # still block, and only the real line is reported as a hit.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         real_secret = "REDMINE" + "_API_KEY=" + "abc123"
         body = "\n".join(
@@ -294,7 +294,7 @@ class ReleaseCheckTreeTest(unittest.TestCase):
     def test_token_shaped_secret_with_punctuation_still_blocks(self) -> None:
         # Redmine #12175 j#60466: a real credential literal carrying token
         # punctuation (slash/base64, dotted) must still block the tree check.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         slash_secret = "REDMINE" + "_API_KEY=" + "ab" + "c+def/123="
         with tempfile.TemporaryDirectory() as tmp:
@@ -318,7 +318,7 @@ class SecretValueClassifierTest(unittest.TestCase):
     """
 
     def test_rejects_code_identifier_and_sentinel_values(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         reject_values = (
             "os.environ.get(API_KEY_ENV)",  # env read / call expression
@@ -342,7 +342,7 @@ class SecretValueClassifierTest(unittest.TestCase):
             )
 
     def test_accepts_opaque_literal_values(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         token = "ab" + "c123"
         accept_values = (
@@ -360,7 +360,7 @@ class SecretValueClassifierTest(unittest.TestCase):
         # Redmine #12175 j#60466: real credential tokens routinely contain
         # `.`, `/`, `+`, and padding `=`. These must stay classified as real
         # secrets — rejecting on token punctuation suppressed actual leaks.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         accept_values = (
             "ab" + "c/123",  # slash / base64-ish
@@ -376,7 +376,7 @@ class SecretValueClassifierTest(unittest.TestCase):
             )
 
     def test_assignment_classifier_pins_request_cases(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         safe_lines = (
             "api_key=os.environ.get(API_KEY_ENV) or None",
@@ -413,7 +413,7 @@ class SecretValueClassifierTest(unittest.TestCase):
         # a same-name keyword pass-through, a None sentinel inside a string,
         # and a snake_case identifier assignment — name a credential field but
         # carry no literal value, so they must not block the tree scan.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         safe_field_name_lines = (
             "cache = RedmineContextCache(api_key=api_key, base_url=base_url)",
@@ -438,7 +438,7 @@ class SecretValueClassifierTest(unittest.TestCase):
         self.assertTrue(release_mod._secret_value_is_real("ab" + "c123"))
 
     def test_real_secret_grep_line_filter_keeps_only_real_hits(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         token = "ab" + "c123"
         grep_stdout = "\n".join(
@@ -456,7 +456,7 @@ class SecretValueClassifierTest(unittest.TestCase):
 
 class ReleaseCheckScaffoldTest(unittest.TestCase):
     def test_scaffold_check_uses_isolated_home_and_targets(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
             rc = release_mod.cmd_release_check_scaffold(argparse.Namespace())
@@ -481,7 +481,7 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
     """
 
     def test_artifact_secret_pattern_matches_values_not_guidance_words(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         pattern = re.compile(release_mod._artifact_grep_pattern())
         fake_secret = "REDMINE" + "_API_KEY=" + "abc123"
@@ -493,7 +493,7 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
         # credential classifier as `release check tree`, so packaged source
         # that names a credential identifier is not flagged, while a personal
         # path or a real literal secret still is.
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         real_secret = "REDMINE" + "_API_KEY=" + "abc123"
         personal_path = "/Users" + "/example/project"
@@ -529,7 +529,7 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
             )
 
     def test_does_not_mutate_repo_dist_directory(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as repo_str:
             repo = Path(repo_str).resolve()
@@ -586,7 +586,7 @@ class ReleaseCheckArtifactTest(unittest.TestCase):
 
 class ReleaseCheckWorkflowTest(unittest.TestCase):
     def test_success_exits_zero(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         payload = {
             "status": "completed",
@@ -605,7 +605,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
         self.assertIn("conclusion: success", out.getvalue())
 
     def test_failure_exits_non_zero(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         payload = {
             "status": "completed",
@@ -622,7 +622,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
         self.assertEqual(release_mod.EXIT_BLOCKER, rc)
 
     def test_in_progress_exits_non_zero(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         payload = {
             "status": "in_progress",
@@ -641,7 +641,7 @@ class ReleaseCheckWorkflowTest(unittest.TestCase):
 
 class ReleaseWorkflowRunsTest(unittest.TestCase):
     def test_runs_listing_renders_columns(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         runs = [
             {
@@ -679,7 +679,7 @@ class ReleaseWorkflowRunsTest(unittest.TestCase):
 
 class ReleaseWorkflowWaitTest(unittest.TestCase):
     def test_wait_returns_zero_when_run_completes_successfully(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         sequence = [
             {"status": "in_progress", "conclusion": None},
@@ -696,7 +696,7 @@ class ReleaseWorkflowWaitTest(unittest.TestCase):
         self.assertIn("conclusion: success", out.getvalue())
 
     def test_wait_returns_timeout_code_when_deadline_elapses(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with patch.object(
             release_mod,
@@ -715,7 +715,7 @@ class ReleaseWorkflowWaitTest(unittest.TestCase):
         self.assertIn("timeout: exceeded", out.getvalue())
 
     def test_wait_returns_blocker_when_run_fails(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with patch.object(
             release_mod,
@@ -755,7 +755,7 @@ class ReleaseBumpPublishParserTest(unittest.TestCase):
 
     def test_release_bump_check(self) -> None:
         args = self.parse("release", "bump", "--check")
-        from mozyo_bridge.application.release import cmd_release_bump
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_bump
 
         self.assertIs(args.func, cmd_release_bump)
         self.assertTrue(args.check)
@@ -763,7 +763,7 @@ class ReleaseBumpPublishParserTest(unittest.TestCase):
 
     def test_release_bump_to(self) -> None:
         args = self.parse("release", "bump", "--to", "0.3.0a1")
-        from mozyo_bridge.application.release import cmd_release_bump
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_bump
 
         self.assertIs(args.func, cmd_release_bump)
         self.assertFalse(args.check)
@@ -873,7 +873,7 @@ class ReleaseBumpCheckTest(unittest.TestCase):
         )
 
     def test_clean_check_reports_each_mirror_file(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -892,7 +892,7 @@ class ReleaseBumpCheckTest(unittest.TestCase):
             self.assertIn("result: clean", text)
 
     def test_mirror_set_drift_is_blocker(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -907,7 +907,7 @@ class ReleaseBumpCheckTest(unittest.TestCase):
             self.assertIn("mirror set values disagree", out.getvalue())
 
     def test_contract_missing_anchor_is_fatal(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -980,7 +980,7 @@ class ReleaseBumpToTest(unittest.TestCase):
         ).stdout.strip()
 
     def test_rewrites_every_mirror_file_without_committing(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1015,7 +1015,7 @@ class ReleaseBumpToTest(unittest.TestCase):
             )
 
     def test_same_version_is_idempotent_noop(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1033,7 +1033,7 @@ class ReleaseBumpToTest(unittest.TestCase):
             )
 
     def test_invalid_version_shape_is_rejected(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1047,7 +1047,7 @@ class ReleaseBumpToTest(unittest.TestCase):
                     )
 
     def test_missing_version_literal_strict_fails(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1082,7 +1082,7 @@ class ReleasePublishTest(unittest.TestCase):
     """
 
     def test_pypi_dry_run_does_not_invoke_gh(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             notes = Path(tmp) / "notes.md"
@@ -1119,7 +1119,7 @@ class ReleasePublishTest(unittest.TestCase):
             self.assertIn("Re-run with `--execute`", out.getvalue())
 
     def test_pypi_execute_invokes_gh_release_create(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             notes = Path(tmp) / "notes.md"
@@ -1156,7 +1156,7 @@ class ReleasePublishTest(unittest.TestCase):
             self.assertIn("--notes-file", argv)
 
     def test_pypi_rejects_missing_notes_file(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "does-not-exist.md"
@@ -1176,7 +1176,7 @@ class ReleasePublishTest(unittest.TestCase):
                     )
 
     def test_pypi_rejects_invalid_tag(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             notes = Path(tmp) / "notes.md"
@@ -1197,7 +1197,7 @@ class ReleasePublishTest(unittest.TestCase):
                     )
 
     def test_testpypi_dispatch_validates_version_without_workflow_input(self) -> None:
-        from mozyo_bridge.application import release as release_mod
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
 
         dispatch_call = []
 

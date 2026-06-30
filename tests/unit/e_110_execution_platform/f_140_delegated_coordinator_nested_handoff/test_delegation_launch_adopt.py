@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
-from mozyo_bridge.application.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegation_launch_adopt import (
     _recommended_command,
     cmd_handoff_delegate_launch_adopt,
 )

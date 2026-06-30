@@ -34,13 +34,13 @@ from mozyo_bridge.application.commands import (
     cmd_notify_codex_legacy_task,
     cmd_notify_codex_review,
 )
-from mozyo_bridge.application.delegation_launch_adopt import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegation_launch_adopt import (
     cmd_handoff_delegate_launch_adopt,
 )
-from mozyo_bridge.application.cli_handoff_grandchild_realization import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_handoff_grandchild_realization import (
     register_grandchild_realization,
 )
-from mozyo_bridge.application.grandchild_dispatch import (
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.grandchild_dispatch import (
     cmd_handoff_grandchild_dispatch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import LAUNCH_ADOPT_MODES

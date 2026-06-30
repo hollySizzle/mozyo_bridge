@@ -29,7 +29,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.otel_receiver import build_server
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import build_server
 from mozyo_bridge.session_inventory import (
     InventoryRecord,
     InventorySnapshot,
@@ -38,7 +38,7 @@ from mozyo_bridge.session_inventory import (
 
 # The served endpoint builds its payload via cockpit_payload.grouped_units_payload,
 # which imports take_inventory into the cockpit_payload namespace — patch it there.
-COCKPIT_PAYLOAD = "mozyo_bridge.application.cockpit_payload"
+COCKPIT_PAYLOAD = "mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload"
 
 
 def _record(

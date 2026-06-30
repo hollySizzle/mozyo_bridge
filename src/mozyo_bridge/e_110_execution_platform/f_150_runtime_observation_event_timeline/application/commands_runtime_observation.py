@@ -155,7 +155,7 @@ def snapshot_from_inventory(
 
     The single inventory -> envelope mapping, shared by the ``observe reload``
     CLI (#12224, via :func:`_capture_tmux`) and the cockpit Web UI (#12225, via
-    :func:`mozyo_bridge.application.cockpit_ui.attach_observation`). Both faces
+    :func:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui.attach_observation`). Both faces
     derive ``observed_at`` / ``freshness`` / ``readability`` / ``display_state``
     from the same logic, so the CLI and the GUI never disagree about whether the
     displayed runtime view is fresh or must be reloaded. The caller supplies the

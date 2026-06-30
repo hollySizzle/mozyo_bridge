@@ -35,7 +35,7 @@ Boundaries (the same non-authoritative contract the #12465/#12466 layer pins):
 
 - **Pure, no I/O.** No tmux / filesystem / send. It returns argv tuples and a
   structured plan; the side-effecting writer (the CLI handler) executes them.
-  The mechanics mirror :mod:`mozyo_bridge.application.attention_projection`, the
+  The mechanics mirror :mod:`mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection`, the
   established pane-option projection-cache precedent.
 - **Display / audit breadcrumb, never routing authority.** The stamped options
   are a projection cache; cross-lane handoff stays bound to the live

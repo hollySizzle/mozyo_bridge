@@ -31,7 +31,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application import sublane_diagnostics
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import sublane_diagnostics
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import CLAUDE_PERMISSION_MODE_ENV
 

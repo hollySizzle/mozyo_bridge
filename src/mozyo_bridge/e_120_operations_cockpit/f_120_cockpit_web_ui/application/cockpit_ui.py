@@ -6,13 +6,13 @@ handling, and the action-time preflight bridge. #12323 split those concerns into
 three focused modules so a UI / rendering change and a domain / read-model change
 no longer land in the same giant file:
 
-- :mod:`mozyo_bridge.application.cockpit_page` — the served HTML / static page
+- :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_page` — the served HTML / static page
   (``INDEX_HTML_TEMPLATE``);
-- :mod:`mozyo_bridge.application.cockpit_payload` — read-only served-API payload
+- :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload` — read-only served-API payload
   assembly + reload / freshness presentation (``units_payload`` /
   ``attach_attention`` / ``attach_observation`` / ``observed_units_from_inventory``
   / ``grouped_units_payload``);
-- :mod:`mozyo_bridge.application.cockpit_actions` — the side-effecting action
+- :mod:`mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions` — the side-effecting action
   endpoints + action-time live preflight bridge (``CockpitActionError`` /
   ``reveal_in_finder`` / ``jump_to_unit`` / the grouped ``_resolve_unit_target``
   / ``grouped_reveal`` / ``grouped_jump`` / ``grouped_action_preview`` /
@@ -33,7 +33,7 @@ that enforce them.
 
 from __future__ import annotations
 
-from mozyo_bridge.application.cockpit_actions import (
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
     DEFAULT_HOST,
     DEFAULT_LANE,
     CockpitActionError,
@@ -47,8 +47,8 @@ from mozyo_bridge.application.cockpit_actions import (
     jump_to_unit,
     reveal_in_finder,
 )
-from mozyo_bridge.application.cockpit_page import INDEX_HTML_TEMPLATE
-from mozyo_bridge.application.cockpit_payload import (
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_page import INDEX_HTML_TEMPLATE
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (
     attach_attention,
     attach_observation,
     grouped_units_payload,

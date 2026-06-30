@@ -29,7 +29,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.otel_receiver import (
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import (
     build_server,
     decode_otlp_json,
 )
@@ -391,7 +391,7 @@ class ReceiverEndToEndTest(unittest.TestCase):
 
     def test_protobuf_without_extra_is_415_with_remediation(self) -> None:
         with patch(
-            "mozyo_bridge.application.otel_receiver.decode_otlp_protobuf",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver.decode_otlp_protobuf",
             return_value=None,
         ):
             status, payload = self._post(
@@ -412,7 +412,7 @@ class ReceiverLoopbackGateTest(unittest.TestCase):
     def test_non_loopback_bind_is_rejected(self) -> None:
         # Review #56128 finding 2: the receiver is localhost-only by
         # contract; a wildcard bind must be refused at the library layer.
-        from mozyo_bridge.application.otel_receiver import (
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import (
             OtelReceiverError,
             build_server,
         )
@@ -425,7 +425,7 @@ class ReceiverLoopbackGateTest(unittest.TestCase):
                     )
 
     def test_loopback_spellings_are_accepted(self) -> None:
-        from mozyo_bridge.application.otel_receiver import build_server
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import build_server
 
         # 127.0.0.2 passes the validator but is not bindable on default
         # macOS, so only actually bind the universally configured ones.

@@ -19,8 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.attention_projection import ATTENTION_OPTION_NAMES
-from mozyo_bridge.application.text_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection import ATTENTION_OPTION_NAMES
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.text_attention_presentation_provider import (
     PROVIDER_NAME,
     TEXT_ATTENTION_PRESENTATION_PROVIDER,
     TEXT_FIELD_LABELS,
@@ -31,7 +31,7 @@ from mozyo_bridge.application.text_attention_presentation_provider import (
     TextAttentionPresentationProvider,
     render_surface_text,
 )
-from mozyo_bridge.application.tmux_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.tmux_attention_presentation_provider import (
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import AttentionRecord
@@ -176,7 +176,7 @@ class TextProviderHasNoRoutingSurfaceTest(unittest.TestCase):
         # Read/projection-first: the provider and its module must not grow a
         # send/route/approve surface that would make display a routing or
         # approval authority.
-        import mozyo_bridge.application.text_attention_presentation_provider as mod
+        import mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.text_attention_presentation_provider as mod
 
         for forbidden in ("send", "route", "approve", "close", "resolve_target"):
             self.assertFalse(

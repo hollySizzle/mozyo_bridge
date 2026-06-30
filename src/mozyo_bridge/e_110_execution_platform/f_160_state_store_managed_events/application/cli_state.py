@@ -10,12 +10,12 @@ Registers the top-level ``state`` command with three subcommands:
 - ``state cleanup`` — the deliberately separate, destructive retirement of
   migrated legacy files; deletes nothing without ``--write --confirm-destroy``.
 
-Handlers live in :mod:`mozyo_bridge.application.commands_state`; this module only
+Handlers live in :mod:`mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.commands_state`; this module only
 wires the parser, matching the split used by the other CLI families.
 """
 from __future__ import annotations
 
-from mozyo_bridge.application.commands_state import (
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.commands_state import (
     cmd_state_cleanup,
     cmd_state_inspect,
     cmd_state_migrate,

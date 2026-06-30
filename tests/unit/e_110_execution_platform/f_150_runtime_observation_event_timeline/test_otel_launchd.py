@@ -21,7 +21,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application import otel_launchd
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import otel_launchd
 
 
 def ok_result(stdout: str = ""):
@@ -67,7 +67,7 @@ class RenderPlistTest(unittest.TestCase):
 
     def test_no_host_argument_keeps_loopback_default(self) -> None:
         with patch(
-            "mozyo_bridge.application.otel_launchd.shutil.which",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.shutil.which",
             return_value="/opt/bin/mozyo-bridge",
         ):
             command = otel_launchd.resolve_serve_command(port=43999)
@@ -82,7 +82,7 @@ class RenderPlistTest(unittest.TestCase):
         import io
 
         with patch(
-            "mozyo_bridge.application.otel_launchd.shutil.which",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.shutil.which",
             return_value=None,
         ), contextlib.redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit):
@@ -104,13 +104,13 @@ class LaunchctlCommandTest(unittest.TestCase):
             return ok_result()
 
         with patch(
-            "mozyo_bridge.application.otel_launchd.shutil.which",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.shutil.which",
             return_value="/opt/bin/mozyo-bridge",
         ), patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             side_effect=fake_run,
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             result = otel_launchd.install(home=self.home)
@@ -130,13 +130,13 @@ class LaunchctlCommandTest(unittest.TestCase):
 
     def test_install_is_idempotent(self) -> None:
         with patch(
-            "mozyo_bridge.application.otel_launchd.shutil.which",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.shutil.which",
             return_value="/opt/bin/mozyo-bridge",
         ), patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             return_value=ok_result(),
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             otel_launchd.install(home=self.home)
@@ -158,10 +158,10 @@ class LaunchctlCommandTest(unittest.TestCase):
         bystander = plist_file.parent / "some.other.agent.plist"
         bystander.write_bytes(b"untouched")
         with patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             side_effect=fake_run,
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             result = otel_launchd.uninstall(home=self.home)
@@ -181,10 +181,10 @@ class LaunchctlCommandTest(unittest.TestCase):
             return ok_result()
 
         with patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             side_effect=fake_run,
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             otel_launchd.restart()
@@ -205,10 +205,10 @@ class LaunchctlCommandTest(unittest.TestCase):
             return ok_result("state = running\n\tpid = 4242\n")
 
         with patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             side_effect=fake_run,
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             payload = otel_launchd.status(home=self.home)
@@ -225,10 +225,10 @@ class LaunchctlCommandTest(unittest.TestCase):
             )()
 
         with patch(
-            "mozyo_bridge.application.otel_launchd.subprocess.run",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.subprocess.run",
             side_effect=fake_run,
         ), patch(
-            "mozyo_bridge.application.otel_launchd.os.getuid",
+            "mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_launchd.os.getuid",
             return_value=501,
         ):
             payload = otel_launchd.status(home=self.home)

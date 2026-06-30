@@ -21,16 +21,16 @@ Boundary, kept enforced in code and pinned by tests
   that action looks currently available, but it is **not** a permission and never
   performs a side effect. Each preview carries ``live_preflight_required=True``:
   executing the named action still routes through the established action-time live
-  preflight in :mod:`mozyo_bridge.application.cockpit_ui`
-  (:func:`~mozyo_bridge.application.cockpit_ui.grouped_reveal` /
-  :func:`~mozyo_bridge.application.cockpit_ui.grouped_jump` ->
-  :func:`~mozyo_bridge.application.cockpit_ui._resolve_unit_target`), which
+  preflight in :mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui`
+  (:func:`~mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui.grouped_reveal` /
+  :func:`~mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui.grouped_jump` ->
+  :func:`~mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui._resolve_unit_target`), which
   re-resolves the candidate identity against a *fresh* inventory and fails closed
   on every uncertainty. This projection can only *refuse* (fail closed), never
   *permit*.
 - **Stale / contradictory / ambiguous -> unavailable.** Availability is derived
   from the displayed row alone and is fail-closed, mirroring the refusal gates of
-  :func:`~mozyo_bridge.application.cockpit_ui.candidate_unit_selector` /
+  :func:`~mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui.candidate_unit_selector` /
   ``_resolve_unit_target`` as a preview: a degraded row (``needs_reload`` — stale /
   unreadable / contradicted / identity_conflict / desired_unit_missing / partial /
   unknown), a non-local ``host_id``, or a row with no observed live role pane
@@ -45,7 +45,7 @@ Boundary, kept enforced in code and pinned by tests
   which is why ``live_preflight_required`` is always set. The live, non-mutating
   counterpart that actually re-queries the inventory (and so can observe
   ambiguity) is
-  :func:`~mozyo_bridge.application.cockpit_ui.grouped_action_preview`.
+  :func:`~mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_ui.grouped_action_preview`.
 - **Public-safe only.** The detail carries the row's public-safe identity
   (``workspace_id`` / ``lane_id`` / ``host_id``), display label, status /
   freshness tokens, and observed role *names* — never a pane id / target, repo
@@ -62,7 +62,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.application.cockpit_actions import DEFAULT_HOST
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import DEFAULT_HOST
 from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import ROLE_CLAUDE, ROLE_CODEX
 from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_display import ROLE_DISPLAY_ORDER
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import UnitView

@@ -26,13 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from mozyo_bridge.application import (
     cli,
-    cli_agents,
-    cli_cockpit,
-    cli_handoff,
-    cli_observability,
     cli_runtime_config,
-    cli_session,
 )
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import cli_session
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import cli_agents
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import cli_handoff
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import cli_observability
+from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import cli_cockpit
 from mozyo_bridge.application.cli import build_parser
 
 

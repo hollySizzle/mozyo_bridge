@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.attention_projection import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection import (
     ATTENTION_OPTION_NAMES,
     ATTENTION_REASON_OPTION,
     ATTENTION_SEVERITY_OPTION,
@@ -28,7 +28,7 @@ from mozyo_bridge.application.attention_projection import (
     ATTENTION_UPDATED_AT_OPTION,
     build_attention_option_plan,
 )
-from mozyo_bridge.application.tmux_attention_presentation_provider import (
+from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.tmux_attention_presentation_provider import (
     PROVIDER_NAME,
     TMUX_ATTENTION_PRESENTATION_PROVIDER,
     TmuxAttentionPresentationProvider,

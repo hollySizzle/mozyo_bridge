@@ -1,6 +1,6 @@
 """Pane-centric cockpit action + preflight-bridge tests (Redmine #12323 split).
 
-Focused on :mod:`mozyo_bridge.application.cockpit_actions`: the side-effecting
+Focused on :mod:`mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions`: the side-effecting
 ``reveal_in_finder`` / ``jump_to_unit`` actions and their action-time live
 preflight (``_resolve_record`` / ``_pick_attached_client``) — structured argv,
 stale-safe failure, attached-client selection with control-mode demotion. Split
@@ -21,7 +21,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.application.cockpit_actions import (
+from mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions import (
     CockpitActionError,
     jump_to_unit,
     reveal_in_finder,
@@ -29,7 +29,7 @@ from mozyo_bridge.application.cockpit_actions import (
 
 # reveal_in_finder calls subprocess.run / sys.platform inside cockpit_actions, so
 # patch those names on that module.
-COCKPIT_ACTIONS = "mozyo_bridge.application.cockpit_actions"
+COCKPIT_ACTIONS = "mozyo_bridge.e_120_operations_cockpit.f_130_cockpit_actions_preflight.application.cockpit_actions"
 
 
 def pane(pane_id: str, session: str, agent: str, cwd: str = "") -> dict:

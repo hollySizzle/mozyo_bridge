@@ -264,7 +264,7 @@ class CockpitUnitsRedmineFieldTest(unittest.TestCase):
         import threading
         import urllib.request as urlreq
 
-        from mozyo_bridge.application.otel_receiver import build_server
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import build_server
 
         import os
 

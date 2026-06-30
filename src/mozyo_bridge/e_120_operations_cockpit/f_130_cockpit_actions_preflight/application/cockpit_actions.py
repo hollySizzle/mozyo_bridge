@@ -2,8 +2,8 @@
 
 Split out of ``cockpit_ui`` (Redmine #12323) so the side-effecting actions and
 their action-time live preflight no longer share a module with UI rendering
-(:mod:`mozyo_bridge.application.cockpit_page`) or the read-only served-API
-payload assembly (:mod:`mozyo_bridge.application.cockpit_payload`). This module
+(:mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_page`) or the read-only served-API
+payload assembly (:mod:`mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload`). This module
 owns the action permission surface only: it re-resolves a pane / candidate Unit
 against a FRESH runtime inventory at action time and fails closed on every
 uncertainty, then performs the structured ``open`` / ``switch-client`` side

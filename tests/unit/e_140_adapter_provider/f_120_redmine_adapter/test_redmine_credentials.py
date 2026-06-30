@@ -222,7 +222,7 @@ class ReceiverWiringTest(unittest.TestCase):
     receiver's Redmine cache, and the key never reaches the served payload."""
 
     def test_build_server_reads_credential_file_without_env(self) -> None:
-        from mozyo_bridge.application.otel_receiver import build_server
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import build_server
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"

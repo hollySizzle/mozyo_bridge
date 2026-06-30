@@ -18,7 +18,7 @@ command connects that decision to the live metadata stamping + a replayable
 ``## Grandchild lane realization`` durable record.
 
 Safe by default and faithful to the projection-cache posture
-(``mozyo_bridge.application.attention_projection`` precedent):
+(``mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application.attention_projection`` precedent):
 
 - **Preview unless ``--apply``.** Default prints the exact ``set-option`` plan +
   the realization record and mutates no tmux. ``--apply`` performs the writes
