@@ -430,6 +430,7 @@ documents:
       - logic-plugin-ready-adapter-boundary
       - logic-module-health-gate
       - logic-coordinator-sublane-development-flow
+      - logic-shared-kernel-freeze
       - spec-bounded-context-map
       - spec-project-map
 
@@ -460,7 +461,21 @@ documents:
       - logic-runtime-observability-boundary
       - logic-coordinator-sublane-development-flow
       - logic-module-health-gate
+      - logic-shared-kernel-freeze
       - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-shared-kernel-freeze
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/shared-kernel-freeze.md
+    purpose: "src/mozyo_bridge/shared/** を frozen kernel として固定し utility dump 増殖を止める設計正本 (Redmine #12640 / Version #276)。frozen set (errors.py / paths.py / name_compat.py) と「bounded context へ upward import しない」kernel 不変条件、errors/paths を foundational kernel として確定残置・name_compat を candidate owner core/state 付き residual とする per-module 配置判断、test_shared_kernel_freeze.py による enforceable guardrail と catalog relation、新 concern を shared でなく bounded context / core/state へ置く規約を定義する。"
+    audit_role: shared_kernel_freeze_logic
+    related_document_refs:
+      - logic-object-oriented-architecture-policy
+      - logic-source-layout-bounded-context-migration
+      - logic-fallback-retirement-ledger
+      - spec-bounded-context-map
       - spec-project-map
 
   - id: logic-runtime-observability-boundary
