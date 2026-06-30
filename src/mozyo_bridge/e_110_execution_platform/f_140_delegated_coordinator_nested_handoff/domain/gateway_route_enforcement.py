@@ -314,6 +314,42 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     )
 
 
+def render_block_die_message(decision: GatewayRouteDecision, lane_id: object) -> str:
+    """The fail-closed CLI ``die`` message for a blocked governed delivery (pure).
+
+    Kept here (not inline in ``orchestrate_handoff``) so the command surface holds
+    only the thin wiring and the gateway-route prose lives with its policy. Names
+    the governed route, the (public-safe) target lane, the suggested safe route,
+    and the explicit durable exception.
+    """
+    lane = _norm(lane_id) or "<unknown>"
+    return (
+        f"gateway route enforcement (Redmine #12918): a {_norm(decision.kind)!r} "
+        f"addressed directly to the Claude worker in lane {lane!r} bypasses that "
+        "lane's Codex gateway. The governed route is coordinator -> sublane Codex "
+        "gateway -> same-lane Claude worker. "
+        f"{decision.suggested_safe_route} If a bypass is genuinely required, re-run "
+        "with the explicit durable exception `--allow-direct-worker` (recorded "
+        "distinctly as a gateway_route_exception)."
+    )
+
+
+def render_exception_advisory(decision: GatewayRouteDecision, lane_id: object) -> str:
+    """The stderr advisory recording an admitted explicit-exception delivery (pure).
+
+    Emitted when ``--allow-direct-worker`` releases the block so the cross-lane
+    worker delivery is recorded distinctly from the normal governed route.
+    """
+    lane = _norm(lane_id) or "<unknown>"
+    return (
+        "gateway route enforcement (Redmine #12918): explicit durable exception "
+        f"applied — {_norm(decision.kind)!r} delivered directly to the cross-lane "
+        f"Claude worker in lane {lane!r} via `--allow-direct-worker`, bypassing the "
+        "lane's Codex gateway. Record this exception distinctly from the normal "
+        "governed route."
+    )
+
+
 __all__ = (
     "GATEWAY_GOVERNED_KINDS",
     "ROUTE_ALLOWED",
@@ -323,4 +359,6 @@ __all__ = (
     "GatewayRouteRequest",
     "GatewayRouteDecision",
     "decide_gateway_route",
+    "render_block_die_message",
+    "render_exception_advisory",
 )

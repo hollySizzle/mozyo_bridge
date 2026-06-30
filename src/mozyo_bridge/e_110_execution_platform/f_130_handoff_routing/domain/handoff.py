@@ -31,6 +31,14 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     ticketless_work_intake_lines,
 )
 
+# Redmine #12918: the gateway-route-blocked structured-outcome wording lives in a
+# small f_130 sibling so this oversized module does not grow inline prose for the
+# new reason (the policy is in the f_140 enforcement module, uncyclable from here).
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
+    GATEWAY_ROUTE_BLOCKED_NARRATIVE,
+    GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
+)
+
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
@@ -988,24 +996,10 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
             ),
         )
     if reason == "gateway_route_blocked":
-        # Redmine #12918: a governed implementation_request / review_result was
-        # addressed directly to a cross-lane Claude worker, bypassing that lane's
-        # Codex gateway. The safe route is the governed hop chain: send to the
-        # target lane's Codex gateway and let it perform the same-lane Claude
-        # handoff. An explicit durable exception (`--allow-direct-worker`) is the
-        # only override and is recorded distinctly from the normal route.
-        return (
-            "sender",
-            (
-                "route the implementation_request / review_result through the "
-                "target lane's Codex gateway (`--to codex` to that lane's gateway "
-                "pane), and let the gateway perform the same-lane Claude worker "
-                "handoff. A direct coordinator-to-sublane-worker send is blocked; "
-                "if a bypass is genuinely required, re-run with the explicit "
-                "durable exception `--allow-direct-worker` (recorded distinctly "
-                "from the normal route)."
-            ),
-        )
+        # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
+        # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
+        # in the f_140 enforcement module, which handoff cannot import back).
+        return "sender", GATEWAY_ROUTE_BLOCKED_NEXT_ACTION
     return "sender", "inspect handoff failure and decide the next step"
 
 
@@ -1277,15 +1271,7 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
             "handoff aborted before typing. No notification was typed."
         )
     if reason == "gateway_route_blocked":
-        return (
-            "Gateway Route Enforcement gate (Redmine #12918): a governed "
-            "implementation_request / review_result was addressed directly to a "
-            "Claude worker in a different lane than the sender, bypassing that "
-            "lane's Codex gateway. The governed route is coordinator -> sublane "
-            "Codex gateway -> same-lane Claude worker; the direct coordinator-to-"
-            "worker send fails closed. Handoff aborted before typing; no "
-            "notification was typed."
-        )
+        return GATEWAY_ROUTE_BLOCKED_NARRATIVE
     return "Handoff did not deliver; see structured outcome for details."
 
 
