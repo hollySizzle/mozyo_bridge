@@ -85,6 +85,22 @@ Version 内 open leaf issue listing は #12651 で操作手段を確定する対
 retirement cleanup はそこへ残す。Redmine subject も日本語を基本にし、固定フィールド名、
 CLI 名、コード識別子、固有 provider 名だけを literal token として残す。
 
+Version bucket は、機能分類より **並列実行と衝突制御** を優先して切る。管制塔が roadmap を
+組み直すときは、各 issue を次の観点で bucket へ割り当てる。
+
+- 同じ file / module / command surface を触る issue は同じ conflict bucket に寄せる。
+- 同じ runtime invariant、route identity、handoff rail、cockpit projection、workflow state を
+  触る issue は同じ execution bucket に寄せ、merge order を Redmine に残す。
+- OOP-first decomposition、workflow runtime、Redmine event watcher、role/provider binding のように
+  依存はあるが file surface が薄いものは、別 bucket に分けて並列 lane 候補にする。
+- Smoke / acceptance / real-machine rerun は run window bucket に分ける。実装 blocker と同じ
+  Version に置かず、blocker が green になった後に実行する。
+- 親 UserStory が umbrella で複数 bucket にまたがる場合は、親の fixed_version を正本にしない。
+  子 issue の fixed_version を execution bucket として読み、親には umbrella / cross-bucket である
+  ことを記録する。
+- Version 付け替えを行う場合は、移動先、理由、並列化または conflict 制御上の意図、smoke / acceptance
+  への影響を移動元または関連 issue の journal に残す。
+
 1. #12670 `ワークフローのレーン所有と遷移関数レジストリを設計する`
    - PlantUML sequence、lane registry、transition function contract を固定する。
    - lane owner は pane id ではなく workflow role / route identity で表す。
@@ -542,7 +558,7 @@ deactivate Coordinator
 
 ## US close と Version close
 
-US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。ここでの Version は Redmine planning bucket / acceptance bundle であり、package release 番号の決定ではない。package release 番号、tag、publish scope は release gate へ渡して別に決める。
+US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。ここでの Version は Redmine planning bucket / execution bucket / conflict bucket / acceptance bundle であり、package release 番号の決定ではない。package release 番号、tag、publish scope は release gate へ渡して別に決める。
 
 US close / Version readiness / session retrospective の前に、管制塔は `$backlog_reconciliation()` を実行する。目的は backlog を綺麗に保つことではなく、owner intent が durable record から消えないことを優先することである。特に、owner が将来機能、未決判断、標準化、配布形態、責務境界について述べた場合、実装しない判断でも未記録のまま scope 外として閉じない。
 
