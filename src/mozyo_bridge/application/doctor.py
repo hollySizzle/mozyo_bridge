@@ -17,7 +17,6 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from mozyo_bridge.application import tmux_ui as tmux_ui_module
 from mozyo_bridge.application.doctor_claude_nagger import (
     ClaudeNaggerSectionUseCase,
     LiveClaudeNaggerReads,
@@ -45,6 +44,10 @@ from mozyo_bridge.application.doctor_rules import (
 from mozyo_bridge.application.doctor_scaffold import (
     LiveScaffoldReads,
     ScaffoldSectionUseCase,
+)
+from mozyo_bridge.application.doctor_tmux_ui import (
+    LiveTmuxUiArtifactReads,
+    TmuxUiArtifactSectionUseCase,
 )
 from mozyo_bridge.application.doctor_health import (
     LiveDoctorSections,
@@ -423,60 +426,20 @@ def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:
     Host wiring is independent of the artifact landing — operators
     may have the artifact installed but choose not to wire it (the
     snippet works just as well via per-session ``source-file``).
+
+    The collector's three responsibilities — the external read of the scaffold
+    manifest + the on-disk snippet probe + the host tmux config wiring state, the
+    verdict authority (``skipped`` / ``ok`` / ``incomplete`` + the artifact and
+    host-wiring next_action guidance), and the legacy section dict assembly — now
+    live behind the typed boundary in ``doctor_tmux_ui`` (#12866).
+    ``LiveTmuxUiArtifactReads`` drives the read through the ``doctor`` /
+    ``tmux_ui`` modules at call time (the ``_scaffold_manifest_files`` manifest
+    reader and the ``TMUX_UI_*`` layout constants),
+    ``TmuxUiArtifactSectionUseCase`` applies the pure
+    ``evaluate_tmux_ui_artifact_section`` policy, and the legacy section dict is
+    preserved byte-for-byte.
     """
-    tracked = _scaffold_manifest_files(target)
-    is_tracked = TMUX_UI_MANIFEST_PATH in tracked
-    snippet_path = target / TMUX_UI_RELATIVE_PATH
-    present = snippet_path.exists()
-    next_action: list[str] = []
-    if not is_tracked:
-        status = "skipped"
-        next_action.append(
-            "tmux UI helper is opt-out (manifest does not track agent-ui.conf); "
-            f"rerun `mozyo-bridge scaffold apply <preset> --target {target}` "
-            "without --skip-tmux-ui to install the snippet"
-        )
-    elif present:
-        status = "ok"
-    else:
-        status = "incomplete"
-        next_action.append(
-            f"manifest tracks {snippet_path} but the file is missing; "
-            "rerun scaffold apply --backup to restore"
-        )
-
-    host_conf = tmux_ui_module.default_host_tmux_conf()
-    host_wiring = tmux_ui_module.compute_status(target, host_conf)
-    wiring_actions: list[str] = []
-    if is_tracked and present:
-        if host_wiring["state"] == tmux_ui_module.STATE_NOT_INSTALLED:
-            wiring_actions.append(
-                "host tmux config does not source agent-ui.conf; run "
-                f"`mozyo-bridge tmux-ui install --target {target}` to wire it"
-            )
-        elif host_wiring["state"] == tmux_ui_module.STATE_DRIFT:
-            wiring_actions.append(
-                "host tmux config has a managed block pointing elsewhere "
-                f"({host_wiring.get('drift_reason')}); rerun "
-                f"`mozyo-bridge tmux-ui install --target {target} --force` to refresh"
-            )
-
-    return {
-        "status": status,
-        "path": str(snippet_path),
-        "present": present,
-        "manifest_tracks_tmux_ui": is_tracked,
-        "host_wiring": {
-            "state": host_wiring["state"],
-            "tmux_conf": host_wiring["tmux_conf"],
-            "tmux_conf_exists": host_wiring["tmux_conf_exists"],
-            "current_source_path": host_wiring["current_source_path"],
-            "expected_snippet": host_wiring["expected_snippet"],
-            "drift_reason": host_wiring["drift_reason"],
-            "next_action": wiring_actions,
-        },
-        "next_action": next_action,
-    }
+    return TmuxUiArtifactSectionUseCase(LiveTmuxUiArtifactReads(target)).execute()
 
 
 def doctor_claude_launch_policy_section() -> dict[str, Any]:
