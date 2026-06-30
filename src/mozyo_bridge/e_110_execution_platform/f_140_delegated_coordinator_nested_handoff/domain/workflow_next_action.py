@@ -50,9 +50,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
-    ROLE_CLAUDE,
-    ROLE_CODEX,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
+    format_role_via_provider,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
     ACTION_AGGREGATE_OWNER_APPROVAL,
@@ -68,10 +68,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_RESOLVE_BLOCKER,
     ACTION_RESOLVE_OWNER_OR_RELEASE_GATE,
     ACTION_RETIRE_LANE,
-    ROLE_AUDITOR,
-    ROLE_COORDINATOR,
-    ROLE_IMPLEMENTER,
-    ROLE_OWNER,
     WorkflowRuntimeState,
 )
 
@@ -163,21 +159,15 @@ _ROUTING_ACTIONS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Owner-role -> expected runtime provider for route selection. The next action's
 # ``owner_role`` is an abstract workflow role; a persisted route identity carries a
-# concrete provider (``codex`` / ``claude``). A lane usually has BOTH a gateway
+# concrete provider (``codex`` / ``claude`` / ...). A lane usually has BOTH a gateway
 # (codex) route and a worker (claude) route, so a route must be chosen by who owns
-# the action, not by an arbitrary key order. This is the MVP default binding
-# (gateway/coordination/audit -> codex, implementation -> claude); making it
-# config-driven is #12673. A route whose provider does not match the expected
-# provider for the owner is NOT selected — the action fails closed rather than
-# pointing at the wrong lane member (review j#68908 finding 1).
-_OWNER_ROLE_EXPECTED_PROVIDER: dict[str, str] = {
-    ROLE_COORDINATOR: ROLE_CODEX,
-    ROLE_AUDITOR: ROLE_CODEX,
-    ROLE_OWNER: ROLE_CODEX,
-    ROLE_IMPLEMENTER: ROLE_CLAUDE,
-}
-
-
+# the action, not by an arbitrary key order. The role -> provider map is no longer a
+# private dict here: it is the config-driven #12673
+# :class:`~...domain.role_provider_binding.RoleProviderBinding`, whose ``default()`` is
+# the same compatibility map (gateway/coordination/audit/owner -> codex, implementation
+# -> claude). A route whose provider does not match the binding's expected provider for
+# the owner is NOT selected — the action fails closed rather than pointing at the wrong
+# lane member (review j#68908 finding 1).
 @dataclass(frozen=True)
 class RouteCandidate:
     """One persisted route for a lane: its provider role + public-safe pointer.
@@ -193,30 +183,35 @@ class RouteCandidate:
     pointer: str
 
 
-def expected_provider_for(owner_role: str) -> str | None:
+def expected_provider_for(
+    owner_role: str, *, binding: RoleProviderBinding | None = None
+) -> str | None:
     """The runtime provider a workflow ``owner_role`` is expected to resolve to (pure).
 
-    Returns ``codex`` / ``claude`` for a known owner role, or ``None`` when the role has
-    no expected provider binding. Exposes the MVP role->provider map (config-driven binding
-    is #12673) so a sibling policy — e.g. the #12672 event watcher's stricter,
-    ambiguity-aware route selection — reuses the *same* binding rather than duplicating it
-    and drifting from it.
+    Returns the provider (``codex`` / ``claude`` / a rebound surface) for a known owner
+    role under ``binding`` (the #12673 :class:`~...domain.role_provider_binding.RoleProviderBinding`,
+    defaulting to the compatibility default), or ``None`` when the role has no binding.
+    Exposes the single role->provider binding so a sibling policy — e.g. the #12672 event
+    watcher's stricter, ambiguity-aware route selection — reuses the *same* binding rather
+    than duplicating it and drifting from it.
     """
-    return _OWNER_ROLE_EXPECTED_PROVIDER.get(owner_role)
+    return (binding or RoleProviderBinding.default()).provider_for(owner_role)
 
 
 def _resolve_route(
-    action: str, owner_role: str, candidates: Sequence[RouteCandidate]
+    owner_role: str,
+    candidates: Sequence[RouteCandidate],
+    binding: RoleProviderBinding,
 ) -> str:
     """Select the route pointer for a routing action, fail-closed (pure).
 
     Returns the public pointer of the most-recently-recorded candidate whose provider
-    matches the owner_role's expected provider; returns ``""`` (unresolved) when the
-    owner has no expected provider, or no candidate matches it. An unresolved routing
-    action is failed closed by :func:`derive_workflow_next_action`. Non-routing actions
-    never call this.
+    matches the owner_role's bound provider; returns ``""`` (unresolved) when the owner
+    has no bound provider, or no candidate matches it. An unresolved routing action is
+    failed closed by :func:`derive_workflow_next_action`. Non-routing actions never call
+    this.
     """
-    expected = _OWNER_ROLE_EXPECTED_PROVIDER.get(owner_role)
+    expected = binding.provider_for(owner_role)
     if expected is None:
         return ""
     matching = [c for c in candidates if c.provider_role == expected]
@@ -252,7 +247,11 @@ class WorkflowNextAction:
 
     ``action`` / ``owner_role`` / ``target_issue`` / ``reason`` are carried straight
     from the #12857 :class:`~...domain.workflow_runtime.NextAction` (the decision
-    authority). ``route_identity`` is the **public-safe** stable route pointer of the
+    authority). ``owner_role`` stays the role-canonical owner; ``provider`` is the
+    concrete runtime surface that role binds to under the #12673 binding (``codex`` /
+    ``claude`` / a rebound surface, or ``""`` when the role has no binding) — the two are
+    kept as separate fields so the workflow state is role-canonical and never
+    provider-fixed. ``route_identity`` is the **public-safe** stable route pointer of the
     target lane (no pane id); ``anchor`` is the durable Redmine pointer; the remaining
     fields are this module's risk / confirmation / fail-closed enrichment.
     """
@@ -267,16 +266,23 @@ class WorkflowNextAction:
     requires_confirmation: bool
     blocked_reason: str
     reason: str
+    provider: str = ""
 
     @property
     def is_blocked(self) -> bool:
         """True when a fail-closed ``blocked_reason`` is set."""
         return bool(self.blocked_reason)
 
+    @property
+    def role_provider(self) -> str:
+        """``"<owner_role> via <provider>"`` display (role + provider together, #12673)."""
+        return format_role_via_provider(self.owner_role, self.provider)
+
     def as_payload(self) -> dict[str, object]:
         return {
             "action": self.action,
             "owner_role": self.owner_role,
+            "provider": self.provider,
             "target_issue": self.target_issue,
             "route_identity": self.route_identity,
             "anchor": self.anchor,
@@ -293,6 +299,7 @@ def derive_workflow_next_action(
     *,
     issue_routes: Mapping[str, Sequence[RouteCandidate]] | None = None,
     issue_anchors: Mapping[str, str] | None = None,
+    binding: RoleProviderBinding | None = None,
 ) -> WorkflowNextAction:
     """Enrich the #12857 overall next action into a command-result ``next_action`` (pure).
 
@@ -300,30 +307,37 @@ def derive_workflow_next_action(
     (each a provider role + public-safe pointer, in recorded order; never a pane id).
     ``issue_anchors`` maps a lane's issue id to its durable Redmine anchor
     (``issue:journal``). Both default to empty — a caller with no persisted route / anchor
-    still gets a well-formed (if route-blocked) next action.
+    still gets a well-formed (if route-blocked) next action. ``binding`` is the #12673
+    role->provider binding the routing/display resolve through; it defaults to
+    :meth:`RoleProviderBinding.default` so existing ``codex`` / ``claude`` operation is
+    unchanged, and a caller can rebind a role to a different runtime surface without the
+    state itself becoming provider-fixed.
 
     For a lane-targeted **routing** action, the route is selected by the action's
-    ``owner_role`` (:func:`_resolve_route`: the most-recent provider-matching candidate),
-    never by an arbitrary key order, so an auditor/coordinator action is never pointed at a
-    worker route. The risk / confirmation / suggested-command come from
-    :func:`risk_policy_for`; a routing action whose route does not resolve (no candidate,
-    or none matching the owner's provider) is escalated to ``requires_confirmation=True``
-    with :data:`BLOCKED_ROUTE_IDENTITY_UNRESOLVED` and at least :data:`RISK_HIGH`
-    (fail-closed: never deliver to an unknown / mismatched live target).
+    ``owner_role`` resolved through ``binding`` (:func:`_resolve_route`: the most-recent
+    provider-matching candidate), never by an arbitrary key order, so an auditor/coordinator
+    action is never pointed at a worker route. The risk / confirmation / suggested-command
+    come from :func:`risk_policy_for`; a routing action whose route does not resolve (no
+    candidate, or none matching the owner's bound provider) is escalated to
+    ``requires_confirmation=True`` with :data:`BLOCKED_ROUTE_IDENTITY_UNRESOLVED` and at
+    least :data:`RISK_HIGH` (fail-closed: never deliver to an unknown / mismatched live
+    target).
     """
     routes = issue_routes or {}
     anchors = issue_anchors or {}
+    active_binding = binding or RoleProviderBinding.default()
     nxt = state.next_action
 
     risk, confirm, suggested, blocked = risk_policy_for(nxt.action)
 
     target = nxt.target_issue
     anchor = anchors.get(target, "") if target else ""
+    provider = active_binding.provider_for(nxt.owner_role) or ""
 
     route_identity = ""
     if target and nxt.action in _ROUTING_ACTIONS:
         route_identity = _resolve_route(
-            nxt.action, nxt.owner_role, routes.get(target, ())
+            nxt.owner_role, routes.get(target, ()), active_binding
         )
         # Fail closed when a lane-targeted routing action has no resolved live route.
         if not blocked and not route_identity:
@@ -342,6 +356,7 @@ def derive_workflow_next_action(
         requires_confirmation=confirm,
         blocked_reason=blocked,
         reason=nxt.reason,
+        provider=provider,
     )
 
 
@@ -382,6 +397,8 @@ def render_command_result_text(result: WorkflowCommandResult) -> str:
     lines = [
         f"next_action: {na.action}",
         f"owner_role: {na.owner_role}",
+        f"provider: {na.provider or '<unbound>'}",
+        f"role_provider: {na.role_provider}",
         f"target_issue: {na.target_issue or '<none>'}",
         f"route_identity: {na.route_identity or '<unresolved>'}",
         f"anchor: {na.anchor or '<none>'}",
@@ -428,6 +445,8 @@ def render_command_result_journal(result: WorkflowCommandResult) -> str:
         "",
         f"- action: {na.action}",
         f"- owner_role: {na.owner_role}",
+        f"- provider: {na.provider or 'unbound'}",
+        f"- role_provider: {na.role_provider}",
         f"- target_issue: {na.target_issue or 'none'}",
         f"- route_identity: {na.route_identity or 'unresolved'}",
         f"- anchor: {na.anchor or 'none'}",
