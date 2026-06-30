@@ -184,6 +184,61 @@ class JsonAndParseTest(_StoreCase):
             parser.parse_args(["workflow", "watch", "--marker", "12672:1:frobnicate"])
 
 
+class RedmineSourceTest(_StoreCase):
+    """`workflow watch --redmine-json` reads Redmine journal history (review j#68992 fix)."""
+
+    def _write_issue_json(self) -> str:
+        payload = {
+            "issue": {"id": "12672"},
+            "journals": [
+                {"id": "68978", "notes": "## Start\nno structured marker here"},
+                {
+                    "id": "68989",
+                    "notes": (
+                        "## Implementation Done / Review Request\n"
+                        "[mozyo:handoff:source=redmine:issue=12672:journal=68989:"
+                        "kind=review_request:to=codex]"
+                    ),
+                },
+                {"id": "69200", "notes": "field-only prose mentioning review, no marker"},
+            ],
+        }
+        path = Path(self._tmp.name) / "issue.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_redmine_json_extracts_structured_markers_only(self):
+        rc, out = _run(
+            [
+                "workflow", "watch",
+                "--redmine-json", self._write_issue_json(),
+                "--store-path", self.store_path,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        # Only the journal carrying a structured marker is ingested; the prose-only
+        # journals (68978, 69200) yield nothing (no natural-language parse).
+        self.assertIn("redmine:12672:68989 review_request -> accepted", out)
+        self.assertNotIn("redmine:12672:68978", out)
+        self.assertNotIn("redmine:12672:69200", out)
+        self.assertIn("accepted: 1", out)
+
+    def test_redmine_json_persists_for_resume(self):
+        path = self._write_issue_json()
+        _run(["workflow", "watch", "--redmine-json", path, "--store-path", self.store_path])
+        store = WorkflowRuntimeStore(path=Path(self.store_path))
+        self.assertEqual([r.event_id for r in store.read_events()], ["redmine:12672:68989"])
+
+    def test_redmine_json_dedup_on_rerun(self):
+        path = self._write_issue_json()
+        _run(["workflow", "watch", "--redmine-json", path, "--store-path", self.store_path])
+        rc, out = _run(
+            ["workflow", "watch", "--redmine-json", path, "--store-path", self.store_path]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted: 0 suppressed: 1", out)
+
+
 class PaneIdNeverEmittedTest(_StoreCase):
     def test_pane_id_is_not_in_output(self):
         rc, out = _run(

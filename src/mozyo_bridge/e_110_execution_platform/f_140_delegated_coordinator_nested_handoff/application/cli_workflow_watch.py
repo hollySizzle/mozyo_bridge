@@ -55,6 +55,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_intake_journal,
     render_intake_text,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
+    markers_from_source,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_next_action import (
     RouteCandidate,
 )
@@ -212,6 +216,32 @@ def _parse_route_identity(spec: str) -> dict:
     return record
 
 
+def _markers_from_redmine_json(args: argparse.Namespace) -> tuple[JournalMarker, ...]:
+    """Read structured gate markers from a fetched Redmine issue-detail JSON snapshot.
+
+    ``--redmine-json`` points at the ``/issues/<id>.json?include=journals`` (or MCP
+    ``get_issue_detail``) payload an operator / MCP already fetched — the Redmine event
+    source. The :class:`MappingRedmineJournalSource` reads its journal entries and
+    :func:`markers_from_source` extracts the structured ``[mozyo:...]`` gate markers (never
+    prose) into :class:`JournalMarker` inputs, so a Redmine-recorded review_request /
+    review_result / implementation_done becomes a pending action. Absent the flag, returns
+    ``()`` and the watcher ingests only explicit ``--marker`` specs.
+    """
+    raw = (getattr(args, "redmine_json", None) or "").strip()
+    if not raw:
+        return ()
+    payload = _json.loads(Path(raw).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(
+            f"--redmine-json {raw!r} must contain a Redmine issue-detail object "
+            "(an issues.json / get_issue_detail payload), not a "
+            f"{type(payload).__name__}"
+        )
+    source = MappingRedmineJournalSource(payload=payload)
+    issue_id = (getattr(args, "source_issue", None) or "").strip()
+    return markers_from_source(source, issue_id)
+
+
 def _store_from_args(args: argparse.Namespace) -> WorkflowRuntimeStore:
     """Build the live store from ``--store-path`` (test/debug) or the home default."""
     raw = (getattr(args, "store_path", None) or "").strip()
@@ -320,7 +350,10 @@ def cmd_workflow_watch(args: argparse.Namespace) -> int:
     markdown with ``--journal``. Never sends; always returns 0 (the result is a record).
     """
     store = _store_from_args(args)
-    markers = tuple(getattr(args, "marker", None) or ())
+    # Redmine-sourced structured markers (the event source) first, then explicit --marker
+    # specs (debug / supplemental); both feed the same intake. Duplicate anchors across the
+    # two are deduplicated by the intake's redmine:<issue>:<journal> suppression.
+    markers = _markers_from_redmine_json(args) + tuple(getattr(args, "marker", None) or ())
     routes = list(getattr(args, "route_identity", None) or ())
     outcome = evaluate_intake_from_store(store, markers, extra_route_records=routes)
 
@@ -350,9 +383,12 @@ def register_watch(workflow_sub) -> None:
         "watch",
         description=(
             "Ingest structured Redmine journal markers into a pending workflow action "
-            "(Redmine #12672). Reads the durable journal markers of each lane "
-            "(--marker ISSUE:JOURNAL:GATE[,conclusion=,callback=,commit=,integrated=,"
-            "open=,blocker=], repeatable; the gate accepts the alias review_result), keys "
+            "(Redmine #12672). Reads the Redmine event source two ways: --redmine-json "
+            "scans a fetched issue-detail snapshot's journal entries for structured "
+            "[mozyo:...] gate markers (the durable history), and --marker supplies an "
+            "explicit/debug ISSUE:JOURNAL:GATE[,conclusion=,callback=,commit=,integrated=,"
+            "open=,blocker=] spec (repeatable; the gate accepts the alias review_result); "
+            "both feed the same intake. The watcher keys "
             "each by the durable redmine:<issue>:<journal> anchor, and folds the recorded "
             "+ newly accepted events into workflow.state + the enriched "
             "workflow.next_action — reporting it as a pending action (ready / "
@@ -369,6 +405,31 @@ def register_watch(workflow_sub) -> None:
             "Advisory: ingest structured Redmine journal markers (deduped by "
             "redmine:<issue>:<journal>) into a pending workflow action. Records a "
             "failed pending state for a missing/ambiguous route; never sends."
+        ),
+    )
+    watch.add_argument(
+        "--redmine-json",
+        dest="redmine_json",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Read the Redmine event source: a fetched issue-detail JSON snapshot "
+            "(issues.json?include=journals / get_issue_detail shape) whose journal entries "
+            "are scanned for structured [mozyo:handoff|workflow-event:...] gate markers and "
+            "converted into pending actions. Structured markers only — note prose is never "
+            "parsed; a journal with no recognized marker yields nothing. Combine with "
+            "--source-issue to set the issue id when the payload omits it. The live "
+            "credentialed auto-poll adapter is a follow-up; this reads a supplied snapshot."
+        ),
+    )
+    watch.add_argument(
+        "--source-issue",
+        dest="source_issue",
+        default=None,
+        metavar="ISSUE_ID",
+        help=(
+            "The Redmine issue id for --redmine-json entries when the payload's issue.id is "
+            "absent (the journal entry's own id is always the dedup anchor)."
         ),
     )
     watch.add_argument(
