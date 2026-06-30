@@ -30,7 +30,16 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json as _json
+from pathlib import Path
 
+from mozyo_bridge.core.state.workflow_runtime_store import (
+    META_CAPACITY,
+    META_OWNER_OR_RELEASE_GATE,
+    META_READY_INDEPENDENT,
+    META_READY_OVERLAP,
+    WorkflowRuntimeStore,
+    workflow_runtime_store_path,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
     CALLBACK_STATES,
@@ -189,14 +198,105 @@ def _assign_event_ids(events: tuple[LaneEvent, ...]) -> tuple[LaneEvent, ...]:
     return tuple(assigned)
 
 
+#: The ``--route-identity`` key aliases accepted on the CLI (alias -> store column).
+_ROUTE_KEY_ALIASES = {
+    "route_id": "route_id",
+    "route": "route_id",
+    "issue": "issue",
+    "ws": "workspace_id",
+    "workspace_id": "workspace_id",
+    "lane": "lane_id",
+    "lane_id": "lane_id",
+    "role": "role",
+    "pane_name": "pane_name",
+    "pane": "pane_name",
+    "pane_id": "last_seen_pane_id",
+    "last_seen_pane_id": "last_seen_pane_id",
+    "observed": "observed_at",
+    "observed_at": "observed_at",
+}
+
+
+def _parse_route_identity(spec: str) -> dict:
+    """Parse a ``key=value,...`` ``--route-identity`` spec into a store route record.
+
+    The required stable keys are ``route_id`` / ``issue`` / ``ws`` (workspace_id) /
+    ``role`` / ``pane_name``; ``lane`` defaults to ``default``; ``pane_id`` (the cache /
+    evidence ``last_seen_pane_id``) and ``observed`` are optional. The pane id is never a
+    routing key — it is recorded only as cache. A missing required key is rejected at parse
+    time so a half-formed identity that could only be matched by pane id never persists.
+    """
+    record: dict[str, str] = {}
+    for modifier in (p.strip() for p in (spec or "").split(",") if p.strip()):
+        key, eq, value = modifier.partition("=")
+        if not eq:
+            raise argparse.ArgumentTypeError(
+                f"--route-identity modifier expects key=value, got {modifier!r}"
+            )
+        column = _ROUTE_KEY_ALIASES.get(key.strip())
+        if column is None:
+            raise argparse.ArgumentTypeError(
+                f"--route-identity unknown key {key.strip()!r} (expected "
+                f"{sorted(set(_ROUTE_KEY_ALIASES))})"
+            )
+        record[column] = value.strip()
+    missing = [
+        k for k in ("route_id", "issue", "workspace_id", "role", "pane_name") if not record.get(k)
+    ]
+    if missing:
+        raise argparse.ArgumentTypeError(
+            f"--route-identity requires non-empty {missing} (a pane id is never the route "
+            "authority)"
+        )
+    return record
+
+
+def _events_from_args(args: argparse.Namespace) -> tuple[LaneEvent, ...]:
+    """The supplied events with a unique durable anchor assigned to each id=-less one."""
+    return _assign_event_ids(tuple(getattr(args, "event", None) or ()))
+
+
+def _advisory_inputs(args: argparse.Namespace) -> dict:
+    """The advisory scalar inputs, as the kwargs the runtime / meta store both consume."""
+    return {
+        META_READY_INDEPENDENT: int(getattr(args, "ready_independent", 0) or 0),
+        META_READY_OVERLAP: int(getattr(args, "ready_overlap", 0) or 0),
+        META_CAPACITY: int(getattr(args, "capacity", 0) or 0),
+        META_OWNER_OR_RELEASE_GATE: bool(getattr(args, "owner_or_release_gate", False)),
+    }
+
+
 def _state_from_args(args: argparse.Namespace) -> WorkflowRuntimeState:
-    events = _assign_event_ids(tuple(getattr(args, "event", None) or ()))
+    inputs = _advisory_inputs(args)
     return evaluate_workflow_runtime(
-        events,
-        ready_independent_work=int(getattr(args, "ready_independent", 0) or 0),
-        ready_overlapping_work=int(getattr(args, "ready_overlap", 0) or 0),
-        capacity_remaining=int(getattr(args, "capacity", 0) or 0),
-        owner_or_release_gate_active=bool(getattr(args, "owner_or_release_gate", False)),
+        _events_from_args(args),
+        ready_independent_work=inputs[META_READY_INDEPENDENT],
+        ready_overlapping_work=inputs[META_READY_OVERLAP],
+        capacity_remaining=inputs[META_CAPACITY],
+        owner_or_release_gate_active=inputs[META_OWNER_OR_RELEASE_GATE],
+    )
+
+
+def _persist_runtime(args: argparse.Namespace) -> None:
+    """Write the supplied events / route identities / advisory inputs to the mozyo DB.
+
+    The companion to ``workflow resume`` (Redmine #12671): it appends the durable event
+    log, upserts the issue-tagged route identities, and records the advisory scalar inputs
+    so ``resume`` reproduces this exact decision from persisted runtime state. Idempotent
+    by ``event_id`` / ``route_id`` (re-persisting the same anchors overwrites in place).
+    """
+    raw = (getattr(args, "store_path", None) or "").strip()
+    store = WorkflowRuntimeStore(
+        path=Path(raw) if raw else workflow_runtime_store_path()
+    )
+    store.append_events(
+        dataclasses.asdict(event) for event in _events_from_args(args)
+    )
+    routes = list(getattr(args, "route_identity", None) or ())
+    if routes:
+        store.put_route_identities(routes)
+    store.set_meta(
+        {key: str(value) for key, value in _advisory_inputs(args).items()}
     )
 
 
@@ -233,6 +333,8 @@ def cmd_workflow_runtime(args: argparse.Namespace) -> int:
     ``workflow.next_action`` shape), or the durable record markdown with ``--journal``.
     Always returns 0: the result is advisory and never blocks.
     """
+    if getattr(args, "persist", False):
+        _persist_runtime(args)
     state = _state_from_args(args)
     if getattr(args, "as_journal", False):
         print(render_runtime_journal(state))
@@ -342,6 +444,38 @@ def register_runtime(workflow_sub) -> None:
             "Emit the durable record markdown (Bandwidth Record Template + runtime next "
             "action) for the Redmine journal (takes precedence over --json)."
         ),
+    )
+    runtime.add_argument(
+        "--persist",
+        action="store_true",
+        dest="persist",
+        help=(
+            "Also write the supplied events / route identities / advisory inputs to the "
+            "mozyo DB workflow runtime store (Redmine #12671), so `workflow resume` can "
+            "reproduce this decision from persisted runtime state. Idempotent by "
+            "event_id / route_id."
+        ),
+    )
+    runtime.add_argument(
+        "--route-identity",
+        action="append",
+        dest="route_identity",
+        type=_parse_route_identity,
+        metavar="route_id=...,issue=...,ws=...,role=...,pane_name=...[,lane=,pane_id=,observed=]",
+        help=(
+            "A lane's stable route identity to persist with --persist (repeatable). "
+            "Required keys: route_id, issue, ws (workspace_id), role, pane_name; optional: "
+            "lane (default 'default'), pane_id (recorded as the cache/evidence "
+            "last_seen_pane_id, never a routing key), observed. The route_identity in "
+            "`workflow resume` output is the public-safe pointer; the pane id is never "
+            "emitted."
+        ),
+    )
+    runtime.add_argument(
+        "--store-path",
+        dest="store_path",
+        default=None,
+        help=argparse.SUPPRESS,  # test/debug override; default is the home store
     )
     runtime.set_defaults(func=cmd_workflow_runtime)
 

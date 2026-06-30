@@ -54,6 +54,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_fill_decision,
     register_fill_decision,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_resume import (
+    cmd_workflow_resume,
+    register_resume,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_runtime import (
     cmd_workflow_runtime,
     register_runtime,
@@ -300,9 +304,12 @@ def register(sub) -> None:
     (Redmine #12856) is the Redmine-aware companion that classifies each lane from its
     durable-record facts first; ``workflow runtime`` (Redmine #12857) is the stateful
     slice that replays an ordered durable event log (with duplicate suppression) into
-    current lane state and the overall next action. The fill-decision / admission /
-    runtime subcommands are registered from their sibling modules so this file stays
-    focused on the step state machine.
+    current lane state and the overall next action; ``workflow resume`` (Redmine #12671)
+    reads the *persisted* mozyo-DB runtime state ``workflow runtime --persist`` wrote and
+    reports the current state plus the enriched ``workflow.next_action`` (route_identity /
+    anchor / risk_level / requires_confirmation / blocked_reason). The fill-decision /
+    admission / runtime / resume subcommands are registered from their sibling modules so
+    this file stays focused on the step state machine.
     """
     workflow = sub.add_parser(
         "workflow",
@@ -324,6 +331,7 @@ def register(sub) -> None:
     register_fill_decision(workflow_sub)
     register_admission(workflow_sub)
     register_runtime(workflow_sub)
+    register_resume(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",
@@ -397,5 +405,6 @@ __all__ = (
     "cmd_workflow_fill_decision",
     "cmd_workflow_admission",
     "cmd_workflow_runtime",
+    "cmd_workflow_resume",
     "register",
 )
