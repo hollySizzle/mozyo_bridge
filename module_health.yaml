@@ -314,7 +314,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1626
+    lines: 1510
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -496,6 +496,40 @@ allowlist:
       specifications (the artifact verdict authority no longer needs a real
       scaffolded checkout / host `~/.tmux.conf` wiring topology). The remaining
       broad `doctor_*_section` collector bodies stay residual to #12638.
+      Lowered 1626 -> 1510 for the #12881 doctor tmux pane-health section
+      collector boundary tranche: the `doctor_tmux_section` collector's three
+      responsibilities — the external read (tmux availability via
+      `command -v tmux`, the `list-panes` connection probe + pane count, the
+      structured `pane_lines` snapshot, the `TMUX_PANE` environment scope, and
+      the `.claude/skills` directory probe used by the Claude cwd warning), the
+      authority-bearing verdict (section status `missing`/`skipped`/`ok`/
+      `warning`, current-session scoping, per-agent window classification
+      `missing`/`duplicate`/`ok`/`not-agent-process`/`unscoped`, the
+      Claude-pane-cwd-outside-repo warning, and the `next_action` de-dupe), and
+      the legacy section dict assembly — moved behind the typed boundary in
+      `doctor_tmux.py` (the pure `evaluate_tmux_section` domain policy that owns
+      the whole verdict + dict assembly from a read-view alone, the
+      `TmuxPaneHealthReads` port + `LiveTmuxPaneHealthReads` adapter, and the
+      `TmuxSectionUseCase`). `doctor_tmux_section` is now a thin handler
+      composing the use case; `LiveTmuxPaneHealthReads` runs the same two
+      `list-panes` calls, reads `TMUX_PANE`, resolves the repo root from the CLI
+      namespace, and only calls `pane_lines` once the server connection is
+      proven (mirroring the legacy short-circuit). The adapter resolves the
+      `subprocess` tmux-availability probe, `run_tmux`, and `pane_lines` through
+      the `doctor` module at call time (mirroring the other `doctor_*` section
+      adapters), so the existing `doctor.subprocess` / `doctor.run_tmux` /
+      `doctor.pane_lines` / `doctor.doctor_tmux_section`-patching section
+      integration tests are unchanged. The `run_tmux` import stays (also used by
+      `doctor_session_section`); the `subprocess` and `pane_lines` imports stay
+      as the read concern resolved at call time; only the now-unused
+      `AGENT_LABELS` / `is_agent_process` imports were dropped from `doctor.py`
+      (the pure policy imports them from `pane_resolver` directly). The
+      pure-path `_cwd_is_under_repo` predicate moves into `doctor_tmux.py` (this
+      collector was its sole consumer; keeping the policy free of the `doctor`
+      module that imports it). `test_doctor_tmux` adds fake-port use-case + pure
+      verdict-policy specifications (the tmux verdict authority no longer needs a
+      real tmux server / pane topology). The remaining broad `doctor_*_section`
+      collector bodies stay residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
