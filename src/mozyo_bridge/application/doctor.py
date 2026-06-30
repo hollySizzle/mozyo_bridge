@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from mozyo_bridge.application import tmux_ui as tmux_ui_module
+from mozyo_bridge.application.doctor_claude_nagger import (
+    ClaudeNaggerSectionUseCase,
+    LiveClaudeNaggerReads,
+)
 from mozyo_bridge.application.doctor_claude_skill import (
     ClaudeSkillSectionUseCase,
     LiveClaudeSkillReads,
@@ -389,66 +393,18 @@ def doctor_claude_nagger_section(args: argparse.Namespace) -> dict[str, Any]:
     ``.claude-nagger/``. Reading the manifest first avoids the false
     ``incomplete`` verdict that a directory-only check produces after
     a ``--skip-nagger --backup`` opt-out.
+
+    The collector's three responsibilities — the external read of the
+    ``.claude-nagger/`` skeleton + the scaffold manifest, the verdict authority,
+    and the legacy section dict assembly — now live behind the typed boundary in
+    ``doctor_claude_nagger`` (#12859). ``LiveClaudeNaggerReads`` drives the read
+    through the ``doctor`` module at call time (``doctor_target``, the
+    ``CLAUDE_NAGGER_*`` constants, and ``_scaffold_manifest_files``),
+    ``ClaudeNaggerSectionUseCase`` applies the pure
+    ``evaluate_claude_nagger_section`` policy, and the legacy section dict is
+    preserved byte-for-byte.
     """
-    target = doctor_target(args)
-    nagger_dir = target / CLAUDE_NAGGER_DIRNAME
-
-    example_paths = {name: nagger_dir / name for name in CLAUDE_NAGGER_EXAMPLES}
-    examples = {
-        name: {
-            "path": str(path),
-            "present": path.exists(),
-        }
-        for name, path in example_paths.items()
-    }
-    config_path = nagger_dir / "config.yaml"
-    next_action: list[str] = []
-
-    tracked = _scaffold_manifest_files(target)
-    nagger_tracked = any(p.startswith(CLAUDE_NAGGER_MANIFEST_PREFIX) for p in tracked)
-
-    if not nagger_tracked:
-        # Either no scaffold manifest at all, or the manifest exists
-        # but the operator opted out of the nagger category. Both
-        # collapse to `skipped`; the suggested remedy points operators
-        # at a rerun without --skip-nagger when they want it back.
-        status = "skipped"
-        next_action.append(
-            "Claude Nagger is opt-out (manifest does not track .claude-nagger/); "
-            f"rerun `mozyo-bridge scaffold apply <preset> --target {target}` "
-            "without --skip-nagger to install the skeleton"
-        )
-    elif not all(info["present"] for info in examples.values()):
-        # Tracked by manifest but examples missing on disk → real drift.
-        status = "incomplete"
-        for name, info in examples.items():
-            if not info["present"]:
-                next_action.append(
-                    f"missing {info['path']}; rerun scaffold apply --backup to restore"
-                )
-    elif config_path.exists():
-        status = "ok"
-    else:
-        # Skeleton present, but the operator has not copied it into
-        # `config.yaml` yet. The nagger does nothing until they do.
-        status = "skeleton-only"
-        next_action.append(
-            f"copy {example_paths['config.yaml.example']} to {config_path} "
-            "to activate Claude Nagger"
-        )
-
-    return {
-        "status": status,
-        "target": str(target),
-        "nagger_dir": str(nagger_dir),
-        "manifest_tracks_nagger": nagger_tracked,
-        "examples": examples,
-        "config_yaml": {
-            "path": str(config_path),
-            "present": config_path.exists(),
-        },
-        "next_action": next_action,
-    }
+    return ClaudeNaggerSectionUseCase(LiveClaudeNaggerReads(args)).execute()
 
 
 def doctor_tmux_ui_artifact_info(target: Path) -> dict[str, Any]:

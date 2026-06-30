@@ -306,7 +306,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/application/doctor.py
-    lines: 1707
+    lines: 1663
     reason: >-
       Aggregated health/diagnostic collectors for `mozyo-bridge doctor`; grows
       with each new diagnostic section.
@@ -436,6 +436,30 @@ allowlist:
       specifications (the scaffold verdict authority no longer needs a real
       scaffolded checkout / drifted-manifest topology). The remaining broad
       `doctor_*_section` collector bodies stay residual to #12638.
+      Lowered 1707 -> 1663 for the #12859 doctor Claude-Nagger section collector
+      boundary tranche: the `doctor_claude_nagger_section` collector's three
+      responsibilities — the external read (`doctor_target` argument resolution +
+      the on-disk `.claude-nagger/` example/`config.yaml` probe + the scaffold
+      manifest's record of the nagger category), the authority-bearing verdict
+      (section status `skipped`/`incomplete`/`ok`/`skeleton-only` + the
+      remediation next_action), and the legacy section dict assembly — moved
+      behind the typed boundary in `doctor_claude_nagger.py` (the
+      `ClaudeNaggerSectionVerdict` value object, the pure
+      `evaluate_claude_nagger_section` domain policy that owns the
+      manifest-source-of-truth branching and the remediation-command wording, the
+      `ClaudeNaggerReads` port + `LiveClaudeNaggerReads` adapter, and the
+      `ClaudeNaggerSectionUseCase`). `doctor_claude_nagger_section` is now a thin
+      handler composing the use case at call time; `LiveClaudeNaggerReads`
+      resolves `doctor_target`, the `CLAUDE_NAGGER_*` constants, and the
+      `_scaffold_manifest_files` manifest reader through the `doctor` module at
+      call time, so the existing nagger section integration / CLI tests are
+      unchanged. The `_scaffold_manifest_files` reader and the `CLAUDE_NAGGER_*`
+      constants stay in `doctor.py` because the `doctor_tmux_ui_artifact_info`
+      collector reuses the same manifest read. `test_doctor_claude_nagger` adds
+      fake-port use-case + pure verdict-policy specifications (the nagger verdict
+      authority no longer needs a real scaffolded checkout / opt-out-with-debris
+      topology). The remaining broad `doctor_*_section` collector bodies stay
+      residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
