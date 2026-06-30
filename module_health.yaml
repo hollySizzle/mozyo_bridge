@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5964
+    lines: 5821
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -291,6 +291,23 @@ allowlist:
       `f_140_delegated_coordinator_nested_handoff/application/gateway_route_gate.py`
       seam over the new `domain/gateway_route_enforcement.py` policy, not here; only
       the one thin call is added here.
+      Lowered 5964 -> 5821 for the #12926 OOP-first init command-handler tranche:
+      the `cmd_init` smart-init / adoption orchestration moved into the new
+      `application/init_command.py` boundary (a typed `InitRequest` value object,
+      a pure fail-closed `*_message` policy that owns the exact `die` wording, the
+      `InitWorkspaceOps` port + `LiveInitWorkspaceOps` adapter, and an
+      `InitUseCase` returning a typed `InitOutcome`). `cmd_init` stays here as a
+      thin handler: build the request, run the use case, render the outcome. The
+      live adapter routes every side effect (`run_tmux` / `pane_lines` /
+      `rename_session` / `rename_window` / `apply_window_subtle_style` / the
+      registry write / the vscode merge / the pane markers) through `commands.*`
+      at call time, so the existing `cmd_init` characterization tests that patch
+      those primitives are unchanged; `test_init_command` adds the fake-port use
+      case + pure-policy specifications. The `_confident_workspace_root` /
+      `_is_fallback_session_name` / `_agent_window_conflict` /
+      `_write_vscode_session_name` / `_bind_agent_pane_markers` leaf helpers stay
+      here as the documented compatibility bridge (tests import / the adapter
+      routes them); the residual `cmd_doctor` tail stays residual to #12638.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
