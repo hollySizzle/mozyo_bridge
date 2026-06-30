@@ -532,6 +532,29 @@ source/test move の full unittest / `health check` は Epic lane (#12624–#126
 real-machine smoke / #12616 bare/pipx alignment / pipx reinstall / local install / tag / publish / version
 bump は本 US で実行しない。
 
+## #12641 Scaffold Boundary Final Decision
+
+US #12641 (parent Feature #12533、Version #276) は、本計画の Fixed / package-data residual 表で
+`scaffold/presets/**` / `scaffold/canonical_sources/**` を「held this round」としてきた scaffold
+package の disposition を **確定 residual** へ昇格させた。決定正本は
+`vibes/docs/logics/scaffold-boundary.md` (`logic-scaffold-boundary`)。
+
+- **論理所有を Feature-level に pin**: scaffold は `e_130_governance_distribution /
+  f_120_scaffold_preset` 帰属として確定する (`bounded-context-map.md` の
+  Redmine-numbered package path map #12519)。
+- **physical path は据え置き**: `src/mozyo_bridge/scaffold/**` を numbered layout の
+  **明示的 packaging 例外** として top-level に残す。理由は pyproject `package-data` glob /
+  `importlib.resources.files("mozyo_bridge.scaffold.presets")` anchor ×3 /
+  `canonical.py` の repo-relative path 定数 / 配布正本境界 docs / module-health baseline の
+  coupling であり、本計画が一貫して held-fixed としてきた構造と同一。behavior-preserving move
+  でも packaging / resource-resolution / build を同時変更する必要があり利得ゼロのため、本 US では
+  move を強制しない (Redmine #12641 j#69241 が residual を pre-authorize)。
+- **move-enabling conditions** と `rules.py` (1081 行 over-gate) / `canonical.py` の責務分割方針は
+  `scaffold-boundary.md` に定義する。
+
+この決定により、上記 Fixed 表の scaffold 行は「本 round 据え置き」ではなく
+「`logic-scaffold-boundary` で確定した residual」として読む。
+
 ## Non-Goals
 
 - 一括 (mega) リファクタブランチ (#12590/#12591 の scoped per-lane reversal は上記

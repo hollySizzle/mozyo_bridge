@@ -288,6 +288,7 @@ documents:
     related_document_refs:
       - logic-bootstrap
       - logic-scaffold-distribution-minimization
+      - logic-scaffold-boundary
       - rule-docs-catalog-governance
       - spec-project-map
 
@@ -299,6 +300,7 @@ documents:
     audit_role: scaffold_distribution_minimization_logic
     related_document_refs:
       - logic-scaffold-rules
+      - logic-scaffold-boundary
       - logic-workspace-registry
       - logic-bootstrap
       - rule-public-private-boundary
@@ -312,6 +314,7 @@ documents:
     audit_role: canonical_renderer_logic
     related_document_refs:
       - logic-scaffold-rules
+      - logic-scaffold-boundary
       - rule-docs-catalog-governance
       - spec-project-map
 
@@ -454,6 +457,7 @@ documents:
     purpose: "src/mozyo_bridge の application / domain 横並び構造を Redmine Feature 対応の import-safe slug 階層へ段階移行する計画正本。Redmine 番号は mapping metadata として保持し、import path / CLI / public surface / packaging 影響と move-only 単位、移動しない file の理由を定義する。#12622 Redmine-Numbered Layout Correction (#12623 migration map / integration policy) で `features/` root を廃し `e_<order>_<slug>` / `f_<order>_<slug>` numbered package path へ全面再移行する correction 方針・residual・sublane conflict-point 管理を定義する。"
     audit_role: source_layout_bounded_context_migration_logic
     related_document_refs:
+      - logic-scaffold-boundary
       - logic-refactor-split-strategy
       - logic-plugin-ready-adapter-boundary
       - logic-modular-config-driven-refactor
@@ -477,6 +481,22 @@ documents:
       - logic-fallback-retirement-ledger
       - spec-bounded-context-map
       - spec-project-map
+
+  - id: logic-scaffold-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/scaffold-boundary.md
+    purpose: "src/mozyo_bridge/scaffold/** の boundary 最終方針正本 (Redmine #12641 / Version #276)。最後の top-level technical package である scaffold の論理所有を governance_distribution の Feature f_120_scaffold_preset に pin しつつ、pyproject package-data glob / importlib.resources anchor / canonical.py の repo-relative path 定数 / 配布正本境界 docs / module-health baseline の coupling inventory を根拠に physical path を src/mozyo_bridge/scaffold/** へ据え置く justified residual を確定する。rules.py (1081 行 over-gate) / canonical.py の責務分割方針と、residual 見直し (move-enabling) 条件を定義する。"
+    audit_role: scaffold_boundary_logic
+    related_document_refs:
+      - logic-source-layout-bounded-context-migration
+      - spec-bounded-context-map
+      - logic-scaffold-distribution-minimization
+      - logic-scaffold-rules
+      - logic-canonical-renderer
+      - logic-shared-kernel-freeze
+      - logic-module-health-gate
+      - logic-refactor-split-strategy
 
   - id: logic-runtime-observability-boundary
     type: logic
