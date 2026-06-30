@@ -58,6 +58,10 @@ from mozyo_bridge.application.doctor_tmux import (
     LiveTmuxPaneHealthReads,
     TmuxSectionUseCase,
 )
+from mozyo_bridge.application.doctor_otel import (
+    LiveOtelDoctorReads,
+    OtelSectionUseCase,
+)
 # ``pane_lines`` is resolved by ``LiveTmuxPaneHealthReads`` through this module at
 # call time (the existing ``doctor.pane_lines`` / ``doctor.run_tmux`` /
 # ``doctor.subprocess`` section integration tests patch these names); ``run_tmux``
@@ -501,86 +505,15 @@ def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
     as observation gaps (env not injected / pre-injection launch /
     unsupported CLI), which is exactly the new blind-spot class the owner
     decision (#11639 constraint 3) requires doctor to expose.
+
+    Thin handler over
+    :class:`~mozyo_bridge.application.doctor_otel.OtelSectionUseCase`: the
+    external read (store counts, receiver ``/healthz`` probe, activity summary,
+    tmux agent discovery) lives in :class:`LiveOtelDoctorReads` and the
+    receiver-unreachable note / observation-gap detection / ``unobserved_agents``
+    / legacy section dict assembly in the pure ``evaluate_otel_section`` policy.
     """
-    import json as _json
-    import urllib.error
-    import urllib.request
-
-    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity import summarize_activity
-    from mozyo_bridge.otel_store import OtelEventStore
-
-    store = OtelEventStore()
-    section: dict[str, Any] = {
-        "status": "ok",
-        "store_path": str(store.path),
-        "store_exists": store.path.exists(),
-        "notes": [],
-    }
-    section.update(store.counts())
-
-    healthz = "http://127.0.0.1:4318/healthz"
-    try:
-        with urllib.request.urlopen(healthz, timeout=2) as response:
-            _json.loads(response.read().decode("utf-8"))
-        section["receiver_reachable"] = True
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        section["receiver_reachable"] = False
-        section["receiver_error"] = str(exc)
-        section["notes"].append(
-            "receiver not reachable: telemetry sent now is lost BY DESIGN "
-            "(best-effort store, not an error). Start it with "
-            "`mozyo-bridge otel serve`; use `agents list` / `session list` "
-            "for liveness in the meantime."
-        )
-
-    # Observation gaps: agent panes with no telemetry source ever.
-    observed_pairs = set()
-    for activity in summarize_activity(store):
-        hints = activity.match_hints
-        if isinstance(hints.get("session"), str) and isinstance(
-            hints.get("agent"), str
-        ):
-            observed_pairs.add((hints["session"], hints["agent"]))
-    gaps: list[dict[str, str]] = []
-    try:
-        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-            discover_agents,
-            fold_agents_by_pane,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import try_pane_lines
-
-        panes = try_pane_lines()
-        if panes is None:
-            section["notes"].append(
-                "tmux unavailable: observation-gap check skipped"
-            )
-        else:
-            for record in fold_agents_by_pane(discover_agents(panes)):
-                if record.agent_kind == "unknown":
-                    continue
-                pairs = {
-                    (view.session, record.agent_kind) for view in record.views
-                }
-                if not pairs & observed_pairs:
-                    gaps.append(
-                        {
-                            "pane_id": record.pane_id,
-                            "session": record.session,
-                            "agent": record.agent_kind,
-                        }
-                    )
-    except Exception as exc:  # diagnosis must never take doctor down
-        section["notes"].append(f"observation-gap check failed: {exc}")
-    section["unobserved_agents"] = gaps
-    if gaps:
-        section["notes"].append(
-            f"{len(gaps)} agent pane(s) have never emitted telemetry "
-            "(OTel env not injected, launched before injection, or the "
-            "CLI does not emit). Restart them via `mozyo` / `mozyo-bridge "
-            "init <agent>` to inject; until then their activity is "
-            "`unknown` and falls back to tmux liveness."
-        )
-    return section
+    return OtelSectionUseCase(LiveOtelDoctorReads(args)).execute()
 
 
 def _live_session_names() -> set[str] | None:
