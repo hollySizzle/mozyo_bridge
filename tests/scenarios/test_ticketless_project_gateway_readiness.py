@@ -69,6 +69,11 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     resolve_project_gateway,
     start_project_gateway_command,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.child_intake_route import (  # noqa: E402
+    STATUS_CHILD_RESOLVED,
+    STATUS_SAME_LANE,
+    resolve_child_intake_route,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_identity import (  # noqa: E402
     ACTION_ADOPT,
     ACTION_BLOCKED,
@@ -87,6 +92,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     CONSULTATION_PROJECT_DOMAIN,
     CONSULTATION_ROUTING,
     TicketlessConsultation,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (  # noqa: E402
+    ROLE_DELEGATED_COORDINATOR as ROLE_CHILD_COORDINATOR,
+    WORK_SHAPE_DOMAIN_DESIGN,
+    TicketlessWorkIntake,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (  # noqa: E402
     PROJECT_DOMAIN_DECISIONS,
@@ -368,18 +378,6 @@ class ImplementationNeedsRedmineAnchorScenarioTest(unittest.TestCase):
         # The worker hop is anchor-gated, so it is never green-path route evidence.
         self.assertFalse(plan.green_path)
 
-    def test_parent_to_child_delegation_also_requires_an_anchor(self) -> None:
-        # Once the gateway decides implementation is needed, the parent -> child
-        # delegation hop already requires an anchor (the consultation-only hop was
-        # the grandparent -> parent one).
-        plan = resolve_relative_route(
-            [_candidate("%30")],
-            caller_role=ROLE_PROJECT_GATEWAY,
-            repo_root=REPO,
-            project_scope=PROJECT,
-        )
-        self.assertTrue(plan.step.anchor_required)
-
     def test_routing_consultation_cannot_smuggle_a_relaxed_anchor_gate(self) -> None:
         # Even a pure routing consultation (the lightest forward class) keeps the
         # worker-dispatch anchor invariant true — the no-anchor rail cannot express
@@ -391,6 +389,70 @@ class ImplementationNeedsRedmineAnchorScenarioTest(unittest.TestCase):
             read_contract=ROLE_PROJECT_GATEWAY,
         )
         self.assertTrue(consultation.worker_dispatch_requires_anchor)
+
+
+class ParentToChildNoAnchorWorkIntakeScenarioTest(unittest.TestCase):
+    """parent -> child work-intake is no-anchor; the CHILD owns the anchor decision.
+
+    The Transition Command Matrix ``親 -> 子`` row and the #12748 Ticketless
+    No-Anchor Work-Intake Primitive are explicit: the parent does NOT mint or
+    require a Redmine anchor to hand the consultation to the child coordinator —
+    the child creates/selects the anchor only once it sees the work shape. So the
+    readiness gate must drive the real #12748 ``child-intake`` surface
+    (:func:`resolve_child_intake_route` / :class:`TicketlessWorkIntake`), not a
+    relative-route step whose anchor flag belongs to a different (worker-dispatch)
+    layer. The child -> grandchild Redmine-anchor gate is a *separate* contract,
+    pinned in :class:`ImplementationNeedsRedmineAnchorScenarioTest`.
+    """
+
+    def test_distinct_child_resolves_and_intake_is_no_anchor(self) -> None:
+        # Two coordinator lanes: the parent's own (%parent) + a distinct child.
+        # The child is resolved by identity (the other lane), and the intake route
+        # never demands a Redmine anchor of itself.
+        route = resolve_child_intake_route(
+            [_candidate("%parent", lane_id="p"), _candidate("%child", lane_id="c")],
+            repo_root=REPO,
+            project_scope=PROJECT,
+            caller_pane="%parent",
+        )
+        self.assertEqual(STATUS_CHILD_RESOLVED, route.status)
+        self.assertTrue(route.ok)
+        self.assertEqual("%child", route.selected.pane_id)
+        self.assertFalse(route.anchor_required)
+
+    def test_route_resolving_back_to_parent_is_same_lane_blocked(self) -> None:
+        # The only coordinator-class lane is the caller's own: the child route
+        # resolved back to the parent. Refuse to adopt the parent as its own child
+        # (the self-fence), never a silent same-lane pick.
+        route = resolve_child_intake_route(
+            [_candidate("%parent", lane_id="p")],
+            repo_root=REPO,
+            project_scope=PROJECT,
+            caller_pane="%parent",
+        )
+        self.assertEqual(STATUS_SAME_LANE, route.status)
+        self.assertFalse(route.ok)
+        self.assertIsNone(route.selected)
+        self.assertFalse(route.anchor_required)
+
+    def test_work_intake_payload_carries_the_no_anchor_invariants(self) -> None:
+        # The forwarded work-intake fixes that the child owns the anchor decision,
+        # the parent must not answer the domain itself, and worker dispatch still
+        # needs a Redmine anchor — so a regression of the #12748 boundary is caught.
+        intake = TicketlessWorkIntake(
+            work_shape=WORK_SHAPE_DOMAIN_DESIGN,
+            callback_to_role=ROLE_PROJECT_GATEWAY,
+            callback_methods=(CALLBACK_VIA_TICKETLESS_CALLBACK,),
+            read_contract=ROLE_CHILD_COORDINATOR,
+        )
+        self.assertTrue(intake.child_owns_anchor_decision)
+        self.assertTrue(intake.parent_must_not_answer_domain)
+        self.assertTrue(intake.worker_dispatch_requires_anchor)
+        # The child coordinator — not the parent gateway — owns the anchor decision.
+        self.assertEqual(ROLE_CHILD_COORDINATOR, intake.anchor_decision_owner)
+        payload = intake.to_structured_dict()
+        self.assertTrue(payload["child_owns_anchor_decision"])
+        self.assertEqual(ROLE_CHILD_COORDINATOR, payload["anchor_decision_owner"])
 
 
 class StandardPathNeedsNoPaneIdScenarioTest(unittest.TestCase):
