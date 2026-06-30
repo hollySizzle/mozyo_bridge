@@ -356,7 +356,11 @@ def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
 
 def cmd_message(args: argparse.Namespace) -> int:
     require_tmux()
-    target = resolve_target(args.target)
+    # Semantic target selection (Redmine #12663): `--select-role` resolves the
+    # target pane by role + repo (+ session / project) instead of a `%pane` id.
+    from mozyo_bridge.application.commands_target_select import resolve_message_target
+
+    target = resolve_message_target(args)
     attempt = getattr(args, "attempt", None)
     no_submit = not getattr(args, "submit", True)
     try:
@@ -5447,6 +5451,11 @@ def orchestrate_handoff(
 
 
 def cmd_handoff_send(args: argparse.Namespace) -> int:
+    # Semantic target selection (Redmine #12663): `--select` resolves the target
+    # `%pane` from role/session/repo/project before the unchanged identity gates.
+    from mozyo_bridge.application.commands_target_select import apply_handoff_selection
+
+    apply_handoff_selection(args)
     return orchestrate_handoff(args)
 
 

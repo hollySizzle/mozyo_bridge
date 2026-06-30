@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5931
+    lines: 5940
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -274,6 +274,14 @@ allowlist:
       integration tests are unchanged. Only the `cmd_doctor` tail now stays residual
       to #12638. `test_status_session_use_case` adds fake-reads-port projection +
       pure match-policy specifications (one fewer `commands.*` monkeypatch dependency).
+      Raised 5931 -> 5940 for the #12663 semantic target selector wiring:
+      `cmd_handoff_send` resolves `--select` via `apply_handoff_selection` and
+      `cmd_message` resolves `--select-role` via `resolve_message_target` (both
+      thin call-time delegations). The fail-closed selector policy + the shared
+      `select_semantic_target` resolver live in the new
+      `f_120_agent_discovery_pane_resolution/domain/target_selector.py` and
+      `application/commands_target_select.py`, not here; the CLI flags live in the
+      new `f_130_handoff_routing/application/cli_handoff_select.py`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

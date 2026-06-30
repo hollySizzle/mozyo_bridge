@@ -62,6 +62,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_q_enter import (
     register_q_enter,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_select import (
+    add_handoff_select_args,
+    add_message_select_args,
+)
 
 
 def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required: bool = False) -> None:
@@ -387,8 +391,13 @@ def configure_handoff_parser(
 def register_message(sub) -> None:
     """Register the `message` subcommand onto ``sub`` (pre-`keys` position)."""
     message = sub.add_parser("message")
-    message.add_argument("target")
+    # `target` is optional under `--select-role` semantic resolution (Redmine
+    # #12663): an operator/ticketless message can name the Codex gateway by role
+    # + repo instead of a hand-copied `%pane`. Exactly one of `target` /
+    # `--select-role` must be given (validated in `cmd_message`).
+    message.add_argument("target", nargs="?")
     message.add_argument("text")
+    add_message_select_args(message)
     message.add_argument(
         "--no-submit",
         dest="submit",
@@ -476,6 +485,10 @@ def register(sub) -> None:
     handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
     handoff_send = handoff_sub.add_parser("send", help="Send a handoff notification from sender to receiver")
     configure_handoff_parser(handoff_send, kind_required=True)
+    # Semantic target selection (Redmine #12663): resolve the pane from `--to` +
+    # `--target-repo` (+ session/project) instead of a `%pane`; fail-closed on
+    # 0/many and never weakens the `--target-repo`/`--target-project` gates.
+    add_handoff_select_args(handoff_send)
     handoff_send.set_defaults(func=cmd_handoff_send)
 
     handoff_reply = handoff_sub.add_parser(
