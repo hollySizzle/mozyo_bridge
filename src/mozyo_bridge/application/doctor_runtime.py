@@ -19,6 +19,25 @@ differ — exactly the silent-drift class that version output cannot distinguish
 Read-only. This module never installs, reinstalls, writes, tags, publishes, or
 contacts a network/ticket system. It only reports the fingerprint and the next
 command an operator should run (use the repo-local CLI during dogfooding).
+
+OOP-first boundary (#12870, #12638 follow-up). The fingerprint splits into three
+concerns behind a typed read boundary so the verdict and assembly are
+specifiable without an installed CLI, source checkout, or git repository:
+
+- :func:`evaluate_fingerprint` is the pure verdict policy (silent-drift
+  authority) and :func:`build_runtime_next_action` is the pure operator
+  next-action policy — both decide from a read-view / verdict alone.
+- :class:`RuntimeFingerprintReads` is the port for the *external read* (active
+  loaded package introspection + repo-local source probe + git anchor) and
+  :class:`LiveRuntimeFingerprintReads` is the live adapter, which resolves the
+  ``doctor`` module helpers (``doctor_target`` / ``_read_source_version`` /
+  ``REPO_LOCAL_INVOCATION``) through a localized lazy import *at call time*,
+  mirroring the other ``doctor_*`` section adapters.
+- :class:`RuntimeFingerprintUseCase` composes the port and the policies and
+  re-assembles the legacy result dict byte-for-byte.
+
+:func:`run_runtime_fingerprint` is the thin composition root and
+:func:`cmd_doctor_runtime` the thin CLI handler (text vs JSON dispatch only).
 """
 
 from __future__ import annotations
@@ -31,15 +50,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import mozyo_bridge
 from mozyo_bridge import __version__
-from mozyo_bridge.application.doctor import (
-    REPO_LOCAL_INVOCATION,
-    _read_source_version,
-    doctor_target,
-)
 
 # Gate-critical feature probes. Each entry maps a probe key to the textual
 # marker that proves the *source tree* ships the behavior. The markers are
@@ -304,39 +318,21 @@ def evaluate_fingerprint(
     }
 
 
-def run_runtime_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
-    """Build the full runtime fingerprint result for ``doctor runtime``."""
-    target = doctor_target(args)
-    source_pkg = (target / "src" / "mozyo_bridge").resolve()
-    source_init = source_pkg / "__init__.py"
+def build_runtime_next_action(
+    verdict: dict[str, Any], repo_local_invocation: str
+) -> list[str]:
+    """Pure operator next-action policy derived from a verdict.
 
-    active_package_path = Path(mozyo_bridge.__file__).resolve().parent
-    active: dict[str, Any] = {
-        "version": __version__,
-        "executable": shutil.which("mozyo-bridge") or "",
-        "python": sys.executable,
-        "package_file": str(Path(mozyo_bridge.__file__).resolve()),
-        "package_path": str(active_package_path),
-        "surface": classify_surface(str(active_package_path), source_pkg),
-        "feature_probes": _active_feature_probes(),
-    }
-
-    source_present = source_init.is_file()
-    source: dict[str, Any] = {
-        "present": source_present,
-        "package_path": str(source_pkg) if source_present else "",
-        "version": _read_source_version(source_init) if source_present else None,
-        "feature_probes": _source_feature_probes(source_pkg)
-        if source_present
-        else None,
-    }
-
-    verdict = evaluate_fingerprint(active, source)
+    Empty when the verdict is ``ok``. Otherwise it points at the repo-local CLI
+    for dogfood / pre-smoke verification, and — only on the headline silent-drift
+    (``drifted``) verdict — appends the stale-runtime / owner-gated-reinstall
+    warning. Split from the read so it is specifiable from a synthetic verdict.
+    """
     next_action: list[str] = []
     if not verdict["ok"]:
         next_action.append(
             "run the repo-local CLI for dogfood / pre-smoke verification: "
-            f"{REPO_LOCAL_INVOCATION} <args>"
+            f"{repo_local_invocation} <args>"
         )
         if verdict["status"] == STATUS_DRIFTED:
             next_action.append(
@@ -344,18 +340,118 @@ def run_runtime_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
                 "runtime under test is stale. Reinstall/upgrade is owner-gated "
                 "(no pipx reinstall, tag, publish, or release without approval)."
             )
+    return next_action
 
-    return {
-        "ok": verdict["ok"],
-        "status": verdict["status"],
-        "relation": verdict["relation"],
-        "summary": verdict["summary"],
-        "probe_mismatch": verdict["probe_mismatch"],
-        "active": active,
-        "source": source,
-        "repo": _git_anchor(target),
-        "next_action": next_action,
-    }
+
+@runtime_checkable
+class RuntimeFingerprintReads(Protocol):
+    """Port: read the active-surface, repo-local source, and git-anchor views.
+
+    Implementations own every external read the fingerprint needs: introspecting
+    the *active* loaded package (path / version / executable / live feature
+    probes), the repo-local *source* tree (presence / version / textual feature
+    probes), and the target's git anchor. They also surface the doctor-owned
+    ``repo_local_invocation`` string the next-action wording needs. The use case
+    and the pure policies depend only on the returned read-view mapping, so the
+    full assembly is specifiable from a fake port with no installed CLI, source
+    checkout, or git repository present.
+    """
+
+    def describe(self) -> dict[str, Any]:
+        ...
+
+
+class LiveRuntimeFingerprintReads:
+    """Live adapter: introspect the active runtime, source tree, and git anchor.
+
+    The ``doctor`` module helpers (``doctor_target`` for target resolution,
+    ``_read_source_version`` for the source ``__version__`` read, and the
+    ``REPO_LOCAL_INVOCATION`` constant for the next-action wording) are resolved
+    through a localized lazy import *at call time*, mirroring the call-time
+    resolution discipline of the other ``doctor_*`` section adapters and keeping
+    the read cheap at module import.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self._args = args
+
+    def describe(self) -> dict[str, Any]:
+        from mozyo_bridge.application import doctor as _doctor
+
+        target = _doctor.doctor_target(self._args)
+        source_pkg = (target / "src" / "mozyo_bridge").resolve()
+        source_init = source_pkg / "__init__.py"
+
+        active_package_path = Path(mozyo_bridge.__file__).resolve().parent
+        active: dict[str, Any] = {
+            "version": __version__,
+            "executable": shutil.which("mozyo-bridge") or "",
+            "python": sys.executable,
+            "package_file": str(Path(mozyo_bridge.__file__).resolve()),
+            "package_path": str(active_package_path),
+            "surface": classify_surface(str(active_package_path), source_pkg),
+            "feature_probes": _active_feature_probes(),
+        }
+
+        source_present = source_init.is_file()
+        source: dict[str, Any] = {
+            "present": source_present,
+            "package_path": str(source_pkg) if source_present else "",
+            "version": _doctor._read_source_version(source_init)
+            if source_present
+            else None,
+            "feature_probes": _source_feature_probes(source_pkg)
+            if source_present
+            else None,
+        }
+
+        return {
+            "active": active,
+            "source": source,
+            "repo": _git_anchor(target),
+            "repo_local_invocation": _doctor.REPO_LOCAL_INVOCATION,
+        }
+
+
+class RuntimeFingerprintUseCase:
+    """Use case: read the fingerprint view, apply the policies, assemble.
+
+    Returns the legacy ``run_runtime_fingerprint`` dict shape byte-for-byte so
+    the ``doctor runtime`` text / JSON output is unchanged.
+    """
+
+    def __init__(self, reads: RuntimeFingerprintReads) -> None:
+        self._reads = reads
+
+    def execute(self) -> dict[str, Any]:
+        view = self._reads.describe()
+        active = view["active"]
+        source = view["source"]
+        verdict = evaluate_fingerprint(active, source)
+        next_action = build_runtime_next_action(
+            verdict, view["repo_local_invocation"]
+        )
+        return {
+            "ok": verdict["ok"],
+            "status": verdict["status"],
+            "relation": verdict["relation"],
+            "summary": verdict["summary"],
+            "probe_mismatch": verdict["probe_mismatch"],
+            "active": active,
+            "source": source,
+            "repo": view["repo"],
+            "next_action": next_action,
+        }
+
+
+def run_runtime_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the full runtime fingerprint result for ``doctor runtime``.
+
+    Thin composition root: wires the live read adapter to the use case. The
+    external reads, verdict policy, and next-action policy live behind the
+    :class:`RuntimeFingerprintReads` boundary.
+    """
+    return RuntimeFingerprintUseCase(LiveRuntimeFingerprintReads(args)).execute()
 
 
 def format_runtime_text(result: dict[str, Any]) -> str:

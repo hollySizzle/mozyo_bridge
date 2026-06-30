@@ -26,7 +26,10 @@ from mozyo_bridge.application.doctor_runtime import (
     STATUS_DRIFTED,
     STATUS_OK,
     STATUS_WARNING,
+    RuntimeFingerprintReads,
+    RuntimeFingerprintUseCase,
     _source_feature_probes,
+    build_runtime_next_action,
     classify_surface,
     evaluate_fingerprint,
     run_runtime_fingerprint,
@@ -233,6 +236,97 @@ class SourceFeatureProbesTest(unittest.TestCase):
             )
             probes = _source_feature_probes(pkg)
             self.assertFalse(probes["standard_target_admission"])
+
+
+class BuildRuntimeNextActionTest(unittest.TestCase):
+    """Pure next-action policy over a synthetic verdict (#12870)."""
+
+    def test_ok_verdict_has_no_next_action(self) -> None:
+        verdict = {"ok": True, "status": STATUS_OK}
+        self.assertEqual([], build_runtime_next_action(verdict, "PYTHONPATH=src ..."))
+
+    def test_warning_points_at_repo_local_cli_only(self) -> None:
+        verdict = {"ok": False, "status": STATUS_WARNING}
+        actions = build_runtime_next_action(verdict, "REPO_LOCAL_CLI")
+        self.assertEqual(1, len(actions))
+        self.assertIn("REPO_LOCAL_CLI", actions[0])
+        self.assertNotIn("stale", " ".join(actions))
+
+    def test_drifted_adds_owner_gated_stale_warning(self) -> None:
+        verdict = {"ok": False, "status": STATUS_DRIFTED}
+        actions = build_runtime_next_action(verdict, "REPO_LOCAL_CLI")
+        self.assertEqual(2, len(actions))
+        self.assertIn("REPO_LOCAL_CLI", actions[0])
+        self.assertIn("owner-gated", actions[1])
+
+
+class _FakeRuntimeReads:
+    """Fake read port: returns a fixed fingerprint read-view (#12870).
+
+    Lets the use case / assembly be specified with no installed CLI, source
+    checkout, or git repository present.
+    """
+
+    def __init__(self, view) -> None:
+        self._view = view
+
+    def describe(self):
+        return self._view
+
+
+class RuntimeFingerprintUseCaseTest(unittest.TestCase):
+    def test_fake_port_satisfies_the_read_protocol(self) -> None:
+        self.assertIsInstance(_FakeRuntimeReads({}), RuntimeFingerprintReads)
+
+    def _view(self, active, source, repo=None, invocation="REPO_LOCAL_CLI"):
+        return {
+            "active": active,
+            "source": source,
+            "repo": repo if repo is not None else {"is_repo": False},
+            "repo_local_invocation": invocation,
+        }
+
+    def test_assembles_legacy_dict_shape(self) -> None:
+        view = self._view(_active(), _source(present=False))
+        result = RuntimeFingerprintUseCase(_FakeRuntimeReads(view)).execute()
+        self.assertEqual(
+            {
+                "ok",
+                "status",
+                "relation",
+                "summary",
+                "probe_mismatch",
+                "active",
+                "source",
+                "repo",
+                "next_action",
+            },
+            set(result),
+        )
+        # No-source verdict is ok, so no next action and the active/source/repo
+        # views pass through from the read unchanged.
+        self.assertTrue(result["ok"])
+        self.assertEqual(STATUS_OK, result["status"])
+        self.assertEqual([], result["next_action"])
+        self.assertEqual(view["active"], result["active"])
+        self.assertEqual(view["repo"], result["repo"])
+
+    def test_silent_drift_view_flows_through_to_drifted_with_next_action(self) -> None:
+        # The #12612 silent-drift class: identical versions, probe gap.
+        active = _active(
+            version="0.9.0",
+            probes={"standard_target_admission": False, "no_target_activation": False},
+        )
+        view = self._view(active, _source(version="0.9.0"), invocation="REPO_LOCAL_CLI")
+        result = RuntimeFingerprintUseCase(_FakeRuntimeReads(view)).execute()
+        self.assertFalse(result["ok"])
+        self.assertEqual(STATUS_DRIFTED, result["status"])
+        self.assertEqual(2, len(result["next_action"]))
+        self.assertIn("REPO_LOCAL_CLI", result["next_action"][0])
+        self.assertEqual(
+            {"standard_target_admission", "no_target_activation"},
+            {m["probe"] for m in result["probe_mismatch"]},
+        )
 
 
 class DoctorRuntimeDispatchTest(unittest.TestCase):
