@@ -123,7 +123,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter 
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
-    SOURCE_HOME_REGISTRY,
     resolve_canonical_session,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
@@ -5647,16 +5646,6 @@ def _write_vscode_session_name(root: Path, session_name: str) -> tuple[Path, boo
     return settings_path, True, None
 
 
-def _init_target_suffix(args: argparse.Namespace) -> str:
-    """Render the explicit target for use in a suggested re-run command.
-
-    Preserves an explicit ``target`` so escape-hatch suggestions do not silently
-    drop it and rename the current pane instead (Redmine #11367 review #54498).
-    """
-    target = getattr(args, "target", None)
-    return f" {target}" if target else ""
-
-
 def cmd_init(args: argparse.Namespace) -> int:
     """Adopt the current/target pane into its workspace as a ``claude`` / ``codex`` agent.
 
@@ -5678,156 +5667,24 @@ def cmd_init(args: argparse.Namespace) -> int:
     manual / debug workflows and meaningful-foreign sessions.
     ``--no-vscode-settings`` runs the smart session/window adoption but skips the
     settings write.
+
+    The adoption policy and side effects live in
+    :mod:`mozyo_bridge.application.init_command` (#12926); this handler stays thin
+    — it builds the request, runs the use case, and renders the outcome.
     """
-    require_tmux()
-    raw_target = args.target or current_pane()
-    if not is_tmux_target(raw_target):
-        die(f"init target must be a tmux pane id or location, not a label: {raw_target}")
-    resolved = run_tmux("display-message", "-t", raw_target, "-p", "#{pane_id}", check=False)
-    if resolved.returncode != 0 or not resolved.stdout.strip():
-        die(f"invalid tmux target: {raw_target}")
-    target = resolved.stdout.strip()
-    location = pane_location(target)
-    target_session, _, rest = location.partition(":")
-    if not target_session or not rest:
-        die(f"could not parse tmux location for {target}: {location!r}")
-    target_window_index = rest.split(".", 1)[0]
+    from mozyo_bridge.application.init_command import (
+        InitRequest,
+        InitUseCase,
+        LiveInitWorkspaceOps,
+    )
 
-    panes = pane_lines()
-    agent = args.agent
-
-    def refuse_on_agent_window_conflict(session: str) -> None:
-        conflicts = _agent_window_conflict(panes, session, target_window_index, agent)
-        if conflicts:
-            existing = ", ".join(sorted(set(conflicts)))
-            die(
-                f"session '{session}' already has a window named '{agent}' at "
-                f"{existing}. Rename or kill that window before running "
-                f"`mozyo-bridge init {agent}` on {target}; tmux tolerates duplicate "
-                "window names but the resolver does not."
-            )
-
-    # --- Legacy window-only path: rename the window in place, nothing else. ---
-    if getattr(args, "window_only", False):
-        refuse_on_agent_window_conflict(target_session)
-        rename_window(f"{target_session}:{target_window_index}", agent)
-        apply_window_subtle_style(target_session, agent)
-        print(
-            f"initialized {target} as {agent} (renamed window "
-            f"{target_session}:{target_window_index} -> {agent}; window-only)"
-        )
-        return 0
-
-    # --- Smart adoption path. -------------------------------------------------
-    target_cwd = ""
-    for pane in panes:
-        if pane.get("id") == target:
-            target_cwd = pane.get("cwd") or ""
-            break
-    root = _confident_workspace_root(target_cwd)
-    if root is None:
-        die(
-            f"refusing to init {target}: cannot confidently determine this pane's "
-            f"workspace root from its cwd ({target_cwd or 'unknown'}). Smart `init` "
-            "adopts the pane into the workspace's derived session, which needs a "
-            "confident root (a `.git` / `.tmux.conf` / `pyproject.toml` / "
-            "`.mozyo-bridge/scaffold.json` ancestor).\n"
-            "Next actions:\n"
-            f"  - cd into the workspace root and re-run `mozyo-bridge init {agent}`.\n"
-            f"  - Or rename only this window in place: "
-            f"`mozyo-bridge init {agent}{_init_target_suffix(args)} --window-only`."
-        )
-    expected = resolve_canonical_session(root)
-    expected_name = expected.name
-
-    # All fail-closed checks run before any mutation.
-    refuse_on_agent_window_conflict(target_session)
-    need_session_rename = target_session != expected_name
-    if need_session_rename:
-        if not _is_fallback_session_name(target_session):
-            die(
-                f"refusing to init {target}: it is in tmux session "
-                f"'{target_session}', which has a meaningful name that differs from "
-                f"this workspace's expected session '{expected_name}'. Smart `init` "
-                "only adopts low-information tmux-integrated fallback sessions "
-                "(all-underscore names); it will not rename a named session.\n"
-                f"  current session:  {target_session}\n"
-                f"  expected session: {expected_name}\n"
-                "Next actions:\n"
-                "  - Start the workspace session: `mozyo` (attach) or "
-                "`mozyo --no-attach`.\n"
-                f"  - Rename only this window in the current session: "
-                f"`mozyo-bridge init {agent}{_init_target_suffix(args)} --window-only`."
-            )
-        if session_exists(expected_name):
-            die(
-                f"refusing to init {target}: the expected session '{expected_name}' "
-                f"already exists as a separate tmux session, so the fallback session "
-                f"'{target_session}' cannot be renamed into it without colliding.\n"
-                "Next actions:\n"
-                f"  - Attach the existing session and run agents there: "
-                f"`tmux attach -t {expected_name}`.\n"
-                f"  - Or rename only this window in place: "
-                f"`mozyo-bridge init {agent}{_init_target_suffix(args)} --window-only`."
-            )
-
-    notes: list[str] = []
-
-    # --- Registry-aware identity (Redmine #11427) -----------------------------
-    # Make the workspace identity durable before any tmux/vscode mutation, but
-    # only after every abortable preflight check above — so a registry write
-    # never precedes a detectable conflict, and a tmux mutation never precedes a
-    # successful registration. A workspace already resolved from the home
-    # registry keeps its identity untouched (no re-derivation); one resolved via
-    # path derivation or an anchor-only state is registered now, converting the
-    # path fallback into a durable registration. ``register_workspace`` is
-    # idempotent and reuses the anchor identity, so the canonical session name is
-    # byte-identical to what ``resolve_canonical_session`` returned above.
-    workspace_id = expected.workspace_id
-    if expected.source != SOURCE_HOME_REGISTRY:
-        from mozyo_bridge.workspace_registry import register_workspace
-
-        registration = register_workspace(root)
-        expected_name = registration.record.canonical_session
-        workspace_id = registration.record.workspace_id
-        notes.append(
-            f"registered workspace '{registration.record.project_name}' "
-            f"({registration.outcome}; session '{expected_name}')"
-        )
-
-    # --- Mutations: vscode settings -> session rename -> window rename -> style.
-    if not getattr(args, "no_vscode_settings", False):
-        settings_path, written, warning = _write_vscode_session_name(root, expected_name)
-        if warning:
-            print(f"warning: {warning}", file=sys.stderr)
-        elif written:
-            notes.append(
-                f'pinned tmux-integrated.sessionName="{expected_name}" in {settings_path}'
-            )
-
-    final_session = target_session
-    if need_session_rename:
-        rename_session(target_session, expected_name)
-        final_session = expected_name
-        notes.append(f"renamed session '{target_session}' -> '{expected_name}'")
-
-    rename_window(f"{final_session}:{target_window_index}", agent)
-    # `init` is the second entry point that promotes an existing pane into the
-    # agent-window rail (the first being bare `mozyo`). Apply the same subtle
-    # status-bar tint so adopted panes look identical to `mozyo`-created ones.
-    apply_window_subtle_style(final_session, agent)
-
-    # Stabilize role binding with the same pane-option markers cockpit panes
-    # carry (Redmine #11427 / #11822): an explicit `@mozyo_agent_role` makes the
-    # resolver report this pane as `pane_option` / strong, so the role survives a
-    # later window rename instead of depending only on the window name. The
-    # paired `@mozyo_workspace_id` ties the pane to the workspace just made
-    # durable above. Both are best-effort (`check=False`): a failed marker write
-    # must not undo the completed adoption.
-    _bind_agent_pane_markers(target, agent, workspace_id, notes)
-
-    print(f"adopted {target} into session '{final_session}' as {agent}")
-    for note in notes:
+    outcome = InitUseCase(LiveInitWorkspaceOps()).run(InitRequest.from_args(args))
+    if outcome.refused_message is not None:
+        die(outcome.refused_message)
+    for warning in outcome.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(outcome.success_line)
+    for note in outcome.notes:
         print(f"  - {note}")
     return 0
 
