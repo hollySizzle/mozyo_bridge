@@ -94,6 +94,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "release",
     "health",
     "tests",
+    "redmine-version",
 ]
 
 

@@ -498,6 +498,20 @@ documents:
       - logic-module-health-gate
       - logic-refactor-split-strategy
 
+  - id: logic-redmine-version-operation-surface
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/redmine-version-operation-surface.md
+    purpose: "Redmine Version の rename/close/lock/delete と Version 内 open leaf issue 列挙を安全に実行する手段の設計正本 (Redmine #12651 / 親 US #12643)。判断 (pure fail-closed preflight: 閉じた operation 語彙・operation×target 固有 confirmation token・rename の package-numbered 名拒否で #12643 を機械強制・close/lock の open-issue 既定 blocked・delete は真に空な Version のみ) と実行 (operator UI / 将来の double-opt-in live adapter) を分離し、f_120_redmine_adapter の domain + RedmineVersionIssueSource/RedmineVersionWrites port + advisory `redmine-version` CLI として確定する。MCP US-only surface が open leaf を列挙できない根拠 (get_project_structure が Task/Test/Bug leaf を落とす) と、flat issue-by-version 読み adapter / Version write live executor / operator UI cleanup への capability gap 分解を記録する。"
+    audit_role: redmine_version_operation_surface_logic
+    related_document_refs:
+      - logic-release-flow
+      - logic-object-oriented-architecture-policy
+      - logic-source-layout-bounded-context-migration
+      - logic-coordinator-sublane-development-flow
+      - spec-bounded-context-map
+      - spec-project-map
+
   - id: logic-runtime-observability-boundary
     type: logic
     status: active
