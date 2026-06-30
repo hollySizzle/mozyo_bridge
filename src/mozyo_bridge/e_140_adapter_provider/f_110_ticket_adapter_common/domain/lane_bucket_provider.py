@@ -65,6 +65,15 @@ SKIP_VERSION_CLOSED = "version_closed"
 SKIP_VERSION_LOCKED = "version_locked"
 SKIP_BUCKET_NOT_FOUND = "bucket_not_found"
 SKIP_AMBIGUOUS_SOURCE = "ambiguous_source"
+#: The issue carries no execution-bucket value at all — the source-neutral analog of
+#: :data:`SKIP_NO_FIXED_VERSION` for a non-Version source. The #12922 custom-field
+#: provider returns this when an issue's configured custom field is unset / empty, so
+#: an issue with no bucket fails closed instead of being placed in a guessed bucket.
+SKIP_NO_EXECUTION_BUCKET = "no_execution_bucket"
+#: A resolved bucket value is outside the provider's configured allow-list. The #12922
+#: custom-field provider can restrict execution-bucket values to a known set; a value
+#: outside it is rejected here rather than dispatched against an unrecognized bucket.
+SKIP_DISALLOWED_VALUE = "disallowed_value"
 
 BUCKET_SKIP_REASONS: frozenset[str] = frozenset(
     {
@@ -74,6 +83,8 @@ BUCKET_SKIP_REASONS: frozenset[str] = frozenset(
         SKIP_VERSION_LOCKED,
         SKIP_BUCKET_NOT_FOUND,
         SKIP_AMBIGUOUS_SOURCE,
+        SKIP_NO_EXECUTION_BUCKET,
+        SKIP_DISALLOWED_VALUE,
     }
 )
 
@@ -433,6 +444,8 @@ __all__ = (
     "SKIP_VERSION_LOCKED",
     "SKIP_BUCKET_NOT_FOUND",
     "SKIP_AMBIGUOUS_SOURCE",
+    "SKIP_NO_EXECUTION_BUCKET",
+    "SKIP_DISALLOWED_VALUE",
     "BUCKET_SKIP_REASONS",
     "version_status_skip_reason",
     "LaneBucketError",

@@ -47,12 +47,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_dispatch_plan,
     render_dispatch_plan_journal,
 )
+from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.lane_bucket_provider import (
+    LaneBucketError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.domain.custom_field_lane_bucket_provider import (
+    CustomFieldBucketConfig,
+    RedmineCustomFieldLaneBucketProvider,
+)
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.domain.fixed_version_lane_bucket_provider import (
     RedmineFixedVersionLaneBucketProvider,
 )
 
 # ``--mode`` accepts the hyphenated UI spelling; the plan vocabulary is the literal token.
 _MODE_BY_FLAG = {"dry-run": MODE_DRY_RUN, "execute": MODE_EXECUTE}
+
+# ``--bucket-source`` selects which #12919 provider reads the bucket. The default stays the
+# Redmine ``fixed_version`` provider: this command never changes the project's source of
+# truth (#12922 non-goal). 'custom-field' is the opt-in execution-bucket migration path.
+_SOURCE_FIXED_VERSION = "fixed-version"
+_SOURCE_CUSTOM_FIELD = "custom-field"
 
 
 def _load_json(path_text: str, flag: str) -> object:
@@ -128,25 +141,65 @@ def _candidate_facts_from_args(
     return facts
 
 
+def _custom_field_config_from_args(
+    args: argparse.Namespace,
+) -> CustomFieldBucketConfig:
+    """Build the custom-field provider config from ``--custom-field-*`` / ``--allowed-bucket``.
+
+    The execution-bucket field is selected by id (``--custom-field-id``) or name
+    (``--custom-field-name``); at least one is required for ``--bucket-source custom-field``.
+    ``--allowed-bucket`` (repeatable) restricts the resolvable values to a closed set; absent
+    it, any non-empty value is accepted.
+    """
+    field_id = (getattr(args, "custom_field_id", None) or "").strip() or None
+    field_name = (getattr(args, "custom_field_name", None) or "").strip() or None
+    if field_id is None and field_name is None:
+        raise SystemExit(
+            "--bucket-source custom-field requires --custom-field-id or --custom-field-name "
+            "to identify the execution-bucket custom field"
+        )
+    allowed = [a.strip() for a in (getattr(args, "allowed_bucket", None) or []) if a.strip()]
+    try:
+        return CustomFieldBucketConfig(
+            field_id=field_id,
+            field_name=field_name,
+            allowed_values=frozenset(allowed) if allowed else None,
+        )
+    except LaneBucketError as exc:  # pragma: no cover - guarded above, defensive
+        raise SystemExit(str(exc)) from exc
+
+
 def _build_plan(args: argparse.Namespace) -> LaneSetDispatchPlan:
     issues_payload = _load_json(getattr(args, "issues_json", ""), "--issues-json")
-    versions_text = (getattr(args, "versions_json", None) or "").strip()
-    versions_payload = (
-        _load_json(versions_text, "--versions-json") if versions_text else None
-    )
-    provider = RedmineFixedVersionLaneBucketProvider(
-        issues_payload=issues_payload,
-        versions_payload=versions_payload,
-    )
     bucket_name = (getattr(args, "bucket_name", None) or "").strip()
-    if bucket_name:
-        # Name path (#12920 review j#69495): resolve the Version by displayed name from the
-        # snapshot, failing closed on an ambiguous name. The id path is unchanged.
-        resolution = provider.resolve_bucket_by_name(bucket_name)
-    else:
-        resolution = provider.resolve_bucket(
-            (getattr(args, "bucket_id", None) or "").strip()
+    bucket_id = (getattr(args, "bucket_id", None) or "").strip()
+    source = getattr(args, "bucket_source", _SOURCE_FIXED_VERSION)
+
+    if source == _SOURCE_CUSTOM_FIELD:
+        # Execution-bucket custom-field source (#12922): bucket identity is the field value,
+        # so id and name selectors both carry the value (name == value for a custom field).
+        provider = RedmineCustomFieldLaneBucketProvider(
+            issues_payload=issues_payload,
+            config=_custom_field_config_from_args(args),
         )
+        resolution = provider.resolve_bucket(bucket_name or bucket_id)
+    else:
+        # Default Redmine fixed_version source (#12919/#12920); unchanged source of truth.
+        versions_text = (getattr(args, "versions_json", None) or "").strip()
+        versions_payload = (
+            _load_json(versions_text, "--versions-json") if versions_text else None
+        )
+        fixed_provider = RedmineFixedVersionLaneBucketProvider(
+            issues_payload=issues_payload,
+            versions_payload=versions_payload,
+        )
+        if bucket_name:
+            # Name path (#12920 review j#69495): resolve the Version by displayed name from
+            # the snapshot, failing closed on an ambiguous name. The id path is unchanged.
+            resolution = fixed_provider.resolve_bucket_by_name(bucket_name)
+        else:
+            resolution = fixed_provider.resolve_bucket(bucket_id)
+
     mode = _MODE_BY_FLAG[getattr(args, "mode", "dry-run")]
     return build_dispatch_plan(
         resolution,
@@ -159,6 +212,7 @@ def _build_plan(args: argparse.Namespace) -> LaneSetDispatchPlan:
 def _print_plan_text(plan: LaneSetDispatchPlan) -> None:
     print(f"bucket_id: {plan.bucket_id}")
     print(f"bucket_name: {plan.bucket_name or '<none>'}")
+    print(f"source_kind: {plan.source_kind or '<none>'}")
     print(f"resolved: {str(plan.resolved).lower()}")
     print(f"mode: {plan.mode}")
     print(f"recommended_route: {RECOMMENDED_ROUTE}")
@@ -225,49 +279,109 @@ def register_dispatch_plan(workflow_sub) -> None:
     dispatch_plan = workflow_sub.add_parser(
         "dispatch-plan",
         description=(
-            "Generate the read-only lane-set dispatch plan for a Redmine Version bucket "
+            "Generate the read-only lane-set dispatch plan for a lane bucket "
             "(Redmine #12920). Reads a supplied issues snapshot (--issues-json, optionally "
-            "--versions-json), resolves the bucket by Version id (--bucket-id) or name "
-            "(--bucket-name, fails closed on an ambiguous name) via the #12919 "
-            "fixed_version provider, "
-            "enumerates its open leaf issues, and classifies each candidate as "
-            "dispatchable / standby / blocked / needs_owner_decision via the #12921 "
-            "risk-based admission policy against the active lanes (--lane-signal "
+            "--versions-json), resolves the bucket via a #12919 lane-bucket provider "
+            "selected by --bucket-source, enumerates its open leaf issues, and classifies "
+            "each candidate as dispatchable / standby / blocked / needs_owner_decision via "
+            "the #12921 risk-based admission policy against the active lanes (--lane-signal "
             "ISSUE:GATE[,...], repeatable, same format as `workflow admission`) and the "
             "optional per-candidate risk facts (--candidate-facts JSON). Each candidate "
             "carries its issue id / tracker / parent / bucket / expected changed surface / "
             "skip reason / recommended route. It also projects the coordinator-owned queue "
             "(review / owner / integration waiting) the candidates are admitted against. "
+            "BUCKET SOURCE (#12922): --bucket-source fixed-version (default) reads the "
+            "Redmine Version / issue fixed_version, resolved by Version id (--bucket-id) or "
+            "name (--bucket-name, fails closed on an ambiguous name). --bucket-source "
+            "custom-field reads an opt-in Redmine custom field (selected by "
+            "--custom-field-id or --custom-field-name, optionally restricted to "
+            "--allowed-bucket values) whose value is the execution bucket, passed as "
+            "--bucket-id / --bucket-name. MIGRATION PATH: Redmine Version stays the "
+            "roadmap / milestone axis and the default bucket source of truth; the "
+            "custom-field source is the opt-in way to read an execution bucket separately, "
+            "so the two can later be split under a deliberate rule update. This command "
+            "never switches the project default. "
             "Read-only and advisory: it discovers nothing, never selects/creates an issue "
-            "or lane, never mutates Redmine/tmux/worktree, and never auto-dispatches "
-            "(--mode execute records intent only and still emits the governed coordinator "
-            "Codex -> sublane Codex gateway -> same-lane Claude route for manual handoff). "
+            "or lane, never mutates Redmine/tmux/worktree, manages no Redmine schema, and "
+            "never auto-dispatches (--mode execute records intent only and still emits the "
+            "governed coordinator Codex -> sublane Codex gateway -> same-lane Claude route "
+            "for manual handoff). "
             "Always exit 0. See vibes/docs/logics/coordinator-sublane-development-flow.md."
         ),
         help=(
-            "Read-only: from a Redmine Version bucket snapshot, enumerate open leaf "
-            "candidates and classify each as dispatchable / standby / blocked / "
-            "needs_owner_decision, with the coordinator-owned queue state. Discovers "
-            "nothing, never mutates, never auto-dispatches."
+            "Read-only: from a lane bucket snapshot (Redmine Version by default, or an "
+            "opt-in execution-bucket custom field via --bucket-source custom-field), "
+            "enumerate open leaf candidates and classify each as dispatchable / standby / "
+            "blocked / needs_owner_decision, with the coordinator-owned queue state. "
+            "Discovers nothing, never mutates, never auto-dispatches."
         ),
     )
-    # The bucket selector: a Redmine Version id OR name (acceptance condition). Exactly one
-    # is required; a name is resolved from the snapshot and fails closed on ambiguity.
+    dispatch_plan.add_argument(
+        "--bucket-source",
+        dest="bucket_source",
+        choices=(_SOURCE_FIXED_VERSION, _SOURCE_CUSTOM_FIELD),
+        default=_SOURCE_FIXED_VERSION,
+        help=(
+            "Which #12919 lane-bucket provider reads the bucket. 'fixed-version' (default) "
+            "reads the Redmine Version / issue fixed_version (the roadmap/milestone axis and "
+            "the unchanged default source of truth). 'custom-field' (#12922) reads an opt-in "
+            "Redmine custom field as the execution bucket (requires --custom-field-id or "
+            "--custom-field-name). The project default source of truth is never switched here."
+        ),
+    )
+    # The bucket selector: a Version id OR name for the fixed-version source (acceptance
+    # condition); for the custom-field source both carry the execution-bucket value (a
+    # custom-field bucket has no separate id/name). Exactly one is required; a fixed-version
+    # name is resolved from the snapshot and fails closed on ambiguity.
     selector = dispatch_plan.add_mutually_exclusive_group(required=True)
     selector.add_argument(
         "--bucket-id",
         dest="bucket_id",
-        metavar="VERSION_ID",
-        help="The Redmine Version id whose bucket to plan (the fixed_version id).",
+        metavar="VERSION_ID_OR_VALUE",
+        help=(
+            "The bucket to plan: the Redmine Version id for --bucket-source fixed-version, "
+            "or the execution-bucket custom-field value for --bucket-source custom-field."
+        ),
     )
     selector.add_argument(
         "--bucket-name",
         dest="bucket_name",
-        metavar="VERSION_NAME",
+        metavar="VERSION_NAME_OR_VALUE",
         help=(
-            "The Redmine Version name whose bucket to plan (resolved from the snapshot's "
-            "versions / embedded fixed_version names; exact match, fails closed on an "
-            "ambiguous name that maps to multiple Version ids)."
+            "The bucket to plan by name: the Redmine Version name for --bucket-source "
+            "fixed-version (resolved from the snapshot's versions / embedded fixed_version "
+            "names; exact match, fails closed on an ambiguous name that maps to multiple "
+            "Version ids), or the execution-bucket custom-field value for --bucket-source "
+            "custom-field (name == value for a custom field)."
+        ),
+    )
+    dispatch_plan.add_argument(
+        "--custom-field-id",
+        dest="custom_field_id",
+        metavar="FIELD_ID",
+        help=(
+            "For --bucket-source custom-field: the Redmine custom field id whose value is the "
+            "execution bucket. One of --custom-field-id / --custom-field-name is required."
+        ),
+    )
+    dispatch_plan.add_argument(
+        "--custom-field-name",
+        dest="custom_field_name",
+        metavar="FIELD_NAME",
+        help=(
+            "For --bucket-source custom-field: the Redmine custom field name whose value is "
+            "the execution bucket. One of --custom-field-id / --custom-field-name is required."
+        ),
+    )
+    dispatch_plan.add_argument(
+        "--allowed-bucket",
+        dest="allowed_bucket",
+        action="append",
+        metavar="VALUE",
+        help=(
+            "For --bucket-source custom-field: an allowed execution-bucket value (repeatable). "
+            "When given, a custom-field value outside this set fails closed (disallowed_value). "
+            "Absent, any non-empty value is accepted."
         ),
     )
     dispatch_plan.add_argument(
