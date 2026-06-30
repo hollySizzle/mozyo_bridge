@@ -61,16 +61,22 @@ from mozyo_bridge.application.doctor_otel import (
     LiveOtelDoctorReads,
     OtelSectionUseCase,
 )
-# ``pane_lines`` is resolved by ``LiveTmuxPaneHealthReads`` through this module at
-# call time (the existing ``doctor.pane_lines`` / ``doctor.run_tmux`` /
-# ``doctor.subprocess`` section integration tests patch these names); ``run_tmux``
-# is also used directly by ``doctor_session_section``.
+# ``pane_lines`` and ``run_tmux`` are resolved through this module at call time
+# by the section adapters (the existing ``doctor.pane_lines`` / ``doctor.run_tmux``
+# / ``doctor.subprocess`` section integration tests patch these names):
+# ``LiveTmuxPaneHealthReads`` (#12881) uses ``run_tmux`` + ``pane_lines`` and
+# ``LiveWorkspaceRegistryReads`` (#12924) uses ``run_tmux`` for the tmux liveness
+# probe behind the workspace-registry section.
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import pane_lines
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import run_tmux
 from mozyo_bridge.scaffold.rules import PRESETS, rules_status, scaffold_state, scaffold_status
 from mozyo_bridge.application.doctor_state_store import (
     LiveStateStoreReads,
     StateStoreSectionUseCase,
+)
+from mozyo_bridge.application.doctor_workspace_registry import (
+    LiveWorkspaceRegistryReads,
+    WorkspaceRegistrySectionUseCase,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -530,6 +536,11 @@ def _live_session_names() -> set[str] | None:
     failure (tmux not installed, no server, non-zero exit) collapses to
     ``None`` so the registry section degrades to ``unknown`` rather than
     guessing a workspace is live or dead.
+
+    Stays in this module as the tmux read concern: ``LiveWorkspaceRegistryReads``
+    (#12924) resolves it through the ``doctor`` module at call time so the
+    existing ``doctor._live_session_names``-patching characterization tests (which
+    keep the registry section suite hermetic / off a real tmux server) stay valid.
     """
     try:
         result = run_tmux("list-sessions", "-F", "#{session_name}", check=False)
@@ -543,213 +554,19 @@ def _live_session_names() -> set[str] | None:
 def doctor_workspace_registry_section(args: argparse.Namespace) -> dict[str, Any]:
     """Diagnose home registry / workspace anchor / runtime identity (#11426).
 
-    Strictly read-only and additive to the existing scaffold/toolchain
-    sections: it never creates the registry, never writes ``last_seen``, and
-    never touches the anchor. It reports four layers:
-
-    - **home registry** existence / schema / readability (safe error state);
-    - **workspace registration** for the target repo;
-    - **anchor** presence and anchor-vs-registry consistency;
-    - **runtime** relationship between the registry's ``last_seen`` cache and
-      live tmux state, explained — never conflated — so the registry is not
-      mistaken for live runtime state.
-
-    Only genuine problems flip the section red: an unreadable registry
-    (``error``), an unsupported schema (``invalid``), or a registry/anchor
-    workspace-id ``drift`` (``drifted``). A never-registered workspace, a
-    missing registry with a recovery anchor, or a missing anchor are all
-    normal, recoverable states and stay ``ok`` with an actionable hint.
+    Thin handler over
+    :class:`~mozyo_bridge.application.doctor_workspace_registry.WorkspaceRegistrySectionUseCase`:
+    the external reads (home registry health probe, registry row load, on-disk
+    anchor read, anchor name-compat resolution, canonical-session resolution,
+    and the tmux liveness probe) live in :class:`LiveWorkspaceRegistryReads` and
+    the four-layer verdict / legacy section dict assembly in the pure
+    ``evaluate_workspace_registry_section`` policy. Strictly read-only: it never
+    creates the registry, never writes ``last_seen``, and never touches the
+    anchor.
     """
-    from mozyo_bridge import workspace_registry as wr
-
-    target = doctor_target(args)
-    home = doctor_home(args)
-
-    health = wr.inspect_registry_health(home)
-    registry_usable = health["status"] in (
-        wr.REGISTRY_HEALTH_OK,
-        wr.REGISTRY_HEALTH_MISSING,
+    return WorkspaceRegistrySectionUseCase(LiveWorkspaceRegistryReads()).execute(
+        doctor_target(args), doctor_home(args)
     )
-
-    # All reads below degrade safely (load/read return None on damage), but we
-    # only trust a registry row when the health probe says the registry is
-    # actually usable; otherwise registration state is "unknown".
-    record = wr.load_workspace_by_path(target, home=home) if registry_usable else None
-    anchor = wr.read_anchor(target)
-    anchor_names = wr.anchor_resolution(target)
-    resolved = wr.resolve_canonical_session(target, home=home)
-
-    next_action: list[str] = []
-
-    # --- registration layer -------------------------------------------------
-    if not registry_usable:
-        registered: bool | None = None
-    else:
-        registered = record is not None
-    registration = {
-        "registered": registered,
-        "workspace_id": record.workspace_id if record else None,
-        "canonical_session": record.canonical_session if record else None,
-        "display_path": record.display_path if record else None,
-        "preset": record.preset if record else None,
-        "preset_version": record.preset_version if record else None,
-    }
-
-    # Anchor name compatibility (Redmine #11920 / #11921): report which name is
-    # on disk so the legacy / both-exist migration states are visible.
-    if anchor_names.both_exist:
-        name_state = "both"
-    elif anchor_names.using_legacy:
-        name_state = "legacy"
-    elif anchor_names.new_exists:
-        name_state = "new"
-    else:
-        name_state = "none"
-    anchor_info = {
-        "path": str(wr.anchor_path(target)),
-        "legacy_path": str(wr.legacy_anchor_path(target)),
-        "name_state": name_state,
-        "present": anchor is not None,
-        "workspace_id": anchor.get("workspace_id") if anchor else None,
-        "canonical_session": anchor.get("canonical_session") if anchor else None,
-    }
-
-    # --- consistency layer --------------------------------------------------
-    if not registry_usable:
-        consistency_status = "unknown"
-        consistency_detail = (
-            "home registry is not usable; registration/consistency cannot be "
-            "determined until it is repaired"
-        )
-    elif record is not None and anchor is not None:
-        if record.workspace_id == anchor["workspace_id"]:
-            consistency_status = "ok"
-            consistency_detail = "registry row and anchor agree on workspace_id"
-        else:
-            consistency_status = "drift"
-            consistency_detail = (
-                "registry row and anchor disagree on workspace_id "
-                f"(registry {record.workspace_id} vs anchor {anchor['workspace_id']})"
-            )
-    elif record is not None and anchor is None:
-        consistency_status = "registry-only"
-        consistency_detail = "registered, but the workspace-local anchor is missing"
-    elif record is None and anchor is not None:
-        consistency_status = "anchor-only"
-        consistency_detail = (
-            "anchor present but the home registry has no row for this workspace "
-            "(registry loss or never upserted); resolution still works from the anchor"
-        )
-    else:
-        consistency_status = "unregistered"
-        consistency_detail = (
-            "workspace is not registered; session name resolves via path "
-            "derivation (pre-registry behavior)"
-        )
-
-    # --- runtime / last_seen layer (tmux is the liveness source) -----------
-    canonical_session = resolved.name
-    live_sessions = _live_session_names()
-    if live_sessions is None:
-        session_live: bool | None = None
-        runtime_status = "unknown"
-        runtime_reason = (
-            "tmux unavailable; liveness unknown. registry last_seen is a "
-            "registration-time cache, not live runtime state"
-        )
-    elif canonical_session in live_sessions:
-        session_live = True
-        runtime_status = "active"
-        runtime_reason = (
-            f"canonical session '{canonical_session}' is live in tmux now; "
-            "last_seen reflects the last `workspace register`, not this liveness"
-        )
-    else:
-        session_live = False
-        runtime_status = "stale"
-        runtime_reason = (
-            f"canonical session '{canonical_session}' is not live in tmux; "
-            "last_seen is the last registration touch, not runtime activity"
-        )
-    runtime = {
-        "last_seen": record.last_seen if record else None,
-        "canonical_session": canonical_session,
-        "session_live": session_live,
-        "status": runtime_status,
-        "reason": runtime_reason,
-    }
-
-    # --- overall status + next actions -------------------------------------
-    if health["status"] == wr.REGISTRY_HEALTH_UNREADABLE:
-        section_status = "error"
-        next_action.append(
-            f"home registry {health['path']} is unreadable; move the corrupt "
-            "file aside and re-register from each workspace's anchor "
-            "(`mozyo-bridge workspace register`)"
-        )
-    elif health["status"] == wr.REGISTRY_HEALTH_INVALID_SCHEMA:
-        section_status = "invalid"
-        next_action.append(
-            f"home registry {health['path']} has schema version "
-            f"{health['schema_version']}, but this mozyo-bridge supports "
-            f"{health['expected_schema_version']}; upgrade mozyo-bridge, or "
-            "move the registry aside and re-register from anchors "
-            "(`mozyo-bridge workspace register`)"
-        )
-    elif anchor_names.both_exist:
-        section_status = "drifted"
-        next_action.append(
-            f"both {wr.ANCHOR_RELATIVE.as_posix()} and "
-            f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()} exist; the new name is "
-            f"authoritative — remove the legacy "
-            f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()} after confirming the new "
-            "anchor (no silent merge)"
-        )
-    elif consistency_status == "drift":
-        section_status = "drifted"
-        next_action.append(
-            "registry row and anchor disagree on workspace_id; run "
-            "`mozyo-bridge workspace register` to reconcile (the anchor wins)"
-        )
-    else:
-        section_status = "ok"
-        if anchor_names.using_legacy:
-            next_action.append(
-                f"anchor uses the legacy name "
-                f"{wr.ANCHOR_LEGACY_RELATIVE.as_posix()}; run `mozyo-bridge "
-                f"workspace register` to migrate it to "
-                f"{wr.ANCHOR_RELATIVE.as_posix()} (the legacy name still reads)"
-            )
-        if consistency_status == "anchor-only":
-            next_action.append(
-                "home registry has no row for this workspace; run "
-                "`mozyo-bridge workspace register` to restore it from the anchor"
-            )
-        elif consistency_status == "registry-only":
-            next_action.append(
-                "workspace anchor is missing; run `mozyo-bridge workspace "
-                "register` to rewrite it (keeps the existing identity)"
-            )
-        elif consistency_status == "unregistered":
-            next_action.append(
-                "workspace is not registered; run `mozyo-bridge workspace "
-                "register` to pin a durable identity (optional — resolution "
-                "already falls back to path derivation)"
-            )
-
-    return {
-        "status": section_status,
-        "target": str(target),
-        "home_registry": health,
-        "registration": registration,
-        "anchor": anchor_info,
-        "consistency": {
-            "status": consistency_status,
-            "detail": consistency_detail,
-        },
-        "runtime": runtime,
-        "next_action": next_action,
-    }
 
 
 # ---------------------------------------------------------------------------
