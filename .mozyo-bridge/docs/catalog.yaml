@@ -584,7 +584,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workflow-cockpit-projection.md
-    purpose: "workflow runtime state (#12671 next_action / #12672 watcher / #12673 role-provider binding / #12857 stateful runtime) を Cockpit UI へ read-only な projection として見せる read model / 責務境界の設計正本。owner_role / provider / lane / next_action / blocked_reason / anchor を WorkflowNextAction の写しとして Unit-keyed (pane_id ではなく issue/lane) に additive 投影し、Redmine=durable / workflow-runtime.sqlite=runtime state / live tmux=liveness の三層を崩さない。attention_state とは分担 (coarse triage vs fine next-action carrier) し drift させない。WebSocket / live update は state model 確定後の follow-up。design-only で実装は分割する。"
+    purpose: "workflow runtime state (#12671 next_action / #12672 watcher / #12673 role-provider binding / #12857 stateful runtime) を Cockpit UI へ read-only な projection として見せる read model / 責務境界の設計正本。read model は overall_next_action (derive_workflow_next_action の enriched WorkflowNextAction 1 件: owner_role/provider/anchor/route_identity/risk/blocked_reason) と lane_rows (LanePendingAction の issue/state_class/action/owner_role のみ) に分離し、enriched field を lane へ複製しない (per-lane enrich は supported な lane-level function 経由の follow-up)。Unit-keyed (pane_id ではなく issue/lane) に additive 投影し、Redmine=durable / workflow-runtime.sqlite=runtime state / live tmux=liveness の三層を崩さない。attention_state とは分担 (coarse triage vs fine next-action carrier) し drift させない。WebSocket / live update は state model 確定後の follow-up。design-only で実装は分割する。"
     audit_role: workflow_cockpit_projection_logic
     related_document_refs:
       - logic-cockpit-attention-state
