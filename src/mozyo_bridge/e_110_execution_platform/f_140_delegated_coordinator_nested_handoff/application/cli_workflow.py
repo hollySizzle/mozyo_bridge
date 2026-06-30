@@ -54,6 +54,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_fill_decision,
     register_fill_decision,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_dispatch_plan import (
+    cmd_workflow_dispatch_plan,
+    register_dispatch_plan,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_lane_admission import (
     cmd_workflow_lane_admission,
     register_lane_admission,
@@ -345,6 +349,7 @@ def register(sub) -> None:
     register_fill_decision(workflow_sub)
     register_admission(workflow_sub)
     register_lane_admission(workflow_sub)
+    register_dispatch_plan(workflow_sub)
     register_runtime(workflow_sub)
     register_resume(workflow_sub)
     register_watch(workflow_sub)
@@ -421,6 +426,7 @@ __all__ = (
     "cmd_workflow_fill_decision",
     "cmd_workflow_admission",
     "cmd_workflow_lane_admission",
+    "cmd_workflow_dispatch_plan",
     "cmd_workflow_runtime",
     "cmd_workflow_resume",
     "cmd_workflow_watch",
