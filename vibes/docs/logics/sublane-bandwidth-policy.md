@@ -2,7 +2,7 @@
 
 この文書は互換 pointer である。サブレーン帯域、admission、pipeline dispatch、Post-Dispatch Fill Loop、drain order、mozyo_bridge dogfood soft profile の実行正本は [[logic-coordinator-sublane-development-flow]] の `## 帯域 / admission / pipeline fill` に統合済み。
 
-新しい規約本文はこの文書へ追加しない。管制塔 / サブレーン開発フローに関する判断は `vibes/docs/logics/coordinator-sublane-development-flow.md` を読み、worktree lifecycle の責務境界だけ [[logic-worktree-lifecycle-boundary]] を読む。
+新しい規約本文はこの文書へ追加しない。管制塔 / サブレーン開発フローに関する判断は `vibes/docs/logics/coordinator-sublane-development-flow.md` を読み、worktree lifecycle の責務境界だけ [[logic-worktree-lifecycle-boundary]] を読む。サブレーン全体のライフサイクル段階関係と各段階の正本所在の index は [[logic-sublane-lifecycle-map]] を読む。
 
 ## 移管理由
 

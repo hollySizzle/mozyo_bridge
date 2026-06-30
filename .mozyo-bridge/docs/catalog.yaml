@@ -689,6 +689,7 @@ documents:
     purpose: git worktree lifecycle (add/remove、branch/path 命名、削除 policy、N-lane 並列 policy) の現行 runbook 境界と、#12603 で再評価する設定駆動 sublane lifecycle / core-managed Git worktree / retire-time merge の設計境界正本。
     audit_role: worktree_lifecycle_boundary_logic
     related_document_refs:
+      - logic-sublane-lifecycle-map
       - logic-coordinator-sublane-development-flow
       - logic-scaffold-distribution-minimization
       - logic-delegated-coordinator-cockpit-display
@@ -702,6 +703,7 @@ documents:
     purpose: 互換 pointer。サブレーン帯域、admission、pipeline fill、drain order、mozyo_bridge dogfood soft profile の正本は logic-coordinator-sublane-development-flow に統合済み。
     audit_role: sublane_bandwidth_policy_logic
     related_document_refs:
+      - logic-sublane-lifecycle-map
       - logic-coordinator-sublane-development-flow
       - logic-worktree-lifecycle-boundary
       - rule-public-private-boundary
@@ -715,6 +717,7 @@ documents:
     purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
+      - logic-sublane-lifecycle-map
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
@@ -737,6 +740,7 @@ documents:
     purpose: 既存プロジェクトへ governed scaffold と sublane 運用を導入するための runbook。read-only preflight、root adoption、既存 routing / catalog の保持、verification、origin 到達性、callback recovery、Redmine close gate を sequence diagram と責務境界で再現可能な adoption 手順として定義する。
     audit_role: existing_project_sublane_adoption_logic
     related_document_refs:
+      - logic-sublane-lifecycle-map
       - logic-scaffold-rules
       - logic-bootstrap
       - logic-coordinator-sublane-development-flow
@@ -749,6 +753,36 @@ documents:
       - rule-project-agent-workflow
       - rule-public-private-boundary
       - skill-workflow-reference
+      - spec-project-map
+
+  - id: logic-sublane-lifecycle-map
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/sublane-lifecycle-map.md
+    purpose: サブレーンの一連のライフサイクル (workspace identity / launch / worktree / callback / retire / merge / acceptance smoke) の関係と段階ごとの正本所在を一箇所に束ねる navigation map。Git / 非Git workspace の段階差分と「retire」の三義 (sublane retirement / pane guarded_kill / fallback rail retirement) を整理する。各段階の execution 契約は canonical doc が正本であり本 map は複製しない。
+    audit_role: sublane_lifecycle_map_logic
+    related_document_refs:
+      - rule-llm-rule-authoring
+      - logic-coordinator-sublane-development-flow
+      - logic-worktree-lifecycle-boundary
+      - logic-existing-project-sublane-adoption
+      - logic-sublane-bandwidth-policy
+      - logic-project-scoped-workspace-identity
+      - logic-workspace-registry
+      - logic-workspace-anchor-project-defaults-migration
+      - logic-managed-state-model
+      - logic-unit-target-model
+      - logic-session-boundary
+      - logic-tmux-send-safety-contract
+      - logic-ack-completion-receiver-state
+      - logic-fallback-retirement-ledger
+      - logic-acceptance-rerun-protocol
+      - logic-turnkey-e2e-acceptance
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-smoke-test-frame
+      - spec-route-identity-ledger
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
       - spec-project-map
 
   - id: logic-session-inventory
