@@ -9,8 +9,10 @@ Covers the stateful runtime command surface (first vertical slice):
 - a repeated ``id=`` is suppressed (replay idempotency is observable);
 - a ``review_request`` lane drives the concrete next action ``perform_review`` (still exit
   0: advisory);
-- ``--json`` carries ``workflow.state`` + ``workflow.next_action``; ``--journal`` emits the
-  durable record markdown;
+- ``--json`` carries the enriched nested ``workflow.{state,next_action}`` envelope (#12671
+  j#68908 finding 2: the runtime command result includes route_identity / anchor /
+  risk_level / requires_confirmation / blocked_reason); ``--route-identity`` resolves the
+  next action's route; ``--journal`` emits the durable record markdown;
 - ``--event`` rejects a malformed spec / unknown gate / empty id.
 """
 
@@ -124,14 +126,14 @@ class IdOmissionRegressionTest(unittest.TestCase):
             ]
         )
         self.assertEqual(rc, 0)
-        payload = json.loads(text)
-        self.assertEqual(payload["state"]["suppressed_event_ids"], [])
-        self.assertEqual(len(payload["state"]["applied_event_ids"]), 2)
+        wf = json.loads(text)["workflow"]
+        self.assertEqual(wf["state"]["suppressed_event_ids"], [])
+        self.assertEqual(len(wf["state"]["applied_event_ids"]), 2)
         self.assertEqual(
-            payload["next_action"]["action"], "aggregate_owner_approval"
+            wf["next_action"]["action"], "aggregate_owner_approval"
         )
         self.assertEqual(
-            payload["state"]["lane_actions"][0]["state_class"], "owner_waiting"
+            wf["state"]["lane_actions"][0]["state_class"], "owner_waiting"
         )
 
     def test_explicit_shared_id_still_suppressed(self):
@@ -164,13 +166,49 @@ class JsonTest(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         payload = json.loads(text)
-        self.assertTrue(payload["advisory"])
+        self.assertIn("workflow", payload)
+        wf = payload["workflow"]
+        self.assertTrue(wf["advisory"])
         self.assertEqual(
-            payload["next_action"]["action"], "aggregate_owner_approval"
+            wf["next_action"]["action"], "aggregate_owner_approval"
         )
-        self.assertEqual(payload["next_action"]["target_issue"], "12857")
-        self.assertEqual(payload["state"]["applied_event_ids"], ["r"])
-        self.assertIn("admission", payload["state"])
+        self.assertEqual(wf["next_action"]["target_issue"], "12857")
+        # enriched safety fields are present on the runtime command result (j#68908 finding 2)
+        for key in ("route_identity", "anchor", "risk_level", "requires_confirmation", "blocked_reason"):
+            self.assertIn(key, wf["next_action"])
+        self.assertEqual(wf["state"]["applied_event_ids"], ["r"])
+        self.assertIn("admission", wf["state"])
+
+    def test_route_identity_resolves_and_omits_pane_id(self):
+        # A supplied --route-identity (with a pane_id cache) resolves the next action's
+        # route via the owner_role provider match; the pane id never appears in the JSON.
+        rc, text = _run(
+            [
+                "workflow", "runtime",
+                "--event", "12857:review_request,id=12857:j1,commit=1",
+                "--route-identity", "route_id=r,issue=12857,ws=ws1,role=codex,pane_name=gw,pane_id=%17",
+                "--json",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        na = json.loads(text)["workflow"]["next_action"]
+        self.assertEqual(na["action"], "perform_review")
+        self.assertIn("pane_name=gw", na["route_identity"])
+        self.assertEqual(na["blocked_reason"], "")
+        self.assertNotIn("%17", text)
+
+    def test_route_unresolved_fails_closed(self):
+        rc, text = _run(
+            [
+                "workflow", "runtime",
+                "--event", "12857:review_request,id=12857:j1,commit=1",
+                "--json",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        na = json.loads(text)["workflow"]["next_action"]
+        self.assertEqual(na["blocked_reason"], "route_identity_unresolved")
+        self.assertTrue(na["requires_confirmation"])
 
 
 class JournalTest(unittest.TestCase):
