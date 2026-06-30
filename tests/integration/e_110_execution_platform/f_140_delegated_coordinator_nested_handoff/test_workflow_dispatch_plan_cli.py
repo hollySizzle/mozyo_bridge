@@ -281,6 +281,187 @@ class PlanTest(unittest.TestCase):
             )
 
 
+_CF_ISSUES = {
+    "issues": [
+        {
+            "id": 1,
+            "tracker": {"name": "開発"},
+            "status": {"name": "New", "is_closed": False},
+            "parent": {"id": 99},
+            "custom_fields": [{"id": 5, "name": "execution_bucket", "value": "bucket-a"}],
+        },
+        {
+            "id": 2,
+            "tracker": {"name": "Task"},
+            "status": {"name": "New", "is_closed": False},
+            "parent": {"id": 99},
+            "custom_fields": [{"id": 5, "name": "execution_bucket", "value": "bucket-a"}],
+        },
+        {
+            "id": 99,
+            "tracker": {"name": "User Story"},
+            "status": {"name": "New", "is_closed": False},
+            "custom_fields": [{"id": 5, "name": "execution_bucket", "value": "bucket-a"}],
+        },
+        {
+            "id": 3,
+            "tracker": {"name": "Task"},
+            "status": {"name": "Closed", "is_closed": True},
+            "custom_fields": [{"id": 5, "name": "execution_bucket", "value": "bucket-a"}],
+        },
+    ]
+}
+
+
+class CustomFieldSourceTest(unittest.TestCase):
+    """`--bucket-source custom-field` execution-bucket provider selection (Redmine #12922)."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.issues = _write(self.tmp, "cf_issues.json", _CF_ISSUES)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_custom_field_by_id_enumerates_same_as_version(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-id",
+                "5",
+                "--bucket-id",
+                "bucket-a",
+                "--issues-json",
+                self.issues,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: true", out)
+        self.assertIn("source_kind: custom_field", out)
+        self.assertIn("candidate: 1", out)
+        self.assertIn("candidate: 2", out)
+        self.assertIn("skipped: 99 -> not_leaf", out)
+        self.assertIn("skipped: 3 -> issue_closed", out)
+
+    def test_custom_field_by_name_json_envelope(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-name",
+                "execution_bucket",
+                "--bucket-name",
+                "bucket-a",
+                "--issues-json",
+                self.issues,
+                "--json",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["bucket_id"], "bucket-a")
+        self.assertEqual(payload["source_kind"], "custom_field")
+        self.assertTrue(payload["resolved"])
+        # Same normalized plan shape as the fixed_version source -> same candidate fields.
+        by_id = {c["issue_id"]: c for c in payload["candidates"]}
+        self.assertEqual(by_id["1"]["classification"], "dispatchable")
+        self.assertEqual(
+            payload["recommended_route"],
+            "coordinator_codex -> sublane_codex_gateway -> same_lane_claude",
+        )
+
+    def test_disallowed_value_is_unresolved(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-id",
+                "5",
+                "--allowed-bucket",
+                "bucket-b",
+                "--bucket-id",
+                "bucket-a",
+                "--issues-json",
+                self.issues,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: false", out)
+        self.assertIn("bucket_skip: disallowed_value", out)
+
+    def test_allowed_value_resolves(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-id",
+                "5",
+                "--allowed-bucket",
+                "bucket-a",
+                "--bucket-id",
+                "bucket-a",
+                "--issues-json",
+                self.issues,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: true", out)
+
+    def test_unknown_value_is_unresolved(self):
+        rc, out = _run(
+            [
+                "workflow",
+                "dispatch-plan",
+                "--bucket-source",
+                "custom-field",
+                "--custom-field-id",
+                "5",
+                "--bucket-id",
+                "missing-bucket",
+                "--issues-json",
+                self.issues,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved: false", out)
+        self.assertIn("bucket_skip: bucket_not_found", out)
+
+    def test_custom_field_source_without_field_selector_fails_closed(self):
+        with self.assertRaises(SystemExit):
+            _run(
+                [
+                    "workflow",
+                    "dispatch-plan",
+                    "--bucket-source",
+                    "custom-field",
+                    "--bucket-id",
+                    "bucket-a",
+                    "--issues-json",
+                    self.issues,
+                ]
+            )
+
+    def test_default_source_is_fixed_version(self):
+        # No --bucket-source: the default fixed-version provider runs (custom_fields ignored).
+        parser = build_parser()
+        ns = parser.parse_args(
+            ["workflow", "dispatch-plan", "--bucket-id", "292", "--issues-json", "x.json"]
+        )
+        self.assertEqual(ns.bucket_source, "fixed-version")
+
+
 class ParsingTest(unittest.TestCase):
     def test_a_bucket_selector_is_required(self):
         parser = build_parser()
