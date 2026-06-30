@@ -49,6 +49,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow,
 )
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.application import (
+    cli_redmine_version,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     BuiltinCliModuleRegistry,
     CliCompositionConfig,
@@ -264,6 +267,18 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             ),
         ),
         cli_test_impact.register,
+    ),
+    (
+        CliFamily(
+            name="redmine-version",
+            summary=(
+                "Redmine Version metadata operations family (Redmine #12651): "
+                "open-leaf enumeration + fail-closed rename/close/lock/delete "
+                "preflight over operator-exported snapshots. Advisory / read-only; "
+                "no Redmine write, no routing/approval/close authority."
+            ),
+        ),
+        cli_redmine_version.register,
     ),
 )
 
