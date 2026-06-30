@@ -213,6 +213,11 @@ def _segments(test_path: str) -> set[str]:
 
 
 def _resolve_numbered(target: SourceTarget, test_files: tuple[str, ...]) -> TestImpact:
+    # A ``numbered_source`` target always carries a parsed epic (see
+    # parse_source_target). Make that precondition explicit so the invariant is
+    # enforced and the type narrows from ``str | None`` to ``str`` for the
+    # context-string construction below.
+    assert target.epic is not None
     direct_name = f"test_{target.module_stem}.py"
     direct: list[str] = []
     feature_neighbors: list[str] = []

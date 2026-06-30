@@ -169,6 +169,18 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: static typing staged adoption gate (mypy config and first typed island)
+  patterns:
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_impact.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_runtime.py
+  - pyproject.toml
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/static-typing-adoption-policy.md と @vibes/docs/logics/object-oriented-architecture-policy.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: otel event store, receiver, and activity model source
   patterns:
   - src/mozyo_bridge/otel_store.py
