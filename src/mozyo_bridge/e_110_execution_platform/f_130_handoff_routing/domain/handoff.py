@@ -31,6 +31,14 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     ticketless_work_intake_lines,
 )
 
+# Redmine #12918: the gateway-route-blocked structured-outcome wording lives in a
+# small f_130 sibling so this oversized module does not grow inline prose for the
+# new reason (the policy is in the f_140 enforcement module, uncyclable from here).
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
+    GATEWAY_ROUTE_BLOCKED_NARRATIVE,
+    GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
+)
+
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
@@ -691,6 +699,7 @@ Reason = Literal[
     "queue_enter",
     "cross_session_claude",
     "target_repo_mismatch",
+    "gateway_route_blocked",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -986,6 +995,11 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "target whose cwd lives under the expected repo."
             ),
         )
+    if reason == "gateway_route_blocked":
+        # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
+        # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
+        # in the f_140 enforcement module, which handoff cannot import back).
+        return "sender", GATEWAY_ROUTE_BLOCKED_NEXT_ACTION
     return "sender", "inspect handoff failure and decide the next step"
 
 
@@ -1256,6 +1270,8 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
             "Target pane's inferred repo root does not match `--target-repo`; "
             "handoff aborted before typing. No notification was typed."
         )
+    if reason == "gateway_route_blocked":
+        return GATEWAY_ROUTE_BLOCKED_NARRATIVE
     return "Handoff did not deliver; see structured outcome for details."
 
 

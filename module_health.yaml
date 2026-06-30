@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5940
+    lines: 5964
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -282,6 +282,15 @@ allowlist:
       `f_120_agent_discovery_pane_resolution/domain/target_selector.py` and
       `application/commands_target_select.py`, not here; the CLI flags live in the
       new `f_130_handoff_routing/application/cli_handoff_select.py`.
+      Raised 5940 -> 5964 for the #12918 gateway-route enforcement gate: a single
+      call-time `enforce_gateway_route(...)` in `orchestrate_handoff` fails closed
+      when a governed implementation_request / review_result is sent `--to claude`
+      directly to a cross-lane worker (bypassing that lane's Codex gateway). The
+      whole gate (sender lane-Unit resolution + the pure `decide_gateway_route`
+      policy + the structured emit + die + exception advisory) lives in the new
+      `f_140_delegated_coordinator_nested_handoff/application/gateway_route_gate.py`
+      seam over the new `domain/gateway_route_enforcement.py` policy, not here; only
+      the one thin call is added here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -328,7 +337,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1706
+    lines: 1722
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -414,6 +423,13 @@ allowlist:
       ticketless tests) and delegates the rendering, so the Redmine-anchored vs
       ticketless-no-anchor boundary is now physically explicit and this module no
       longer grows per ticketless field.
+      Raised 1706 -> 1722 for the #12918 `gateway_route_blocked` delivery Reason:
+      the token on the `Reason` literal plus the one-line `next_action_for` /
+      `_outcome_narrative` branches that reference it. The two structured-outcome
+      strings live in the separate `domain/gateway_route_wording.py` (kept out of
+      this module; the policy is in the f_140 enforcement module which imports
+      `handoff.KIND_LABELS`, so it cannot be imported back here without a cycle), so
+      only the Reason registration plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

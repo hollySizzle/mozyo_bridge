@@ -4744,6 +4744,30 @@ def orchestrate_handoff(
         )
         raise AssertionError("unreachable")
 
+    # Gateway Route Enforcement Gate (Redmine #12918): fail closed when a governed
+    # implementation_request / review_result is sent `--to claude` directly to a
+    # worker in a different lane than the sender, bypassing that lane's Codex
+    # gateway. The whole gate (policy + emit + die) lives in the f_140
+    # `application/gateway_route_gate` seam so this oversized module keeps only the
+    # one call.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_route_gate import (
+        enforce_gateway_route,
+    )
+
+    enforce_gateway_route(
+        args,
+        kind=kind,
+        receiver=receiver,
+        preflight_target=preflight_target,
+        source=source,
+        mode=mode,
+        anchor=anchor,
+        target=target,
+        record_format=record_format,
+        record_command=record_command,
+        emit=_emit_outcome,
+    )
+
     expected_target_repo = getattr(args, "target_repo", None)
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())

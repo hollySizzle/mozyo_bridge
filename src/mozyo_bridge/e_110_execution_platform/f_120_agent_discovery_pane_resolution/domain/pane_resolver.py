@@ -98,6 +98,38 @@ def current_session_name() -> str | None:
     return result.stdout.strip() or None
 
 
+def current_pane_lane_unit() -> tuple[str | None, str | None]:
+    """The ``(workspace_id, lane_id)`` Unit of the *sender* pane, or ``(None, None)``.
+
+    Redmine #12918: the gateway-route enforcement gate needs the sender's own lane
+    Unit to tell a legitimate same-lane ``gateway -> worker`` dispatch from a
+    coordinator reaching directly into a different lane's worker. The authority for
+    that Unit is the live pane inventory, not a bare tmux option read: the sender
+    pane (``TMUX_PANE``) is matched against the same :func:`pane_lines` rows the
+    target is resolved from, so a sender that the inventory does not carry — run
+    outside tmux, or from a pane the managed inventory does not know — resolves to
+    ``(None, None)``. The caller treats that as "sender identity unknown" and skips
+    the gate (it cannot prove a cross-lane bypass), mirroring how the cross-session
+    gate is skipped when the sender session is unknown.
+
+    Best-effort and fail-open for *resolution*: any inventory read failure (no tmux)
+    yields ``(None, None)`` rather than raising, so the enforcement gate never turns
+    a discovery hiccup into a spurious block.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None, None
+    try:
+        rows = pane_lines()
+    except (Exception, SystemExit):
+        return None, None
+    for row in rows:
+        if row.get("id") == pane:
+            workspace_id, lane_id = _pane_lane_identity(row)
+            return (workspace_id or None), lane_id
+    return None, None
+
+
 def _active_or_first(panes: list[dict[str, str]]) -> dict[str, str]:
     """The active pane among ``panes``, else the first (split-window tie-break)."""
     for pane in panes:
