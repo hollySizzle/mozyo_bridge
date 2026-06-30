@@ -4744,6 +4744,88 @@ def orchestrate_handoff(
         )
         raise AssertionError("unreachable")
 
+    # Gateway Route Enforcement Gate (Redmine #12918).
+    #
+    # The governed development route is coordinator Codex -> sublane Codex gateway
+    # -> same-lane Claude worker. The repeated operational error (#12670 j#68733)
+    # was a coordinator dispatching an `implementation_request` / `review_result`
+    # *directly* to a sublane Claude worker, bypassing that lane's Codex gateway.
+    # The cross-session `--to claude` gate above only catches a *different tmux
+    # session*; this gate catches the same-session, *different lane* cockpit case
+    # by keying on the lane Unit (`@mozyo_lane_id`, Redmine #11820) — never a pane
+    # id (`route_identity_ledger`: a pane id is a cache, not the route authority).
+    #
+    # It fires only for the governed kinds, only for `--to claude`, and only when
+    # the sender's own lane Unit is resolvable from the live inventory and differs
+    # from the target worker's lane. A sender the inventory does not carry (run
+    # outside tmux, the existing integration tests) leaves the gate skipped, just
+    # like the cross-session gate is skipped when the sender session is unknown, so
+    # a normal same-lane gateway -> worker dispatch is never blocked. An explicit
+    # durable exception (`--allow-direct-worker`) releases the block and is
+    # recorded distinctly as a `gateway_route_exception`.
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import (
+        pane_resolver as _pr_gw,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (
+        GatewayRouteRequest,
+        decide_gateway_route,
+    )
+
+    sender_ws_gw, sender_lane_gw = _pr_gw.current_pane_lane_unit()
+    gateway_route_decision = decide_gateway_route(
+        GatewayRouteRequest(
+            kind=kind,
+            receiver=receiver,
+            sender_identity_known=sender_lane_gw is not None,
+            sender_workspace_id=sender_ws_gw,
+            sender_lane_id=sender_lane_gw,
+            target_workspace_id=preflight_target.workspace_id,
+            target_lane_id=preflight_target.lane_id,
+            target_role=preflight_target.role,
+            allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
+        )
+    )
+    if gateway_route_decision.is_blocked:
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="gateway_route_blocked",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "gateway route enforcement (Redmine #12918): a "
+            f"{kind!r} addressed directly to the Claude worker in lane "
+            f"{(preflight_target.lane_id or '<unknown>')!r} bypasses that lane's "
+            "Codex gateway. The governed route is coordinator -> sublane Codex "
+            "gateway -> same-lane Claude worker. "
+            f"{gateway_route_decision.suggested_safe_route} "
+            "If a bypass is genuinely required, re-run with the explicit durable "
+            "exception `--allow-direct-worker` (recorded distinctly as a "
+            "gateway_route_exception)."
+        )
+        raise AssertionError("unreachable")
+    if gateway_route_decision.is_exception:
+        # Admitted only by the explicit durable exception: record it distinctly
+        # from the normal route so the bypass is auditable (acceptance #4). This is
+        # advisory stderr only; it does not alter the delivery that proceeds below.
+        print(
+            "gateway route enforcement (Redmine #12918): explicit durable "
+            f"exception applied — {kind!r} delivered directly to the cross-lane "
+            f"Claude worker in lane {(preflight_target.lane_id or '<unknown>')!r} "
+            "via `--allow-direct-worker`, bypassing the lane's Codex gateway. "
+            "Record this exception distinctly from the normal governed route.",
+            file=sys.stderr,
+        )
+
     expected_target_repo = getattr(args, "target_repo", None)
     if expected_target_repo:
         expected_resolved = str(Path(expected_target_repo).expanduser().resolve())

@@ -691,6 +691,7 @@ Reason = Literal[
     "queue_enter",
     "cross_session_claude",
     "target_repo_mismatch",
+    "gateway_route_blocked",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -986,6 +987,25 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "target whose cwd lives under the expected repo."
             ),
         )
+    if reason == "gateway_route_blocked":
+        # Redmine #12918: a governed implementation_request / review_result was
+        # addressed directly to a cross-lane Claude worker, bypassing that lane's
+        # Codex gateway. The safe route is the governed hop chain: send to the
+        # target lane's Codex gateway and let it perform the same-lane Claude
+        # handoff. An explicit durable exception (`--allow-direct-worker`) is the
+        # only override and is recorded distinctly from the normal route.
+        return (
+            "sender",
+            (
+                "route the implementation_request / review_result through the "
+                "target lane's Codex gateway (`--to codex` to that lane's gateway "
+                "pane), and let the gateway perform the same-lane Claude worker "
+                "handoff. A direct coordinator-to-sublane-worker send is blocked; "
+                "if a bypass is genuinely required, re-run with the explicit "
+                "durable exception `--allow-direct-worker` (recorded distinctly "
+                "from the normal route)."
+            ),
+        )
     return "sender", "inspect handoff failure and decide the next step"
 
 
@@ -1255,6 +1275,16 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
         return (
             "Target pane's inferred repo root does not match `--target-repo`; "
             "handoff aborted before typing. No notification was typed."
+        )
+    if reason == "gateway_route_blocked":
+        return (
+            "Gateway Route Enforcement gate (Redmine #12918): a governed "
+            "implementation_request / review_result was addressed directly to a "
+            "Claude worker in a different lane than the sender, bypassing that "
+            "lane's Codex gateway. The governed route is coordinator -> sublane "
+            "Codex gateway -> same-lane Claude worker; the direct coordinator-to-"
+            "worker send fails closed. Handoff aborted before typing; no "
+            "notification was typed."
         )
     return "Handoff did not deliver; see structured outcome for details."
 

@@ -205,6 +205,23 @@ def configure_handoff_parser(
         ),
     )
     parser_.add_argument(
+        "--allow-direct-worker",
+        dest="allow_direct_worker",
+        action="store_true",
+        help=(
+            "Explicit durable exception to the gateway-route enforcement gate "
+            "(Redmine #12918). By default a governed implementation_request / "
+            "review_result addressed `--to claude` directly to a worker in a "
+            "different lane than the sender fails closed with "
+            "`gateway_route_blocked`, because the governed route is coordinator -> "
+            "sublane Codex gateway -> same-lane Claude worker. Pass this flag ONLY "
+            "when a direct cross-lane worker delivery is genuinely required; the "
+            "send is then admitted but recorded distinctly as a "
+            "`gateway_route_exception` so the bypass is auditable. It does not "
+            "relax any cross-session / `--target-repo` / project gate."
+        ),
+    )
+    parser_.add_argument(
         "--workdir",
         dest="workdir",
         help=(
