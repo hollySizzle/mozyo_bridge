@@ -75,8 +75,27 @@ REPO_LOCAL_CONFIG_VERSION: int = 1
 
 #: The closed set of recognized top-level keys. Anything else fails closed.
 REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"version", "cli", "providers", "presentation", "delegation"}
+    {"version", "cli", "providers", "presentation", "delegation", "sublane_integration"}
 )
+
+#: The closed set of recognized keys inside the ``sublane_integration`` sub-record
+#: (Redmine #12604): the sublane Git worktree / retire-merge policy knob. ``version``
+#: is optional and defaults to :data:`REPO_LOCAL_CONFIG_VERSION`; the three policy
+#: keys carry *operational intent only* (see :class:`SublaneIntegrationConfig`) and
+#: never any owner-approval / close / callback / routing / send authority — those stay
+#: core-owned and the runtime preflight remains the final authority over this config.
+SUBLANE_INTEGRATION_KEYS: frozenset[str] = frozenset(
+    {"version", "manage_worktree", "integration_branch", "merge_on_retire"}
+)
+
+#: The behavior-preserving sublane-integration policy defaults (Redmine #12604).
+#: They are the documented *default path* of the (opt-in, explicitly invoked) sublane
+#: integration flow — create a worktree / branch at launch, and attempt a merge to the
+#: integration branch before retirement. They do **not** change any existing command:
+#: no current ``mozyo-bridge`` surface reads this block, and a repo that never invokes
+#: the sublane integration flow is unaffected by the defaults.
+DEFAULT_MANAGE_WORKTREE: bool = True
+DEFAULT_MERGE_ON_RETIRE: bool = True
 
 #: The closed set of recognized keys inside the ``presentation`` sub-record.
 #: ``version`` / ``surface`` select the projection *surface* (#12189); the three
@@ -274,6 +293,26 @@ def _checked_version(record: "Mapping[object, object]", *, source: str) -> int:
     return version
 
 
+def _checked_bool(
+    record: "Mapping[object, object]", key: str, default: bool, *, source: str
+) -> bool:
+    """Return a strict boolean record value, failing closed on anything else.
+
+    The key is optional and defaults to ``default``. ``int`` (including ``0`` /
+    ``1``) and any non-``bool`` value are rejected so ``merge_on_retire: 0`` cannot
+    silently read as ``False`` and a typo'd value never becomes a quiet policy
+    change — the fail-closed boundary the rest of this schema enforces.
+    """
+    if key not in record:
+        return default
+    value = record[key]
+    if not isinstance(value, bool):
+        raise RepoLocalConfigError(
+            f"{source} record {key!r} must be a boolean, got {value!r}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class PresentationSelectionConfig:
     """Projection-only selection of a built-in surface + desired grouping.
@@ -368,13 +407,120 @@ class PresentationSelectionConfig:
 
 
 @dataclass(frozen=True)
+class SublaneIntegrationConfig:
+    """The sublane Git worktree / retire-merge policy knob (Redmine #12604).
+
+    This is the typed *field contract* for the ``sublane_integration`` block of
+    ``.mozyo-bridge/config.yaml``. It carries **operational intent only** for the
+    config-driven sublane lifecycle the parent (#12603) re-evaluates: whether to
+    create a Git worktree / branch at sublane launch, which integration branch a
+    retire-time merge targets, and whether that merge is attempted at all.
+
+    Three policy fields:
+
+    - :attr:`manage_worktree` — in a Git workspace, the sublane launch default path
+      creates a worktree / branch (the documented #12604 default). ``False`` opts a
+      lane out, e.g. for a non-Git directory scaffold the runtime preflight also
+      skips worktree creation regardless of this flag.
+    - :attr:`integration_branch` — the configured target branch a retire-time merge
+      integrates into. ``None`` (the default) leaves the branch to runtime
+      resolution (e.g. the repo default branch); a runtime that cannot resolve a
+      target fails closed (``integration_blocked``) rather than guessing.
+    - :attr:`merge_on_retire` — attempt a merge to :attr:`integration_branch` before
+      retiring the lane (the documented #12604 default). ``merge_on_retire: false``
+      is the opt-out: the merge attempt is skipped, but every other retirement gate
+      (clean worktree, verification, durable record, and the owner-approval / close
+      / callback / durable-anchor invariants) still applies.
+
+    Boundary, kept enforced in code (this is *policy intent*, not authority):
+
+    - **The runtime preflight is the final authority, never this config.** This
+      record can opt *out* of a merge attempt; it can never opt out of a safety
+      gate or mark a blocked retirement as ``ok``. The decision authority is the
+      pure :mod:`...domain.sublane_integration_policy` preflight, which fails closed
+      on a dirty worktree, a merge conflict, an unresolved target branch, a
+      verification failure, or a missing invariant — *whatever this config says*.
+    - **The owner-approval / close / callback / durable-anchor invariants cannot be
+      disabled here.** There is deliberately no key for them: the closed
+      :data:`SUBLANE_INTEGRATION_KEYS` set admits only the three operational fields,
+      and a boundary-shaped key (``owner`` / ``approval`` / ``close`` / ``route`` /
+      ``send`` / credential, …) is rejected by the same closed-schema check the rest
+      of this module enforces.
+    - **Behavior-preserving default.** The default (manage worktree, merge on
+      retire, runtime-resolved branch) is the documented default *path of the opt-in
+      sublane integration flow*; no existing command reads this block, so a missing
+      ``sublane_integration`` block never changes default ``mozyo-bridge`` behavior.
+    """
+
+    manage_worktree: bool = DEFAULT_MANAGE_WORKTREE
+    integration_branch: Optional[str] = None
+    merge_on_retire: bool = DEFAULT_MERGE_ON_RETIRE
+
+    @classmethod
+    def default(cls) -> "SublaneIntegrationConfig":
+        """The behavior-preserving default sublane-integration policy."""
+        return cls()
+
+    @classmethod
+    def from_record(
+        cls, record: "Optional[Mapping[str, object]]" = None
+    ) -> "SublaneIntegrationConfig":
+        """Normalize a ``sublane_integration`` sub-record into a typed policy.
+
+        ``None`` or an empty mapping yields the behavior-preserving default. A
+        non-mapping record, a boundary-crossing / unknown key, an unsupported
+        version, a non-boolean ``manage_worktree`` / ``merge_on_retire``, or an
+        ``integration_branch`` that is neither ``None`` nor a non-empty string fails
+        closed with :class:`RepoLocalConfigError`.
+        """
+        if record is None:
+            return cls.default()
+        if not isinstance(record, Mapping):
+            raise RepoLocalConfigError(
+                "sublane integration config record must be a mapping (a YAML "
+                f"table), got {type(record).__name__}"
+            )
+        _reject_boundary_and_unknown_keys(
+            record,
+            allowed=SUBLANE_INTEGRATION_KEYS,
+            source="sublane integration config",
+        )
+        _checked_version(record, source="sublane integration config")
+        manage_worktree = _checked_bool(
+            record,
+            "manage_worktree",
+            DEFAULT_MANAGE_WORKTREE,
+            source="sublane integration config",
+        )
+        merge_on_retire = _checked_bool(
+            record,
+            "merge_on_retire",
+            DEFAULT_MERGE_ON_RETIRE,
+            source="sublane integration config",
+        )
+        integration_branch = record.get("integration_branch")
+        if integration_branch is not None:
+            if not isinstance(integration_branch, str) or not integration_branch.strip():
+                raise RepoLocalConfigError(
+                    "sublane integration config 'integration_branch' must be a "
+                    "non-empty string naming the target branch, or omitted for "
+                    f"runtime resolution; got {integration_branch!r}"
+                )
+        return cls(
+            manage_worktree=manage_worktree,
+            integration_branch=integration_branch,
+            merge_on_retire=merge_on_retire,
+        )
+
+
+@dataclass(frozen=True)
 class RepoLocalConfig:
     """The closed top-level ``.mozyo-bridge/config.yaml`` record (schema only).
 
-    Composes the four configurable surfaces — :attr:`cli`, :attr:`providers`,
-    :attr:`presentation`, :attr:`delegation` — each behavior-preserving by
-    default. The default (no fields set) reproduces the current ``mozyo-bridge``
-    behavior exactly.
+    Composes the five configurable surfaces — :attr:`cli`, :attr:`providers`,
+    :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration` — each
+    behavior-preserving by default. The default (no fields set) reproduces the
+    current ``mozyo-bridge`` behavior exactly.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -391,6 +537,9 @@ class RepoLocalConfig:
         default_factory=PresentationSelectionConfig.default
     )
     delegation: DelegationConfig = field(default_factory=DelegationConfig.default)
+    sublane_integration: SublaneIntegrationConfig = field(
+        default_factory=SublaneIntegrationConfig.default
+    )
 
     @classmethod
     def default(cls) -> "RepoLocalConfig":
@@ -471,11 +620,19 @@ class RepoLocalConfig:
             raise RepoLocalConfigError(
                 f"delegation config is invalid: {exc}"
             ) from exc
+        # The sublane integration policy knob (#12604) is parsed by its own
+        # self-contained sub-record, which raises RepoLocalConfigError directly, so
+        # the single fail-closed boundary holds without re-wrapping. An absent
+        # ``sublane_integration`` block resolves to the behavior-preserving default.
+        sublane_integration = SublaneIntegrationConfig.from_record(
+            record.get("sublane_integration")
+        )
         return cls(
             cli=cli,
             providers=providers,
             presentation=presentation,
             delegation=delegation,
+            sublane_integration=sublane_integration,
         )
 
 
@@ -485,8 +642,12 @@ __all__ = (
     "PRESENTATION_SELECTION_KEYS",
     "PRESENTATION_GROUPING_SUBKEYS",
     "DEFAULT_PRESENTATION_SURFACE",
+    "SUBLANE_INTEGRATION_KEYS",
+    "DEFAULT_MANAGE_WORKTREE",
+    "DEFAULT_MERGE_ON_RETIRE",
     "RepoLocalConfigError",
     "PresentationSelectionConfig",
+    "SublaneIntegrationConfig",
     "RepoLocalConfig",
     "DelegationConfig",
     "DelegationConfigError",
