@@ -225,6 +225,64 @@ class RedmineFixedVersionLaneBucketProvider:
         )
         return BucketResolution.of(bucket)
 
+    def _version_name_index(self) -> dict[str, set[str]]:
+        """Map each known Version *name* to the set of distinct ids carrying it (pure).
+
+        Names are read from the two sources :meth:`_version_state` already reads — the
+        versions snapshot and the ``fixed_version`` objects embedded on issues — so a name
+        resolves even when only the issues snapshot is supplied. A name carried by more
+        than one distinct id is ambiguous; :meth:`resolve_bucket_by_name` fails closed on
+        it rather than guessing.
+        """
+        index: dict[str, set[str]] = {}
+
+        def _add(version_id: Optional[str], name: Optional[str]) -> None:
+            if version_id is None or name is None:
+                return
+            index.setdefault(name, set()).add(version_id)
+
+        for version in self._versions():
+            _add(_str_or_none(version.get("id")), _str_or_none(version.get("name")))
+        for issue in self._issues():
+            fixed = _mapping(issue.get("fixed_version"))
+            _add(_str_or_none(fixed.get("id")), _str_or_none(fixed.get("name")))
+        return index
+
+    def resolve_bucket_by_name(self, name: str) -> BucketResolution:
+        """Resolve a bucket by its Version *name* (Redmine #12920), fail-closed on ambiguity.
+
+        The acceptance condition lets an operator name a Version by id *or* name; this is
+        the name path (the id path is :meth:`resolve_bucket`). The name is matched exactly
+        (whitespace-trimmed, case-sensitive) against the versions snapshot and the issues'
+        embedded ``fixed_version`` names. An empty name, or a name carried by more than one
+        distinct Version id, is ambiguous (:data:`SKIP_AMBIGUOUS_SOURCE`) and never guessed;
+        an unmatched name is :data:`SKIP_BUCKET_NOT_FOUND`. A unique match delegates to
+        :meth:`resolve_bucket` so the resolved bucket is byte-identical to the id path.
+        """
+        target = _str_or_none(name)
+        if target is None:
+            return BucketResolution.skipped(
+                BucketSkip(SKIP_AMBIGUOUS_SOURCE, detail="empty version name")
+            )
+        ids = sorted(self._version_name_index().get(target, set()))
+        if not ids:
+            return BucketResolution.skipped(
+                BucketSkip(
+                    SKIP_BUCKET_NOT_FOUND,
+                    detail=f"no version named {target!r} in the snapshot",
+                )
+            )
+        if len(ids) > 1:
+            return BucketResolution.skipped(
+                BucketSkip(
+                    SKIP_AMBIGUOUS_SOURCE,
+                    detail=(
+                        f"version name {target!r} matches multiple ids: {', '.join(ids)}"
+                    ),
+                )
+            )
+        return self.resolve_bucket(ids[0])
+
     def resolve_issue_bucket(self, issue_id: str) -> BucketResolution:
         target = _str_or_none(issue_id)
         if target is None:
