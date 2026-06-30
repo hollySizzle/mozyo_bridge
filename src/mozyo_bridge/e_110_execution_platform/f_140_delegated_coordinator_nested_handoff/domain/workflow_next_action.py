@@ -193,6 +193,18 @@ class RouteCandidate:
     pointer: str
 
 
+def expected_provider_for(owner_role: str) -> str | None:
+    """The runtime provider a workflow ``owner_role`` is expected to resolve to (pure).
+
+    Returns ``codex`` / ``claude`` for a known owner role, or ``None`` when the role has
+    no expected provider binding. Exposes the MVP role->provider map (config-driven binding
+    is #12673) so a sibling policy — e.g. the #12672 event watcher's stricter,
+    ambiguity-aware route selection — reuses the *same* binding rather than duplicating it
+    and drifting from it.
+    """
+    return _OWNER_ROLE_EXPECTED_PROVIDER.get(owner_role)
+
+
 def _resolve_route(
     action: str, owner_role: str, candidates: Sequence[RouteCandidate]
 ) -> str:
@@ -437,6 +449,7 @@ __all__ = (
     "BLOCKED_UNKNOWN_ACTION",
     "BLOCKED_ROUTE_IDENTITY_UNRESOLVED",
     "risk_policy_for",
+    "expected_provider_for",
     "RouteCandidate",
     "WorkflowNextAction",
     "derive_workflow_next_action",

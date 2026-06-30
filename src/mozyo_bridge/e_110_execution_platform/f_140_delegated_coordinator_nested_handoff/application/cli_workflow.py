@@ -62,6 +62,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_runtime,
     register_runtime,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_watch import (
+    cmd_workflow_watch,
+    register_watch,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
@@ -307,9 +311,13 @@ def register(sub) -> None:
     current lane state and the overall next action; ``workflow resume`` (Redmine #12671)
     reads the *persisted* mozyo-DB runtime state ``workflow runtime --persist`` wrote and
     reports the current state plus the enriched ``workflow.next_action`` (route_identity /
-    anchor / risk_level / requires_confirmation / blocked_reason). The fill-decision /
-    admission / runtime / resume subcommands are registered from their sibling modules so
-    this file stays focused on the step state machine.
+    anchor / risk_level / requires_confirmation / blocked_reason); ``workflow watch``
+    (Redmine #12672) ingests structured Redmine journal markers (deduped by the
+    ``redmine:<issue>:<journal>`` anchor) into that same store and reports the resulting
+    pending action, recording a fail-closed ``failed`` state for a missing / ambiguous route
+    rather than sending. The fill-decision / admission / runtime / resume / watch subcommands
+    are registered from their sibling modules so this file stays focused on the step state
+    machine.
     """
     workflow = sub.add_parser(
         "workflow",
@@ -332,6 +340,7 @@ def register(sub) -> None:
     register_admission(workflow_sub)
     register_runtime(workflow_sub)
     register_resume(workflow_sub)
+    register_watch(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",
@@ -406,5 +415,6 @@ __all__ = (
     "cmd_workflow_admission",
     "cmd_workflow_runtime",
     "cmd_workflow_resume",
+    "cmd_workflow_watch",
     "register",
 )
