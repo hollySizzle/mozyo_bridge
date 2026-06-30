@@ -221,7 +221,9 @@ def _markers_from_redmine_json(args: argparse.Namespace) -> tuple[JournalMarker,
 
     ``--redmine-json`` points at the ``/issues/<id>.json?include=journals`` (or MCP
     ``get_issue_detail``) payload an operator / MCP already fetched — the Redmine event
-    source. The :class:`MappingRedmineJournalSource` reads its journal entries and
+    source. Both real shapes are accepted: the Redmine REST shape that nests journals under
+    ``issue.journals``, and the MCP / export wrapper shape with a top-level ``journals``
+    list. The :class:`MappingRedmineJournalSource` reads its journal entries and
     :func:`markers_from_source` extracts the structured ``[mozyo:...]`` gate markers (never
     prose) into :class:`JournalMarker` inputs, so a Redmine-recorded review_request /
     review_result / implementation_done becomes a pending action. Absent the flag, returns

@@ -219,19 +219,47 @@ class MappingRedmineJournalSource:
     """A :class:`RedmineJournalSource` over an already-fetched Redmine issue-detail mapping.
 
     ``payload`` is the ``/issues/<id>.json?include=journals`` (or MCP ``get_issue_detail``)
-    shape an operator / MCP fetched: either ``{"issue": {...}, "journals": [...]}`` or a bare
-    ``{"journals": [...]}``. Each journal object contributes a :class:`RedmineJournalEntry`
-    (its ``id`` + ``notes``); field-only journals with an empty ``notes`` are dropped (no
-    marker can live in an empty note). Pure — it reads a supplied snapshot and performs no
-    network I/O. The live network read is the follow-up adapter behind the same port.
+    shape an operator / MCP fetched. Both real shapes are supported:
+
+    - the **Redmine REST** shape nests journals under the issue: ``{"issue": {"id": …,
+      "journals": [...]}}``;
+    - the **MCP / export wrapper** shape lifts them to the top level:
+      ``{"issue": {...}, "journals": [...]}`` (or a bare ``{"journals": [...]}``).
+
+    A top-level ``journals`` list wins when present; otherwise ``issue.journals`` is read, so
+    a direct REST fetch is not silently dropped (review j#69006 finding 1). Each journal
+    object contributes a :class:`RedmineJournalEntry` (its ``id`` + ``notes``); field-only
+    journals with an empty ``notes`` are dropped (no marker can live in an empty note). A
+    valid empty journal list simply yields no entries. Pure — it reads a supplied snapshot
+    and performs no network I/O. The live network read is the follow-up adapter behind the
+    same port.
     """
 
     payload: Mapping[str, object]
 
+    @staticmethod
+    def _as_journal_list(raw: object) -> list[Mapping[str, object]] | None:
+        """A list of journal mappings from a candidate value, or None if it is not a list.
+
+        ``None`` means "this location had no journals list" (so the caller falls back to the
+        other location); an **empty** list is a valid result (no events) and is returned as
+        ``[]``. A bare string is never a journals list even though ``str`` is a ``Sequence``.
+        """
+        if isinstance(raw, str) or not isinstance(raw, Sequence):
+            return None
+        return [j for j in raw if isinstance(j, Mapping)]
+
     def _journals(self) -> Sequence[Mapping[str, object]]:
-        raw = self.payload.get("journals")
-        if isinstance(raw, Sequence):
-            return [j for j in raw if isinstance(j, Mapping)]
+        # Top-level journals (MCP / export wrapper shape) win when present.
+        top = self._as_journal_list(self.payload.get("journals"))
+        if top is not None:
+            return top
+        # Fall back to the Redmine REST shape, which nests journals under the issue.
+        issue = self.payload.get("issue")
+        if isinstance(issue, Mapping):
+            nested = self._as_journal_list(issue.get("journals"))
+            if nested is not None:
+                return nested
         return []
 
     def _issue_id(self, issue_id: str | None) -> str:

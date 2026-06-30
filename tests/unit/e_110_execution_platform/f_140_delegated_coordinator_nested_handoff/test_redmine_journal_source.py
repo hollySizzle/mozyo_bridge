@@ -154,5 +154,51 @@ class MappingSourceTest(unittest.TestCase):
         self.assertEqual(markers[0].event_id, "redmine:12672:5")
 
 
+class NestedRestShapeTest(unittest.TestCase):
+    """The Redmine REST shape nests journals under issue.journals (review j#69006)."""
+
+    def test_nested_issue_journals_are_read(self):
+        # The /issues/<id>.json?include=journals shape: journals under the issue.
+        payload = {
+            "issue": {
+                "id": "12672",
+                "journals": [
+                    {"id": "68989", "notes": _handoff_marker("12672", "68989", "review_request")},
+                ],
+            }
+        }
+        source = MappingRedmineJournalSource(payload=payload)
+        markers = markers_from_source(source, "")
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].event_id, "redmine:12672:68989")
+        # The issue id resolves from issue.id too.
+        self.assertEqual(markers[0].issue, "12672")
+
+    def test_top_level_journals_take_precedence(self):
+        # When both are present the top-level (MCP wrapper) list wins; the nested one is a
+        # stale duplicate in that wrapper shape.
+        payload = {
+            "issue": {
+                "id": "12672",
+                "journals": [{"id": "999", "notes": _handoff_marker("12672", "999", "review_request")}],
+            },
+            "journals": [{"id": "68989", "notes": _handoff_marker("12672", "68989", "review_request")}],
+        }
+        source = MappingRedmineJournalSource(payload=payload)
+        entries = source.read_entries()
+        self.assertEqual([e.journal_id for e in entries], ["68989"])
+
+    def test_empty_nested_journal_list_yields_nothing_not_crash(self):
+        payload = {"issue": {"id": "12672", "journals": []}}
+        source = MappingRedmineJournalSource(payload=payload)
+        self.assertEqual(source.read_entries(), [])
+        self.assertEqual(markers_from_source(source, ""), ())
+
+    def test_no_journals_anywhere_yields_empty(self):
+        payload = {"issue": {"id": "12672"}}
+        source = MappingRedmineJournalSource(payload=payload)
+        self.assertEqual(source.read_entries(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

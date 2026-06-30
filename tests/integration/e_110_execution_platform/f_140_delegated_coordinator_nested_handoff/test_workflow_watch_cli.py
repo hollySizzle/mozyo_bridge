@@ -238,6 +238,32 @@ class RedmineSourceTest(_StoreCase):
         self.assertEqual(rc, 0)
         self.assertIn("accepted: 0 suppressed: 1", out)
 
+    def test_nested_redmine_rest_shape_is_read(self):
+        # The standard /issues/<id>.json?include=journals shape nests journals under the
+        # issue (review j#69006): it must not silently drop them.
+        payload = {
+            "issue": {
+                "id": "12672",
+                "journals": [
+                    {
+                        "id": "68989",
+                        "notes": (
+                            "[mozyo:handoff:source=redmine:issue=12672:journal=68989:"
+                            "kind=review_request:to=codex]"
+                        ),
+                    }
+                ],
+            }
+        }
+        path = Path(self._tmp.name) / "rest.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        rc, out = _run(
+            ["workflow", "watch", "--redmine-json", str(path), "--store-path", self.store_path]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("redmine:12672:68989 review_request -> accepted", out)
+        self.assertIn("accepted: 1", out)
+
 
 class PaneIdNeverEmittedTest(_StoreCase):
     def test_pane_id_is_not_in_output(self):
