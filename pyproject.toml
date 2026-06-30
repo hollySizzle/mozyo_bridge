@@ -40,6 +40,12 @@ classifiers = [
 # The receiver works without this extra when agents are configured with
 # OTEL_EXPORTER_OTLP_PROTOCOL=http/json.
 otel = ["opentelemetry-proto>=1.25"]
+# Static type checker for the OOP-first staged typing gate (Redmine #12642 /
+# Version #276). Opt-in dev extra so the type check is reproducible without
+# adding a runtime dependency or auto-installing anything. Run the gate with
+# `python -m mypy` from the repo root (config below). See
+# vibes/docs/logics/static-typing-adoption-policy.md.
+typecheck = ["mypy>=1.8"]
 
 [project.scripts]
 mozyo-bridge = "mozyo_bridge.application.cli:main"
@@ -89,3 +95,40 @@ mozyo_bridge = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+# --- Static typing staged adoption (Redmine #12642 / Version #276) -----------
+# OOP-first architecture is adopted together with static typing. This is the
+# CONSERVATIVE FIRST gate: the default `python -m mypy` run checks only the
+# typed bounded-context islands listed in `files`. Whole-repo strict typing is
+# explicitly NOT the first gate; new OOP-first object boundaries (value object /
+# result object / Protocol port / use-case injection) are added to `files` as
+# each tranche lands. Rationale, staged priority, and the ratchet plan live in
+# vibes/docs/logics/static-typing-adoption-policy.md.
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+files = [
+    "src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain",
+]
+# The repo is not yet type-clean as a whole: do not chase imports out of the
+# typed island into untyped modules, and tolerate third-party packages that
+# ship no stubs (e.g. PyYAML). This keeps the gate scoped without erroring on
+# the surrounding, not-yet-typed code.
+follow_imports = "silent"
+ignore_missing_imports = true
+# Low-noise correctness signal that does not demand the rest of the repo be
+# typed first.
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+no_implicit_optional = true
+
+# The typed island is held to a stricter bar than the surrounding repo: it is
+# fully annotated today and must stay that way. Tightening per-module here (not
+# globally) is how the gate ratchets one bounded context at a time.
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true

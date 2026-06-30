@@ -424,11 +424,25 @@ documents:
     purpose: "OOP-first architecture and static typing planning bucket 以降の architecture work で OOP-first と static typing を基本姿勢にする設計思想正本。CLI / use case / domain policy / port-adapter / value object の責務境界と pure function の残し方を定義する。"
     audit_role: object_oriented_architecture_policy_logic
     related_document_refs:
+      - logic-static-typing-adoption-policy
       - logic-refactor-split-strategy
       - logic-source-layout-bounded-context-migration
       - logic-plugin-ready-adapter-boundary
       - logic-module-health-gate
       - logic-coordinator-sublane-development-flow
+      - spec-bounded-context-map
+      - spec-project-map
+
+  - id: logic-static-typing-adoption-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/static-typing-adoption-policy.md
+    purpose: "OOP-first architecture を static typing とセットで段階導入するための tool / command / 最初の適用 boundary の設計正本 (Redmine #12642 / Version #276)。tool = `mypy` (pyproject `[tool.mypy]` 完結 / opt-in `typecheck` extra / `python -m mypy`)、最初の typed island = `e_150_quality_architecture/f_150_ci_verification/domain` (value/result object 群)、island だけ strict・repo 全体 strict は要求しない・CI 強制は本 tranche では保留する保守的 first gate、tranche ごとの ratchet 計画を定義する。"
+    audit_role: static_typing_adoption_policy_logic
+    related_document_refs:
+      - logic-object-oriented-architecture-policy
+      - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
       - spec-bounded-context-map
       - spec-project-map
 
@@ -1235,6 +1249,18 @@ file_conventions:
     document_refs:
       - logic-test-runtime-profiling-policy
       - logic-tests-placement-discovery-policy
+      - spec-project-map
+
+  - id: fc-static-typing-gate
+    name: static typing staged adoption gate (mypy config and first typed island)
+    patterns:
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_impact.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_runtime.py
+      - pyproject.toml
+    severity: warn
+    document_refs:
+      - logic-static-typing-adoption-policy
+      - logic-object-oriented-architecture-policy
       - spec-project-map
 
   - id: fc-otel-event-store-source
