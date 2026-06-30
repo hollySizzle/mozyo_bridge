@@ -176,19 +176,30 @@ class LiveRedmineVersionIssueSource:
                     "Redmine returned a malformed issues page (no issues list)",
                     reason=READ_TRANSPORT_ERROR,
                 )
-            collected.extend(
-                entry for entry in issues if isinstance(entry, Mapping)
-            )
             total = body.get("total_count")
             if not isinstance(total, int) or isinstance(total, bool):
                 raise RedmineVersionReadUnavailable(
                     "Redmine returned a malformed issues page (no total_count)",
                     reason=READ_TRANSPORT_ERROR,
                 )
-            # Stop once we have covered the reported total, or the server
-            # returned a short/empty page (defensive against a stalled offset).
-            if len(collected) >= total or not issues:
+            page_issues = [entry for entry in issues if isinstance(entry, Mapping)]
+            collected.extend(page_issues)
+            if len(collected) >= total:
+                # Covered the reported total: a complete snapshot. This is the
+                # ONLY success path — including the genuinely-empty Version,
+                # where total_count == 0 and the first page returns [].
                 return collected
+            # total_count is not yet covered, so another page is required. If
+            # this page yielded no usable rows the walk cannot make progress:
+            # the server's total_count and page contents disagree. Refuse a
+            # partial snapshot rather than report a short read as a complete
+            # (or empty) Version — the #12923 fail-closed contract (j#69422).
+            if not page_issues:
+                raise RedmineVersionReadUnavailable(
+                    "Redmine returned an empty page before total_count was "
+                    "covered; refusing a partial snapshot",
+                    reason=READ_TRANSPORT_ERROR,
+                )
             offset += self._page_limit
         # Exhausted MAX_PAGES without covering total_count: refuse a partial
         # snapshot rather than understate the Version's open work.

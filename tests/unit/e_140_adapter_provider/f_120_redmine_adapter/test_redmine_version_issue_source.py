@@ -224,6 +224,44 @@ class FailClosedTest(unittest.TestCase):
             source.read_version_issues("248")
         self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
 
+    def test_empty_page_before_total_covered_fails_closed(self) -> None:
+        # Regression (j#69422): a first page with no issues but total_count > 0
+        # must NOT be returned as a (partial/empty) snapshot — it fails closed,
+        # so a gap is never rendered as an empty Version.
+        opener = _RecordingOpener([{"issues": [], "total_count": 2}])
+        with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
+            _source(opener).read_version_issues("248")
+        self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
+
+    def test_empty_second_page_before_total_covered_fails_closed(self) -> None:
+        # Regression (j#69422): a full first page that still does not cover
+        # total_count, followed by an empty page, must fail closed rather than
+        # return the first page as a complete snapshot.
+        page1 = {"issues": [_issue(i) for i in range(10)], "total_count": 25}
+        empty = {"issues": [], "total_count": 25}
+        opener = _RecordingOpener([page1, empty])
+        with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
+            _source(opener, page_limit=10).read_version_issues("248")
+        self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
+        self.assertEqual(opener.offsets, ["0", "10"])  # walked, then refused
+
+    def test_page_with_only_non_mapping_rows_before_total_fails_closed(self) -> None:
+        # A page whose rows are all unusable (non-mapping) makes no progress
+        # toward total_count and must fail closed, not loop or truncate.
+        opener = _RecordingOpener([{"issues": [1, 2, 3], "total_count": 5}])
+        with self.assertRaises(RedmineVersionReadUnavailable) as ctx:
+            _source(opener).read_version_issues("248")
+        self.assertEqual(ctx.exception.reason, READ_TRANSPORT_ERROR)
+
+    def test_short_final_page_that_covers_total_succeeds(self) -> None:
+        # The legitimate short-page case: a non-full final page that brings the
+        # collected count up to total_count is a complete snapshot, not a gap.
+        page1 = {"issues": [_issue(i) for i in range(10)], "total_count": 15}
+        page2 = {"issues": [_issue(i) for i in range(10, 15)], "total_count": 15}
+        opener = _RecordingOpener([page1, page2])
+        issues = _source(opener, page_limit=10).read_version_issues("248")
+        self.assertEqual(len(issues), 15)
+
     def test_page_walk_guard_refuses_partial_snapshot(self) -> None:
         # total_count always claims more than a page; never converges -> guard.
         full_page = {"issues": [_issue(i) for i in range(10)], "total_count": 10_000}
