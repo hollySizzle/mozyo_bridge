@@ -272,6 +272,20 @@ def configure_handoff_parser(
         ),
     )
     parser_.add_argument(
+        "--main-lane-exception",
+        dest="main_lane_exception",
+        help=(
+            "Authorize a `--to claude --kind implementation_request` send to the "
+            "repo's default/main lane (Redmine #12441). Implementation-shaped "
+            "work defaults to a cockpit-visible sublane, so a direct main-lane "
+            "Claude implementation dispatch fails closed unless this flag "
+            "references a durable owner/operator `main_lane_exception` decision "
+            "(e.g. a Redmine journal pointer). Prefer routing via the target-lane "
+            "Codex gateway (`--to codex`) or a sublane instead; this is the "
+            "narrow, audited escape hatch, not the default path."
+        ),
+    )
+    parser_.add_argument(
         "--mode",
         choices=sorted(MODES),
         default=MODE_QUEUE_ENTER,

@@ -195,10 +195,13 @@ class QueueEnterPreflightBindingTest(unittest.TestCase):
     def test_cockpit_marker_role_admits_matching_receiver(self) -> None:
         # Cockpit pane: marker=claude, layout window=codex. `--to claude` binds
         # via the pane option and submits Enter under the default queue-enter
-        # rail; the layout window name does not block it.
+        # rail; the layout window name does not block it. A non-default lane
+        # keeps this a legitimate same-lane *sublane* Claude dispatch so the
+        # #12441 main-lane guard (cockpit + default lane + implementation_request)
+        # does not apply — this test isolates the role-binding behavior.
         pane = _pane(
             pane_id="%2", location="mozyo-cockpit:0.2", window_name="codex",
-            command="claude", agent_role="claude",
+            command="claude", agent_role="claude", lane_id="lane-sub",
         )
         result, sent, _stdout = self._run_handoff(
             self._argv("claude"), pane, sender_session="mozyo-cockpit"

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5821
+    lines: 5875
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -319,6 +319,12 @@ allowlist:
       are unchanged) and prints the outcome. The extracted body offsets the one new
       `doctor_command` import, so the count is unchanged; the residual command
       orchestration that remains here stays residual to #12638.
+      Raised 5821 -> 5875 for the #12440/#12441 main-lane implementation_request
+      fail-closed guard wired into `orchestrate_handoff` (the decision predicate
+      lives in `f_130_handoff_routing/domain/handoff.py`; this is the blocked-
+      outcome + actionable-die wiring after target preflight, before the mode-
+      scoped binding gate). Rebased onto current main from already-reviewed commit
+      11700ce; moved-module architecture preserved.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -365,7 +371,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1722
+    lines: 1809
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -458,6 +464,28 @@ allowlist:
       this module; the policy is in the f_140 enforcement module which imports
       `handoff.KIND_LABELS`, so it cannot be imported back here without a cycle), so
       only the Reason registration plumbing lands here.
+      Raised 1722 -> 1809 for the #12440/#12441 main-lane implementation_request
+      guard: the pure `main_lane_implementation_request_blocked` predicate
+      (cockpit/sublane-scoped fail-closed decision), the `MAIN_LANE_ID` constant,
+      the `main_lane_implementation_blocked` reason, and its next-action /
+      narrative branches. Rebased onto current main from already-reviewed commit
+      11700ce; moved-module architecture preserved.
+    owner_issue: "#12321"
+    resolution_version: "v0.10.10 (Version #241)"
+    expires: "2027-11-30"
+
+  - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/cli_handoff.py
+    lines: 1011
+    reason: >-
+      `handoff` argparse registrar (`configure_handoff_parser` + the send / reply
+      / cross-workspace-consult subcommands). Pure flag wiring; the orchestration
+      lives in `application/commands.py` and the sibling extractions
+      (`cli_handoff_q_enter` / `cli_handoff_select` / `cli_handoff_ticketless`).
+      Was 995 (under threshold) until the #12440/#12441 integration rebase added
+      the `--main-lane-exception` flag (already-reviewed commit 11700ce), tipping
+      it to 1011. The flag is the narrow, audited escape hatch for the main-lane
+      implementation_request guard; its help text carries the audit-facing
+      explanation. Allowlisted rather than extracting a one-flag sibling module.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

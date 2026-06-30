@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     AGENT_KIND_CODEX,
     AGENT_KIND_UNKNOWN,
     ROLE_SOURCE_WINDOW_NAME,
+    VIEW_KIND_COCKPIT_PANE,
     infer_repo_root,
     project_preflight_target,
 )
@@ -89,6 +90,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     build_notification_body,
     evaluate_standard_target_admission,
     is_explicit_pane_target,
+    main_lane_implementation_request_blocked,
     make_outcome,
     normalize_anchor,
     resolve_queue_enter_retry_policy,
@@ -4540,6 +4542,58 @@ def orchestrate_handoff(
     # is a compatibility fallback (`role_source == window_name`); ambiguous /
     # unknown is surfaced for fail-closed handling below.
     preflight_target = project_preflight_target(target_info)
+
+    # Main-lane implementation-dispatch guard (Redmine #12441; prevention note
+    # #12438 j#63436). In the managed cockpit / sublane operating model (epic
+    # #12366; `vibes/docs/logics/coordinator-sublane-development-flow.md`) the
+    # main-unit Claude is not an implementer; implementation-shaped work defaults
+    # to a cockpit-visible sublane, so a direct `handoff send --to claude --kind
+    # implementation_request` into the cockpit's default/main-lane Claude is a
+    # process gap (#12438 j#63432/j#63434). Fail closed in EVERY mode (the
+    # resolved target's lane/view is known here, before the mode-scoped binding
+    # gate below) unless an explicit `--main-lane-exception` references an
+    # owner/operator decision. Deliberately scoped to cockpit panes: a plain
+    # `normal_window` Claude (unmanaged repo, no sublane model), a same-lane
+    # *sublane* Claude (non-`default` lane), a `--to codex` gateway dispatch, and
+    # any non-`implementation_request` notification to the main-lane Claude are
+    # all unaffected.
+    if main_lane_implementation_request_blocked(
+        receiver=receiver,
+        kind=kind,
+        target_lane_id=preflight_target.lane_id,
+        target_is_cockpit_pane=(preflight_target.view_kind == VIEW_KIND_COCKPIT_PANE),
+        target_binds_claude=preflight_target.binds_receiver("claude"),
+        has_main_lane_exception=bool(getattr(args, "main_lane_exception", None)),
+    ):
+        _emit_outcome(
+            make_outcome(
+                status="blocked",
+                reason="main_lane_implementation_blocked",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "blocked: `--to claude --kind implementation_request` resolved to "
+            f"the repo's default/main lane (pane {target}, lane="
+            f"{preflight_target.lane_id!r}). Implementation-shaped work defaults "
+            "to a cockpit-visible sublane — \"pane already open\" is not an "
+            "exception. Dispatch through the target-lane Codex gateway "
+            "(`--to codex --target <session>:codex --target-repo <root>`), which "
+            "performs the same-lane Claude handoff, or — only with a genuine "
+            "owner/operator decision recorded in the durable anchor — pass "
+            "`--main-lane-exception <journal-ref>`. A same-lane sublane Claude "
+            "dispatch (non-default lane) is unaffected."
+        )
+        raise AssertionError("unreachable")
+
     if (mode == MODE_QUEUE_ENTER or require_receiver_binding) and not preflight_target.binds_receiver(receiver):
         # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908;
         # mode-independent for receiver-locked wrappers since Redmine #11779).
