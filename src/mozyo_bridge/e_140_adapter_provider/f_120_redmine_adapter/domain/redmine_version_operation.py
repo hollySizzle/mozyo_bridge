@@ -85,19 +85,22 @@ class VersionState:
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "VersionState":
         """Parse one ``list_versions`` entry. Fail-closed on a missing id, and
-        ``counts_known`` only when all three count fields are present."""
+        ``counts_known`` only when all three count fields are present **and parse
+        as integers** — a present-but-unparseable count (e.g. a malformed
+        snapshot) must not be trusted as a genuine ``0``."""
         version_id = str(payload.get("id", "")).strip()
         if not version_id:
             raise VersionOperationError("version entry has no id")
         count_keys = ("issues_count", "open_issues_count", "closed_issues_count")
-        counts_known = all(key in payload for key in count_keys)
+        parsed = [_coerce_count(payload[key]) if key in payload else None for key in count_keys]
+        counts_known = all(value is not None for value in parsed)
         return cls(
             version_id=version_id,
             name=str(payload.get("name", "") or ""),
             status=str(payload.get("status", "") or "").strip().lower(),
-            issues_count=_as_int(payload.get("issues_count")),
-            open_issues_count=_as_int(payload.get("open_issues_count")),
-            closed_issues_count=_as_int(payload.get("closed_issues_count")),
+            issues_count=parsed[0] or 0,
+            open_issues_count=parsed[1] or 0,
+            closed_issues_count=parsed[2] or 0,
             counts_known=counts_known,
         )
 
@@ -311,8 +314,15 @@ def _operator_ui_step(
     return f"{base} > Delete (confirm; only valid for an empty version)"
 
 
-def _as_int(value: object) -> int:
+def _coerce_count(value: object) -> int | None:
+    """Parse an issue-count field to an int, or ``None`` when it is missing or
+    not an integer. ``None`` keeps ``counts_known`` false so a malformed count is
+    never trusted as a genuine ``0`` by a destructive preflight."""
+    if isinstance(value, bool):  # bool is an int subclass; reject it explicitly
+        return None
+    if isinstance(value, int):
+        return value
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
-        return 0
+        return None

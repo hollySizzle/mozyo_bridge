@@ -34,8 +34,9 @@ domain + port を置く。
   の真に空な Version のみ許可 (三者確認で矛盾 snapshot も blocked)。非空は `version_not_empty`、
   `historical_protected` 指定は `historical_protected` で blocked (歴史保持は close/lock 領域)。
   `VersionState.counts_known` は既定 False (fail-closed); `from_mapping` は 3 count field
-  全て存在時のみ True、CLI inline は 3 count 全指定時のみ True、`--versions-json` は
-  list_versions の count を信頼する。
+  全て存在 **かつ整数 parse 可能** な時のみ True (parse 不能な値は trusted zero にしない)、
+  CLI inline は 3 count 全指定時のみ True (argparse `type=int` が parse 不能を弾く)、
+  `--versions-json` は list_versions の count を上記 parse 規則で信頼する。
 - 全 guard 通過時のみ `rest_step` (`PUT/DELETE /versions/<id>.json`) と
   `operator_ui_step` を出す。pure・network 無し・mutation 無し。
 

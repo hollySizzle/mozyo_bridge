@@ -214,6 +214,38 @@ class PreflightCliTest(_SnapshotCase):
         self.assertEqual(code, 0)
         self.assertIn("DELETE /versions/999.json", out)
 
+    def test_parse_invalid_snapshot_counts_fail_closed(self) -> None:
+        # Regression (j#69325): a --versions-json entry with non-numeric counts
+        # must not let the delete preflight pass on trusted-zero counts.
+        bad = Path(self._tmp.name) / "bad_counts.json"
+        bad.write_text(
+            json.dumps(
+                {
+                    "versions": [
+                        {"id": "999", "name": "bad", "status": "open", "issues_count": "not-a-number", "open_issues_count": "not-a-number", "closed_issues_count": "not-a-number"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, out = self._run(
+            [
+                "redmine-version",
+                "preflight",
+                "--version-id",
+                "999",
+                "--op",
+                "delete",
+                "--versions-json",
+                str(bad),
+                "--confirm",
+                "delete:999",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("counts_required", out)
+        self.assertNotIn("DELETE /versions/999.json", out)
+
     def test_unknown_version_in_snapshot_fails_closed(self) -> None:
         code, _ = self._run(
             [

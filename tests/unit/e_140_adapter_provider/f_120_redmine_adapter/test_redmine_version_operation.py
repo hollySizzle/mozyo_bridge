@@ -313,6 +313,54 @@ class VersionStateParseTest(unittest.TestCase):
         state = VersionState.from_mapping({"id": "281", "name": "bucket", "status": "open"})
         self.assertFalse(state.counts_known)
 
+    def test_from_mapping_with_unparseable_count_is_counts_unknown(self) -> None:
+        # Regression (j#69325): a present-but-non-numeric count must NOT be
+        # trusted as a genuine 0 (which would let delete pass).
+        state = VersionState.from_mapping(
+            {
+                "id": "999",
+                "name": "bad counts",
+                "status": "open",
+                "issues_count": "not-a-number",
+                "open_issues_count": "not-a-number",
+                "closed_issues_count": "not-a-number",
+            }
+        )
+        self.assertFalse(state.counts_known)
+        decision = decide_version_operation(
+            VersionOperationRequest(
+                operation="delete", state=state, confirmation="delete:999"
+            )
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("counts_required", decision.blocked_reasons)
+        self.assertIsNone(decision.rest_step)
+
+    def test_from_mapping_with_partial_unparseable_count_is_counts_unknown(self) -> None:
+        state = VersionState.from_mapping(
+            {
+                "id": "999",
+                "status": "open",
+                "issues_count": 0,
+                "open_issues_count": "x",
+                "closed_issues_count": 0,
+            }
+        )
+        self.assertFalse(state.counts_known)
+
+    def test_from_mapping_with_string_numeric_counts_is_known(self) -> None:
+        # Real list_versions returns numeric strings sometimes; these parse fine.
+        state = VersionState.from_mapping(
+            {
+                "id": "999",
+                "status": "open",
+                "issues_count": "0",
+                "open_issues_count": "0",
+                "closed_issues_count": "0",
+            }
+        )
+        self.assertTrue(state.counts_known)
+
     def test_from_mapping_without_id_fails_closed(self) -> None:
         with self.assertRaises(VersionOperationError):
             VersionState.from_mapping({"name": "no id"})
