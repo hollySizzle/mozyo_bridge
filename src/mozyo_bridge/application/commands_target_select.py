@@ -71,22 +71,35 @@ def discover_all_candidates() -> list[TargetCandidate]:
     )
 
 
-def resolve_expected_repo(repo_arg: Optional[str], *, sender_cwd: str) -> Optional[str]:
-    """Resolve the selection's expected repo root to a concrete path.
+def resolve_sender_repo_root(sender_cwd: str) -> Optional[str]:
+    """The sender's *own* workspace (Git repo) root, or ``None`` (#12663).
 
-    An explicit ``--target-repo <path>`` resolves to its absolute root; an
-    omitted flag or ``auto`` defaults to the *sender's* own workspace root (the
-    "send to the gateway for this repo" UX). ``None`` when no marker is
-    reachable — the selector then treats repo as "any" and stays fail-closed on
-    ambiguity downstream.
+    This is the workspace-identity anchor for the cross-workspace Claude guard
+    and the default selection repo. Resolved once from the sender's cwd through
+    the shared workspace-root resolver. Patchable for tests.
     """
     from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
         resolve_workspace_root,
     )
 
+    return resolve_workspace_root(sender_cwd)
+
+
+def resolve_expected_repo(
+    repo_arg: Optional[str], *, sender_repo_root: Optional[str]
+) -> Optional[str]:
+    """Resolve the selection's expected repo root to a concrete path.
+
+    An explicit ``--target-repo <path>`` resolves to its absolute root; an
+    omitted flag or ``auto`` defaults to the sender's own workspace root (the
+    "send to the gateway for this repo" UX). ``None`` only when neither an
+    explicit repo nor a resolvable sender workspace exists — the resolver then
+    fails closed rather than selecting across arbitrary repos (#12663 review
+    j#68819 finding 2).
+    """
     if repo_arg and repo_arg != REPO_AUTO:
         return str(Path(repo_arg).expanduser().resolve())
-    return resolve_workspace_root(sender_cwd)
+    return sender_repo_root
 
 
 def select_semantic_target(
@@ -96,27 +109,37 @@ def select_semantic_target(
     session: Optional[str],
     project: Optional[str],
     sender_cwd: str,
-    sender_session: Optional[str],
     candidates: Optional[Sequence[TargetCandidate]] = None,
 ) -> SelectedTarget:
     """Resolve a semantic route identity to one pane, or fail closed (Redmine #12663).
 
-    Discovers candidates (unless injected), resolves the expected repo root,
-    runs the pure :func:`select_target` policy with the shared Unicode path
-    normaliser, and — on any non-``resolved`` outcome — prints the classified
-    candidate diagnostics to stderr and :func:`die`\\ s without sending. On
-    success returns the chosen ``pane_id`` and the concrete ``repo_root`` it
-    matched so the caller can pass that root straight into the unchanged
-    ``--target-repo`` identity gate.
+    Discovers candidates (unless injected), resolves the sender's own workspace
+    root and the expected selection repo, runs the pure :func:`select_target`
+    policy with the shared Unicode path normaliser, and — on any non-``resolved``
+    outcome — prints the classified candidate diagnostics to stderr and
+    :func:`die`\\ s without sending. Fails closed when no repo identity can be
+    established (no explicit ``--target-repo`` and no resolvable sender
+    workspace), so a lone visible pane across arbitrary repos is never selected
+    (#12663 review j#68819 finding 2). On success returns the chosen ``pane_id``
+    and the concrete ``repo_root`` it matched so the caller can pass that root
+    straight into the unchanged ``--target-repo`` identity gate.
     """
     pool = list(candidates) if candidates is not None else discover_all_candidates()
-    expected_repo = resolve_expected_repo(repo, sender_cwd=sender_cwd)
+    sender_repo_root = resolve_sender_repo_root(sender_cwd)
+    expected_repo = resolve_expected_repo(repo, sender_repo_root=sender_repo_root)
+    if expected_repo is None:
+        die(
+            "semantic target selection needs a repo identity but none could be "
+            "established: pass an explicit `--target-repo <git-root>` (the "
+            "sender's own workspace root was not resolvable). No message was sent."
+        )
+        raise AssertionError("unreachable")
     query = TargetSelectorQuery(
         role=role,
         repo_root=expected_repo,
         session=session,
         project_scope=project,
-        sender_session=sender_session,
+        sender_repo_root=sender_repo_root,
     )
     selection = select_target(pool, query, normalize=normalize_path_unicode)
     if not selection.resolved:
@@ -137,15 +160,11 @@ def select_semantic_target(
     )
 
 
-def _sender_context() -> tuple[str, Optional[str]]:
-    """The sender's own cwd + tmux session for the selection query."""
+def _sender_cwd() -> str:
+    """The sender's own cwd for the selection query."""
     import os
 
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
-        current_session_name,
-    )
-
-    return os.getcwd(), current_session_name()
+    return os.getcwd()
 
 
 def apply_handoff_selection(args) -> None:
@@ -164,14 +183,12 @@ def apply_handoff_selection(args) -> None:
             "--select resolves the target pane semantically and is mutually "
             "exclusive with an explicit --target; drop one of them."
         )
-    sender_cwd, sender_session = _sender_context()
     selected = select_semantic_target(
         role=getattr(args, "to", None),
         repo=getattr(args, "target_repo", None),
         session=getattr(args, "target_session", None),
         project=getattr(args, "target_project", None),
-        sender_cwd=sender_cwd,
-        sender_session=sender_session,
+        sender_cwd=_sender_cwd(),
     )
     args.target = selected.pane_id
     if selected.repo_root:
@@ -199,14 +216,12 @@ def resolve_message_target(args) -> str:
                 "--select-role resolves the target pane semantically and is "
                 "mutually exclusive with a positional target; drop one of them."
             )
-        sender_cwd, sender_session = _sender_context()
         return select_semantic_target(
             role=select_role,
             repo=getattr(args, "target_repo", None),
             session=getattr(args, "target_session", None),
             project=getattr(args, "target_project", None),
-            sender_cwd=sender_cwd,
-            sender_session=sender_session,
+            sender_cwd=_sender_cwd(),
         ).pane_id
     if not explicit_target:
         die(

@@ -108,7 +108,7 @@ class ExactlyOneCandidateSelectsScenarioTest(unittest.TestCase):
             _cockpit(),
             TargetSelectorQuery(
                 role="codex", repo_root=REPO, session=DEPT_SESSION,
-                sender_session=DEPT_SESSION,
+                sender_repo_root=REPO,
             ),
         )
         self.assertEqual(sel.status, SELECT_RESOLVED)
@@ -147,12 +147,28 @@ class CrossWorkspaceClaudeRoutedToGatewayScenarioTest(unittest.TestCase):
         sel = select_target(
             [foreign_claude],
             TargetSelectorQuery(
-                role="claude", repo_root=OTHER_REPO, sender_session=DEPT_SESSION
+                role="claude", repo_root=OTHER_REPO, sender_repo_root=REPO
             ),
         )
         self.assertEqual(sel.status, SELECT_CROSS_WORKSPACE_CLAUDE)
         self.assertIsNone(sel.pane_id)
         self.assertIn("Codex gateway", sel.detail)
+
+    def test_same_session_other_repo_claude_is_refused(self):
+        # The real cockpit packs every lane into one tmux session, so the guard
+        # must hold on repo identity even when the session matches (j#68819 #1).
+        other_repo_claude = _pane(
+            "%41", role="claude", session=DEPT_SESSION, repo_root=OTHER_REPO
+        )
+        sel = select_target(
+            [other_repo_claude],
+            TargetSelectorQuery(
+                role="claude", repo_root=OTHER_REPO, session=DEPT_SESSION,
+                sender_repo_root=REPO,
+            ),
+        )
+        self.assertEqual(sel.status, SELECT_CROSS_WORKSPACE_CLAUDE)
+        self.assertIsNone(sel.pane_id)
 
 
 class StandardRouteNeedsNoPaneIdScenarioTest(unittest.TestCase):
@@ -162,7 +178,7 @@ class StandardRouteNeedsNoPaneIdScenarioTest(unittest.TestCase):
         sel = select_target(
             _cockpit(),
             TargetSelectorQuery(
-                role="codex", repo_root=REPO, sender_session=DEPT_SESSION
+                role="codex", repo_root=REPO, sender_repo_root=REPO
             ),
         )
         self.assertEqual(sel.status, SELECT_RESOLVED)

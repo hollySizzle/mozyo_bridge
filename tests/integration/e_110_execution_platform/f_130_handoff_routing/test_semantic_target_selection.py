@@ -79,7 +79,6 @@ class SelectSemanticTargetResolver(unittest.TestCase):
             session=None,
             project=None,
             sender_cwd="/somewhere",
-            sender_session="dept-root",
             candidates=cands,
         )
         self.assertEqual(selected.pane_id, "%10")
@@ -97,7 +96,6 @@ class SelectSemanticTargetResolver(unittest.TestCase):
                 session=None,
                 project=None,
                 sender_cwd="/somewhere",
-                sender_session="dept-root",
                 candidates=cands,
             )
         out = stderr.getvalue()
@@ -116,9 +114,51 @@ class SelectSemanticTargetResolver(unittest.TestCase):
                 session=None,
                 project=None,
                 sender_cwd="/x",
-                sender_session="dept-root",
                 candidates=cands,
             )
+
+    def test_no_repo_identity_fails_closed(self):
+        # Finding 2 (j#68819): no explicit --target-repo and an unresolvable
+        # sender workspace must fail closed, not select the only visible pane.
+        cands = [_candidate("%10", role="codex", repo_root=REPO)]
+        with patch.object(cts, "resolve_sender_repo_root", return_value=None), \
+            self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cts.select_semantic_target(
+                role="codex",
+                repo=None,
+                session=None,
+                project=None,
+                sender_cwd="/unresolvable",
+                candidates=cands,
+            )
+
+    def test_same_session_cross_repo_claude_fails_closed(self):
+        # Finding 1 (j#68819): a Claude pane in another repo but the same cockpit
+        # session must be refused even with an explicit --target-repo for it.
+        cands = [_candidate("%20", role="claude", session="dept-root", repo_root=OTHER_REPO)]
+        with patch.object(cts, "resolve_sender_repo_root", return_value=REPO), \
+            self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cts.select_semantic_target(
+                role="claude",
+                repo=OTHER_REPO,
+                session=None,
+                project=None,
+                sender_cwd="/sender/repo",
+                candidates=cands,
+            )
+
+    def test_same_repo_claude_resolves(self):
+        cands = [_candidate("%21", role="claude", session="dept-root", repo_root=REPO)]
+        with patch.object(cts, "resolve_sender_repo_root", return_value=REPO):
+            selected = cts.select_semantic_target(
+                role="claude",
+                repo=REPO,
+                session=None,
+                project=None,
+                sender_cwd="/sender/repo",
+                candidates=cands,
+            )
+        self.assertEqual(selected.pane_id, "%21")
 
 
 class HandoffSendSelectWiring(unittest.TestCase):

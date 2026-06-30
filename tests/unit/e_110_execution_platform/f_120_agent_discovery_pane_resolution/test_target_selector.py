@@ -176,30 +176,43 @@ class SelectTargetFailClosed(unittest.TestCase):
 
 
 class CrossWorkspaceClaudeGuard(unittest.TestCase):
-    def test_unique_claude_in_foreign_session_fails_closed(self):
-        cands = [_candidate("%20", role="claude", session="other-ws")]
+    def test_same_session_different_repo_claude_fails_closed(self):
+        # The #12663 j#68819 finding 1 core case: a cockpit packs many repos into
+        # ONE tmux session, so a same-session Claude in a different repo is still
+        # a cross-workspace direct send and must be refused.
+        cands = [_candidate("%20", role="claude", session="dept-root", repo_root=OTHER_REPO)]
         sel = select_target(
-            cands, _query(role="claude", sender_session="dept-root")
+            cands,
+            _query(role="claude", repo_root=OTHER_REPO, session="dept-root",
+                   sender_repo_root=REPO),
         )
         self.assertEqual(sel.status, SELECT_CROSS_WORKSPACE_CLAUDE)
         self.assertIsNone(sel.pane_id)
         self.assertIs(sel.selected, cands[0])
         self.assertIn("Codex gateway", sel.detail)
 
-    def test_same_session_claude_resolves(self):
-        cands = [_candidate("%20", role="claude", session="dept-root")]
+    def test_missing_sender_repo_identity_fails_closed_for_claude(self):
+        cands = [_candidate("%20", role="claude", repo_root=REPO)]
+        sel = select_target(cands, _query(role="claude", sender_repo_root=None))
+        self.assertEqual(sel.status, SELECT_CROSS_WORKSPACE_CLAUDE)
+
+    def test_same_repo_claude_resolves_even_across_sessions(self):
+        # Repo root is the workspace boundary, not the session: same repo in a
+        # different session is the sender's own workspace -> allowed.
+        cands = [_candidate("%20", role="claude", session="other-session", repo_root=REPO)]
         sel = select_target(
-            cands, _query(role="claude", sender_session="dept-root")
+            cands, _query(role="claude", repo_root=REPO, sender_repo_root=REPO)
         )
         self.assertEqual(sel.status, SELECT_RESOLVED)
         self.assertEqual(sel.pane_id, "%20")
 
-    def test_codex_cross_session_is_allowed(self):
+    def test_codex_cross_repo_is_allowed(self):
         # The cross-workspace guard is Claude-only; the Codex gateway IS the
-        # cross-workspace route, so a foreign-session Codex resolves.
-        cands = [_candidate("%20", role="codex", session="other-ws")]
+        # cross-workspace route, so a foreign-repo Codex resolves.
+        cands = [_candidate("%20", role="codex", session="other-ws", repo_root=OTHER_REPO)]
         sel = select_target(
-            cands, _query(role="codex", sender_session="dept-root")
+            cands,
+            _query(role="codex", repo_root=OTHER_REPO, sender_repo_root=REPO),
         )
         self.assertEqual(sel.status, SELECT_RESOLVED)
 

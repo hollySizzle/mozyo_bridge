@@ -78,17 +78,20 @@ class TargetSelectorQuery:
     checkout root (already resolved to a concrete path by the caller; ``None``
     means "any repo", discouraged but allowed when the sender has no resolvable
     workspace). ``session`` and ``project_scope`` are optional further
-    discriminators. ``sender_session`` is the sender's own tmux session, carried
-    so the cross-workspace ``--to claude`` refusal can be modelled purely here
-    (a foreign workspace's Claude pane must be reached via its Codex gateway,
-    never addressed directly).
+    discriminators. ``sender_repo_root`` is the sender's *own* workspace (Git
+    repo) root, carried so the cross-workspace ``--to claude`` refusal can be
+    modelled purely here: in a multi-column cockpit every lane shares one tmux
+    *session*, so the workspace boundary is the repo root, not the session — a
+    Claude pane outside the sender's own repo must be reached via that repo's
+    Codex gateway, never addressed directly (Redmine #12663 review j#68819
+    finding 1).
     """
 
     role: str
     repo_root: str | None = None
     session: str | None = None
     project_scope: str | None = None
-    sender_session: str | None = None
+    sender_repo_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,11 +156,14 @@ def select_target(
 
     Exactly one survivor → ``SELECT_RESOLVED``. Zero → ``SELECT_NO_CANDIDATE``
     tagged with the stage that emptied the set. More than one →
-    ``SELECT_AMBIGUOUS``. A uniquely resolved Claude pane in a different tmux
-    session than ``query.sender_session`` → ``SELECT_CROSS_WORKSPACE_CLAUDE``
-    (route via the target repo's Codex gateway). ``normalize`` is the path
-    identity normaliser (the caller injects the shared Unicode normaliser); the
-    default keeps the function pure for tests that pass canonical roots.
+    ``SELECT_AMBIGUOUS``. A uniquely resolved Claude pane whose repo root is not
+    the sender's own (``query.sender_repo_root``) → ``SELECT_CROSS_WORKSPACE_CLAUDE``
+    (route via the target repo's Codex gateway); the boundary is the workspace
+    repo root, not the tmux session, because a multi-column cockpit packs many
+    repos into one session (Redmine #12663 review j#68819 finding 1).
+    ``normalize`` is the path identity normaliser (the caller injects the shared
+    Unicode normaliser); the default keeps the function pure for tests that pass
+    canonical roots.
     """
     role = query.role
     if role not in SELECTABLE_ROLES:
@@ -202,12 +208,14 @@ def select_target(
 
     if len(project_matched) == 1:
         chosen = project_matched[0]
-        if (
-            role == AGENT_KIND_CLAUDE
-            and query.sender_session
-            and chosen.session
-            and chosen.session != query.sender_session
+        if role == AGENT_KIND_CLAUDE and not _same_repo(
+            chosen.repo_root, query.sender_repo_root, normalize
         ):
+            # Workspace boundary is the repo root, not the session: a cockpit
+            # packs many repos into one tmux session, so a same-session Claude in
+            # a different repo is still a cross-workspace direct send and must be
+            # refused (Redmine #12663 review j#68819 finding 1). A missing sender
+            # repo identity also fails closed here (cannot prove same-workspace).
             return TargetSelection(
                 status=SELECT_CROSS_WORKSPACE_CLAUDE,
                 query=query,
@@ -218,13 +226,14 @@ def select_target(
                 narrowing_stage=None,
                 reason="cross_workspace_claude",
                 detail=(
-                    "the resolved Claude pane lives in a different tmux session "
-                    f"(sender_session={query.sender_session!r} "
-                    f"target_session={chosen.session!r}). Addressing a foreign "
-                    "workspace's Claude pane directly bypasses its audit "
+                    "the resolved Claude pane is not in the sender's own "
+                    f"workspace (sender_repo={query.sender_repo_root!r} "
+                    f"target_repo={chosen.repo_root!r}). Cross-workspace Claude "
+                    "direct delivery bypasses the target workspace's audit "
                     "boundary; route through that repo's Codex gateway instead "
-                    "(select `--to codex` for the same repo and ask it to perform "
-                    "the local Claude handoff)."
+                    "(select `--to codex` for that repo and ask it to perform the "
+                    "local Claude handoff). Same-lane Claude in the sender's own "
+                    "repo stays allowed."
                 ),
             )
         return TargetSelection(
