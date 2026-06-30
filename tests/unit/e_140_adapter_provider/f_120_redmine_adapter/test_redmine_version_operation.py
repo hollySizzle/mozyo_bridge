@@ -383,6 +383,23 @@ class VersionStateParseTest(unittest.TestCase):
         )
         self.assertFalse(state.counts_known)
 
+    def test_from_mapping_untrusted_count_shapes_are_counts_unknown(self) -> None:
+        # Coverage net (j#69311/j#69325/j#69343 lineage): every non-(non-negative
+        # int) count shape must leave counts_known False so the destructive
+        # preflight fails closed. Redmine returns integer counts; anything else is
+        # a malformed/untrusted payload.
+        for bad in (1.5, 0.0, True, False, "", "  ", None, [1], {"x": 1}):
+            state = VersionState.from_mapping(
+                {
+                    "id": "999",
+                    "status": "open",
+                    "issues_count": bad,
+                    "open_issues_count": 0,
+                    "closed_issues_count": 0,
+                }
+            )
+            self.assertFalse(state.counts_known, f"value={bad!r}")
+
     def test_from_mapping_with_string_numeric_counts_is_known(self) -> None:
         # Real list_versions returns numeric strings sometimes; these parse fine.
         state = VersionState.from_mapping(
