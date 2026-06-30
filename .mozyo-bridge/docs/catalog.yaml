@@ -767,13 +767,22 @@ documents:
       - logic-worktree-lifecycle-boundary
       - logic-existing-project-sublane-adoption
       - logic-sublane-bandwidth-policy
-      - logic-workspace-registry
       - logic-project-scoped-workspace-identity
+      - logic-workspace-registry
+      - logic-workspace-anchor-project-defaults-migration
+      - logic-managed-state-model
+      - logic-unit-target-model
       - logic-session-boundary
       - logic-tmux-send-safety-contract
+      - logic-ack-completion-receiver-state
       - logic-fallback-retirement-ledger
       - logic-acceptance-rerun-protocol
+      - logic-turnkey-e2e-acceptance
       - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-smoke-test-frame
+      - spec-route-identity-ledger
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
       - spec-project-map
 
   - id: logic-session-inventory
