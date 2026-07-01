@@ -114,12 +114,47 @@ BLOCKED_REASONS = frozenset(
     }
 )
 
-#: The dispatch outcome tokens recorded in the outcome / journal.
-DISPATCH_SENT = "sent"
+# ---------------------------------------------------------------------------
+# Dispatch outcome tokens recorded in the outcome / journal.
+#
+# Redmine #12986: the creation-side actuator used to record a single ``sent``
+# token the moment the gateway ``handoff send`` exited 0, and the executed
+# outcome / journal read that as a fully-started lane. But a gateway send exiting
+# 0 proves only that the *gateway* pane received the notification — it does NOT
+# prove the gateway forwarded the request to the same-lane Claude worker, nor
+# that the worker started. #12982 / #12984 sat silently at ``sublane actuated``
+# with no worker progress precisely because ``sent`` overstated that gateway
+# notification as worker-start. The two states are now named distinctly so the
+# durable record can never read a gateway-notified lane as worker-started.
+# ---------------------------------------------------------------------------
+
+#: The gateway ``handoff send`` exited 0: the gateway pane *received* the
+#: implementation_request notification. This proves gateway notification only —
+#: NOT that the same-lane worker was dispatched / started. A ``gateway_notified``
+#: lane with no subsequent worker-dispatch ack is a ``no_progress_after_handoff``
+#: candidate (classify with ``sublane callback-recovery --dispatch-delivered``).
+DISPATCH_GATEWAY_NOTIFIED = "gateway_notified"
+#: The same-lane worker actually received / acked the dispatched
+#: implementation_request. The current creation-side actuator does NOT reach this
+#: state — it only notifies the gateway — so this token names the honest target a
+#: follow-up worker-dispatch/ack step must reach before a lane counts as worker-
+#: started. Kept in the vocabulary so the coordinator record and the
+#: :attr:`SublaneActuationOutcome.worker_dispatch_confirmed` signal can
+#: distinguish "gateway notified" from "worker dispatched".
+DISPATCH_WORKER_DISPATCHED = "worker_dispatched"
 #: Dispatch was intentionally skipped (``--no-dispatch``).
 DISPATCH_SKIPPED = "skipped"
 #: Dispatch was not reached (dry-run, or actuation blocked before the dispatch step).
 DISPATCH_NOT_ATTEMPTED = "not_attempted"
+
+DISPATCH_RESULTS = frozenset(
+    {
+        DISPATCH_GATEWAY_NOTIFIED,
+        DISPATCH_WORKER_DISPATCHED,
+        DISPATCH_SKIPPED,
+        DISPATCH_NOT_ATTEMPTED,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +225,17 @@ class SublaneActuationOutcome:
     def executed(self) -> bool:
         return self.status == ACTUATE_EXECUTED
 
+    @property
+    def worker_dispatch_confirmed(self) -> bool:
+        """True only when the same-lane worker receipt was confirmed.
+
+        A :data:`DISPATCH_GATEWAY_NOTIFIED` dispatch is NOT worker-confirmed: the
+        gateway pane received the notification but the same-lane Claude worker
+        start is unproven (Redmine #12986). The coordinator reads this to avoid
+        treating a gateway-notified lane as worker-started.
+        """
+        return self.dispatch_result == DISPATCH_WORKER_DISPATCHED
+
     def as_payload(self) -> dict[str, object]:
         return {
             "status": self.status,
@@ -204,6 +250,7 @@ class SublaneActuationOutcome:
             "worker_pane": self.worker_pane,
             "dispatch_target": self.dispatch_target,
             "dispatch_result": self.dispatch_result,
+            "worker_dispatch_confirmed": self.worker_dispatch_confirmed,
             "durable_anchor": self.durable_anchor,
             "adopted": self.adopted,
             "steps": [s.as_payload() for s in self.steps],
@@ -245,6 +292,7 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         f"- worker_pane: {outcome.worker_pane or '-'}",
         f"- dispatch_target: {outcome.dispatch_target or '-'}",
         f"- dispatch_result: {outcome.dispatch_result}",
+        f"- worker_dispatch_confirmed: {str(outcome.worker_dispatch_confirmed).lower()}",
         f"- durable_anchor: {outcome.durable_anchor or '-'}",
     ]
     if outcome.is_blocked:
@@ -253,16 +301,42 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
             "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
         )
     else:
-        lines.append(
-            "- next_action: "
-            + (
-                "confirm with `sublane list --json`; gateway routes the "
-                "implementation_request to the same-lane worker"
-                if outcome.execute
-                else "re-run with --execute to actuate the resolved plan"
-            )
-        )
+        lines.append("- next_action: " + _next_action(outcome))
     return "\n".join(lines)
+
+
+def _next_action(outcome: SublaneActuationOutcome) -> str:
+    """Honest next-action for a non-blocked outcome (pure).
+
+    Redmine #12986: a :data:`DISPATCH_GATEWAY_NOTIFIED` executed run must NOT tell
+    the coordinator the gateway already routed to the worker — that overstatement
+    is exactly what let #12982 / #12984 read as started while the worker never
+    received the request. For a gateway-notified lane the record spells out that
+    worker dispatch is unconfirmed and points at the ``callback-recovery``
+    classifier so a silent stall is recoverable instead of mistaken for success.
+    """
+    if not outcome.execute:
+        return "re-run with --execute to actuate the resolved plan"
+    if outcome.dispatch_result == DISPATCH_GATEWAY_NOTIFIED:
+        return (
+            "gateway notified only — worker dispatch NOT yet confirmed. The "
+            "gateway must forward the implementation_request to the same-lane "
+            "worker and a worker-dispatch ack must land; until then treat this as "
+            "a `no_progress_after_handoff` candidate (classify with `mozyo-bridge "
+            "sublane callback-recovery --dispatch-delivered`). Confirm the lane "
+            "with `sublane list --json`"
+        )
+    if outcome.dispatch_result == DISPATCH_WORKER_DISPATCHED:
+        return (
+            "worker dispatch confirmed; confirm the lane with `sublane list "
+            "--json` and await the worker's implementation_done callback"
+        )
+    if outcome.dispatch_result == DISPATCH_SKIPPED:
+        return (
+            "lane created/adopted; dispatch skipped (--no-dispatch). Dispatch the "
+            "implementation_request to the gateway when ready"
+        )
+    return "confirm the lane with `sublane list --json`"
 
 
 __all__ = (
@@ -284,9 +358,11 @@ __all__ = (
     "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
     "BLOCKED_REASONS",
-    "DISPATCH_SENT",
+    "DISPATCH_GATEWAY_NOTIFIED",
+    "DISPATCH_WORKER_DISPATCHED",
     "DISPATCH_SKIPPED",
     "DISPATCH_NOT_ATTEMPTED",
+    "DISPATCH_RESULTS",
     "ActuationStep",
     "SublaneActuationOutcome",
     "render_actuation_journal",

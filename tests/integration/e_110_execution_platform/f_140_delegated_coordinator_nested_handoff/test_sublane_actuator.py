@@ -29,7 +29,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
     ACTUATE_READY,
-    DISPATCH_SENT,
+    DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
@@ -192,7 +192,10 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertEqual(outcome.gateway_pane, "%120")
         self.assertEqual(outcome.worker_pane, "%121")
         self.assertEqual(outcome.dispatch_target, "%120")
-        self.assertEqual(outcome.dispatch_result, DISPATCH_SENT)
+        # #12986: a successful gateway send is `gateway_notified`, not `sent`, and
+        # is NOT worker-confirmed — the gateway still owes a worker dispatch.
+        self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertFalse(outcome.worker_dispatch_confirmed)
         names = ops._names()
         self.assertIn("create_worktree", names)
         self.assertIn("append_lane_column", names)
@@ -345,12 +348,25 @@ class RenderTests(unittest.TestCase):
         self.assertIn("blocked", text)
         self.assertIn("handoff_failed", text)
 
+    def test_gateway_notified_text_warns_worker_unconfirmed(self):
+        # #12986: the human-facing render must not read as full success; it flags
+        # that only the gateway was notified and points at callback-recovery.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()], dispatch_rc=0)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        text = format_actuate_text(outcome)
+        self.assertIn("gateway_notified", text)
+        self.assertIn("worker dispatch NOT confirmed", text)
+        self.assertIn("callback-recovery", text)
+        # the executed reason itself carries the honest clause
+        self.assertIn("worker dispatch NOT yet confirmed", outcome.reason)
+
     def test_payload_is_machine_readable(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         payload = outcome.as_payload()
         self.assertEqual(payload["gateway_pane"], "%120")
-        self.assertEqual(payload["dispatch_result"], "sent")
+        self.assertEqual(payload["dispatch_result"], "gateway_notified")
+        self.assertFalse(payload["worker_dispatch_confirmed"])
         self.assertEqual(payload["durable_anchor"], "70159")
         self.assertIsInstance(payload["steps"], list)
 

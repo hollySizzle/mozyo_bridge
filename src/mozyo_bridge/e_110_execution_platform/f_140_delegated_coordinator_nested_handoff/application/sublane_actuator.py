@@ -62,8 +62,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
     ACTUATE_READY,
+    DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_NOT_ATTEMPTED,
-    DISPATCH_SENT,
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
@@ -776,7 +776,11 @@ class SublaneActuateUseCase:
                 order=4,
                 title="dispatch implementation_request",
                 status=STEP_EXECUTED,
-                detail=dispatch_detail,
+                # #12986: name the step for what it proves — the gateway was
+                # notified, not that the worker was dispatched / started.
+                detail=f"gateway {gateway_pane} notified ({dispatch_detail}); "
+                "worker dispatch not yet confirmed — gateway must forward to the "
+                "same-lane worker",
                 command=self._dispatch_command(request),
             )
         )
@@ -786,7 +790,11 @@ class SublaneActuateUseCase:
             gateway_pane=gateway_pane,
             worker_pane=worker_pane,
             dispatch_target=gateway_pane,
-            dispatch_result=DISPATCH_SENT,
+            # Redmine #12986: a gateway `handoff send` exit 0 proves gateway
+            # notification only, never that the same-lane worker was dispatched or
+            # started. Record it honestly as `gateway_notified` (not `sent`) so a
+            # gateway-notified-but-quiet lane is never read as worker-started.
+            dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
             adopted=adopted,
             steps=tuple(steps),
         )
@@ -808,7 +816,8 @@ class SublaneActuateUseCase:
             execute=True,
             reason="sublane actuated: "
             + ("adopted existing lane" if adopted else "created lane")
-            + f"; launch action {launch.action!r}",
+            + f"; launch action {launch.action!r}"
+            + self._dispatch_reason_suffix(dispatch_result),
             issue=request.issue,
             lane_label=request.lane_label,
             branch=request.branch or None,
@@ -822,6 +831,22 @@ class SublaneActuateUseCase:
             adopted=adopted,
             steps=steps,
         )
+
+    @staticmethod
+    def _dispatch_reason_suffix(dispatch_result: str) -> str:
+        """Honest dispatch clause appended to an executed outcome's reason (pure).
+
+        Redmine #12986: keep the reason from reading as full success when only the
+        gateway was notified — spell out that worker dispatch is unconfirmed.
+        """
+        if dispatch_result == DISPATCH_GATEWAY_NOTIFIED:
+            return (
+                " — gateway notified only; worker dispatch NOT yet confirmed "
+                "(worker-dispatch ack still owed)"
+            )
+        if dispatch_result == DISPATCH_SKIPPED:
+            return " — dispatch skipped (--no-dispatch)"
+        return ""
 
     def _dispatch_command(self, request: SublaneCreateRequest) -> str:
         journal = request.journal or "<journal>"
@@ -858,6 +883,12 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
         lines.append(
             f"  dispatch: {outcome.dispatch_result} -> {outcome.dispatch_target}"
         )
+        if outcome.dispatch_result == DISPATCH_GATEWAY_NOTIFIED:
+            lines.append(
+                "  ! gateway notified only; worker dispatch NOT confirmed "
+                "(worker_dispatch_confirmed=false). If no worker progress lands, "
+                "classify with `sublane callback-recovery --dispatch-delivered`"
+            )
     if outcome.is_blocked:
         lines.append("  -> blocked: " + ", ".join(outcome.blocked_reasons))
     else:
