@@ -5242,85 +5242,58 @@ def orchestrate_handoff(
     return 0
 
 
-def cmd_handoff_send(args: argparse.Namespace) -> int:
-    # Semantic target selection (Redmine #12663): `--select` resolves the target
-    # `%pane` from role/session/repo/project before the unchanged identity gates.
-    from mozyo_bridge.application.commands_target_select import apply_handoff_selection
+# ``CONSULT_DEFAULT_KIND`` and the four ``handoff`` command entry bodies moved to
+# the OOP-first ``application/handoff_command.py`` boundary (Redmine #12936). The
+# constant is re-exported here so existing ``commands.CONSULT_DEFAULT_KIND``
+# references stay valid; the wrappers below stay thin so their importers (``cli`` /
+# ``cli_handoff`` bind the ``cmd_handoff_*`` entry points; ``test_handoff_orchestrator``
+# compares ``cmd_handoff_reply`` by identity) and the ``commands.*`` monkeypatch
+# seams the live adapter resolves at call time are unchanged.
+from mozyo_bridge.application.handoff_command import (  # noqa: E402
+    CONSULT_DEFAULT_KIND,
+)
 
-    apply_handoff_selection(args)
-    return orchestrate_handoff(args)
+
+def cmd_handoff_send(args: argparse.Namespace) -> int:
+    from mozyo_bridge.application.handoff_command import (
+        HandoffCommandUseCase,
+        LiveHandoffCommandOps,
+    )
+
+    return HandoffCommandUseCase(LiveHandoffCommandOps()).run_send(args)
 
 
 def cmd_handoff_reply(args: argparse.Namespace) -> int:
-    return orchestrate_handoff(args, default_kind="reply")
+    from mozyo_bridge.application.handoff_command import (
+        HandoffCommandUseCase,
+        LiveHandoffCommandOps,
+    )
+
+    return HandoffCommandUseCase(LiveHandoffCommandOps()).run_reply(args)
 
 
 def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
-    """Standard ticketless no-anchor callback / hands-off primitive (Redmine #12703).
+    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``."""
+    from mozyo_bridge.application.handoff_command import (
+        HandoffCommandUseCase,
+        LiveHandoffCommandOps,
+    )
 
-    Returns a ticketless consultation hands-off result (``consultation_result`` /
-    ``no_dispatch`` / ``blocked`` / ``anchor_required``) to the caller lane over
-    the standard delivery rail (queue-enter / standard semantics, the same target
-    admission / repo-identity / cross-session gates), WITHOUT a Redmine anchor and
-    without fabricating one. The structured callback fields are carried as the
-    workflow *result* (``DeliveryOutcome.ticketless_callback``), recorded
-    distinctly from the transport outcome.
-
-    It does NOT touch the Redmine-governed ``handoff reply`` / ``reply`` rail
-    (those still require ``--issue`` + ``--journal``), and it fails closed if the
-    dispatch decision is an actual child -> grandchild worker dispatch (which still
-    requires a real anchor via ``handoff send``).
-    """
-    return orchestrate_handoff(args, default_kind="reply", ticketless=True)
-
-
-CONSULT_DEFAULT_KIND = "design_consultation"
-"""Default ``--kind`` for `handoff cross-workspace-consult` (Redmine #11779).
-
-The cross-workspace primitive exists to carry design-consultation requests
-through the target workspace's Codex gateway, so it defaults to
-``design_consultation`` while still accepting any other ``KIND_LABELS`` value
-(e.g. a cross-workspace ``review_request``) via an explicit ``--kind``.
-"""
+    return HandoffCommandUseCase(
+        LiveHandoffCommandOps()
+    ).run_ticketless_callback(args)
 
 
 def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:
-    """Cross-workspace design-consultation primitive (Redmine #11779).
+    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_cross_workspace_consult``."""
+    from mozyo_bridge.application.handoff_command import (
+        HandoffCommandUseCase,
+        LiveHandoffCommandOps,
+    )
 
-    A thin, boundary-preserving wrapper over :func:`orchestrate_handoff`. It
-    encodes the *standard cross-workspace consult route* as a single command
-    without re-implementing or relaxing any safety gate:
-
-    - The receiver is fixed to ``codex``: the consult always lands on the
-      target workspace's Codex gateway pane, never directly in a foreign Claude
-      pane (a cross-session ``--to claude`` is blocked by the Cross-Workspace
-      Handoff gate anyway). The target Codex reads the durable anchor and, if
-      implementation is needed, performs the local same-session Claude handoff
-      inside its own workspace.
-    - ``--target`` and ``--target-repo`` are mandatory at the parser surface,
-      so the cross-workspace identity gate (Redmine #10332 / #11301 / #11778)
-      always runs. This *tightens* `handoff send` (which only runs the repo
-      gate when ``--target-repo`` is supplied); it never relaxes it.
-    - ``--kind`` defaults to ``design_consultation`` and may be overridden.
-    - The durable source of truth stays the Redmine issue / Asana task; the
-      pane notification is only the pointer.
-
-    All actual gating (cross_session_claude block, target_repo identity gate,
-    receiver-process binding, marker/landing rail, ``--target-repo auto``
-    explicit-``%pane`` requirement) is delegated to :func:`orchestrate_handoff`
-    so this wrapper cannot hide or weaken it.
-
-    ``require_receiver_binding=True`` closes the boundary in **every** mode
-    (Redmine #11779 review j#58685): the role-binding gate that `handoff send`
-    runs only under ``queue-enter`` must also run under ``--mode standard`` /
-    ``--mode pending`` here, or an explicit foreign-Claude ``%pane`` could be
-    typed into under a ``to=codex`` marker — exactly the gateway bypass this
-    primitive promises to prevent.
-    """
-    args.to = "codex"
-    if getattr(args, "kind", None) is None:
-        args.kind = CONSULT_DEFAULT_KIND
-    return orchestrate_handoff(args, require_receiver_binding=True)
+    return HandoffCommandUseCase(
+        LiveHandoffCommandOps()
+    ).run_cross_workspace_consult(args)
 
 
 def _confident_workspace_root(cwd: str) -> Path | None:

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5586
+    lines: 5559
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -411,6 +411,26 @@ allowlist:
       #12933 cockpit/status/layout launch carve, so it auto-merges cleanly; the
       extracted body net-shrinks the module by 1 line from the post-#12933 baseline
       (5587), so the combined post-merge `commands.py` line count is 5586.
+      Lowered 5586 -> 5559 for the #12936 OOP-first handoff command-entry tranche
+      (rebased/integrated onto current origin/main atop the #12935 tranche above):
+      the ``CONSULT_DEFAULT_KIND`` constant and the four ``cmd_handoff_send`` /
+      ``cmd_handoff_reply`` / ``cmd_handoff_ticketless_callback`` /
+      ``cmd_handoff_cross_workspace_consult`` entry bodies moved into the new
+      ``application/handoff_command.py`` boundary (a ``HandoffCommandOps`` port +
+      ``LiveHandoffCommandOps`` adapter and a shared ``HandoffCommandUseCase`` with
+      one ``run_*`` method per entry). The four ``cmd_handoff_*`` functions stay
+      here as thin adapters (build the ops, run the use case) and ``commands`` still
+      re-exports ``CONSULT_DEFAULT_KIND`` so their importers (``cli`` /
+      ``cli_handoff`` bind the entry points; ``test_handoff_orchestrator`` compares
+      ``cmd_handoff_reply`` by identity) and the ``commands.*`` seams the live
+      adapter resolves at call time are unchanged. This tranche does not touch
+      ``orchestrate_handoff``, the handoff implementation_request main-lane guard,
+      the gateway route enforcement, or the transport rail semantics (out of #12936
+      scope); ``test_handoff_command`` adds the fake-port use-case specifications.
+      The region is disjoint from the #12932/#12933/#12935 carves (pane primitives +
+      launch command + instruction-install), so the 27-line net removal is measured
+      from the post-#12935 baseline (5586) and the combined post-merge ``commands.py``
+      line count is 5559.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
