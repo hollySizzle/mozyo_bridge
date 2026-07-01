@@ -40,19 +40,35 @@ reference bundle. Design boundaries (Redmine #12700 description / j#66929):
   set, blank id/path, empty resolvable paths, blank obligation token) cannot be
   built. Omitting the bundle is the explicit fallback of no contract binding.
 
-The two builtin bundles mirror the two transition roles in
+The two bundles mirror the two transition roles in
 :mod:`...domain.transition_role`: the ``grandparent_coordinator`` bundle equips
 the project gateway it hands off to with the four ticketless workflow contracts
 the project gateway needs; the ``project_gateway`` bundle equips a delegated child
 lane with
 the sublane-development-flow spine and the delegated-coordinator acceptance
 contracts (the parent -> child delegated transition the issue also calls out).
+
+Redmine #12953 moved the bundle *composition* — the per-role refs, obligations,
+and ``contract_set_version`` — out of builtin module constants and into the
+packaged config file :data:`WORKFLOW_CONTRACT_CONFIG_FILENAME`, so the config is
+the single source of truth the runtime resolver reads at import time. The values
+stay fixed tokens (catalog ids, repo-relative paths, snake_case obligation
+tokens, an int version), so the durable-record-safe property is unchanged; only
+their *home* moved from Python literals to a validated config. The named
+obligation / set-version constants and :data:`WORKFLOW_CONTRACT_BUNDLES` are now
+*derived* from the loaded config rather than hand-maintained beside it.
+:func:`validate_bundles_against_catalog` adds the catalog schema check the issue
+asks for: every ref's ``contract_id`` must resolve in the docs catalog with a
+matching ``canonical_path``, and a missing catalog ref fails closed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import resources
 from typing import Iterable, Mapping, Sequence
+
+import yaml
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
     ROLE_GRANDPARENT_COORDINATOR,
@@ -71,34 +87,13 @@ class WorkflowContractError(ValueError):
 # canonical checkout location (its redmine_project id), not a route oracle.
 MOZYO_BRIDGE_PROJECT_SUBDIR = "projects/giken-3800-mozyo-bridge"
 
-# Bumped when the *composition* of a builtin bundle changes (a doc added /
-# removed / re-pathed) OR when an obligation token's semantics change, so a
-# receiver that pins this can detect bundle drift without the bundle ever carrying
-# a doc body. (Per-doc content versions are not invented here — there is no durable
-# source for them; the catalog ``contract_id`` is the stable per-doc identity.)
-# v2 (#12737): the ticketless callback obligation now names the product callback
-# *return path* (``ticketless-callback`` / ``q-enter consultation_callback``), so a
-# v1-pinning receiver must re-read it.
-WORKFLOW_CONTRACT_SET_VERSION = 2
-
-# Fixed obligation tokens (no operator free text) so they stay durable-record
-# safe. The receiver reads these as a normal-operation contract: read every
-# listed contract before acting, and hand the result back on the listed callback
-# states rather than leaving pane prose as the only evidence (#12700 j#66940).
-READ_OBLIGATION_ALL_BEFORE_ACTING = "read_all_listed_contracts_before_acting"
-# #12737 sharpens this from "callback these four result classes" to naming the
-# product *return path*: a ticketless consultation result is returned to the
-# caller lane through ``handoff ticketless-callback`` or ``handoff q-enter --intent
-# consultation_callback`` — not left as a local pane final answer when a callback
-# target exists. The worker-dispatch anchor gate is unchanged; only the
-# consultation-phase return path is named here.
-CALLBACK_OBLIGATION_TICKETLESS = (
-    "return_consultation_result_no_dispatch_blocked_or_anchor_required_via_"
-    "ticketless_callback_or_q_enter_consultation_callback"
+# The packaged config file that is the source of truth for the bundle
+# composition (per-role refs / obligations / set version). Read at import time by
+# :func:`_load_bundles_from_config`; travels with the wheel via ``package-data``.
+WORKFLOW_CONTRACT_CONFIG_PACKAGE = (
+    "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain"
 )
-CALLBACK_OBLIGATION_DELEGATED_CHILD = (
-    "callback_implementation_done_review_request_or_blocked_to_delegation_parent"
-)
+WORKFLOW_CONTRACT_CONFIG_FILENAME = "workflow_contract_config.yaml"
 
 
 def _clean_token(value: object, *, field: str) -> str:
@@ -289,59 +284,126 @@ class WorkflowContractBundle:
         return lines
 
 
-# Builtin bundles, keyed by the same transition-role tokens the boundary uses so
-# the two payloads stay coupled. The grandparent bundle equips the project gateway
-# with the four ticketless workflow contracts it needs (parent/child/
-# grandchild lane contract, Redmine work-item boundary, blocked callback, child
-# dispatch boundary). The project_gateway bundle equips a delegated child lane
-# with the sublane-development-flow spine + delegated-coordinator acceptance
-# contracts (the parent -> child delegated transition).
-WORKFLOW_CONTRACT_BUNDLES: dict[str, WorkflowContractBundle] = {
-    ROLE_GRANDPARENT_COORDINATOR: WorkflowContractBundle(
-        current_role=ROLE_GRANDPARENT_COORDINATOR,
-        contract_set_version=WORKFLOW_CONTRACT_SET_VERSION,
-        read_obligation=READ_OBLIGATION_ALL_BEFORE_ACTING,
-        callback_obligation=CALLBACK_OBLIGATION_TICKETLESS,
-        refs=(
-            make_ref(
-                "logic-ticketless-project-gateway-runtime-ux",
-                "vibes/docs/logics/ticketless-project-gateway-runtime-ux.md",
-            ),
-            make_ref(
-                "logic-delegated-coordinator-real-machine-acceptance",
-                "vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md",
-            ),
-            make_ref(
-                "logic-delegated-coordinator-smoke-test-frame",
-                "vibes/docs/logics/delegated-coordinator-smoke-test-frame.md",
-            ),
-            make_ref(
-                "logic-coordinator-sublane-development-flow",
-                "vibes/docs/logics/coordinator-sublane-development-flow.md",
-            ),
-        ),
-    ),
-    ROLE_PROJECT_GATEWAY: WorkflowContractBundle(
-        current_role=ROLE_PROJECT_GATEWAY,
-        contract_set_version=WORKFLOW_CONTRACT_SET_VERSION,
-        read_obligation=READ_OBLIGATION_ALL_BEFORE_ACTING,
-        callback_obligation=CALLBACK_OBLIGATION_DELEGATED_CHILD,
-        refs=(
-            make_ref(
-                "logic-coordinator-sublane-development-flow",
-                "vibes/docs/logics/coordinator-sublane-development-flow.md",
-            ),
-            make_ref(
-                "logic-delegated-coordinator-real-machine-acceptance",
-                "vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md",
-            ),
-            make_ref(
-                "logic-delegated-coordinator-smoke-test-frame",
-                "vibes/docs/logics/delegated-coordinator-smoke-test-frame.md",
-            ),
-        ),
-    ),
-}
+def _config_text() -> str:
+    """Read the packaged workflow-contract config file text.
+
+    Fails closed (:class:`WorkflowContractError`) when the packaged config cannot
+    be read, so an install that dropped the file never silently degrades to "no
+    contracts".
+    """
+    try:
+        return (
+            resources.files(WORKFLOW_CONTRACT_CONFIG_PACKAGE)
+            .joinpath(WORKFLOW_CONTRACT_CONFIG_FILENAME)
+            .read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, OSError, ModuleNotFoundError) as exc:
+        raise WorkflowContractError(
+            f"workflow contract config {WORKFLOW_CONTRACT_CONFIG_FILENAME!r} "
+            f"could not be read: {exc}"
+        ) from exc
+
+
+def _bundle_from_config(role: str, spec: object, *, version: int) -> WorkflowContractBundle:
+    """Build one bundle from a config ``roles`` entry, failing closed.
+
+    Malformed / missing fields raise :class:`WorkflowContractError`; the ref
+    mappings are handed to :func:`make_ref` (which derives the resolvable paths)
+    and :class:`WorkflowContractBundle` (which rejects blank fields and duplicate
+    contract ids), so the config never yields a partial bundle.
+    """
+    if not isinstance(spec, Mapping):
+        raise WorkflowContractError(
+            f"workflow contract config role {role!r} must map to a bundle mapping"
+        )
+    try:
+        read_obligation = spec["read_obligation"]
+        callback_obligation = spec["callback_obligation"]
+        raw_refs = spec["refs"]
+    except KeyError as exc:
+        raise WorkflowContractError(
+            f"workflow contract config role {role!r} missing required field: "
+            f"{exc.args[0]!r}"
+        ) from exc
+    if not isinstance(raw_refs, Sequence) or isinstance(raw_refs, (str, bytes)):
+        raise WorkflowContractError(
+            f"workflow contract config role {role!r} refs must be a sequence"
+        )
+    refs: list[WorkflowContractRef] = []
+    for entry in raw_refs:
+        if not isinstance(entry, Mapping):
+            raise WorkflowContractError(
+                f"workflow contract config role {role!r} ref entries must be mappings"
+            )
+        try:
+            contract_id = entry["contract_id"]
+            canonical_path = entry["canonical_path"]
+        except KeyError as exc:
+            raise WorkflowContractError(
+                f"workflow contract config role {role!r} ref missing required "
+                f"field: {exc.args[0]!r}"
+            ) from exc
+        refs.append(make_ref(contract_id, canonical_path))  # type: ignore[arg-type]
+    return WorkflowContractBundle(
+        current_role=role,
+        contract_set_version=version,
+        read_obligation=read_obligation,  # type: ignore[arg-type]
+        callback_obligation=callback_obligation,  # type: ignore[arg-type]
+        refs=tuple(refs),
+    )
+
+
+def _load_bundles_from_config() -> tuple[int, dict[str, WorkflowContractBundle]]:
+    """Parse the packaged config into ``(set_version, bundles-by-role)``.
+
+    The config is the source of truth for the bundle composition (Redmine #12953);
+    this loader fails closed on a malformed top-level shape (non-mapping,
+    missing / non-int ``contract_set_version``, missing / non-mapping ``roles``,
+    a blank role token) and delegates per-bundle validation to
+    :func:`_bundle_from_config`.
+    """
+    raw = yaml.safe_load(_config_text())
+    if not isinstance(raw, Mapping):
+        raise WorkflowContractError(
+            "workflow contract config must be a mapping at the top level"
+        )
+    version = raw.get("contract_set_version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise WorkflowContractError(
+            "workflow contract config contract_set_version must be an int; got "
+            f"{version!r}"
+        )
+    roles = raw.get("roles")
+    if not isinstance(roles, Mapping) or not roles:
+        raise WorkflowContractError(
+            "workflow contract config must contain a non-empty `roles` mapping"
+        )
+    bundles: dict[str, WorkflowContractBundle] = {}
+    for role, spec in roles.items():
+        role_token = _clean_token(role, field="config role")
+        bundles[role_token] = _bundle_from_config(role_token, spec, version=version)
+    return version, bundles
+
+
+# The config is the single source of truth; the version, obligation constants, and
+# bundle dict are DERIVED from it (Redmine #12953). The named constants are kept as
+# stable, backward-compatible aliases (durable-record-safe fixed tokens) so
+# existing importers and durable records keep resolving them, but they now trace
+# to the config rather than duplicating literals beside it.
+WORKFLOW_CONTRACT_SET_VERSION, WORKFLOW_CONTRACT_BUNDLES = _load_bundles_from_config()
+
+READ_OBLIGATION_ALL_BEFORE_ACTING = WORKFLOW_CONTRACT_BUNDLES[
+    ROLE_GRANDPARENT_COORDINATOR
+].read_obligation
+# #12737: the ticketless callback obligation names the product *return path*
+# (``ticketless-callback`` / ``q-enter consultation_callback``), not just "callback
+# the result"; a v1-pinning receiver must re-read it (set version 2).
+CALLBACK_OBLIGATION_TICKETLESS = WORKFLOW_CONTRACT_BUNDLES[
+    ROLE_GRANDPARENT_COORDINATOR
+].callback_obligation
+CALLBACK_OBLIGATION_DELEGATED_CHILD = WORKFLOW_CONTRACT_BUNDLES[
+    ROLE_PROJECT_GATEWAY
+].callback_obligation
 
 WORKFLOW_CONTRACT_TOKENS: tuple[str, ...] = tuple(WORKFLOW_CONTRACT_BUNDLES.keys())
 
@@ -420,9 +482,46 @@ def workflow_contract_from_payload(
     )
 
 
+def validate_bundles_against_catalog(
+    catalog_canonical_paths: Mapping[str, str],
+    bundles: Mapping[str, WorkflowContractBundle] | None = None,
+) -> None:
+    """Fail closed unless every ref resolves in the docs catalog (Redmine #12953).
+
+    ``catalog_canonical_paths`` maps a docs-catalog ``contract_id`` to its
+    canonical path (build it from the catalog ``documents`` list). Each ref in
+    each bundle must (a) have a ``contract_id`` present in the catalog — a
+    **missing catalog ref** fails closed — and (b) carry the same
+    ``canonical_path`` the catalog records for that id — a drifted path fails
+    closed. ``bundles`` defaults to the loaded :data:`WORKFLOW_CONTRACT_BUNDLES`.
+
+    Pure over its inputs (no catalog I/O here), so the caller owns where the
+    catalog is read from — a verification-time check that does not make the
+    runtime resolver depend on the repo-local catalog being present.
+    """
+    if bundles is None:
+        bundles = WORKFLOW_CONTRACT_BUNDLES
+    for role, bundle in bundles.items():
+        for ref in bundle.refs:
+            if ref.contract_id not in catalog_canonical_paths:
+                raise WorkflowContractError(
+                    f"workflow contract ref {ref.contract_id!r} (role {role!r}) has "
+                    "no matching docs-catalog id"
+                )
+            catalog_path = catalog_canonical_paths[ref.contract_id]
+            if catalog_path != ref.canonical_path:
+                raise WorkflowContractError(
+                    f"workflow contract ref {ref.contract_id!r} (role {role!r}) "
+                    f"canonical_path {ref.canonical_path!r} does not match the "
+                    f"docs-catalog path {catalog_path!r}"
+                )
+
+
 __all__: Iterable[str] = (
     "WorkflowContractError",
     "MOZYO_BRIDGE_PROJECT_SUBDIR",
+    "WORKFLOW_CONTRACT_CONFIG_PACKAGE",
+    "WORKFLOW_CONTRACT_CONFIG_FILENAME",
     "WORKFLOW_CONTRACT_SET_VERSION",
     "READ_OBLIGATION_ALL_BEFORE_ACTING",
     "CALLBACK_OBLIGATION_TICKETLESS",
@@ -434,4 +533,5 @@ __all__: Iterable[str] = (
     "make_ref",
     "resolve_workflow_contract",
     "workflow_contract_from_payload",
+    "validate_bundles_against_catalog",
 )

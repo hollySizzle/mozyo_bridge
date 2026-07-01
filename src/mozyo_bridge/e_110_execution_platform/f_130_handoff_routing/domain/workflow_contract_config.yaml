@@ -1,0 +1,64 @@
+# Workflow-contract bundle configuration (Redmine #12953).
+#
+# This file is the SOURCE OF TRUTH for the per-transition-role workflow-contract
+# reference bundles the ticketless / delegated transition payload carries. The
+# runtime resolver in `domain/workflow_contract.py` reads this file at import
+# time and builds the fail-closed `WorkflowContractBundle` objects from it; the
+# builtin `WORKFLOW_CONTRACT_BUNDLES` dict and the named obligation / set-version
+# constants are derived from these values, not hand-maintained beside them
+# (Redmine #12953, staged from the #12700 builtin-constant form).
+#
+# Every value here is a FIXED TOKEN (a catalog contract id, a repo-relative
+# canonical path, a fixed snake_case obligation token, or an int set-version),
+# never operator free text — so a bundle stays durable-record safe in full, the
+# same property the #12700 builtin bundles had. The config carries POINTERS, never
+# doc bodies. `resolvable_paths` are DERIVED (canonical + monorepo-nested form) by
+# the resolver, so they are not listed here.
+#
+# Schema (validated fail-closed by the resolver; see `WorkflowContractError`):
+#   contract_set_version: int  — bumped when a bundle's composition or an
+#                                obligation token's semantics change.
+#   roles: mapping of transition-role token -> bundle:
+#     read_obligation:     fixed token — what the receiver must read before acting.
+#     callback_obligation: fixed token — the product callback return path.
+#     refs: ordered list of {contract_id, canonical_path}; contract_id is the
+#           stable docs-catalog id (validated against the catalog by
+#           `validate_bundles_against_catalog`); canonical_path is the
+#           sender-repo-relative doc path. Duplicate contract ids in one bundle,
+#           a blank field, or an empty ref list fail closed.
+
+# v2 (#12737): the ticketless callback obligation names the product callback
+# return path (ticketless-callback / q-enter consultation_callback), so a
+# v1-pinning receiver must re-read it.
+contract_set_version: 2
+
+roles:
+  # Equips the project gateway it hands off to with the four ticketless workflow
+  # contracts the project gateway needs (parent/child/grandchild lane contract,
+  # Redmine work-item boundary, blocked callback, child-dispatch boundary).
+  grandparent_coordinator:
+    read_obligation: read_all_listed_contracts_before_acting
+    callback_obligation: return_consultation_result_no_dispatch_blocked_or_anchor_required_via_ticketless_callback_or_q_enter_consultation_callback
+    refs:
+      - contract_id: logic-ticketless-project-gateway-runtime-ux
+        canonical_path: vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
+      - contract_id: logic-delegated-coordinator-real-machine-acceptance
+        canonical_path: vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md
+      - contract_id: logic-delegated-coordinator-smoke-test-frame
+        canonical_path: vibes/docs/logics/delegated-coordinator-smoke-test-frame.md
+      - contract_id: logic-coordinator-sublane-development-flow
+        canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
+
+  # Equips a delegated child lane with the sublane-development-flow spine and the
+  # delegated-coordinator acceptance contracts (the parent -> child delegated
+  # transition), with a child -> parent callback obligation.
+  project_gateway:
+    read_obligation: read_all_listed_contracts_before_acting
+    callback_obligation: callback_implementation_done_review_request_or_blocked_to_delegation_parent
+    refs:
+      - contract_id: logic-coordinator-sublane-development-flow
+        canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
+      - contract_id: logic-delegated-coordinator-real-machine-acceptance
+        canonical_path: vibes/docs/logics/delegated-coordinator-real-machine-acceptance.md
+      - contract_id: logic-delegated-coordinator-smoke-test-frame
+        canonical_path: vibes/docs/logics/delegated-coordinator-smoke-test-frame.md

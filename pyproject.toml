@@ -61,6 +61,10 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 mozyo_bridge = [
+    # Source-of-truth config for the ticketless / delegated workflow-contract
+    # reference bundles (Redmine #12953). The runtime resolver reads it at import
+    # time, so it must travel with the wheel.
+    "e_110_execution_platform/f_130_handoff_routing/domain/workflow_contract_config.yaml",
     "scaffold/presets/presets.yaml",
     "scaffold/presets/*/AGENTS.md",
     "scaffold/presets/*/CLAUDE.md",
