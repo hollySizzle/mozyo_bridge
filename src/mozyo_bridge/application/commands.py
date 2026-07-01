@@ -2148,119 +2148,31 @@ def _handle_cockpit_reconcile(
     return 0
 
 
-# Faithful `project_group_tmux_window` action names (#12330). Distinct from the
-# shared-cockpit `create` / `focus` / `append` so the executor never confuses a
-# group-window placement (which mutates a live session without a fresh attach)
-# with the single-window create (which attaches a new -CC session).
-GROUP_ACTION_FOCUS = "group_focus"
-GROUP_ACTION_APPEND = "group_append"
-GROUP_ACTION_CREATE = "group_create"
-GROUP_ACTIONS = (GROUP_ACTION_FOCUS, GROUP_ACTION_APPEND, GROUP_ACTION_CREATE)
-
-
 def _cockpit_group_window_action(
     workspace, session, *, decision, codex_ratio, launch
 ):
     """Resolve the faithful per-Project-Group tmux-window action (#12330).
 
-    Returns ``(action, plan, blocked_reason, window_name)`` for a workspace whose
-    desired presentation faithfully executes ``project_group_tmux_window`` (the
-    ``decision.executed_surface == group_tmux_window`` case). The caller has
-    already confirmed the cockpit ``session`` exists with a `cockpit` home window.
-
-    Fail-closed and identity-safe:
-
-    - Duplicate detection is **cross-window**: if this ``workspace_id + lane_id``
-      already has a Codex pane in ANY managed window (the `cockpit` home window or
-      a group window), the action is :data:`GROUP_ACTION_FOCUS` of that exact pane
-      — never a second placement. Identity is read off the pane options, so the
-      window the pane lives in is irrelevant.
-    - Otherwise the group's existing window is located by the mozyo-written
-      ``@mozyo_group_id`` window marker (deterministic, never the window name).
-      A non-empty match -> :data:`GROUP_ACTION_APPEND` a column beside that
-      window's rightmost Codex pane (same fair-share split + identity stamping the
-      shared cockpit uses). No match (or an ungrouped Unit, ``group_id`` empty) ->
-      :data:`GROUP_ACTION_CREATE` a fresh group window.
-
-    Pure-ish: it reads live tmux (multi-window discovery) but mutates nothing; the
-    returned plan is executed (with rollback) only on a real run.
+    Thin wrapper over the #12982 :class:`CockpitGroupWindowUseCase` boundary; the
+    live adapter routes the #12330 multi-window discovery
+    (``commands._read_managed_cockpit_windows``) and the rightmost-codex geometry
+    pick (``commands._rightmost_codex_anchor``) through this module at call time,
+    so the group-window characterization tests that patch
+    ``commands._read_managed_cockpit_windows`` keep intercepting the read. Returns
+    the same ``(action, plan, blocked_reason, window_name)`` tuple as before.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
-        build_cockpit_append_plan,
-        build_group_window_create_plan,
-        build_group_window_focus_plan,
-        normalize_lane,
-        sanitize_group_window_name,
+    from mozyo_bridge.application.cockpit_group_window_command import (
+        CockpitGroupWindowUseCase,
+        LiveCockpitGroupWindowOps,
     )
 
-    target_lane = normalize_lane(workspace.lane_id)
-    managed = _read_managed_cockpit_windows(session)
-
-    # Cross-window duplicate detection (focus priority): a Codex pane carrying the
-    # same workspace+lane in any window means the Unit is already laid out.
-    for win in managed:
-        for col in win.get("columns") or []:
-            if (
-                col.get("role") == "codex"
-                and col.get("workspace_id") == workspace.workspace_id
-                and normalize_lane(col.get("lane_id")) == target_lane
-            ):
-                return (
-                    GROUP_ACTION_FOCUS,
-                    build_group_window_focus_plan(col["pane_id"], session=session),
-                    None,
-                    win.get("window") or "",
-                )
-
-    group_id = decision.group_id
-    window_name = sanitize_group_window_name(decision.desired_window_name)
-
-    # Locate the group's existing window by the deterministic group marker (never
-    # the window name). Only a non-empty group id can share a window; an ungrouped
-    # Unit (empty group id) always gets its own fresh window.
-    host = None
-    if group_id:
-        for win in managed:
-            if (win.get("group_id") or "") == group_id:
-                host = win
-                break
-
-    if host is not None:
-        codex_cols = [
-            c for c in (host.get("columns") or []) if c.get("role") == "codex"
-        ]
-        anchor = _rightmost_codex_anchor(codex_cols)
-        if not anchor:
-            return (
-                GROUP_ACTION_APPEND,
-                None,
-                (
-                    f"Project Group window {host.get('window')!r} exists but carries "
-                    "no mozyo-identified codex column to append beside; rebuild the "
-                    "cockpit or remove the stale window."
-                ),
-                host.get("window") or window_name,
-            )
-        plan = build_cockpit_append_plan(
-            workspace,
-            anchor_pane=anchor,
-            column_index=len(codex_cols),
-            codex_ratio=codex_ratio,
-            session=session,
-            window=host.get("window") or window_name,
-            launch=launch,
-        )
-        return (GROUP_ACTION_APPEND, plan, None, host.get("window") or window_name)
-
-    plan = build_group_window_create_plan(
+    return CockpitGroupWindowUseCase(LiveCockpitGroupWindowOps()).resolve(
         workspace,
-        group_id=group_id,
-        window_name=window_name,
+        session,
+        decision=decision,
         codex_ratio=codex_ratio,
-        session=session,
         launch=launch,
     )
-    return (GROUP_ACTION_CREATE, plan, None, window_name)
 
 
 def cmd_cockpit(args: argparse.Namespace) -> int:
@@ -4519,6 +4431,20 @@ from mozyo_bridge.application.init_command import (  # noqa: E402
     _confident_workspace_root,
     _is_fallback_session_name,
     _write_vscode_session_name,
+)
+
+# Compatibility re-export (#12982): the faithful per-Project-Group tmux-window
+# action vocabulary + routing moved into the `cockpit_group_window_command`
+# boundary. Re-export the `GROUP_ACTION_*` / `GROUP_ACTIONS` names so the
+# executor dispatch in `cmd_cockpit` and existing imports
+# (`commands.GROUP_ACTION_FOCUS` are exercised directly by tests) keep resolving
+# to one source of truth. `cockpit_group_window_command` imports `commands` only
+# lazily (in its live adapter), so this top-level import introduces no cycle.
+from mozyo_bridge.application.cockpit_group_window_command import (  # noqa: E402,F401
+    GROUP_ACTION_APPEND,
+    GROUP_ACTION_CREATE,
+    GROUP_ACTION_FOCUS,
+    GROUP_ACTIONS,
 )
 
 

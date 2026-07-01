@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4640
+    lines: 4566
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -673,6 +673,30 @@ allowlist:
       post-#12983 baseline (4777) and the combined post-merge ``commands.py`` line
       count is 4640. ``test_handoff_delivery_command`` adds the fake-port use-case +
       pure-decision specifications.
+      Lowered 4640 -> 4566 for the #12982 OOP-first cockpit managed-window read
+      helper residual tranche: the faithful per-Project-Group tmux-window action
+      residual (``_cockpit_group_window_action`` plus the ``GROUP_ACTION_*`` /
+      ``GROUP_ACTIONS`` vocabulary) moved into the new
+      ``application/cockpit_group_window_command.py`` boundary, sitting on top of the
+      #12971 ``cockpit_read_command`` multi-window discovery. The boundary is a pure
+      ``resolve_group_window_action`` decision (cross-window focus priority,
+      group-marker location, ungrouped-Unit / different-lane / stale-window rules,
+      composing the ``cockpit_layout`` plan builders) plus a ``CockpitGroupWindowOps``
+      port and ``LiveCockpitGroupWindowOps`` adapter that route the
+      ``_read_managed_cockpit_windows`` discovery + ``_rightmost_codex_anchor`` pick
+      through ``commands`` at call time, and a ``CockpitGroupWindowUseCase`` that reads
+      the managed windows then runs the pure decision. ``_cockpit_group_window_action``
+      stays here as a thin module-level wrapper (builds the live ops, runs the use
+      case) so ``cmd_cockpit``'s call site and the ``commands._cockpit_group_window_action``
+      / ``commands._read_managed_cockpit_windows`` patch seams keep resolving
+      byte-for-byte; ``commands`` re-exports ``GROUP_ACTION_*`` / ``GROUP_ACTIONS`` (one
+      source of truth) so the executor dispatch and existing imports are unchanged.
+      ``cockpit_group_window_command`` imports ``commands`` only lazily (in its live
+      adapter), so the re-export introduces no cycle. The action tuple / plan / window
+      name / block-reason shapes are byte-for-byte preserved. 4640 -> 4566 is a 74-line
+      net removal and the post-merge ``commands.py`` line count is 4566.
+      ``test_cockpit_group_window_command`` adds the fake-port use-case + pure-decision
+      specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
