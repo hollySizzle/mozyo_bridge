@@ -39,6 +39,7 @@ from mozyo_bridge.application.launch_command import (
     new_agent_session_argv,
     new_agent_window_argv,
     render_cockpit_layout_dry_run,
+    render_mozyo_session_block,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     CockpitWorkspace,
@@ -198,6 +199,22 @@ class PureHelpersTest(unittest.TestCase):
         )
         self.assertFalse(payload["ready"])
 
+    def test_render_mozyo_session_block_matches_legacy_stdout(self) -> None:
+        # Byte-for-byte with the legacy handler: session line, header, then the
+        # raw table appended verbatim (the table carries its own trailing newline).
+        self.assertEqual(
+            "session=s created=claude:%1,codex:%2\nINDEX\tNAME\tPROCESS\n0\tclaude\tclaude\n",
+            render_mozyo_session_block("s", ["claude:%1", "codex:%2"], "0\tclaude\tclaude\n"),
+        )
+
+    def test_render_mozyo_session_block_empty_created_and_no_table(self) -> None:
+        # No created windows collapses to ``-``; a ``None`` table (probe failed)
+        # appends no rows, so the block ends at the header newline.
+        self.assertEqual(
+            "session=s created=-\nINDEX\tNAME\tPROCESS\n",
+            render_mozyo_session_block("s", [], None),
+        )
+
     def test_layout_dry_run_and_json_render(self) -> None:
         cmd = argparse.Namespace(argv=["new-session", "-d", "-s", "mozyo-cockpit"])
         plan = argparse.Namespace(
@@ -231,7 +248,7 @@ class MozyoLaunchUseCaseTest(unittest.TestCase):
         ops = _FakeLaunchOps(session_exists=True, cwd_mismatch=["/elsewhere"])
         outcome = MozyoLaunchUseCase(ops).run(_mozyo_args(session="custom"))
         self.assertIsNone(outcome.error_message)
-        self.assertEqual("custom", outcome.session)
+        self.assertIn("session=custom created=-", outcome.pre_attach_text)
 
     def test_select_window_failure_carries_notice_and_error(self) -> None:
         ops = _FakeLaunchOps(
@@ -258,7 +275,7 @@ class MozyoLaunchUseCaseTest(unittest.TestCase):
         self.assertTrue(payload["ready"])
         # JSON short-circuits: no separate notice/text carried.
         self.assertIsNone(outcome.notice)
-        self.assertIsNone(outcome.session)
+        self.assertIsNone(outcome.pre_attach_text)
 
     def test_text_attach_outcome_carries_argv(self) -> None:
         ops = _FakeLaunchOps(
@@ -266,16 +283,24 @@ class MozyoLaunchUseCaseTest(unittest.TestCase):
             list_result=_result(returncode=0, stdout="0\tclaude\tclaude\n"),
         )
         outcome = MozyoLaunchUseCase(ops).run(_mozyo_args(cc=True))
-        self.assertEqual("mozyo-repo", outcome.session)
-        self.assertEqual(("claude:%1",), outcome.created)
-        self.assertEqual("0\tclaude\tclaude\n", outcome.windows_table)
+        # The session line, header, and raw window table are rendered into the
+        # pre-attach block byte-for-byte (#12984).
+        self.assertEqual(
+            "session=mozyo-repo created=claude:%1\nINDEX\tNAME\tPROCESS\n0\tclaude\tclaude\n",
+            outcome.pre_attach_text,
+        )
         self.assertEqual(("tmux", "-CC", "attach", "-t", "mozyo-repo"), outcome.attach_argv)
         self.assertFalse(outcome.no_attach)
 
     def test_list_windows_failure_yields_no_table(self) -> None:
         ops = _FakeLaunchOps(list_result=_result(returncode=1, stdout="ignored"))
         outcome = MozyoLaunchUseCase(ops).run(_mozyo_args())
-        self.assertIsNone(outcome.windows_table)
+        # A failed ``list-windows`` probe contributes no rows: the block ends at
+        # the header newline.
+        self.assertEqual(
+            "session=mozyo-repo created=-\nINDEX\tNAME\tPROCESS\n",
+            outcome.pre_attach_text,
+        )
 
     def test_setup_args_thread_defaults(self) -> None:
         ops = _FakeLaunchOps()

@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4566
+    lines: 4564
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -697,6 +697,27 @@ allowlist:
       net removal and the post-merge ``commands.py`` line count is 4566.
       ``test_cockpit_group_window_command`` adds the fake-port use-case + pure-decision
       specifications.
+      Lowered 4566 -> 4564 for the #12984 bare-``mozyo`` launch render/attach residual
+      tranche (rebased/integrated onto current ``origin/main`` ``6163ed5`` after the
+      #12982 cockpit group-window carve above): the ``cmd_mozyo`` handler's residual
+      session/window-table rendering tail (the ``session=<name> created=<...>`` line, the
+      ``INDEX/NAME/PROCESS`` header, and the raw ``list-windows`` table print with its
+      ``created`` collapse-to-``-`` and ``if result.returncode == 0`` no-table guard)
+      moved into the existing ``application/launch_command.py`` boundary as a pure
+      ``render_mozyo_session_block`` presenter, carried on ``MozyoLaunchOutcome`` as the
+      pre-rendered ``pre_attach_text`` (replacing the raw ``session`` / ``created`` /
+      ``windows_table`` outcome fields). This aligns ``cmd_mozyo`` with its sibling
+      ``cmd_layout_apply`` (which already prints a pre-rendered outcome block): the
+      handler now runs the use case, prints the legacy notice / ``die`` /
+      ``pre_attach_text`` (with ``end=""``), and does the terminal ``os.execvp`` attach —
+      the stdout ordering, exit code, ``--json`` / ``--no-attach``, and attach behavior
+      are byte-for-byte preserved. ``cmd_mozyo`` keeps its public identity and parser
+      binding. The #12982 cockpit group-window carve and this #12984 launch render/attach
+      carve touch disjoint regions of ``commands.py``, so it auto-merged and the removals
+      stack — 4640 -> 4566 (#12982) -> 4564 (#12984); the 2-line net removal is measured
+      from the post-#12982 baseline (4566) and the combined post-merge ``commands.py``
+      line count is 4564. ``test_launch_command`` adds the pure
+      ``render_mozyo_session_block`` specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

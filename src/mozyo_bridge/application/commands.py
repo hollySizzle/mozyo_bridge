@@ -622,10 +622,11 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     attaches unless ``--no-attach`` was given. An explicit ``--session NAME``
     still overrides the resolved name (Redmine #10796).
 
-    The session-name resolution guards, the JSON payload, and the attach-command
-    form live behind the ``launch_command`` boundary (#12933); this handler stays
-    thin — it runs the use case, prints the outcome, and does the terminal
-    ``os.execvp`` attach through the live adapter.
+    The session-name resolution guards, the JSON payload, the session/window-table
+    rendering, and the attach-command form live behind the ``launch_command``
+    boundary (#12933 / #12984); this handler stays thin — it runs the use case,
+    prints the rendered outcome, and does the terminal ``os.execvp`` attach through
+    the live adapter.
     """
     from mozyo_bridge.application.launch_command import (
         LiveLaunchOps,
@@ -637,17 +638,14 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     if outcome.json_stdout is not None:
         print(outcome.json_stdout)
         return 0
-    # The non-JSON legacy notice prints before the session line (and before a
+    # The non-JSON legacy notice prints before the pre-attach block (and before a
     # late select-window failure), matching the original ordering.
     if outcome.notice:
         print(outcome.notice)
     if outcome.error_message is not None:
         die(outcome.error_message)
-    created = outcome.created
-    print(f"session={outcome.session} created={','.join(created) if created else '-'}")
-    print("INDEX\tNAME\tPROCESS")
-    if outcome.windows_table is not None:
-        print(outcome.windows_table, end="")
+    if outcome.pre_attach_text is not None:
+        print(outcome.pre_attach_text, end="")
     if outcome.no_attach:
         print(f"attach: {outcome.attach_command}")
         return 0

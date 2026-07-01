@@ -145,6 +145,29 @@ def build_mozyo_json_payload(
     }
 
 
+def render_mozyo_session_block(
+    session: str, created: list[str], windows_table: str | None
+) -> str:
+    """The bare-``mozyo`` text block printed before attaching (byte-for-byte).
+
+    Owns the exact wording the legacy ``cmd_mozyo`` body emitted: the session
+    summary line (``created`` collapses to ``-`` when empty), the
+    ``INDEX/NAME/PROCESS`` header, and the raw ``list-windows`` rows. A ``None``
+    ``windows_table`` — the probe failed — contributes no rows, matching the
+    legacy ``if result.returncode == 0`` guard. The block ends with the header's
+    newline (plus the raw table, which already carries its own trailing newline),
+    so the thin handler prints it with ``end=""``.
+    """
+
+    block = (
+        f"session={session} created={','.join(created) if created else '-'}\n"
+        "INDEX\tNAME\tPROCESS\n"
+    )
+    if windows_table is not None:
+        block += windows_table
+    return block
+
+
 def render_cockpit_layout_dry_run(plan, session: str, attach_command: str) -> str:
     """The ``layout apply cockpit --dry-run`` text block (planned tmux commands)."""
 
@@ -283,21 +306,19 @@ class MozyoLaunchOutcome:
     """Result of :class:`MozyoLaunchUseCase` — a refusal, JSON, or an attach plan.
 
     ``error_message`` is the bare ``die`` message (the handler exits non-zero).
-    ``notice`` is the non-JSON legacy-session notice printed *before* the session
-    line (or before a late ``die``); it is ``None`` in JSON mode, where the notice
-    rides ``json_stdout`` instead. ``json_stdout`` is the single ``--json`` block.
-    On the text success path the handler prints the session line + window table,
-    then attaches unless ``no_attach``. ``windows_table`` is ``None`` when the
-    ``list-windows`` probe failed (nothing is printed for the table), matching the
-    legacy ``if result.returncode == 0`` guard.
+    ``notice`` is the non-JSON legacy-session notice printed *before* the
+    pre-attach block (or before a late ``die``); it is ``None`` in JSON mode,
+    where the notice rides ``json_stdout`` instead. ``json_stdout`` is the single
+    ``--json`` block. On the text success path ``pre_attach_text`` is the fully
+    rendered session line + window-table block (see
+    :func:`render_mozyo_session_block`); the handler prints it with ``end=""`` and
+    then attaches unless ``no_attach``.
     """
 
     error_message: str | None = None
     notice: str | None = None
     json_stdout: str | None = None
-    session: str | None = None
-    created: tuple[str, ...] = ()
-    windows_table: str | None = None
+    pre_attach_text: str | None = None
     attach_command: str | None = None
     attach_argv: tuple[str, ...] = ()
     no_attach: bool = False
@@ -429,9 +450,11 @@ class MozyoLaunchUseCase:
             )
         return MozyoLaunchOutcome(
             notice=text_notice,
-            session=session,
-            created=tuple(created),
-            windows_table=result.stdout if result.returncode == 0 else None,
+            pre_attach_text=render_mozyo_session_block(
+                session,
+                list(created),
+                result.stdout if result.returncode == 0 else None,
+            ),
             attach_command=attach_command,
             attach_argv=tuple(attach_argv(session, control_mode)),
             no_attach=bool(getattr(args, "no_attach", False)),
