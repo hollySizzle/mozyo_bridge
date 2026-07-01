@@ -95,6 +95,10 @@ mozyo_bridge = [
     # `mozyo-bridge scaffold canonical --check` (drift gate).
     "scaffold/canonical_sources/*.yaml",
     "scaffold/canonical_sources/*/bodies/*.md",
+    # Role profile template config (Redmine #12952). The four fixed role profile
+    # template bodies + version/source pointers ship as this packaged artifact,
+    # loaded via importlib.resources by f_130 role_profile.py at import.
+    "e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml",
 ]
 
 [tool.pytest.ini_options]

@@ -1248,6 +1248,8 @@ file_conventions:
       - src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py
       - src/mozyo_bridge/application/repo_local_config_loader.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_config.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
       - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py

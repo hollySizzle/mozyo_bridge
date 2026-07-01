@@ -12,9 +12,11 @@ Redmine #12396 / US #12388 / Feature #12386 (`Delegated Coordinator / Nested Han
 
 ## 解決ロジック (送信側)
 
-実装: `src/mozyo_bridge/domain/role_profile.py`。
+実装: `src/mozyo_bridge/domain/role_profile.py` (resolver) + `role_profile_config.py` (config schema) + packaged `role_profile_templates.yaml` (template 本文の runtime 正本; Redmine #12952)。
 
-- builtin template registry: 4 role token (`coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`) の本文を US #12387 spec から code 定数として pin する。runtime で markdown を parse せず、path 探索もしない (self-contained / fail-closed)。
+- template registry: 4 role token (`coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`) の本文は、wheel に同梱される config artifact `role_profile_templates.yaml` を runtime 正本として持つ。本文の human-facing 正本は引き続き US #12387 spec であり、packaged YAML はその machine-readable 写しである。
+- config load: `role_profile.py` が import 時に一度だけ `importlib.resources` で packaged YAML を読み (cwd / worktree の path 探索はしない = package-anchored resource)、`RoleProfileConfig.from_record` で schema 検証してから registry を構成する。runtime で markdown を parse せず、path 推測もしない (self-contained / fail-closed)。malformed / missing artifact は import 時に `RoleProfileConfigError` で loud に fail-closed し、handoff 途中で partial contract を送らない。
+- config schema (`role_profile_config.py`): 固定 4 role 語彙を code invariant として持ち、config は「その 4 token を過不足なく定義する」ことを要求する。unknown role token / role 欠落 / 空 template / declared `placeholders` と template の `<...>` token 不一致 / 不明 key / 空 `version`・`source` はすべて `RoleProfileConfigError` で fail-closed する。`version` は `ROLE_PROFILE_VERSION`、`source` は `ROLE_PROFILE_SOURCE` の durable pointer を運ぶ。
 - `resolve_role_profile(role, fields)`: template を取得し、`<...>` placeholder を structured field 値で置換する。pure / deterministic。
 - `RoleProfileResolution`: 解決結果。structured pointer field (`role_profile` / `profile_source` / `profile_version` / `unresolved_placeholders`) と `resolved_text` を持つ。
   - `profile_source`: template 本文の正本への repo-relative pointer (spec path)。
@@ -44,8 +46,8 @@ Redmine #12396 / US #12388 / Feature #12386 (`Delegated Coordinator / Nested Han
 ## 安全 invariant (固定)
 
 - role profile は routing landing marker を変更しない (custom instruction と structured fields の分離)。
-- template 解決は path 探索せず builtin registry に閉じる (fail-closed)。
-- profile_version は解決済み contract 本文への忠実な pointer である (template 本文変更時に bump)。
+- template 解決は cwd / worktree の path 探索をせず、wheel-packaged config artifact を schema 検証したうえで registry に閉じる (fail-closed)。config 正本の外出し先は packaged resource に限り、send 時に外部 path を推測しない。
+- profile_version は解決済み contract 本文への忠実な pointer である (template 本文変更時に `role_profile_templates.yaml` の `version` を bump)。
 
 ## 参照正本
 
@@ -57,7 +59,8 @@ Redmine #12396 / US #12388 / Feature #12386 (`Delegated Coordinator / Nested Han
 
 ## 検証
 
-- `python3 -m unittest tests.test_handoff_role_profile`
+- `python3 -m unittest tests.unit.e_110_execution_platform.f_130_handoff_routing.test_handoff_role_profile`
+- `python3 -m unittest tests.unit.e_110_execution_platform.f_130_handoff_routing.test_role_profile_config`
 - `mozyo-bridge docs validate --repo .`
 - `mozyo-bridge docs validate --check-file-coverage --repo .`
 - `mozyo-bridge docs generate-file-conventions --check --repo .`

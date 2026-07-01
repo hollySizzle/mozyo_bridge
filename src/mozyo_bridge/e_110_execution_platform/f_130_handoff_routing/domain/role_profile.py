@@ -6,8 +6,10 @@ profile templates defined by US #12387
 profile template``). That spec is the human-facing source of truth for the
 template *bodies*; this module is the runtime resolver that
 
-- pins the builtin templates as code constants so resolution is self-contained
-  and fail-closed (no filesystem path guessing at send time),
+- loads the fixed templates from a wheel-packaged, schema-validated config
+  artifact (``role_profile_templates.yaml``) so resolution stays self-contained
+  and fail-closed (a package-anchored resource read via ``importlib.resources``,
+  never a cwd / worktree path guess at send time),
 - substitutes the ``<...>`` placeholders from handoff structured fields,
 - carries the structured ``role_profile`` / ``profile_source`` /
   ``profile_version`` fields so the receiver never has to discover the template
@@ -20,7 +22,10 @@ mutates the routing landing marker. The resolved contract is carried in the
 durable delivery record and a compact single-line pointer in the pane body; the
 durable anchor remains the source of truth.
 
-When a template body changes, bump :data:`ROLE_PROFILE_VERSION` so the persisted
+The template bodies and the ``ROLE_PROFILE_VERSION`` / ``ROLE_PROFILE_SOURCE``
+pointers now live in the packaged ``role_profile_templates.yaml``, validated by
+:class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile_config.RoleProfileConfig`;
+when a template body changes, bump ``version`` there so the persisted
 ``profile_version`` stays a faithful pointer to the resolved contract text.
 """
 
@@ -28,66 +33,65 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from importlib import resources
 from typing import Iterable, Mapping, Optional
+
+import yaml
+
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile_config import (
+    ROLE_COORDINATOR,
+    ROLE_DELEGATED_COORDINATOR,
+    ROLE_IMPLEMENTATION_GATEWAY,
+    ROLE_IMPLEMENTATION_WORKER,
+    ROLE_PROFILE_CONFIG_RESOURCE,
+    RoleProfileConfig,
+    RoleProfileConfigError,
+)
 
 
 class RoleProfileError(ValueError):
     """A role profile could not be resolved (e.g. unknown / missing template)."""
 
 
-# Stable identifier for the builtin template set. Date-stamped to the #12387
-# spec body it mirrors; bump on any template-body edit so a persisted
+def load_packaged_role_profile_config() -> RoleProfileConfig:
+    """Load + validate the wheel-packaged role profile template config.
+
+    Reads ``role_profile_templates.yaml`` from this package via
+    :mod:`importlib.resources` — a package-anchored resource, never a cwd /
+    worktree path walk — and validates it through
+    :meth:`RoleProfileConfig.from_record`. The send-time invariant holds: the
+    template registry is resolved from a fixed packaged artifact with no
+    filesystem path guessing, and a malformed / missing artifact fails closed
+    (:class:`RoleProfileConfigError`) at import rather than sending a partial or
+    unvalidated role contract.
+    """
+    text = (
+        resources.files(__package__)
+        .joinpath(ROLE_PROFILE_CONFIG_RESOURCE)
+        .read_text(encoding="utf-8")
+    )
+    return RoleProfileConfig.from_record(yaml.safe_load(text))
+
+
+# The validated config is the runtime source of truth. Loaded once at import so
+# the resolver stays synchronous and self-contained (no per-send IO); a packaging
+# error surfaces immediately and loudly rather than mid-handoff.
+_CONFIG = load_packaged_role_profile_config()
+
+# Stable identifier for the template set. Sourced from the packaged config's
+# ``version``; bump it there on any template-body edit so a persisted
 # ``profile_version`` always points at the contract text that was sent.
-ROLE_PROFILE_VERSION = "2026-06-21"
+ROLE_PROFILE_VERSION = _CONFIG.version
 
 # Repo-relative pointer to the human-facing source of truth for the template
 # bodies. Persisted as ``profile_source`` so the receiver reads the role
 # contract without guessing a path.
-ROLE_PROFILE_SOURCE = "vibes/docs/specs/delegated-coordinator-role-profile.md"
-
-ROLE_COORDINATOR = "coordinator"
-ROLE_DELEGATED_COORDINATOR = "delegated_coordinator"
-ROLE_IMPLEMENTATION_GATEWAY = "implementation_gateway"
-ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
+ROLE_PROFILE_SOURCE = _CONFIG.source
 
 # Insertion-ordered so CLI ``choices`` and help text list the roles top-down by
-# authority, matching the spec's ``## role 語彙`` ordering.
-ROLE_PROFILE_TEMPLATES: dict[str, str] = {
-    ROLE_COORDINATOR: (
-        "# role profile: coordinator\n"
-        "- あなたは <project> の最上位 coordinator (管制塔 Codex) である。\n"
-        "- owner-facing 判断、owner approval 回収、親 issue / US の Review Gate と close を担う。\n"
-        "- 実装 diff は自分で作らず、子 lane / sublane へ委譲する。\n"
-        "- owner-approval-waiting はすべてあなたに集約される単一 aggregation point である。\n"
-        "- durable record: <redmine_project> の issue / journal。"
-    ),
-    ROLE_DELEGATED_COORDINATOR: (
-        "# role profile: delegated_coordinator\n"
-        "- あなたは <parent_project> から委譲された <child_project> の delegated_coordinator である。\n"
-        "- 委譲元 (parent coordinator route): <parent_callback_target>。\n"
-        "- 子 project 内の dispatch / audit / 子 issue close を担うが、親 issue (<parent_issue>) は close しない。\n"
-        "- owner approval は自 lane で回収せず、parent coordinator route へ callback して戻す。\n"
-        "- downstream (孫) dispatch は shallow delegation のみ。主目的は context window 圧迫回避。\n"
-        "- handoff-worthy state は parent coordinator route へ callback する。\n"
-        "- durable record: <redmine_project> の issue / journal。"
-    ),
-    ROLE_IMPLEMENTATION_GATEWAY: (
-        "# role profile: implementation_gateway\n"
-        "- あなたは <lane> の implementation_gateway (target-lane Codex) である。\n"
-        "- cross-lane handoff を受け、durable anchor <durable_anchor> を読み、自 lane の request か確認する。\n"
-        "- same-lane の implementation_worker へ submit 完結で route する。\n"
-        "- blocked / review-ready / owner-action-needed を上位 (<upstream_coordinator>) へ callback する。\n"
-        "- 実装 diff は作らない。owner approval / parent close は扱わない。"
-    ),
-    ROLE_IMPLEMENTATION_WORKER: (
-        "# role profile: implementation_worker\n"
-        "- あなたは <lane> の implementation_worker (sublane Claude) である。\n"
-        "- durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。\n"
-        "- owner approval 回収・issue close・coordinator-owned 仕様決定の自己確定はしない。\n"
-        "- 仕様矛盾・scope 不足・invariant 衝突に当たったら停止し、design consultation / blocked を記録して same-lane gateway へ callback する。\n"
-        "- callback 先 (same-lane gateway): <gateway_callback_target>。"
-    ),
-}
+# authority, matching the spec's ``## role 語彙`` ordering (the config schema
+# rebuilds the registry in :data:`KNOWN_ROLE_TOKENS` order).
+ROLE_PROFILE_TEMPLATES: dict[str, str] = dict(_CONFIG.templates)
 
 ROLE_PROFILE_TOKENS: tuple[str, ...] = tuple(ROLE_PROFILE_TEMPLATES.keys())
 
@@ -237,6 +241,8 @@ def parse_profile_fields(pairs: Optional[Iterable[str]]) -> dict[str, str]:
 
 __all__: Iterable[str] = (
     "RoleProfileError",
+    "RoleProfileConfigError",
+    "load_packaged_role_profile_config",
     "ROLE_PROFILE_VERSION",
     "ROLE_PROFILE_SOURCE",
     "ROLE_COORDINATOR",
