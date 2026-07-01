@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -572,119 +571,57 @@ def new_agent_window(agent: str, session: str, cwd: str | None = None) -> str:
     )
 
 
+# The bare ``mozyo`` / repo session bootstrap helper tail (``list_session_windows``
+# / ``wait_for_agent_terminal_pane`` / ``wait_for_text`` / ``_marker_visible_in``
+# / ``rollback_unsubmitted_input`` / ``ensure_repo_session_windows``) was carved
+# into an OOP-first boundary (Redmine #12975 / #12638): a ``SessionBootstrapOps``
+# port over the tmux / pane / session primitives, a ``LiveSessionBootstrapOps``
+# adapter that routes those primitives through this module's globals at call time
+# (so the existing ``commands.*`` monkeypatch seams — and the notify /
+# pane-primitive / status / launch boundaries that reach ``commands.wait_for_text``
+# / ``.rollback_unsubmitted_input`` / ``.list_session_windows`` /
+# ``.ensure_repo_session_windows`` at call time — are unchanged), the pure
+# ``marker_visible_in`` / ``project_session_window_names`` projections, and a
+# ``SessionBootstrapUseCase`` owning the five behavior-preserving flows. The
+# functions below stay thin module-level wrappers (build the live ops, run the use
+# case) so the parser bindings, the ``orchestrate_handoff`` strict-rail callers of
+# ``wait_for_text`` / ``_marker_visible_in``, and the tests that patch these
+# ``commands.*`` names keep working unchanged.
+
+
+def _session_bootstrap_use_case():
+    from mozyo_bridge.application.session_bootstrap_command import (
+        LiveSessionBootstrapOps,
+        SessionBootstrapUseCase,
+    )
+
+    return SessionBootstrapUseCase(LiveSessionBootstrapOps())
+
+
 def list_session_windows(session: str) -> list[str]:
-    result = run_tmux("list-windows", "-t", session, "-F", "#{window_name}", check=False)
-    if result.returncode != 0:
-        return []
-    return [name.strip() for name in result.stdout.splitlines() if name.strip()]
+    return _session_bootstrap_use_case().list_session_windows(session)
 
 
 def wait_for_agent_terminal_pane(pane_id: str, agent: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        info = pane_info(pane_id)
-        command = Path(info.get("command") or "").name
-        if is_agent_process(command):
-            return
-        time.sleep(0.2)
-    die(f"timed out waiting for {agent} pane startup: {pane_id}")
-
-
-_WRAP_INDENT = re.compile(r"\n\s+")
+    _session_bootstrap_use_case().wait_for_agent_terminal_pane(pane_id, agent, timeout)
 
 
 def wait_for_text(target: str, text: str, lines: int, timeout: float) -> bool:
-    # Receiver TUIs (codex CLI, Claude Code) wrap long input at the visible
-    # pane width, emitting a literal newline + continuation indent inside
-    # the captured text. tmux capture-pane -J only rejoins lines tmux itself
-    # wrapped, so a raw substring search would miss a marker split by the
-    # TUI wrap even though it landed cleanly on the wire.
-    #
-    # Two wrap shapes are observed in practice and require different
-    # normalize functions:
-    #   1. word-boundary wrap (`mozyo-bridge message` markers like
-    #      `[mozyo-bridge from:claude pane:%110 at:mozyo_bridge:2.0]`,
-    #      ~60 chars, contain whitespace) — TUI wraps at a space, so
-    #      collapsing `\n\s+` into a single ` ` reconstructs the original.
-    #   2. character-wrap (`mozyo-bridge handoff` markers like
-    #      `[mozyo:handoff:source=asana:task=...:comment=...:kind=...:to=...]`,
-    #      100+ chars, contain no whitespace) — TUI wraps at an arbitrary
-    #      character boundary, so the only normalize that reconstructs the
-    #      original is collapsing `\n\s+` to the empty string.
-    # Try the raw match first (cheap, scrollback-safe), then both wrap
-    # normalizes before declaring the marker absent. All three paths still
-    # return False when the marker is genuinely missing, preserving the
-    # fail-closed rollback contract.
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _marker_visible_in(capture_pane(target, lines), text):
-            return True
-        time.sleep(0.2)
-    return False
+    return _session_bootstrap_use_case().wait_for_text(target, text, lines, timeout)
 
 
 def _marker_visible_in(captured: str, text: str) -> bool:
-    """One-shot check whether ``text`` is visible in ``captured`` pane text.
+    from mozyo_bridge.application.session_bootstrap_command import marker_visible_in
 
-    Mirrors the three wrap normalizations :func:`wait_for_text` polls with: raw
-    substring, word-boundary wrap (``\\n\\s+`` -> ``" "``), and character-wrap
-    (``\\n\\s+`` -> ``""``). Shared so the queue-enter Enter-only retry can probe
-    for the marker once per interval without re-implementing the wrap handling
-    or paying a second polling timeout.
-    """
-    if text in captured:
-        return True
-    if text in _WRAP_INDENT.sub(" ", captured):
-        return True
-    if text in _WRAP_INDENT.sub("", captured):
-        return True
-    return False
+    return marker_visible_in(captured, text)
 
 
 def rollback_unsubmitted_input(target: str) -> None:
-    cmd_keys(argparse.Namespace(target=target, keys=["C-u"]))
+    _session_bootstrap_use_case().rollback_unsubmitted_input(target)
 
 
 def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
-    """Ensure `args.session` exists with one window per agent (claude, codex).
-
-    Each agent runs in its own tmux window in a single repo-scoped session.
-    The window-model guarantee is gated on tmux window names; missing agent
-    windows are created. Pre-existing non-agent windows (zsh, custom names)
-    are left untouched and stay reachable through their indices — they just
-    are not agent targets. Returns the list of newly created
-    ``agent:pane_id`` entries.
-    """
-    require_tmux()
-    config_loaded = False
-    if args.config and session_exists(args.session):
-        load_tmux_conf_for(args)
-        config_loaded = True
-    created: list[str] = []
-    if not session_exists(args.session):
-        claude_pane = new_agent_session_window("claude", args.session, cwd=args.cwd)
-        created.append(f"claude:{claude_pane}")
-    if args.config and not config_loaded:
-        load_tmux_conf_for(args)
-    windows = list_session_windows(args.session)
-    for agent in ("claude", "codex"):
-        if agent in windows:
-            continue
-        pane_id = new_agent_window(agent, args.session, cwd=args.cwd)
-        created.append(f"{agent}:{pane_id}")
-    for agent in ("claude", "codex"):
-        pane = find_agent_window(agent, args.session)
-        if pane:
-            ensure_agent_target(pane, agent, force=args.force)
-            if args.ready_timeout:
-                wait_for_agent_terminal_pane(pane["id"], agent, args.ready_timeout)
-            # Apply the subtle per-window status-bar tint after the window
-            # exists, the user's `.tmux.conf` has been sourced (above), and
-            # the agent pane is settled. Window-scoped — only the agent
-            # windows we manage are tinted; legacy windows in the same
-            # session stay at the user's global style.
-            apply_window_subtle_style(args.session, agent)
-    return created
+    return _session_bootstrap_use_case().ensure_repo_session_windows(args)
 
 
 def cmd_mozyo(args: argparse.Namespace) -> int:

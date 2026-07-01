@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5318
+    lines: 5255
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -486,6 +486,28 @@ allowlist:
       abort / warning wording and ``{"stamp_warnings"}`` / ``None`` return shapes are
       byte-for-byte preserved. ``test_cockpit_repair_command`` adds the fake-port
       use-case + pure-helper specifications.
+      Lowered 5318 -> 5255 for the #12975 bare-``mozyo`` session bootstrap carve
+      (rebased onto ``origin/main`` fd47f49 after #12972; the two carves touch
+      disjoint regions so ``commands.py`` auto-merged and the removals stack — 5453
+      -> 5318 (#12972) -> 5255 (#12975)):
+      the helper tail ``list_session_windows`` / ``wait_for_agent_terminal_pane`` /
+      ``wait_for_text`` / ``_marker_visible_in`` / ``rollback_unsubmitted_input`` /
+      ``ensure_repo_session_windows`` moved into the new
+      ``application/session_bootstrap_command.py`` boundary (pure
+      ``project_session_window_names`` / ``marker_visible_in`` /
+      ``pane_command_basename`` projections + a ``SessionBootstrapOps`` port and
+      ``LiveSessionBootstrapOps`` adapter + a ``SessionBootstrapUseCase`` owning the
+      five flows). The six functions stay here as thin module-level wrappers (build
+      the live ops, run the use case) so the parser bindings, the
+      ``orchestrate_handoff`` strict-rail ``wait_for_text`` / ``_marker_visible_in``
+      callers, the notify / pane-primitive / status / launch boundaries that reach
+      these ``commands.*`` names at call time, and the tests that patch them keep
+      working unchanged; the adapter resolves ``commands.list_session_windows`` /
+      ``commands.wait_for_agent_terminal_pane`` at call time so the
+      ``ensure_repo_session_windows`` window-model tests still steer the flow, and
+      ``cmd_mozyo`` stays the existing thin ``launch_command`` (#12933) root.
+      ``test_session_bootstrap_command`` adds the fake-port use-case + pure-projection
+      specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
