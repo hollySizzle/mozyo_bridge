@@ -67,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
+    REASON_LANE_MISMATCH,
     REASON_LAUNCH_BLOCKED,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
@@ -92,6 +93,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneCreateRequest,
     SublaneLaneView,
+    parse_issue_from_lane_label,
     project_sublanes,
 )
 
@@ -194,12 +196,22 @@ class LiveSublaneActuatorOps:
         rows = try_pane_lines() or []
         target = _normalize_path(worktree_path)
         target_base = Path(worktree_path).name
-        for lane in project_sublanes(rows):
-            if not lane.repo_root:
-                continue
-            root = _normalize_path(lane.repo_root)
-            if root == target or Path(lane.repo_root).name == target_base:
+        lanes = [lane for lane in project_sublanes(rows) if lane.repo_root]
+        # Prefer an exact repo-root match; the returned lane's *identity* is still
+        # validated against the request by the use case, so this only narrows the
+        # candidate.
+        for lane in lanes:
+            if _normalize_path(lane.repo_root) == target:
                 return lane
+        # Basename fallback only when it is unambiguous — a single lane shares the
+        # worktree basename. Returning an arbitrary basename collision would hand a
+        # different repo's lane to the identity check (or, worse, pass it); require
+        # uniqueness here and still let the use case validate identity.
+        basename_matches = [
+            lane for lane in lanes if Path(lane.repo_root).name == target_base
+        ]
+        if len(basename_matches) == 1:
+            return basename_matches[0]
         return None
 
     def dispatch_implementation_request(
@@ -266,6 +278,32 @@ class SublaneActuateUseCase:
 
     ops: SublaneActuatorOps
     policy: SublaneIntegrationPolicy = SublaneIntegrationPolicy.default()
+
+    @staticmethod
+    def _identity_matches(
+        lane: SublaneLaneView, request: SublaneCreateRequest
+    ) -> bool:
+        """True iff the resolved ``lane`` is the requested target (pure).
+
+        The lane's ``lane_label`` must equal the requested label, and its issue must
+        match the requested issue. The lane's ``issue`` is parsed from its label by
+        :func:`project_sublanes`; ``parse_issue_from_lane_label`` is used as the fallback
+        so a lane whose ``issue`` field was not pre-populated is still validated by re-
+        parsing its label. A blank requested label / issue, a mismatched label, or a
+        mismatched issue all fail closed — this is the guard that stops a repo-root /
+        basename collision from misdelivering to the wrong gateway (Review j#70250).
+        """
+        want_label = (request.lane_label or "").strip()
+        got_label = (lane.lane_label or "").strip()
+        if not want_label or got_label != want_label:
+            return False
+        want_issue = (request.issue or "").strip()
+        got_issue = (lane.issue or "").strip() or (
+            parse_issue_from_lane_label(got_label) or ""
+        )
+        if want_issue and got_issue != want_issue:
+            return False
+        return True
 
     def _decide_launch(
         self, request: SublaneCreateRequest
@@ -515,8 +553,37 @@ class SublaneActuateUseCase:
                 )
             )
 
-        # Step 2 — append (or adopt) the cockpit lane column.
+        # Step 2 — append (or adopt) the cockpit lane column. A lane that already resolves
+        # for this worktree MUST match the requested identity before we adopt or dispatch
+        # to it: a repo-root / basename collision with a different (or stale) lane is an
+        # ambiguous target and fails closed here. Never adopt / append onto — nor later
+        # dispatch to — a lane whose lane_label / issue does not match the request, which
+        # would misdeliver the implementation_request to the wrong gateway (Review j#70250).
         existing = self.ops.read_lane(request.worktree_path)
+        if existing is not None and not self._identity_matches(existing, request):
+            steps.append(
+                ActuationStep(
+                    order=2,
+                    title="resolve lane column",
+                    status=STEP_BLOCKED,
+                    detail=f"a different lane (label={existing.lane_label!r} "
+                    f"issue={existing.issue!r}) already resolves for this worktree; "
+                    "refusing to adopt / append onto an ambiguous target",
+                    command=None,
+                )
+            )
+            return self._blocked(
+                request,
+                launch_action=launch.action,
+                reason="resolved lane identity does not match the requested lane "
+                "(repo-root / basename collision or stale lane); fail-closed before "
+                "adopt / dispatch",
+                reasons=(REASON_LANE_MISMATCH,),
+                dispatch=dispatch,
+                steps=tuple(steps),
+                gateway_pane=existing.gateway_pane,
+                worker_pane=existing.worker_pane,
+            )
         adopted = bool(existing and existing.gateway_pane and existing.worker_pane)
         if adopted:
             lane = existing
@@ -526,7 +593,8 @@ class SublaneActuateUseCase:
                     title="adopt lane column",
                     status=STEP_SKIPPED,
                     detail="a live gateway + worker column already exists for this "
-                    "worktree; adopting it (no new panes appended)",
+                    "worktree and matches the requested identity; adopting it (no new "
+                    "panes appended)",
                     command=None,
                 )
             )
@@ -603,6 +671,33 @@ class SublaneActuateUseCase:
                 steps=tuple(steps),
                 gateway_pane=lane.gateway_pane if lane else None,
                 worker_pane=lane.worker_pane if lane else None,
+                adopted=adopted,
+            )
+        # Identity re-confirm on the resolved lane (covers the append path: an appended
+        # lane whose stamped label / issue does not match the request is a mismatch too).
+        if not self._identity_matches(lane, request):
+            steps.append(
+                ActuationStep(
+                    order=3,
+                    title="confirm lane identity",
+                    status=STEP_BLOCKED,
+                    detail=f"resolved lane identity (label={lane.lane_label!r} "
+                    f"issue={lane.issue!r}) does not match the requested lane "
+                    f"(label={request.lane_label!r} issue={request.issue!r}); refusing "
+                    "to dispatch to a mismatched lane",
+                    command=None,
+                )
+            )
+            return self._blocked(
+                request,
+                launch_action=launch.action,
+                reason="resolved lane identity does not match the requested lane; "
+                "fail-closed before dispatch",
+                reasons=(REASON_LANE_MISMATCH,),
+                dispatch=dispatch,
+                steps=tuple(steps),
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
                 adopted=adopted,
             )
         gateway_pane = lane.gateway_pane

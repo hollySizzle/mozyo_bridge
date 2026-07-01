@@ -23,10 +23,13 @@ Three concerns, each pure:
 - the fail-closed blocked-reason tokens (:data:`REASON_*`) — a create-side actuator is
   *additive*, so its fail-closed set is missing identity, an unverified launch target, a
   missing durable anchor, a worktree collision (branch / path already taken), a pane-
-  creation / stamp read-back failure, and a handoff-dispatch failure; a **dirty worktree
-  fail-closed is a retire-side gate** (#12604 :func:`decide_retire_integration`), because an
-  additive create never clobbers an existing checkout — a collision surfaces as
-  :data:`REASON_WORKTREE_CREATE_FAILED`, not silent data loss;
+  creation / stamp read-back failure, a **lane-identity mismatch** (the resolved lane's
+  ``lane_label`` / ``issue`` does not match the request — a repo-root / basename collision
+  or a stale lane, which would misdeliver to the wrong gateway), and a handoff-dispatch
+  failure; a **dirty worktree fail-closed is a retire-side gate** (#12604
+  :func:`decide_retire_integration`), because an additive create never clobbers an existing
+  checkout — a collision surfaces as :data:`REASON_WORKTREE_CREATE_FAILED`, not silent data
+  loss;
 - the :class:`ActuationStep` / :class:`SublaneActuationOutcome` value objects and
   :func:`render_actuation_journal`, the replayable machine-readable record the coordinator
   posts to the Redmine durable anchor (the "Redmine durable record package" of the issue
@@ -90,6 +93,11 @@ REASON_PANE_CREATE_FAILED = "pane_create_failed"
 #: The appended / adopted lane did not carry the expected identity stamps (repo-root /
 #: lane) on read-back, so the lane could not be positively confirmed.
 REASON_STAMP_FAILED = "stamp_failed"
+#: The lane resolved for the worktree does not match the requested lane identity
+#: (lane_label / issue) — a repo-root / basename collision or a stale / different lane.
+#: Adopting or dispatching to it would misdeliver #<issue> to the wrong gateway, so the
+#: ambiguous target fails closed before any adopt / dispatch.
+REASON_LANE_MISMATCH = "lane_identity_mismatch"
 #: The gateway ``implementation_request`` dispatch returned a non-zero / failed outcome.
 REASON_HANDOFF_FAILED = "handoff_failed"
 
@@ -101,6 +109,7 @@ BLOCKED_REASONS = frozenset(
         REASON_WORKTREE_CREATE_FAILED,
         REASON_PANE_CREATE_FAILED,
         REASON_STAMP_FAILED,
+        REASON_LANE_MISMATCH,
         REASON_HANDOFF_FAILED,
     }
 )
@@ -272,6 +281,7 @@ __all__ = (
     "REASON_WORKTREE_CREATE_FAILED",
     "REASON_PANE_CREATE_FAILED",
     "REASON_STAMP_FAILED",
+    "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
     "BLOCKED_REASONS",
     "DISPATCH_SENT",

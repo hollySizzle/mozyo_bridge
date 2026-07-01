@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
+    REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
     REASON_STAMP_FAILED,
@@ -277,6 +278,63 @@ class ExecuteFailClosedTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+
+
+def _wrong_lane(*, lane_label="issue_99999_wrong", issue="99999", workspace_id="other-ws",
+                gateway="%999", worker="%998", repo_root="/wt/12973"):
+    """A colliding lane: same repo_root as the request, but a different identity."""
+    return SublaneLaneView(
+        workspace_id=workspace_id,
+        lane_id="lx",
+        lane_label=lane_label,
+        issue=issue,
+        branch="z",
+        repo_root=repo_root,
+        gateway_pane=gateway,
+        worker_pane=worker,
+        state="active",
+    )
+
+
+class LaneIdentityValidationTests(unittest.TestCase):
+    """Review j#70250: never adopt / dispatch to a lane whose identity mismatches."""
+
+    def test_adopt_mismatched_lane_fails_closed(self):
+        # A live lane shares the repo_root but carries a different issue / lane_label /
+        # workspace — it must not be adopted or dispatched to (the reviewer's repro).
+        ops = FakeActuatorOps(git=True, worktree_exists=True, lanes=[_wrong_lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LANE_MISMATCH, outcome.blocked_reasons)
+        self.assertFalse(outcome.adopted)
+        # never appended onto the ambiguous target, never dispatched to %999
+        self.assertNotIn("append_lane_column", ops._names())
+        self.assertNotIn("dispatch", ops._names())
+
+    def test_appended_lane_identity_mismatch_fails_closed(self):
+        # No existing lane, so we create + append, but the read-back lane's stamped
+        # identity does not match the request -> fail closed before dispatch.
+        wrong = _wrong_lane(lane_label="issue_88888_other", issue="88888",
+                            gateway="%777", worker="%776")
+        ops = FakeActuatorOps(git=True, worktree_exists=False, lanes=[None, wrong])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LANE_MISMATCH, outcome.blocked_reasons)
+        self.assertNotIn("dispatch", ops._names())
+
+    def test_issue_mismatch_against_matching_label_fails_closed(self):
+        # Label matches but the requested issue disagrees with the lane's issue.
+        ops = FakeActuatorOps(git=True, worktree_exists=True, lanes=[_lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(issue="88888"), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LANE_MISMATCH, outcome.blocked_reasons)
+
+    def test_matching_identity_still_adopts(self):
+        # Sanity: the guard does not over-reject the correct lane.
+        ops = FakeActuatorOps(git=True, worktree_exists=True, lanes=[_lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.adopted)
 
 
 class RenderTests(unittest.TestCase):
