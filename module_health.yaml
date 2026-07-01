@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4808
+    lines: 4781
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -599,6 +599,34 @@ allowlist:
       are exercised directly by ``test_mozyo_bridge``) keep resolving. The
       now-unused ``REPO_ROOT_MARKERS`` / ``find_repo_root`` imports were dropped from
       ``commands.py``.
+      Lowered 4808 -> 4781 for the #12974 OOP-first status/session helper tranche
+      (rebased/integrated onto current origin/main ``36f278b`` after #12979, itself
+      atop the #12978 cockpit-peer-adopt, #12977 cockpit-planner, #12976
+      cockpit-membership, #12975 session-bootstrap, and #12972 repair-executor
+      tranches above): the residual ``session_cwd_mismatch`` /
+      ``legacy_basename_session_notice`` / ``resolve_status_session`` helpers moved
+      into the new ``application/status_session_helper.py`` boundary (the pure
+      ``cwd_is_under_repo`` / ``select_offending_cwds`` /
+      ``legacy_basename_notice_text`` decisions + a ``StatusSessionHelperReads``
+      port and ``LiveStatusSessionHelperReads`` adapter + the
+      ``SessionCwdMismatchUseCase`` / ``LegacyBasenameNoticeUseCase`` /
+      ``ResolveStatusSessionUseCase`` use cases). The three functions stay here as
+      thin wrappers (build the live reads, run the use case); ``cwd_is_under_repo``
+      is re-exported. The adapter resolves ``commands.pane_lines`` /
+      ``commands.session_exists`` / ``commands.session_cwd_mismatch`` /
+      ``commands.current_session_name`` / ``commands.repo_root_from_args`` /
+      ``commands.resolve_canonical_session`` at call time, so the ``status`` /
+      session-naming characterization tests that patch those seams (and the
+      ``LiveLaunchOps`` caller) keep working unchanged and the ``mozyo status`` CLI
+      output + exit convention are preserved. ``test_status_session_helper`` adds
+      the fake-port use-case + pure-decision specifications. The region is disjoint
+      from the #12972 repair-executor, #12975 session-bootstrap, #12976 cockpit
+      membership, #12977 cockpit-planner, #12978 cockpit-peer-adopt, and #12979 init
+      config carves, so ``commands.py`` auto-merged and the removals stack — 5453 ->
+      5318 (#12972) -> 5255 (#12975) -> 5136 (#12976) -> 5012 (#12977) -> 4886
+      (#12978) -> 4808 (#12979) -> 4781 (#12974); the 27-line net removal is measured
+      from the post-#12979 baseline (4808) and the combined post-merge ``commands.py``
+      line count is 4781.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

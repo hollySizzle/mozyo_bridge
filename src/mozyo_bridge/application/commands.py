@@ -35,6 +35,13 @@ from mozyo_bridge.application.commands_agents import (
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
 from mozyo_bridge.application.status_session_port import LiveStatusSession
+from mozyo_bridge.application.status_session_helper import (
+    LegacyBasenameNoticeUseCase,
+    LiveStatusSessionHelperReads,
+    ResolveStatusSessionUseCase,
+    SessionCwdMismatchUseCase,
+    cwd_is_under_repo,
+)
 from mozyo_bridge.application.commands_status import (
     LiveStatusCockpitMembership,
     LiveStatusDoctorContinuation,
@@ -2724,72 +2731,48 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
 
 
 def session_cwd_mismatch(session: str, repo_root: Path) -> list[str]:
-    """Return the cwds of panes in `session` when none of them are under `repo_root`.
+    """Thin adapter over the status/session helper boundary (#12974).
 
-    The session is considered "pointing at another work root" only when it has at
-    least one pane and every pane's cwd is outside `repo_root`. Returns the list
-    of offending cwds in that case; otherwise an empty list.
+    The pane-snapshot read + the pure "every pane outside the repo" decision
+    live in :class:`~mozyo_bridge.application.status_session_helper.
+    SessionCwdMismatchUseCase`; this stays a module-level function so the
+    ``commands.session_cwd_mismatch`` monkeypatch seam (and the ``LiveLaunchOps``
+    caller that routes through it) is unchanged, and the live use case resolves
+    ``commands.pane_lines`` at call time.
     """
-    same_session_panes = [
-        pane
-        for pane in pane_lines()
-        if (pane.get("location") or "").split(":", 1)[0] == session
-    ]
-    if not same_session_panes:
-        return []
-    if any(cwd_is_under_repo(pane.get("cwd") or "", repo_root) for pane in same_session_panes):
-        return []
-    return [pane.get("cwd") or "?" for pane in same_session_panes]
+    return SessionCwdMismatchUseCase(LiveStatusSessionHelperReads()).resolve(
+        session, repo_root
+    )
 
 
 def legacy_basename_session_notice(repo_root: Path, derived_session: str) -> str | None:
-    """Return a migration notice when a legacy basename-named session lingers.
+    """Thin adapter over the status/session helper boundary (#12974).
 
-    Before Redmine #10796, bare ``mozyo`` named the session after the repo
-    basename. Now it derives ``derived_session``. If a session still exists
-    under the old basename name *and* it belongs to this repo (at least one
-    pane under ``repo_root`` / not clearly another repo's), point the operator
-    at it so the old session is not silently orphaned. Returns ``None`` when
-    there is nothing to migrate. The notice is advisory only — it never blocks
-    the bare-``mozyo`` flow.
+    The advisory migration-notice decision + wording live in
+    :class:`~mozyo_bridge.application.status_session_helper.
+    LegacyBasenameNoticeUseCase`; this stays a module-level function so the
+    ``LiveLaunchOps`` caller and the ``commands.session_exists`` /
+    ``commands.session_cwd_mismatch`` seams the use case resolves at call time
+    are unchanged. The notice is advisory only — it never blocks the
+    bare-``mozyo`` flow.
     """
-    legacy = repo_root.name
-    if not legacy or legacy == derived_session:
-        return None
-    if not session_exists(legacy):
-        return None
-    if session_cwd_mismatch(legacy, repo_root):
-        # The legacy-named session's panes are all outside this repo, so it is
-        # a different repo's session that merely shares the basename. Not ours.
-        return None
-    return (
-        f"notice: legacy session '{legacy}' (named by repo basename) exists for this repo; "
-        f"bare `mozyo` now derives '{derived_session}'. Attach the old one explicitly with "
-        f"`mozyo --session {legacy}` (or `tmux attach -t {legacy}`), or remove it once empty "
-        f"with `tmux kill-session -t {legacy}`."
+    return LegacyBasenameNoticeUseCase(LiveStatusSessionHelperReads()).resolve(
+        repo_root, derived_session
     )
 
 
 def resolve_status_session(args: argparse.Namespace) -> str:
-    """Pick the session ``cmd_status`` should describe.
+    """Thin adapter over the status/session helper boundary (#12974).
 
-    Order: explicit ``--session`` > current tmux session (when run inside
-    tmux) > the bare-``mozyo`` resolved session name (see
-    :func:`resolve_canonical_session`: registered canonical identity first,
-    path derivation as fallback). The final fallback matches what bare
-    ``mozyo`` creates so ``status`` finds that session by name (Redmine
-    #10796, #11429). The hard-coded ``agents`` default is intentionally not
-    used; it produced misleading ``session: agents (missing)`` output under
-    the bare-``mozyo`` window model (see Asana task 1214758916882465).
+    The explicit > current-tmux > canonical-name selection lives in
+    :class:`~mozyo_bridge.application.status_session_helper.
+    ResolveStatusSessionUseCase`; this stays a module-level function so the
+    ``commands.resolve_status_session`` monkeypatch seam is unchanged and the
+    live use case resolves ``commands.current_session_name`` /
+    ``commands.repo_root_from_args`` / ``commands.resolve_canonical_session`` at
+    call time.
     """
-    explicit = getattr(args, "session", None)
-    if explicit:
-        return explicit
-    current = current_session_name()
-    if current:
-        return current
-    repo_root = repo_root_from_args(args)
-    return resolve_canonical_session(repo_root).name
+    return ResolveStatusSessionUseCase(LiveStatusSessionHelperReads()).resolve(args)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -4706,16 +4689,6 @@ def _bind_agent_pane_markers(
         run_tmux(
             "set-option", "-p", "-t", target, WORKSPACE_OPTION, workspace_id, check=False
         )
-
-
-def cwd_is_under_repo(cwd: str, repo_root: Path) -> bool:
-    if not cwd:
-        return True
-    try:
-        Path(cwd).expanduser().resolve().relative_to(repo_root.resolve())
-    except ValueError:
-        return False
-    return True
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
