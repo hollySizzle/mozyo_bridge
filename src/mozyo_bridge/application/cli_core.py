@@ -43,8 +43,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_callback_recovery,
     cmd_sublane_readiness,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
+    cmd_sublane_start,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
-    cmd_sublane_create,
     cmd_sublane_list,
     cmd_sublane_retire,
 )
@@ -301,10 +303,13 @@ def register_lifecycle(sub) -> None:
         "create",
         aliases=["start"],
         help=(
-            "Plan (do not actuate) a sublane: from issue / lane-label / branch / "
-            "worktree, emit the fail-closed, replayable worktree + gateway pane + "
-            "worker pane + dispatch steps. Fails closed on missing identity or an "
-            "unverified target."
+            "Plan a sublane (default) or, with --execute, actuate it in one action "
+            "(Redmine #12973): from issue / lane-label / branch / worktree, emit the "
+            "fail-closed, replayable worktree + gateway pane + worker pane + dispatch "
+            "steps; --execute creates/adopts the worktree + cockpit column and "
+            "dispatches the implementation_request. Fails closed on missing identity "
+            "or an unverified target. This is the standard sublane entrypoint; the "
+            "raw `cockpit append` / `handoff send` primitives are debug surfaces."
         ),
     )
     sublane_create.add_argument("--issue", required=True, help="Redmine issue id")
@@ -329,9 +334,38 @@ def register_lifecycle(sub) -> None:
         default=None,
         help="Coordinator pane the gateway calls back to",
     )
+    # Live actuator (Redmine #12973): opt-in `--execute` performs the additive
+    # worktree + cockpit column + gateway dispatch; without it the surface stays the
+    # #12955 plan-only default (side-effect-free, back-compat).
+    sublane_create.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actuate the plan (create/adopt the worktree + cockpit gateway/worker "
+        "column and dispatch the implementation_request). Default: plan only, no side "
+        "effects. Requires --journal for the dispatch anchor.",
+    )
+    sublane_create.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Preview the one-action actuation plan (worktree + cockpit column + "
+        "dispatch) without any side effect. Wins over --execute when both are given.",
+    )
+    sublane_create.add_argument(
+        "--no-dispatch",
+        dest="no_dispatch",
+        action="store_true",
+        help="With --execute, create/adopt the lane but skip the gateway dispatch.",
+    )
+    sublane_create.add_argument(
+        "--target-repo",
+        dest="target_repo",
+        default="auto",
+        help="Target-repo resolution for the --execute dispatch (default: auto).",
+    )
     add_repo_option(sublane_create)
     _add_lifecycle_json(sublane_create)
-    sublane_create.set_defaults(func=cmd_sublane_create)
+    sublane_create.set_defaults(func=cmd_sublane_start)
 
     sublane_list = sublane_sub.add_parser(
         "list",
