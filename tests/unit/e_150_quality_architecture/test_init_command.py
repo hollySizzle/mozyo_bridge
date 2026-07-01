@@ -23,6 +23,8 @@ exercisable without patching the live side effects.
 from __future__ import annotations
 
 import argparse
+import json
+import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +36,10 @@ from mozyo_bridge.application.init_command import (
     InitUseCase,
     InitWorkspaceOps,
     LiveInitWorkspaceOps,
+    _agent_window_conflict,
+    _confident_workspace_root,
+    _is_fallback_session_name,
+    _write_vscode_session_name,
     agent_window_conflict_message,
     expected_session_exists_message,
     foreign_session_message,
@@ -402,6 +408,86 @@ class LiveInitWorkspaceOpsTest(unittest.TestCase):
 
     def test_fake_satisfies_the_port_protocol(self) -> None:
         self.assertIsInstance(_FakeInitWorkspaceOps(), InitWorkspaceOps)
+
+
+class WorkspaceConfigHelperTest(unittest.TestCase):
+    """The workspace/session config helper tail moved into this boundary (#12979).
+
+    These pin the pure fallback / window-conflict decisions and the workspace-root
+    discovery / VS Code settings write directly in the module that now owns them,
+    which is the OOP-first carve's payoff.
+    """
+
+    def test_is_fallback_session_name_only_matches_all_underscore(self) -> None:
+        self.assertTrue(_is_fallback_session_name("___________"))
+        self.assertTrue(_is_fallback_session_name("__"))
+        self.assertFalse(_is_fallback_session_name(""))
+        self.assertFalse(_is_fallback_session_name("mozyo-giken-3500-jgmlife"))
+        self.assertFalse(_is_fallback_session_name("2026PBL_____"))
+
+    def test_confident_root_returns_marked_root_and_fails_closed_otherwise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = (Path(tmp) / "ws").resolve()
+            (workspace / ".git").mkdir(parents=True)
+            nested = workspace / "sub" / "dir"
+            nested.mkdir(parents=True)
+            self.assertEqual(_confident_workspace_root(str(nested)), workspace)
+
+            bare = (Path(tmp) / "bare").resolve()
+            bare.mkdir()
+            self.assertIsNone(_confident_workspace_root(str(bare)))
+            self.assertIsNone(_confident_workspace_root(""))
+
+    def test_agent_window_conflict_excludes_target_and_other_sessions(self) -> None:
+        panes = [
+            {"location": "sess:1.0", "window_name": "claude", "id": "%1"},
+            {"location": "sess:2.0", "window_name": "claude", "id": "%2"},
+            {"location": "sess:3.0", "window_name": "codex", "id": "%3"},
+            {"location": "other:9.0", "window_name": "claude", "id": "%9"},
+        ]
+        # Window 1 is the target; only the other same-session `claude` window
+        # (window 2) is a conflict — window 3 is a different agent, `other:9` a
+        # different session.
+        self.assertEqual(
+            _agent_window_conflict(panes, "sess", "1", "claude"),
+            ["sess:2(%2)"],
+        )
+        # Querying `codex` while skipping its own window (3) leaves no conflict.
+        self.assertEqual(_agent_window_conflict(panes, "sess", "3", "codex"), [])
+
+    def test_write_vscode_session_name_creates_settings_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path, written, warning = _write_vscode_session_name(root, "mozyo-repo")
+            self.assertTrue(written)
+            self.assertIsNone(warning)
+            self.assertEqual(path, root / ".vscode" / "settings.json")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["tmux-integrated.sessionName"], "mozyo-repo")
+
+    def test_write_vscode_session_name_warns_on_unparseable_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = root / ".vscode" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("{ /* JSONC comment */ }", encoding="utf-8")
+            path, written, warning = _write_vscode_session_name(root, "mozyo-repo")
+            self.assertFalse(written)
+            self.assertIsNotNone(warning)
+            assert warning is not None
+            self.assertIn("not plain JSON", warning)
+            # Operator content is left untouched.
+            self.assertEqual(
+                settings.read_text(encoding="utf-8"), "{ /* JSONC comment */ }"
+            )
+
+    def test_commands_re_exports_the_legacy_names(self) -> None:
+        from mozyo_bridge.application import commands
+
+        self.assertIs(commands._confident_workspace_root, _confident_workspace_root)
+        self.assertIs(commands._is_fallback_session_name, _is_fallback_session_name)
+        self.assertIs(commands._agent_window_conflict, _agent_window_conflict)
+        self.assertIs(commands._write_vscode_session_name, _write_vscode_session_name)
 
 
 if __name__ == "__main__":

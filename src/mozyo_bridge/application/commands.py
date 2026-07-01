@@ -172,10 +172,8 @@ from mozyo_bridge.scaffold.rules import (
 )
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import (
-    REPO_ROOT_MARKERS,
     default_queue_path,
     default_tmux_conf,
-    find_repo_root,
     normalize_path_unicode,
 )
 
@@ -4623,98 +4621,6 @@ def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:
     ).run_cross_workspace_consult(args)
 
 
-def _confident_workspace_root(cwd: str) -> Path | None:
-    """Return the workspace root for ``cwd`` only when its identity is confident.
-
-    Walks up from ``cwd`` using the same markers bare ``mozyo`` uses and returns
-    the root only when that root actually bears a repo / workspace marker
-    (``.git`` / ``.tmux.conf`` / ``pyproject.toml`` / ``.mozyo-bridge/scaffold.json``).
-    Returns ``None`` when ``cwd`` is empty or the walk fell through to a
-    marker-less directory, so smart ``init`` fails closed rather than adopting an
-    unidentifiable cwd into a derived session. Uses ``find_repo_root`` (a pure
-    cwd walk-up) rather than ``resolve_repo_root`` so the root reflects where the
-    pane actually is, not a ``MOZYO_REPO`` override.
-    """
-    if not cwd:
-        return None
-    root = find_repo_root(Path(cwd))
-    if any((root / marker).exists() for marker in REPO_ROOT_MARKERS):
-        return root
-    return None
-
-
-def _is_fallback_session_name(name: str) -> bool:
-    """True for a low-information tmux-integrated fallback session name.
-
-    The VS Code ``tmux-integrated`` extension sanitizes a non-ASCII workspace
-    basename down to underscores, so a fully Japanese basename becomes an
-    all-underscore session like ``___________``. Such a name carries no
-    workspace identity and is safe for smart ``init`` to rename into the derived
-    session. A name with any non-underscore character is treated as meaningful
-    and is never renamed without an explicit ``--window-only`` opt-in.
-    """
-    return bool(name) and all(ch == "_" for ch in name)
-
-
-def _agent_window_conflict(
-    panes: list[dict], session: str, skip_window_index: str, agent: str
-) -> list[str]:
-    """Return `session:idx(pane)` for other windows in ``session`` named ``agent``.
-
-    The resolver keys agents on the window name, so a second window named
-    ``agent`` in the same session is ambiguous even though tmux tolerates it.
-    The target window itself (``skip_window_index``) is excluded.
-    """
-    conflicts = []
-    for pane in panes:
-        pane_location_value = pane.get("location") or ""
-        pane_session, _, pane_rest = pane_location_value.partition(":")
-        if pane_session != session:
-            continue
-        pane_window_index = pane_rest.split(".", 1)[0]
-        if pane_window_index == skip_window_index:
-            continue
-        if pane.get("window_name") == agent:
-            conflicts.append(f"{pane_session}:{pane_window_index}({pane.get('id')})")
-    return conflicts
-
-
-def _write_vscode_session_name(root: Path, session_name: str) -> tuple[Path, bool, str | None]:
-    """Merge ``tmux-integrated.sessionName`` into ``<root>/.vscode/settings.json``.
-
-    Returns ``(path, written, warning)``. ``written`` is ``False`` with a
-    non-``None`` ``warning`` when the existing file is JSONC / unparseable —
-    smart ``init`` warns and continues rather than clobbering operator content
-    or aborting the whole adoption. Only the workspace-local settings file is
-    ever touched; user-global VS Code settings are never read or written.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.session_naming import (
-        VSCODE_SESSION_NAME_KEY,
-        VSCODE_SETTINGS_RELATIVE,
-        merge_vscode_session_name,
-    )
-
-    settings_path = root / VSCODE_SETTINGS_RELATIVE
-    existing = (
-        settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    )
-    try:
-        new_text = merge_vscode_session_name(existing, session_name)
-    except ValueError as exc:
-        return (
-            settings_path,
-            False,
-            (
-                f"{settings_path} is not plain JSON ({exc}); left unchanged. Add "
-                f'"{VSCODE_SESSION_NAME_KEY}": "{session_name}" by hand, or re-run '
-                "with --no-vscode-settings to silence this."
-            ),
-        )
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(new_text, encoding="utf-8")
-    return settings_path, True, None
-
-
 def cmd_init(args: argparse.Namespace) -> int:
     """Adopt the current/target pane into its workspace as a ``claude`` / ``codex`` agent.
 
@@ -4756,6 +4662,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     for note in outcome.notes:
         print(f"  - {note}")
     return 0
+
+
+# Compatibility re-export (#12979): the workspace/session config helper tail
+# (`_confident_workspace_root` / `_is_fallback_session_name` /
+# `_agent_window_conflict` / `_write_vscode_session_name`) moved into the
+# `init_command` boundary that consumes them. Re-export the legacy names so
+# existing imports (`commands._confident_workspace_root` /
+# `commands._is_fallback_session_name` are exercised directly by tests) keep
+# resolving byte-for-byte. `init_command` imports `commands` only lazily, so this
+# top-level import introduces no cycle.
+from mozyo_bridge.application.init_command import (  # noqa: E402
+    _agent_window_conflict,
+    _confident_workspace_root,
+    _is_fallback_session_name,
+    _write_vscode_session_name,
+)
 
 
 def _bind_agent_pane_markers(

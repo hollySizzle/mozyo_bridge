@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4886
+    lines: 4808
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -582,6 +582,23 @@ allowlist:
       executor via the port (executor semantics unchanged).
       ``test_cockpit_peer_adopt_command`` adds the fake-port use-case + pure-helper
       specifications.
+      Lowered 4886 -> 4808 for #12979 (rebased onto ``origin/main`` 89689e0 after
+      #12978; the carves touch disjoint regions of ``commands.py`` so it
+      auto-merged and the removals stack — 5318 -> 5255 (#12975) -> 5136 (#12976)
+      -> 5012 (#12977) -> 4886 (#12978) -> 4808 (#12979)): the ``mozyo init``
+      workspace/session config helper tail (``_confident_workspace_root`` /
+      ``_is_fallback_session_name`` / ``_agent_window_conflict`` /
+      ``_write_vscode_session_name``) moved into the
+      ``application/init_command.py`` boundary (#12926) that already consumes them —
+      the pure fallback / window-conflict decisions and the workspace-root discovery
+      / VS Code settings write now live next to the ``LiveInitWorkspaceOps`` adapter,
+      which delegates to them locally instead of round-tripping through
+      ``commands.*``. The functions are byte-for-byte identical; ``commands.py``
+      re-exports the four legacy ``_``-prefixed names so existing imports
+      (``commands._confident_workspace_root`` / ``commands._is_fallback_session_name``
+      are exercised directly by ``test_mozyo_bridge``) keep resolving. The
+      now-unused ``REPO_ROOT_MARKERS`` / ``find_repo_root`` imports were dropped from
+      ``commands.py``.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
