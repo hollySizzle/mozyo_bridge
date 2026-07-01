@@ -43,6 +43,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_callback_recovery,
     cmd_sublane_readiness,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
+    cmd_sublane_create,
+    cmd_sublane_list,
+    cmd_sublane_retire,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -209,13 +214,16 @@ def register_lifecycle(sub) -> None:
     doctor_runtime.set_defaults(func=cmd_doctor_runtime)
 
     # `sublane` groups the read-only sublane startup / callback-stall
-    # diagnostics (Redmine #12159). Both subcommands are pure over their inputs
-    # and never change handoff / queue-enter / launch behavior.
+    # diagnostics (Redmine #12159) and the lifecycle MVP (create / list / retire,
+    # Redmine #12955). The diagnostics subcommands are pure; the lifecycle
+    # subcommands are discovery / planning / preflight only — they never actuate
+    # `git worktree add/remove`, pane kill, or a merge (the destructive actuator is
+    # gated behind a Design Consultation per worktree-lifecycle-boundary.md).
     sublane = sub.add_parser(
         "sublane",
         help=(
-            "Read-only sublane startup readiness and callback-stall recovery "
-            "diagnostics (Redmine #12159)"
+            "Sublane lifecycle (create / list / retire, Redmine #12955) plus "
+            "startup readiness and callback-stall recovery diagnostics (#12159)"
         ),
     )
     sublane_sub = sublane.add_subparsers(dest="sublane_command", required=True)
@@ -279,3 +287,136 @@ def register_lifecycle(sub) -> None:
         help="Emit structured JSON output instead of human-readable text",
     )
     sublane_callback.set_defaults(func=cmd_sublane_callback_recovery)
+
+    # --- lifecycle MVP (Redmine #12955): create / start, list / status, retire ---
+
+    def _add_lifecycle_json(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Emit structured JSON output instead of human-readable text",
+        )
+
+    sublane_create = sublane_sub.add_parser(
+        "create",
+        aliases=["start"],
+        help=(
+            "Plan (do not actuate) a sublane: from issue / lane-label / branch / "
+            "worktree, emit the fail-closed, replayable worktree + gateway pane + "
+            "worker pane + dispatch steps. Fails closed on missing identity or an "
+            "unverified target."
+        ),
+    )
+    sublane_create.add_argument("--issue", required=True, help="Redmine issue id")
+    sublane_create.add_argument(
+        "--lane-label",
+        dest="lane_label",
+        required=True,
+        help="Lane label (e.g. issue_<id>_<slug>)",
+    )
+    sublane_create.add_argument(
+        "--branch", required=True, help="Branch name for the lane worktree"
+    )
+    sublane_create.add_argument(
+        "--worktree", required=True, help="Worktree path for the lane"
+    )
+    sublane_create.add_argument(
+        "--journal", default=None, help="Durable-anchor journal id for the dispatch step"
+    )
+    sublane_create.add_argument(
+        "--upstream-coordinator",
+        dest="upstream_coordinator",
+        default=None,
+        help="Coordinator pane the gateway calls back to",
+    )
+    add_repo_option(sublane_create)
+    _add_lifecycle_json(sublane_create)
+    sublane_create.set_defaults(func=cmd_sublane_create)
+
+    sublane_list = sublane_sub.add_parser(
+        "list",
+        aliases=["status"],
+        help=(
+            "Read-only: list live sublanes (issue / worktree / gateway pane / "
+            "worker pane / branch / state) from the tmux pane inventory."
+        ),
+    )
+    sublane_list.add_argument(
+        "--lane",
+        default=None,
+        help="Filter to a single lane by lane id, lane label, or issue id",
+    )
+    add_repo_option(sublane_list)
+    _add_lifecycle_json(sublane_list)
+    sublane_list.set_defaults(func=cmd_sublane_list)
+
+    sublane_retire = sublane_sub.add_parser(
+        "retire",
+        help=(
+            "Fail-closed retire preflight: evaluate the retire decision from git "
+            "probes + durable-record invariants and emit the verdict + journal + "
+            "retirement runbook. Does NOT actuate pane kill / worktree remove / "
+            "branch delete (gated); never deletes remote branches. Exits non-zero "
+            "when retirement is blocked."
+        ),
+    )
+    sublane_retire.add_argument("--issue", required=True, help="Redmine issue id")
+    sublane_retire.add_argument(
+        "--lane-label",
+        dest="lane_label",
+        required=True,
+        help="Lane label to retire (e.g. issue_<id>_<slug>)",
+    )
+    sublane_retire.add_argument(
+        "--worktree", default=None, help="Worktree path to include in the runbook"
+    )
+    sublane_retire.add_argument(
+        "--branch", default=None, help="Local branch to include in the runbook"
+    )
+    sublane_retire.add_argument(
+        "--integration-branch",
+        dest="integration_branch",
+        default=None,
+        help="Integration branch name (recorded in the durable journal)",
+    )
+    # Durable-record invariants the operator asserts (each defaults to unsatisfied
+    # so an omitted flag fails closed).
+    sublane_retire.add_argument(
+        "--issue-closed",
+        dest="issue_closed",
+        action="store_true",
+        help="The lane's Redmine issue is durably closed.",
+    )
+    sublane_retire.add_argument(
+        "--owner-approved",
+        dest="owner_approved",
+        action="store_true",
+        help="The owner close-approval journal exists.",
+    )
+    sublane_retire.add_argument(
+        "--callbacks-drained",
+        dest="callbacks_drained",
+        action="store_true",
+        help="No outstanding coordinator callback is owed.",
+    )
+    sublane_retire.add_argument(
+        "--verified",
+        dest="verified",
+        action="store_true",
+        help="The lane's verification (tests / checks) passed.",
+    )
+    sublane_retire.add_argument(
+        "--durable-record",
+        dest="durable_record",
+        action="store_true",
+        help="The durable retire record / anchor is present.",
+    )
+    sublane_retire.add_argument(
+        "--target-identity-known",
+        dest="target_identity_known",
+        action="store_true",
+        help="The lane / worktree / pane target is positively resolved.",
+    )
+    add_repo_option(sublane_retire)
+    _add_lifecycle_json(sublane_retire)
+    sublane_retire.set_defaults(func=cmd_sublane_retire)
