@@ -102,6 +102,30 @@ class ProjectSublanesTests(unittest.TestCase):
         ]
         self.assertEqual(project_sublanes(rows), [])
 
+    def test_skips_main_lane_with_hashed_lane_id(self):
+        # Regression (#12955 j#69954): the live main / coordinator lane carries a hashed
+        # non-default lane id and only its label reads "main"; it must not appear as a
+        # sublane alongside real ones.
+        rows = [
+            _row(id="%2", agent_role="codex", lane_id="lane-124611ffed3c",
+                 lane_label="main"),
+            _row(id="%3", agent_role="claude", lane_id="lane-124611ffed3c",
+                 lane_label="main"),
+            _row(id="%93", agent_role="codex", lane_id="lane-12955",
+                 lane_label="issue_12955_x"),
+            _row(id="%99", agent_role="claude", lane_id="lane-12955",
+                 lane_label="issue_12955_x"),
+        ]
+        views = project_sublanes(rows)
+        self.assertEqual([v.lane_label for v in views], ["issue_12955_x"])
+
+    def test_skips_main_lane_by_kind(self):
+        rows = [
+            _row(id="%2", agent_role="codex", lane_id="lane-abc",
+                 lane_label="", lane_kind="main"),
+        ]
+        self.assertEqual(project_sublanes(rows), [])
+
     def test_state_gateway_only_and_worker_only(self):
         gw = project_sublanes([_row(id="%1", agent_role="codex", lane_id="l1")])
         self.assertEqual(gw[0].state, SUBLANE_STATE_GATEWAY_ONLY)

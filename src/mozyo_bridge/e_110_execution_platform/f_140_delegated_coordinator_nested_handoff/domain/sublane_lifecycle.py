@@ -64,6 +64,16 @@ WORKER_ROLE = "claude"
 #: The reserved non-sublane lane id (cockpit / unmanaged panes carry this).
 DEFAULT_LANE = "default"
 
+#: The main / coordinator lane's label. The coordinator lane is *not* a sublane, but its
+#: panes do not always carry ``lane_id == "default"``: in a live cockpit the main lane is
+#: stamped with a hashed workspace lane id (e.g. ``lane-124611ffed3c``) and only the
+#: label / kind reads ``main``. Excluding it by label / kind — not just the literal
+#: default lane id — keeps ``list`` / ``status`` reporting real sublanes only.
+MAIN_LANE_LABEL = "main"
+
+#: Lane-kind values (``@mozyo_lane_kind``) that mark the coordinator / default lane.
+_NON_SUBLANE_KINDS = frozenset({"main", "default"})
+
 #: ``issue_<id>_<slug>`` lane-label convention (the existing dogfood naming). Only the
 #: numeric issue id is extracted; the slug is display-only and never forced-generated
 #: here (issue-number -> path/branch generation stays operator judgment per the boundary
@@ -154,6 +164,24 @@ class SublaneLaneView:
         }
 
 
+def _is_non_sublane_lane(lane_id: str, lane_label: str, lane_kind: str) -> bool:
+    """True for the coordinator / default lane, which ``list`` / ``status`` must exclude.
+
+    A lane is *not* a sublane when any of its identity signals mark it as the main /
+    default coordinator lane: the reserved :data:`DEFAULT_LANE` id (or an empty id, which
+    normalizes to it), the :data:`MAIN_LANE_LABEL`, or a main / default lane kind. Relying
+    on the literal default lane id alone is insufficient — the live main lane carries a
+    hashed lane id and only its label / kind reads ``main`` (Redmine #12955 j#69954).
+    """
+    if (lane_id or "").strip() in ("", DEFAULT_LANE):
+        return True
+    if (lane_label or "").strip().casefold() == MAIN_LANE_LABEL:
+        return True
+    if (lane_kind or "").strip().casefold() in _NON_SUBLANE_KINDS:
+        return True
+    return False
+
+
 def _lane_state(gateway_pane: Optional[str], worker_pane: Optional[str]) -> str:
     if gateway_pane and worker_pane:
         return SUBLANE_STATE_ACTIVE
@@ -172,10 +200,12 @@ def project_sublanes(
     """Fold a tmux pane inventory into one :class:`SublaneLaneView` per sublane (pure).
 
     ``pane_rows`` are the ``pane_lines`` row dicts (keys ``id`` / ``agent_role`` /
-    ``workspace_id`` / ``lane_id`` / ``lane_label`` / ``cwd`` / ``command`` /
-    ``pane_active`` / ``repo_root_stamp`` …). Rows are grouped by ``(workspace_id,
-    lane_id)``; the reserved :data:`DEFAULT_LANE` (cockpit / unmanaged panes) is skipped so
-    only real sublanes appear. Within a lane the first ``codex`` pane is the gateway and
+    ``workspace_id`` / ``lane_id`` / ``lane_label`` / ``lane_kind`` / ``cwd`` /
+    ``command`` / ``pane_active`` / ``repo_root_stamp`` …). Rows are grouped by
+    ``(workspace_id, lane_id)``; the coordinator / default lane is skipped
+    (:func:`_is_non_sublane_lane` — by default lane id, ``main`` label, or main / default
+    kind) so only real sublanes appear. Within a lane the first ``codex`` pane is the
+    gateway and
     the first ``claude`` pane the worker; extra same-role panes are still listed under
     ``panes`` but never silently promoted. ``branches`` is a caller-resolved
     ``lane_id -> branch`` lookup (the domain never runs git); an absent entry leaves
@@ -189,7 +219,12 @@ def project_sublanes(
 
     for row in pane_rows:
         lane_id = (row.get("lane_id") or "").strip() or DEFAULT_LANE
-        if lane_id == DEFAULT_LANE:
+        lane_label_raw = (row.get("lane_label") or "").strip()
+        lane_kind_raw = (row.get("lane_kind") or "").strip()
+        # Exclude the coordinator / default lane by any of its identity signals — the
+        # live main lane carries a hashed lane id, so a literal default-id check alone
+        # would emit it as a sublane (Redmine #12955 j#69954).
+        if _is_non_sublane_lane(lane_id, lane_label_raw, lane_kind_raw):
             continue
         workspace_id = (row.get("workspace_id") or "").strip()
         key = (workspace_id, lane_id)
@@ -540,6 +575,7 @@ __all__ = (
     "GATEWAY_ROLE",
     "WORKER_ROLE",
     "DEFAULT_LANE",
+    "MAIN_LANE_LABEL",
     "parse_issue_from_lane_label",
     "SUBLANE_STATE_ACTIVE",
     "SUBLANE_STATE_GATEWAY_ONLY",
