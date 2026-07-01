@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5875
+    lines: 5873
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -325,6 +325,16 @@ allowlist:
       outcome + actionable-die wiring after target preflight, before the mode-
       scoped binding gate). Rebased onto current main from already-reviewed commit
       11700ce; moved-module architecture preserved.
+      Lowered 5875 -> 5873 for the #12930 OOP-first doctor/instruction command-tail
+      tranche: the `cmd_doctor_instruction` (`doctor instruction` runbook) and
+      `cmd_instruction_doctor` (`runtime-config check`) json/text rendering decision
+      + `result["ok"]` exit-code mapping moved into the new
+      `application/doctor_instruction_command.py` boundary (shared
+      `InstructionCommandUseCase` returning a typed `InstructionCommandOutcome`).
+      Both stay here as thin handlers that hand the use case the
+      `doctor_instruction` / `instruction_doctor` runner + renderer resolved lazily
+      at call time (so those modules' monkeypatch seams are unchanged) and print the
+      outcome; the extracted bodies net-shrink the module by 2 lines.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

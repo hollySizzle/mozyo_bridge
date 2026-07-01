@@ -5793,35 +5793,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor_instruction(args: argparse.Namespace) -> int:
+    # Thin handler over the ``doctor_instruction_command`` boundary (#12930): the
+    # run + json/text render + exit-code mapping live there. Lazy imports preserve
+    # the ``doctor_instruction`` monkeypatch seams.
     from mozyo_bridge.application.doctor_instruction import (
         format_doctor_instruction_text,
         run_doctor_instruction,
     )
+    from mozyo_bridge.application.doctor_instruction_command import InstructionCommandUseCase
 
-    result = run_doctor_instruction(args)
-    if getattr(args, "json", False):
-        import json as _json
-
-        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_doctor_instruction_text(result))
-    return 0 if result["ok"] else 1
+    outcome = InstructionCommandUseCase(run_doctor_instruction, format_doctor_instruction_text).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
 
 
 def cmd_instruction_doctor(args: argparse.Namespace) -> int:
+    # Thin handler mirroring ``cmd_doctor_instruction`` over the shared
+    # ``doctor_instruction_command`` boundary (#12930). Lazy imports preserve the
+    # ``instruction_doctor`` monkeypatch seams.
     from mozyo_bridge.application.instruction_doctor import (
         format_instruction_doctor_text,
         run_instruction_doctor,
     )
+    from mozyo_bridge.application.doctor_instruction_command import InstructionCommandUseCase
 
-    result = run_instruction_doctor(args)
-    if getattr(args, "json", False):
-        import json as _json
-
-        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_instruction_doctor_text(result))
-    return 0 if result["ok"] else 1
+    outcome = InstructionCommandUseCase(run_instruction_doctor, format_instruction_doctor_text).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
 
 
 def cmd_instruction_install(args: argparse.Namespace) -> int:
