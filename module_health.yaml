@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4564
+    lines: 4374
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -718,6 +718,27 @@ allowlist:
       from the post-#12982 baseline (4566) and the combined post-merge ``commands.py``
       line count is 4564. ``test_launch_command`` adds the pure
       ``render_mozyo_session_block`` specifications.
+      Lowered 4564 -> 4374 for the #12987 cockpit adopt resolver/advisory residual
+      tranche: the four adopt helpers — ``_coexisting_normal_observations`` (live
+      inventory -> adopt observation projection), ``_cockpit_adopt_advisory``
+      (tolerant detect wrapper), ``_resolve_cockpit_adopt`` (the #11898 fail-closed
+      adopt decision), and ``_handle_cockpit_adopt`` (the preview / json /
+      confirm-gated ``mozyo cockpit adopt`` handler) — moved to the new
+      ``application/cockpit_adopt_command.py`` (the direct analog of the #12978
+      peer-adopt carve): a pure ``project_normal_session_observations`` projection,
+      a ``CockpitAdoptOps`` port with a ``LiveCockpitAdoptOps`` adapter that routes
+      the advisory / client / anchor / lane / tmux / executor seams through this
+      module at call time (and ``take_inventory`` from its source module), and a
+      ``CockpitAdoptUseCase`` rendering through an injected ``emit`` sink so the
+      confirm path's header/results interleaving around the atomic move is
+      preserved. All four names stay here as same-signature thin wrappers (the
+      ``cmd_cockpit`` adopt dispatch and the ``commands._cockpit_adopt_advisory``
+      / ``_session_attached_clients`` / ``_resolve_workspace_lane`` patch seams are
+      unchanged); the now-unused ``AGENT_KIND_CODEX`` / ``AGENT_KIND_CLAUDE`` /
+      ``ROLE_SOURCE_WINDOW_NAME`` imports were dropped. 4564 -> 4374 is a 190-line
+      net removal and the post-carve ``commands.py`` line count is 4374.
+      ``test_cockpit_adopt_command`` adds the fake-port use-case + pure-projection
+      specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
