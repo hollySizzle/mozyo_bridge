@@ -1146,60 +1146,15 @@ def _read_cockpit_columns(session: str, window: str | None = None):
     geometry (Redmine #11849) lets append pick the visually rightmost column
     instead of trusting list-panes order.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
-
-    target_window = COCKPIT_WINDOW if window is None else window
-    # A window id (`@N`) is unique across the whole tmux server, so it targets the
-    # window on its own; only a window *name* needs the `session:` qualifier.
-    target = (
-        target_window
-        if target_window.startswith("@")
-        else f"{session}:{target_window}"
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
     )
 
-    def _as_int(value: str) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
-    # Read-only and tolerant: a missing tmux binary / server, or a missing
-    # cockpit window, all degrade to "no cockpit" (None) rather than raising —
-    # so `--dry-run` / `--json` stay non-mutating and never abort (#11803 review).
-    try:
-        result = run_tmux(
-            "list-panes",
-            "-t",
-            target,
-            "-F",
-            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
-            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_width}"
-            "\t#{@mozyo_project_scope}\t#{@mozyo_project_path}"
-            "\t#{@mozyo_project_label}",
-            check=False,
-        )
-    except (Exception, SystemExit):
-        return None
-    if getattr(result, "returncode", 1) != 0:
-        return None
-    columns = []
-    for line in (getattr(result, "stdout", "") or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 3 and parts[0]:
-            columns.append(
-                {
-                    "pane_id": parts[0],
-                    "workspace_id": parts[1],
-                    "role": parts[2],
-                    "lane_id": parts[3] if len(parts) >= 4 else "",
-                    "pane_left": _as_int(parts[4]) if len(parts) >= 5 else 0,
-                    "pane_width": _as_int(parts[5]) if len(parts) >= 6 else 0,
-                    "project_scope": parts[6] if len(parts) >= 7 else "",
-                    "project_path": parts[7] if len(parts) >= 8 else "",
-                    "project_label": parts[8] if len(parts) >= 9 else "",
-                }
-            )
-    return columns
+    # Thin wrapper over the #12971 :class:`CockpitReadUseCase` boundary; the live
+    # adapter routes ``run_tmux`` through this module at call time, so the tests
+    # patching ``commands.run_tmux`` still intercept the read.
+    return CockpitReadUseCase(LiveCockpitReadOps()).read_columns(session, window)
 
 
 def _read_managed_cockpit_windows(session: str):
@@ -1226,44 +1181,17 @@ def _read_managed_cockpit_windows(session: str):
     `--dry-run` / `--json` stay non-mutating. A window whose pane read fails or
     carries no managed pane is simply omitted.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import GROUP_WINDOW_OPTION
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
+    )
 
-    try:
-        result = run_tmux(
-            "list-windows",
-            "-t",
-            session,
-            "-F",
-            "#{window_id}\t#{window_name}\t#{" + GROUP_WINDOW_OPTION + "}",
-            check=False,
-        )
-    except (Exception, SystemExit):
-        return []
-    if getattr(result, "returncode", 1) != 0:
-        return []
-    managed = []
-    for line in (getattr(result, "stdout", "") or "").splitlines():
-        parts = line.split("\t")
-        window_id = parts[0] if parts else ""
-        if not window_id:
-            continue
-        window_name = parts[1] if len(parts) >= 2 else ""
-        group_hint = parts[2] if len(parts) >= 3 else ""
-        # Read panes by the unambiguous window id, never the (possibly duplicate)
-        # name.
-        columns = _read_cockpit_columns(session, window_id)
-        if not columns:
-            continue
-        if any((c.get("workspace_id") or "") for c in columns):
-            managed.append(
-                {
-                    "window_id": window_id,
-                    "window": window_name,
-                    "group_id": group_hint,
-                    "columns": columns,
-                }
-            )
-    return managed
+    # Thin wrapper over the #12971 :class:`CockpitReadUseCase` boundary. The use
+    # case reads each window's panes through the live adapter's ``read_columns``
+    # seam, which routes ``commands._read_cockpit_columns`` at call time — so the
+    # group-window tests that patch that seam with a ``side_effect`` still feed
+    # this discovery.
+    return CockpitReadUseCase(LiveCockpitReadOps()).read_managed_windows(session)
 
 
 def _read_cockpit_geometry(session: str):
@@ -1283,48 +1211,15 @@ def _read_cockpit_geometry(session: str):
     window, degrade to ``None`` (no cockpit) rather than raising, so the diagnostic
     never mutates and never aborts.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import COCKPIT_WINDOW
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
+    )
 
-    def _as_int(value: str) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
-    try:
-        result = run_tmux(
-            "list-panes",
-            "-t",
-            f"{session}:{COCKPIT_WINDOW}",
-            "-F",
-            "#{pane_id}\t#{@mozyo_workspace_id}\t#{@mozyo_agent_role}"
-            "\t#{@mozyo_lane_id}\t#{pane_left}\t#{pane_top}"
-            "\t#{pane_width}\t#{pane_height}",
-            check=False,
-        )
-    except (Exception, SystemExit):
-        return None
-    if getattr(result, "returncode", 1) != 0:
-        return None
-    panes = []
-    for line in (getattr(result, "stdout", "") or "").splitlines():
-        parts = line.split("\t")
-        if not parts or not parts[0]:
-            continue
-        parts = (parts + [""] * 8)[:8]
-        panes.append(
-            {
-                "pane_id": parts[0],
-                "workspace_id": parts[1],
-                "role": parts[2],
-                "lane_id": parts[3],
-                "pane_left": _as_int(parts[4]),
-                "pane_top": _as_int(parts[5]),
-                "pane_width": _as_int(parts[6]),
-                "pane_height": _as_int(parts[7]),
-            }
-        )
-    return panes
+    # Thin wrapper over the #12971 :class:`CockpitReadUseCase` boundary; the live
+    # adapter routes ``run_tmux`` through this module at call time, so the tests
+    # patching ``commands.run_tmux`` still intercept the read.
+    return CockpitReadUseCase(LiveCockpitReadOps()).read_geometry(session)
 
 
 def _rightmost_codex_anchor(codex_columns) -> str | None:

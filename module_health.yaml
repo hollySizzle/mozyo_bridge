@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5558
+    lines: 5453
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -449,6 +449,26 @@ allowlist:
       by the cockpit-append launch and the #12933 launch adapter). The extracted
       bodies net-shrink the module by 1 line from the post-#12936 baseline (5559);
       ``test_launch_command`` adds the fake-port use-case + pure-argv specifications.
+      Lowered 5558 -> 5453 for the #12971 OOP-first cockpit live-read adapter
+      tranche (rebased/integrated onto current origin/main atop the #12970 tranche
+      above): the three read helpers ``_read_cockpit_columns`` /
+      ``_read_managed_cockpit_windows`` / ``_read_cockpit_geometry`` moved into the
+      new ``application/cockpit_read_command.py`` boundary (pure ``project_*`` /
+      ``*_target`` projection helpers + a ``CockpitReadOps`` port and
+      ``LiveCockpitReadOps`` adapter + a ``CockpitReadUseCase`` with a
+      ``read_columns`` / ``read_managed_windows`` / ``read_geometry`` method). The
+      three functions stay here as thin wrappers (build the live ops, run the use
+      case). The adapter resolves ``commands.run_tmux`` and
+      ``commands._read_cockpit_columns`` at call time, so the append / geometry /
+      group-window / membership characterization tests that patch those module
+      seams keep intercepting the reads unchanged, and the ``cockpit list`` /
+      ``cockpit status`` / ``cockpit doctor-geometry`` CLI output + exit
+      conventions are byte-for-byte preserved. The region is disjoint from the
+      #12970 launch-helper carve (agent-window launch vs cockpit read), so the
+      105-line net removal is measured from the post-#12970 baseline (5558) and the
+      combined post-merge ``commands.py`` line count is 5453.
+      ``test_cockpit_read_command`` adds the fake-port use-case + pure-projection
+      specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
