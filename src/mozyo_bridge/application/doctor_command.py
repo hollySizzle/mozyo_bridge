@@ -35,6 +35,18 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+# The public boundary surface of this command module. ``format_doctor_text`` is
+# the pure renderer re-exported by :mod:`mozyo_bridge.application.doctor` for the
+# ``doctor.format_doctor_text`` / ``commands.format_doctor_text`` compatibility
+# facade; ``DoctorCommandUseCase`` / ``DoctorCommandOutcome`` are the command
+# wrapper the thin ``cmd_doctor`` adapter composes. ``_format_skill_block`` is an
+# internal helper of ``format_doctor_text`` and is intentionally excluded.
+__all__ = [
+    "DoctorCommandOutcome",
+    "DoctorCommandUseCase",
+    "format_doctor_text",
+]
+
 
 def _format_skill_block(name: str, info: dict[str, Any], indent: str) -> list[str]:
     lines = [

@@ -53,6 +53,17 @@ from mozyo_bridge.application.doctor_health import (
     RunDoctorUseCase,
     UNHEALTHY_SECTION_STATUSES,
 )
+# The pure ``run_doctor`` result -> text renderer (``format_doctor_text`` and its
+# ``_format_skill_block`` helper) and the ``doctor`` command tail
+# (``DoctorCommandOutcome`` / ``DoctorCommandUseCase``) live behind the bounded
+# command boundary in :mod:`mozyo_bridge.application.doctor_command` (#12927).
+# ``format_doctor_text`` is re-exported here so existing ``doctor.format_doctor_text``
+# importers stay byte-for-byte: ``commands.py`` imports it from this module (and
+# exposes the ``commands.format_doctor_text`` monkeypatch target), and the
+# workspace-registry / state-store inspector integration tests import it from here.
+# The renderer is pure, so the boundary module imports nothing from this module —
+# no import cycle.
+from mozyo_bridge.application.doctor_command import format_doctor_text  # noqa: F401
 from mozyo_bridge.application.doctor_tmux import (
     LiveTmuxPaneHealthReads,
     TmuxSectionUseCase,
@@ -609,16 +620,3 @@ def run_doctor(args: argparse.Namespace) -> dict[str, Any]:
     # ``evaluate_doctor_health`` policy, and the legacy result shape is
     # preserved byte-for-byte for the CLI / JSON / ``format_doctor_text`` paths.
     return RunDoctorUseCase(LiveDoctorSections(args)).execute()
-
-
-# The pure ``run_doctor`` result -> text renderer (``format_doctor_text`` and
-# its ``_format_skill_block`` helper) and the ``doctor`` command tail
-# (``DoctorCommandOutcome`` / ``DoctorCommandUseCase``) now live behind the
-# bounded command boundary in :mod:`mozyo_bridge.application.doctor_command`
-# (#12927). ``format_doctor_text`` is re-exported here so the existing
-# ``doctor.format_doctor_text`` importers stay byte-for-byte: ``commands.py``
-# imports it from this module (and exposes the ``commands.format_doctor_text``
-# monkeypatch target), and the workspace-registry / state-store inspector
-# integration tests import it from here. The renderer is pure, so the boundary
-# module imports nothing from this module — no import cycle.
-from mozyo_bridge.application.doctor_command import format_doctor_text  # noqa: E402,F401

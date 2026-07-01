@@ -131,5 +131,35 @@ class FormatDoctorTextTest(unittest.TestCase):
         self.assertIs(doctor.format_doctor_text, format_doctor_text)
 
 
+class DoctorCommandPublicSurfaceTest(unittest.TestCase):
+    """Pin the boundary's explicit public facade (#12956 cleanup leaf)."""
+
+    def test_all_declares_exactly_the_public_boundary(self) -> None:
+        from mozyo_bridge.application import doctor_command
+
+        self.assertEqual(
+            ["DoctorCommandOutcome", "DoctorCommandUseCase", "format_doctor_text"],
+            doctor_command.__all__,
+        )
+
+    def test_internal_skill_block_helper_stays_out_of_public_surface(self) -> None:
+        from mozyo_bridge.application import doctor_command
+
+        # ``_format_skill_block`` is a private helper of ``format_doctor_text``;
+        # it must not leak into the declared public command boundary.
+        self.assertNotIn("_format_skill_block", doctor_command.__all__)
+        # It still exists as the internal helper the renderer depends on.
+        self.assertTrue(hasattr(doctor_command, "_format_skill_block"))
+
+    def test_public_names_are_all_importable(self) -> None:
+        from mozyo_bridge.application import doctor_command
+
+        for name in doctor_command.__all__:
+            self.assertTrue(
+                hasattr(doctor_command, name),
+                f"{name} declared in __all__ but not defined",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
