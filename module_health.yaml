@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5453
+    lines: 5318
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -469,6 +469,23 @@ allowlist:
       combined post-merge ``commands.py`` line count is 5453.
       ``test_cockpit_read_command`` adds the fake-port use-case + pure-projection
       specifications.
+      Lowered 5453 -> 5318 for #12972: the five cockpit repair executor bodies
+      (``execute_cockpit_adopt_plan`` / ``execute_peer_adopt_plan`` /
+      ``execute_cockpit_reset_plan`` / ``execute_cockpit_rebalance_plan`` /
+      ``execute_cockpit_reconcile_plan``) moved into the new
+      ``application/cockpit_repair_command.py`` boundary (pure ``result_detail``
+      helper + a ``CockpitRepairOps`` port and ``LiveCockpitRepairOps`` adapter + a
+      ``CockpitRepairUseCase`` with ``execute_adopt`` / ``execute_peer_adopt`` /
+      ``execute_reset`` / ``execute_rebalance`` / ``execute_reconcile``). The five
+      functions stay here as thin wrappers over a shared ``_cockpit_repair_use_case``
+      builder (bind the passed-in ``run``, run the use case). The adapter binds the
+      caller's ``run`` and resolves ``commands.die`` at call time, so the
+      adopt / peer-adopt / reset / rebalance / reconcile characterization tests that
+      call the executors directly with a fake runner — and any that patch
+      ``commands.die`` — keep intercepting, and the transactional rollback / fail-fast
+      abort / warning wording and ``{"stamp_warnings"}`` / ``None`` return shapes are
+      byte-for-byte preserved. ``test_cockpit_repair_command`` adds the fake-port
+      use-case + pure-helper specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

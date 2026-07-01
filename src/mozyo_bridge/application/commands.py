@@ -912,180 +912,45 @@ def execute_cockpit_plan(plan, run, *, cleanup_captured: bool = False) -> dict:
     return ids
 
 
-def execute_cockpit_adopt_plan(plan, run) -> dict:
-    """Run a :class:`CockpitAdoptPlan`, atomically, with best-effort rollback (#11898).
+def _cockpit_repair_use_case(run):
+    """Build the #12972 :class:`CockpitRepairUseCase` over the passed-in ``run``.
 
-    The two ``join_commands`` move the live codex/claude panes and are treated as
-    a transaction: if the first join (codex) lands but a later join fails, the
-    codex pane is **moved back** beside the still-present source claude pane —
-    never ``kill-pane``'d, because it carries a live agent (this is the crucial
-    difference from :func:`execute_cockpit_plan`'s ``cleanup_captured``, which
-    kills freshly-*created* panes). ``stamp_commands`` re-apply identity after
-    both joins succeed and are best-effort: a stamp failure leaves the pair
-    adopted and is reported as a warning, not rolled back. Returns
-    ``{"stamp_warnings": [...]}``.
+    The live adapter binds this call's ``run`` (the module-level ``run_tmux`` or a
+    test's fake) and routes ``die`` through this module at call time, so the
+    characterization tests that call ``execute_*_plan`` directly with a fake
+    runner — and any that patch ``commands.die`` — keep intercepting unchanged.
     """
+    from mozyo_bridge.application.cockpit_repair_command import (
+        CockpitRepairUseCase,
+        LiveCockpitRepairOps,
+    )
 
-    def _detail(result) -> str:
-        return (getattr(result, "stderr", "") or "").strip() or (
-            getattr(result, "stdout", "") or ""
-        ).strip()
+    return CockpitRepairUseCase(LiveCockpitRepairOps(run))
 
-    def _rollback(joined_codex: bool) -> str | None:
-        # Only the codex pane can be mid-adopted: it joins first, so if a later
-        # step fails it is alone in the cockpit while the claude pane is still in
-        # the source session. Move it back beside that source pane. Best-effort —
-        # a failed rollback leaves the live codex pane in the cockpit (reported),
-        # never killed.
-        if not joined_codex:
-            return None
-        result = run(
-            "join-pane", "-h", "-s", plan.source_codex_pane,
-            "-t", plan.source_claude_pane, check=False,
-        )
-        if getattr(result, "returncode", 0) != 0:
-            return (
-                f"rollback failed: codex pane {plan.source_codex_pane} could not "
-                f"be moved back to source session {plan.source_session!r} "
-                f"({_detail(result) or 'nonzero exit'}); it is now live in the "
-                f"cockpit — move it manually, it was NOT killed."
-            )
-        return None
 
-    joined_codex = False
-    for cmd in plan.join_commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            rollback_note = _rollback(joined_codex)
-            message = (
-                f"cockpit adopt step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(cmd.argv)}` -> {_detail(result) or 'nonzero exit'}"
-            )
-            if rollback_note:
-                message += f"\n{rollback_note}"
-            elif joined_codex:
-                message += (
-                    f"\nrolled back: codex pane {plan.source_codex_pane} moved "
-                    f"back to source session {plan.source_session!r}."
-                )
-            die(message)
-        joined_codex = True
-
-    # Both joins landed — the pair is adopted. Identity re-stamp is best-effort.
-    stamp_warnings: list[str] = []
-    for cmd in plan.stamp_commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            stamp_warnings.append(
-                f"{cmd.purpose}: {_detail(result) or 'nonzero exit'}"
-            )
-    return {"stamp_warnings": stamp_warnings}
+def execute_cockpit_adopt_plan(plan, run) -> dict:
+    """Thin wrapper over the #12972 :class:`CockpitRepairUseCase` adopt path (#11898)."""
+    return _cockpit_repair_use_case(run).execute_adopt(plan)
 
 
 def execute_peer_adopt_plan(plan, run) -> None:
-    """Run a :class:`PeerAdoptPlan`'s identity binds, fail-closed (Redmine #12133).
-
-    Peer adopt only ``set-option`` (+ ``select-pane -T``) binds the role-less
-    candidate pane — there is no pane move / kill / split, so the pane and any
-    agent in it are untouched. The binds are treated as a small transaction: if a
-    later bind fails after earlier ones landed, the earlier identity options are
-    **unset** (best-effort) so the pane returns to its pre-adopt role-less state
-    rather than being left half-bound (the very #12130 drift this repairs). Any
-    failure raises via :func:`die`; a clean run returns ``None``.
-    """
-
-    def _detail(result) -> str:
-        return (getattr(result, "stderr", "") or "").strip() or (
-            getattr(result, "stdout", "") or ""
-        ).strip()
-
-    # Track the identity options we successfully set so a mid-sequence failure can
-    # roll them back. The title (`select-pane -T`) is cosmetic and not rolled back.
-    set_options: list[str] = []
-    for cmd in plan.stamp_commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            for option in reversed(set_options):
-                run("set-option", "-p", "-u", "-t", plan.pane_id, option, check=False)
-            rolled = (
-                f" rolled back {len(set_options)} identity option(s) on "
-                f"{plan.pane_id} to restore its role-less state."
-                if set_options
-                else ""
-            )
-            die(
-                f"cockpit peer-adopt step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(cmd.argv)}` -> {_detail(result) or 'nonzero exit'}."
-                f"{rolled}"
-            )
-        if cmd.argv[:1] == ("set-option",):
-            # argv is ("set-option", "-p", "-t", pane, OPTION, value).
-            set_options.append(cmd.argv[4])
+    """Thin wrapper over the #12972 :class:`CockpitRepairUseCase` peer-adopt path (#12133)."""
+    _cockpit_repair_use_case(run).execute_peer_adopt(plan)
 
 
 def execute_cockpit_reset_plan(plan, run) -> None:
-    """Run a :class:`CockpitResetPlan`'s ``kill-session`` (#11814), fail-fast.
-
-    ``run`` is a ``run_tmux``-style callable. The plan is built only after the
-    target was graded mozyo-managed, so this just executes the destructive
-    teardown and aborts (``die``) on a non-zero tmux exit rather than reporting a
-    half-killed session as success.
-    """
-    for cmd in plan.commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            detail = (getattr(result, "stderr", "") or "").strip() or (
-                getattr(result, "stdout", "") or ""
-            ).strip()
-            die(
-                f"cockpit reset step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}"
-            )
+    """Thin wrapper over the #12972 :class:`CockpitRepairUseCase` reset path (#11814)."""
+    _cockpit_repair_use_case(run).execute_reset(plan)
 
 
 def execute_cockpit_rebalance_plan(plan, run) -> None:
-    """Run a :class:`CockpitRebalancePlan`'s ``resize-pane`` commands (#12135), fail-fast.
-
-    ``run`` is a ``run_tmux``-style callable. The plan already targets real
-    ``%pane`` ids (no token resolution needed) and touches no identity option, so
-    this just runs each ``resize-pane -x`` in left-to-right order and aborts
-    (``die``) on a non-zero tmux exit rather than reporting a half-rebalanced
-    layout as success.
-    """
-    for cmd in plan.commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            detail = (getattr(result, "stderr", "") or "").strip() or (
-                getattr(result, "stdout", "") or ""
-            ).strip()
-            die(
-                f"cockpit rebalance step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}"
-            )
+    """Thin wrapper over the #12972 :class:`CockpitRepairUseCase` rebalance path (#12135)."""
+    _cockpit_repair_use_case(run).execute_rebalance(plan)
 
 
 def execute_cockpit_reconcile_plan(plan, run) -> None:
-    """Run a :class:`CockpitReconcilePlan`'s swap + relayout commands (#12136), fail-fast.
-
-    ``run`` is a ``run_tmux``-style callable. The plan's ``swap-pane`` commands
-    reorder the live panes, then the single ``select-layout`` applies the per-Unit
-    columns. No command kills a pane — `swap-pane` / `select-layout` only move /
-    relayout live panes (identity rides with them). A non-zero tmux exit aborts
-    (``die``); because nothing is killed, a partial reorder is recoverable by
-    re-running reconcile (it re-sorts from the live order).
-    """
-    for cmd in plan.commands:
-        result = run(*cmd.argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            detail = (getattr(result, "stderr", "") or "").strip() or (
-                getattr(result, "stdout", "") or ""
-            ).strip()
-            die(
-                f"cockpit reconcile step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(cmd.argv)}` -> {detail or 'nonzero exit'}\n"
-                f"No pane was killed; re-run `mozyo cockpit reconcile` to continue "
-                f"from the current live layout."
-            )
+    """Thin wrapper over the #12972 :class:`CockpitRepairUseCase` reconcile path (#12136)."""
+    _cockpit_repair_use_case(run).execute_reconcile(plan)
 
 
 def cmd_layout_apply(args: argparse.Namespace) -> int:
