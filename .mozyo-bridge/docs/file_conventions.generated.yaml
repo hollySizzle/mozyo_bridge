@@ -53,6 +53,17 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: ticketless/delegated workflow-contract bundle config source of truth
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/workflow_contract_config.yaml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
+    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: delegated coordinator runtime and projection source
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py
