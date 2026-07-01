@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4777
+    lines: 4640
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -645,6 +645,34 @@ allowlist:
       queue TUI cleanup only; ``test_notify_command`` adds the fake-port
       ``NotifyCommandUseCase`` specifications. 4781 -> 4777 is a 4-line net removal
       and the post-merge ``commands.py`` line count is 4777.
+      Lowered 4777 -> 4640 for the #12981 handoff delivery-rendering residual
+      tranche (rebased/integrated onto current ``origin/main`` ``12c6a80`` after the
+      #12983 notify carve above): the strict-rail delivery-rendering / persistence
+      tail (``_emit_outcome`` / ``_emit_receipt`` / ``_maybe_persist_delivery_record``
+      / the ``_emit_handoff_marker_timeout_guidance`` stderr trailer) moved into the
+      new ``application/handoff_delivery_command.py`` boundary (the pure
+      ``marker_timeout_guidance_lines`` decision + a ``DeliveryRecordOps`` port and
+      ``LiveDeliveryRecordOps`` adapter + a ``DeliveryRecordUseCase`` holding the four
+      bodies), aligning with the existing #12936 ``handoff_command.py`` entry boundary
+      and the ``domain/delivery_record_sink`` delivery-record boundary. The four
+      functions stay here as thin module-level wrappers (build the live ops, run the
+      use case) because ``orchestrate_handoff`` calls them on every terminal path and
+      passes ``_emit_outcome`` as the gateway-route ``emit=`` callback — their
+      signatures and the stdout record / JSON outcome / persistence receipt / stderr
+      trailer are byte-for-byte preserved, and ``orchestrate_handoff`` / the strict
+      rail / marker-timeout / queue-enter / transport semantics are untouched. The live
+      adapter routes ``die`` through ``commands`` at call time and lazily imports the
+      sink / infra transport, so the delivery-record / delivery-sink integration tests
+      that drive ``orchestrate_handoff`` for real keep intercepting unchanged. The
+      now-unused ``NO_SUBMIT_RETRY_BUDGET`` / ``build_delivery_record`` /
+      ``RECORD_FORMAT_TEXT`` / ``RECORD_FORMAT_JSON`` imports were dropped from
+      ``commands.py``. The #12983 notify carve (``notify_command.py``) and this #12981
+      handoff-delivery carve (``handoff_delivery_command.py``) touch disjoint regions
+      of ``commands.py``, so it auto-merged and the removals stack — 4781 -> 4777
+      (#12983) -> 4640 (#12981); the 137-line net removal is measured from the
+      post-#12983 baseline (4777) and the combined post-merge ``commands.py`` line
+      count is 4640. ``test_handoff_delivery_command`` adds the fake-port use-case +
+      pure-decision specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

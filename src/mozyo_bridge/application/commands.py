@@ -14,6 +14,10 @@ from mozyo_bridge.application.pane_primitive_command import (
     PanePrimitiveOutcome,
     PanePrimitiveUseCase,
 )
+from mozyo_bridge.application.handoff_delivery_command import (
+    DeliveryRecordUseCase,
+    LiveDeliveryRecordOps,
+)
 from mozyo_bridge.application.commands_common import (
     config_path_from_args,
     repo_root_from_args,
@@ -81,12 +85,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     MODE_PENDING,
     MODE_QUEUE_ENTER,
     MODES,
-    NO_SUBMIT_RETRY_BUDGET,
     QueueEnterRetryOutcome,
     RECEIVERS,
     RECORD_FORMAT_BOTH,
-    RECORD_FORMAT_JSON,
-    RECORD_FORMAT_TEXT,
     RECORD_FORMATS,
     SOURCES,
     SOURCE_TICKETLESS,
@@ -94,7 +95,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     TicketlessAnchor,
     TicketlessConsultationAnchor,
     TicketlessWorkIntakeAnchor,
-    build_delivery_record,
     build_execution_root,
     build_inactive_pane_fallback_command,
     build_marker,
@@ -298,36 +298,15 @@ def cmd_type(args: argparse.Namespace) -> int:
 
 
 def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
-    """Print the stderr trailer after a strict-rail `handoff send` marker_timeout.
+    """Thin seam over :meth:`DeliveryRecordUseCase.emit_marker_timeout_guidance`.
 
-    Required by Asana task 1214779823377861 to keep agents from collapsing a
-    single transient ``marker_timeout`` into the preset's ``Notification
-    fails`` branch. The structured outcome and durable record already enumerate
-    the fallback path; this trailer surfaces it on the failure stream so the
-    agent sees it even when the durable record is consumed by a downstream
-    process and not re-read.
+    The strict-rail ``handoff send`` marker_timeout stderr trailer (Asana task
+    1214779823377861) moved to ``application/handoff_delivery_command.py`` (#12981)
+    as the pure :func:`~mozyo_bridge.application.handoff_delivery_command.marker_timeout_guidance_lines`
+    plus this use-case emit; kept module-level because its caller is the
+    ``orchestrate_handoff`` strict rail.
     """
-    cap = NO_SUBMIT_RETRY_BUDGET
-    print(
-        f"hint: fallback path: `mozyo-bridge read {receiver}` then "
-        f"`mozyo-bridge message {receiver} \"<resubmit text>\" --no-submit "
-        f"--attempt <N>` (up to {cap} attempts per preset contract; track "
-        "remaining with `--attempt N`).",
-        file=sys.stderr,
-    )
-    print(
-        "hint: --no-submit retry budget and the `mozyo-bridge handoff send` "
-        "retry pool are separate budgets; do not borrow attempts across them.",
-        file=sys.stderr,
-    )
-    print(
-        f"hint: only after the {cap}-attempt --no-submit budget is exhausted "
-        "AND the last gate error lacks a literal next-action verb (`read "
-        "target again`, `retry`, `refresh`) may the preset's `Notification "
-        "fails` branch fire. Record every attempted command and observed "
-        "error verbatim in the durable record before escalating.",
-        file=sys.stderr,
-    )
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_marker_timeout_guidance(receiver)
 
 
 def cmd_message(args: argparse.Namespace) -> int:
@@ -2868,52 +2847,24 @@ def _emit_outcome(
     activation: TargetActivationOutcome | None = None,
     submit_lines: list[str] | None = None,
 ) -> None:
-    """Emit the structured outcome and/or the durable delivery-record text.
+    """Thin seam over :meth:`DeliveryRecordUseCase.emit_outcome` (#12981).
 
-    ``record_format=both`` (default) prints the multi-line record first, a
-    blank separator line, and the single-line JSON outcome last so existing
-    callers that scrape the last JSON-looking line keep working while humans
-    can paste the record block verbatim into the source-of-truth ticket
-    system. ``json`` preserves the prior CLI shape for scripts; ``text`` is
-    for callers that only want the markdown.
-
-    ``recovery_command`` (Redmine #12162) is an optional copy-pasteable
-    recovery command threaded into the markdown record for failure paths whose
-    structured ``(status, reason)`` is too generic to special-case inside
-    ``build_delivery_record`` (e.g. the queue-enter inactive-split block, which
-    emits the shared ``blocked / invalid_args`` reason). It does not affect the
-    ``json`` outcome shape that scripts scrape.
-
-    ``duplicate_lane_panes`` (Redmine #12229) is an optional list of redacted
-    identity rows for live same-lane duplicate receiver panes; it renders a
-    diagnostic advisory in the markdown record and likewise does not affect the
-    ``json`` outcome shape.
-
-    ``role_profile_contract`` (Redmine #12388) is the optional fully resolved
-    role-profile contract body appended to the markdown record. Like the others
-    it does not affect the ``json`` outcome shape; it is intentionally kept to
-    the printed (pasteable) record and omitted from the opt-in auto-persist body
-    because it may embed operator-supplied field values.
+    Kept module-level with the identical signature because ``orchestrate_handoff``
+    calls it on every terminal path and passes it as the ``emit=`` callback to the
+    gateway-route gate; the body moved to
+    ``application/handoff_delivery_command.py``.
     """
-    if record_format not in RECORD_FORMATS:
-        die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {record_format!r}")
-    if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
-        print(
-            build_delivery_record(
-                outcome,
-                command=command,
-                recovery_command=recovery_command,
-                duplicate_lane_panes=duplicate_lane_panes,
-                role_profile_contract=role_profile_contract,
-                retry=retry,
-                activation=activation,
-                submit_lines=submit_lines,
-            )
-        )
-        if record_format == RECORD_FORMAT_BOTH:
-            print("")
-    if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
-        print(outcome.to_json())
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_outcome(
+        outcome,
+        record_format=record_format,
+        command=command,
+        recovery_command=recovery_command,
+        duplicate_lane_panes=duplicate_lane_panes,
+        role_profile_contract=role_profile_contract,
+        retry=retry,
+        activation=activation,
+        submit_lines=submit_lines,
+    )
 
 
 def _submit_lines_for(args: argparse.Namespace, outcome) -> list[str] | None:
@@ -2953,26 +2904,10 @@ def _record_command_from_args(args: argparse.Namespace) -> str | None:
 
 
 def _emit_receipt(receipt, *, record_format: str) -> None:
-    """Emit the durable delivery-record persistence receipt (Redmine #12311).
-
-    Carries no credential by construction — only the provider id, the persisted
-    flag, an explicit reason, an optional ``issue/journal`` location pointer, and
-    the record class. ``text`` / ``both`` print a one-line human summary; ``json``
-    / ``both`` print the receipt JSON last so a script can scrape it.
-    """
-    if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
-        if receipt.persisted:
-            print(
-                f"- Durable delivery record persisted to {receipt.location} "
-                f"(class: {receipt.record_class})"
-            )
-        else:
-            print(
-                "- Durable delivery record not persisted "
-                f"(reason: {receipt.reason})"
-            )
-    if record_format in (RECORD_FORMAT_JSON, RECORD_FORMAT_BOTH):
-        print(receipt.to_json())
+    """Thin seam over :meth:`DeliveryRecordUseCase.emit_receipt` (#12981)."""
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_receipt(
+        receipt, record_format=record_format
+    )
 
 
 def _maybe_persist_delivery_record(
@@ -2984,95 +2919,23 @@ def _maybe_persist_delivery_record(
     retry: QueueEnterRetryOutcome | None = None,
     activation: TargetActivationOutcome | None = None,
 ) -> None:
-    """Best-effort durable persistence of the delivery record (Redmine #12311).
+    """Thin seam over :meth:`DeliveryRecordUseCase.maybe_persist` (#12981).
 
-    Opt-in via ``--persist-delivery`` and a no-op otherwise, so the default
-    handoff behavior is byte-identical. Called only on the *typed* terminal
-    paths (``pending_input`` / ``sent``): a blocked-before-typing outcome has no
-    delivery to durably record, and its pasteable record already prints to
-    stdout.
-
-    The persisted body is rendered WITHOUT the free-text ``--record-command``
-    (Finding 1, j#62549): that field is user-supplied and can carry a private
-    path or a credential-shaped argument, so the opt-in durable sink must not
-    auto-journal it. The printed stdout record (via ``_emit_outcome``) still
-    includes ``- Command:`` for human audit-replay; only the auto-persisted body
-    omits it. Every other body field is already redacted (``execution_root`` /
-    duplicate-pane rows carry no absolute paths), so the persisted note carries
-    no unvetted free text. The note records the delivery outcome, the
-    receiver/target identity, and (only when one was live at send time) the
-    duplicate same-lane advisory — the conditions Redmine #12311 fixes in tests.
-
-    This NEVER alters the pane-send outcome: persistence runs after the outcome
-    is emitted and any failure — including an unexpected sink error — is
-    swallowed and reported as a ``transport_error`` receipt. The live Redmine
-    journal-write transport (Redmine #12347) is wired behind a second explicit
-    opt-in: ``--persist-delivery`` selects the seam, and the trusted-environment
-    ``MOZYO_REDMINE_DELIVERY_WRITE`` flag enables the live write. Without the env
-    opt-in the transport is ``None`` and resolution stays the byte-compatible
-    staged ``provider_unavailable`` posture; with it the credential-safe
-    transport reads the trusted base URL / API key from the env at write time
-    and fails closed (``credential_missing`` / ``unauthorized`` /
-    ``provider_unavailable`` / ``transport_error``) without ever carrying a
-    credential (``vibes/docs/logics/plugin-ready-adapter-boundary.md``
-    Implementation Guardrail #6; the credential boundary is reused verbatim from
-    ``redmine_context``).
+    The opt-in ``--persist-delivery`` durable persistence wiring (Redmine #12311 /
+    #12347) — build the note, pick the credential-safe live Redmine transport by
+    source, resolve the sink, persist, and emit the receipt — moved to
+    ``application/handoff_delivery_command.py``; the live transport / sink
+    resolution now flows through the injected port. Kept module-level because
+    ``orchestrate_handoff`` calls it on the typed terminal paths.
     """
-    if not getattr(args, "persist_delivery", False):
-        return
-    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
-        DeliveryReceipt,
-        PERSIST_TRANSPORT_ERROR,
-        build_delivery_record_note,
-        resolve_delivery_record_sink,
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).maybe_persist(
+        args,
+        outcome,
+        duplicate_lane_panes=duplicate_lane_panes,
+        record_format=record_format,
+        retry=retry,
+        activation=activation,
     )
-    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import SOURCE_REDMINE
-    from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
-        redmine_delivery_transport_from_env,
-    )
-
-    try:
-        # `command=None`: the durable sink path must not auto-journal the
-        # user-supplied free-text `--record-command` (Finding 1, j#62549). The
-        # stdout record built by `_emit_outcome` keeps it for audit-replay.
-        record_markdown = build_delivery_record(
-            outcome,
-            command=None,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            retry=retry,
-            activation=activation,
-        )
-        note = build_delivery_record_note(
-            outcome,
-            record_markdown=record_markdown,
-            has_duplicate_advisory=bool(duplicate_lane_panes),
-        )
-        # Live Redmine journal-write transport (Redmine #12347): built only when
-        # the explicit `MOZYO_REDMINE_DELIVERY_WRITE` opt-in is set in the
-        # trusted environment; otherwise `None`, so resolution stays the
-        # byte-compatible staged `provider_unavailable` posture. The transport
-        # reads the trusted base URL / API key from the env at write time and
-        # fails closed (credential_missing / unauthorized / provider_unavailable
-        # / transport_error) without ever carrying a credential.
-        redmine_transport = None
-        if (outcome.source or "") == SOURCE_REDMINE:
-            redmine_transport = redmine_delivery_transport_from_env()
-        sink = resolve_delivery_record_sink(
-            enabled=True,
-            source=outcome.source or "",
-            redmine_transport=redmine_transport,
-        )
-        receipt = sink.persist(note)
-    except Exception:
-        # Best-effort: durable persistence must never break or alter the pane
-        # send (the delivery already happened). Surface an explicit
-        # transport_error receipt instead of raising.
-        receipt = DeliveryReceipt(
-            provider=getattr(outcome, "source", None),
-            persisted=False,
-            reason=PERSIST_TRANSPORT_ERROR,
-        )
-    _emit_receipt(receipt, record_format=record_format)
 
 
 def _window_active_pane_id(target_info: dict) -> str | None:
