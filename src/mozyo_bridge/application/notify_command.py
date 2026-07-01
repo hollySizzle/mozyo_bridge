@@ -21,6 +21,10 @@ guard, or the gateway route enforcement surfaces (all out of #12931 scope):
   environment, and :class:`LiveNotifyOps` the live adapter.
 - :class:`LegacyQueueNotifyUseCase` holds the ``notify_agent`` body.
 - :class:`StandardNotifyUseCase` holds the ``_notify_standard_via_handoff`` body.
+- :class:`NotifyCommandUseCase` holds the six ``cmd_notify_*`` command-entry
+  bodies (Redmine #12983): the per-subcommand receiver / default-kind / legacy-flag
+  entry policy that used to sit in ``commands.py``, delegating the actual work to
+  the two use cases above.
 
 The live adapter resolves every helper *through the* :mod:`commands` *module at
 call time* (``require_tmux`` / ``find_handoff_task`` / ``pane_info`` /
@@ -274,3 +278,74 @@ class StandardNotifyUseCase:
             journal = getattr(args, "journal", None)
             print(f"notified {agent}: journal={journal} target={target} read_lines={read_lines}")
         return rc
+
+
+class NotifyCommandUseCase:
+    """The six ``notify-*`` CLI command entry bodies behind the :class:`NotifyOps` port.
+
+    The ``notify-*`` command family historically kept its *entry policy* — the
+    receiver agent, the default handoff kind, and the small legacy-flag
+    normalizations — as thin procedural wrappers in ``application/commands.py``
+    (``_notify_standard_via_handoff`` plus the six ``cmd_notify_*`` functions).
+    This carves that residual entry layer into the notify boundary under #12983
+    while preserving the public ``commands.cmd_notify_*`` identity and the legacy
+    task behavior:
+
+    - ``run_codex`` / ``run_claude`` / ``run_codex_review`` /
+      ``run_claude_review_result`` route the *standard* subcommands through
+      :class:`StandardNotifyUseCase`, i.e. the shared high-level
+      ``orchestrate_handoff`` rail. The two ``*_review*`` variants first pin
+      ``args.type`` to the legacy Redmine-shaped token so the type -> kind mapping
+      resolves the reviewed kind while still recording the legacy summary rule.
+    - ``run_codex_legacy_task`` / ``run_claude_legacy_task`` reset ``args.journal``
+      to ``None`` and route through :class:`LegacyQueueNotifyUseCase`, i.e. the
+      retired-queue type-observe-marker-Enter cleanup path. These stay
+      wrapper-only cleanup paths and do NOT become the standard transport.
+
+    Behavior is byte-for-byte identical to the original ``cmd_notify_*`` wrappers:
+    the same receiver, default kind, ``args.type`` pinning, ``args.journal`` reset,
+    orchestration rail, and success lines. The two inner use cases share this
+    instance's single :class:`NotifyOps`, so the live ``commands.*`` monkeypatch
+    seams they resolve at call time stay intact.
+    """
+
+    def __init__(self, ops: NotifyOps) -> None:
+        self._ops = ops
+
+    def _notify_standard(
+        self, args: argparse.Namespace, agent: str, default_kind: str
+    ) -> int:
+        # Formerly ``commands._notify_standard_via_handoff``: map the legacy
+        # Redmine-shaped ``notify-*`` flags onto ``orchestrate_handoff``'s
+        # normalized contract so the standard notify path shares a single
+        # orchestration rail with ``mozyo-bridge handoff`` / ``reply``.
+        return StandardNotifyUseCase(self._ops).run(args, agent, default_kind)
+
+    def _notify_legacy(self, args: argparse.Namespace, agent: str) -> int:
+        # Formerly ``commands.notify_agent``: drive the raw
+        # type-observe-marker-Enter TUI rail directly. This wrapper-only cleanup
+        # path intentionally does NOT route through ``orchestrate_handoff`` and
+        # emits no structured durable record.
+        return LegacyQueueNotifyUseCase(self._ops).run(args, agent)
+
+    def run_codex(self, args: argparse.Namespace) -> int:
+        return self._notify_standard(args, "codex", default_kind="reply")
+
+    def run_claude(self, args: argparse.Namespace) -> int:
+        return self._notify_standard(args, "claude", default_kind="reply")
+
+    def run_codex_review(self, args: argparse.Namespace) -> int:
+        args.type = "review_request"
+        return self._notify_standard(args, "codex", default_kind="review_request")
+
+    def run_claude_review_result(self, args: argparse.Namespace) -> int:
+        args.type = "review_result"
+        return self._notify_standard(args, "claude", default_kind="review_result")
+
+    def run_codex_legacy_task(self, args: argparse.Namespace) -> int:
+        args.journal = None
+        return self._notify_legacy(args, "codex")
+
+    def run_claude_legacy_task(self, args: argparse.Namespace) -> int:
+        args.journal = None
+        return self._notify_legacy(args, "claude")

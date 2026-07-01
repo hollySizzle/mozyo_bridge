@@ -29,6 +29,7 @@ import unittest
 
 from mozyo_bridge.application.notify_command import (
     LegacyQueueNotifyUseCase,
+    NotifyCommandUseCase,
     StandardNotifyUseCase,
 )
 
@@ -233,6 +234,106 @@ class StandardNotifyUseCaseTest(unittest.TestCase):
             StandardNotifyUseCase(ops).run(self._args(), "codex", default_kind="reply")
 
         self.assertIn("target=-", out.getvalue())
+
+
+class NotifyCommandUseCaseTest(unittest.TestCase):
+    """The six ``cmd_notify_*`` command-entry bodies (#12983 residual carve).
+
+    These pin the per-subcommand entry policy — receiver, default kind, the
+    ``args.type`` pinning for the review variants, and the ``args.journal`` reset
+    for the legacy-task variants — over the shared :class:`NotifyOps` fake, so the
+    standard-vs-legacy routing decision is exercisable in isolation.
+    """
+
+    def _standard_args(self, **overrides) -> argparse.Namespace:
+        base = dict(
+            issue="9020",
+            journal="46005",
+            target="%9",
+            type=None,
+            force=False,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def _legacy_args(self, **overrides) -> argparse.Namespace:
+        base = dict(
+            journal="46005",
+            target="%9",
+            config=False,
+            force=True,
+            read_lines=20,
+            landing_timeout=5.0,
+            submit_delay=0.0,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_run_codex_routes_standard_reply_to_codex(self) -> None:
+        ops = _FakeNotifyOps(orchestrate_rc=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = NotifyCommandUseCase(ops).run_codex(self._standard_args())
+
+        self.assertEqual(0, rc)
+        self.assertEqual("codex", ops.orchestrated.to)
+        self.assertEqual("reply", ops.orchestrated.kind)
+        # standard path never touches the legacy TUI rail.
+        self.assertNotIn("require_tmux", ops.calls)
+
+    def test_run_claude_routes_standard_reply_to_claude(self) -> None:
+        ops = _FakeNotifyOps(orchestrate_rc=0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            NotifyCommandUseCase(ops).run_claude(self._standard_args())
+
+        self.assertEqual("claude", ops.orchestrated.to)
+        self.assertEqual("reply", ops.orchestrated.kind)
+
+    def test_run_codex_review_pins_type_and_kind(self) -> None:
+        ops = _FakeNotifyOps(orchestrate_rc=0)
+        args = self._standard_args(type=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            NotifyCommandUseCase(ops).run_codex_review(args)
+
+        # entry policy pins the legacy Redmine-shaped token before mapping.
+        self.assertEqual("review_request", args.type)
+        self.assertEqual("codex", ops.orchestrated.to)
+        self.assertEqual("review_request", ops.orchestrated.kind)
+        self.assertIsNone(ops.orchestrated.summary)
+
+    def test_run_claude_review_result_pins_type_and_kind(self) -> None:
+        ops = _FakeNotifyOps(orchestrate_rc=0)
+        args = self._standard_args(type=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            NotifyCommandUseCase(ops).run_claude_review_result(args)
+
+        self.assertEqual("review_result", args.type)
+        self.assertEqual("claude", ops.orchestrated.to)
+        self.assertEqual("review_result", ops.orchestrated.kind)
+
+    def test_run_codex_legacy_task_resets_journal_and_uses_queue_rail(self) -> None:
+        ops = _FakeNotifyOps(task={"id": "legacy-1"}, marker_seen=True)
+        args = self._legacy_args()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = NotifyCommandUseCase(ops).run_codex_legacy_task(args)
+
+        self.assertEqual(0, rc)
+        # legacy-task entry resets journal -> the queue rail resolves the task.
+        self.assertIsNone(args.journal)
+        self.assertIn("require_tmux", ops.calls)
+        self.assertIn("find_handoff_task", ops.calls)
+        self.assertEqual([["Enter"]], [k.keys for k in ops.keys])
+        self.assertIn("notified codex: task=legacy-1", out.getvalue())
+        # legacy path never routes through orchestrate_handoff.
+        self.assertIsNone(ops.orchestrated)
+
+    def test_run_claude_legacy_task_resets_journal_and_targets_claude(self) -> None:
+        ops = _FakeNotifyOps(task={"id": "legacy-2"}, marker_seen=True)
+        args = self._legacy_args()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            NotifyCommandUseCase(ops).run_claude_legacy_task(args)
+
+        self.assertIsNone(args.journal)
+        self.assertIn("notified claude: task=legacy-2", out.getvalue())
 
 
 if __name__ == "__main__":

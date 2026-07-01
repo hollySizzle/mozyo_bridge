@@ -2812,52 +2812,48 @@ def notify_agent(args: argparse.Namespace, agent: str) -> int:
     return LegacyQueueNotifyUseCase(LiveNotifyOps()).run(args, agent)
 
 
-def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_kind: str) -> int:
-    """Adapter for the standard `notify-*` subcommands.
+def _notify_command_use_case():
+    """Build the notify command-entry use case over the live ``NotifyOps``.
 
-    Maps the legacy Redmine-shaped CLI flags onto ``orchestrate_handoff``'s
-    normalized contract so the standard notify path shares a single
-    orchestration rail with `mozyo-bridge handoff` / `mozyo-bridge reply`.
-    Legacy queue notifications (`notify-*-legacy-task`) intentionally stay on
-    ``notify_agent``; they remain wrapper-only cleanup paths, not the
-    standard path. The body lives in
-    :class:`mozyo_bridge.application.notify_command.StandardNotifyUseCase`
-    (#12931); this stays a thin adapter.
+    The six ``cmd_notify_*`` entry bodies (the per-subcommand receiver /
+    default-kind / legacy-flag entry policy, plus the standard adapter formerly
+    named ``_notify_standard_via_handoff``) live in
+    :class:`mozyo_bridge.application.notify_command.NotifyCommandUseCase` (#12983);
+    these stay thin, module-level wrappers so the public ``commands.cmd_notify_*``
+    identity and the parser bindings are unchanged. Imported lazily so no import
+    cycle is introduced (``notify_command`` resolves ``commands`` only at call
+    time through :class:`LiveNotifyOps`).
     """
     from mozyo_bridge.application.notify_command import (
         LiveNotifyOps,
-        StandardNotifyUseCase,
+        NotifyCommandUseCase,
     )
 
-    return StandardNotifyUseCase(LiveNotifyOps()).run(args, agent, default_kind)
+    return NotifyCommandUseCase(LiveNotifyOps())
 
 
 def cmd_notify_codex(args: argparse.Namespace) -> int:
-    return _notify_standard_via_handoff(args, "codex", default_kind="reply")
+    return _notify_command_use_case().run_codex(args)
 
 
 def cmd_notify_claude(args: argparse.Namespace) -> int:
-    return _notify_standard_via_handoff(args, "claude", default_kind="reply")
+    return _notify_command_use_case().run_claude(args)
 
 
 def cmd_notify_codex_review(args: argparse.Namespace) -> int:
-    args.type = "review_request"
-    return _notify_standard_via_handoff(args, "codex", default_kind="review_request")
+    return _notify_command_use_case().run_codex_review(args)
 
 
 def cmd_notify_claude_review_result(args: argparse.Namespace) -> int:
-    args.type = "review_result"
-    return _notify_standard_via_handoff(args, "claude", default_kind="review_result")
+    return _notify_command_use_case().run_claude_review_result(args)
 
 
 def cmd_notify_codex_legacy_task(args: argparse.Namespace) -> int:
-    args.journal = None
-    return notify_agent(args, "codex")
+    return _notify_command_use_case().run_codex_legacy_task(args)
 
 
 def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
-    args.journal = None
-    return notify_agent(args, "claude")
+    return _notify_command_use_case().run_claude_legacy_task(args)
 
 
 def _emit_outcome(

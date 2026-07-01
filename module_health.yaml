@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4781
+    lines: 4777
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -627,6 +627,24 @@ allowlist:
       (#12978) -> 4808 (#12979) -> 4781 (#12974); the 27-line net removal is measured
       from the post-#12979 baseline (4808) and the combined post-merge ``commands.py``
       line count is 4781.
+      Lowered 4781 -> 4777 for the #12983 OOP-first notify legacy-wrapper residual
+      tranche: the notify command-entry residual (the ``_notify_standard_via_handoff``
+      standard adapter + the six ``cmd_notify_*`` entry bodies) moved into the
+      existing ``application/notify_command.py`` boundary as the new
+      ``NotifyCommandUseCase`` (the per-subcommand receiver / default-kind /
+      legacy-flag entry policy, delegating to the #12931 ``StandardNotifyUseCase`` /
+      ``LegacyQueueNotifyUseCase`` over one shared ``NotifyOps``). The six
+      ``cmd_notify_*`` functions stay here as thin, module-level named wrappers
+      (public ``commands.cmd_notify_*`` identity + the ``cli`` / ``cli_handoff``
+      parser bindings preserved) built via the new ``_notify_command_use_case``
+      factory; ``notify_agent`` is untouched. The private
+      ``_notify_standard_via_handoff`` helper is retired (its body already lived in
+      ``StandardNotifyUseCase`` and no external caller referenced it). Standard
+      ``notify-*`` routing still flows through the high-level ``orchestrate_handoff``
+      rail and the legacy ``notify-*-legacy-task`` path still drives the retired
+      queue TUI cleanup only; ``test_notify_command`` adds the fake-port
+      ``NotifyCommandUseCase`` specifications. 4781 -> 4777 is a 4-line net removal
+      and the post-merge ``commands.py`` line count is 4777.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
