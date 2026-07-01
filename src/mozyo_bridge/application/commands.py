@@ -1762,110 +1762,56 @@ def _handle_cockpit_status(
     return outcome.exit_code
 
 
+def _cockpit_peer_adopt_use_case():
+    """Build the #12978 :class:`CockpitPeerAdoptUseCase` over the live ops.
+
+    The live adapter routes ``_read_cockpit_geometry`` / ``_read_cockpit_pane_runtime``
+    / ``require_tmux`` / ``run_tmux`` / ``execute_peer_adopt_plan`` / ``die`` through
+    this module at call time, so the characterization tests patching those seams keep
+    intercepting and the boundary module never imports :mod:`commands` at module scope.
+    """
+    from mozyo_bridge.application.cockpit_peer_adopt_command import (
+        CockpitPeerAdoptUseCase,
+        LiveCockpitPeerAdoptOps,
+    )
+
+    return CockpitPeerAdoptUseCase(LiveCockpitPeerAdoptOps())
+
+
 def _read_cockpit_pane_runtime(session: str, pane_id: str) -> dict:
     """Read one cockpit pane's cwd / foreground process / lane label (#12133, read-only).
 
-    The geometry reader (:func:`_read_cockpit_geometry`) deliberately does not read
-    cwd / process (a privacy + scope choice for the diagnostic). Peer adopt needs
-    them for its fail-closed preflight (does the candidate's checkout / running
-    agent contradict the destination?) and to mirror the destination Unit's lane
-    label onto the adopted pane. Tolerant: any tmux failure degrades to empties so
-    the planner simply treats the facts as "unknown" (never a fabricated match).
-    Returns ``{cwd, process, lane_label}``.
+    Thin wrapper over the #12978 boundary's :func:`read_pane_runtime` (routing this
+    module's ``run_tmux`` at call time). The geometry reader
+    (:func:`_read_cockpit_geometry`) deliberately does not read cwd / process (a
+    privacy + scope choice); peer adopt needs them for its fail-closed preflight and
+    to mirror the destination Unit's lane label. Also the shared read seam for
+    :func:`_cockpit_unit_repo_root`. Tolerant: any tmux failure degrades to empties so
+    the planner treats the facts as "unknown". Returns ``{cwd, process, lane_label}``.
     """
-    # A tmux pane id (`%id`) is globally unique, so display-message targets it
-    # directly (no window qualifier needed).
-    try:
-        result = run_tmux(
-            "display-message",
-            "-p",
-            "-t",
-            pane_id,
-            "-F",
-            "#{pane_current_path}\t#{pane_current_command}\t#{@mozyo_lane_label}",
-            check=False,
-        )
-    except (Exception, SystemExit):
-        return {"cwd": "", "process": "", "lane_label": ""}
-    if getattr(result, "returncode", 1) != 0:
-        return {"cwd": "", "process": "", "lane_label": ""}
-    line = (getattr(result, "stdout", "") or "").splitlines()
-    parts = ((line[0] if line else "").split("\t") + ["", "", ""])[:3]
-    return {"cwd": parts[0], "process": parts[1], "lane_label": parts[2]}
+    from mozyo_bridge.application.cockpit_peer_adopt_command import read_pane_runtime
+
+    return read_pane_runtime(run_tmux, pane_id)
 
 
 def _resolve_peer_adopt_candidate(session: str, pane_id: str):
     """Resolve the role-less candidate pane's preflight facts (#12133).
 
-    Reads the candidate's live cwd / foreground process and resolves the cwd
-    through the same registry → anchor → derivation chain the rest of the cockpit
-    uses, so the pure planner can fail-closed when the checkout / running agent
-    contradicts the destination. Only ids / labels are carried forward — never the
-    absolute path (privacy boundary). Tolerant: an unresolvable cwd yields empty
-    ids ("unknown", not a contradiction).
+    Thin wrapper over the #12978 :class:`CockpitPeerAdoptUseCase` resolver; the live
+    adapter reads the runtime through ``commands._read_cockpit_pane_runtime`` and
+    resolves the cwd through the registry → anchor → lane chain at call time.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import PeerAdoptCandidate
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLES, normalize_lane
-
-    runtime = _read_cockpit_pane_runtime(session, pane_id)
-    cwd = (runtime.get("cwd") or "").strip()
-    process = (runtime.get("process") or "").strip()
-    process_role = process if process in ROLES else ""
-
-    cwd_workspace_id = ""
-    cwd_lane_id = ""
-    if cwd:
-        try:
-            repo_root = str(Path(cwd).expanduser().resolve())
-            canon = resolve_canonical_session(repo_root)
-            cwd_workspace_id = getattr(canon, "workspace_id", None) or ""
-            if cwd_workspace_id:
-                lane = _resolve_workspace_lane(repo_root, cwd_workspace_id)
-                cwd_lane_id = normalize_lane(getattr(lane, "lane_id", None))
-        except (Exception, SystemExit):
-            cwd_workspace_id = ""
-            cwd_lane_id = ""
-    return PeerAdoptCandidate(
-        pane_id=pane_id,
-        cwd_workspace_id=cwd_workspace_id,
-        cwd_lane_id=cwd_lane_id,
-        process_role=process_role,
-        process_name=process,
-    )
+    return _cockpit_peer_adopt_use_case().resolve_candidate(session, pane_id)
 
 
 def _resolve_peer_adopt_target(session: str, diagnosis, workspace_id: str, lane_id: str, role: str):
     """Build the destination :class:`PeerAdoptTarget`, mirroring its peer's metadata (#12133).
 
-    The lane label is read off the Unit's existing opposite-role peer pane so the
-    adopted pane stamps the same human-facing lane label as its sibling; the
-    display label defaults to the workspace id. When the Unit / peer cannot be
-    found the planner blocks anyway, so missing metadata is harmless.
+    Thin wrapper over the #12978 :class:`CockpitPeerAdoptUseCase` resolver; the peer's
+    lane label is read through ``commands._read_cockpit_pane_runtime`` at call time.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import PeerAdoptTarget
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLE_CLAUDE, normalize_lane
-
-    target_lane = normalize_lane(lane_id)
-    lane_label = None
-    unit = next(
-        (
-            u
-            for u in diagnosis.units
-            if u.workspace_id == workspace_id
-            and normalize_lane(u.lane_id) == target_lane
-        ),
-        None,
-    )
-    if unit is not None:
-        peer_panes = unit.codex_panes if role == ROLE_CLAUDE else unit.claude_panes
-        if peer_panes:
-            label = (_read_cockpit_pane_runtime(session, peer_panes[0]).get("lane_label") or "").strip()
-            lane_label = label or None
-    return PeerAdoptTarget(
-        workspace_id=workspace_id,
-        lane_id=target_lane,
-        lane_label=lane_label,
-        label=workspace_id,
+    return _cockpit_peer_adopt_use_case().resolve_target(
+        session, diagnosis, workspace_id, lane_id, role
     )
 
 
@@ -1874,94 +1820,22 @@ def _handle_cockpit_peer_adopt(
 ) -> int:
     """`mozyo cockpit peer-adopt` — bind a role-less pane as a Unit's missing peer (#12133).
 
-    The first safe repair slice of US #12132: it adopts the role-less cockpit pane
-    named by ``--pane`` as the ``--role`` peer of the existing Unit named by
-    ``--unit workspace/lane``, by binding that pane's identity options only — never
-    a pane move / kill / split / rebalance. Fail-closed: the pure planner
-    (:func:`plan_peer_adopt`) must clear every guard (exactly one missing peer, the
-    selected role-less candidate, and a non-contradicting cwd/process preflight),
-    and the mutation runs only with ``--confirm``. ``--dry-run`` / ``--json`` and a
-    bare invocation (no ``--confirm``) preview without mutating and never gate on a
-    mutable tmux server. Exit ``0`` when the decision is applicable (and applied,
-    when confirmed); ``1`` when fail-closed blocked.
+    Thin wrapper over the #12978 :class:`CockpitPeerAdoptUseCase` boundary: it builds
+    the live ops, runs the confirm-gated handler, and renders the returned
+    :class:`PeerAdoptOutcome` (json payload or the pre-rendered text). The fail-closed
+    guard order, the confirm-gated apply (reusing the #12972 ``execute_peer_adopt_plan``
+    executor), and the CLI output + exit conventions are unchanged.
     """
     import json as _json
 
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
-        diagnose_cockpit_geometry,
-        format_peer_adopt_text,
-        plan_peer_adopt,
+    outcome = _cockpit_peer_adopt_use_case().handle(
+        session, args, json_output=json_output, dry_run=dry_run
     )
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import normalize_lane
-
-    pane_id = getattr(args, "peer_pane", None)
-    unit_arg = getattr(args, "peer_unit", None)
-    role = getattr(args, "peer_role", None)
-    confirm = bool(getattr(args, "confirm", False))
-
-    missing = [
-        flag
-        for flag, value in (("--pane", pane_id), ("--unit", unit_arg), ("--role", role))
-        if not value
-    ]
-    if missing:
-        die(
-            "cockpit peer-adopt requires "
-            + ", ".join(missing)
-            + " (e.g. `mozyo cockpit peer-adopt --pane %123 --unit video/default "
-            "--role claude`)."
-        )
-
-    if "/" in unit_arg:
-        workspace_id, lane_token = unit_arg.rsplit("/", 1)
-    else:
-        workspace_id, lane_token = unit_arg, ""
-    workspace_id = workspace_id.strip()
-    target_lane = normalize_lane(lane_token)
-    if not workspace_id:
-        die("cockpit peer-adopt --unit needs a workspace id (e.g. `video/default`).")
-
-    panes = _read_cockpit_geometry(session)
-    diagnosis = diagnose_cockpit_geometry(session=session, panes=panes)
-    candidate = _resolve_peer_adopt_candidate(session, pane_id)
-    target = _resolve_peer_adopt_target(session, diagnosis, workspace_id, target_lane, role)
-    decision = plan_peer_adopt(
-        diagnosis=diagnosis,
-        target=target,
-        pane_id=pane_id,
-        role=role,
-        candidate=candidate,
-    )
-
-    will_apply = decision.ok and confirm and not dry_run and not json_output
-
-    if json_output:
-        payload = decision.as_dict()
-        payload["applied"] = False
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if decision.ok else 1
-
-    if not decision.ok:
-        print(format_peer_adopt_text(decision))
-        return 1
-
-    if not will_apply:
-        print(format_peer_adopt_text(decision, applied=False))
-        if not confirm:
-            print(
-                "  (preview only — re-run with `--confirm` to bind the pane "
-                "identity.)"
-            )
-        return 0
-
-    require_tmux()
-    execute_peer_adopt_plan(decision.plan, run_tmux)
-    print(format_peer_adopt_text(decision, applied=True))
-    print(
-        "  smoke: re-run `mozyo cockpit doctor-geometry` and `mozyo agents targets` "
-        "to confirm the missing-peer / role-less finding is resolved."
-    )
-    return 0
+    if outcome.json_payload is not None:
+        print(_json.dumps(outcome.json_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    elif outcome.text:
+        print(outcome.text)
+    return outcome.exit_code
 
 
 def _read_cockpit_window_layout(session: str):

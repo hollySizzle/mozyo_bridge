@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5012
+    lines: 4886
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -556,6 +556,31 @@ allowlist:
       are byte-for-byte preserved. ``cmd_layout_apply`` already lives thin behind the
       #12933 ``launch_command`` boundary and is unchanged.
       ``test_cockpit_planner_command`` adds the fake-port use-case + fail-soft-leaf
+      specifications.
+      Lowered 5012 -> 4886 for #12978 (rebased onto ``origin/main`` 5294f80 after
+      #12977; the peer-adopt carve and the #12977 layout-planner / #12976 membership /
+      #12975 session-bootstrap carves touch disjoint regions so ``commands.py``
+      auto-merged and the removals stack — 5453 -> 5318 (#12972) -> 5255 (#12975)
+      -> 5136 (#12976) -> 5012 (#12977) -> 4886 (#12978)): the cockpit peer-adopt
+      resolver / handler tail (``_read_cockpit_pane_runtime`` /
+      ``_resolve_peer_adopt_candidate`` / ``_resolve_peer_adopt_target`` /
+      ``_handle_cockpit_peer_adopt``) moved into the new
+      ``application/cockpit_peer_adopt_command.py`` boundary (pure
+      ``project_pane_runtime`` / ``read_pane_runtime`` / ``missing_flags`` /
+      ``split_peer_unit`` helpers + a ``CockpitPeerAdoptOps`` port and
+      ``LiveCockpitPeerAdoptOps`` adapter + a ``CockpitPeerAdoptUseCase`` with
+      ``resolve_candidate`` / ``resolve_target`` / ``handle`` returning a typed
+      ``PeerAdoptOutcome``). The four functions stay here as thin wrappers over a
+      shared ``_cockpit_peer_adopt_use_case`` builder. The adapter resolves
+      ``commands._read_cockpit_geometry`` / ``commands._read_cockpit_pane_runtime``
+      (also the ``_cockpit_unit_repo_root`` seam #12976's membership adapters reach
+      at call time) / ``commands.require_tmux`` / ``commands.run_tmux`` / the registry
+      cwd→identity reads at call time, so the peer-adopt characterization tests that
+      patch those seams keep intercepting, and the fail-closed guard order,
+      confirm-gated apply, and ``cockpit peer-adopt`` CLI output + exit conventions
+      are byte-for-byte preserved. It reuses the #12972 ``execute_peer_adopt_plan``
+      executor via the port (executor semantics unchanged).
+      ``test_cockpit_peer_adopt_command`` adds the fake-port use-case + pure-helper
       specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
