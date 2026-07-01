@@ -28,13 +28,13 @@
       "sha256": "718e6707047608a7f830c5a06b9c2796ff1114f0d926011dfde59d4afcd949c2"
     },
     "AGENTS.md": {
-      "sha256": "c5fc35b26bd2027232df074bbbcf8d50645ff94e17f6f8fd5919961bb5a36479"
+      "sha256": "59148c6d6f6a62572bc00054c9fb5be7e8293056de99aae1ca54312fd0634a6f"
     },
     "CLAUDE.md": {
-      "sha256": "c60f19f79e08796c8c0abaa4594b54210d59e6158aec05a86086aa832a120afe"
+      "sha256": "4234a80c925dc7cdfdabc6f763d181064b47ef0f41aa524cfb86a7ed01f89b4e"
     }
   },
-  "generated_by": "mozyo-bridge 0.9.0",
+  "generated_by": "mozyo-bridge 0.9.2",
   "mode": "repo-local",
   "preset": "redmine-governed",
   "preset_hash": "4f00f293b90e6f3544bc8975efc05205c80c5de35ae0957c010f07e837bc84c7",
