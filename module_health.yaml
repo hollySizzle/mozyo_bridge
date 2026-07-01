@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5255
+    lines: 5136
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -508,6 +508,31 @@ allowlist:
       ``cmd_mozyo`` stays the existing thin ``launch_command`` (#12933) root.
       ``test_session_bootstrap_command`` adds the fake-port use-case + pure-projection
       specifications.
+      Lowered 5255 -> 5136 for the #12976 OOP-first cockpit membership / list /
+      status projection tranche (rebased/integrated onto current origin/main atop
+      the #12972 repair-executor and #12975 session-bootstrap tranches above; over
+      the #12971 read adapter; the three carves touch disjoint regions so
+      ``commands.py`` auto-merged and the removals stack — 5453 -> 5318 (#12972)
+      -> 5255 (#12975) -> 5136 (#12976)): the six projection helpers
+      ``_cockpit_unit_repo_root`` / ``_membership_observations_from_windows`` /
+      ``_resolve_registry_facts`` / ``_collect_cockpit_membership`` /
+      ``_handle_cockpit_list`` / ``_handle_cockpit_status`` moved into the new
+      ``application/cockpit_membership_command.py`` boundary (a pure
+      ``build_membership_observations`` reshape + ``UnitRepoRootOps`` /
+      ``RegistryFactsOps`` / ``CockpitMembershipOps`` ports with ``Live*``
+      adapters + ``UnitRepoRootUseCase`` / ``RegistryFactsUseCase`` /
+      ``CockpitMembershipUseCase`` with ``collect`` / ``list`` / ``status`` and
+      typed ``CockpitListOutcome`` / ``CockpitStatusOutcome``). The six functions
+      stay here as thin wrappers (build the live ops, run the use case, print the
+      rendered text). The adapters resolve ``commands._read_managed_cockpit_windows``
+      / ``._read_cockpit_geometry`` / ``._read_cockpit_pane_runtime`` /
+      ``._cockpit_unit_repo_root`` / ``._resolve_registry_facts`` /
+      ``.resolve_canonical_session`` / ``._resolve_workspace_lane`` at call time,
+      so the cockpit membership characterization tests that patch those module
+      seams keep intercepting unchanged, and the ``cockpit list`` / ``cockpit
+      status`` CLI output + exit conventions are byte-for-byte preserved.
+      ``test_cockpit_membership_command`` adds the fake-port use-case +
+      pure-projection specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

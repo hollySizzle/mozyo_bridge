@@ -1756,19 +1756,15 @@ def _cockpit_unit_repo_root(session: str, *pane_ids: str) -> str:
     pane cwd is readable (the caller then falls back to the registry path).
     Tolerant: any tmux failure degrades to ``""``.
     """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
+    from mozyo_bridge.application.cockpit_membership_command import (
+        LiveUnitRepoRootOps,
+        UnitRepoRootUseCase,
+    )
 
-    for pane_id in pane_ids:
-        if not pane_id:
-            continue
-        runtime = _read_cockpit_pane_runtime(session, pane_id)
-        cwd = (runtime.get("cwd") or "").strip()
-        if not cwd:
-            continue
-        root = infer_repo_root(cwd)
-        if root:
-            return root
-    return ""
+    # Thin wrapper over the #12976 membership boundary; the live adapter routes
+    # ``commands._read_cockpit_pane_runtime`` at call time, so the tests patching
+    # that seam still intercept the read.
+    return UnitRepoRootUseCase(LiveUnitRepoRootOps()).resolve(session, *pane_ids)
 
 
 def _membership_observations_from_windows(managed_windows, session: str):
@@ -1783,49 +1779,20 @@ def _membership_observations_from_windows(managed_windows, session: str):
     Role-less columns (no ``workspace_id``) are skipped here — they surface as a
     cockpit-wide warning from the geometry diagnosis instead.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
-        ROLE_CLAUDE,
-        ROLE_CODEX,
-        normalize_lane,
+    from mozyo_bridge.application.cockpit_membership_command import (
+        build_membership_observations,
     )
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import MembershipObservation
 
-    observations = []
-    for window in managed_windows or []:
-        units: dict[tuple[str, str], dict[str, str]] = {}
-        order: list[tuple[str, str]] = []
-        for col in window.get("columns", []) or []:
-            workspace_id = col.get("workspace_id") or ""
-            if not workspace_id:
-                continue
-            key = (workspace_id, normalize_lane(col.get("lane_id")))
-            if key not in units:
-                units[key] = {"codex": "", "claude": ""}
-                order.append(key)
-            role = col.get("role")
-            pane_id = col.get("pane_id") or ""
-            if role == ROLE_CODEX and not units[key]["codex"]:
-                units[key]["codex"] = pane_id
-            elif role == ROLE_CLAUDE and not units[key]["claude"]:
-                units[key]["claude"] = pane_id
-        for key in order:
-            codex_pane = units[key]["codex"]
-            claude_pane = units[key]["claude"]
-            observations.append(
-                MembershipObservation(
-                    workspace_id=key[0],
-                    lane_id=key[1],
-                    lane_label="",
-                    codex_pane=codex_pane,
-                    claude_pane=claude_pane,
-                    window=window.get("window") or "",
-                    window_id=window.get("window_id") or "",
-                    repo_root=_cockpit_unit_repo_root(
-                        session, codex_pane, claude_pane
-                    ),
-                )
-            )
-    return observations
+    # Thin wrapper over the #12976 membership boundary. The repo-root resolution
+    # is routed through ``commands._cockpit_unit_repo_root`` at call time so the
+    # membership tests that patch that seam keep intercepting.
+    return build_membership_observations(
+        managed_windows,
+        session,
+        lambda codex_pane, claude_pane: _cockpit_unit_repo_root(
+            session, codex_pane, claude_pane
+        ),
+    )
 
 
 def _resolve_registry_facts(workspace_id: str):
@@ -1837,28 +1804,14 @@ def _resolve_registry_facts(workspace_id: str):
     (label falls back to the id, repo root empty) rather than raising, so the
     membership view never aborts on a thin identity record.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import RegistryFacts
-    from mozyo_bridge.workspace_registry import load_workspace_by_id, read_anchor
-
-    try:
-        record = load_workspace_by_id(workspace_id)
-    except (Exception, SystemExit):
-        record = None
-    if record is None:
-        return RegistryFacts.unresolved(workspace_id)
-    repo_root = getattr(record, "canonical_path", "") or ""
-    anchor_present = False
-    if repo_root:
-        try:
-            anchor_present = read_anchor(Path(repo_root)) is not None
-        except (Exception, SystemExit):
-            anchor_present = False
-    return RegistryFacts(
-        label=getattr(record, "project_name", "") or workspace_id,
-        repo_root=repo_root,
-        registry_present=True,
-        anchor_present=anchor_present,
+    from mozyo_bridge.application.cockpit_membership_command import (
+        LiveRegistryFactsOps,
+        RegistryFactsUseCase,
     )
+
+    # Thin wrapper over the #12976 membership boundary; the live adapter routes
+    # the ``workspace_registry`` reads at call time.
+    return RegistryFactsUseCase(LiveRegistryFactsOps()).resolve(workspace_id)
 
 
 def _collect_cockpit_membership(session: str):
@@ -1872,28 +1825,16 @@ def _collect_cockpit_membership(session: str):
     reads are tolerant: a missing tmux / cockpit degrades to an empty report, so
     `cockpit list` / `status` never abort.
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import diagnose_cockpit_geometry
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import project_membership_report
-
-    managed = _read_managed_cockpit_windows(session)
-    geometry = diagnose_cockpit_geometry(
-        session=session, panes=_read_cockpit_geometry(session)
+    from mozyo_bridge.application.cockpit_membership_command import (
+        CockpitMembershipUseCase,
+        LiveCockpitMembershipOps,
     )
-    observations = _membership_observations_from_windows(managed, session)
-    cockpit_present = bool(managed) or geometry.cockpit_present
 
-    facts: dict[str, object] = {}
-    for obs in observations:
-        if obs.workspace_id not in facts:
-            facts[obs.workspace_id] = _resolve_registry_facts(obs.workspace_id)
-
-    return project_membership_report(
-        session=session,
-        cockpit_present=cockpit_present,
-        observations=observations,
-        facts_by_workspace=facts,
-        geometry=geometry,
-    )
+    # Thin wrapper over the #12976 membership boundary. The live adapter routes
+    # every read (managed windows / geometry / unit repo root / registry facts)
+    # through this module at call time, so the membership characterization tests
+    # that patch those seams keep intercepting.
+    return CockpitMembershipUseCase(LiveCockpitMembershipOps()).collect(session)
 
 
 def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
@@ -1906,16 +1847,14 @@ def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
     state, not an error. Cockpit membership is a display / liveness projection,
     never Redmine workflow truth.
     """
-    import json as _json
+    from mozyo_bridge.application.cockpit_membership_command import (
+        CockpitMembershipUseCase,
+        LiveCockpitMembershipOps,
+    )
 
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import format_membership_text
-
-    report = _collect_cockpit_membership(session)
-    if json_output:
-        print(_json.dumps(report.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_membership_text(report))
-    return 0
+    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).list(session)
+    print(outcome.render(json_output=json_output))
+    return outcome.exit_code
 
 
 def _handle_cockpit_status(
@@ -1932,77 +1871,19 @@ def _handle_cockpit_status(
     (absent, missing peer, or a geometry warning) — so a script can branch on the
     code while still parsing the full report from stdout.
     """
-    import dataclasses as _dataclasses
-    import json as _json
-
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import infer_repo_root
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import normalize_lane
-    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
-        CockpitMembershipReport,
-        absent_membership,
-        format_membership_text,
+    from mozyo_bridge.application.cockpit_membership_command import (
+        CockpitMembershipUseCase,
+        LiveCockpitMembershipOps,
     )
 
+    # The repo argument extraction stays here (argparse-facing); the use case is
+    # handed a resolved repo path and owns the identity / projection.
     repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
-    repo_root = str(Path(repo).expanduser().resolve())
-    # The operator asked about THIS checkout: report the queried repo root (walked
-    # to its repo top), not the registry canonical / main checkout (review j#62643).
-    queried_root = infer_repo_root(repo_root) or repo_root
-    canon = resolve_canonical_session(repo_root)
-    workspace_id = getattr(canon, "workspace_id", None) or canon.name
-    lane = _resolve_workspace_lane(repo_root, getattr(canon, "workspace_id", None))
-    target_lane = normalize_lane(lane.lane_id)
-    facts = _resolve_registry_facts(workspace_id)
-
-    report = _collect_cockpit_membership(session)
-    match = next(
-        (
-            w
-            for w in report.workspaces
-            if w.workspace_id == workspace_id
-            and normalize_lane(w.lane_id) == target_lane
-        ),
-        None,
+    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).status(
+        session=session, repo=repo
     )
-    if match is None:
-        label = facts.label if facts.registry_present else canon.name
-        match = absent_membership(
-            session=session,
-            workspace_id=workspace_id,
-            label=label,
-            repo_root=queried_root,
-            lane_id=target_lane,
-            lane_label=lane.lane_label,
-            registry_present=facts.registry_present,
-            anchor_present=facts.anchor_present,
-            registry_canonical_path=facts.repo_root,
-        )
-    else:
-        # Pin the matched row's repo root to the queried checkout so a worktree /
-        # lane query echoes the path the operator asked about, never the registry
-        # canonical main checkout (review j#62643).
-        match = _dataclasses.replace(match, repo_root=queried_root)
-
-    single = CockpitMembershipReport(
-        session=session,
-        cockpit_present=report.cockpit_present,
-        workspaces=(match,),
-        warnings=report.warnings,
-    )
-    if json_output:
-        payload = single.as_dict()
-        payload["query"] = {
-            "workspace_id": workspace_id,
-            "label": match.label,
-            "repo_root": queried_root,
-            "registry_canonical_path": facts.repo_root,
-            "lane_id": target_lane,
-            "member": match.member,
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_membership_text(single, query_label=match.label))
-    return 0 if match.ok else 1
+    print(outcome.render(json_output=json_output))
+    return outcome.exit_code
 
 
 def _read_cockpit_pane_runtime(session: str, pane_id: str) -> dict:
