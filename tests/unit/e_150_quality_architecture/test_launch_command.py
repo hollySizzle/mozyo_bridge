@@ -28,6 +28,7 @@ import unittest
 from pathlib import Path
 
 from mozyo_bridge.application.launch_command import (
+    AgentWindowLaunchUseCase,
     CockpitLayoutUseCase,
     MozyoLaunchUseCase,
     _parse_mozyo_window_rows,
@@ -35,6 +36,8 @@ from mozyo_bridge.application.launch_command import (
     attach_command_line,
     build_cockpit_layout_json_payload,
     build_mozyo_json_payload,
+    new_agent_session_argv,
+    new_agent_window_argv,
     render_cockpit_layout_dry_run,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
@@ -337,6 +340,120 @@ class CockpitLayoutUseCaseTest(unittest.TestCase):
             CockpitLayoutUseCase(ops).run(_layout_args())
         kill = [c for c in ops.calls if c[0] == "run_tmux" and c[1][:1] == ("kill-session",)]
         self.assertTrue(kill, "expected a kill-session teardown before re-raise")
+
+
+class _FakeAgentWindowOps:
+    """A synthetic :class:`AgentWindowLaunchOps` recording the driven calls."""
+
+    def __init__(
+        self,
+        *,
+        supported: bool = True,
+        run_result: argparse.Namespace | None = None,
+        launch_command: str = "env OTEL=1 claude",
+    ) -> None:
+        self._supported = supported
+        self._run_result = run_result or _result(returncode=0, stdout="%7\n")
+        self._launch_command = launch_command
+        self.calls: list[tuple] = []
+        self.recorded: list[tuple] = []
+        self.died: list[str] = []
+
+    def require_tmux(self) -> None:
+        self.calls.append(("require_tmux",))
+
+    def is_supported_agent(self, agent: str) -> bool:
+        return self._supported
+
+    def agent_launch_command(self, agent: str, session: str, cwd) -> str:
+        self.calls.append(("agent_launch_command", agent, session, cwd))
+        return self._launch_command
+
+    def run_tmux(self, *args, **kwargs):
+        self.calls.append(("run_tmux", args, kwargs))
+        return self._run_result
+
+    def record_pane_created(self, agent, session, pane_id, cwd) -> None:
+        self.recorded.append((agent, session, pane_id, cwd))
+
+    def die(self, message: str):
+        # Mirror the live ``die`` contract: never returns.
+        self.died.append(message)
+        raise SystemExit(message)
+
+
+class AgentWindowArgvTest(unittest.TestCase):
+    def test_new_session_argv_matches_legacy_shape(self) -> None:
+        argv = new_agent_session_argv("claude", "s", "/repo", "env X=1 claude")
+        self.assertEqual(
+            [
+                "new-session", "-d", "-s", "s", "-n", "claude",
+                "-P", "-F", "#{pane_id}", "-c", "/repo", "env X=1 claude",
+            ],
+            argv,
+        )
+
+    def test_new_window_argv_matches_legacy_shape(self) -> None:
+        argv = new_agent_window_argv("codex", "s", None, "env X=1 codex")
+        # No cwd -> no ``-c`` pair; window is added to ``<session>:``.
+        self.assertEqual(
+            [
+                "new-window", "-d", "-t", "s:", "-n", "codex",
+                "-P", "-F", "#{pane_id}", "env X=1 codex",
+            ],
+            argv,
+        )
+
+    def test_launch_command_is_always_the_trailing_arg(self) -> None:
+        # The tmux boundary tests assert on ``captured[0][-1]``; keep it last.
+        self.assertEqual(
+            "env X=1 claude", new_agent_session_argv("claude", "s", "/r", "env X=1 claude")[-1]
+        )
+        self.assertEqual(
+            "env X=1 codex", new_agent_window_argv("codex", "s", None, "env X=1 codex")[-1]
+        )
+
+
+class AgentWindowLaunchUseCaseTest(unittest.TestCase):
+    def test_new_session_window_returns_pane_and_records_event(self) -> None:
+        ops = _FakeAgentWindowOps(run_result=_result(returncode=0, stdout="%1\n"))
+        pane = AgentWindowLaunchUseCase(ops).new_session_window("claude", "s", "/repo")
+        self.assertEqual("%1", pane)
+        # The env-wrapped launch command rides the trailing tmux arg.
+        run = [c for c in ops.calls if c[0] == "run_tmux"][0]
+        self.assertEqual("new-session", run[1][0])
+        self.assertEqual("env OTEL=1 claude", run[1][-1])
+        self.assertEqual({"check": False}, run[2])
+        self.assertEqual([("claude", "s", "%1", "/repo")], ops.recorded)
+
+    def test_new_window_uses_new_window_verb(self) -> None:
+        ops = _FakeAgentWindowOps(run_result=_result(returncode=0, stdout="%2\n"))
+        pane = AgentWindowLaunchUseCase(ops).new_window("codex", "s")
+        self.assertEqual("%2", pane)
+        run = [c for c in ops.calls if c[0] == "run_tmux"][0]
+        self.assertEqual("new-window", run[1][0])
+
+    def test_unsupported_agent_dies_before_run(self) -> None:
+        ops = _FakeAgentWindowOps(supported=False)
+        with self.assertRaises(SystemExit):
+            AgentWindowLaunchUseCase(ops).new_session_window("bogus", "s")
+        self.assertEqual(["unsupported agent: bogus"], ops.died)
+        self.assertFalse(any(c[0] == "run_tmux" for c in ops.calls))
+        self.assertEqual([], ops.recorded)
+
+    def test_nonzero_return_dies_with_verb_specific_message(self) -> None:
+        ops = _FakeAgentWindowOps(run_result=_result(returncode=1, stderr="boom"))
+        with self.assertRaises(SystemExit):
+            AgentWindowLaunchUseCase(ops).new_window("claude", "s")
+        self.assertEqual(["tmux new-window failed: boom"], ops.died)
+        self.assertEqual([], ops.recorded)
+
+    def test_empty_pane_id_dies(self) -> None:
+        ops = _FakeAgentWindowOps(run_result=_result(returncode=0, stdout="  \n"))
+        with self.assertRaises(SystemExit):
+            AgentWindowLaunchUseCase(ops).new_session_window("claude", "s")
+        self.assertEqual(["tmux new-session did not return a pane id"], ops.died)
+        self.assertEqual([], ops.recorded)
 
 
 if __name__ == "__main__":

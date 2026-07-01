@@ -541,3 +541,166 @@ class CockpitLayoutUseCase:
             attach_argv=tuple(attach_argv(session, control_mode)),
             no_attach=no_attach,
         )
+
+
+# --- Agent window launch primitives (#12970) ---------------------------------
+#
+# The lower-level pane-creation helpers that ``ensure_repo_session_windows`` (and
+# the managed-events boundary tests) drive historically lived as procedural
+# bodies in :mod:`mozyo_bridge.application.commands`:
+#
+# - ``new_agent_session_window`` — open a fresh detached session whose first
+#   window runs ``agent``.
+# - ``new_agent_window`` — add an ``agent`` window to an existing session.
+#
+# Both build a *pure* ``tmux new-session`` / ``new-window`` argv and then drive
+# the *side effects* (``require_tmux`` / ``run_tmux`` / the env-wrapped
+# ``_agent_launch_command`` / the best-effort desired-state ``created`` event).
+# This carves that into the same OOP-first shape as the launch commands above so
+# it is consistent with the existing boundary rather than a second style.
+
+
+def new_agent_session_argv(
+    agent: str, session: str, cwd: str | None, launch_command: str
+) -> list[str]:
+    """The ``tmux new-session -d ...`` argv opening ``agent``'s first window.
+
+    Byte-for-byte the argv the legacy ``new_agent_session_window`` built: a
+    detached session ``session`` whose first window is named ``agent``, printing
+    the new pane id (``-P -F '#{pane_id}'``), optionally started in ``cwd``, with
+    ``launch_command`` (the ``_agent_launch_command`` env-wrapped shell string) as
+    the trailing window command.
+    """
+
+    argv = ["new-session", "-d", "-s", session, "-n", agent, "-P", "-F", "#{pane_id}"]
+    if cwd:
+        argv.extend(["-c", cwd])
+    argv.append(launch_command)
+    return argv
+
+
+def new_agent_window_argv(
+    agent: str, session: str, cwd: str | None, launch_command: str
+) -> list[str]:
+    """The ``tmux new-window -d ...`` argv adding ``agent``'s window to ``session``.
+
+    Byte-for-byte the argv the legacy ``new_agent_window`` built; mirrors
+    :func:`new_agent_session_argv` with ``new-window -t <session>:``.
+    """
+
+    argv = ["new-window", "-d", "-t", f"{session}:", "-n", agent, "-P", "-F", "#{pane_id}"]
+    if cwd:
+        argv.extend(["-c", cwd])
+    argv.append(launch_command)
+    return argv
+
+
+@runtime_checkable
+class AgentWindowLaunchOps(Protocol):
+    """Port: what the agent-window launch use case needs from its environment.
+
+    The live adapter routes every call through the :mod:`commands` module at call
+    time so the characterization tests that patch
+    ``mozyo_bridge.application.commands.<fn>`` (``require_tmux`` / ``run_tmux`` /
+    ``_agent_launch_command`` / ``_record_managed_pane_created`` / ``die`` and the
+    ``AGENT_COMMANDS`` support set) keep intercepting the real side effects.
+    """
+
+    def require_tmux(self) -> None: ...
+
+    def is_supported_agent(self, agent: str) -> bool: ...
+
+    def agent_launch_command(self, agent: str, session: str, cwd: str | None) -> str: ...
+
+    def run_tmux(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def record_pane_created(
+        self, agent: str, session: str, pane_id: str, cwd: str | None
+    ) -> None: ...
+
+    def die(self, message: str) -> NoReturn: ...
+
+
+class LiveAgentWindowLaunchOps:
+    """Live :class:`AgentWindowLaunchOps` over the real ``commands`` helpers.
+
+    Resolves each helper *through the* :mod:`commands` *module at call time*
+    rather than binding it at import time, so the ``new_agent_session_window`` /
+    ``new_agent_window`` boundary tests that patch
+    ``mozyo_bridge.application.commands.<fn>`` keep intercepting the live side
+    effects, and this module keeps no import cycle with ``commands``. The
+    env-wrapped launch string and the best-effort desired-state ``created`` event
+    stay owned by ``commands._agent_launch_command`` /
+    ``commands._record_managed_pane_created`` (both still ``commands.*`` seams).
+    """
+
+    @staticmethod
+    def _commands() -> Any:
+        from mozyo_bridge.application import commands
+
+        return commands
+
+    def require_tmux(self) -> None:
+        self._commands().require_tmux()
+
+    def is_supported_agent(self, agent: str) -> bool:
+        return agent in self._commands().AGENT_COMMANDS
+
+    def agent_launch_command(self, agent: str, session: str, cwd: str | None) -> str:
+        return self._commands()._agent_launch_command(agent, session, cwd)
+
+    def run_tmux(self, *args: Any, **kwargs: Any) -> Any:
+        return self._commands().run_tmux(*args, **kwargs)
+
+    def record_pane_created(
+        self, agent: str, session: str, pane_id: str, cwd: str | None
+    ) -> None:
+        self._commands()._record_managed_pane_created(agent, session, pane_id, cwd)
+
+    def die(self, message: str) -> NoReturn:
+        self._commands().die(message)
+        raise AssertionError("unreachable")  # pragma: no cover - die raises SystemExit
+
+
+@dataclass
+class AgentWindowLaunchUseCase:
+    """Open a managed agent pane over the :class:`AgentWindowLaunchOps` port.
+
+    Mirrors the legacy ``new_agent_session_window`` / ``new_agent_window`` bodies
+    exactly: require tmux, reject an unsupported agent, build the env-wrapped
+    launch command, run the ``new-session`` / ``new-window`` tmux call, fail
+    closed (``die``) on a non-zero return or an empty pane id, then record the
+    best-effort desired-state ``created`` event. Returns the new pane id.
+    """
+
+    ops: AgentWindowLaunchOps
+
+    def new_session_window(
+        self, agent: str, session: str, cwd: str | None = None
+    ) -> str:
+        return self._launch(new_agent_session_argv, "new-session", agent, session, cwd)
+
+    def new_window(self, agent: str, session: str, cwd: str | None = None) -> str:
+        return self._launch(new_agent_window_argv, "new-window", agent, session, cwd)
+
+    def _launch(
+        self, build_argv, verb: str, agent: str, session: str, cwd: str | None
+    ) -> str:
+        ops = self.ops
+        ops.require_tmux()
+        if not ops.is_supported_agent(agent):
+            ops.die(f"unsupported agent: {agent}")
+        launch_command = ops.agent_launch_command(agent, session, cwd)
+        result = ops.run_tmux(
+            *build_argv(agent, session, cwd, launch_command), check=False
+        )
+        if result.returncode != 0:
+            ops.die(
+                f"tmux {verb} failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        pane_id = result.stdout.strip()
+        if not pane_id:
+            ops.die(f"tmux {verb} did not return a pane id")
+        ops.record_pane_created(agent, session, pane_id, cwd)
+        return pane_id

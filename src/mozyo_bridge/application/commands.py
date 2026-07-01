@@ -538,39 +538,38 @@ def _record_managed_pane_created(
 
 
 def new_agent_session_window(agent: str, session: str, cwd: str | None = None) -> str:
-    require_tmux()
-    if agent not in AGENT_COMMANDS:
-        die(f"unsupported agent: {agent}")
-    args = ["new-session", "-d", "-s", session, "-n", agent, "-P", "-F", "#{pane_id}"]
-    if cwd:
-        args.extend(["-c", cwd])
-    args.append(_agent_launch_command(agent, session, cwd))
-    result = run_tmux(*args, check=False)
-    if result.returncode != 0:
-        die(f"tmux new-session failed: {result.stderr.strip() or result.stdout.strip()}")
-    pane_id = result.stdout.strip()
-    if not pane_id:
-        die("tmux new-session did not return a pane id")
-    _record_managed_pane_created(agent, session, pane_id, cwd)
-    return pane_id
+    """Open a fresh detached session whose first window runs ``agent``.
+
+    Thin wrapper over the ``launch_command`` agent-window boundary (#12970); the
+    ``require_tmux`` / ``run_tmux`` / ``_agent_launch_command`` /
+    ``_record_managed_pane_created`` / ``die`` seams stay here and the live
+    adapter resolves them through this module at call time, so the boundary tests
+    that patch ``commands.<fn>`` are unchanged.
+    """
+    from mozyo_bridge.application.launch_command import (
+        AgentWindowLaunchUseCase,
+        LiveAgentWindowLaunchOps,
+    )
+
+    return AgentWindowLaunchUseCase(LiveAgentWindowLaunchOps()).new_session_window(
+        agent, session, cwd
+    )
 
 
 def new_agent_window(agent: str, session: str, cwd: str | None = None) -> str:
-    require_tmux()
-    if agent not in AGENT_COMMANDS:
-        die(f"unsupported agent: {agent}")
-    args = ["new-window", "-d", "-t", f"{session}:", "-n", agent, "-P", "-F", "#{pane_id}"]
-    if cwd:
-        args.extend(["-c", cwd])
-    args.append(_agent_launch_command(agent, session, cwd))
-    result = run_tmux(*args, check=False)
-    if result.returncode != 0:
-        die(f"tmux new-window failed: {result.stderr.strip() or result.stdout.strip()}")
-    pane_id = result.stdout.strip()
-    if not pane_id:
-        die("tmux new-window did not return a pane id")
-    _record_managed_pane_created(agent, session, pane_id, cwd)
-    return pane_id
+    """Add an ``agent`` window to an existing session.
+
+    Thin wrapper over the ``launch_command`` agent-window boundary (#12970);
+    mirrors :func:`new_agent_session_window`.
+    """
+    from mozyo_bridge.application.launch_command import (
+        AgentWindowLaunchUseCase,
+        LiveAgentWindowLaunchOps,
+    )
+
+    return AgentWindowLaunchUseCase(LiveAgentWindowLaunchOps()).new_window(
+        agent, session, cwd
+    )
 
 
 def list_session_windows(session: str) -> list[str]:

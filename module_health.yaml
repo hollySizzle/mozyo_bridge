@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5559
+    lines: 5558
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -431,6 +431,24 @@ allowlist:
       launch command + instruction-install), so the 27-line net removal is measured
       from the post-#12935 baseline (5586) and the combined post-merge ``commands.py``
       line count is 5559.
+      Lowered 5559 -> 5558 for the #12970 OOP-first agent-window launch-helper
+      tranche: the ``new_agent_session_window`` / ``new_agent_window`` pane-creation
+      bodies moved into the existing ``application/launch_command.py`` boundary as
+      pure ``new_agent_session_argv`` / ``new_agent_window_argv`` builders + an
+      ``AgentWindowLaunchOps`` port, a ``LiveAgentWindowLaunchOps`` adapter, and an
+      ``AgentWindowLaunchUseCase`` (require-tmux / unsupported-agent die / build the
+      env-wrapped launch command / run new-session|new-window / fail-closed on a
+      non-zero return or empty pane id / best-effort ``created`` event). The two
+      ``new_agent_*`` functions stay here as thin wrappers so their monkeypatch
+      surface is preserved, and the ``_agent_launch_command`` /
+      ``_record_managed_pane_created`` / ``require_tmux`` / ``run_tmux`` / ``die``
+      seams stay in ``commands`` (the live adapter resolves them through this module
+      at call time, so the managed-events / permission-policy / otel characterization
+      tests are unchanged). ``ensure_repo_session_windows`` still calls the module-level
+      wrappers; ``_agent_launch_command`` is untouched (still a ``commands.*`` seam used
+      by the cockpit-append launch and the #12933 launch adapter). The extracted
+      bodies net-shrink the module by 1 line from the post-#12936 baseline (5559);
+      ``test_launch_command`` adds the fake-port use-case + pure-argv specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
