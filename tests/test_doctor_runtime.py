@@ -348,13 +348,33 @@ class DoctorRuntimeDispatchTest(unittest.TestCase):
 
 class RunRuntimeFingerprintEndToEndTest(unittest.TestCase):
     def test_checkout_classifies_as_source_tree_and_ok(self) -> None:
-        # The test process runs under PYTHONPATH=src, so the active package IS
-        # this checkout's source tree: the fingerprint must say so and pass, and
-        # the live feature probes must detect the #12597 symbols that exist here.
+        # Two run lanes reach this end-to-end test:
+        #  * PYTHONPATH=src (local dev): the active package IS this checkout's
+        #    source tree, so the fingerprint classifies as `source_tree` and
+        #    passes, with the #12597 live feature probes detected here.
+        #  * installed-package lane (CI runs `mozyo-bridge tests profile`, whose
+        #    entry point imports the site-packages build BEFORE this file
+        #    prepends `src`, so the active module stays the installed one): the
+        #    fingerprint CORRECTLY warns to use the repo-local CLI for dogfood.
+        #    That advisory is benign — it must not be a genuine drift / probe
+        #    mismatch, and the matching source checkout must still be detected.
         args = argparse.Namespace(repo=str(ROOT), home=None, json=False)
         result = run_runtime_fingerprint(args)
-        self.assertTrue(result["ok"])
-        self.assertEqual("source_tree", result["active"]["surface"])
+        if result["active"]["surface"] == "source_tree":
+            # Local dev / PYTHONPATH=src lane: active IS the checkout source.
+            self.assertEqual(STATUS_OK, result["status"])
+            self.assertTrue(result["ok"])
+        else:
+            # Installed-package lane: benign "use repo-local CLI" advisory only,
+            # never a genuine drift, with the active build matching the source.
+            self.assertEqual(STATUS_WARNING, result["status"])
+            self.assertFalse(result["probe_mismatch"])
+            self.assertEqual(
+                result["active"]["version"], result["source"]["version"]
+            )
+        # Invariants that hold in BOTH lanes: the live #12597 probes are present
+        # on the active surface, the matching source checkout is detected, and
+        # the git anchor resolves.
         self.assertTrue(result["active"]["feature_probes"]["standard_target_admission"])
         self.assertTrue(result["active"]["feature_probes"]["no_target_activation"])
         self.assertTrue(result["source"]["present"])
