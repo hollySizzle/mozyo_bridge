@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5136
+    lines: 5012
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -533,6 +533,30 @@ allowlist:
       status`` CLI output + exit conventions are byte-for-byte preserved.
       ``test_cockpit_membership_command`` adds the fake-port use-case +
       pure-projection specifications.
+      Lowered 5136 -> 5012 for #12977 (rebased onto ``origin/main`` cb72704 after
+      #12976 integrated; the carves touch disjoint regions so ``commands.py``
+      auto-merged and the removals stack — 5318 (#12972) -> 5255 (#12975) -> 5136
+      (#12976) -> 5012 (#12977)): the three ``layout apply cockpit`` planner /
+      composition helpers (``_resolve_project_scope_fields`` /
+      ``_resolve_cockpit_workspaces`` / ``execute_cockpit_plan``) moved into the new
+      ``application/cockpit_planner_command.py`` boundary (a fail-soft
+      ``resolve_project_scope_fields`` leaf + a ``CockpitWorkspacesOps`` port and
+      ``LiveCockpitWorkspacesOps`` adapter with a ``CockpitWorkspacesUseCase`` +
+      a ``CockpitPlanExecutorOps`` port and ``LiveCockpitPlanExecutorOps`` adapter
+      with a ``CockpitPlanExecutorUseCase``). The three functions stay here as thin
+      wrappers (delegate to the leaf / build the live ops + run the use case). The
+      workspace adapter resolves ``commands.resolve_canonical_session`` /
+      ``commands._resolve_workspace_lane`` / ``commands._resolve_project_scope_fields``
+      (and the ``session_inventory.take_inventory`` source) at call time, and the
+      plan-executor adapter binds the caller's ``run`` and resolves ``commands.die``
+      at call time — so the ``layout apply`` / ``cockpit`` / group-window /
+      project-scope characterization tests that patch those seams or call the
+      executor directly with a fake runner keep intercepting, and the column
+      identity, workspace+lane+scope dedupe keying, and fail-fast / cleanup wording
+      are byte-for-byte preserved. ``cmd_layout_apply`` already lives thin behind the
+      #12933 ``launch_command`` boundary and is unchanged.
+      ``test_cockpit_planner_command`` adds the fake-port use-case + fail-soft-leaf
+      specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

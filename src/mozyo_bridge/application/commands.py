@@ -674,179 +674,55 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
 def _resolve_project_scope_fields(
     cwd: str | None, repo_root: str | None
 ) -> tuple[str | None, tuple[str | None, str | None, str | None], str | None]:
-    """Resolve a cockpit column's Git repo root + project scope (Redmine #12658).
+    """Thin wrapper over the #12977 :func:`resolve_project_scope_fields` leaf.
 
-    When ``cwd`` resolves inside an adopted monorepo project, the workspace
-    identity is the *Git repository root* (the umbrella/department workspace) and
-    the project scope (the project's ``redmine_project`` id) is carried
-    separately — so the cockpit / dry-run JSON keeps ``repo_root`` and the project
-    path distinct. Returns ``(effective_repo_root, (scope, path, label),
-    launch_cwd)`` where ``launch_cwd`` is the absolute project workdir a launched
-    pane should start in (Redmine #12658 j#66505) so its cwd is under the project
-    path and a ``--target-project`` handoff gate can pass.
-
-    Fail-soft and compatibility-preserving: when no adopted project contains the
-    cwd (a single-repo workspace, an un-scanned root, or any discovery error) the
-    original ``repo_root`` is returned unchanged with an empty project triple and
-    a ``None`` launch_cwd, so existing single-repo cockpit behavior is identical.
+    The fail-soft Git-root + project-scope resolution (Redmine #12658) lives
+    behind the ``cockpit_planner_command`` boundary; this stays here as the
+    ``commands._resolve_project_scope_fields`` name so ``cmd_cockpit`` / the
+    workspace resolver — and the tests that patch this seam — keep intercepting.
     """
-    none_triple: tuple[str | None, str | None, str | None] = (None, None, None)
-    if not cwd:
-        return repo_root, none_triple, None
-    try:
-        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-            project_scope_for_cwd,
-            resolve_workspace_root,
-        )
+    from mozyo_bridge.application.cockpit_planner_command import (
+        resolve_project_scope_fields,
+    )
 
-        # Prefer the real Git worktree root over a nested project-local scaffold
-        # marker (Redmine #12658 j#66499): a monorepo project subdir may carry its
-        # own `.mozyo-bridge/scaffold.json`, at which `infer_repo_root` would stop
-        # and collapse the workspace onto the project. The Git root is the
-        # workspace; the scaffold marker is the fallback only when there is no Git
-        # root above (non-git scaffolded workspace, #11301).
-        git_root = resolve_workspace_root(cwd) or repo_root
-        if not git_root:
-            return repo_root, none_triple, None
-        scope = project_scope_for_cwd(cwd, git_root)
-    except Exception:  # noqa: BLE001 - project scope is additive; never block cockpit
-        return repo_root, none_triple, None
-    if scope is None:
-        return repo_root, none_triple, None
-    # Launch the pane at the project workdir (repo-relative ``scope.workdir``
-    # resolved against the Git root) so the pane cwd is under the project path.
-    launch_cwd = str(Path(git_root) / scope.workdir)
-    return git_root, (scope.scope, scope.path, scope.label), launch_cwd
+    return resolve_project_scope_fields(cwd, repo_root)
 
 
 def _resolve_cockpit_workspaces(args: argparse.Namespace) -> list:
-    """Resolve the active workspaces to summon into the cockpit (Redmine #11788).
+    """Thin wrapper over the #12977 :class:`CockpitWorkspacesUseCase` boundary.
 
-    Explicit ``--repo`` columns win (deterministic order). Otherwise the active
-    mozyo workspaces are discovered from the live session inventory — one column
-    per distinct workspace that currently carries a codex/claude agent pane.
+    The live adapter routes ``resolve_canonical_session`` /
+    ``_resolve_workspace_lane`` / ``_resolve_project_scope_fields`` through this
+    module (and ``take_inventory`` through its source) at call time, so the
+    ``layout apply`` characterization tests that patch those seams still feed the
+    explicit-``--repo`` and live-inventory column resolution unchanged (#11788 /
+    #11820).
     """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import CockpitWorkspace, normalize_lane
+    from mozyo_bridge.application.cockpit_planner_command import (
+        CockpitWorkspacesUseCase,
+        LiveCockpitWorkspacesOps,
+    )
 
-    repos = getattr(args, "layout_repos", None)
-    out: list = []
-    if repos:
-        for repo in repos:
-            resolved = str(Path(repo).expanduser().resolve())
-            # Project-scoped identity (#12658): re-root to the Git repo root and
-            # carry the project scope separately when this column is an adopted
-            # monorepo project; single-repo columns are unchanged.
-            effective_root, (p_scope, p_path, p_label), p_launch = (
-                _resolve_project_scope_fields(resolved, resolved)
-            )
-            canon = resolve_canonical_session(effective_root)
-            wsid = getattr(canon, "workspace_id", None) or canon.name
-            lane = _resolve_workspace_lane(effective_root, getattr(canon, "workspace_id", None))
-            out.append(
-                CockpitWorkspace(
-                    workspace_id=wsid,
-                    label=canon.name,
-                    repo_root=effective_root,
-                    lane_id=lane.lane_id,
-                    lane_label=lane.lane_label,
-                    project_scope=p_scope,
-                    project_path=p_path,
-                    project_label=p_label,
-                    launch_cwd=p_launch,
-                )
-            )
-        return out
-
-    from mozyo_bridge.session_inventory import take_inventory
-
-    snapshot = take_inventory()
-    # One column per distinct workspace+lane (Redmine #11820). Keying by
-    # `workspace_id` alone would collapse same-workspace-different-lane checkouts
-    # (e.g. a main worktree and a linked worktree) into a single column, which
-    # contradicts the append-as-separate-column contract this US adds — so the
-    # dedupe key carries the normalized lane id too.
-    by_lane: dict[tuple, object] = {}
-    for rec in snapshot.records:
-        if rec.agent_kind not in (AGENT_KIND_CODEX, AGENT_KIND_CLAUDE):
-            continue
-        wsid = (
-            (rec.workspace.workspace_id if rec.workspace else None)
-            or rec.repo_root
-            or rec.session
-        )
-        lane = _resolve_workspace_lane(
-            rec.repo_root or "",
-            rec.workspace.workspace_id if rec.workspace else None,
-        )
-        # Project-scoped identity (#12658): a discovered pane carries its own cwd,
-        # so resolve the project scope from it; the Git repo_root is kept as the
-        # workspace authority.
-        _eff_root, (p_scope, p_path, p_label), p_launch = _resolve_project_scope_fields(
-            rec.cwd, rec.repo_root
-        )
-        key = (wsid, normalize_lane(lane.lane_id), p_scope or "")
-        if key not in by_lane:
-            by_lane[key] = CockpitWorkspace(
-                workspace_id=wsid,
-                label=rec.session,
-                repo_root=rec.repo_root,
-                lane_id=lane.lane_id,
-                lane_label=lane.lane_label,
-                project_scope=p_scope,
-                project_path=p_path,
-                project_label=p_label,
-                launch_cwd=p_launch,
-            )
-    return list(by_lane.values())
+    return CockpitWorkspacesUseCase(LiveCockpitWorkspacesOps()).resolve(args)
 
 
 def execute_cockpit_plan(plan, run, *, cleanup_captured: bool = False) -> dict:
-    """Run a :class:`CockpitPlan`'s tmux commands, resolving logical tokens.
+    """Thin wrapper over the #12977 :class:`CockpitPlanExecutorUseCase` boundary.
 
-    ``run`` is a ``run_tmux``-style callable. Each command's logical pane tokens
-    (``@colN_role``) are substituted with the real ``%pane`` id captured from an
-    earlier ``-P -F '#{pane_id}'`` command. Returns the token -> pane id map.
-
-    Fail-fast (Redmine #11788 review): a tmux step that exits non-zero, or a
-    capturing step that does not return a ``%pane`` id, is fatal. Continuing
-    would run later steps against an empty / wrong target and present a broken
-    half-built layout as if it succeeded, so the layout — whose source of truth
-    is tmux state — must abort instead.
-
-    ``cleanup_captured`` (Redmine #11803 review): when appending into an
-    existing shared cockpit the session must not be killed, so a mid-append
-    failure would otherwise orphan the new panes already created. With this
-    flag, every pane captured so far is ``kill-pane``'d (best-effort) before
-    aborting, leaving the shared cockpit's other columns intact.
+    The live adapter binds the passed-in ``run`` (``run_tmux`` or a test fake) and
+    routes ``commands.die`` at call time, so the token-resolution / fail-fast /
+    ``cleanup_captured`` rollback behavior (#11788 / #11803) is byte-for-byte
+    preserved and the executors that call this directly with a fake runner — and
+    any that patch ``commands.die`` — keep intercepting.
     """
-    ids: dict[str, str] = {}
+    from mozyo_bridge.application.cockpit_planner_command import (
+        CockpitPlanExecutorUseCase,
+        LiveCockpitPlanExecutorOps,
+    )
 
-    def _abort(message: str):
-        if cleanup_captured:
-            for pane_id in ids.values():
-                run("kill-pane", "-t", pane_id, check=False)
-        die(message)
-
-    for cmd in plan.commands:
-        argv = [ids.get(token, token) for token in cmd.argv]
-        result = run(*argv, check=False)
-        if getattr(result, "returncode", 0) != 0:
-            detail = (getattr(result, "stderr", "") or "").strip() or (
-                getattr(result, "stdout", "") or ""
-            ).strip()
-            _abort(
-                f"cockpit layout step failed ({cmd.purpose}): "
-                f"`tmux {' '.join(argv)}` -> {detail or 'nonzero exit'}"
-            )
-        if cmd.captures:
-            pane_id = (getattr(result, "stdout", "") or "").strip()
-            if not pane_id.startswith("%"):
-                _abort(
-                    f"cockpit layout step did not return a pane id "
-                    f"({cmd.purpose}): got {pane_id!r}"
-                )
-            ids[cmd.captures] = pane_id
-    return ids
+    return CockpitPlanExecutorUseCase(LiveCockpitPlanExecutorOps(run)).execute(
+        plan, cleanup_captured=cleanup_captured
+    )
 
 
 def _cockpit_repair_use_case(run):
