@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4374
+    lines: 4223
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -739,6 +739,28 @@ allowlist:
       net removal and the post-carve ``commands.py`` line count is 4374.
       ``test_cockpit_adopt_command`` adds the fake-port use-case + pure-projection
       specifications.
+      Lowered 4374 -> 4223 for the #12989 cockpit reset/rebuild handler residual
+      tranche (stacked directly on the #12987 adopt carve above): the reset grade
+      read (``_assess_cockpit_reset``), the extra-window enumeration
+      (``_cockpit_extra_windows``), the inventory report
+      (``_print_cockpit_reset_inventory``), and the preview / json /
+      confirm-gated ``mozyo cockpit reset`` / ``rebuild`` handler
+      (``_handle_cockpit_reset``) moved to the new
+      ``application/cockpit_reset_command.py``: pure ``cockpit_extra_windows`` /
+      ``render_reset_inventory_lines``, a ``CockpitResetOps`` port with a
+      ``LiveCockpitResetOps`` adapter routing the
+      ``_session_attached_clients_result`` / ``list_session_windows`` /
+      ``require_tmux`` / reset + create executor seams through this module at
+      call time, and a ``CockpitResetUseCase`` rendering through an injected
+      ``emit`` sink whose ``CockpitResetOutcome.attach_session`` hands the
+      terminal attach back to the thin wrapper (``os.execvp`` stays here, so the
+      ``commands.os.execvp`` patch seam is unchanged). ``_assess_cockpit_reset``
+      / ``_cockpit_extra_windows`` (called directly by the group-window test) /
+      ``_handle_cockpit_reset`` stay as same-signature thin wrappers;
+      ``_print_cockpit_reset_inventory`` had no remaining callers and is retired.
+      4374 -> 4223 is a 151-line net removal and the post-carve ``commands.py``
+      line count is 4223. ``test_cockpit_reset_command`` adds the fake-port
+      use-case + pure-rendering specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
