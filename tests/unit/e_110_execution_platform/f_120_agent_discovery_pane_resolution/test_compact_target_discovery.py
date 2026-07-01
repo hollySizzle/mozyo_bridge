@@ -16,6 +16,7 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -257,6 +258,47 @@ class BuildTargetCandidatesTest(unittest.TestCase):
 
         build_target_candidates(records, resolve_workspace=resolver)
         self.assertEqual(["/work/repo"], calls)  # cached per distinct root
+
+    # --- project scope provenance (#12985) --------------------------------
+
+    def test_stamped_scope_reports_stamped_source(self) -> None:
+        records = self._records([
+            _pane("%9", "mozyo-cockpit:0.1", window_name="codex",
+                  agent_role="claude",
+                  project_scope="giken-cloud-drive-management",
+                  project_path="projects/giken-cloud-drive-management",
+                  project_label="クラウドドライブ管理"),
+        ])
+        c = build_target_candidates(records)[0]
+        self.assertEqual("stamped", c.project_scope_source)
+        self.assertEqual(
+            "stamped", c.to_dict()["identity"]["project_scope_source"]
+        )
+
+    def test_derived_scope_reports_live_scan_source(self) -> None:
+        records = self._records([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        cands = build_target_candidates(
+            records,
+            resolve_project=lambda root, cwd: ("scope-x", "projects/x", "X"),
+        )
+        self.assertEqual("live_scan", cands[0].project_scope_source)
+        self.assertEqual(
+            "live_scan", cands[0].to_dict()["identity"]["project_scope_source"]
+        )
+
+    def test_no_scope_reports_unresolved_source(self) -> None:
+        records = self._records([
+            _pane("%2", "repo:0.0", window_name="claude", command="claude"),
+        ])
+        cands = build_target_candidates(records, resolve_project=lambda r, c: None)
+        self.assertEqual("unresolved", cands[0].project_scope_source)
+        # Always a string in the projection (an enum-ish diagnostic, not an
+        # identity), even though the scope fields themselves render as null.
+        identity = cands[0].to_dict()["identity"]
+        self.assertIsNone(identity["project_scope"])
+        self.assertEqual("unresolved", identity["project_scope_source"])
 
 
 class AgentsTargetsCommandTest(unittest.TestCase):
@@ -1017,6 +1059,100 @@ class ResolveAgentTargetsUseCaseFakePortTest(unittest.TestCase):
                 agent_filter=None, session_filter=None
             )
         self.assertEqual([], cands)
+
+
+class ScanProgressNoteTest(unittest.TestCase):
+    """#12985: the stderr renderer for project-scope scan progress events."""
+
+    def _note(self, event) -> str:
+        from mozyo_bridge.application import commands_agents
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            commands_agents._scan_progress_note(event)
+        return err.getvalue()
+
+    def _event(self, kind, elapsed, count=None):
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+            ScanProgressEvent,
+        )
+
+        return ScanProgressEvent(kind, "/ws/root", elapsed, adopted_count=count)
+
+    def test_start_renders_one_stderr_line(self) -> None:
+        out = self._note(self._event("scan_start", 0.0))
+        self.assertIn("note: scanning project scopes under /ws/root", out)
+        self.assertEqual(1, out.count("\n"))
+
+    def test_slow_renders_still_scanning_with_elapsed(self) -> None:
+        out = self._note(self._event("scan_slow", 6.2))
+        self.assertIn("still scanning project scopes under /ws/root", out)
+        self.assertIn("6s elapsed", out)
+
+    def test_fast_done_is_silent(self) -> None:
+        # A quick scan already printed its start line; a completion line is
+        # only worth the noise when the scan was slow enough to have emitted
+        # the still-scanning note.
+        self.assertEqual("", self._note(self._event("scan_done", 0.1, count=1)))
+
+    def test_slow_done_reports_duration_and_adoption(self) -> None:
+        out = self._note(self._event("scan_done", 31.0, count=2))
+        self.assertIn("project scope scan finished under /ws/root", out)
+        self.assertIn("31s", out)
+        self.assertIn("2 scopes adopted", out)
+
+
+class AgentsTargetsScanProgressTest(unittest.TestCase):
+    """#12985: `agents targets` surfaces the live scan; JSON stays parseable."""
+
+    def test_live_scan_note_reaches_stderr_and_json_stays_machine_readable(
+        self,
+    ) -> None:
+        from mozyo_bridge.application import commands, commands_agents
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
+            project_discovery as pd,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            pd.clear_discovery_cache()
+            canon = argparse.Namespace(name="mozyo-bridge", workspace_id="wsA")
+            args = argparse.Namespace(session=None, agent=None, as_json=True)
+            try:
+                with patch.object(commands_agents, "require_tmux"), \
+                    patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.pane_lines",
+                          return_value=[_pane("%2", "repo:0.0", window_name="claude",
+                                              command="claude", cwd=str(repo))]), \
+                    patch("mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery.infer_repo_root",
+                          return_value=str(repo)), \
+                    patch.object(commands, "resolve_canonical_session",
+                                 return_value=canon), \
+                    patch.object(commands, "_probe_checkout_facts",
+                                 return_value={"branch": "main"}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = commands.cmd_agents_targets(args)
+            finally:
+                pd.clear_discovery_cache()
+        self.assertEqual(0, rc)
+        # The previously-silent live scan announces itself on stderr...
+        self.assertIn("note: scanning project scopes under", err.getvalue())
+        # ...while stdout stays a parseable JSON document with the additive
+        # provenance key (no project.yaml here -> unresolved).
+        payload = json.loads(out.getvalue())
+        self.assertEqual(1, len(payload))
+        self.assertEqual(
+            "unresolved", payload[0]["identity"]["project_scope_source"]
+        )
+
+    def test_listener_is_scoped_to_the_command(self) -> None:
+        # After the handler returns, the module-level listener is uninstalled,
+        # so shared-path callers (cockpit / handoff) stay silent.
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application import (
+            project_discovery as pd,
+        )
+
+        self.assertIsNone(pd._progress_listener)
 
 
 if __name__ == "__main__":

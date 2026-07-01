@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Iterator, Optional, Sequence
 
 import yaml
 
@@ -76,6 +80,81 @@ _SKIP_DIRS = frozenset(
         "site-packages",
     }
 )
+
+
+#: Seconds after which a still-running bounded scan emits one ``scan_slow``
+#: progress event (Redmine #12985). High enough that the common fast scan never
+#: emits it; low enough that an operator watching a large-root walk learns the
+#: process is alive well before losing patience.
+DEFAULT_SLOW_SCAN_NOTICE_SECONDS = 5.0
+
+#: :attr:`ScanProgressEvent.kind` vocabulary. ``scan_start`` fires when a live
+#: bounded scan begins for a root (a memoized lookup emits nothing), ``scan_slow``
+#: fires at most once per scan after :data:`DEFAULT_SLOW_SCAN_NOTICE_SECONDS`
+#: (or the ``slow_after`` the listener was installed with), and ``scan_done``
+#: fires when the scan returns.
+SCAN_PROGRESS_START = "scan_start"
+SCAN_PROGRESS_SLOW = "scan_slow"
+SCAN_PROGRESS_DONE = "scan_done"
+
+
+@dataclass(frozen=True)
+class ScanProgressEvent:
+    """One observable step of a per-root bounded project-scope scan (#12985).
+
+    A display/diagnostic value only — never a routing or adoption input.
+    ``adopted_count`` is populated on ``scan_done`` (the number of scopes the
+    finished scan adopted; ``0`` also covers the drift-fail-closed outcome).
+    """
+
+    kind: str
+    repo_root: str
+    elapsed_seconds: float
+    adopted_count: Optional[int] = None
+
+
+ScanProgressListener = Callable[[ScanProgressEvent], None]
+
+_progress_listener: Optional[ScanProgressListener] = None
+_slow_notice_seconds: float = DEFAULT_SLOW_SCAN_NOTICE_SECONDS
+
+
+@contextmanager
+def scan_progress(
+    listener: ScanProgressListener,
+    *,
+    slow_after: float = DEFAULT_SLOW_SCAN_NOTICE_SECONDS,
+) -> Iterator[None]:
+    """Install ``listener`` for scan progress events inside the block (#12985).
+
+    The injectable seam the presentation layer (``agents targets``) uses to
+    surface the previously-silent live scan: discovery itself never writes to
+    stderr for progress, and with no listener installed (the default, and every
+    other caller of this module) nothing is emitted — so the cockpit / handoff
+    shared paths and the memoized cache-hit path stay exactly as quiet as
+    before. Listener exceptions are swallowed: progress display must never
+    change discovery results. Not thread-safe by design — the CLI installs it
+    around one discovery pass on the main thread (the ``scan_slow`` timer
+    thread only *reads* the installed listener).
+    """
+    global _progress_listener, _slow_notice_seconds
+    previous = (_progress_listener, _slow_notice_seconds)
+    _progress_listener = listener
+    _slow_notice_seconds = slow_after
+    try:
+        yield
+    finally:
+        _progress_listener, _slow_notice_seconds = previous
+
+
+def _emit_scan_progress(event: ScanProgressEvent) -> None:
+    listener = _progress_listener
+    if listener is None:
+        return
+    try:
+        listener(event)
+    except Exception:  # noqa: BLE001 - progress display must never break discovery
+        pass
 
 
 def _read_text(path: Path) -> Optional[str]:
@@ -187,7 +266,30 @@ def resolve_project_scopes(
 
 @lru_cache(maxsize=256)
 def _cached_adopted_scopes(repo_root: str, max_depth: int) -> tuple[ProjectScope, ...]:
-    adopted, drift = resolve_project_scopes(repo_root, max_depth=max_depth)
+    # Progress events (#12985) fire only on a real (non-memoized) scan: entering
+    # this body means the lru cache missed, so a cache hit stays silent for free.
+    # The scan_slow timer arms only when a listener is installed and always
+    # cancels on the way out; it is a daemon thread so a hung walk can never keep
+    # the process alive on its own.
+    started = time.monotonic()
+    _emit_scan_progress(ScanProgressEvent(SCAN_PROGRESS_START, repo_root, 0.0))
+    slow_timer: Optional[threading.Timer] = None
+    if _progress_listener is not None:
+        slow_timer = threading.Timer(
+            _slow_notice_seconds,
+            lambda: _emit_scan_progress(
+                ScanProgressEvent(
+                    SCAN_PROGRESS_SLOW, repo_root, time.monotonic() - started
+                )
+            ),
+        )
+        slow_timer.daemon = True
+        slow_timer.start()
+    try:
+        adopted, drift = resolve_project_scopes(repo_root, max_depth=max_depth)
+    finally:
+        if slow_timer is not None:
+            slow_timer.cancel()
     if drift:
         # Fail closed on generated-cache drift (Redmine #12658 review j#66481
         # blocker 3): the design source requires a cache/source disagreement to be
@@ -204,8 +306,18 @@ def _cached_adopted_scopes(repo_root: str, max_depth: int) -> tuple[ProjectScope
             f"discovery_cache is regenerated ({detail})",
             file=sys.stderr,
         )
-        return ()
-    return tuple(adopted)
+        result: tuple[ProjectScope, ...] = ()
+    else:
+        result = tuple(adopted)
+    _emit_scan_progress(
+        ScanProgressEvent(
+            SCAN_PROGRESS_DONE,
+            repo_root,
+            time.monotonic() - started,
+            adopted_count=len(result),
+        )
+    )
+    return result
 
 
 def adopted_scopes_for_repo(

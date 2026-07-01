@@ -580,6 +580,21 @@ def codex_gateway_candidates(
 # no private hostname leaks into compact output or any durable record.
 HOST_LOCAL = "local"
 
+# Project-scope provenance vocabulary (Redmine #12985): names HOW a candidate's
+# project scope was obtained so an operator/LLM reading `agents targets` can
+# tell a stamped cockpit pane from a scope derived by the bounded live scan,
+# and both from a pane with no scope at all. Display / diagnostic metadata
+# only — never a routing key. `stamped` = the cockpit-stamped
+# `@mozyo_project_scope` pane option was authoritative; `live_scan` = the scope
+# was derived from the pane cwd via the injected bounded project-scope
+# discovery resolver; `unresolved` = no project scope applies (single-repo
+# workspace pane) or no resolver could bind one. The vocabulary may grow (e.g.
+# a cross-process `cache` source) without breaking consumers — treat unknown
+# values as diagnostic text.
+PROJECT_SCOPE_SOURCE_STAMPED = "stamped"
+PROJECT_SCOPE_SOURCE_LIVE_SCAN = "live_scan"
+PROJECT_SCOPE_SOURCE_UNRESOLVED = "unresolved"
+
 
 @dataclass(frozen=True)
 class TargetCandidate:
@@ -644,6 +659,11 @@ class TargetCandidate:
     project_scope: str = ""
     project_path: str = ""
     project_label: str = ""
+    # Provenance of the project scope above (Redmine #12985): one of the
+    # PROJECT_SCOPE_SOURCE_* values. Defaulted (like the #12658 fields) so
+    # existing constructors stay valid; an unset value reads as `unresolved` in
+    # the projection. Diagnostic metadata only — never a routing key.
+    project_scope_source: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Nested canonical ``TargetRecord`` projection (Redmine #11907).
@@ -680,6 +700,12 @@ class TargetCandidate:
                 "project_scope": self.project_scope or None,
                 "project_path": self.project_path or None,
                 "project_label": self.project_label or None,
+                # Additive provenance for the project scope (Redmine #12985):
+                # always a string ("stamped" / "live_scan" / "unresolved") so a
+                # consumer can distinguish a stamped cockpit scope from a
+                # live-scan-derived one without re-deriving. Diagnostic only.
+                "project_scope_source": self.project_scope_source
+                or PROJECT_SCOPE_SOURCE_UNRESOLVED,
             },
             "repo": {
                 "label": self.repo_short,
@@ -760,19 +786,26 @@ def build_target_candidates(
             branch_cache[repo_root] = resolve_branch(repo_root)
         return branch_cache[repo_root]
 
-    def project_for(record: AgentRecord) -> tuple[str, str, str]:
+    def project_for(record: AgentRecord) -> tuple[str, str, str, str]:
         # A stamped pane option (cockpit-managed pane) is authoritative; an
         # un-stamped pane (normal `mozyo`) derives its scope from the cwd via the
         # injected resolver so a pane running inside a project subdir still
-        # projects its scope. Empty triple when no project scope applies — the
-        # single-repo workspace stays unchanged.
+        # projects its scope. Empty scope when none applies — the single-repo
+        # workspace stays unchanged. The fourth element names the provenance
+        # (#12985) so the projection can say WHICH of these branches bound the
+        # scope without the consumer re-deriving it.
         if record.project_scope:
-            return (record.project_scope, record.project_path, record.project_label)
+            return (
+                record.project_scope,
+                record.project_path,
+                record.project_label,
+                PROJECT_SCOPE_SOURCE_STAMPED,
+            )
         if resolve_project is not None and record.cwd:
             derived = resolve_project(record.repo_root, record.cwd)
             if derived is not None:
-                return derived
-        return ("", "", "")
+                return (*derived, PROJECT_SCOPE_SOURCE_LIVE_SCAN)
+        return ("", "", "", PROJECT_SCOPE_SOURCE_UNRESOLVED)
 
     candidates: list[TargetCandidate] = []
     for record in records:
@@ -780,7 +813,9 @@ def build_target_candidates(
             continue
         workspace_id, workspace_label = workspace_for(record.repo_root)
         repo_short = Path(record.repo_root).name if record.repo_root else None
-        project_scope, project_path, project_label = project_for(record)
+        project_scope, project_path, project_label, project_scope_source = (
+            project_for(record)
+        )
         candidates.append(
             TargetCandidate(
                 pane_id=record.pane_id,
@@ -808,6 +843,7 @@ def build_target_candidates(
                 project_scope=project_scope,
                 project_path=project_path,
                 project_label=project_label,
+                project_scope_source=project_scope_source,
             )
         )
     return candidates

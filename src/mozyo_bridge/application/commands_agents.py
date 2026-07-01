@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json as _json
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -395,6 +396,48 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scan_progress_note(event) -> None:
+    """Render one project-scope scan progress event as a stderr note (#12985).
+
+    The bounded per-root live scan behind project-scope resolution used to run
+    silently, so a large root looked like a hang for 30s+. This prints the
+    minimal operator-facing progress the issue asks for: one line when a live
+    scan starts, a single still-scanning line if it runs past the slow
+    threshold, and a completion line only for a scan that was slow enough to
+    have warranted one. Memoized (cache-hit) lookups emit no events, so the
+    fast path stays quiet. stderr only — the parseable stdout table / ``--json``
+    payload never changes shape here.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+        DEFAULT_SLOW_SCAN_NOTICE_SECONDS,
+        SCAN_PROGRESS_DONE,
+        SCAN_PROGRESS_SLOW,
+        SCAN_PROGRESS_START,
+    )
+
+    if event.kind == SCAN_PROGRESS_START:
+        print(
+            f"note: scanning project scopes under {event.repo_root} "
+            "(first scan in this process; result is cached) ...",
+            file=sys.stderr,
+        )
+    elif event.kind == SCAN_PROGRESS_SLOW:
+        print(
+            f"note: still scanning project scopes under {event.repo_root} "
+            f"({event.elapsed_seconds:.0f}s elapsed) ...",
+            file=sys.stderr,
+        )
+    elif (
+        event.kind == SCAN_PROGRESS_DONE
+        and event.elapsed_seconds >= DEFAULT_SLOW_SCAN_NOTICE_SECONDS
+    ):
+        print(
+            f"note: project scope scan finished under {event.repo_root} "
+            f"({event.elapsed_seconds:.0f}s, {event.adopted_count} scopes adopted)",
+            file=sys.stderr,
+        )
+
+
 def cmd_agents_targets(args: argparse.Namespace) -> int:
     """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
 
@@ -425,7 +468,17 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     identity hints only.
     """
     require_tmux()
-    candidates = _discover_candidates(args)
+
+    # Silent-hang fix (#12985): the per-root bounded project-scope scan behind
+    # discovery can walk a large root for 30s+. Install the stderr note listener
+    # only around this command's discovery pass, so the cockpit / handoff shared
+    # paths stay silent and the memoized cache-hit path emits nothing.
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
+        scan_progress,
+    )
+
+    with scan_progress(_scan_progress_note):
+        candidates = _discover_candidates(args)
 
     # Delegated-coordinator-tree display projection (#12466), consuming the
     # closed #12465 `delegation_projection` foundation. Derived once across all

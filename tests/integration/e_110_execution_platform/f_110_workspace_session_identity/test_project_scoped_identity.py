@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -510,6 +512,87 @@ class DriftFailClosedTests(unittest.TestCase):
                 pd.project_scope_for_cwd(str(self.proj / "src"), str(self.repo))
             )
         self.assertIn("cache drift", err.getvalue())
+
+
+class ScanProgressTests(unittest.TestCase):
+    """#12985: the live bounded scan is observable through the injectable listener.
+
+    The previously-silent `os.walk` behind `agents targets` project-scope
+    enrichment emits `scan_start` / `scan_slow` / `scan_done` events to an
+    installed listener; the memoized cache-hit path and every caller that
+    installs no listener stay exactly as quiet as before, and a broken listener
+    can never change discovery results.
+    """
+
+    def setUp(self):
+        pd.clear_discovery_cache()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / ".git").mkdir()
+        proj = self.repo / "projects" / "giken-cloud-drive-management"
+        proj.mkdir(parents=True)
+        (proj / "project.yaml").write_text(_ENABLED_DOC, encoding="utf-8")
+
+    def tearDown(self):
+        pd.clear_discovery_cache()
+        self._tmp.cleanup()
+
+    def test_live_scan_emits_start_and_done_and_memoized_hit_is_silent(self):
+        events = []
+        with pd.scan_progress(events.append):
+            first = pd.adopted_scopes_for_repo(str(self.repo))
+            second = pd.adopted_scopes_for_repo(str(self.repo))  # memoized hit
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [e.kind for e in events],
+            [pd.SCAN_PROGRESS_START, pd.SCAN_PROGRESS_DONE],
+        )
+        self.assertEqual(events[0].repo_root, str(self.repo))
+        self.assertEqual(events[0].elapsed_seconds, 0.0)
+        self.assertEqual(events[1].adopted_count, 1)
+        self.assertGreaterEqual(events[1].elapsed_seconds, 0.0)
+
+    def test_no_listener_emits_nothing_and_scan_still_adopts(self):
+        scopes = pd.adopted_scopes_for_repo(str(self.repo))
+        self.assertEqual([s.scope for s in scopes], ["giken-cloud-drive-management"])
+
+    def test_slow_scan_emits_one_still_scanning_event(self):
+        events = []
+        real_resolve = pd.resolve_project_scopes
+
+        def slow_resolve(repo_root, *, max_depth):
+            time.sleep(0.25)
+            return real_resolve(repo_root, max_depth=max_depth)
+
+        with patch.object(pd, "resolve_project_scopes", slow_resolve):
+            with pd.scan_progress(events.append, slow_after=0.01):
+                pd.adopted_scopes_for_repo(str(self.repo))
+        self.assertEqual(
+            [e.kind for e in events],
+            [pd.SCAN_PROGRESS_START, pd.SCAN_PROGRESS_SLOW, pd.SCAN_PROGRESS_DONE],
+        )
+        self.assertGreater(events[1].elapsed_seconds, 0.0)
+
+    def test_fast_scan_never_emits_still_scanning(self):
+        events = []
+        with pd.scan_progress(events.append, slow_after=30.0):
+            pd.adopted_scopes_for_repo(str(self.repo))
+        self.assertNotIn(pd.SCAN_PROGRESS_SLOW, [e.kind for e in events])
+
+    def test_listener_exception_never_breaks_discovery(self):
+        def broken(_event):
+            raise RuntimeError("listener boom")
+
+        with pd.scan_progress(broken):
+            scopes = pd.adopted_scopes_for_repo(str(self.repo))
+        self.assertEqual([s.scope for s in scopes], ["giken-cloud-drive-management"])
+
+    def test_listener_uninstalled_after_block(self):
+        events = []
+        with pd.scan_progress(events.append):
+            pass
+        pd.adopted_scopes_for_repo(str(self.repo))
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":
