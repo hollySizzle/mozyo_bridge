@@ -66,13 +66,13 @@ config が不正 (読めない / 型違い / required field 欠落) なら fail 
 
 ## allowlist (`module_health.yaml`)
 
-repo root の `module_health.yaml` が正本。各 entry は `path` / `lines` (baseline) / `reason` / `owner_issue` / `resolution_version` を必須とする。`resolution_version` は既存 schema 名として残すが、意味は Redmine planning bucket / resolution bucket であり、package release version ではない。各 oversized module の解消 (分割) は coordinator 決定 (#12321 j#62668) で記録された対応 bucket 側で行う:
+repo root の `module_health.yaml` が正本。各 entry は `path` / `lines` (baseline) / `reason` / `owner_issue` / `resolution_version` を必須とする。`resolution_version` は既存 schema 名として残すが、意味は Redmine roadmap / resolution group であり、package release version でも active lane-set authority でもない。各 oversized module の解消 (分割) は coordinator 決定 (#12321 j#62668) で記録された対応 group 側で行う:
 
 - `presentation_grouping.py` → **v0.10.8** (Version #239, split US #12322)
 - `cockpit_ui.py` → **v0.10.9** (Version #240, split US #12323)
 - 残り 6 module (commands / cockpit_layout / doctor / release / handoff / scaffold.rules) → **v0.10.10** (Version #241 module-health ratchet, US #12324)
 
-本 gate の責務は新規成長の停止であり、分割は上記 historical bucket で実施する。`resolution_version` に `TBD` 等の未定値は使わない (受入条件「解消予定 bucket を記録する」を満たすため)。将来 schema を変えるなら `resolution_bucket` などへ移行するが、既存 config 互換性に影響するため別 issue で扱う。
+本 gate の責務は新規成長の停止であり、分割は上記 historical resolution group で実施する。`resolution_version` に `TBD` 等の未定値は使わない (受入条件「解消予定 group を記録する」を満たすため)。将来 schema を変えるなら `resolution_group` などへ移行するが、既存 config 互換性に影響するため別 issue で扱う。
 
 baseline 更新フロー: 既存 oversized file を意図的に増やす必要があるとき、`module_health.yaml` の該当 `lines` を新しい値へ上げ、journal に理由を残す。silent な肥大化はできない。
 

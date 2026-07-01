@@ -64,7 +64,7 @@ Redmine #12499 の現在の合格目標は #12546 autonomous parent real-machine
 3. 上記後に scenario / oracle を再実行し、classical test が実機 smoke より粗い振る舞い検査へ
    退化していないかを audit する。
 
-#12603 / `sublane lifecycle and worktree integration late window` planning bucket の sublane Git/non-Git lifecycle hardening は、#12546 後の統合強化であり、
+#12603 / `sublane lifecycle and worktree integration late window` roadmap group の sublane Git/non-Git lifecycle hardening は、#12546 後の統合強化であり、
 新しい finding が依存関係として再分類されない限り #12546 の前提 gate ではない。
 
 この順序は mozyo_bridge repo-local の運用順序であり、3 層 acceptance の普遍条件ではない。

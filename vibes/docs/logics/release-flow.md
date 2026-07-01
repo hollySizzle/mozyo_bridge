@@ -283,8 +283,8 @@ PyPI production publisher:
 
 - This section defines the **package release version** written to package metadata,
   Git tags, and release notes. It is separate from Redmine Version objects, which
-  are planning buckets / execution buckets / conflict buckets / acceptance
-  windows and must not be treated as the package version source of truth.
+  are roadmap / milestone / acceptance grouping surfaces and must not be treated
+  as either the package version source of truth or the active lane-set authority.
 - version scheme は PEP 440 と SemVer に従う。
 - 現状 release-version mirror set は 2 file (`pyproject.toml` の `[project].version` + `src/mozyo_bridge/__init__.py` の `__version__`) で構成され、両者が同じ version 文字列を保つことで単一の正本とみなす。authoritative な mirror set 定義は `vibes/docs/logics/release-helper-contract.md` の `release bump` 節を正本とする。
 - `tests/test_mozyo_bridge.py:test_module_version_matches_pyproject_version` がこの一致を test として enforce している。CLI 層からも `mozyo-bridge release bump --check` で同じ invariant が観測できる。

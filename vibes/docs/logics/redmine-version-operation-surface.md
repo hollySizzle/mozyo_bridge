@@ -23,7 +23,7 @@ domain + port を置く。
   `"<op>:<version_id>"` で operation × target 固有。欠落/不一致は `confirmation_required`。
 - **rename**: `new_name` 必須・現名と異なること・`classify_version_name` が
   `package_numbered` (`^v?\d+\.\d+...`) を返す名前は `new_name_package_numbered` で blocked。
-  これが #12643 の「Redmine Version 名 = planning bucket、package 版番号にしない」を機械強制する。
+  これが #12643 の「Redmine Version 名 = roadmap group、package 版番号にしない」を機械強制する。
 - **close / lock**: counts 未確認 (`counts_known=False`) は `counts_required` で blocked
   (欠落/default の `open_issues_count=0` を「open issue 無し」と誤読しない)。counts 既知で
   `open_issues_count > 0` は既定 blocked (`open_issues_present`); 明示 `allow_open_issues`
