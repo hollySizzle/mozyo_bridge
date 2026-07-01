@@ -10,6 +10,11 @@ from pathlib import Path
 
 from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
 from mozyo_bridge.application.doctor_command import DoctorCommandUseCase
+from mozyo_bridge.application.pane_primitive_command import (
+    LivePanePrimitiveOps,
+    PanePrimitiveOutcome,
+    PanePrimitiveUseCase,
+)
 from mozyo_bridge.application.commands_common import (
     config_path_from_args,
     repo_root_from_args,
@@ -250,77 +255,43 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
 # cli_cockpit parser registrar keep their identity and ``func.__name__``.
 
 
+# The ``cmd_id`` / ``cmd_resolve`` / ``cmd_read`` / ``cmd_type`` / ``cmd_message``
+# / ``cmd_keys`` low-level pane/debug primitives were carved into an OOP-first
+# command boundary (Redmine #12932 / #12638): a ``PanePrimitiveOps`` port over
+# every tmux / pane / read-marker primitive, a ``LivePanePrimitiveOps`` adapter
+# that routes those primitives through this module's globals at call time (so the
+# existing ``commands.*`` monkeypatch seams are unchanged), a ``PanePrimitiveUseCase``
+# owning the six behavior-preserving flows, and a ``PanePrimitiveOutcome`` value
+# object. The ``cmd_*`` handlers below stay thin composition roots (kept as
+# module-level names so the cli_core / cli / cli_handoff parser bindings and the
+# ``rollback_unsubmitted_input`` / notify internal callers that reference them —
+# and the tests that patch ``commands.cmd_read`` / ``.cmd_message`` / ``.cmd_keys``
+# — are unchanged). The ``_emit_message_gate_guidance`` trailer moved with the
+# family to ``pane_primitive_command.py`` (routed via the port); the sibling
+# ``_emit_handoff_marker_timeout_guidance`` below stays here (its caller is the
+# out-of-scope ``orchestrate_handoff`` strict rail).
+
+
+def _emit_pane_primitive_outcome(outcome: PanePrimitiveOutcome) -> int:
+    if outcome.stdout is not None:
+        print(outcome.stdout, end=outcome.stdout_end)
+    return outcome.exit_code
+
+
 def cmd_id(_: argparse.Namespace) -> int:
-    print(current_pane())
-    return 0
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).id(_))
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
-    require_tmux()
-    print(resolve_target(args.target))
-    return 0
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).resolve(args))
 
 
 def cmd_read(args: argparse.Namespace) -> int:
-    require_tmux()
-    target = resolve_target(args.target)
-    print(capture_pane(target, args.lines), end="")
-    mark_read(target)
-    return 0
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).read(args))
 
 
 def cmd_type(args: argparse.Namespace) -> int:
-    require_tmux()
-    target = resolve_target(args.target)
-    require_read(target)
-    run_tmux("send-keys", "-t", target, "-l", "--", args.text)
-    clear_read(target)
-    return 0
-
-
-def _emit_message_gate_guidance(
-    target: str,
-    *,
-    attempt: int | None = None,
-    no_submit: bool = False,
-) -> None:
-    """Print the stderr guidance trailer after a `mozyo-bridge message` gate failure.
-
-    The base ``error: ...`` line already names the literal next-action verb
-    ("read target again", "must read target before interacting", etc.). This
-    trailer is the structural anti-shortcut required by Asana task
-    1214779823377861: it spells out the retry path (``mozyo-bridge read``,
-    then re-run) and the per-preset ``--no-submit`` retry budget so an agent
-    cannot conflate the budget with the ``handoff send`` retry pool or jump
-    straight to the preset's ``Notification fails`` branch after one transient
-    failure.
-    """
-    cap = NO_SUBMIT_RETRY_BUDGET
-    print(
-        f"hint: retry path: `mozyo-bridge read {target}` to refresh the read "
-        f"marker, then re-run the failed `mozyo-bridge message` command.",
-        file=sys.stderr,
-    )
-    if not no_submit:
-        return
-    if attempt is not None:
-        used = max(0, int(attempt))
-        remaining = max(0, cap - used)
-        print(
-            f"hint: --no-submit retry budget: attempt {used}/{cap} just "
-            f"failed; {remaining}/{cap} attempts remaining per preset "
-            "contract. Do not borrow from the `mozyo-bridge handoff send` "
-            "retry pool — they are separate budgets.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"hint: --no-submit retry budget: up to {cap} attempts per "
-            "preset contract; pass `--attempt N` on each retry to track "
-            "the remaining budget. Do not borrow from the `mozyo-bridge "
-            "handoff send` retry pool — they are separate budgets.",
-            file=sys.stderr,
-        )
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).type_text(args))
 
 
 def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
@@ -357,53 +328,11 @@ def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
 
 
 def cmd_message(args: argparse.Namespace) -> int:
-    require_tmux()
-    # Semantic target selection (Redmine #12663): `--select-role` resolves the
-    # target pane by role + repo (+ session / project) instead of a `%pane` id.
-    from mozyo_bridge.application.commands_target_select import resolve_message_target
-
-    target = resolve_message_target(args)
-    attempt = getattr(args, "attempt", None)
-    no_submit = not getattr(args, "submit", True)
-    try:
-        require_read(target)
-    except SystemExit:
-        # `require_read` dies before returning; intercept so the structural
-        # guidance trailer lands on stderr right after the base `error:` line.
-        # Re-raise to preserve the SystemExit exit code.
-        _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
-        raise
-    sender = current_pane()
-    sender_id = pane_window_name(sender) or sender
-    header = f"[mozyo-bridge from:{sender_id} pane:{sender} at:{pane_location(sender)}]"
-    run_tmux("send-keys", "-t", target, "-l", "--", f"{header} {args.text}")
-    if getattr(args, "submit", True):
-        landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
-        read_lines = int(getattr(args, "read_lines", 50) or 50)
-        landing_lines = max(read_lines, 200)
-        if not wait_for_text(target, header, landing_lines, landing_timeout):
-            run_tmux("send-keys", "-t", target, "C-u")
-            clear_read(target)
-            _emit_message_gate_guidance(target, attempt=attempt, no_submit=no_submit)
-            die(
-                "message marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
-                f"target={target} marker={header}"
-            )
-        submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
-        if submit_delay:
-            time.sleep(submit_delay)
-        run_tmux("send-keys", "-t", target, "Enter")
-    clear_read(target)
-    return 0
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).message(args))
 
 
 def cmd_keys(args: argparse.Namespace) -> int:
-    require_tmux()
-    target = resolve_target(args.target)
-    require_read(target)
-    run_tmux("send-keys", "-t", target, *args.keys)
-    clear_read(target)
-    return 0
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).keys(args))
 
 
 # Per-agent window status-bar styling under the bare-`mozyo` window model.

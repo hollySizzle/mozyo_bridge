@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5823
+    lines: 5752
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -351,6 +351,27 @@ allowlist:
       ``test_notify_command`` adds the fake-port use-case specifications. The
       50-line net removal is measured from the post-#12930 baseline (5873), so the
       combined post-merge ``commands.py`` line count is 5823.
+      Lowered 5823 -> 5752 for the #12932 OOP-first pane-primitive command-wrapper
+      tranche (rebased onto current origin/main atop the #12931 tranche above; the
+      Review Gate j#69694 blocker was the stale-base merge-order conflict, not an
+      isolated behavior finding): the `cmd_id` / `cmd_resolve` / `cmd_read` /
+      `cmd_type` / `cmd_message` / `cmd_keys` low-level pane/debug primitives moved
+      into the new `application/pane_primitive_command.py` boundary (a
+      `PanePrimitiveOps` port over every tmux / pane / read-marker primitive the
+      family touches, a `LivePanePrimitiveOps` adapter routing those primitives
+      through `commands.*` at call time, a `PanePrimitiveUseCase` owning the six
+      behavior-preserving flows, and a typed `PanePrimitiveOutcome`). The `cmd_*`
+      handlers stay here as thin composition roots (module-level names preserved for
+      the cli_core / cli / cli_handoff parser bindings, the `rollback_unsubmitted_input`
+      / notify internal callers, and the `commands.cmd_read` / `.cmd_message` /
+      `.cmd_keys` monkeypatch seams) that print the outcome via the shared
+      `_emit_pane_primitive_outcome` helper. The `_emit_message_gate_guidance` stderr
+      trailer moved with the family (routed via the port); the sibling
+      `_emit_handoff_marker_timeout_guidance` stays here (its caller is the
+      out-of-scope `orchestrate_handoff` strict rail). The 71-line net removal is
+      measured from the post-#12931 baseline (5823), so the combined post-merge
+      `commands.py` line count is 5752. `test_pane_primitive_command` adds the
+      fake-port use-case specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
