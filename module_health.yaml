@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5752
+    lines: 5587
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -372,6 +372,29 @@ allowlist:
       measured from the post-#12931 baseline (5823), so the combined post-merge
       `commands.py` line count is 5752. `test_pane_primitive_command` adds the
       fake-port use-case specifications.
+      Lowered 5752 -> 5587 for the #12933 OOP-first cockpit/status/layout
+      command-entry tranche (rebased/integrated onto current origin/main atop the
+      #12930/#12931/#12932 tranches above; the Review Gate blocker was the
+      stale-base merge-order conflict, not an isolated behavior finding): the two
+      attach-launching command bodies moved into the new
+      `application/launch_command.py` boundary (the pure `attach_*` / `build_*` /
+      `render_*` policy, a `LaunchOps` port + `LiveLaunchOps` adapter, and the
+      `MozyoLaunchUseCase` / `CockpitLayoutUseCase` returning typed
+      `MozyoLaunchOutcome` / `LayoutLaunchOutcome`). `cmd_mozyo` and
+      `cmd_layout_apply` stay here as thin handlers: run the use case, print the
+      outcome, do the terminal `os.execvp` attach through the live adapter (which
+      routes `require_tmux` / `session_exists` / `ensure_repo_session_windows` /
+      `run_tmux` / `_resolve_cockpit_workspaces` / `_agent_launch_command` /
+      `execute_cockpit_plan` and `os.execvp` through `commands.*` at call time, so
+      the characterization tests are unchanged). The `_parse_mozyo_window_rows`
+      helper (single-use by the `mozyo --json` payload) moved into the boundary
+      byte-for-byte and its dead `AGENT_LABELS` import was dropped. `cmd_status`
+      was already thin (#12831); the larger `cmd_cockpit` dispatcher and its
+      cockpit-repair handlers stay residual to #12638. The 165-line net removal is
+      measured from the post-#12932 baseline (5752); the region is disjoint from
+      the #12930/#12931/#12932 carves (doctor/instruction tail + notify wrappers +
+      pane primitives), so the combined post-merge ``commands.py`` line count is
+      5587.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
