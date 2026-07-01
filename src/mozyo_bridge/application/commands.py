@@ -5537,19 +5537,18 @@ def cmd_instruction_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_instruction_install(args: argparse.Namespace) -> int:
+    # Thin handler over the ``instruction_install_command`` boundary (#12935): the
+    # run + json/text render + exit-code mapping live there. Lazy imports preserve
+    # the ``instruction_install`` monkeypatch seams.
     from mozyo_bridge.application.instruction_install import (
         format_instruction_install_text,
         run_instruction_install,
     )
+    from mozyo_bridge.application.instruction_install_command import InstructionInstallUseCase
 
-    result = run_instruction_install(args)
-    if getattr(args, "json", False):
-        import json as _json
-
-        print(_json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_instruction_install_text(result))
-    return 0 if result["ok"] else 1
+    outcome = InstructionInstallUseCase(run_instruction_install, format_instruction_install_text).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
 
 
 # --- Compatibility facade: handlers split into family modules (#12142, #12154). ---

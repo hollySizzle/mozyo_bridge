@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5587
+    lines: 5586
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -395,6 +395,22 @@ allowlist:
       the #12930/#12931/#12932 carves (doctor/instruction tail + notify wrappers +
       pane primitives), so the combined post-merge ``commands.py`` line count is
       5587.
+      Lowered 5587 -> 5586 for the #12935 OOP-first instruction-install command-entry
+      tranche (rebased/integrated onto current origin/main atop the #12933 tranche
+      above; the successive Review Gate blockers j#69708 / j#69739 / j#69759 were
+      stale-base merge-order conflicts against #12931 then #12932 then #12933, not
+      isolated behavior findings): the `cmd_instruction_install` (`runtime-config
+      install` / deprecated `instruction install`) json/text rendering decision +
+      `result["ok"]` exit-code mapping moved into the new
+      `application/instruction_install_command.py` boundary (`InstructionInstallUseCase`
+      returning a typed `InstructionInstallOutcome`). It stays here as a thin handler
+      that hands the use case the `instruction_install` runner + renderer resolved
+      lazily at call time (so that module's monkeypatch seams are unchanged) and
+      prints the outcome; the write-side entry keeps its own boundary rather than
+      coupling to the #12930 diagnostic module. The region is disjoint from the
+      #12933 cockpit/status/layout launch carve, so it auto-merges cleanly; the
+      extracted body net-shrinks the module by 1 line from the post-#12933 baseline
+      (5587), so the combined post-merge `commands.py` line count is 5586.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
