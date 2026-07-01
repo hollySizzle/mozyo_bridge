@@ -2,11 +2,11 @@
 
 Redmine #11889 / #12603。git worktree の生成・削除・命名・並列運用 policy を、現行実装では mozyo-bridge core CLI の標準機能にせず、LLM が実行できる skill / runbook / operator recipe として扱う方針正本。
 
-> 本 doc は責務境界の **方針正本 + 汎用 runbook** である。#11889 時点では新しい core CLI worktree command を追加しない。#12603 / `sublane lifecycle and worktree integration late window` planning bucket では、設定駆動の sublane lifecycle として core-managed Git worktree / retire-time merge を導入するかを再設計する。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
+> 本 doc は責務境界の **方針正本 + 汎用 runbook** である。#11889 時点では新しい core CLI worktree command を追加しない。#12603 / `sublane lifecycle and worktree integration late window` roadmap group では、設定駆動の sublane lifecycle として core-managed Git worktree / retire-time merge を導入するかを再設計する。実運用 policy (削除条件・N 本並列の上限など) は operator 判断であり、OSS default に固定しない。
 
 ## 背景
 
-`#11850` の cockpit サブレーン PoC では、issue ごとに git worktree を作り、lane / pane / branch / Redmine gate を対応させる運用が有効だった。運用哲学、bandwidth/admission、pipeline fill の正本は、この repo では repo-local spine [[logic-coordinator-sublane-development-flow]] である。
+`#11850` の cockpit サブレーン PoC では、issue ごとに git worktree を作り、lane / pane / branch / Redmine gate を対応させる運用が有効だった。運用哲学、bandwidth/admission、pipeline fill の正本は、この repo では repo-local spine [[logic-coordinator-sublane-development-flow]] である。worktree 段階を含むサブレーン全体のライフサイクル (workspace identity / launch / worktree / callback / retire / merge / acceptance smoke) の段階関係と各段階の正本所在は [[logic-sublane-lifecycle-map]] を index として読む。
 
 > 配布注記: この spine 本体は **mozyo_bridge repo-local であり配布されない**。本 doc 自体は scaffold で配布されるため、配布先 (adopter) には spine が存在しない。adopter は spine を読みに行かず、配布済みの `mozyo-bridge-agent` skill workflow reference (`skills/mozyo-bridge-agent/references/workflow.md`) を sublane 規律の entrypoint として読む。とくに `## Post-Dispatch Fill Loop` (pipeline-first / coordinator-blocking 語彙 / Drain Order) と、`## Sublane Coordinator Callback` / `## Sublane Completion Guardrails` (callback drain / downstream resume) / `## Sublane Retirement Drain` / `## Owner Approval Aggregation` が、bandwidth/admission・callback・retirement・owner aggregation の配布版正本である。
 

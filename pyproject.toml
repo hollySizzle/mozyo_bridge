@@ -68,6 +68,11 @@ mozyo_bridge = [
     "scaffold/presets/presets.yaml",
     "scaffold/presets/*/AGENTS.md",
     "scaffold/presets/*/CLAUDE.md",
+    # Sublane-flow opt-in router variants (Redmine #11955): the scaffold reads
+    # these `_router/*.sublane.md` templates when `--with-sublane-flow` is set,
+    # so they must travel with the wheel alongside the base router templates.
+    "scaffold/presets/*/AGENTS.sublane.md",
+    "scaffold/presets/*/CLAUDE.sublane.md",
     "scaffold/presets/*/VERSION",
     "scaffold/presets/*/agent-workflow.md",
     # Preset-shipped repo-local artifacts under `files/`. setuptools' glob

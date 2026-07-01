@@ -4,8 +4,8 @@
 the project gateway?"* over the discovered :class:`TargetCandidate` list. It does
 not answer the two questions the GK3500 exploratory smoke (#12698) surfaced:
 
-1. **launch-or-adopt** — when classification lands a request on
-   ``giken-cloud-drive-management`` but *no* live lane carries that project's
+1. **launch-or-adopt** — when classification lands a request on a specific
+   project scope but *no* live lane carries that project's
    gateway identity, the resolver returns ``gateway_missing`` and stops. The
    grandparent coordinator had no semantic way to say *"adopt the existing
    gateway, or launch one"* without copying a ``%pane``.

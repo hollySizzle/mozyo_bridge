@@ -50,7 +50,10 @@ class MessageContractTest(unittest.TestCase):
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.require_read"), \
             patch("mozyo_bridge.application.commands.clear_read"), \
-            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch(
+                "mozyo_bridge.application.commands_target_select.resolve_message_target",
+                return_value="%2",
+            ), \
             patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
             patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
@@ -268,7 +271,10 @@ class MessageGateGuidanceTest(unittest.TestCase):
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             require_read_patch, \
             patch("mozyo_bridge.application.commands.clear_read"), \
-            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch(
+                "mozyo_bridge.application.commands_target_select.resolve_message_target",
+                return_value="%2",
+            ), \
             patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
             patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \
@@ -381,7 +387,10 @@ class MessageGateGuidanceTest(unittest.TestCase):
         with patch("mozyo_bridge.application.commands.require_tmux"), \
             patch("mozyo_bridge.application.commands.require_read"), \
             patch("mozyo_bridge.application.commands.clear_read"), \
-            patch("mozyo_bridge.application.commands.resolve_target", return_value="%2"), \
+            patch(
+                "mozyo_bridge.application.commands_target_select.resolve_message_target",
+                return_value="%2",
+            ), \
             patch("mozyo_bridge.application.commands.current_pane", return_value="%1"), \
             patch("mozyo_bridge.application.commands.pane_window_name", return_value="codex"), \
             patch("mozyo_bridge.application.commands.pane_location", return_value="agents:0.0"), \

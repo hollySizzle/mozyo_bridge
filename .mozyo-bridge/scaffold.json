@@ -28,10 +28,10 @@
       "sha256": "718e6707047608a7f830c5a06b9c2796ff1114f0d926011dfde59d4afcd949c2"
     },
     "AGENTS.md": {
-      "sha256": "59148c6d6f6a62572bc00054c9fb5be7e8293056de99aae1ca54312fd0634a6f"
+      "sha256": "53d7f3602dd7a057ecaa3c875d856561e9fccb0cdf1951a328eecd1cafc2f6a1"
     },
     "CLAUDE.md": {
-      "sha256": "4234a80c925dc7cdfdabc6f763d181064b47ef0f41aa524cfb86a7ed01f89b4e"
+      "sha256": "fb402a4ec39adc61b8d4ba474ac98fc909197349fd8bf7ebf4ac0199be8e684b"
     }
   },
   "generated_by": "mozyo-bridge 0.9.2",

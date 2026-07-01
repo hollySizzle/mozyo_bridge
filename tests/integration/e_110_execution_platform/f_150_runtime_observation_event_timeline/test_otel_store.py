@@ -470,11 +470,17 @@ class PackagingMetadataTest(unittest.TestCase):
         self.assertIn("keywords", project)
         self.assertIn("classifiers", project)
         extras = project["optional-dependencies"]
-        self.assertEqual(["otel"], sorted(extras))
-        for requirement in extras["otel"]:
-            # Every extras entry must look like a PEP 508 requirement,
-            # not orphaned project metadata.
-            self.assertRegex(requirement, r"^[A-Za-z0-9_.-]+[><=~!]")
+        # `otel` is the runtime OTLP decode extra (#11672); `typecheck` is the
+        # opt-in dev extra pinning mypy for the staged typing gate (#12642).
+        # Both are legitimate PEP 508 extras — the guard below is that every
+        # extras entry is a requirement, not orphaned project metadata that a
+        # TOML table-placement mistake dropped under optional-dependencies.
+        self.assertEqual(["otel", "typecheck"], sorted(extras))
+        for requirements in extras.values():
+            for requirement in requirements:
+                # Every extras entry must look like a PEP 508 requirement,
+                # not orphaned project metadata.
+                self.assertRegex(requirement, r"^[A-Za-z0-9_.-]+[><=~!]")
 
 
 class BootstrapInjectionTest(unittest.TestCase):
