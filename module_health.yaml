@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 5873
+    lines: 5823
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -335,6 +335,22 @@ allowlist:
       `doctor_instruction` / `instruction_doctor` runner + renderer resolved lazily
       at call time (so those modules' monkeypatch seams are unchanged) and print the
       outcome; the extracted bodies net-shrink the module by 2 lines.
+      Lowered 5873 -> 5823 for the #12931 OOP-first notify command-wrapper tranche
+      (rebased/integrated onto current origin/main atop the #12930 tranche above):
+      the ``notify_agent`` legacy-queue body and the ``_notify_standard_via_handoff``
+      standard adapter body moved into the new ``application/notify_command.py``
+      boundary (a ``NotifyOps`` port + ``LiveNotifyOps`` adapter, and the
+      ``LegacyQueueNotifyUseCase`` / ``StandardNotifyUseCase`` use cases). Both
+      ``notify_agent`` and ``_notify_standard_via_handoff`` stay here as thin
+      adapters (build the ops, run the use case) so their importers
+      (``test_mozyo_bridge`` imports ``notify_agent``; ``cli`` / ``cli_handoff``
+      bind the ``cmd_notify_*`` entry points) and the ``commands.*`` monkeypatch
+      seams the live adapter resolves at call time are unchanged. This tranche does
+      not touch ``orchestrate_handoff``, the handoff implementation_request guard,
+      or the gateway route enforcement surfaces (out of #12931 scope);
+      ``test_notify_command`` adds the fake-port use-case specifications. The
+      50-line net removal is measured from the post-#12930 baseline (5873), so the
+      combined post-merge ``commands.py`` line count is 5823.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

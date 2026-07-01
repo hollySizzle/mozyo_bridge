@@ -3724,35 +3724,20 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def notify_agent(args: argparse.Namespace, agent: str) -> int:
-    require_tmux()
-    validate_notify_gate(args)
-    task = None if getattr(args, "journal", None) else find_handoff_task(args, agent)
-    target_name = args.target or agent
-    if getattr(args, "config", False):
-        load_tmux_conf_for(args)
-    target_info = pane_info(target_name)
-    ensure_agent_target(target_info, agent, force=args.force)
-    target = target_info["id"]
-    read_lines = str(args.read_lines)
-    cmd_read(argparse.Namespace(target=target, lines=args.read_lines))
-    prompt = build_prompt(args, agent, task)
-    cmd_message(argparse.Namespace(target=target, text=prompt, submit=False))
-    cmd_read(argparse.Namespace(target=target, lines=args.read_lines))
-    marker = landing_marker(args, task)
-    landing_lines = max(args.read_lines, 200)
-    if not wait_for_text(target, marker, landing_lines, args.landing_timeout):
-        rollback_unsubmitted_input(target)
-        die(
-            "notification marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
-            f"target={target} marker={marker}"
-        )
-    submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.0) or 0.0))
-    if submit_delay:
-        time.sleep(submit_delay)
-    cmd_keys(argparse.Namespace(target=target, keys=["Enter"]))
-    gate = f"task={task.get('id')}" if task else f"journal={args.journal}"
-    print(f"notified {agent}: {gate} target={target} read_lines={read_lines}")
-    return 0
+    """Legacy-queue notify path (`notify-*-legacy-task`).
+
+    The type-observe-marker-Enter TUI orchestration and its byte-for-byte
+    behavior live in :class:`mozyo_bridge.application.notify_command.
+    LegacyQueueNotifyUseCase` (#12931); this stays a thin adapter so importers
+    (`test_mozyo_bridge`) and the ``commands.*`` monkeypatch seams the use case
+    resolves at call time are unchanged.
+    """
+    from mozyo_bridge.application.notify_command import (
+        LegacyQueueNotifyUseCase,
+        LiveNotifyOps,
+    )
+
+    return LegacyQueueNotifyUseCase(LiveNotifyOps()).run(args, agent)
 
 
 def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_kind: str) -> int:
@@ -3763,51 +3748,16 @@ def _notify_standard_via_handoff(args: argparse.Namespace, agent: str, default_k
     orchestration rail with `mozyo-bridge handoff` / `mozyo-bridge reply`.
     Legacy queue notifications (`notify-*-legacy-task`) intentionally stay on
     ``notify_agent``; they remain wrapper-only cleanup paths, not the
-    standard path.
+    standard path. The body lives in
+    :class:`mozyo_bridge.application.notify_command.StandardNotifyUseCase`
+    (#12931); this stays a thin adapter.
     """
-    validate_notify_gate(args)
-    type_str = getattr(args, "type", None)
-    if type_str in KIND_LABELS:
-        kind = type_str
-        summary = None
-    else:
-        kind = default_kind
-        summary = f"legacy --type={type_str}" if type_str else None
-    forwarded = argparse.Namespace(
-        to=agent,
-        source="redmine",
-        kind=kind,
-        issue=getattr(args, "issue", None),
-        journal=getattr(args, "journal", None),
-        task_id=None,
-        comment_id=None,
-        anchor_url=None,
-        target=getattr(args, "target", None),
-        mode=MODE_QUEUE_ENTER,
-        summary=summary,
-        force=bool(getattr(args, "force", False)),
-        landing_timeout=float(getattr(args, "landing_timeout", 8.0) or 8.0),
-        submit_delay=float(getattr(args, "submit_delay", 0.2) or 0.0),
-        read_lines=int(getattr(args, "read_lines", 50) or 50),
-        record_format=getattr(args, "record_format", RECORD_FORMAT_BOTH),
-        record_command=getattr(args, "record_command", None),
+    from mozyo_bridge.application.notify_command import (
+        LiveNotifyOps,
+        StandardNotifyUseCase,
     )
-    rc = orchestrate_handoff(forwarded)
-    # Preserve the legacy success line so external scripts and the in-repo
-    # smoke (`smoke/real_tmux_notify_smoke.py`) that grep `notified <agent>:
-    # journal=...` keep working. The new primitive owns the durable record
-    # and structured outcome; this wrapper line is purely a back-compat
-    # courtesy and only fires on successful return from orchestrate_handoff
-    # (which dies on marker_timeout, so failure paths never reach this).
-    if rc == 0:
-        try:
-            target = pane_info(getattr(args, "target", None) or agent)["id"]
-        except SystemExit:
-            target = "-"
-        read_lines = int(getattr(args, "read_lines", 50) or 50)
-        journal = getattr(args, "journal", None)
-        print(f"notified {agent}: journal={journal} target={target} read_lines={read_lines}")
-    return rc
+
+    return StandardNotifyUseCase(LiveNotifyOps()).run(args, agent, default_kind)
 
 
 def cmd_notify_codex(args: argparse.Namespace) -> int:
