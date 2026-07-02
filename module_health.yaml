@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4223
+    lines: 4141
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -761,6 +761,24 @@ allowlist:
       4374 -> 4223 is a 151-line net removal and the post-carve ``commands.py``
       line count is 4223. ``test_cockpit_reset_command`` adds the fake-port
       use-case + pure-rendering specifications.
+      Lowered 4223 -> 4141 for the #13009 cockpit rebalance handler residual
+      tranche (stacked on the #12989 reset carve above): the preview / json /
+      confirm-gated ``mozyo cockpit rebalance`` handler
+      (``_handle_cockpit_rebalance``) moved to the new
+      ``application/cockpit_rebalance_command.py``: a pure
+      ``render_rebalance_preview_lines`` renderer, a ``CockpitRebalanceOps``
+      port with a ``LiveCockpitRebalanceOps`` adapter routing the
+      ``_cockpit_rebalance_columns`` column read (behind the
+      ``_read_cockpit_window_layout`` patch seam) / ``require_tmux`` / #12135
+      rebalance executor / ``die`` seams through this module at call time, and
+      a ``CockpitRebalanceUseCase`` rendering through an injected ``emit``
+      sink. ``_handle_cockpit_rebalance`` stays as a same-signature thin
+      wrapper; the shared ``_read_cockpit_window_layout`` /
+      ``_cockpit_rebalance_columns`` readers stay here (the reconcile handler
+      still consumes them directly). 4223 -> 4141 is an 82-line net removal and
+      the post-carve ``commands.py`` line count is 4141.
+      ``test_cockpit_rebalance_command`` adds the fake-port use-case +
+      pure-rendering specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
