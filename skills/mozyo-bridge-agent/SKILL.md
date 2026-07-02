@@ -5,27 +5,27 @@ description: Follow the mozyo_bridge project workflow for ticket-driven work (Re
 
 # mozyo-bridge-agent
 
-## Core Workflow
+## 中核 workflow
 
-1. Fetch the repository's central preset rules named in `AGENTS.md` (the `mozyo_bridge` repo itself uses the `redmine-governed` preset; other adopting projects may use `redmine`, `asana`, or `none`).
-2. Confirm the current `cwd`.
-3. Confirm the active ticket in the repo's ticket system (Redmine issue / journal for Redmine-preset repos including `mozyo_bridge`; Asana task / comment for Asana-preset repos) and the project notes.
-4. Read only the reference files needed for the current work.
-5. Run verification that matches the risk of the change.
-6. Record material results, blockers, and remaining risks in the active ticket system (Redmine journal or Asana comment, whichever the repo uses).
+1. `AGENTS.md` に記載された repository の central preset rules を取得する (`mozyo_bridge` repo 自身は `redmine-governed` preset を使う。他の採用 project は `redmine`、`asana`、`none` を使う場合がある)。
+2. 現在の `cwd` を確認する。
+3. repo の ticket システムで active な ticket (`mozyo_bridge` を含む Redmine-preset repo では Redmine issue / journal、Asana-preset repo では Asana task / comment) と project notes を確認する。
+4. 現在の作業に必要な reference file のみを読む。
+5. 変更の risk に見合った検証を実行する。
+6. 重要な結果、blocker、残存 risk を active な ticket システム (repo が使う方の Redmine journal または Asana comment) に記録する。
 
-## References
+## 参照
 
-- Work execution rules: `references/workflow.md`
-- Redmine issue authoring granularity and Version operation: `references/redmine-issue-authoring.md`
-- Project map and source-of-truth routing: `references/project-map.md`
-- Release and verification checks: `references/release.md`
-- Safety rules for tmux notification behavior: `references/safety.md`
+- 作業実行規約: `references/workflow.md`
+- Redmine issue の起票粒度と Version 運用: `references/redmine-issue-authoring.md`
+- Project map と正本 routing: `references/project-map.md`
+- Release と検証 check: `references/release.md`
+- tmux 通知動作の安全規約: `references/safety.md`
 
-## Guardrails
+## Guardrail
 
-- Do not store secrets, tokens, personal credentials, or personal information in repo files, preset rule docs, or ticket-system entries (Asana tasks / comments, Redmine issues / journals).
-- Keep root `AGENTS.md` and `CLAUDE.md` as routers. Do not turn them into full rule books.
-- Treat `mozyo-bridge` pane messages as notifications, not authoritative task state.
-- Prefer GitHub Actions Trusted Publishing over local PyPI token upload.
-- Imperative or request phrases from the user ("実行せよ", "対応して", "やって", "implement it", etc.) are not by themselves authorization for Codex to perform a direct edit on policy / skill / rule files. Convert normal development tasks into a Claude handoff by default. See `references/workflow.md` for the narrow Codex direct-edit exception conditions.
+- secret、token、個人 credential、個人情報を repo file、preset rule doc、ticket システムの entry (Asana task / comment、Redmine issue / journal) に保存しない。
+- root の `AGENTS.md` と `CLAUDE.md` は router として維持する。完全な rule book に変えない。
+- `mozyo-bridge` の pane message は通知として扱い、権威ある task state として扱わない。
+- local の PyPI token upload より GitHub Actions Trusted Publishing を優先する。
+- ユーザーからの命令・依頼の表現 ("実行せよ", "対応して", "やって", "implement it" など) は、それ単体では Codex が policy / skill / rule file を直接編集する authorization にならない。通常の開発 task は default で Claude への handoff に変換する。Codex direct-edit の狭い例外条件は `references/workflow.md` を読む。

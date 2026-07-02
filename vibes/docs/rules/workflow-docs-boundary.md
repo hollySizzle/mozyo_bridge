@@ -1,6 +1,6 @@
 # Workflow Docs Source-Of-Truth Boundary
 
-Redmine #13025。mozyo-bridge の workflow docs を「配布して他 project でも成立させる基幹運用」と「この repo 固有の運用」に分離するための判断規約。mozyo_bridge dogfood でうまくいった workflow が repo-local に閉じ込められ、他 project で 3-window workflow や Redmine 操作が再現しない状態を防ぐ。portable な判断ルール自体は配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## Workflow Docs Source-Of-Truth Boundary` 節が正本であり、本 doc はその mozyo_bridge repo への適用 (surface 対応表 / upstream 手順 / repo 固有分類) を定義する。同じ判断材料を両方に複製しない。
+Redmine #13025。mozyo-bridge の workflow docs を「配布して他 project でも成立させる基幹運用」と「この repo 固有の運用」に分離するための判断規約。mozyo_bridge dogfood でうまくいった workflow が repo-local に閉じ込められ、他 project で 3-window workflow や Redmine 操作が再現しない状態を防ぐ。portable な判断ルール自体は配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## Workflow docs の正本境界` 節が正本であり、本 doc はその mozyo_bridge repo への適用 (surface 対応表 / upstream 手順 / repo 固有分類) を定義する。同じ判断材料を両方に複製しない。
 
 ## Surface 対応表
 

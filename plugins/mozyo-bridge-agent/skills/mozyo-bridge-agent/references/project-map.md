@@ -1,41 +1,41 @@
-# Project Map Reference
+# Project map リファレンス
 
-How an agent resolves the project map — important paths, documentation namespaces, and the ticket-system binding — for the repository it is working in. The map itself is repo-specific data and lives in the adopting repo, not in this distributed body.
+agent が作業対象の repository について project map — 重要 path、documentation namespace、ticket システムの binding — をどう解決するか。map 自体は repo 固有の data であり、この配布本文ではなく採用 repo 側にある。
 
-## Resolving The Adopting Repo's Map
+## 採用 repo 自身の map を解決する
 
-- Read the adopting repo's own project map from its local docs namespace; for a governed-scaffold repo, the docs catalog is the entry point (`mozyo-bridge docs resolve <path>` surfaces the registered map / spec docs for the paths you are touching).
-- A useful project map covers: the package / import names, the repository and workspace root, the ticket system and project id selected by the repo's scaffold preset, the implementation / test / docs paths, CI workflows, and packaging metadata.
-- Root `AGENTS.md` / `CLAUDE.md` stay thin routers; the map body belongs in the repo's local docs, and this reference does not duplicate it.
+- 採用 repo 自身の project map をその local docs namespace から読む。governed-scaffold repo では docs catalog が入口である (`mozyo-bridge docs resolve <path>` が、触っている path に対して登録済みの map / spec docs を提示する)。
+- 有用な project map は次を網羅する: package / import 名、repository と workspace root、repo の scaffold preset が選択した ticket システムと project id、実装 / test / docs の path、CI workflow、packaging metadata。
+- root の `AGENTS.md` / `CLAUDE.md` は thin router のままとする。map の本文は repo の local docs に属し、本 reference はそれを複製しない。
 
-## mozyo_bridge (this repository) — worked example
+## mozyo_bridge (この repository) — worked example
 
-The concrete map below is for the `mozyo_bridge` repository itself — the repo that develops mozyo-bridge — kept here as a worked example and for dogfooding sessions. An adopting project maintains its own equivalent in its local docs; do not copy these values.
+以下の具体的な map は `mozyo_bridge` repository 自身 — mozyo-bridge を開発する repo — のものであり、worked example として、また dogfooding session のためにここに保持する。採用 project は自身の同等物を自身の local docs で維持する。これらの値を copy しない。
 
 ### Repository
 
 - Project: `mozyo-bridge`
 - Import package: `mozyo_bridge`
-- Package name: `mozyo-bridge`
+- Package 名: `mozyo-bridge`
 - Repository: https://github.com/hollySizzle/mozyo_bridge
-- Workspace: repository root
-- Ticket system for `mozyo_bridge`: Redmine project `giken-3800-mozyo-bridge` (preset `redmine-governed`); the durable work record is the Redmine issue / journal.
-- Asana project: configure per user or private workspace (used by adopting repos whose central preset is `asana`, not by `mozyo_bridge` itself).
+- Workspace: repository の root
+- `mozyo_bridge` の ticket システム: Redmine project `giken-3800-mozyo-bridge` (preset `redmine-governed`)。durable な作業記録は Redmine issue / journal である。
+- Asana project: user ごとまたは private workspace で設定する (central preset が `asana` の採用 repo が使うもので、`mozyo_bridge` 自身は使わない)。
 
-### Important Paths
+### 重要 path
 
-- `src/mozyo_bridge/`: package implementation
-- `tests/`: unit tests
-- `smoke/real_tmux_notify_smoke.py`: real tmux notification smoke test
+- `src/mozyo_bridge/`: package 実装
+- `tests/`: unit test
+- `smoke/real_tmux_notify_smoke.py`: 実 tmux 通知 smoke test
 - `.github/workflows/test.yml`: CI test workflow
 - `.github/workflows/testpypi.yml`: TestPyPI publish workflow
 - `.github/workflows/publish.yml`: production PyPI publish workflow
 - `pyproject.toml`: package metadata
-- `README.md`: user-facing usage and safety notes
-- `.env.example`: local environment example with no secrets
+- `README.md`: user 向けの使用方法と安全上の注意
+- `.env.example`: secret を含まない local 環境の example
 
-### Documentation
+### ドキュメント
 
-- `vibes/docs/`: project documentation namespace, not a runtime namespace.
-- `skills/mozyo-bridge-agent/`: shared skill source for Claude/Codex workflow guidance.
-- `.claude/skills/mozyo-bridge-agent/`: Claude Code project-skill adapter.
+- `vibes/docs/`: project documentation の namespace であり、runtime namespace ではない。
+- `skills/mozyo-bridge-agent/`: Claude/Codex workflow guidance の共有 skill source。
+- `.claude/skills/mozyo-bridge-agent/`: Claude Code の project-skill adapter。

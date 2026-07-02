@@ -1,60 +1,67 @@
-# Safety Reference
+# Safety リファレンス
 
-## Secret Handling
+## Secret の取り扱い
 
-- Do not commit or paste real PyPI/TestPyPI tokens, API keys, personal credentials, or personal information.
-- `.env`, `.env.*`, and `.pypirc` are local-only secret surfaces and must stay ignored.
-- Do not store secrets in any ticket-system entries (Asana task descriptions / comments, Redmine issue descriptions / journals), preset rule docs, knowledge base pages, or repository docs.
+- 実物の PyPI/TestPyPI token、API key、個人 credential、個人情報を commit したり貼り付けたりしない。
+- `.env`、`.env.*`、`.pypirc` は local 専用の secret surface であり、ignore されたままにしなければならない。
+- secret を ticket システムの entry (Asana task description / comment、Redmine issue description / journal)、preset rule doc、knowledge base page、repository docs のいずれにも保存しない。
 
-## Notification Safety
+## 通知の安全規約
 
-- `mozyo-bridge` is a notification transport.
-- It is not the source of truth for review state, task completion, or release approval.
-- The receiving agent must check Asana or the named source of truth before acting. Do not infer receiver state, task state, or gate state from `mozyo-bridge status` output, `mozyo-bridge doctor` output, or pane scrollback when a durable Asana / Redmine anchor is available; those surfaces are operator/debug aids, not the durable record. Read the named task / comment / issue / journal instead.
-- The standard handoff/reply path is the high-level primitive: `mozyo-bridge handoff send` / `mozyo-bridge handoff reply` / top-level alias `mozyo-bridge reply`. The primitive resolves the receiver pane, runs the deterministic Layer B preflight, types the marker-prefixed notification, and either presses Enter (queue-enter / standard rails) or leaves it pending (`--mode pending`). The caller does not assemble `mozyo-bridge read` + `mozyo-bridge message` shell choreography for normal handoff/reply.
-- The `notify-*` wrappers (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) are compatibility entrypoints that route internally through the same primitive for standard Redmine-shaped notifications and keep the same safety rails. `notify-*-legacy-task` is a retired-queue cleanup wrapper only and is not the standard path.
-- The low-level `mozyo-bridge read`, `mozyo-bridge message`, `mozyo-bridge type`, and `mozyo-bridge keys` commands are operator/debug primitives (pane inspection, ad-hoc operator messages, raw typing, raw keys). They are not the standard handoff/reply path; do not assemble them by hand as a routine substitute for the primitive. The only sanctioned uses are the `--no-submit` operator/debug fallback in the per-preset Retry Path Checklist and explicit operator debugging.
-- Two send rails exist; pick the right one rather than weakening either:
-  - `--mode queue-enter` (v0.4 normative default for agent pane handoff — `mozyo-bridge handoff send` / `handoff reply` / `notify-*` standard variants targeting Claude / Codex panes; rejects `--force`): a deterministic Layer B preflight runs before any typing; if any of the following checks fails, the CLI dies with `blocked` and the corresponding `Reason` before `send-keys -l` is issued:
-    - explicit `--target` must live in the receiver's tmux window (`Reason: invalid_args`),
-    - target pane must live in the **sender's** tmux session, i.e. invoke from inside the same tmux session as the receiver (`Reason: invalid_args`),
-    - target pane must be the **active split** of its window (`Reason: invalid_args`),
-    - foreground process must match the receiver's allowlist (`Reason: target_not_agent`): strong identity for literal `claude` (receiver=`claude`) and literal `codex` (receiver=`codex`); weak identity for literal `node` and versioned native binary basenames, which both Claude Code and Codex CLI legitimately use — Step 9 (window-name binding) plus operator discipline carry cross-binding protection in the weak case.
-    When all checks pass, Enter is issued regardless of whether the landing marker was observed. Outcome is `sent` / `ok` when the marker was observed and `sent` / `queue_enter` when it was not — both are practical queued submission, not confirmed landing, so receivers still read the durable Asana task comment / Redmine journal as the source of truth. v0.4 default flip does not weaken the preflight; out-of-scope targets (`mozyo-bridge message`, non-agent panes) do not enter this rail.
-  - `--mode standard` (strict explicit fallback, preserved from v0.1; `mozyo-bridge message --submit` default behavior): strict marker-observed Enter. Marker miss is fail-closed — input is cleared via `C-u`, Enter is not sent, and the outcome is `blocked` / `marker_timeout`. Select this rail explicitly when strict landing observation is required (regression check after a queue-enter rail change, brand-new pane where queue-pickup probability is unverified, observability test, audit requirement that demands strict landing evidence) or when the target falls outside the v0.4 default scope. Behavior is unchanged from v0.1 and not relaxed by the default flip; record the reason for selecting it in the durable record so an auditor can replay why the default was overridden.
-- Whichever rail is used, the durable record (Asana task comment / Redmine journal) is still the source of truth. The pane notification is a pointer.
-- `.agent_handoff/tasks.json` is a retired queue cleanup surface, not a standard notification fallback.
+- `mozyo-bridge` は通知 transport である。
+- review state、task 完了、release 承認の正本ではない。
+- 受信側 agent は行動する前に Asana または指名された正本を確認しなければならない。durable な Asana / Redmine anchor が利用可能なときは、`mozyo-bridge status` 出力、`mozyo-bridge doctor` 出力、pane scrollback から receiver state、task state、gate state を推測しない。これらの surface は operator/debug 補助であり、durable record ではない。代わりに指名された task / comment / issue / journal を読む。
+- 標準の handoff/reply 経路は高レベル primitive である: `mozyo-bridge handoff send` / `mozyo-bridge handoff reply` / top-level alias `mozyo-bridge reply`。この primitive は receiver pane を解決し、決定的な Layer B preflight を実行し、marker 前置の通知を type し、Enter を押す (queue-enter / standard rail) か pending のまま残す (`--mode pending`)。caller は通常の handoff/reply のために `mozyo-bridge read` + `mozyo-bridge message` の shell choreography を自前で組み立てない。
+- `notify-*` wrapper (`notify-codex`, `notify-claude`, `notify-codex-review`, `notify-claude-review-result`) は互換 entrypoint であり、標準の Redmine 形式通知について内部で同じ primitive を経由し、同じ safety rail を維持する。`notify-*-legacy-task` は retired-queue cleanup 専用の wrapper であり、標準経路ではない。
+- 低レベルの `mozyo-bridge read`、`mozyo-bridge message`、`mozyo-bridge type`、`mozyo-bridge keys` command は operator/debug primitive である (pane 検査、ad-hoc な operator message、raw typing、raw keys)。これらは標準の handoff/reply 経路ではなく、primitive の日常的な代替として手で組み立てない。認められた用途は、per-preset の Retry Path Checklist にある `--no-submit` operator/debug fallback と、明示的な operator debugging のみである。
+- raw な tmux pane mutation は、workflow の delivery / recovery のための agent 操作として禁止である。agent は `tmux send-keys`、`tmux paste-buffer`、直接の Enter / `C-u`、その他の raw key injection で agent pane を操作しない。低レベルの `mozyo-bridge type` / `mozyo-bridge keys` を handoff の代替として使わない。`mozyo-bridge message --no-submit` を実行してから自ら raw な Enter を発行して submit することもしない。read-only の検査 (`tmux capture-pane`、`mozyo-bridge read`) は許可される。
+- raw な tmux mutation は operator/debug 専用である。使用時点での明示的な operator 指示と、その指示の durable record (Redmine journal / Asana comment) が揃っている場合にのみ許可される。agent は自身の判断でこれを実行しない。
+- `mozyo-bridge handoff send` / `handoff reply` が失敗した場合 (例えば `marker_timeout`)、agent は `un-notified` state を durable record に記録し、receiver への到達は承認済みの高レベル経路に委ねる。receiver pane を mutate して delivery を自己修復しない。
+- 送信 rail は 2 本存在する。どちらかを弱めるのではなく、正しい方を選ぶ:
+  - `--mode queue-enter` (agent pane handoff の v0.4 規範 default — Claude / Codex pane を target とする `mozyo-bridge handoff send` / `handoff reply` / `notify-*` 標準 variant。`--force` を拒否する): typing の前に決定的な Layer B preflight が走る。次の check のいずれかが失敗した場合、CLI は `send-keys -l` を発行する前に `blocked` と対応する `Reason` を出して die する:
+    - 明示的な `--target` は receiver の tmux window 内に存在しなければならない (`Reason: invalid_args`)、
+    - target pane は **送信側** の tmux session 内に存在しなければならない。すなわち receiver と同じ tmux session の内側から呼び出す (`Reason: invalid_args`)、
+    - target pane はその window の **active split** でなければならない。**または** standard_target_admission (Redmine #12597) を pass する: 最小の admission 契約 (live pane / 強い role 一致 / `workspace_id` あり / 一意) を満たす registered な inactive split は、`tmux select-pane` で activate して deliver される — pane selection のみで、raw な `send-keys` / `paste-buffer` / 低レベル `type` / `keys` による recovery は決して行わない — activation は durable record に記録する。admit されない inactive split (例: `workspace_id` なし)、または `--no-target-activation` の場合は、`Reason: invalid_args` と strict-rail recovery command を出して fail-closed のままとなる、
+    - foreground process は receiver の allowlist に一致しなければならない (`Reason: target_not_agent`): literal `claude` (receiver=`claude`) と literal `codex` (receiver=`codex`) は強い identity。literal `node` と version 付き native binary basename は弱い identity であり、これらは Claude Code と Codex CLI の双方が正当に使う — 弱い場合の cross-binding 保護は Step 9 (window-name binding) と operator discipline が担う。
+    すべての check が pass すると、landing marker が観測されたかどうかに関わらず Enter が発行される。outcome は、marker が観測された場合は `sent` / `ok`、観測されなかった場合は `sent` / `queue_enter` である — どちらも実用上の queued submission であって確認済みの landing ではないため、receiver は引き続き durable な Asana task comment / Redmine journal を正本として読む。v0.4 の default 切り替えは preflight を弱めない。scope 外の target (`mozyo-bridge message`、非 agent pane) はこの rail に入らない。
+  - `--mode standard` (v0.1 から維持される strict な明示 fallback。`mozyo-bridge message --submit` の default 挙動): marker 観測を厳格に要求する Enter。marker miss は fail-closed である — `C-u` rollback が発行され、Enter は送信されず、outcome は `blocked` / `marker_timeout` となる (sender は receiver の composer がクリアされたことを tmux capture から検証しない)。strict な landing 観測が必要なとき (queue-enter rail 変更後の regression check、queue-pickup 確率が未検証の新規 pane、observability テスト、strict な landing 証跡を要求する audit 要件)、または target が v0.4 default scope の外にあるときに、この rail を明示的に選ぶ。挙動は v0.1 から不変で、default 切り替えによって緩和されない。default を override した理由を auditor が replay できるよう、この rail を選んだ理由を durable record に記録する。
+- どちらの rail を使う場合でも、durable record (Asana task comment / Redmine journal) が引き続き正本である。pane 通知は pointer である。
+- `.agent_handoff/tasks.json` は retired な queue cleanup surface であり、標準の通知 fallback ではない。
 
-## Tool Error Parsing
+## Tool error の解釈
 
-When a `mozyo-bridge` command (or any other tool) dies with an `error: ...` message, parse the literal text of that error first, before pattern-matching the failure shape against past similar-looking errors. The literal text is the authoritative next-step source; a remembered "this kind of error is usually fatal / escape via X" pattern from prior sessions does not override it.
+`mozyo-bridge` command (またはその他の tool) が `error: ...` message を出して die したとき、失敗の形を過去の似て見える error に pattern-match する前に、まずその error の literal text を解釈する。literal text が権威ある next-step の source である。過去 session で記憶した「この種の error は通常 fatal / X で回避」という pattern はこれを override しない。
 
-- If the error contains a literal next-action verb such as `read target again`, `retry`, `refresh`, `re-run`, or an explicit `Retry path:` / `Fallback path:` hint, follow that verb verbatim before considering any higher fallback. The verb is the authoritative next step.
-- Only after the literal next-action verb has been followed and produced a fresh failure, or after the latest error demonstrably contains no next-action verb at all, may the agent escalate to a higher fallback. Skipping the literal verb in favor of a remembered escape path is a known regression mode (Asana task 1214779823377861).
-- `mozyo-bridge message --no-submit` and `mozyo-bridge handoff send` marker-gate failures emit `hint:` trailers on stderr that name both the retry path and the per-preset `--no-submit` retry budget. Those trailers are part of the contract — read them and act on them, do not treat them as decoration.
-- The `--no-submit` retry budget (cap 3) and the standard `handoff send` retry pool are **separate budgets**. Do not borrow attempts across them when judging whether the preset's `Notification fails` branch may fire.
+- error が `read target again`、`retry`、`refresh`、`re-run` のような literal な next-action verb、あるいは明示的な `Retry path:` / `Fallback path:` hint を含む場合、より上位の fallback を検討する前に、その verb を verbatim に実行する。その verb が権威ある next step である。
+- literal な next-action verb に従った上で新たな失敗が生じた後、または最新の error が next-action verb を全く含まないと明白に確認できた後にのみ、agent はより上位の fallback へ escalate してよい。literal な verb を skip して記憶済みの escape path を優先するのは既知の regression mode である (Asana task 1214779823377861)。
+- `mozyo-bridge message --no-submit` と `mozyo-bridge handoff send` の marker-gate 失敗は、retry path と per-preset の `--no-submit` retry budget の両方を示す `hint:` trailer を stderr に出す。これらの trailer は契約の一部である — 読んで従う。飾りとして扱わない。
+- `--no-submit` retry budget (上限 3) と標準の `handoff send` retry pool は **別々の budget** である。preset の `Notification fails` branch を発火させてよいか判断する際に、両者の間で試行回数を融通しない。
 
-## Sender Handoff Boundary
+## 送信側 handoff 境界
 
-When asking another agent to work through `mozyo-bridge`, the sending agent should only verify the handoff itself:
+`mozyo-bridge` 経由で他の agent に作業を依頼するとき、送信側 agent は handoff 自体のみを検証する:
 
-- Confirm the target pane is the intended agent and repository context.
-- Send the operator message.
-- Submit the message when the delivery guard allows it. Default for agent pane handoff is `--mode queue-enter` (v0.4 normative default); use `--mode standard` only when strict landing observation is required (regression check, brand-new pane, observability test, strict-landing audit requirement) or when the target is outside the v0.4 default scope (`mozyo-bridge message`, non-agent pane).
-- Optionally read the pane once immediately after delivery to catch obvious blockers such as a missing skill, missing Notion MCP access, or an unsubmitted prompt.
+- target pane が意図した agent と repository context であることを確認する。
+- operator message を送信する。
+- delivery guard が許すときに message を submit する。agent pane handoff の default は `--mode queue-enter` (v0.4 規範 default) である。`--mode standard` は、strict な landing 観測が必要なとき (regression check、新規 pane、observability テスト、strict-landing の audit 要件)、または target が v0.4 default scope の外 (`mozyo-bridge message`、非 agent pane) のときにのみ使う。
+- 任意で、delivery 直後に pane を一度読み、skill の欠落、Notion MCP access の欠落、未 submit の prompt のような明白な blocker を捕捉する。
 
-Do not keep polling or watching the target pane as standard practice. After the handoff is delivered, rely on the durable source of truth named in the request, normally Redmine journals (for `mozyo_bridge` and other Redmine-preset repos) or Asana task comments (for Asana-preset repos), repository changes, or an explicit completion notification from the target agent.
+target pane の polling や監視を標準運用として続けない。handoff の deliver 後は、依頼で指名された durable な正本に依拠する。通常は Redmine journal (`mozyo_bridge` およびその他の Redmine-preset repo)、Asana task comment (Asana-preset repo)、repository の変更、または target agent からの明示的な完了通知である。
 
-When a project's central preset or rule mandates a sender notification for every handoff of a given direction, that requirement is not relaxed by audit-only, revalidation, or doc-only framing of the task, nor by the receiver's prior pickup-intent statement; the sender must attempt the notification on every such handoff. Recording an "un-notified" state without first attempting the standard-path notification is a sender-side rationalization, not a satisfied fallback condition.
+operator が target を pane id ではなく自然言語で指名した場合 ("人形使いへ返して", "あっちの Claude に渡して")、送信前に compact な target discovery で解決する。`mozyo-bridge agents targets` は候補を列挙するのみで、選択はしない。一意な候補を `workspace` / `lane` / `role` / `pane_id` / `repo_short` 列に照らして確認し、その上で明示的な `pane_id` へ `--target-repo auto` (または明示的な repo root) を付けて送信する — identity を pane title 単独で決して信用しない。自然名が 0 件または 2 件以上の候補に一致する場合は fail closed とする: 候補を提示するか owner に尋ね、黙って 1 つを選ばない。この解決の利便性は以下のどの境界も緩めない — 特に session 横断の `--to claude` は引き続き拒否され、target session の Codex gateway を経由しなければならない。同じ gateway 規則は 1 つの物理 session 内の lane 境界にも及ぶ: coordinator lane から target lane へ跨る handoff (例えば複数 lane を収容する cockpit session) は、その lane で一意に解決された Claude pane へ直接送るのではなく、**target lane の Codex** pane を経由する。Claude への直接 delivery は同一 lane 内の宛先指定に限る。完全な手順は `references/workflow.md` の `## 自然名 target への handoff` にある。
 
-## Result Notification Boundary
+project の central preset や rule が、ある方向のすべての handoff について sender 通知を義務づけている場合、その要件は task を audit-only、revalidation、doc-only と位置づけることによっても、receiver の事前の pickup 意思表明によっても緩和されない。sender は該当するすべての handoff で通知を試行しなければならない。標準経路の通知を先に試行せずに "un-notified" state を記録するのは送信側の正当化であり、満たされた fallback 条件ではない。
 
-Writing the durable result is necessary but not always sufficient for a handoff. When work or audit began from another agent's request, notify that sender after recording the result so they know to read the durable source of truth.
+## 結果通知の境界
 
-The return notification should be short and should point back to the durable record. Do not use the return notification as a substitute for the Redmine journal (default for `mozyo_bridge`), Asana comment (for Asana-preset repos), repository change, or other named source of truth.
+durable な結果を書くことは handoff にとって必要だが、常に十分とは限らない。作業や audit が他の agent の依頼から始まった場合は、結果を記録した後にその sender へ通知し、durable な正本を読むべきだと分かるようにする。
 
-## Release Safety
+返信通知は短くし、durable record を指し返すものにする。返信通知を、Redmine journal (`mozyo_bridge` の default)、Asana comment (Asana-preset repo)、repository の変更、その他の指名された正本の代替として使わない。
 
-- Prefer GitHub Actions OIDC Trusted Publishing.
-- Do not make local token upload the standard production PyPI route.
-- Confirm CI and TestPyPI install before production release.
+coordinator / sublane 運用モデル (main の Codex coordinator lane が実装 sublane へ作業を dispatch する) では、この返信境界は常設 rule へ広がる: sublane が handoff-worthy な state — blocked、implementation_done、review_request、review 結果、commit 記録、owner close 承認依頼 — のいずれかに到達したとき、durable anchor を添えた簡潔な callback を coordinator lane の Codex へ送り、coordinator cockpit から作業が stall して見えないようにする。この callback は lane 境界を越えるため、1 つの物理 cockpit session の内側であっても Codex-to-Codex で行い (他 lane の Claude へ直接送らない)、Redmine journal への pointer にとどめ、その copy にしない。完全な手順は `references/workflow.md` の `## Sublane の coordinator callback` にある。
+
+## Release 安全規約
+
+- GitHub Actions OIDC Trusted Publishing を優先する。
+- local token upload を production PyPI の標準経路にしない。
+- production release の前に CI と TestPyPI install を確認する。

@@ -33,17 +33,18 @@ class SkillCrossWorkspaceGuidanceTest(unittest.TestCase):
 
     REQUIRED_GUIDANCE_MARKERS = (
         # Cross-Workspace Handoff section heading must be present.
-        "## Cross-Workspace Handoff",
+        # (Markers pin the Japanese skill body since Redmine #13050.)
+        "## Workspace 横断 handoff",
         # The gateway target form must stay copy-pasteable and now carries
         # the workspace identity gate that admits the send on the default
         # rail.
         "--to codex --target <target_session>:codex --target-repo",
         # The constrained cross-session admission contract (Redmine #11301).
-        "constrained identity gate",
-        "no `--mode` needed",
+        "制約付き identity gate",
+        "`--mode` 不要で default rail 上で動く",
         # `--mode standard` / `--mode pending` must read as a fallback, not
         # as mandatory-because-queue-enter-rejects-all-cross-session.
-        "remain available as fallbacks",
+        "fallback として引き続き利用できる",
         # A scaffolded non-git workspace is a first-class identity root.
         ".mozyo-bridge/scaffold.json",
     )
@@ -106,35 +107,38 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
 
     SECTION_MARKERS: tuple[str, ...] = (
         # Major section headings — drop any of these and the workflow
-        # body has lost a primary topic.
-        "## Start Of Work",
-        "## Ticket-ID Entrypoint",
-        "## Ticket System Conventions",
-        "## Handoff Lifecycle",
-        "## Cross-Workspace Handoff",
-        "## Same-Lane Claude Dispatch",
-        "## Sublane Coordinator Callback",
-        "## Named Cockpit Groups And Multiple Local Cockpit Sessions",
-        "## Coordinator Stop And Next-Action Standard",
-        "## Owner Approval Aggregation",
-        "## Stall And No-Progress Detection Standard",
-        "## Sublane Completion Guardrails",
-        "## Sublane Retirement Drain",
-        "## Post-Dispatch Fill Loop",
-        "## Existing-Project Sublane Adoption",
-        "## Claude / Codex Role Boundary",
-        "## Policy / Skill Authoring Boundary",
+        # body has lost a primary topic. Headings are pinned verbatim
+        # against the Japanese skill body (Redmine #13050 translation).
+        "## 作業開始",
+        "## Ticket-ID 入口",
+        "## Ticket システム運用規約",
+        "## Handoff ライフサイクル",
+        "## Workspace 横断 handoff",
+        "## 同一レーン Claude dispatch",
+        "## Sublane の coordinator callback",
+        "## 名前付き cockpit group と複数 local cockpit session",
+        "## Coordinator stop と next-action 標準",
+        "## Owner 承認の集約",
+        "## Stall / no-progress 検出標準",
+        "## Sublane 完了 guardrail",
+        "## Sublane 退役 drain",
+        "## Dispatch 後の fill loop",
+        "## 既存 project の sublane 導入",
+        "## Claude / Codex 役割境界",
+        "## Policy / skill authoring 境界",
         "### Repo-Local Guardrail Autonomous Lane",
         "## Audit-Owned Commit Authority",
-        "## Workflow Change Verification",
+        "## Workflow 変更の反映確認 (Workflow Change Verification)",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
+        # Prose markers are verbatim substrings of the Japanese skill
+        # body (Redmine #13050 translation); literal tokens stay as-is.
         # Role boundary — Claude implements, Codex audits, and the
         # gateway can't be reframed by short imperatives.
-        "Claude owns implementation for normal development tasks",
-        "Codex does not directly implement normal development tasks",
-        "are not by themselves authorization for Codex to perform a direct edit",
+        "通常開発タスクの実装は Claude が所有する",
+        "Codex は `mozyo_bridge` の通常開発タスクを直接実装しない",
+        "それだけでは Codex が direct edit を行う authorization にはならない",
         # Codex direct-edit gate vocabulary (Redmine path).
         "`codex_direct_edit` gate journal",
         "role: 実装者",
@@ -150,7 +154,7 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # and the per-system commit message contracts must stay
         # verbatim so operators can copy-paste them.
         "Audit-Owned Commit Authority",
-        "Codex audit-owned commit",
+        "Codex による audit-owned commit",
         "Refs: Redmine #<issue_id>",
         "Journal: <journal_id>",
         "Refs: Asana task <task_id>",
@@ -158,19 +162,19 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # Close-Approval-Separation reminder pulled from the central
         # preset is the load-bearing distinction between Review Gate
         # and Close Gate.
-        "Review approval alone is not close approval",
+        "review approval 単独は close approval ではない",
         "owner close approval journal",
         # Handoff Lifecycle vocabulary — durable record is the source
         # of truth, pane is a pointer.
-        "the durable source of truth",
-        "pane notification is still only the pointer",
+        "まず durable な source of truth を記録するか特定する",
+        "pane 通知は依然として pointer でしかない",
         # Sublane coordinator callback (Redmine #11852). A sublane must
         # report handoff-worthy states back to the coordinator lane's
         # Codex with a durable anchor, cross-lane Codex-to-Codex, so the
         # work does not look stalled from the coordinator cockpit.
-        "send a concise callback to the coordinator lane",
+        "coordinator lane へ簡潔な callback を送らなければならない",
         "owner close approval requested",
-        "The sublane's Codex owns the cross-lane callback",
+        "lane 横断 callback は sublane の Codex が所有する",
         # Same-lane Claude dispatch submit-completion (Redmine #12207, updated for
         # the Redmine #12597 standard_target_admission rail). A same-lane
         # Codex→Claude dispatch is a standard handoff that must reach submit
@@ -179,63 +183,63 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # standard` only for an unadmitted inactive cockpit-grid split);
         # `--no-submit` / `--mode pending` stays an explicit operator/debug
         # fallback, not the standard dispatch path.
-        "that dispatch is a **standard handoff and must complete the submit**",
-        "Inactive-split Claude pane: standard_target_admission activates a registered pane; only unadmitted panes need `--mode standard`",
-        "`--no-submit` / `--mode pending` is not the standard dispatch path",
+        "その dispatch は **標準 handoff であり、submit を完了しなければならない**",
+        "inactive-split の Claude pane: standard_target_admission が登録済み pane を activate する。`--mode standard` が必要なのは未 admit の pane のみである",
+        "`--no-submit` / `--mode pending` は標準の dispatch path ではない",
         # Named cockpit groups — grouping vs identity separation
         # (Redmine #11853). A multi-cockpit layout must not become an
         # implicit cross-group send shortcut, and the cross-group rail
         # must route through the target group's Codex gateway.
-        "A **cockpit group is a named tmux session**",
-        "not the routing or identity source of truth",
-        "route it through the **target group's Codex** pane",
-        "Multiple cockpit sessions do not create a cross-session Claude shortcut",
+        "**cockpit group は名前付き tmux session である**",
+        "routing や identity の正本ではない",
+        "**target group の Codex** pane を経由させ",
+        "複数 cockpit session は session 横断 Claude shortcut を作らない",
         # Coordinator stop and next-action standard (Redmine #11860). Every
         # coordinator stop records a durable reason plus a three-part
         # next-action proposal and returns ready work to the queue, without
         # relaxing Close Approval Separation or self-authorizing a carve-out.
-        "make every stop carry a next-action proposal",
-        "A stop is justified only when the *only* remaining next actions are in the owner-approval range",
-        "A next-action proposal is not self-authorization",
-        "Hand gated work back to the queue, not to a held pane",
+        "すべての stop に next-action 提案を持たせ",
+        "stop が正当化されるのは、残る next action が owner 承認範囲*のみ*になったときだけである",
+        "next-action 提案は self-authorization ではない",
+        "gate された作業は、保持した pane ではなく queue に返す",
         # Owner approval aggregation (Redmine #11867). Owner-approval-waiting
         # always converges on the single main coordinator Codex, is never
         # resolved inside the sublane, and the waiting queue is enumerable
         # from the durable record independent of pane count.
-        "The single owner-facing aggregation point is the main coordinator Codex",
-        "A sublane never resolves owner approval inside its own lane",
+        "owner 窓口の集約点は main coordinator Codex の一点である",
+        "sublane は owner 承認を自 lane 内で決して解決しない",
         "owner-action-needed",
-        "the owner-approval-waiting set is a property of the durable record, enumerable from the durable record, not by scanning panes",
-        "Aggregation is not self-authorization",
+        "owner-approval-waiting 集合は durable record の性質であり、durable record から列挙できる。pane の走査によってではない",
+        "集約は self-authorization ではない",
         # Stall and no-progress detection (Redmine #11880). The coordinator
         # defines a stall candidate from the durable record, classifies it into
         # four states, treats a stale CLI as a distinct callback-delivery
         # failure, and records every stall check and re-notification.
-        "A **stall candidate is a unit of work whose handoff was delivered but whose expected next durable journal has not appeared**",
+        "**stall candidate とは、handoff は delivery されたが、期待される次の durable journal が operator の許容 window 内に現れていない作業単位**",
         "`no_progress_after_handoff`",
         "`progress_without_callback`",
         "`callback_delivery_failed`",
         "`callback_not_attempted`",
-        "Stale CLI is a distinct stall mode during a handoff or callback",
-        "it records that fact on the issue",
-        "Detection is not re-dispatch of completed work",
+        "stale CLI は handoff / callback 中の独立した stall mode である",
+        "その事実を issue 上に記録する",
+        "検出は完了済み作業の re-dispatch ではない",
         # Sublane completion guardrails (Redmine #12213). A handoff-worthy
         # state is incomplete until its callback outcome journal lands, a
         # dependency hold parks on the durable record instead of waiting on a
         # go-ahead, the coordinator owns callback drain and downstream resume,
         # and a commit hash is origin-reachability-checked before it is recorded
         # in a gate — all carried in a fixed-field shape a checker can read.
-        "### A handoff-worthy state is not complete until its callback outcome journal lands",
-        "are not complete until their callback outcome journal is recorded",
-        "### A dependency hold parks on the durable record; it does not wait on a go-ahead",
-        "it does not stop on an operator / go-ahead question",
-        "### The coordinator owns callback drain and downstream resume",
-        "the coordinator owns callback drain",
+        "### handoff-worthy state は callback outcome journal が載るまで完了しない",
+        "その callback outcome journal が記録されるまで complete ではない",
+        "### dependency hold は durable record に park する (go-ahead を待たない)",
+        "operator への go-ahead の質問で停止しない",
+        "### callback drain と downstream resume は coordinator が所有する",
+        "coordinator は callback drain (蓄積した callback outcome journal を読み、それに基づいて行動する)",
         "downstream resume",
-        "### Origin reachability preflight before recording a commit hash in a gate",
-        "verify the commit is reachable from `origin` and record the result as `origin_reachable`",
-        "### Fixed-field journal shape",
-        "`resume_condition`, `resume_owner`, `origin_reachable`",
+        "### gate へ commit hash を記録する前の origin 到達性 preflight",
+        "その commit が `origin` から到達可能であることを検証し、結果を `origin_reachable` として記録する",
+        "### 固定 field の journal shape",
+        "`resume_condition`、`resume_owner`、`origin_reachable`",
         # Sublane retirement drain (Redmine #12214). A closed lane is the
         # default retire candidate, a dependency ancestor is retained until
         # downstream consumed, an open hold condition forbids retirement, a
@@ -243,17 +247,17 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # owns the retirement drain after the callback drain — bracketed by
         # retire_ready / retired journals in a checker-readable fixed-field
         # shape.
-        "### A closed lane is the default retire candidate",
-        "the lane is by default a `retire_candidate`",
-        "### A dependency ancestor lane is retained until downstream consumed",
+        "### closed lane は既定の retire candidate である",
+        "その lane は既定で `retire_candidate` となる",
+        "### dependency ancestor lane は downstream 消費まで retain する",
         "`retirement_state: retain_until_downstream_consumed`",
-        "### Retirement is prohibited while any hold condition is open",
-        "a non-empty `retire_blockers` list means `retirement_state: retire_blocked`",
-        "### Destructive-operation safety preflight",
-        "moves a lane from `retire_candidate` to `retirement_state: retire_ready`",
-        "### retire_ready and retired journal shape",
-        "### The coordinator owns the retirement drain, after the callback drain",
-        "the coordinator runs the retirement drain after the callback drain",
+        "### hold 条件が open の間は退役を禁止する",
+        "`retire_blockers` list が空でない限り `retirement_state: retire_blocked`",
+        "### 破壊的操作の safety preflight",
+        "lane を `retire_candidate` から `retirement_state: retire_ready` へ進める",
+        "### retire_ready / retired journal shape",
+        "### 退役 drain は callback drain の後に coordinator が所有する",
+        "coordinator は callback drain の後に退役 drain を実行する",
         # Post-dispatch fill loop (Redmine #12355, portable extract of the
         # repo-local spine identified by the #12353 inventory). Pipeline-first
         # is the default and serialization is the recorded exception; a single
@@ -261,14 +265,14 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # coordinator-blocking vocabulary, the Drain Order, and the one durable
         # fill decision are pinned so the distributed body keeps the loop that
         # ties the drains to the next dispatch.
-        "### Pipeline-first is the default, serialization is the recorded exception",
-        "### Minimal coordinator-blocking state vocabulary",
-        "### Drain Order",
-        "### Re-run the loop after every dispatch and every drain",
-        "A single successful dispatch is **not** a coordinator stop condition",
+        "### pipeline-first が default、直列化は記録付き例外",
+        "### 最小の coordinator-blocking state 語彙",
+        "### Drain 順序",
+        "### dispatch / drain のたびに loop を再実行する",
+        "dispatch が 1 件成功しただけでは coordinator の stop 条件には**ならず**",
         "`stop_coordinator_blocking`",
         "`stop_soft_profile_full`",
-        "portable extract of the repo-local spine",
+        "repo-local spine `vibes/docs/logics/coordinator-sublane-development-flow.md` の portable な抽出である",
         # Existing-project sublane adoption (Redmine #12432, portable extract
         # of the repo-local runbook vibes/docs/logics/existing-project-sublane-
         # adoption.md added under #12423). Adopting the governed scaffold + flow
@@ -277,26 +281,26 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # relaxing any approval gate, and carries the full adoption sequence
         # (preflight / decomposition / dispatch / scaffold+catalog / verify /
         # origin-reachable commit / callback recovery / close order).
-        "### When existing-project adoption applies",
-        "### Read-only preflight before any adoption edit",
-        "**Preserve existing routing**",
-        "### Dispatch decision and scaffold / rules / catalog adoption",
-        "### Verification, origin-reachable commit, callback recovery, and close order",
-        "### Boundaries existing-project adoption does not relax",
-        "Adoption is the setup path, not a relaxation of any gate",
-        "bootstrap exception",
-        "A clean `scaffold status` is not workflow adoption",
+        "### 既存 project 導入が適用される場面",
+        "### 導入編集前の read-only preflight",
+        "**既存 routing を保全する**",
+        "### Dispatch decision と scaffold / rules / catalog 導入",
+        "### 検証・origin 到達 commit・callback recovery・close 順序",
+        "### 既存 project 導入が緩めない境界",
+        "導入は setup 経路であり、いかなる gate の緩和でもない",
+        "bootstrap 例外",
+        "clean な `scaffold status` は workflow 導入ではない",
         # Workflow Change Verification policy.
         "Workflow Change Verification",
-        "Claude implements the normal development task",
+        "通常開発タスクは Claude が実装する",
         # Redmine default-project resolution (Redmine #10689). The
         # workspace-local snippet path and the "explicit wins over
         # default" / "UNVERIFIED escalates" rules must stay in the
         # skill body so agents pick them up at session start.
-        "Default project resolution",
+        "Default project 解決",
         ".mozyo-bridge/redmine-defaults.md",
         ".mozyo-bridge/project-defaults.yaml",
-        "An explicit `project_id` always wins over the default",
+        "明示の `project_id` は常に default に優先する",
         "UNVERIFIED",
     )
 

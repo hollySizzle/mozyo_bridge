@@ -804,12 +804,13 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         self.workflow = self.workflow_path.read_text(encoding="utf-8")
 
     def test_audit_owned_commit_section_present(self) -> None:
-        # Section header and policy headline.
+        # Section header and policy headline. Prose markers pin the
+        # Japanese skill body (Redmine #13050 translation).
         self.assertIn("## Audit-Owned Commit Authority", self.workflow)
         # Cross-system boundary statement.
-        self.assertIn("commit authority, not an implementation authority", self.workflow)
-        self.assertIn("Codex direct implementation edit", self.workflow)
-        self.assertIn("Codex audit-owned commit", self.workflow)
+        self.assertIn("これは commit 権限であって、実装権限ではない", self.workflow)
+        self.assertIn("Codex による直接実装編集", self.workflow)
+        self.assertIn("Codex による audit-owned commit", self.workflow)
 
     def test_audit_owned_commit_has_preflight_steps(self) -> None:
         self.assertIn("git status", self.workflow)
@@ -821,7 +822,7 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         self.assertIn("Refs: Redmine #<issue_id>", self.workflow)
         self.assertIn("Journal: <journal_id>", self.workflow)
         # Commit hash must be recorded in the durable record, not pane chat.
-        self.assertIn("Record the commit hash", self.workflow)
+        self.assertIn("commit hash を durable な正本に記録する", self.workflow)
 
     def test_workflow_lifecycle_anchors_at_handoff_primitive(self) -> None:
         # Regression rail for Asana 1214760806178471: the Handoff Lifecycle
@@ -833,15 +834,15 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # old path. The presence of these names alongside the explicit
         # operator/debug paragraph also locks the boundary between standard
         # handoff and low-level primitives in a single section.
-        section_start = self.workflow.index("## Handoff Lifecycle")
+        section_start = self.workflow.index("## Handoff ライフサイクル")
         section_end = self.workflow.index(
-            "## Claude / Codex Role Boundary", section_start
+            "## Claude / Codex 役割境界", section_start
         )
         section = self.workflow[section_start:section_end]
         self.assertIn("`mozyo-bridge handoff send`", section)
         self.assertIn("`mozyo-bridge handoff reply`", section)
         self.assertIn("`mozyo-bridge reply`", section)
-        self.assertIn("compatibility", section)
+        self.assertIn("互換 entrypoint", section)
         # The operator/debug paragraph must explicitly call out the low-level
         # commands so the boundary survives doc refactors.
         self.assertIn("`mozyo-bridge read`", section)
@@ -868,11 +869,11 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         """
         section_start = self.workflow.index("## Audit-Owned Commit Authority")
         section_end = self.workflow.index(
-            "## Workflow Change Verification", section_start
+            "## Workflow 変更の反映確認", section_start
         )
         section = self.workflow[section_start:section_end]
         self.assertIn("owner close approval", section)
-        self.assertIn("Review approval alone is not close approval", section)
+        self.assertIn("review approval 単独は close approval ではない", section)
         self.assertIn("Close Approval Separation", section)
 
     def test_audit_owned_commit_does_not_grant_direct_implementation(self) -> None:
@@ -882,18 +883,21 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # tripping on the legitimate Codex direct-edit *exception* phrasing in
         # the Policy / Skill Authoring Boundary section.
         section_start = self.workflow.index("## Audit-Owned Commit Authority")
-        section_end = self.workflow.index("## Workflow Change Verification", section_start)
+        section_end = self.workflow.index("## Workflow 変更の反映確認", section_start)
         section = self.workflow[section_start:section_end]
         self.assertNotIn("Codex may edit", section)
         self.assertNotIn("Codex may implement", section)
         self.assertNotIn("Codex implements normal", section)
         # The section must explicitly preserve the prohibition on Codex
         # producing new diffs while granting the commit-only authority.
-        self.assertIn("Codex must not edit implementation files", section)
-        self.assertIn("commit authority, not an implementation authority", section)
+        self.assertIn(
+            "audit 承認済み diff を「手直し」するために実装 file を編集してはならない",
+            section,
+        )
+        self.assertIn("これは commit 権限であって、実装権限ではない", section)
         # The section must NOT silently waive the implementer / auditor
         # boundary defined elsewhere.
-        self.assertIn("does not waive the implementer / auditor boundary", section)
+        self.assertIn("実装者 / 監査者の境界を免除しない", section)
 
     def test_main_unit_claude_safe_use_section_present(self) -> None:
         """Redmine #11858: the shared skill reference must carry the main-unit
@@ -901,33 +905,38 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         Claude pane beside the coordinator Codex knows what it may offload to
         save Codex context and what stays owner-facing. The boundary is the
         portable workflow risk, not an operator's private offload list."""
-        section_start = self.workflow.index("## Main-Unit Claude Safe-Use Boundary")
+        section_start = self.workflow.index("## Main-unit Claude の安全使用境界")
         section_end = self.workflow.index(
-            "\n## Claude / Codex Role Boundary", section_start
+            "\n## Claude / Codex 役割境界", section_start
         )
         section = self.workflow[section_start:section_end]
         # Anchored to the durable record and framed as observed risk, not a
         # fixed judgement about any model.
         self.assertIn("#11858", section)
         self.assertIn(
-            "observed workflow risk, not a fixed judgement about any model",
+            "観測された workflow 上の risk から引かれたものであり、"
+            "特定 model の能力についての固定的な判断ではない",
             section,
         )
         # Output is input/draft, never evidence the coordinator can act on
         # without confirming against the source of truth.
-        self.assertIn("draft / input, never evidence", section)
+        self.assertIn("draft / input であって決して evidence ではない", section)
         # The two explicit buckets the acceptance criteria require.
-        self.assertIn("### Allowed uses (safe Codex-context savings)", section)
-        self.assertIn("### Prohibited uses (stay with the coordinator Codex)", section)
+        self.assertIn("### 許可される用途 (安全な Codex context 節約)", section)
+        self.assertIn("### 禁止される用途 (coordinator Codex に残すもの)", section)
         # Concrete Codex-context-saving safe tasks.
-        self.assertIn("Summarizing long Redmine journals", section)
-        self.assertIn("Extracting candidates", section)
+        self.assertIn(
+            "長い Redmine journal、diff、log、command transcript を、"
+            "coordinator がその後検証する短い brief に要約する",
+            section,
+        )
+        self.assertIn("candidate の抽出", section)
         # Owner-facing / gate actions that must NOT be delegated.
         self.assertIn("owner close approval", section)
         self.assertIn("Review Gate", section)
-        self.assertIn("durable routing decisions", section)
+        self.assertIn("durable な routing 判断", section)
         # The difference from a sublane Claude must be explicit.
-        self.assertIn("### Difference from a sublane Claude", section)
+        self.assertIn("### sublane Claude との違い", section)
         # Portable vs private operator preference separation.
         self.assertIn("public-private-boundary.md", section)
 
@@ -938,20 +947,20 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         read as moving any owner-facing / gate boundary onto the Claude pane.
         A future edit that softened the prohibition into an allowance would be
         caught here."""
-        section_start = self.workflow.index("## Main-Unit Claude Safe-Use Boundary")
+        section_start = self.workflow.index("## Main-unit Claude の安全使用境界")
         section_end = self.workflow.index(
-            "\n## Claude / Codex Role Boundary", section_start
+            "\n## Claude / Codex 役割境界", section_start
         )
         section = self.workflow[section_start:section_end]
         # The assistant framing and the non-relaxation clause must both stand.
-        self.assertIn("assistant, not a parallel coordinator", section)
+        self.assertIn("assistant であり並列 coordinator ではない", section)
         self.assertIn(
-            "Owner-facing and gate decisions stay with the coordinator Codex",
+            "owner 窓口と gate 判断は coordinator Codex に残る",
             section,
         )
         # It must defer owner approval to the single aggregation point, not the
         # Claude pane.
-        self.assertIn("never a Claude pane", section)
+        self.assertIn("決して Claude pane にではない", section)
 
     def test_issue_subject_description_separation_section_present(self) -> None:
         """Redmine #11856: the shared skill reference must carry the
@@ -961,9 +970,9 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         It must also carry the immediate-correction rule for a malformed
         subject and stay anchored to the durable record."""
         section_start = self.workflow.index(
-            "### Issue Subject / Description Separation"
+            "### Issue の subject / description 分離"
         )
-        section_end = self.workflow.index("\n## Local Documentation", section_start)
+        section_end = self.workflow.index("\n## Local docs", section_start)
         section = self.workflow[section_start:section_end]
         # Anchored to the durable record and the concrete observed failure.
         self.assertIn("#11856", section)
@@ -971,16 +980,16 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # The two acceptance-criteria halves: explicit subject on create, and
         # an immediate-correction rule for a bad subject.
         self.assertIn("explicit-subject-on-create", section)
-        self.assertIn("Immediate-correction rule", section)
+        self.assertIn("即時修正規則", section)
         # Concrete creation-time discipline: always pass an explicit subject and
         # never let the body derive it.
-        self.assertIn("Always pass an explicit `subject`", section)
-        self.assertIn("Never let the description body produce the subject", section)
+        self.assertIn("常に明示の `subject` を渡す", section)
+        self.assertIn("description 本文から subject を生成させない", section)
         # The correction names the actual repair tool and lands on the durable
         # record.
         self.assertIn("update_issue_subject_tool", section)
         # Must not claim to change gate vocabulary / hierarchy / required fields.
-        self.assertIn("does not change any gate vocabulary", section)
+        self.assertIn("gate 語彙、階層 semantics、必須 field は一切変えない", section)
         # Portable rule vs operator's private subject style.
         self.assertIn("public-private-boundary.md", section)
 
@@ -3874,9 +3883,10 @@ class CodexDirectEditGuardrailHardeningTest(unittest.TestCase):
         )
         body = ref.read_text(encoding="utf-8")
         # Must explicitly name the Redmine gate journal as the durable
-        # record for Redmine projects.
+        # record for Redmine projects. Prose markers pin the Japanese
+        # skill body (Redmine #13050 translation).
         for marker in (
-            "Redmine `codex_direct_edit` gate journal",
+            "Redmine の `codex_direct_edit` gate journal",
             "allowed_paths",
             "role: 実装者",
             "follow_up_review",
@@ -3884,8 +3894,8 @@ class CodexDirectEditGuardrailHardeningTest(unittest.TestCase):
             ".mozyo-bridge/docs/file_conventions.generated.yaml",
             # The hardening must be tied to a concrete failure mode
             # without publishing internal ticket identifiers.
-            "Past incident pattern",
-            "Review Gate-approved audit-owned commit path",
+            "過去の incident pattern",
+            "Review Gate で承認された audit-owned commit 経路",
         ):
             self.assertIn(
                 marker,
@@ -3960,7 +3970,7 @@ class CodexDirectEditGuardrailHardeningTest(unittest.TestCase):
             / "workflow.md"
         )
         body = mirror.read_text(encoding="utf-8")
-        self.assertIn("Redmine `codex_direct_edit` gate journal", body)
+        self.assertIn("Redmine の `codex_direct_edit` gate journal", body)
         self.assertIn(".mozyo-bridge/docs/file_conventions.generated.yaml", body)
 
 

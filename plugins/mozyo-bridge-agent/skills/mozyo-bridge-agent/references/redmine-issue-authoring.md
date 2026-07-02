@@ -1,6 +1,6 @@
 # Redmine Issue 記載粒度と Version 運用 Reference
 
-LLM が迷わず ticket を起票し dispatch 候補を選べるようにするための、Epic / Feature / UserStory / leaf issue の記載粒度と Redmine Version 運用の判断ロジック (Redmine #13024)。本 reference は portable な authoring / planning guideline を持つ。gate 語彙・必須 journal field・close 条件は central preset、subject / description の機構は `references/workflow.md` `### Issue Subject / Description Separation` が正本であり、重なる箇所は再掲せず pointer にする。
+LLM が迷わず ticket を起票し dispatch 候補を選べるようにするための、Epic / Feature / UserStory / leaf issue の記載粒度と Redmine Version 運用の判断ロジック (Redmine #13024)。本 reference は portable な authoring / planning guideline を持つ。gate 語彙・必須 journal field・close 条件は central preset、subject / description の機構は `references/workflow.md` `### Issue の subject / description 分離` が正本であり、重なる箇所は再掲せず pointer にする。
 
 ## 階層粒度の判断表
 
@@ -58,6 +58,6 @@ dispatch 候補の選定:
 ## 境界
 
 - gate 名、必須 field、review / close の意味論: central preset (本 doc は gate 語彙を追加しない)。
-- subject / description の authoring 機構と explicit-subject-on-create rule: `references/workflow.md` `### Issue Subject / Description Separation`。
-- 本 guideline 自体の配置 (配布 body か採用 repo の local docs か): `references/workflow.md` `## Workflow Docs Source-Of-Truth Boundary` (Redmine #13025)。repo 固有の Version 名、具体の Epic / Feature カタログ、workspace の番号 prefix 採用事実は repo-local の事実であり、本配布 body には置かない。
+- subject / description の authoring 機構と explicit-subject-on-create rule: `references/workflow.md` `### Issue の subject / description 分離`。
+- 本 guideline 自体の配置 (配布 body か採用 repo の local docs か): `references/workflow.md` `## Workflow docs の正本境界` (Redmine #13025)。repo 固有の Version 名、具体の Epic / Feature カタログ、workspace の番号 prefix 採用事実は repo-local の事実であり、本配布 body には置かない。
 - operator 固有 policy を OSS default に入れない: 10〜20 の目安を超える具体の在庫しきい値、private な優先順位付け、業務ドメイン名は public / private boundary rule に従い operator の runbook 側に置く。

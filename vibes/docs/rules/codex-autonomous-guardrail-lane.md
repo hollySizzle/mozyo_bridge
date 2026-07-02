@@ -89,6 +89,6 @@ preset 側 schema をそのまま採用する。journal field の最小例:
 - distributed lane policy 本体: preset agent-workflow.md `### Repo-Local Guardrail Autonomous Lane`
 - central preset Codex Direct Edit Gate: 同 file `### Codex Direct Edit Gate`
 - project-local agent workflow: `vibes/docs/rules/agent-workflow.md`
-- skill workflow: `skills/mozyo-bridge-agent/references/workflow.md` `## Policy / Skill Authoring Boundary`
+- skill workflow: `skills/mozyo-bridge-agent/references/workflow.md` `## Policy / skill authoring 境界`
 - docs catalog governance: `.mozyo-bridge/rules/docs_catalog_governance.yaml`
 - product owner 判断の durable anchor: Redmine #10338

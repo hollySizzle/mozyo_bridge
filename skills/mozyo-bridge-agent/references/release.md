@@ -1,12 +1,12 @@
-# Release Reference
+# Release リファレンス
 
-## Scope: mozyo-bridge package maintainers only
+## 適用範囲: mozyo-bridge package maintainer 専用
 
-This reference is the release runbook for the **mozyo-bridge package itself** — versioning, TestPyPI / PyPI publishing, and distribution checks for `hollySizzle/mozyo_bridge`. An adopting project never publishes this package and does not follow this runbook for its own releases; use your project's own release process and keep only the portable posture (run verification matched to the release risk, and prefer OIDC Trusted Publishing over local token upload). The runbook stays in the distributed body so maintainer and dogfooding sessions carry it.
+本 reference は **mozyo-bridge package 自体** の release runbook である — `hollySizzle/mozyo_bridge` の versioning、TestPyPI / PyPI publishing、distribution check を扱う。採用 project がこの package を publish することはなく、自身の release にこの runbook を適用しない。project 自身の release process を使い、portable な姿勢のみを保つ (release の risk に見合った検証を実行し、local token upload より OIDC Trusted Publishing を優先する)。runbook は maintainer session と dogfooding session が携行できるよう配布本文に残す。
 
-## Standard Verification
+## 標準検証
 
-Use the smallest check set that matches the change.
+変更に見合った最小の check set を使う。
 
 ```bash
 python -m unittest discover -s tests -v
@@ -14,156 +14,99 @@ python -m pip wheel . --no-deps -w /tmp/mozyo_bridge_dist
 python -m mozyo_bridge --help
 ```
 
-Use a Python environment matching the project's supported Python versions for local tests.
+local test には、project がサポートする Python version に一致した Python 環境を使う。
 
-## tmux Delivery Changes
+## tmux delivery 変更時
 
-Run real smoke checks when changing tmux delivery, pane resolution, marker safety, or CLI notification contracts.
+tmux delivery、pane 解決、marker safety、CLI 通知契約を変更するときは、実 smoke check を実行する。
 
 ```bash
 python smoke/real_tmux_notify_smoke.py
 MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.py
 ```
 
-## Release Flow
+## Release フロー
 
-1. Start from a release ticket in the active ticket system (Redmine issue for `mozyo_bridge`; Asana task for Asana-preset repos).
-2. Run local unit tests and build checks.
-3. Run release artifact guardrails.
-4. Push to `main` and confirm GitHub Actions `Test` succeeds.
-5. Use `Publish to TestPyPI` for TestPyPI.
-6. Validate TestPyPI install with `pipx`.
-7. Treat internal beta distribution as complete after TestPyPI install validation.
-8. Decide production PyPI release separately and only when explicitly requested.
+1. active な ticket システムの release ticket から始める (`mozyo_bridge` では Redmine issue、Asana-preset repo では Asana task)。
+2. local の unit test と build check を実行する。
+3. release artifact guardrail を実行する。
+4. `main` へ push し、GitHub Actions `Test` の成功を確認する。
+5. TestPyPI には `Publish to TestPyPI` を使う。
+6. TestPyPI install を `pipx` で検証する。
+7. 内部 beta distribution は TestPyPI install の検証後に完了として扱う。
+8. production PyPI release は別途、明示的に要求された場合にのみ決定する。
 
-## Automated TestPyPI Dev Publish (main CI)
+## TestPyPI dev 自動配布 (main CI)
 
-`.github/workflows/testpypi.yml` publishes a unique TestPyPI dev artifact
-automatically after the `Test` workflow succeeds on `main` (Redmine #12756).
-This keeps a normal-PATH-installable artifact aligned with `main` for real
-smoke work (e.g. #12709) instead of relying on source-runtime or
-`PYTHONPATH=src`.
+`.github/workflows/testpypi.yml` は、`main` で `Test` workflow が成功した後に、一意な TestPyPI dev artifact を自動で publish する (Redmine #12756)。これにより、source-runtime や `PYTHONPATH=src` に依存する代わりに、実 smoke 作業 (例: #12709) 向けに、通常 PATH で install 可能な artifact を `main` に整合させ続ける。
 
-- Trigger: `workflow_run` on `Test` (`completed`, `branches: [main]`); the job
-  publishes only when `workflow_run.conclusion == 'success'`.
-- Version: the job runs `scripts/compute_testpypi_dev_version.py`, which appends
-  a PEP 440 `.dev<N>` segment to the committed `pyproject.toml` version. `N` is
-  a UTC timestamp concatenated with the triggering `Test` run's globally-unique
-  id (e.g. `0.9.2.dev20260628090000123456789`), so two `Test` runs completing in
-  the same second still produce distinct versions and never collide on TestPyPI.
-  The rewrite is ephemeral in the CI checkout and is never committed, so the
-  committed release version is untouched.
-- Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`,
-  `id-token: write`). The automatic path stays in the same `testpypi.yml`
-  workflow file as the manual dispatch so the existing TestPyPI pending
-  publisher (workflow `testpypi.yml`) keeps authorizing it. No local PyPI
-  tokens.
-- Manual `workflow_dispatch` is unchanged: it builds the committed (static)
-  release version for exact-version release-candidate validation.
-- Evidence: the dev-publish job writes the `version` and `commit` SHA (plus the
-  source CI run URL) to the workflow run's job summary. Read the mapping there.
+- Trigger: `Test` に対する `workflow_run` (`completed`, `branches: [main]`)。job は `workflow_run.conclusion == 'success'` のときにのみ publish する。
+- Version: job は `scripts/compute_testpypi_dev_version.py` を実行し、commit 済みの `pyproject.toml` version に PEP 440 の `.dev<N>` segment を付加する。`N` は UTC timestamp と、トリガーとなった `Test` run の globally-unique な id を連結したものであり (例: `0.9.2.dev20260628090000123456789`)、同一秒に完了した 2 つの `Test` run でも異なる version を生成し、TestPyPI 上で決して衝突しない。この書き換えは CI checkout 内の一時的なもので決して commit されないため、commit 済みの release version には触れない。
+- Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`, `id-token: write`)。自動経路は manual dispatch と同じ `testpypi.yml` workflow file に置かれ、既存の TestPyPI pending publisher (workflow `testpypi.yml`) がそのまま authorize し続ける。local の PyPI token は使わない。
+- 手動の `workflow_dispatch` は不変である: exact-version の release-candidate 検証のために、commit 済みの (static な) release version を build する。
+- Evidence: dev-publish job は `version` と `commit` SHA (加えて source CI run の URL) を workflow run の job summary に書き込む。対応関係はそこで読む。
 
-Production PyPI stays separate. This workflow never publishes to production
-PyPI, never tags, and never creates a GitHub Release (the production
-`publish.yml` runs on `release: published`).
+production PyPI は分離されたままである。この workflow は production PyPI へ publish せず、tag も打たず、GitHub Release も決して作成しない (production の `publish.yml` は `release: published` で走る)。
 
-## Local pipx Dev Runtime Alignment
+## Local pipx dev runtime の整合
 
-Align the normal-PATH pipx runtime (default `~/.local/bin/mozyo-bridge`) with a
-published TestPyPI dev artifact, then verify the CLI surface — not
-`--version` alone:
+通常 PATH の pipx runtime (default `~/.local/bin/mozyo-bridge`) を publish 済みの TestPyPI dev artifact に整合させ、その上で CLI surface を検証する — `--version` 単独ではなく:
 
 ```bash
 # Pin the EXACT version from the 'Publish to TestPyPI' run summary
 scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000123456789
 ```
 
-Pass the exact dev version; `latest` is intentionally unsupported. The install
-uses TestPyPI as the primary index and PyPI as an extra-index for dependencies.
-pip considers the target package from both indexes, and a dev release sorts
-before the PyPI final, so an unpinned install could resolve the PyPI production
-release and taint smoke evidence. The exact dev version exists only on TestPyPI
-(PyPI never hosts dev releases), so pinning it guarantees the artifact comes
-from TestPyPI.
+正確な dev version を渡す。`latest` は意図的に非サポートである。install は TestPyPI を primary index として、PyPI を依存関係用の extra-index として使う。pip は target package を両方の index から考慮し、dev release は PyPI の final より順序が前に sort されるため、pin なしの install は PyPI の production release を解決して smoke 証跡を汚染しうる。正確な dev version は TestPyPI にのみ存在する (PyPI は dev release を決して host しない) ため、pin することで artifact が TestPyPI 由来であることが保証される。
 
-The script installs with the pip backend (TestPyPI for `mozyo-bridge`, PyPI for
-dependencies, `--pre`, `--force`) and verifies the installed surface:
+script は pip backend で install し (`mozyo-bridge` は TestPyPI、依存関係は PyPI、`--pre`、`--force`)、install された surface を検証する:
 
-- `mozyo-bridge --version` and `mozyo --version` (required)
-- `mozyo-bridge project-gateway consult --help` (required)
-- `mozyo-bridge workflow step --help` (future #12755 — reported PENDING, not a
-  failure, against artifacts built before it ships)
+- `mozyo-bridge --version` と `mozyo --version` (必須)
+- `mozyo-bridge project-gateway consult --help` (必須)
+- `mozyo-bridge workflow step --help` (将来の #12755 — それが出荷される前に build された artifact に対しては PENDING として報告され、failure ではない)
 
-To tie smoke evidence to a commit: record BOTH the installed
-`mozyo-bridge --version` string AND the commit SHA it maps to (from the
-`Publish to TestPyPI` run summary) in the Redmine smoke-evidence journal. The
-version alone is insufficient — different `main`, TestPyPI, and PyPI builds can
-share a base version string while shipping different command/preset/skill
-content.
+smoke 証跡を commit に結び付けるには: install された `mozyo-bridge --version` 文字列と、それが対応する commit SHA (`Publish to TestPyPI` run summary から) の両方を、Redmine の smoke-evidence journal に記録する。version 単独では不十分である — 異なる `main`、TestPyPI、PyPI の build は、異なる command/preset/skill 内容を出荷しながら同じ base version 文字列を共有しうる。
 
-## Release Artifact Guardrails
+## Release artifact guardrail
 
-Do not rely on `mozyo-bridge --version` alone. It reports the package version
-from `pyproject.toml`, so GitHub `main`, TestPyPI, and PyPI can share the same
-version string while shipping different command, preset, or skill content.
+`mozyo-bridge --version` 単独に依拠しない。これは `pyproject.toml` の package version を報告するため、GitHub `main`、TestPyPI、PyPI は、異なる command、preset、skill 内容を出荷しながら同じ version 文字列を共有しうる。
 
-Before release, inspect all three surfaces:
+release 前に、3 つの surface すべてを検査する:
 
-- Source tree: search for credentials, tokens, `.env` / `.pypirc` content, and
-  host-specific absolute paths such as `/Users/<name>`, `/home/<name>`, or
-  `C:\Users\<name>`. Personal home paths are release blockers in public refs
-  even when they are not secrets.
-- Fresh scaffold output: with an isolated `--home` and isolated target, run
-  `rules install`, scaffold `asana`, `redmine`, and `none`, then confirm
-  generated `AGENTS.md`, `CLAUDE.md`, and `.mozyo-bridge/scaffold.json` contain
-  `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md`
-  and no resolved user-home path. `scaffold status` must report clean.
-- Build artifacts: build both wheel and sdist, extract them, and scan the
-  extracted files. Do not inspect the wheel only; sdist can include root docs.
+- Source tree: credential、token、`.env` / `.pypirc` の内容、`/Users/<name>`、`/home/<name>`、`C:\Users\<name>` のような host 固有の絶対 path を検索する。個人の home path は、secret でない場合でも public ref では release blocker である。
+- Fresh scaffold 出力: 隔離した `--home` と隔離した target で、`rules install` を実行し、`asana`、`redmine`、`none` を scaffold し、その上で生成された `AGENTS.md`、`CLAUDE.md`、`.mozyo-bridge/scaffold.json` が `${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md` を含み、解決済みの user-home path を含まないことを確認する。`scaffold status` は clean を報告しなければならない。
+- Build artifact: wheel と sdist の両方を build して展開し、展開された file を scan する。wheel だけを検査しない。sdist は root docs を含みうる。
 
-Record any false positives and their rationale in the active release ticket (Redmine journal on the release issue, or an Asana comment on the release task, depending on the repo's central preset).
+false positive とその根拠は、active な release ticket に記録する (repo の central preset に応じて、release issue 上の Redmine journal、または release task 上の Asana comment)。
 
-## Release Ref Consistency
+## Release ref の整合
 
-- Keep version bumps as standalone commits.
-- For a tagged release, install scripts and the skill tree must be fetched from
-  the same tag as the package version under test. Set
-  `MOZYO_BRIDGE_SKILL_REF=vX.Y.Z` for the fresh install smoke.
-- Confirm the remote tag points to the intended release commit with
-  `git ls-remote origin refs/tags/vX.Y.Z`.
-- Do not mix a TestPyPI / PyPI package with install scripts from floating
-  `main` when claiming release acceptance.
+- version bump は単独 commit として保つ。
+- tag 付き release では、install script と skill tree を、検証対象の package version と同じ tag から取得しなければならない。fresh install smoke には `MOZYO_BRIDGE_SKILL_REF=vX.Y.Z` を設定する。
+- remote tag が意図した release commit を指すことを `git ls-remote origin refs/tags/vX.Y.Z` で確認する。
+- release acceptance を主張する際に、TestPyPI / PyPI package と floating な `main` 由来の install script を混在させない。
 
-For TestPyPI validation, force the pip backend so TestPyPI is used for
-`mozyo-bridge` and PyPI remains available for dependencies:
+TestPyPI 検証では pip backend を強制し、`mozyo-bridge` には TestPyPI を使い、依存関係には PyPI を利用可能なままにする:
 
 ```bash
 pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==X.Y.Z
 ```
 
-Do not create a GitHub Release for internal beta distribution. The production
-publish workflow runs on `release: published`, so a GitHub Release is a
-production trigger.
+内部 beta distribution のために GitHub Release を作成しない。production の publish workflow は `release: published` で走るため、GitHub Release は production trigger である。
 
-## Distribution Gates
+## Distribution gate
 
-- Internal beta distribution uses TestPyPI, not production PyPI.
-- Before calling an internal beta ready, install the package from TestPyPI with
-  the same command given to beta testers.
-- Do not substitute a local checkout, editable install, or local wheel for the
-  beta tester path.
-- Confirm both command entry points start: `mozyo-bridge --help` and
-  `mozyo --help`.
-- Confirm distributed scaffold/rule content that is material to the change is
-  present inside the installed package.
-- Confirm `rules install`, per-preset scaffold, `scaffold status`, and
-  `doctor --target` work from the fresh TestPyPI / PyPI install path.
-- Production PyPI distribution is separate from internal beta distribution and
-  requires an explicit production release request or approval.
+- 内部 beta distribution は production PyPI ではなく TestPyPI を使う。
+- 内部 beta を ready と呼ぶ前に、beta tester に渡すのと同じ command で package を TestPyPI から install する。
+- beta tester の経路を、local checkout、editable install、local wheel で代替しない。
+- 両方の command entry point が起動することを確認する: `mozyo-bridge --help` と `mozyo --help`。
+- 変更に関わる配布 scaffold/rule 内容が、install 済み package の内部に存在することを確認する。
+- `rules install`、per-preset の scaffold、`scaffold status`、`doctor --target` が、fresh な TestPyPI / PyPI install 経路から動作することを確認する。
+- production PyPI distribution は内部 beta distribution と分離されており、明示的な production release の要求または承認を要する。
 
 ## Trusted Publishing
 
-TestPyPI pending publisher:
+TestPyPI の pending publisher:
 
 - Project: `mozyo-bridge`
 - Owner: `hollySizzle`
@@ -171,7 +114,7 @@ TestPyPI pending publisher:
 - Workflow: `testpypi.yml`
 - Environment: `testpypi`
 
-PyPI production publisher:
+PyPI の production publisher:
 
 - Project: `mozyo-bridge`
 - Owner: `hollySizzle`
