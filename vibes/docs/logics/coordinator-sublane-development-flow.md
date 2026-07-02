@@ -399,41 +399,9 @@ journal には issue ID と state class を書き、private path や operator-sp
 
 ### 孫 dispatch / context 保護
 
-帯域 admission が「lane を開くか」を管制塔の注意力で判断するのに対し、孫 (grandchild) dispatch は別の軸で判断する。子 coordinator から孫 implementation lane を開く主目的は **`purpose: preserve_coordinator_context`** であり、作業サイズそのものではない。判断基準は「実装が一定行数を超えるか」ではなく、「その作業を coordinator 自身の context window 内で実行すると、後続の dispatch / callback / audit / owner aggregation を保つために必要な context を圧迫するか」である。
+孫 (grandchild) dispatch 判断の正本 — `purpose: preserve_coordinator_context` を軸とする判断基準、孫 dispatch を選ぶ候補条件 (long diff / long test log / iterative trial / 大量 journal 読解 / parent callback context 保持)、孫 dispatch を避けてよい context-neutral な作業、no-dispatch 記録の粒度 — は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `### 孫 dispatch / context 保護` (`## 委譲コーディネータ role model (delegated coordinator)` 配下) にある。本 spine は再掲しない (#13029 で pointer 化)。
 
-ここで保護する context は、parent 管制塔と、委譲された子 coordinator の双方の LLM context window である。large diff や log を coordinator 自身が読み込むと、coordinator が保持すべき durable anchor pointer、active lane state、callback routing、未処理 owner decision の保持余地が削られる。孫 lane へ逃がすことで、coordinator は pointer と判断だけを context に残せる。`purpose: preserve_coordinator_context` を明示しない「大きそうだから孫に出す」判断は、この policy の対象ではない。
-
-#### 孫 dispatch を選ぶ候補条件
-
-次のいずれかに該当し、coordinator の context を保護する利益が dispatch 1 往復の overhead を上回る場合、孫 dispatch を default route とする。これらは context 消費の signal であり、行数 threshold ではない。
-
-- **long diff**: 実装 / review 対象の diff が大きく、coordinator が全体を読み込むと context を占有する。
-- **long test log**: test / build / lint の出力が長く、失敗解析を coordinator context 内で回すと膨らむ。
-- **iterative trial**: 試行錯誤 (repro → 修正 → 再実行) を複数往復する見込みで、中間状態が context に積もる。
-- **大量 journal 読解**: 複数 issue / 長い journal 履歴を読み込んで実装する必要があり、読解だけで context を消費する。
-- **parent callback context 保持**: coordinator が parent からの callback を受けて route し続ける必要があり、その routing context を実装ノイズで汚したくない。
-
-これらは OR 条件であり、複数該当するほど孫 dispatch の利益は明確になる。単一条件でも該当すれば dispatch してよい。
-
-#### 孫 dispatch を避けてよい作業
-
-次の作業は context window をほとんど消費しないため、coordinator / 子 coordinator が自 lane で直接処理してよく、孫 dispatch を避けられる。
-
-- **read-only investigation**: durable anchor の確認、状態分類、grep / 単一ファイル参照など、diff を生まない調査。
-- **ticket-only update**: Redmine status / 進捗 / relation の更新など、ticket system に閉じる操作。
-- **小さい journal update**: 1 件の短い gate / pointer journal の記録など、読解 / 実装を伴わない durable record。
-
-これらは「サイズが小さいから sublane を避ける」のではなく、「context 圧迫が無いから coordinator が保持すべき pointer / 判断を失わない」点が判断基準である。実装 diff を伴う work は、たとえ短くても、context preservation 以外の理由 (urgent minimal correction の durable reason など `### Admission Rule` の例外) が無い限り、通常の sublane dispatch default に従う。
-
-#### no-dispatch 記録の粒度
-
-孫を使わない判断を毎回 journal 化すると、ticket-only / read-only / 小さい update のたびに記録 noise が増え、durable record の信号対雑音比が下がる。記録粒度は作業種別に応じて次のように抑える。
-
-- read-only investigation / ticket-only update / 小さい journal update を coordinator が自 lane で処理する場合、**専用の no-dispatch journal を要求しない**。これらは context-neutral な default であり、明示記録なしで進めてよい。
-- context を消費し得る work (上記候補条件のいずれかに触れる) を孫 dispatch せずに coordinator 自身が処理する場合は、新しい独立 journal を起票せず、`### Admission Rule` の dispatch decision に `grandchild_dispatch: avoided` と短い `reason` (例: `context_cost_low` / `single_pass_no_iteration` / `urgent_minimal_correction`) を 1 行追記する。
-- 判断が borderline (context を消費しそうだが coordinator が context を保持したい) の場合のみ、reason を具体化する。
-
-つまり記録は「context を消費し得る work を孫に出さなかった非自明な判断」に集中させ、context-neutral な default work には記録を課さない。
+本 repo 固有の結線: context を消費し得る work を孫に出さずに coordinator 自身が処理する非自明判断は、新しい独立 journal を起票せず、`### Admission Rule` の dispatch decision に `grandchild_dispatch: avoided` と短い `reason` (例: `context_cost_low` / `single_pass_no_iteration` / `urgent_minimal_correction`) を 1 行追記する。dispatch decision template の `grandchild_dispatch` / `purpose` field は本書 `## Sublane dispatch decision` を正とする。
 
 ## 実行 runbook
 
@@ -477,28 +445,9 @@ journal を source of truth とした callback sweep / recovery で行う。
 
 ## 仕様決定 routing
 
-管制塔が持つ仕様決定は、後戻りコストが高いもの、横断的なもの、または authority / safety に触れるものである。
+coordinator / sublane の仕様決定 routing の正本 — 管制塔 (coordinator) で決める判断 (後戻りコストが高い / 横断的 / authority・safety に触れる)、サブレーンで決めてよい判断 (1 US 内に閉じる local implementation detail 等)、実装中に coordinator-owned 判断へ当たった場合の停止・記録・escalation — は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## 仕様決定 routing` にある。本 spine は再掲しない (#13029 で pointer 化)。
 
-### 管制塔で決める
-
-- 複数 UserStory、複数 Version、複数 provider / module / surface に影響する判断。
-- file path、config file name、schema version、source-of-truth、config precedence。
-- workflow authority、owner approval、review authority、close approval、routing authority、handoff / send safety、credential / secret / auth / permission / billing / destructive-operation、release / publish approval に関わる判断。
-- user-facing behavior、operator UX、diagnostics、validation command の標準。
-- migration、backward compatibility、public/private boundary、future plugin API への制約。
-- 「どちらでも実装できる」が、選択により今後の roadmap が変わる判断。
-- sublane 間で file / invariant / merge order が衝突する判断。
-
-### サブレーンで決めてよい
-
-- 1 UserStory 内に閉じる local implementation detail。
-- helper 関数、class split、test file 分割、internal naming。
-- coordinator 決定済み方針から機械的に導ける edge case。
-- migration や利用者影響が無い小さい error message detail。
-
-### エスカレーション
-
-実装中に coordinator-owned 仕様決定が必要になった場合、sublane は実装を止め、Redmine に design consultation / blocked / owner-action-needed を記録し、coordinator Codex へ callback する。
+本 repo での適用: escalation の記録は Redmine の design consultation / blocked / owner-action-needed journal で行い、coordinator Codex へ callback する (`### Admission Rule` / `## Sublane dispatch decision` の記録形式)。Design Consultation の発火 / 非発火判断は配布側 `## Design Consultation 発火判断` と `vibes/docs/rules/claude-design-consultation.md` (repo 採用記録) を読む。
 
 ## 標準フロー
 
@@ -588,28 +537,9 @@ deactivate Coordinator
 
 US close は管制塔 Codex が担当し、条件は `$close_contract()` を正とする。Version close は owner approval を要求する。管制塔は readiness summary、残 open issue、release / publish scope、follow-up version を提示し、owner 承認後に閉じる。ここでの Version は Redmine roadmap / milestone / acceptance grouping surface であり、package release 番号の決定でも active lane-set authority でもない。package release 番号、tag、publish scope は release gate へ渡して別に決める。
 
-US close / Version readiness / session retrospective の前に、管制塔は `$backlog_reconciliation()` を実行する。目的は backlog を綺麗に保つことではなく、owner intent が durable record から消えないことを優先することである。特に、owner が将来機能、未決判断、標準化、配布形態、責務境界について述べた場合、実装しない判断でも未記録のまま scope 外として閉じない。
+US close / Version readiness / session retrospective の前に、管制塔は `$backlog_reconciliation()` を実行する。gate の正本 — deferred 提案 (`後で` / `別 Version` / `follow-up` / `later-stage` / `deferred`) の immediate durable classification (`new issue` / `existing issue` / `explicit no-op` / `owner decision pending` の 4 分類)、close / readiness 前の棚卸し対象語彙、owner intent 保存を backlog の綺麗さより優先する原則、Version roadmap 提案の durable classification 要件 — は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## Backlog reconciliation gate (deferred intent の即時 durable 分類)` にある。本 spine は再掲しない (#13029 で pointer 化)。
 
-加えて、管制塔または agent 自身が `後で`、`別 Version`、`follow-up`、`later-stage`、`deferred` として後続作業を提案した時点で、close 前の棚卸しを待たず immediate durable classification を行う。分類先は `new issue` / `existing issue` / `explicit no-op` / `owner decision pending` のいずれかであり、会話だけに仮置きしない。分類が未確定なら `owner decision pending` として Redmine に残し、何を owner が決めれば `new issue` または `explicit no-op` へ進めるかを書く。
-
-棚卸し対象は、Redmine journal、review notes、docs diff、owner chat から観測された次の語彙・論点である。
-
-- `non-goal` / `非目標`
-- `future scope` / `later-stage` / `deferred`
-- `owner decision pending` / 意思決定待ち
-- 標準化、標準プラグイン、配布形態、public/private boundary
-- private consumer 側に置くか、`mozyo-bridge` の reusable primitive に切り出すかで迷った論点
-
-各項目は、次のいずれかに分類して Redmine に残す。
-
-- new issue: UserStory / inquiry / decision issue として起票する。
-- existing issue: 既存 issue に relation / journal で紐づける。
-- explicit no-op: 採用しない理由と再評価条件の有無を記録する。
-- owner decision pending: 実装せず、owner 判断待ちとして残す。
-
-未分類の owner intent / deferred decision が残る場合、管制塔は「全部完了」「残 scope なし」と表現しない。backlog が一時的に粗くなることより、owner intent が消えることを重い失敗として扱う。重複や不要 issue は後で close / `不要` / 統合できるが、未記録の intent は次セッションで検出できないためである。
-
-Version 単位の roadmap を提案する場合は、各 Version について少なくとも container issue または `owner decision pending` を残す。Version 名だけ、chat 上の箇条書きだけ、または「次で扱う」という宣言だけでは durable classification を満たさない。container issue を作る場合は、Version の目的、受け入れ観点、既知の関連 issue、現時点で非目標にする scope を description または journal に残す。
+本 repo 固有の追加: 棚卸し論点には、private consumer 側に置くか `mozyo-bridge` の reusable primitive に切り出すかで迷った論点 (`vibes/docs/rules/public-private-boundary.md`) と、標準プラグイン / 配布形態の未決論点を含める。分類の記録先は Redmine journal / issue description であり、explicit no-op で不要になった issue は `不要` status で閉じられる。
 
 Version close 前に open issue が残っている場合、管制塔は「未完のまま黙って無視」しない。各 issue について次のいずれかを durable record に残す。
 
@@ -667,7 +597,7 @@ retire_blockers = active_lane, review_pending, owner_approval_pending, unresolve
 
 - `vibes/docs/rules/agent-workflow.md`
 - `vibes/docs/specs/work-unit-granularity-config.md` (configurable work-unit granularity の schema / dispatch 契約の正本)
-- `vibes/docs/specs/delegated-coordinator-role-profile.md` (親→子委譲時の `coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker` role 語彙と責務境界の正本)
+- `vibes/docs/specs/delegated-coordinator-role-profile.md` (親→子委譲の採用記録 / packaged runtime 設定同期 anchor。role 語彙と責務境界の配布正本は #13029 により `skills/mozyo-bridge-agent/references/workflow.md` `## 委譲コーディネータ role model (delegated coordinator)`)
 - `vibes/docs/logics/sublane-bandwidth-policy.md` (互換 pointer。帯域正本は本書)
 - `vibes/docs/logics/worktree-lifecycle-boundary.md`
 - `skills/mozyo-bridge-agent/references/workflow.md`

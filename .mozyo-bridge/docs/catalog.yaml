@@ -63,7 +63,7 @@ documents:
     type: rule
     status: active
     canonical_path: vibes/docs/rules/claude-design-consultation.md
-    purpose: Claude design consultation を high-signal gate として発火させる project-local 運用ルール (発火/非発火条件、相談 payload 要素、gate lifecycle 整合)。毎回必須にしない。
+    purpose: Claude design consultation を high-signal gate として発火させる運用の project-local 採用記録。発火/非発火条件・payload 要素・Review/Close 照合の正本は #13029 により配布側 skill-workflow-reference の `## Design Consultation 発火判断`。本 doc は repo 固有適用と handoff コマンド形を保持する。毎回必須にしない。
     audit_role: claude_design_consultation_rule
     related_document_refs:
       - rule-project-agent-workflow
@@ -131,7 +131,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/delegated-coordinator-role-profile.md
-    purpose: coordinator / delegated_coordinator / implementation_gateway / implementation_worker の最小 role 語彙、親 issue close・owner approval・callback・downstream dispatch の責務境界、固定 role profile template の正本。
+    purpose: 委譲コーディネータ role model の採用記録と packaged `role_profile_templates.yaml` の同期 anchor。role 語彙・権限対応表・責務境界・固定 role profile template の配布正本は #13029 により skill-workflow-reference の `## 委譲コーディネータ role model (delegated coordinator)`。
     audit_role: delegated_coordinator_role_profile_spec
     related_document_refs:
       - logic-coordinator-sublane-development-flow

@@ -25,29 +25,24 @@
   (`epic|feature|user_story|leaf_issue`) と例外条件の正本は
   `vibes/docs/specs/work-unit-granularity-config.md` を読む。
 - Issue は目的、作業対象、成果物、完了条件、必要な gate journal を持つ。
-- ユーザー向けの narrative、進捗報告、handoff summary、review summary、次アクション説明では、
-  Redmine issue / task を **ID だけで呼ばない**。必ず `#<id> <短い概要>` の形で書く。
-  例: `#12703 ticketless no-anchor callback transport`、
-  `#12700 workflow contract refs injection`。ID は durable anchor であり、
-  人間が記憶する作業名ではない。
-- 複数回同じ issue を列挙する短い表や log では、最初の出現で `#<id> <短い概要>` を示し、
-  以後の同一段落内では `#<id>` だけに省略してよい。ただし、段落・節・turn をまたいで
-  次アクションや blocker を説明する場合は再度概要を添える。
-- machine-readable surface では literal を保つ。commit trailer (`Refs: Redmine #<id>`,
-  `issue_<id>`)、CLI flag、JSON field、Redmine journal の構造化 field、branch 名、
-  file path はこの人間向け label rule の対象外である。
+- narrative の issue 参照 labeling — `#<id> <短い概要>` の形、同一段落内の省略ルール、
+  machine-readable surface (commit trailer / CLI flag / JSON field / branch 名 / file path)
+  の対象外扱い — の正本は、#13029 により配布側
+  `skills/mozyo-bridge-agent/references/workflow.md` の
+  「Narrative の issue 参照は `#<id> <短い概要>` で書く」節にある。本 doc は再掲しない
+  (#13029 で pointer 化)。repo 内の適用例: `#12703 ticketless no-anchor callback transport`。
 - 作業が完了、block、scope 変更、handoff、review、owner close approval、close
   に進む場合は、該当 issue の journal を更新する。
 - chat message を durable な作業ログとして扱わない。
 - issue scope が膨らんだ場合は、黙って削らず follow-up issue に分割する。
-- owner intent、future scope、non-goal、later-stage、decision pending は、close /
-  Version readiness / session retrospective 前に
-  `vibes/docs/logics/coordinator-sublane-development-flow.md` の
-  backlog reconciliation gate で棚卸しし、new issue / existing issue /
-  explicit no-op / owner decision pending のいずれかに分類する。
-- cockpit / sublane 運用で agent が「後で」「別 Version」「follow-up」
-  「later-stage」と提案した場合は、同 doc の immediate durable classification
-  を正とし、会話だけに残さない。
+- owner intent、future scope、non-goal、later-stage、decision pending の棚卸しと、
+  「後で」「別 Version」「follow-up」「later-stage」提案の immediate durable
+  classification (new issue / existing issue / explicit no-op / owner decision pending)
+  の正本は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の
+  `## Backlog reconciliation gate (deferred intent の即時 durable 分類)` にある。
+  repo の US close / Version close 運用への組み込みは
+  `vibes/docs/logics/coordinator-sublane-development-flow.md` `## US close と Version close`
+  を読む。会話だけに残さない。
 - Claude の通常開発完了 journal には、次の最小証跡を短く残す。
   - `mozyo-bridge-agent` skill を loaded したこと。
   - active Redmine issue / journal と relevant project docs を確認したこと。
@@ -75,18 +70,7 @@
 
 ## User Interaction And Escalation
 
-- Claude は active Redmine issue の scope 内では自律的に作業する。通常はユーザーへ直接質問しない。
-- Claude は以下に該当する場合だけ Codex へ escalation する。
-  - Redmine issue の目的、成果物、完了条件が曖昧である。
-  - 規約、Redmine、repository docs の間に矛盾がある。
-  - shared skill、scaffold preset、repo-local policy の境界判断が必要である。
-  - destructive、irreversible、release、publish、tag、version bump など外部影響のある操作判断が必要である。
-  - secret、credential、個人情報、権限、認証に触れる可能性がある。
-  - ユーザー意図の解釈が複数あり、間違えると作業が無駄になる。
-  - audit finding への対応方針が source of truth から決めきれない。
-- Codex は escalation を受けたら、既存の source of truth から判断できるかを先に確認する。判断できる場合はユーザーへ質問せず、判断と根拠を Redmine に記録する。
-- Codex は source of truth だけでは推測になる場合に限り、ユーザーへ問い合わせる。ユーザーとの対話窓口は原則 Codex に統一する。
-- ユーザーが Claude に直接指示した場合、Claude は必要に応じて Redmine journal または Codex への通知で source of truth を更新してから続行する。
+escalation trigger 一覧 (実装者 Claude がユーザー窓口 Codex へ escalate する 7 条件) と、escalation を受けた Codex の handling (source of truth 先行確認、ユーザー問い合わせの限定、対話窓口の Codex 統一、Claude への直接指示時の source of truth 更新) の正本は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `### 実装者 escalation trigger (Claude → Codex)` にある。本 doc は再掲しない (#13029 で pointer 化)。本 repo 固有の追加はない (durable record は Redmine issue / journal)。
 
 ## Claude / Codex Role Boundary
 

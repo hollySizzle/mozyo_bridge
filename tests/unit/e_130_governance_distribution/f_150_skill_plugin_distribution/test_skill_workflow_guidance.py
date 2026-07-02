@@ -129,6 +129,17 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "### Repo-Local Guardrail Autonomous Lane",
         "## Audit-Owned Commit Authority",
         "## Workflow 変更の反映確認 (Workflow Change Verification)",
+        # Redmine #13029 upstream of the repo-local core workflow: spec-decision
+        # routing, design-consultation firing, backlog reconciliation, delegated
+        # coordinator role model (incl. grandchild dispatch), and the narrative
+        # issue-labeling rule move into the distributed body.
+        "## 仕様決定 routing",
+        "## Design Consultation 発火判断",
+        "## Backlog reconciliation gate (deferred intent の即時 durable 分類)",
+        "## 委譲コーディネータ role model (delegated coordinator)",
+        "### 孫 dispatch / context 保護",
+        "### 固定 role profile template",
+        "### 実装者 escalation trigger (Claude → Codex)",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
@@ -293,6 +304,24 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # Workflow Change Verification policy.
         "Workflow Change Verification",
         "通常開発タスクは Claude が実装する",
+        # Redmine #13029 portable core-workflow upstream. Spec-decision
+        # routing keeps the coordinator-owned / sublane-decidable split and
+        # the stop-on-coordinator-owned-decision rule; design consultation
+        # keeps the firing axis; backlog reconciliation keeps the immediate
+        # four-way durable classification; the delegated-coordinator model
+        # keeps the fixed role invariants and the grandchild-dispatch
+        # purpose; the labeling rule and the implementer escalation window
+        # stay verbatim.
+        "sublane は実装を止め、durable record に design consultation / blocked / owner-action-needed を記録し",
+        "後戻りコスト × 実装者反証の有益性",
+        "実装者は実装せず、設計に答える",
+        "**owner decision pending** — 実装せず、owner 判断待ちとして残す",
+        "`purpose: preserve_coordinator_context`",
+        "parent issue close は最上位 `coordinator` のみが行う",
+        "owner approval は最上位 `coordinator` の単一 aggregation point に集約し、子 lane 内で ratify しない",
+        "`grandchild_dispatch: avoided`",
+        "必ず `#<id> <短い概要>` の形で書く",
+        "ユーザーとの対話窓口は原則 Codex に統一する",
         # Redmine default-project resolution (Redmine #10689). The
         # workspace-local snippet path and the "explicit wins over
         # default" / "UNVERIFIED escalates" rules must stay in the
