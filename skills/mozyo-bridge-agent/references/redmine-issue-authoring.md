@@ -1,60 +1,60 @@
-# Redmine Issue Authoring And Version Operation Reference
+# Redmine Issue 記載粒度と Version 運用 Reference
 
-How to write Epic / Feature / UserStory / leaf issues and how to operate Redmine Versions so an LLM can author tickets and pick dispatch candidates without guessing (Redmine #13024). This reference carries the portable authoring / planning guideline; the gate vocabulary, required journal fields, and close conditions stay in the central preset, and the subject / description mechanics stay in `references/workflow.md` `### Issue Subject / Description Separation`. Where the two would overlap, this document points instead of restating.
+LLM が迷わず ticket を起票し dispatch 候補を選べるようにするための、Epic / Feature / UserStory / leaf issue の記載粒度と Redmine Version 運用の判断ロジック (Redmine #13024)。本 reference は portable な authoring / planning guideline を持つ。gate 語彙・必須 journal field・close 条件は central preset、subject / description の機構は `references/workflow.md` `### Issue Subject / Description Separation` が正本であり、重なる箇所は再掲せず pointer にする。
 
-## Hierarchy Granularity Decision Table
+## 階層粒度の判断表
 
-Pick the tracker by what the record is *for*, not by how big the work feels:
+tracker は「作業の大きさの感覚」ではなく「その record が何のためにあるか」で選ぶ:
 
-| Level | What it is | Completion semantics | Author it when |
+| 階層 | 何であるか | 完了の意味 | 起票する場面 |
 | --- | --- | --- | --- |
-| **Epic** | Long-lived investment area in the product portfolio | Not a work-completion unit; normally stays open for years | A durable product / governance area needs a portfolio node |
-| **Feature** | Continuing capability category under an Epic | Not a work-completion unit; normally stays open | A capability inside an Epic will accumulate UserStories over time |
-| **UserStory** | The standard unit of work and acceptance — roughly `1 US = 1 branch / 1 worktree / 1 PR` | Closes via review / owner close approval / Close Gate (central preset `## Completion`) | Work is being planned, dispatched, or accepted |
-| **Task / Test / Bug (leaf)** | Breakdown, verification, or defect *inside* a US scope | Closes on a replayable implementation_done journal + commit record (task_close) | A US needs an auditable sub-record, or a preset-listed task-level exception applies |
+| **Epic** | product portfolio 上の長寿命な投資領域 | 作業完了単位ではない。通常は年単位で open のまま | 恒久的な product / governance 領域に portfolio node が必要なとき |
+| **Feature** | Epic 配下の継続的な機能カテゴリ | 作業完了単位ではない。通常 open のまま | Epic 内のある能力に UserStory が継続的に積まれていくとき |
+| **UserStory** | 標準の作業・受け入れ単位 — 概ね `1 US = 1 branch / 1 worktree / 1 PR 相当` | review / owner close approval / Close Gate で close (central preset `## Completion`) | 作業を計画・dispatch・受け入れするとき |
+| **Task / Test / Bug (leaf)** | US scope **内部** の内訳・検証・不具合対応 | replayable な implementation_done journal + commit record で close (task_close) | US に監査可能な sub-record が必要なとき、または preset の task-level 例外に該当するとき |
 
-- **Epic / Feature are a catalog, not a queue.** They express "this area is still part of the product". Do not close them because the current UserStories finished, and do not dispatch them as implementation units without an explicit owner / operator decision (see the work-unit granularity contract distributed with the governed preset).
-- **The UserStory is the standard work unit** (`1US = 1作業単位`). Plan it so one implementer can carry its child Task / Test / Bug issues end to end in one lane: one branch / worktree / PR-equivalent of scope. If a US cannot fit that shape, split it into multiple USes rather than growing an umbrella.
-- **Leaf issues are subordinate.** Create them to structure a US, not as free-standing work; a standalone leaf dispatch is the preset's task-level exception, and the reason must land in the dispatch decision journal.
-- **Ordering prefix convention (recommended).** Epic and Feature numbering prefixes are each an independent sequence, and a 10-step prefix (`110`, `120`, `130`, ...) expresses workflow reading order — the order an agent should scan the catalog — not priority or progress. The gaps leave room to insert areas later without renumbering. Adopting projects may use another ordering convention; whatever is chosen, keep it a display/reading order, never an identity or routing key.
+- **Epic / Feature はカタログであり、queue ではない。** 「この領域はまだ product の一部である」ことを表す。直近の UserStory が完了したことを理由に close せず、explicit な owner / operator decision なしに実装単位として dispatch しない (governed preset が配布する work-unit granularity 契約を参照)。
+- **UserStory が標準の作業単位** (`1US = 1作業単位`)。1 実装者が配下の Task / Test / Bug を 1 lane で一気通貫できる形 — branch / worktree / PR 相当 1 つ分の scope — に収まるよう計画する。収まらない US は umbrella 化せず複数 US に分割する。
+- **leaf issue は従属物。** US を構造化するために作り、独立した作業として起票しない。leaf 単体の dispatch は preset の task-level 例外であり、該当理由を dispatch decision journal に残す。
+- **順序 prefix convention (推奨)。** Epic と Feature の番号 prefix はそれぞれ独立した系列とし、10 刻みの prefix (`110`, `120`, `130`, ...) は workflow 上の読み順 — agent がカタログを走査すべき順序 — を表す。優先度や進捗ではない。刻みの隙間は後から領域を挿入しても振り直さないための余白である。採用 project は別の順序 convention を使ってよいが、いずれにせよ表示・読み順に留め、identity や routing の key にしない。
 
-## Owner Utterance And Normalized Intent
+## 原文要点と Normalized Intent
 
-Ticket descriptions that originate from owner conversation keep two separated sections instead of one blended summary:
+owner との会話から生まれる ticket の description は、1 つに溶かした要約ではなく、分離した 2 節を保つ:
 
-- **原文要点 (owner utterance digest)** — a lightly condensed record of what the owner actually said. Summarizing is fine; dropping a thought, policy, or concern is not. When later work seems to contradict the ticket, this section is what arbitration reads.
-- **Normalized intent** — the actionable restatement: what the work is, in scope terms an implementer can execute.
+- **原文要点 (owner utterance digest)** — owner が実際に言ったことの軽い要約記録。要約はよいが、思想・方針・懸念を落とすことは不可。後の作業が ticket と矛盾して見えるとき、仲裁が読むのはこの節である。
+- **Normalized intent** — 実行可能な言い換え: 実装者が実行できる scope の言葉で「何をする作業か」を述べる。
 
-Scope / Close conditions / Non-goals then follow from the normalized intent. Never overwrite the utterance digest to match a later reinterpretation; append instead.
+Scope / Close conditions / Non-goals は normalized intent から導く。後からの再解釈に合わせて原文要点を書き換えない。追記で対応する。
 
-## UserStory Close Conditions And Acceptance Notes
+## UserStory の Close Conditions と Acceptance Notes
 
-Write close conditions so a conversation-driven flow can verify them without re-asking the owner:
+会話駆動の運用でも owner に聞き直さず検証できるよう、close condition は次の形で書く:
 
-- Each close condition is an observable statement about the repo, docs, or durable record ("X is documented in Y", "Z passes"), not a feeling ("works well").
-- Keep the list short (roughly 3–6 items); if it grows past that, the US is probably two USes.
-- Non-goals are part of acceptance: state what the US deliberately does not do, so audit does not read missing work as a gap.
-- Boundary references beat duplication: when a sibling US owns part of the topic, name it ("placement is #NNNN's scope") instead of restating its rules.
+- 各 close condition は repo / docs / durable record について**観測可能な文** (「X が Y に記載されている」「Z が pass する」) で書く。感想 (「うまく動く」) にしない。
+- リストは短く保つ (目安 3〜6 項目)。それを超えるなら、その US はおそらく 2 つの US である。
+- **Non-goals も受け入れの一部。** 意図的にやらないことを明記し、audit が「やっていない部分」を gap と誤読しないようにする。
+- 重複より境界参照。兄弟 US が扱う話題は再説明せず「配置は #NNNN の scope」のように名指しで参照する。
 
-## Version Operation
+## Version 運用
 
-A Redmine Version is a **planning / release-readiness / lane-inventory bucket** — the primary candidate range for release planning, sprint-like grouping, readiness windows, and lane dispatch. It is **not** the package version authority: tags, package metadata, release notes, and the release journal own the shipped version number, and Version names must not pre-encode future package numbers.
+Redmine Version は **planning / release-readiness / lane-inventory bucket** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される version 番号の正本は tag / package metadata / release notes / release journal であり、Version 名に将来の package 番号を先入れしない。
 
-Sizing and lifecycle:
+サイズと lifecycle:
 
-- **Target roughly 10–20 UserStories per Version.** A Version that is too small starves sublane ticket inventory; one that is too large stops being a readiness window. Split or merge on that signal.
-- **Create Versions around existing candidates, not ahead of them.** Do not pre-create an empty Version as a placeholder; create or select one when candidate USes exist to fill it.
-- **Prefer existing related Versions for follow-ups.** A follow-up US goes into the Version whose theme it continues; do not mint a new Version per follow-up wave.
+- **1 Version は概ね 10〜20 UserStory を目安とする。** 小さすぎる Version は sublane のチケット在庫を枯らし、大きすぎる Version は readiness window として機能しなくなる。その兆候で分割・統合する。
+- **Version は候補がある状態で作り、先回りして作らない。** 空の Version を placeholder として先行作成しない。埋めるべき候補 US が存在するときに作成・選択する。
+- **follow-up は関連する既存 Version を優先する。** follow-up US はテーマを継続する Version に入れる。follow-up の波ごとに新規 Version を乱造しない。
 
-Dispatch candidate selection:
+dispatch 候補の選定:
 
-1. Prefer ready UserStories in the current Version — that is what the Version-as-inventory model is for.
-2. When the current Version's ready inventory runs dry, refill from the related Feature's USes or an adjacent (theme-continuing) Version, and record the refill reason in the dispatch decision journal.
-3. Version membership never overrides the durable-record gates: a US is dispatchable because its record is ready, not because of which bucket it sits in, and sharing (or not sharing) a Version is by itself neither a serialization nor a parallelization reason.
+1. **current Version 内の ready UserStory を優先する** — Version-as-inventory model の目的そのものである。
+2. current Version の ready 在庫が枯れたときのみ、関連 Feature 配下の US または隣接する (テーマ継続の) Version から補充し、**補充理由を dispatch decision journal に残す**。
+3. Version 所属は durable-record gate を上書きしない: US が dispatch 可能なのは record が ready だからであり、どの bucket にいるかではない。Version が同じ / 違うこと自体は直列化・並列化いずれの理由にもならない。
 
-## Boundaries
+## 境界
 
-- Gate names, required fields, review / close semantics: central preset (this document adds no gate vocabulary).
-- Subject / description authoring mechanics and the explicit-subject-on-create rule: `references/workflow.md` `### Issue Subject / Description Separation`.
-- Where this guideline itself lives (distributed body vs an adopting repo's local docs): `references/workflow.md` `## Workflow Docs Source-Of-Truth Boundary` (Redmine #13025). Repo-specific Version names, concrete Epic / Feature catalogs, and workspace numbering adoptions are repo-local facts and stay out of this distributed body.
-- Keep operator-specific policy out of OSS defaults: concrete inventory thresholds beyond the 10–20 guide, private prioritization, and named business domains belong to the operator's runbook, per the public / private boundary rule.
+- gate 名、必須 field、review / close の意味論: central preset (本 doc は gate 語彙を追加しない)。
+- subject / description の authoring 機構と explicit-subject-on-create rule: `references/workflow.md` `### Issue Subject / Description Separation`。
+- 本 guideline 自体の配置 (配布 body か採用 repo の local docs か): `references/workflow.md` `## Workflow Docs Source-Of-Truth Boundary` (Redmine #13025)。repo 固有の Version 名、具体の Epic / Feature カタログ、workspace の番号 prefix 採用事実は repo-local の事実であり、本配布 body には置かない。
+- operator 固有 policy を OSS default に入れない: 10〜20 の目安を超える具体の在庫しきい値、private な優先順位付け、業務ドメイン名は public / private boundary rule に従い operator の runbook 側に置く。
