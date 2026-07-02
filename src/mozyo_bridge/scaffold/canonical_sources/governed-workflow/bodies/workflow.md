@@ -200,13 +200,14 @@ review_request:
     - 変更ファイル
     - 配下issue一覧と各状態 (US-level のみ。残リスク・未完 scope を含む)
     - review観点
+    - 根拠出所 (依頼理由・review観点に owner 発話 / 規約 / 実装者判断を根拠として載せる場合、`### 根拠出所分類` の 4 分類で出所を明示する)
     - 未確認事項
     - 受信agent
     - 受領方法
 review:
   actor: 監査者
   標準粒度: UserStory。対象 commit だけでなく配下 Task / Test / Bug の issue / journal / docs / residual risk を横断して読む
-  必須: [対象commit_or_diff, remote_verification, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 未確認事項, 再review要否, 結論]
+  必須: [対象commit_or_diff, remote_verification, 配下issue確認結果 (US-levelのみ), resolved_docs, 照合規約, 指摘事項, 指摘事項_根拠出所, 未確認事項, 再review要否, 結論]
   remote_verification: 対象 commit 群が origin (共有 remote) 上に到達可能であることを read-only で確認する。確認できない場合は事実指摘ではなく blocker とし close へ進めない (`### Commit Hash Origin 到達可能性`)
   指摘事項_分類:
     - 事実: コード・設定・docs で確認済みの不整合のみ
@@ -707,6 +708,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - commit_origin到達: (対象 commit が origin 到達可能か: push済み確認方法 / 未push理由)
 - changed_paths:
 - review_focus:
+- 根拠出所: (依頼理由・review_focus に載せる根拠: owner_intent j#<id>/原文要点 | documented_rule <path + 節名> | agent_judgment | hearsay)
 - 未確認事項:
 - receiver: Codex
 - receive_method: mozyo-bridge journal <id>
@@ -744,6 +746,7 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - purpose: dispute
 - dispute_target: journal #
 - evidence:
+- 根拠出所: (owner_intent anchor | documented_rule path | agent_judgment | hearsay)
 - counterproposal:
 - owner_escalation_required:
 
