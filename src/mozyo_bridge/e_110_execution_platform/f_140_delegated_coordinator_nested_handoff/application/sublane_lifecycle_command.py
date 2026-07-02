@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -58,6 +59,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     plan_sublane_create,
     preflight_sublane_retire,
     project_sublanes,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
+    normalize_work_unit_granularity,
 )
 
 
@@ -386,6 +390,49 @@ def _repo_root(args: argparse.Namespace) -> Path:
     return Path(repo).expanduser() if repo else Path.cwd()
 
 
+def resolve_work_unit_request_fields(
+    args: argparse.Namespace, repo_root: Path
+) -> tuple[str, Optional[str]]:
+    """Resolve the #13002 work-unit granularity + decision anchor for a create.
+
+    Precedence: an explicit ``--work-unit`` flag wins; otherwise the repo-local
+    ``.mozyo-bridge/config.yaml`` ``work_unit.granularity`` (a missing / absent
+    block is the ``user_story`` default). A present-but-broken config raises
+    ``RepoLocalConfigError`` — the caller fails closed instead of silently
+    dispatching with the default unit. The decision anchor
+    (``--work-unit-decision-journal``) passes through verbatim; whether it is
+    required is the pure :func:`decide_work_unit_dispatch` gate's call.
+    """
+    anchor = getattr(args, "work_unit_decision_journal", None)
+    explicit = getattr(args, "work_unit", None)
+    if explicit:
+        return normalize_work_unit_granularity(explicit), anchor
+    # Imported lazily so the pure use cases / tests never require the loader
+    # (and its file IO) unless the config fallback is actually consulted.
+    from mozyo_bridge.application.repo_local_config_loader import (
+        load_repo_local_config,
+    )
+
+    config = load_repo_local_config(repo_root)
+    return config.work_unit.granularity, anchor
+
+
+def _build_create_request(
+    args: argparse.Namespace, *, work_unit: str, work_unit_decision_anchor: Optional[str]
+) -> SublaneCreateRequest:
+    """Assemble the create request from CLI args + the resolved work unit (pure)."""
+    return SublaneCreateRequest(
+        issue=getattr(args, "issue", "") or "",
+        lane_label=getattr(args, "lane_label", "") or "",
+        branch=getattr(args, "branch", "") or "",
+        worktree_path=getattr(args, "worktree", "") or "",
+        journal=getattr(args, "journal", None),
+        upstream_coordinator=getattr(args, "upstream_coordinator", None),
+        work_unit=work_unit,
+        work_unit_decision_anchor=work_unit_decision_anchor,
+    )
+
+
 def cmd_sublane_list(args: argparse.Namespace) -> int:
     use_case = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=_repo_root(args)))
     outcome = use_case.run(lane_filter=getattr(args, "lane", None))
@@ -397,15 +444,22 @@ def cmd_sublane_list(args: argparse.Namespace) -> int:
 
 
 def cmd_sublane_create(args: argparse.Namespace) -> int:
-    request = SublaneCreateRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane_label=getattr(args, "lane_label", "") or "",
-        branch=getattr(args, "branch", "") or "",
-        worktree_path=getattr(args, "worktree", "") or "",
-        journal=getattr(args, "journal", None),
-        upstream_coordinator=getattr(args, "upstream_coordinator", None),
+    repo_root = _repo_root(args)
+    # Fail closed on a present-but-broken repo-local config: never silently plan
+    # with the default work unit when the operator's declared config is unreadable.
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+        RepoLocalConfigError,
     )
-    use_case = SublaneCreateUseCase(LiveSublaneLifecycleOps(repo_root=_repo_root(args)))
+
+    try:
+        work_unit, decision_anchor = resolve_work_unit_request_fields(args, repo_root)
+    except RepoLocalConfigError as exc:
+        print(f"invalid repo-local config: {exc}", file=sys.stderr)
+        return 1
+    request = _build_create_request(
+        args, work_unit=work_unit, work_unit_decision_anchor=decision_anchor
+    )
+    use_case = SublaneCreateUseCase(LiveSublaneLifecycleOps(repo_root=repo_root))
     outcome = use_case.run(request)
     if getattr(args, "json", False):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
@@ -443,6 +497,7 @@ __all__ = (
     "SublaneLifecycleOps",
     "LiveSublaneLifecycleOps",
     "RetireAssertions",
+    "resolve_work_unit_request_fields",
     "SublaneListOutcome",
     "SublaneCreateOutcome",
     "SublaneRetireOutcome",

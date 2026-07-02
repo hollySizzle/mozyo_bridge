@@ -37,6 +37,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
     REASON_STAMP_FAILED,
+    REASON_WORK_UNIT_BLOCKED,
     REASON_WORKTREE_CREATE_FAILED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
@@ -179,6 +180,48 @@ class MissingIdentityTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+
+
+class WorkUnitGateTests(unittest.TestCase):
+    """#13002: epic / feature units never actuate without an explicit decision."""
+
+    def test_epic_without_decision_anchor_blocks_before_probe(self):
+        ops = FakeActuatorOps(git=True)
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(work_unit="epic"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_WORK_UNIT_BLOCKED, outcome.blocked_reasons)
+        self.assertIn(
+            "work_unit_explicit_decision_required", outcome.blocked_reasons
+        )
+        self.assertEqual(ops.calls, [])  # short-circuit before any probe
+
+    def test_feature_without_decision_anchor_blocks_dry_run_too(self):
+        outcome = SublaneActuateUseCase(FakeActuatorOps()).run(
+            _req(work_unit="feature"), execute=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_WORK_UNIT_BLOCKED, outcome.blocked_reasons)
+
+    def test_epic_with_durable_decision_anchor_executes(self):
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=False, lanes=[None, _lane()], dispatch_rc=0
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(work_unit="epic", work_unit_decision_anchor="70719"),
+            execute=True,
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_leaf_issue_exception_unit_executes(self):
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=False, lanes=[None, _lane()], dispatch_rc=0
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(work_unit="leaf_issue"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
 
 class ExecuteHappyPathTests(unittest.TestCase):

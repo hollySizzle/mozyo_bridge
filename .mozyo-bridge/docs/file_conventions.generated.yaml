@@ -75,6 +75,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
   - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_project_config.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/work_unit_granularity.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/route_identity_ledger.py
   - src/mozyo_bridge/domain/handoff_route_identity.py
@@ -102,8 +103,8 @@ rules:
   - tests/support/delegation_route_fakes.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
-    と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-route-live-executor.md と @vibes/docs/specs/route-identity-ledger.md
-    と @vibes/docs/specs/delegated-coordinator-role-profile.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
+    と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-route-live-executor.md
+    と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
     と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/unit-target-model.md
     と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
     をよく確認し従うこと

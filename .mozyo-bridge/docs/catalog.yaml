@@ -201,6 +201,21 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-work-unit-granularity-config
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/work-unit-granularity-config.md
+    purpose: "governed work-unit granularity (`epic` / `feature` / `user_story` / `leaf_issue`) の config knob schema と dispatch 契約の正本 (#13002)。default `user_story` (1US=1作業単位)、`leaf_issue` は central preset の task_level例外の適用面、`epic` / `feature` は explicit owner/operator decision (durable anchor) なしで fail-closed。granularity で緩められない固定 invariant (gate / durable anchor / sublane route / hidden worker 禁止) の境界を定義する。"
+    audit_role: work_unit_granularity_config_spec
+    related_document_refs:
+      - spec-delegation-policy-project-config
+      - logic-coordinator-sublane-development-flow
+      - logic-unit-presentation-state-db
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-vscode-agent-pane-contract
     type: spec
     status: active
@@ -785,10 +800,11 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める leaf 数最大化型 lane 配置、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - logic-sublane-lifecycle-map
+      - spec-work-unit-granularity-config
       - rule-project-agent-workflow
       - rule-llm-rule-authoring
       - rule-docs-catalog-governance
@@ -1254,6 +1270,7 @@ file_conventions:
       - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_project_config.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/work_unit_granularity.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/route_identity_ledger.py
       - src/mozyo_bridge/domain/handoff_route_identity.py
@@ -1283,6 +1300,7 @@ file_conventions:
     document_refs:
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
+      - spec-work-unit-granularity-config
       - spec-delegated-coordinator-decision-records
       - spec-delegated-route-live-executor
       - spec-route-identity-ledger

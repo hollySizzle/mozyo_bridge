@@ -46,6 +46,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     RepoLocalConfig,
     RepoLocalConfigError,
     SublaneIntegrationConfig,
+    WorkUnitGranularityConfig,
 )
 
 
@@ -577,6 +578,37 @@ class SublaneIntegrationConfigTest(unittest.TestCase):
     def test_unsupported_version_fails_closed(self) -> None:
         with self.assertRaises(RepoLocalConfigError):
             SublaneIntegrationConfig.from_record({"version": 2})
+
+
+class WorkUnitGranularityWiringTest(unittest.TestCase):
+    """The governed work-unit granularity knob (Redmine #13002)."""
+
+    def test_default_is_user_story(self) -> None:
+        default = WorkUnitGranularityConfig.default()
+        self.assertEqual(default.granularity, "user_story")
+        self.assertEqual(RepoLocalConfig.default().work_unit, default)
+
+    def test_missing_block_keeps_user_story_default(self) -> None:
+        config = RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}})
+        self.assertEqual(config.work_unit, WorkUnitGranularityConfig.default())
+
+    def test_valid_record_selects_granularity(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"work_unit": {"version": 1, "granularity": "leaf_issue"}}
+        )
+        self.assertEqual(config.work_unit.granularity, "leaf_issue")
+
+    def test_invalid_granularity_fails_closed_as_repo_local_error(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"work_unit": {"granularity": "sprint"}})
+
+    def test_unknown_key_fails_closed_as_repo_local_error(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"work_unit": {"unit": "user_story"}})
+
+    def test_non_mapping_record_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"work_unit": "user_story"})
 
 
 if __name__ == "__main__":

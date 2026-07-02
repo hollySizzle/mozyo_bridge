@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
@@ -57,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     cmd_sublane_create,
+    resolve_work_unit_request_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     ACTUATE_BLOCKED,
@@ -72,6 +74,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
     REASON_STAMP_FAILED,
+    REASON_WORK_UNIT_BLOCKED,
     REASON_WORKTREE_CREATE_FAILED,
     STEP_BLOCKED,
     STEP_EXECUTED,
@@ -344,7 +347,19 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 2. Anchor requirement: a live dispatch needs a durable journal id.
+        # 2. Work-unit granularity gate (#13002): an epic / feature unit is never
+        # actuated / dispatched without an explicit owner / operator decision anchor.
+        unit_decision = request.work_unit_decision()
+        if not unit_decision.is_allowed:
+            return self._blocked(
+                request,
+                launch_action=None,
+                reason=unit_decision.reason,
+                reasons=(REASON_WORK_UNIT_BLOCKED, unit_decision.diagnostic),
+                dispatch=dispatch,
+            )
+
+        # 3. Anchor requirement: a live dispatch needs a durable journal id.
         anchor = (request.journal or "").strip()
         if execute and dispatch and not anchor:
             return self._blocked(
@@ -356,7 +371,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3. Resolve the launch decision; a blocked launch is fail-closed. With every
+        # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently
         # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
         launch = self._decide_launch(request)
@@ -369,11 +384,11 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 4. Dry-run: resolve the plan; perform nothing.
+        # 5. Dry-run: resolve the plan; perform nothing.
         if not execute:
             return self._dry_run(request, launch, dispatch=dispatch)
 
-        # 5. Live actuation, fail-closed, stopping at the first failure.
+        # 6. Live actuation, fail-closed, stopping at the first failure.
         return self._execute(request, launch, dispatch=dispatch, target_repo=target_repo)
 
     # -- helpers ------------------------------------------------------------
@@ -925,6 +940,20 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
     if not execute and not dry_run:
         return cmd_sublane_create(args)
 
+    repo_root = _repo_root(args)
+    # Resolve the #13002 work-unit granularity exactly as the plan-only surface
+    # does (flag > repo-local config > user_story default), failing closed on a
+    # present-but-broken config instead of silently actuating the default unit.
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+        RepoLocalConfigError,
+    )
+
+    try:
+        work_unit, decision_anchor = resolve_work_unit_request_fields(args, repo_root)
+    except RepoLocalConfigError as exc:
+        print(f"invalid repo-local config: {exc}", file=sys.stderr)
+        return 1
+
     request = SublaneCreateRequest(
         issue=getattr(args, "issue", "") or "",
         lane_label=getattr(args, "lane_label", "") or "",
@@ -932,8 +961,10 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         worktree_path=getattr(args, "worktree", "") or "",
         journal=getattr(args, "journal", None),
         upstream_coordinator=getattr(args, "upstream_coordinator", None),
+        work_unit=work_unit,
+        work_unit_decision_anchor=decision_anchor,
     )
-    use_case = SublaneActuateUseCase(LiveSublaneActuatorOps(repo_root=_repo_root(args)))
+    use_case = SublaneActuateUseCase(LiveSublaneActuatorOps(repo_root=repo_root))
     outcome = use_case.run(
         request,
         execute=execute and not dry_run,

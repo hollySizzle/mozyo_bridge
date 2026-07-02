@@ -51,6 +51,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorktreeLaunchDecision,
     render_integration_decision_journal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
+    DEFAULT_WORK_UNIT_GRANULARITY,
+    WorkUnitDispatchDecision,
+    decide_work_unit_dispatch,
+)
 
 # ---------------------------------------------------------------------------
 # Roles + lane identity (literal; machine-readable regardless of UI language).
@@ -291,6 +296,13 @@ class SublaneCreateRequest:
     generation an operator decision). ``journal`` is the durable anchor the dispatch
     steps point at. ``upstream_coordinator`` is the coordinator pane the gateway calls
     back to; ``None`` renders a placeholder in the dispatch step.
+
+    ``work_unit`` declares the governed granularity of the dispatched unit (#13002):
+    the caller-asserted kind of ``issue`` (``user_story`` standard default /
+    ``leaf_issue`` exception / ``epic`` / ``feature``), a fact no probe can infer —
+    like the retire assertions, it is supplied from the durable Redmine record.
+    ``work_unit_decision_anchor`` is the durable owner / operator decision journal
+    an ``epic`` / ``feature`` dispatch must carry; without it the plan fails closed.
     """
 
     issue: str
@@ -301,6 +313,15 @@ class SublaneCreateRequest:
     upstream_coordinator: Optional[str] = None
     gateway_role: str = GATEWAY_ROLE
     worker_role: str = WORKER_ROLE
+    work_unit: str = DEFAULT_WORK_UNIT_GRANULARITY
+    work_unit_decision_anchor: Optional[str] = None
+
+    def work_unit_decision(self) -> WorkUnitDispatchDecision:
+        """The fail-closed #13002 work-unit dispatch decision for this request."""
+        return decide_work_unit_dispatch(
+            self.work_unit,
+            explicit_decision_anchor=self.work_unit_decision_anchor,
+        )
 
     def missing_fields(self) -> Tuple[str, ...]:
         """The required identity fields left blank (fail-closed trigger)."""
@@ -373,9 +394,12 @@ def plan_sublane_create(
 
     1. any required identity field is blank -> :data:`CREATE_BLOCKED` (``missing_field``
        reasons), no steps;
-    2. the launch decision is :data:`LAUNCH_BLOCKED` -> :data:`CREATE_BLOCKED` carrying the
+    2. the #13002 work-unit granularity gate refuses -> :data:`CREATE_BLOCKED` carrying
+       the ``work_unit_*`` diagnostic, no steps (an ``epic`` / ``feature`` unit is never
+       planned without an explicit owner / operator decision anchor);
+    3. the launch decision is :data:`LAUNCH_BLOCKED` -> :data:`CREATE_BLOCKED` carrying the
        decision reason, no steps (never plan against an unverified target);
-    3. otherwise -> :data:`CREATE_PLANNED` with the ordered worktree + gateway + worker +
+    4. otherwise -> :data:`CREATE_PLANNED` with the ordered worktree + gateway + worker +
        dispatch steps. A :data:`LAUNCH_REUSE_WORKTREE` action renders the worktree step as
        a no-op reuse note rather than a ``git worktree add``.
 
@@ -389,6 +413,14 @@ def plan_sublane_create(
             "sublane against an incomplete target",
             launch_action=launch.action,
             blocked_reasons=tuple(f"missing_field:{name}" for name in missing),
+        )
+    unit_decision = request.work_unit_decision()
+    if not unit_decision.is_allowed:
+        return SublaneCreatePlan(
+            status=CREATE_BLOCKED,
+            reason=unit_decision.reason,
+            launch_action=launch.action,
+            blocked_reasons=(unit_decision.diagnostic,),
         )
     if launch.action == LAUNCH_BLOCKED:
         return SublaneCreatePlan(

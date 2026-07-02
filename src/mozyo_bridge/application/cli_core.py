@@ -334,6 +334,29 @@ def register_lifecycle(sub) -> None:
         default=None,
         help="Coordinator pane the gateway calls back to",
     )
+    # Governed work-unit granularity (Redmine #13002): the standard dispatch unit
+    # is one UserStory (1US=1作業単位). `leaf_issue` is the task-level-exception
+    # unit; `epic` / `feature` are oversized and fail closed without an explicit
+    # owner/operator decision anchor. Default: repo-local config
+    # (`work_unit.granularity`), else `user_story`.
+    sublane_create.add_argument(
+        "--work-unit",
+        dest="work_unit",
+        choices=["epic", "feature", "user_story", "leaf_issue"],
+        default=None,
+        help="Granularity of the dispatched work unit (default: repo-local "
+        "config `work_unit.granularity`, else user_story — the governed "
+        "standard; leaf_issue only for the governed task-level exceptions; "
+        "epic/feature require --work-unit-decision-journal).",
+    )
+    sublane_create.add_argument(
+        "--work-unit-decision-journal",
+        dest="work_unit_decision_journal",
+        default=None,
+        help="Durable journal id of the explicit owner/operator decision that "
+        "authorizes an epic/feature-sized implementation dispatch. Required "
+        "for --work-unit epic|feature; ignored otherwise.",
+    )
     # Live actuator (Redmine #12973): opt-in `--execute` performs the additive
     # worktree + cockpit column + gateway dispatch; without it the surface stays the
     # #12955 plan-only default (side-effect-free, back-compat).

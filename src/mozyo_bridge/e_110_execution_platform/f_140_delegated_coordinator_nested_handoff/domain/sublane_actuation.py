@@ -100,6 +100,9 @@ REASON_STAMP_FAILED = "stamp_failed"
 REASON_LANE_MISMATCH = "lane_identity_mismatch"
 #: The gateway ``implementation_request`` dispatch returned a non-zero / failed outcome.
 REASON_HANDOFF_FAILED = "handoff_failed"
+#: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was
+#: requested without an explicit owner / operator decision anchor (durable journal id).
+REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
 
 BLOCKED_REASONS = frozenset(
     {
@@ -111,6 +114,7 @@ BLOCKED_REASONS = frozenset(
         REASON_STAMP_FAILED,
         REASON_LANE_MISMATCH,
         REASON_HANDOFF_FAILED,
+        REASON_WORK_UNIT_BLOCKED,
     }
 )
 
@@ -357,6 +361,7 @@ __all__ = (
     "REASON_STAMP_FAILED",
     "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
+    "REASON_WORK_UNIT_BLOCKED",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",
     "DISPATCH_WORKER_DISPATCHED",

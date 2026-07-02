@@ -196,6 +196,48 @@ class PlanCreateTests(unittest.TestCase):
         self.assertIn(LAUNCH_BLOCKED, plan.blocked_reasons)
 
 
+class PlanWorkUnitGateTests(unittest.TestCase):
+    """#13002: the work-unit granularity gate on the plan-only surface."""
+
+    def _launch(self, action=LAUNCH_CREATE_WORKTREE):
+        return WorktreeLaunchDecision(action=action, reason="r")
+
+    def test_default_request_is_user_story_and_plans(self):
+        request = _req()
+        self.assertEqual(request.work_unit, "user_story")
+        plan = plan_sublane_create(request, self._launch())
+        self.assertEqual(plan.status, CREATE_PLANNED)
+
+    def test_leaf_issue_exception_unit_plans(self):
+        plan = plan_sublane_create(_req(work_unit="leaf_issue"), self._launch())
+        self.assertEqual(plan.status, CREATE_PLANNED)
+
+    def test_epic_without_decision_anchor_fails_closed(self):
+        plan = plan_sublane_create(_req(work_unit="epic"), self._launch())
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertEqual(plan.steps, ())
+        self.assertIn("work_unit_explicit_decision_required", plan.blocked_reasons)
+
+    def test_feature_without_decision_anchor_fails_closed(self):
+        plan = plan_sublane_create(_req(work_unit="feature"), self._launch())
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("work_unit_explicit_decision_required", plan.blocked_reasons)
+
+    def test_epic_with_durable_decision_anchor_plans(self):
+        plan = plan_sublane_create(
+            _req(work_unit="epic", work_unit_decision_anchor="70719"),
+            self._launch(),
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+
+    def test_missing_identity_still_wins_over_work_unit_gate(self):
+        plan = plan_sublane_create(
+            _req(worktree_path="", work_unit="epic"), self._launch()
+        )
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
+
+
 class PreflightRetireTests(unittest.TestCase):
     def _blocked(self):
         return RetireDecision(

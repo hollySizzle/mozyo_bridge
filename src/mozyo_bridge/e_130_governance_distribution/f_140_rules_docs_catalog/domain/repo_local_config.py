@@ -15,6 +15,10 @@ internal selection records:
 - ``delegation`` -> :class:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config.DelegationConfig`
   (Redmine #12549): the public-safe external-parent child-candidate surface that
   a delegation resolver reads. Default (no candidates) is behavior-preserving.
+- ``work_unit`` -> :class:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity.WorkUnitGranularityConfig`
+  (Redmine #13002): the governed work-unit granularity for sublane dispatch
+  (``epic`` / ``feature`` / ``user_story`` / ``leaf_issue``). Default
+  (``user_story``) is the standard governed unit.
 
 Boundary, kept enforced in code (this is *schema only*):
 
@@ -57,6 +61,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DelegationConfig,
     DelegationConfigError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
+    WorkUnitGranularityConfig,
+    WorkUnitGranularityError,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import CliCompositionConfig
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
@@ -75,7 +83,15 @@ REPO_LOCAL_CONFIG_VERSION: int = 1
 
 #: The closed set of recognized top-level keys. Anything else fails closed.
 REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"version", "cli", "providers", "presentation", "delegation", "sublane_integration"}
+    {
+        "version",
+        "cli",
+        "providers",
+        "presentation",
+        "delegation",
+        "sublane_integration",
+        "work_unit",
+    }
 )
 
 #: The closed set of recognized keys inside the ``sublane_integration`` sub-record
@@ -517,10 +533,10 @@ class SublaneIntegrationConfig:
 class RepoLocalConfig:
     """The closed top-level ``.mozyo-bridge/config.yaml`` record (schema only).
 
-    Composes the five configurable surfaces — :attr:`cli`, :attr:`providers`,
-    :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration` — each
-    behavior-preserving by default. The default (no fields set) reproduces the
-    current ``mozyo-bridge`` behavior exactly.
+    Composes the six configurable surfaces — :attr:`cli`, :attr:`providers`,
+    :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration`,
+    :attr:`work_unit` — each behavior-preserving by default. The default (no
+    fields set) reproduces the current ``mozyo-bridge`` behavior exactly.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -539,6 +555,9 @@ class RepoLocalConfig:
     delegation: DelegationConfig = field(default_factory=DelegationConfig.default)
     sublane_integration: SublaneIntegrationConfig = field(
         default_factory=SublaneIntegrationConfig.default
+    )
+    work_unit: WorkUnitGranularityConfig = field(
+        default_factory=WorkUnitGranularityConfig.default
     )
 
     @classmethod
@@ -627,12 +646,24 @@ class RepoLocalConfig:
         sublane_integration = SublaneIntegrationConfig.from_record(
             record.get("sublane_integration")
         )
+        # The governed work-unit granularity knob (#13002) is parsed by its own
+        # self-contained domain schema; its WorkUnitGranularityError is re-raised
+        # as a RepoLocalConfigError so the loader keeps a single fail-closed
+        # boundary. An absent ``work_unit`` block resolves to the ``user_story``
+        # standard-unit default, so it stays behavior-preserving.
+        try:
+            work_unit = WorkUnitGranularityConfig.from_record(record.get("work_unit"))
+        except WorkUnitGranularityError as exc:
+            raise RepoLocalConfigError(
+                f"work_unit config is invalid: {exc}"
+            ) from exc
         return cls(
             cli=cli,
             providers=providers,
             presentation=presentation,
             delegation=delegation,
             sublane_integration=sublane_integration,
+            work_unit=work_unit,
         )
 
 
@@ -651,4 +682,6 @@ __all__ = (
     "RepoLocalConfig",
     "DelegationConfig",
     "DelegationConfigError",
+    "WorkUnitGranularityConfig",
+    "WorkUnitGranularityError",
 )
