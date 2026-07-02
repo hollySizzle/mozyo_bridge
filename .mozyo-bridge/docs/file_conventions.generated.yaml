@@ -390,7 +390,8 @@ rules:
   - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/**
   severity: block
   message: 'このファイルを変更する場合は､ @skills/mozyo-bridge-agent/references/workflow.md と @skills/mozyo-bridge-agent/references/project-map.md
-    と @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/safety.md をよく確認し従うこと
+    と @skills/mozyo-bridge-agent/references/redmine-issue-authoring.md と @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/safety.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

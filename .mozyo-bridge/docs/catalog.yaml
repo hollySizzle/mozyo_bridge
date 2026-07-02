@@ -274,6 +274,18 @@ documents:
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state
 
+  - id: skill-redmine-issue-authoring-reference
+    type: rule
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/redmine-issue-authoring.md
+    purpose: Redmine issue 記載粒度 (Epic / Feature / US / leaf) と Version 運用 (planning / lane inventory bucket) の判断 guideline。
+    audit_role: skill_redmine_issue_authoring_rule
+    related_document_refs:
+      - skill-workflow-reference
+      - rule-project-agent-workflow
+      - spec-work-unit-granularity-config
+      - logic-redmine-version-operation-surface
+
   - id: skill-project-map-reference
     type: spec
     status: active
@@ -1631,6 +1643,7 @@ file_conventions:
     document_refs:
       - skill-workflow-reference
       - skill-project-map-reference
+      - skill-redmine-issue-authoring-reference
       - logic-skill-distribution
       - skill-safety-reference
 

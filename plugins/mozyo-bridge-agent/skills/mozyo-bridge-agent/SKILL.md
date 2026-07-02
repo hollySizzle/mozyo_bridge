@@ -17,6 +17,7 @@ description: Follow the mozyo_bridge project workflow for ticket-driven work (Re
 ## References
 
 - Work execution rules: `references/workflow.md`
+- Redmine issue authoring granularity and Version operation: `references/redmine-issue-authoring.md`
 - Project map and source-of-truth routing: `references/project-map.md`
 - Release and verification checks: `references/release.md`
 - Safety rules for tmux notification behavior: `references/safety.md`
