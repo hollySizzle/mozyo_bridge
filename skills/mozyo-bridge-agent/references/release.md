@@ -1,5 +1,9 @@
 # Release Reference
 
+## Scope: mozyo-bridge package maintainers only
+
+This reference is the release runbook for the **mozyo-bridge package itself** — versioning, TestPyPI / PyPI publishing, and distribution checks for `hollySizzle/mozyo_bridge`. An adopting project never publishes this package and does not follow this runbook for its own releases; use your project's own release process and keep only the portable posture (run verification matched to the release risk, and prefer OIDC Trusted Publishing over local token upload). The runbook stays in the distributed body so maintainer and dogfooding sessions carry it.
+
 ## Standard Verification
 
 Use the smallest check set that matches the change.
