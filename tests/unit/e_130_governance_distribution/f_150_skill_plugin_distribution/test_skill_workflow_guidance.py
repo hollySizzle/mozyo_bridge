@@ -140,6 +140,11 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "### 孫 dispatch / context 保護",
         "### 固定 role profile template",
         "### 実装者 escalation trigger (Claude → Codex)",
+        # Redmine #13060 upstream of the medium-priority operational
+        # doctrines: the ACK / delivery / completion separation and the
+        # runtime-fingerprint verification discipline.
+        "## ACK / delivery / completion の分離",
+        "## Runtime fingerprint 検証規律",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
@@ -322,6 +327,17 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         "`grandchild_dispatch: avoided`",
         "必ず `#<id> <短い概要>` の形で書く",
         "ユーザーとの対話窓口は原則 Codex に統一する",
+        # Redmine #13060 medium-priority doctrine upstream. Delivery ACK
+        # never stands in for completion, pane silence is not a completion
+        # detector, a version string alone is not runtime evidence, and a
+        # fingerprint mismatch never counts as PASS.
+        "**delivery ACK を task completion の代理にしない。**",
+        "「観測できない」ことは「完了した」ことではない",
+        "runtime signal で workflow gate を自動前進させない",
+        "version 文字列単独を evidence にしない",
+        "`blocked` または `environmental` として記録し、PASS evidence に混ぜない",
+        "実行 surface をその場で自己修復しない",
+        "--with-worktree-runbook",
         # Redmine default-project resolution (Redmine #10689). The
         # workspace-local snippet path and the "explicit wins over
         # default" / "UNVERIFIED escalates" rules must stay in the

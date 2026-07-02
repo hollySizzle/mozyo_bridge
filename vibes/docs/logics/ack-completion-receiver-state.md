@@ -28,6 +28,8 @@
 
 ことを目的とする。CLI / preset / skill / 実装ファイルへの挙動変更を伴う改修は別 task が所有し、本 doc は伴わない。
 
+> 配布注記 (#13060): 三概念の分離 (delivery ACK / receiver state / task completion) と、それを取り違えない運用規範の portable 正本は、配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## ACK / delivery / completion の分離` にある。本 doc はその repo-local doctrine 深部 — signal layer model、runtime event 語彙、`DeliveryOutcome` 射影、`mozyo_bridge_pty` workstream との接続段階 — の正本であり続ける。
+
 ## Non-Goals
 
 - `wait_for_text` / `marker` 観測 / `C-u` rollback / queue-enter rail の挙動変更 (`vibes/docs/logics/tmux-send-safety-contract.md` が正本)
@@ -282,7 +284,7 @@ doctrine としての position:
 
 ## 運用への帰結 (現行 `mozyo-bridge` の挙動規範)
 
-本 doc が doctrine として固定する運用規範。挙動変更を伴う改修は別 task が所有するが、判断の正本としての規範は本 doc が宣言する。
+配布節 `## ACK / delivery / completion の分離` (portable 規範の正本; #13060) を、現行 `mozyo-bridge` の機構 (`DeliveryOutcome` / `--no-submit` retry / inspector contract) へ結線した repo 適用。挙動変更を伴う改修は別 task が所有するが、repo 内判断の正本としての規範は本節が宣言する。
 
 1. **task completion を pane / stdout / chat から判定しない**。durable record (Asana task / comment / state) を読むことで判定する。chat や pane 経由の「終わった」「OK」「completed」は notification にすぎず、durable record に書かれて初めて completion 扱いになる。
 2. **delivery ACK を task completion の代理として扱わない**。`sent` / `ok` / `submitted` は「receiver runtime に渡し終えた」だけの事実であり、その後の `acknowledged` / `processed` / `task completed` を含意しない。
