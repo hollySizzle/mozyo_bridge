@@ -120,6 +120,7 @@ Redmine #12393 / US #12387 / Feature #12386 (`Delegated Coordinator / Nested Han
 - durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。
 - owner approval 回収・issue close・coordinator-owned 仕様決定の自己確定はしない。
 - 仕様矛盾・scope 不足・invariant 衝突に当たったら停止し、design consultation / blocked を記録して same-lane gateway へ callback する。
+- review / review_result の指摘は迎合せず code / docs / 事実で独立検証し、finding ごとに accepted / disputed の verdict を journal に記録してから対応する。誤りと判断した指摘は design consultation (purpose: dispute) で上申する (review_finding_verdict gate)。
 - callback 先 (same-lane gateway): <gateway_callback_target>。
 ```
 

@@ -9,7 +9,7 @@
 # f_130_handoff_routing/domain/role_profile.py via role_profile_config.py
 # (fail-closed on unknown/missing role, empty template, placeholder mismatch).
 # `placeholders` must list exactly the `<...>` tokens present in `template`.
-version: '2026-06-21'
+version: '2026-07-02'
 source: vibes/docs/specs/delegated-coordinator-role-profile.md
 roles:
   coordinator:
@@ -58,6 +58,7 @@ roles:
       - durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。
       - owner approval 回収・issue close・coordinator-owned 仕様決定の自己確定はしない。
       - 仕様矛盾・scope 不足・invariant 衝突に当たったら停止し、design consultation / blocked を記録して same-lane gateway へ callback する。
+      - review / review_result の指摘は迎合せず code / docs / 事実で独立検証し、finding ごとに accepted / disputed の verdict を journal に記録してから対応する。誤りと判断した指摘は design consultation (purpose: dispute) で上申する (review_finding_verdict gate)。
       - callback 先 (same-lane gateway): <gateway_callback_target>。
     placeholders:
     - lane

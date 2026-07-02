@@ -221,6 +221,19 @@ design_consultation_dispute:
     - counterproposal
     - owner_escalation_required: true|false
   終端: Answer 後も合意不能なら owner 判断へ escalate
+review_finding_verdict:
+  actor: 実装者
+  trigger: review / review_result journal を受領した時 (指摘事項が 1 件以上ある場合)
+  義務:
+    - 各指摘事項の妥当性を、迎合せず code / docs / 事実で独立検証する
+    - finding ごとに verdict を journal に記録する: accepted (検証根拠を併記) | disputed (evidence + counterproposal を併記)
+    - disputed は design_consultation_dispute へ接続する (dispute_target = 対象 review journal id)
+    - verdict 記録前に指摘対応の実装・commit を行わない
+  invalid_verdict:
+    - 検証を伴わない accepted (「reviewer の指摘だから」は根拠ではない)
+    - 複数 finding への一括 verdict (finding ごとに記録する)
+  dispute_round_cap: 同一 finding への dispute は 1 往復まで。Answer 後も合意不能なら owner へ escalate する (窓口は Codex。実装者が owner へ直接確認しない)
+  適用外: 指摘事項ゼロの approved review (verdict 不要。受領 ack のみでよい)
 owner_close_approval:
   actor: codex (ユーザー窓口) または owner
   必須:
@@ -266,6 +279,15 @@ codex_direct_edit:
     - "進めて"
     上記の短い命令だけでは codex_direct_edit gate は有効化しない
 ```
+
+### Review Finding Verdict Obligation (迎合禁止)
+
+review は正しさの最終保証ではない。誤った指摘を検証なしに実装することは、正しい指摘を無視することと同種の欠陥である。実装者は review / review_result の指摘事項を **必ず** 独立検証し、finding ごとの verdict (accepted / disputed) を durable record に残してから対応する。本 preset の要求は「上申してもよい」(許可) ではなく「妥当性判断を記録せよ」(義務) である。
+
+- 検証は code / docs / 事実に基づく。reviewer の権威・言い回しの強さ・修正の手軽さは verdict の根拠にならない。
+- disputed の上申経路と必須 field は既存の `design_consultation_dispute` gate をそのまま使う。新しい gate 名 / transport kind は作らない。
+- dispute は同一 finding につき 1 往復まで。合意不能は owner 判断へ escalate し、その窓口は `### Claude Owner-Question Bypass Prohibition` に従い Codex に集約する。
+- 逆振れの抑制: evidence を欠く dispute、taste の相違のみを理由とする dispute は invalid。正しい指摘への再反論で owner 判断コストを浪費しない。
 
 ### Commit Hash Origin 到達可能性
 
@@ -560,6 +582,12 @@ stop
   - id: review_without_remote_verification
     条件: [agent:codex, gate:review, 対象commit:origin到達不能_または未確認]
     action: blocker記録 (事実指摘扱いしない)しcloseへ進めない
+  - id: implement_review_finding_without_verdict
+    条件: [agent:claude_code, review指摘事項:あり, review_finding_verdict_journal:missing]
+    action: 指摘対応の実装・commit禁止 (finding ごとの verdict 記録が先)
+  - id: accept_review_finding_without_verification
+    条件: [verdict:accepted, 独立検証記録:なし]
+    action: invalid verdict として correction journal を起票 (迎合は欠陥)
   - id: close_on_local_only_commit
     条件: [gate:close_or_owner_close_approval, commit_hash:origin到達不能]
     action: close禁止 (local-only commit を anchor にしない); reopen+correction
@@ -669,6 +697,15 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - 未確認事項:
 - 再review要否:
 - 結論:
+
+## Gate: review_finding_verdict
+- 対象review_journal: j#
+- finding_1: <指摘の要約>
+  - verdict: accepted | disputed
+  - 検証方法: (確認した code / docs / 事実)
+  - 根拠:
+  - disputed の場合: design_consultation (purpose: dispute) journal id
+- (以降 finding ごとに繰り返す。一括 verdict は invalid)
 
 ## Gate: task_close (US 配下の Task / Test / Bug)
 - implementation_done_journal:
