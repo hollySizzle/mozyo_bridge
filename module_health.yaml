@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 4141
+    lines: 3994
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -779,6 +779,26 @@ allowlist:
       the post-carve ``commands.py`` line count is 4141.
       ``test_cockpit_rebalance_command`` adds the fake-port use-case +
       pure-rendering specifications.
+      Lowered 4141 -> 3994 for the #13008 cockpit reconcile handler residual
+      tranche (stacked on the #13009 rebalance carve above; the two carves
+      touch disjoint ``commands.py`` regions and auto-merge): the pane
+      identity projection (``_cockpit_pane_identity``) and the preview / json /
+      confirm-gated ``mozyo cockpit reconcile`` handler
+      (``_handle_cockpit_reconcile``) moved to the new
+      ``application/cockpit_reconcile_command.py``: pure
+      ``project_pane_identity`` / ``render_reconcile_preview_lines``, a
+      ``CockpitReconcileOps`` port with a ``LiveCockpitReconcileOps`` adapter
+      routing the ``_read_cockpit_window_layout`` / ``_read_cockpit_geometry``
+      / ``require_tmux`` / reconcile executor / ``_cockpit_rebalance_columns``
+      seams through this module at call time, and a ``CockpitReconcileUseCase``
+      rendering through an injected ``emit`` sink (no attach tail — all paths
+      return exit code 0; the fail-closed unparseable-layout / blocked-plan
+      aborts raise via the port's ``die``). ``_handle_cockpit_reconcile`` stays
+      as a same-signature thin wrapper for the ``cmd_cockpit`` dispatch;
+      ``_cockpit_pane_identity`` had no remaining callers and is retired.
+      4141 -> 3994 is a 147-line net removal and the post-carve ``commands.py``
+      line count is 3994. ``test_cockpit_reconcile_command`` adds the fake-port
+      use-case + pure-projection/rendering specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

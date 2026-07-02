@@ -1550,177 +1550,30 @@ def _handle_cockpit_rebalance(
     )
 
 
-def _cockpit_pane_identity(session: str):
-    """``{pane_id: {workspace_id, lane_id, role}}`` from the live cockpit panes (#12136).
-
-    Reuses the read-only :func:`_read_cockpit_geometry` reader (it already lists
-    every cockpit pane with its `@mozyo_*` options) and projects the identity map
-    the reconcile planner groups Units by. Returns ``{}`` when the cockpit window
-    is absent.
-    """
-    panes = _read_cockpit_geometry(session)
-    if not panes:
-        return {}
-    return {
-        p["pane_id"]: {
-            "workspace_id": p.get("workspace_id", ""),
-            "lane_id": p.get("lane_id", ""),
-            "role": p.get("role", ""),
-        }
-        for p in panes
-        if p.get("pane_id")
-    }
-
-
 def _handle_cockpit_reconcile(
     session: str, *, confirm: bool, json_output: bool, dry_run: bool,
     codex_ratio: int = 70,
 ) -> int:
     """`mozyo cockpit reconcile` — preview/confirm structural layout-tree repair (#12136).
 
-    Reads the live cockpit ``window_layout`` tree and pane identity, and plans an
-    order-preserving flatten of any nested top-level cell (a 2x2 / mixed-Unit
-    drift) into clean per-Unit columns via `swap-pane` + a checksum-valid
-    `select-layout`. ``codex_ratio`` (CLI ``--ratio``) sizes the codex-over-claude
-    vertical split of each rebuilt column. Safety contract: the default path and
-    `--dry-run` / `--json` are non-mutating previews; only an explicit `--confirm`
-    (and not `--dry-run` / `--json`) runs the plan. It never kills a pane and never
-    re-infers identity from geometry. Fails closed on an unidentified pane (#12133
-    scope), a Unit split across cells, a duplicate same-role pane, or an
-    unparseable layout. A cockpit already one-Unit-per-column, or absent, is a
-    benign no-op.
+    Thin wrapper (Redmine #13008) over
+    :meth:`~mozyo_bridge.application.cockpit_reconcile_command.CockpitReconcileUseCase.handle`.
+    Kept here with the original signature for the ``cmd_cockpit`` reconcile
+    dispatch; the live ops route the ``_read_cockpit_window_layout`` /
+    ``_read_cockpit_geometry`` / ``require_tmux`` / executor seams back through
+    this module at call time (and render through a plain ``print`` sink), so
+    the patch seams and the preview / json / confirm output are byte-for-byte
+    unchanged.
     """
-    import json as _json
-    import shlex as _shlex
-
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
-        build_cockpit_reconcile_plan,
-        parse_window_layout,
+    from mozyo_bridge.application.cockpit_reconcile_command import (
+        CockpitReconcileUseCase,
+        LiveCockpitReconcileOps,
     )
 
-    layout = _read_cockpit_window_layout(session)
-    present = layout is not None
-    root = parse_window_layout(layout) if layout else None
-    # Fail closed on an unparseable-but-present layout: a non-empty layout string
-    # that did not parse must NOT be reported as "clean" (a no-op success); the
-    # safe outcome is a blocked preview / refusal, never a mutation.
-    if present and root is None:
-        message = (
-            f"cockpit reconcile: could not parse the live `window_layout` for "
-            f"session {session!r}; refusing to reconcile (fail-closed). Re-read "
-            f"and retry, or inspect the cockpit manually."
-        )
-        if json_output:
-            # Same audit-field contract as the normal JSON branch (#12136 j#59881):
-            # an unparseable layout has no cells/target, so those are empty/None.
-            print(_json.dumps(
-                {"command": "cockpit reconcile", "executes": False,
-                 "would_execute": False, "confirm": confirm, "session": session,
-                 "cockpit_present": True, "drift": False, "clean": False,
-                 "blocked_reason": message, "current_layout": layout,
-                 "current_cells": [], "target_layout": None,
-                 "target_layout_checksum": None, "plan": None},
-                ensure_ascii=False, indent=2, sort_keys=True,
-            ))
-            return 0
-        die(message) if confirm and not dry_run else print(message)
-        return 0
-    identity = _cockpit_pane_identity(session)
-    plan = build_cockpit_reconcile_plan(
-        root, identity, session=session, codex_ratio=codex_ratio
+    return CockpitReconcileUseCase(LiveCockpitReconcileOps()).handle(
+        session, confirm=confirm, json_output=json_output, dry_run=dry_run,
+        codex_ratio=codex_ratio,
     )
-
-    would_execute = bool(
-        confirm and not dry_run and present and plan.drift and not plan.blocked_reason
-    )
-
-    if json_output:
-        target = plan.target_layout
-        payload = {
-            "command": "cockpit reconcile",
-            "executes": False,
-            "would_execute": would_execute,
-            "confirm": confirm,
-            "session": session,
-            "cockpit_present": present,
-            "drift": plan.drift,
-            "clean": plan.clean,
-            # Normalized audit fields: `blocked_reason` matches `plan.blocked_reason`;
-            # `current_layout` / `current_cells` are the observed before-state and
-            # `target_layout` / `target_layout_checksum` the planned after-state.
-            "blocked_reason": plan.blocked_reason,
-            "current_layout": layout,
-            "current_cells": [c.as_dict() for c in plan.cells],
-            "target_layout": target,
-            "target_layout_checksum": (
-                target.split(",", 1)[0] if target else None
-            ),
-            "plan": plan.as_dict(),
-        }
-        print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    if not present:
-        print(
-            f"cockpit reconcile: no cockpit window for session {session!r} — "
-            "nothing to reconcile."
-        )
-        return 0
-
-    units = " | ".join(f"{ws}/{lane}" for ws, lane in plan.units_in_order)
-
-    # Preview: bare command (no `--confirm`) or `--dry-run`. No mutation.
-    if dry_run or not confirm:
-        print(
-            f"cockpit reconcile (preview; no tmux changes): session={session} "
-            f"cells={plan.cell_count} units={len(plan.units_in_order)}"
-        )
-        for cell in plan.cells:
-            names = ", ".join(f"{ws}/{lane}" for ws, lane in cell.unit_keys) or "-"
-            flag = " [tangled: >1 Unit in one cell]" if cell.tangled else ""
-            extra = (
-                f" unidentified={list(cell.unidentified_panes)}"
-                if cell.unidentified_panes
-                else ""
-            )
-            print(f"  cell {cell.index} (x={cell.x} w={cell.width}): {names}{flag}{extra}")
-        if plan.blocked_reason:
-            print(f"  cannot reconcile: {plan.blocked_reason}")
-        elif plan.clean:
-            print("  already one Unit per top-level column — nothing to reconcile.")
-        else:
-            print(f"  target Unit columns (left-to-right, order preserved): {units}")
-            print("  reconcile plan (swap-pane order fix + checksum select-layout; "
-                  "no pane killed, identity untouched):")
-            for cmd in plan.commands:
-                print(
-                    "    tmux " + " ".join(_shlex.quote(tok) for tok in cmd.argv)
-                )
-            print("  run `mozyo cockpit reconcile --confirm` to apply.")
-        return 0
-
-    # Confirm-gated execution: the only path that mutates tmux.
-    if plan.blocked_reason:
-        die(plan.blocked_reason)
-    if plan.clean or not plan.commands:
-        print(
-            f"cockpit reconcile: session {session!r} already one Unit per "
-            "top-level column — nothing to do."
-        )
-        return 0
-
-    require_tmux()
-    print(
-        f"cockpit reconcile: flattening nested cells into {len(plan.units_in_order)} "
-        f"per-Unit columns in cockpit {session!r}..."
-    )
-    execute_cockpit_reconcile_plan(plan, run_tmux)
-    _, after = _cockpit_rebalance_columns(session)
-    print(
-        f"  reconciled: {len(after)} top-level columns now align with Units; "
-        "run `mozyo cockpit rebalance` to even widths."
-    )
-    return 0
 
 
 def _cockpit_group_window_action(
