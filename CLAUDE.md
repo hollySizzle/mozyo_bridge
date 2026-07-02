@@ -80,6 +80,7 @@ hard stop: `.mozyo-bridge/docs/file_conventions.generated.yaml` 等の generator
 - Run `git diff --check` or `git diff --cached --check` before commit.
 - Commit only files in the active Redmine issue scope. Leave unrelated dirty files untouched.
 - Commit messages for Redmine-scoped work include `Refs: Redmine #<issue_id>` and `issue_<issue_id>`.
+- Push implementation commits to the issue / lane branch only; do not push `origin/main` directly. Integration into `origin/main` is the coordinator's post-review integration disposition (正本: central preset `### Commit Hash Origin 到達可能性` / skill `references/workflow.md` `## Integration Disposition And Push Authority`).
 - After committing, record the commit hash in the same Redmine issue journal.
 
 <!-- mozyo-bridge:project-local-additions:end -->

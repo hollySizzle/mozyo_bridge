@@ -316,13 +316,23 @@ gate journal に記録する根拠 — review finding、implementation_request /
 
 Implementation Done / Review Request / Review / owner_close_approval / Close の各 gate に記録する commit hash は、durable anchor として扱う前に **origin (共有 remote) から到達可能でなければならない**。未 push の local-only commit はサーバー側から原理的に検出できず、後続の監査・close・引き継ぎが replay できない anchor になる。
 
+push は 2 層に分かれる。**実装者の push は issue / lane branch に限る** (anchor 到達性はそれで満たされる)。**integration branch (origin/main / release branch) を前進させるのは review 承認後の coordinator** であり、その統合判断を integration disposition として記録する。実装者の「記録前に push せよ」を integration branch への直 push と読み替えない。
+
 ```yaml
 origin到達可能性:
   対象gate: [implementation_done, review_request, review, owner_close_approval, close]
   実装者責務:
     - Implementation Done / Review Request で commit hash を記録する前に、その commit が共有 remote へ push 済みで到達可能であることを確認する
+    - push する ref は issue / lane branch に限る。integration branch (origin/main / release branch) を実装者が直接前進させない (統合は coordinator の integration disposition)
     - 確認は read-only (例: `git fetch` 後の `git branch -r --contains <hash>`、または `git merge-base --is-ancestor <hash> origin/<branch>`)
     - 到達不能なら記録前に push する。push できない場合は gate を blocked とし理由を journal に残す。未 push の hash を anchor として記録しない
+  main_unit例外実装:
+    - main lane / main-unit での例外実装 (dispatch decision に例外理由が記録された場合) でも、実装者は primary checkout の integration branch 上で直接 commit せず、issue branch を切って作業し branch を push する
+    - coordinator と実装者が同一 checkout を共有する場合、checkout の branch 切替が衝突しうる。commit 前に current branch を確認し、可能なら専用 worktree を使う。誤って integration branch に乗った commit は push せず issue branch へ移し、correction を journal に残す
+  統合責務 (integration disposition):
+    - review 承認後、coordinator が integration branch への統合を merge | patch_equivalent | explicit_deferral のいずれかとして判断し、統合 commit 群・merge 方式・検証結果を integration journal に記録する
+    - merge の標準は ff-only (`git merge --ff-only`)。non-ff (merge commit / rebase 統合) を使う場合は理由を integration journal に記録する
+    - 統合後の Review Gate 済み commit hash が rebase 等で origin 到達不能になった場合は、re-anchoring correction journal で新 hash へ再接続する (silent edit をしない)
   監査者責務:
     - Review Gate で対象 commit 群が origin 上に到達可能であることを remote verification として確認し、結果を review journal に残す
     - 到達性が確認できない場合は事実指摘ではなく blocker として扱い、close へ進めない
@@ -331,6 +341,7 @@ origin到達可能性:
     - local-only commit に対する close は invalid。reopen + correction journal を起票する
   禁止:
     - 自動 push/pull 機構の導入。push は実装者の明示操作のままとし、gate 検証は read-only な到達性確認に限る
+    - 自動 merge / auto-integration 機構の導入。統合は coordinator の明示操作と integration journal 記録のままとする
 ```
 
 ### Codex Direct Edit Gate
@@ -602,6 +613,9 @@ stop
   - id: record_unreachable_commit_as_anchor
     条件: [gate:implementation_done_or_review_request, commit_hash:未push_origin到達不能]
     action: anchor記録禁止 (push後に記録、push不能ならblocked)
+  - id: implementer_advances_integration_branch
+    条件: [agent:実装者, push先:origin/main または release/integration branch]
+    action: push禁止 (issue/lane branch へ push し、統合は review 承認後の coordinator の integration disposition に委ねる)
   - id: review_without_remote_verification
     条件: [agent:codex, gate:review, 対象commit:origin到達不能_または未確認]
     action: blocker記録 (事実指摘扱いしない)しcloseへ進めない
