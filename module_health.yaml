@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3994
+    lines: 3581
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -799,6 +799,30 @@ allowlist:
       4141 -> 3994 is a 147-line net removal and the post-carve ``commands.py``
       line count is 3994. ``test_cockpit_reconcile_command`` adds the fake-port
       use-case + pure-projection/rendering specifications.
+      Lowered 3994 -> 3581 for the #13011 cockpit dispatcher residual tranche:
+      the ``cmd_cockpit`` dispatcher body (the sub-action short-circuit routing
+      plus the create/append/focus launcher flow — workspace/lane/project-scope
+      resolution, the #11820/#12739 duplicate detection, the presentation
+      placement, the plan resolution, the ``--json`` / ``--dry-run``
+      projections, and the real-run execution prints) moved to the new
+      ``application/cockpit_dispatcher_command.py``: pure
+      ``resolve_cockpit_route`` / ``find_same_unit_column`` /
+      ``resolve_shared_cockpit_action`` / ``build_cockpit_json_payload`` /
+      ``render_cockpit_dry_run_lines``, a ``CockpitSubactionRoutes`` port over
+      the eight already-carved ``_handle_cockpit_*`` wrappers plus a
+      ``CockpitLaunchFlowOps`` port whose live adapters route every
+      ``commands.*`` seam (and
+      ``repo_local_config_loader.load_repo_local_config``) at call time, and a
+      ``CockpitDispatchUseCase`` rendering through an injected ``emit`` sink
+      whose ``CockpitDispatchOutcome.attach_session`` hands the terminal attach
+      back to the thin wrapper (``os.execvp`` stays here, so the
+      ``commands.os.execvp`` patch seam is unchanged). ``cmd_cockpit`` stays as
+      the thin public entry; the now-unused
+      ``COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT`` import was dropped and the
+      ``GROUP_ACTION_*`` re-exports are unchanged. 3994 -> 3581 is a 413-line
+      net removal and the post-carve ``commands.py`` line count is 3581.
+      ``test_cockpit_dispatcher_command`` adds the pure route/decision/rendering
+      + fake-port use-case specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
