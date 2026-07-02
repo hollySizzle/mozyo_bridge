@@ -72,23 +72,13 @@ preset 側 schema をそのまま採用する。journal field の最小例:
 
 `.mozyo-bridge/docs/catalog.yaml` を含む edit では追加で `mozyo-bridge docs generate-file-conventions --check --repo .` と `mozyo-bridge docs audit-impact --all-changed --check-generated --repo .` を実行し、journal の `verification` フィールドにその結果を残す。drift があれば `mozyo-bridge docs generate-file-conventions --repo .` で regenerate して再 commit する。
 
-## Lane を起動しない条件 (preset 側と同じ)
+## Lane を起動しない条件
 
-- 変更が lane 範囲を超える。
-- 変更が central preset / 配布 surface に影響する。
-- 変更が credential / token / 個人情報 / 認証フローに触れる。
-- product owner の以前の指示と矛盾する変更を入れる必要がある。
-- 同一 issue で過去に同じ path について `要修正` / `block` review を受けている。
-
-該当する場合は Claude handoff または `codex_direct_edit` gate に escalate する。
+正本は preset `#### lane を起動しない条件` (範囲超過 / 配布 surface 影響 / credential 接触 / owner 指示との矛盾 / 同一 path の `要修正`・`block` 歴)。該当時は Claude handoff または `codex_direct_edit` gate に escalate する。本 repo 固有の追加条件はない (#13028 で pointer 化)。
 
 ## Workflow-Change Verification
 
-本 lane policy 自身が workflow / guardrail 変更であるため、policy 配布後の **次の通常開発タスク** で本 lane が想定通りに機能することを workflow-change verification として確認する。
-
-- 検証 task は本 lane を直接変更しない通常開発タスクとする。
-- 検証 task では Claude が実装し、Codex は lane を実際に 1 回以上利用して repo-local guardrail を更新する。`codex_autonomous_edit` journal が破綻なく回ることを durable record として残す。
-- 結果を Redmine issue に記録する。lane policy 自身に gap が見つかれば preset / project-local doc / catalog のいずれかへ follow-up issue を起票する。
+正本は preset `#### Workflow-Change Verification` (lane policy 変更後、lane を直接変更しない通常開発タスクで機能確認し、`codex_autonomous_edit` journal が破綻なく回ることを durable record に残す)。本 repo 固有の追加はない (#13028 で pointer 化)。
 
 ### 実施記録
 

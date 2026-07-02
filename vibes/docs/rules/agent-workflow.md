@@ -115,29 +115,15 @@
 
 ## Codex Pre-Edit Classification Gate
 
-Codex は `apply_patch`、新規 file 作成、既存 file 更新、git commit の前に、対象変更がどの実装主体に属するかを分類する。分類を作業後に思い出して correction する運用を標準にしない。
-
-- repo 内の正本成果物を作成・更新・削除する作業は、拡張子や内容種別に関係なく **実装成果物** と扱う。Markdown、HTML、調査メモ、ドラフト、表、taxonomy、report、runbook、設定例も、repo に置かれて後続 agent / user / release が参照するなら実装成果物である。
-- 「コードではない」「一時メモに見える」「文章だけ」「commit hash を journal に書く必要がある」という理由は、Codex direct edit の根拠にならない。commit 要件は実装主体の分類を通過した後にだけ発動する。
-- Codex が直接編集できるのは、対象 path が Repo-Local Guardrail Autonomous Lane に入っている場合、または active ticket に `codex_direct_edit` gate があり `allowed_paths` に対象 path が列挙されている場合だけである。
-- ユーザーが `mozyo-bridge`、Claude 協業、handoff、agent 分担を話題にした場合は、Codex direct edit を default にしない。default は Claude handoff とし、autonomous lane または `codex_direct_edit` gate が確認できた場合だけ direct edit に切り替える。
-- Codex が direct edit 例外を使う場合は、edit が land する前、または autonomous lane では edit と同時 / commit 直後に durable record を残す。record には例外種別、対象 file、理由、検証方法、follow-up review 要否を含める。
-- Codex が誤って先に成果物を作った場合、その成果物を完了扱いにしない。correction として事実、影響範囲、採用・修正・破棄の判断を durable record に残し、Claude 実装 / 採否判断から Codex audit へ戻す。
+正本は central preset `### Codex Pre-Edit Classification Gate` (#13028 で pointer 化)。edit / commit 前に変更の実装主体を分類し、Markdown・runbook・設定例も repo 正本成果物なら実装成果物として扱う、という判断規約は preset 本文を読む。本 repo 固有の追加はなく、repo 固有の gated-surface path 拡張は `## Policy / Skill Authoring Boundary` を読む。
 
 ## Policy / Skill Authoring Boundary
 
-- 自律フロー、規約、skill、handoff、audit、release / distribution gate の変更では、Codex は方針整理、文案作成、ユーザー対話、audit を担当する。
-- 上記の repo ファイル変更実装者は原則 Claude とする。Codex は通常時、規約や skill reference の repo ファイルを直接編集して commit しない。ただし `Repo-Local Guardrail Autonomous Lane` に入る `vibes/docs/rules/**`, `vibes/docs/logics/**`, `vibes/docs/specs/**`, `.mozyo-bridge/docs/catalog.yaml` は preset と `vibes/docs/rules/codex-autonomous-guardrail-lane.md` に従って Codex が自律編集できる。保護 scope は実装ファイル (`src/**`, `tests/**`, `docs/**`, `README.md`, release workflow, CLI behavior) と autonomous lane 外の guardrail / docs / catalog surfaces (`AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, `.codex/skills/**`, `.claude/skills/**`, `skills/mozyo-bridge-agent/**`, `plugins/mozyo-bridge-agent/**`, `src/mozyo_bridge/scaffold/presets/**`) の両方を含む。chat 上の「ユーザーがガードレール変更を明示」だけでは bypass にならない。
-- Codex direct edit が許される例外は、対象 path が autonomous lane 外の場合、以下のいずれかに当てはまる場合に限る。条件は narrow に運用し、ユーザー指示が曖昧な場合や、複数の解釈ができる場合は default に戻して Claude handoff にする。
-  1. ユーザーが `Codex direct edit` または「Codex が直接編集してよい」「Codex に直接実装させてよい」と同等の文言で、対象 task または対象 file を限定して明示的に許可した場合。「実行せよ」「対応して」「やって」「お願いします」「進めて」など一般的な命令形・依頼形・激励形は該当しない。
-  2. 既存の誤実装、誤 commit、または誤手順を Redmine / repo に correction として記録するための最小の変更である場合。
-  3. Claude に handoff する暇がない真に緊急の小修正である場合(例: 数分以内に進行する release / publish / CI を止めるための1〜数行の修正)。この例外を使う前に Codex は実装を停止し、Redmine に「緊急 direct edit 申請」として状況、対象ファイル、想定変更、影響範囲を記録し、可能ならユーザー確認を得る。状況が曖昧な場合や、確認を得られない場合は適用しない。
-- Codex が例外として直接実装した場合の durable record は ticket system に依存する。edit が land する **前** に作成する。
-  - Asana projects: Asana task comment に `Codex direct edit` を残し、(a) 該当した例外条件、(b) ユーザー指示の原文または引用、(c) 変更ファイル、(d) 実施した verification、(e) 後続反映確認の要否、を記録する。
-  - Redmine projects (`mozyo_bridge` repo を含む。`redmine-governed` preset を採用): autonomous lane 外では active issue に Redmine `codex_direct_edit` gate journal を起票する。必須 field は `role: 実装者`, `direct_edit: true`, `allowed_paths` (Codex が触る全 path を列挙), `reason`, `follow_up_review`。journal が存在しないまま edit を commit した場合は invalid とみなす。autonomous lane 内の edit は `codex_direct_edit` gate ではなく `codex_autonomous_edit` journal で記録する。
-- 上記の record が欠けた direct edit は事後 correction の対象とする。過去 incident pattern: `codex_direct_edit` gate journal なし、または Review Gate 承認済み audit-owned commit path なしで Codex が repo diff を作成した場合は、correction journal に記録し、governed implementation/review flow に戻す。
-- `.mozyo-bridge/docs/file_conventions.generated.yaml` をはじめとする catalog generator output は Claude / Codex / owner いずれも手編集しない。`.mozyo-bridge/docs/catalog.yaml` を変更して `mozyo-bridge docs generate-file-conventions` で再生成し、`--check` で drift 確認する。
-- 自律フローや role boundary の変更を Codex が直接実装した場合でも、変更後の反映確認 requirement は免除されない。
+- 役割分担 (Codex = 方針整理 / 文案 / ユーザー対話 / audit、Claude = repo file 実装)、Codex direct edit の例外 3 条件、edit 前の記録要件の正本は、skill `skills/mozyo-bridge-agent/references/workflow.md` `## Policy / Skill Authoring Boundary` (cross-system 手順) と central preset `### Codex Direct Edit Gate` / Gate Schema `codex_direct_edit`。autonomous lane 外の Codex 直接編集には active issue 上の Redmine `codex_direct_edit` gate journal (必須 field は `role: 実装者`, `direct_edit: true`, `allowed_paths`, `reason`, `follow_up_review` — 意味論の正本は preset Gate Schema) が edit 前に必要。本 doc は semantics を再掲しない (#13028 で pointer 化)。
+- **本 repo 固有の保護 scope 拡張**: 実装ファイル (`src/**`, `tests/**`, `docs/**`, `README.md`, release workflow, CLI behavior) に加え、autonomous lane 外の guardrail / docs / catalog surfaces として `AGENTS.md`, `CLAUDE.md`, `.mozyo-bridge/rules/**`, `.codex/skills/**`, `.claude/skills/**`, `skills/mozyo-bridge-agent/**`, `plugins/mozyo-bridge-agent/**`, `src/mozyo_bridge/scaffold/presets/**` を含む。chat 上の「ユーザーがガードレール変更を明示」だけでは bypass にならない。
+- `Repo-Local Guardrail Autonomous Lane` に入る `vibes/docs/rules/**`, `vibes/docs/logics/**`, `vibes/docs/specs/**`, `.mozyo-bridge/docs/catalog.yaml` は preset と `vibes/docs/rules/codex-autonomous-guardrail-lane.md` (採用記録) に従って Codex が自律編集できる。
+- `.mozyo-bridge/docs/file_conventions.generated.yaml` 等の catalog generator output は誰も手編集しない (`.mozyo-bridge/docs/catalog.yaml` 変更 → `mozyo-bridge docs generate-file-conventions` 再生成 → `--check`)。
+- 記録が欠けた direct edit は事後 correction の対象 (過去 incident pattern: `codex_direct_edit` gate journal なし、または Review Gate 承認済み audit-owned commit path なしの Codex repo diff → correction journal に記録して governed flow へ戻す)。direct edit 後も反映確認 requirement は免除されない。correction flow の詳細は上記正本に従う。
 
 ## Redmine Hierarchy Semantics
 
@@ -169,27 +155,13 @@ Redmine の表示上、Epic / Feature が `未着手` のまま配下 UserStory 
 
 ## Audit Handoff (Claude → Codex)
 
-- 監査の標準単位は UserStory である (central preset `### US-Level Audit Model` を正本とする)。Claude は US 配下の Task / Test / Bug をまとめて実装し、各 issue に実装・検証・残リスクの journal を残したうえで、US 完了時に US-level audit request (gate 名は `review_request`) を記録して Codex に audit を依頼する。doc-only / rule-only scope の US でも省略しない。
-- Task / Test / Bug ごとの per-issue audit 依頼は不要。ただし central preset の `us_level_audit.task_level例外` (guardrail / workflow / preset / router / skill 変更、release / packaging / CI、credential、destructive operation / migration、architecture / 互換性変更、実装者の判断迷い、owner / 監査者の明示要求) に該当する場合は Task-level review または design consultation を経由する。親 US を持たない単独 issue は issue 自身を audit 単位とする。
-- 依頼経路は高レベル handoff primitive を標準とする: `mozyo-bridge handoff send --to codex --source redmine --issue <issue_id> --journal <journal_id> --kind <review_request|design_consultation|implementation_done|reply|custom>` (および `mozyo-bridge handoff reply ...` / 上位 alias `mozyo-bridge reply ...`)。primitive が receiver pane resolve / deterministic Layer B preflight / marker-prefixed notification の typing / Enter 発行をまとめて行うため、caller は `mozyo-bridge read codex` + `mozyo-bridge message codex` の shell-level 組み立てを行わない。`mozyo-bridge read` / `message` / `type` / `keys` は operator/debug 用の低レベル primitive (read inspection、ad-hoc operator message、raw typing、raw keys) であり、standard handoff/reply の代替にしない。`status` / `doctor` / pane scrollback は durable Redmine anchor が利用可能なときに receiver state / issue state の推測 source として使わず、anchor を直接読む。
-- audit 依頼 (US-level audit request) には次を含める。
-  - 対象 US と配下 issue の一覧・各状態・implementation_done journal
-  - 対象 commit 群と変更ファイルの一覧
-  - 実施した verification
-  - 重点的に audit してほしい観点・残リスク・未確認事項
-- Codex の audit feedback が ticket system のコメント / journal または明示的な通知として返るまで、US を completed として扱わない。pane に echo されただけの応答を audit pass と判定しない。
-- audit で issue が指摘された場合は修正 commit を打ち、同じ Codex pane に再 audit を依頼する。
-- US close 前の mandatory audit は `mozyo_bridge` repository の project-local policy として維持する (US-level audit model 自体は `redmine-governed` / `redmine-rails-governed` preset 経由で配布される)。
+- 監査の標準単位 (UserStory)、task_level例外、US-level audit request の必須内容、gate 語彙の正本は central preset `### US-Level Audit Model` / `### Gate Schema` (review_request)。handoff primitive の使い方 (高レベル `mozyo-bridge handoff send` 標準、低レベル read/message/type/keys は operator/debug 用、durable anchor を直接読む) の正本は skill `references/workflow.md` の Handoff Lifecycle / Same-Lane Claude Dispatch。本 doc は再掲しない (#13028 で pointer 化)。
+- 本 repo 固有の宣言: US close 前の mandatory audit は `mozyo_bridge` repository の project-local policy として維持する (US-level audit model 自体は `redmine-governed` / `redmine-rails-governed` preset 経由で配布される)。doc-only / rule-only scope の US でも省略しない。
 - `mozyo-bridge scaffold apply <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
 
 ## Workflow Change Verification
 
-- 自律フロー、skills、rules、handoff、escalation、release / distribution gate を変更した場合は、変更後に新規セッションで反映確認を行う。
-- 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。検証対象の規約や skill そのものを変更する task を検証対象にしない。
-- 反映確認の通常開発 task は Claude が実装し、Codex は handoff と audit を担当する。Codex は検証対象 task を直接実装しない。
-- task の大小や production 影響の有無では検証対象を判定しない。判定軸は、検証対象の自律フロー規約、skill、workflow、release / distribution gate を直接変更する作業かどうかである。
-- 反映確認では、agent が起動時規約、Redmine issue、source of truth、handoff / escalation、audit、verification 記録を想定どおり扱ったかを確認する。
-- 反映確認の結果は Redmine に記録する。問題があれば follow-up issue を起票する。
+正本は skill `references/workflow.md` `## Workflow Change Verification` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。
 
 ## 禁止事項
 
