@@ -74,6 +74,23 @@ The portable rule is *that creators pass an explicit concise subject and correct
 - Read the resolved docs before implementation, before review, and before any guardrail change. `docs resolve` is the entry point for reading the catalog, not a substitute for it.
 - If the resolver fails (no catalog, an unresolved path, or the command is unavailable), do not pretend to have read the docs: stop, or record the gap as an open item in the Redmine journal before proceeding.
 
+## Workflow Docs Source-Of-Truth Boundary
+
+The mozyo-bridge workflow is written in layered surfaces, and every rule is placed by one question: **would another adopting project need it?** Content that answers yes belongs in the distributed body; content that answers no stays in the adopting repo's own docs. Core workflow proven while dogfooding one repo is upstreamed into the distributed body — it must not stay locked in that repo's local docs, where every other adopting project silently loses it.
+
+- **Central preset** (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/rules/presets/<preset>/agent-workflow.md`, distributed via `mozyo-bridge rules install` / scaffold): the governance contract — gate vocabulary and required fields, role split, path edit-permission boundaries, close conditions. The preset is authoritative for *what the gates are*; this reference does not restate its tables.
+- **This skill reference body** (`skills/mozyo-bridge-agent/references/**`, distributed via the plugin marketplace and Codex `$skill-installer`): the portable operating procedures — ticket-system entrypoints and issue authoring, the general use of Epic / Feature / UserStory / leaf issues and Versions, the handoff lifecycle and send safety, the coordinator / sublane / callback / review / owner-close standard model (including the standard cockpit window topology), stall detection, retirement, and the visible-lane / durable-anchor premise with its hidden-worker prohibition. This body is authoritative for *how the day-to-day flow runs* in any adopting project.
+- **Repo-local docs** (the adopting repo's own docs namespace): the repo's architecture / source-layout policy, repo-specific technical debt and baselines, concrete Version names / issue history / local exceptions, adoption declarations, and thin pointers or explicitly preset-permitted overrides back to the distributed body.
+
+Placement discipline:
+
+- **One rule, one home.** A repo-local doc does not restate distributed procedure; it declares adoption, adds repo-specific extensions, and points at the distributed section (path + section name, not a paraphrase). Two docs answering the same question differently is the failure this boundary exists to prevent.
+- **Read order resolves double-reading.** Gate / permission questions read the central preset; procedure questions read this reference body; repo-specific application reads the repo's local rule doc. An agent does not need to read the same rule twice in two places.
+- **A portable rule found repo-local is a distribution gap, not a precedent.** Fix it by upstreaming the portable part and shrinking the local doc to a pointer plus the repo-specific residue.
+- **Two boundaries compose.** This section decides *distributed vs repo-local*; the public / private boundary (see `vibes/docs/rules/public-private-boundary.md` in the `mozyo_bridge` repo, or the adopting project's equivalent) decides *portable vs operator-private*. Operator-private policy — concrete paths, cockpit composition, lane-count profiles, private runbooks — never enters the distributed body regardless of which layer it would otherwise fit.
+
+For the `mozyo_bridge` repo itself, the concrete surface inventory and upstream procedure live in `vibes/docs/rules/workflow-docs-boundary.md` (Redmine #13025).
+
 ## Handoff Lifecycle
 
 Use handoff only when the active project workflow or the user explicitly asks for another agent to participate.

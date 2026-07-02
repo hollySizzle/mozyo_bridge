@@ -422,8 +422,9 @@ rules:
   - vibes/docs/rules/agent-workflow.md
   - skills/mozyo-bridge-agent/references/workflow.md
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/logics/autonomous-ticket-entrypoint.md
-    と @vibes/docs/logics/ack-completion-receiver-state.md と @vibes/docs/logics/coordinator-sublane-development-flow.md をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md と @vibes/docs/rules/workflow-docs-boundary.md
+    と @vibes/docs/logics/autonomous-ticket-entrypoint.md と @vibes/docs/logics/ack-completion-receiver-state.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
+    をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

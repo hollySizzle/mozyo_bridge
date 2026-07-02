@@ -94,6 +94,18 @@ documents:
       - rule-release-distribution
       - spec-project-map
 
+  - id: rule-workflow-docs-boundary
+    type: rule
+    status: active
+    canonical_path: vibes/docs/rules/workflow-docs-boundary.md
+    purpose: 配布 workflow docs (central preset / skill references) と repo-local docs の source-of-truth 配置境界。surface 対応表、正本 / pointer / override の書き分け、upstream 手順。
+    audit_role: workflow_docs_boundary_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - skill-workflow-reference
+      - logic-skill-distribution
+
   - id: spec-project-map
     type: spec
     status: active
@@ -1655,6 +1667,7 @@ file_conventions:
     document_refs:
       - rule-project-agent-workflow
       - skill-workflow-reference
+      - rule-workflow-docs-boundary
       - logic-autonomous-ticket-entrypoint
       - logic-ack-completion-receiver-state
       - logic-coordinator-sublane-development-flow

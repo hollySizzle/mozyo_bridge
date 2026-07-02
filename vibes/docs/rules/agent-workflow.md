@@ -4,6 +4,8 @@
 
 この文書は `mozyo_bridge` repository で作業する AI agent の実行規約である。root の `AGENTS.md` / `CLAUDE.md` は router に留め、詳細規約はこの文書に置く。
 
+役割の分界 (#13025): 本 doc は **mozyo_bridge repo 固有** の運用規約の正本である。配布される portable 運用手順の正本は `skills/mozyo-bridge-agent/references/workflow.md`、gate / 役割 / 編集権限 / close 条件の governance contract は central preset `.mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md` にあり、本 doc はそれらを再掲せず、採用宣言・repo 固有拡張・pointer に留める。配置判断の正本は配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## Workflow Docs Source-Of-Truth Boundary`、mozyo_bridge への適用は `vibes/docs/rules/workflow-docs-boundary.md` を読む。
+
 ## 作業開始
 
 - 現在の `cwd` が対象 repository root、またはその配下であることを確認する。
