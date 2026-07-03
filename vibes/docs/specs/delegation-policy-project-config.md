@@ -136,6 +136,22 @@ depth 2 = grandchild implementation lane (孫 lane)
 | authority-shaped key (owner approval / close / callback / route / target / pane / credential を制御しようとする key) | reject。固定 invariant は config truth にならない |
 | config が live runtime と矛盾 | config は desired declaration。action permission は side-effecting command の live preflight が決める (`unit-presentation-state-db.md`) |
 
+## 将来 config 拡張点: project 別 host 分離 / lane cap / spillover
+
+Redmine #13087 (US #13081 child 3)。#13081 は「全 sublane を単一 project/common sublane host window で集約管理する」を default に固定した (#13085 `delegation_window_policy` default `shared` / #13015 launcher placement / #13086 read-model `host_window` + `stale_hints`)。project ごとの host window 分離、workspace 全体の lane cap、host window 溢れ時の spillover は **将来の config 拡張候補** であり、本節はその source-of-truth / default / fallback を実装に先立って固定する。運用目安の数字 (dogfood soft profile の burst 5 本目等) を product の固定仕様として code に hard-code しない。
+
+| 拡張候補 | 将来 key の置き場所 (source-of-truth) | 現時点の default | fallback (未設定 / 不正値) |
+| --- | --- | --- | --- |
+| project 別 host window 分離 | `presentation` config family (`unit-presentation-state-db.md` schema。現行 knob は `delegation_window_policy: shared \| separate`) | `shared`: 全 sublane が単一 project/common host window に集約 (#13085) | 未知 key は closed key set で fail-closed reject。display 層に届いた不正値は documented default (`shared`) へ degrade |
+| workspace lane cap | `delegation:` config (現行の config-owned cap は per-coordinator の `max_active_child_lanes`。workspace 全体 cap は将来 key) + spine admission (`coordinator-sublane-development-flow.md` `### Local Soft Profile`) | product 固定 cap なし。dispatch 抑制は spine の admission / soft profile の運用判断 | config 不在 = product は lane 数を制限しない。soft profile の数字は repo-local 運用 profile であり portable core default ではない |
+| spillover (host window 溢れ時の第 2 host window) | 未実装。将来 key は `presentation` config family (placement surface 語彙の明示拡張) | spillover なし: sublane は常に単一 host window へ append。複数 window への分裂は #13086 read-model が `window_split` stale hint として advisory に可視化するのみ | 未設定 = spillover なし。hint は advisory であり auto-rebalance / auto-retire を trigger しない |
+
+### 拡張時の規約
+
+- 新 key は **明示的な schema 追加** で導入する: closed key set (`GROUPING_CONFIG_KEYS` / `delegation` field contract) への追加、fail-closed matrix の更新、本書または表示正本 doc への追記を伴う。未知 key が silent に受理される経路を作らない。現行 schema が未知 key を fail-closed で reject することが、この拡張点の保護そのものである。
+- lane cap を config 化する場合も、cap は「狭める / 許可する」方向にのみ効く project knob であり、固定 invariant (owner approval 単一集約 / durable anchor / hidden subagent 禁止 / durable callback 要件) を緩めない。
+- `max 5 lanes` 等の運用目安値を core default として code に導入しない。数字は repo-local soft profile (`### Local Soft Profile`) または将来の project config の値であり、product 仕様ではない。guard tests (#13087: presentation schema の未知拡張 key reject / `max_active_child_lanes` の上限 clamp 不在 / sublane inventory の lane 数非制限) がこの非導入を pin する。
+
 ## Public / Private boundary
 
 OSS default に入れてよいもの:

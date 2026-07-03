@@ -170,6 +170,34 @@ class EffectivePolicyTest(unittest.TestCase):
         self.assertFalse(eff.grandchild_permitted)
 
 
+class LaneCapConfigOwnershipTest(unittest.TestCase):
+    """#13087: the active-lane cap is config-owned; no product upper clamp exists.
+
+    Pins the acceptance that `max 5 lanes`-style figures never enter the code as
+    a fixed product ceiling (delegation-policy-project-config.md
+    `## 将来 config 拡張点`): a project config above 5 passes through unchanged
+    and the capacity gate honors it; the only clamps are the safety-side lower
+    bound (>= 1) and the depth hard ceiling.
+    """
+
+    def test_max_active_child_lanes_has_no_product_upper_clamp(self):
+        eff = effective_policy(_open_policy(max_active_child_lanes=8))
+        self.assertEqual(eff.effective_max_active_child_lanes, 8)
+        self.assertEqual(eff.diagnostics, ())
+
+    def test_capacity_gate_honors_config_beyond_five(self):
+        policy = _open_policy(max_active_child_lanes=8)
+        gate = resolve_grandchild_policy_gate(
+            policy, current_depth=1, active_grandchild_lanes=6
+        )
+        self.assertTrue(gate.permitted)
+        gate_full = resolve_grandchild_policy_gate(
+            policy, current_depth=1, active_grandchild_lanes=8
+        )
+        self.assertFalse(gate_full.permitted)
+        self.assertEqual(gate_full.reason, REASON_ACTIVE_LANE_CAPACITY_EXHAUSTED)
+
+
 class PolicyGateTest(unittest.TestCase):
     def test_open_policy_permits_grandchild_lane(self):
         gate = resolve_grandchild_policy_gate(_open_policy())

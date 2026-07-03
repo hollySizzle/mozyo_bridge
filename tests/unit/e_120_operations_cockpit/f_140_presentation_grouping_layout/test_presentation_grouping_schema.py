@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
     ALLOWED_PROJECTIONS,
     DEFAULT_DELEGATION_WINDOW_POLICY,
+    GROUPING_CONFIG_KEYS,
     DEFAULT_PROJECT_GROUP_PRESENTATION,
     DELEGATION_WINDOW_POLICY_MODES,
     DELEGATION_WINDOW_POLICY_SEPARATE,
@@ -452,6 +453,42 @@ class DelegationWindowPolicyConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SHARED
+        )
+
+
+class ConfigExtensionPointGuardTest(unittest.TestCase):
+    """#13087: host separation / lane cap / spillover stay *future* config
+    extension points of this closed-key family (delegation-policy-project-config.md
+    `## 将来 config 拡張点`). Until a key is added as an explicit schema addition,
+    the closed key set rejects it — nothing is silently accepted — and the
+    grouping schema carries no lane-count / spillover vocabulary, so a `max 5
+    lanes` product hard-code cannot enter through this family unnoticed."""
+
+    def test_future_extension_keys_fail_closed_today(self) -> None:
+        for key in (
+            "sublane_host_policy",
+            "spillover_policy",
+            "max_active_lanes",
+            "max_sublanes",
+            "lane_cap",
+        ):
+            with self.assertRaises(PresentationGroupingConfigError):
+                PresentationGroupingConfig.from_record({key: 5})
+
+    def test_grouping_schema_has_no_lane_cap_or_spillover_key(self) -> None:
+        # The closed top-level key set is exactly the documented display knobs;
+        # adding a cap / spillover key later must change this set (and the spec).
+        self.assertEqual(
+            GROUPING_CONFIG_KEYS,
+            frozenset(
+                {
+                    "version",
+                    "project_groups",
+                    "grouping",
+                    "project_group_presentation",
+                    "delegation_window_policy",
+                }
+            ),
         )
 
 

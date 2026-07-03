@@ -242,6 +242,11 @@ def effective_policy(policy: DelegationPolicy) -> EffectiveDelegationPolicy:
         depth = 0
         diagnostics.append(f"invalid_max_delegation_depth:{raw_depth!r}_clamped_to_0")
 
+    # Deliberately no *upper* clamp: the lane cap is a config-owned project knob
+    # (min with the spine's admission judgment), never a product-fixed number.
+    # Operating figures like "5 lanes" stay in the repo-local soft profile /
+    # future project config, not as a core default here
+    # (delegation-policy-project-config.md `## 将来 config 拡張点`, #13087).
     raw_lanes = policy.max_active_child_lanes
     if not isinstance(raw_lanes, bool) and isinstance(raw_lanes, int) and raw_lanes >= 1:
         lanes = raw_lanes

@@ -162,6 +162,14 @@ DELEGATION_WINDOW_POLICY_MODES: frozenset[str] = frozenset(
 #: shared project/common sublane host window — a delegated coordinator, its
 #: grandchild worker, and every launching sublane fold into the single host
 #: window (Redmine #13085 / #13081; ``separate`` is the opt-in).
+#:
+#: Project-specific host separation and host-window spillover are *future config
+#: extension points* of this closed-key ``presentation`` family, never implicit
+#: behavior: a future key lands as an explicit schema addition (closed key sets
+#: reject it until then), and this display family carries no lane-count cap —
+#: ``max 5 lanes``-style figures are operating guidance in the repo-local soft
+#: profile / future project config, not product spec
+#: (``delegation-policy-project-config.md`` ``## 将来 config 拡張点``, #13087).
 DEFAULT_DELEGATION_WINDOW_POLICY: str = DELEGATION_WINDOW_POLICY_SHARED
 
 #: The default lane id every non-lane construction lands on (mirrors

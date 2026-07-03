@@ -223,6 +223,42 @@ class HostWindowProjectionTests(unittest.TestCase):
         )
 
 
+class SingleHostWindowUncappedTests(unittest.TestCase):
+    """#13087: the read model imposes no lane cap on the shared host window.
+
+    Pins the acceptance that `max 5 lanes` never enters the product as fixed
+    behavior (delegation-policy-project-config.md `## 将来 config 拡張点`): six
+    lanes folded into the single project/common host window (#13085 default)
+    all project identically — no truncation, no count-triggered hint. Lane-count
+    figures stay operating guidance in the repo-local soft profile / future
+    project config, and spillover stays unimplemented (multi-window drift is
+    only ever the advisory `window_split` hint, per lane, from its own panes).
+    """
+
+    def test_six_lanes_on_one_host_window_all_project_without_hints(self):
+        rows = []
+        for n in range(1, 7):
+            for pane_suffix, role in ((f"{n}0", "codex"), (f"{n}1", "claude")):
+                rows.append(
+                    _row(
+                        id=f"%{pane_suffix}",
+                        agent_role=role,
+                        lane_id=f"l{n}",
+                        lane_label=f"issue_10{n}_work",
+                        location=f"cockpit:3.{pane_suffix}",
+                        window_name="mozyo_bridge",
+                        repo_root_stamp=f"/wt/l{n}",
+                    )
+                )
+        views = project_sublanes(rows)
+        self.assertEqual(len(views), 6)
+        for v in views:
+            self.assertEqual(v.host_window, "cockpit:3")
+            self.assertEqual(v.host_window_name, "mozyo_bridge")
+            self.assertEqual(v.state, SUBLANE_STATE_ACTIVE)
+            self.assertEqual(v.stale_hints, ())
+
+
 class StaleHintTests(unittest.TestCase):
     """#13086: machine-readable retire decision material (advisory only)."""
 
