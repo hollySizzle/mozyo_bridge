@@ -67,6 +67,17 @@ fragments:
     when:
       tool: claude
     body_file: bodies/body_claude.md
+  # Always-rule digest (Redmine #13148). Shared across both tools and all
+  # variants (empty `when` matches every output context), so the same
+  # generated 1-line-per-rule digest + canonical pointers reach AGENTS.md
+  # and CLAUDE.md. The rule bodies live in the distributed skill / preset;
+  # this block is generated, never hand-edited, and drift falls out of
+  # `scaffold canonical --check`. Placed after the tool body so it reads as
+  # its own section just above the sublane route / project-local block.
+  # Placement axis + line cap: vibes/docs/rules/workflow-docs-boundary.md
+  # `## 規則の activation 軸`.
+  - id: always_digest
+    body_file: bodies/always_digest.md
   # Emits only for the `--with-sublane-flow` variant outputs (the base
   # outputs carry no `sublane_flow` key, so this `when` never matches
   # there). Shared across both tools; placed after the tool body and

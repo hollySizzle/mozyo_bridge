@@ -1,7 +1,7 @@
 
 ## ClaudeCode 起動時の最小 reminder
 
-- 迎合せず事実に基づいて結論を述べる。意見の不一致は `${rule_path}` が指定する durable record に残す。
+- 意見の不一致は `${rule_path}` が指定する durable record に残す (迎合禁止規則の正本 pointer は下記「常時適用規則ダイジェスト」)。
 - implementation done / implementation_done は completion ではない。review / audit / close 条件は `${rule_path}` に従う。
 - pane 通知は通知でしかない。判断の正本は `${rule_path}` と active な `${ticket_anchor_label}` を読む。
 - handoff を送る場合は `${rule_path}` の handoff startup decision / receive-method rule に従い、受領方法を durable record に残す。

@@ -484,6 +484,111 @@ class CanonicalRendererTest(unittest.TestCase):
                 )
 
 
+class AlwaysRuleDigestTest(unittest.TestCase):
+    """Pin Redmine #13148: the always-rule digest in the router pair.
+
+    The digest block is generated into both router templates from
+    `canonical_sources/router/bodies/always_digest.md`. `CanonicalRendererTest`
+    already gates byte-drift between the canonical render and the committed
+    templates. This class pins the *semantic* contract the byte gate cannot:
+
+    - the digest ships in BOTH tool routers (AGENTS.md + CLAUDE.md), so an
+      agent that loads neither the skill nor the preset still meets the
+      always rules;
+    - every digest entry's canonical pointer target actually exists (a
+      renamed section in the skill / preset must update the digest in the
+      same commit, or this test fails loudly);
+    - the entry count stays within the ≤10-line cap from
+      `vibes/docs/rules/workflow-docs-boundary.md` `## 規則の activation 軸`,
+      so the router stays thin.
+    """
+
+    ROUTER_DIR = Path("src/mozyo_bridge/scaffold/presets/_router")
+    DIGEST_HEADING = "## 常時適用規則ダイジェスト (生成)"
+    BEGIN = "<!-- mozyo-bridge:always-digest:begin -->"
+    END = "<!-- mozyo-bridge:always-digest:end -->"
+    DIGEST_ENTRY_CAP = 10
+
+    def _digest_entries(self, router_name: str) -> list[str]:
+        body = (ROOT / self.ROUTER_DIR / router_name).read_text(encoding="utf-8")
+        self.assertIn(self.DIGEST_HEADING, body, f"{router_name} missing digest heading")
+        self.assertIn(self.BEGIN, body, f"{router_name} missing digest begin marker")
+        self.assertIn(self.END, body, f"{router_name} missing digest end marker")
+        block = body.split(self.BEGIN, 1)[1].split(self.END, 1)[0]
+        return [
+            line for line in block.splitlines() if line.startswith("- ")
+        ]
+
+    def test_digest_ships_in_both_tool_routers(self) -> None:
+        for router_name in ("AGENTS.md", "CLAUDE.md"):
+            entries = self._digest_entries(router_name)
+            self.assertGreater(
+                len(entries),
+                0,
+                f"{router_name} always-digest block has no entries; the "
+                "always rules would be unreachable from the router.",
+            )
+
+    def test_digest_is_byte_identical_across_tools(self) -> None:
+        # The always rules are tool-agnostic; the shared fragment must
+        # render the same digest bytes into both routers.
+        self.assertEqual(
+            self._digest_entries("AGENTS.md"),
+            self._digest_entries("CLAUDE.md"),
+        )
+
+    def test_digest_entry_count_within_line_cap(self) -> None:
+        for router_name in ("AGENTS.md", "CLAUDE.md"):
+            entries = self._digest_entries(router_name)
+            self.assertLessEqual(
+                len(entries),
+                self.DIGEST_ENTRY_CAP,
+                f"{router_name} always-digest has {len(entries)} entries, over "
+                f"the ≤{self.DIGEST_ENTRY_CAP} cap; replace an entry instead of "
+                "appending (workflow-docs-boundary.md `## 規則の activation 軸`).",
+            )
+
+    def test_digest_pointer_targets_exist(self) -> None:
+        # Each digest entry is a pointer, not the rule body. Pin that the
+        # named canonical sections still exist so a rename can't silently
+        # leave the digest pointing at a dead section.
+        skill_body = (
+            ROOT
+            / "skills/mozyo-bridge-agent/references/workflow.md"
+        ).read_text(encoding="utf-8")
+        preset_body = (
+            ROOT
+            / "src/mozyo_bridge/scaffold/presets/redmine-governed/agent-workflow.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "### Narrative の issue 参照は",
+            skill_body,
+            "digest points at a skill section that no longer exists.",
+        )
+        for section in (
+            "### 応答言語ポリシー",
+            "### Review Finding Verdict Obligation (迎合禁止)",
+            "### 根拠出所分類",
+        ):
+            self.assertIn(
+                section,
+                preset_body,
+                f"digest points at preset section {section!r} that no longer exists.",
+            )
+
+    def test_boundary_doc_defines_activation_axis(self) -> None:
+        # The placement rule + line cap the digest cites must be reachable
+        # in the repo-local boundary doc.
+        boundary = (
+            ROOT / "vibes/docs/rules/workflow-docs-boundary.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("## 規則の activation 軸", boundary)
+        self.assertIn("always", boundary)
+        self.assertIn("per-task", boundary)
+        self.assertIn("exceptional", boundary)
+
+
 class GovernedWorkflowCanonicalTest(unittest.TestCase):
     """Pin Redmine #10426: governed preset agent-workflow.md canonicalization.
 
