@@ -901,8 +901,10 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
         if outcome.dispatch_result == DISPATCH_GATEWAY_NOTIFIED:
             lines.append(
                 "  ! gateway notified only; worker dispatch NOT confirmed "
-                "(worker_dispatch_confirmed=false). If no worker progress lands, "
-                "classify with `sublane callback-recovery --dispatch-delivered`"
+                "(worker_dispatch_confirmed=false). Drive the ack with "
+                "`sublane dispatch-worker --execute` (#12988); if no worker "
+                "progress lands, classify with `sublane callback-recovery "
+                "--dispatch-delivered`"
             )
     if outcome.is_blocked:
         lines.append("  -> blocked: " + ", ".join(outcome.blocked_reasons))
