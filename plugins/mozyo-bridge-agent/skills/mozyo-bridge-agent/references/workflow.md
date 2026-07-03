@@ -745,6 +745,62 @@ push は二層の権限であり、層ごとに所有者が異なる (Redmine #1
 - **main-unit 例外の実装でも branch は切る。** dispatch decision が main unit / primary checkout で実装する例外を記録した場合でも、実装者は issue branch を作成しその branch を push する。primary checkout の integration branch に作業を直接 commit することは決してない。coordinator と実装者が 1 つの checkout を共有すると branch 切り替えが衝突し得る — commit 前に現在の branch を確認し、専用 worktree を優先し、衝突が起きたら黙って修復せず correction として記録する。
 - **権限 field は central preset に置いたままにする。** この規約の gate-level の記述 (実装者の push ref 制限、integration disposition の記録、禁止遷移 `implementer_advances_integration_branch`) は central preset の `### Commit Hash Origin 到達可能性` にある。本節は運用手順であり、preset の field 表を再掲しない。
 
+## Publication checkpoint (integration 層と publication 層の分離)
+
+`## Integration disposition と push authority` は push が二層の権限であることを固定したが、そこで扱うのは *統合 (integration)* — coordinator が review approval 済みの commit を integration branch へ進めること — までである。統合された commit が *いつ公開履歴 (`origin/main`) へ昇格するか* は別の checkpoint であり、本節がそれを固定する。この doctrine の出所は owner_intent である (durable anchor: Redmine #13126 j#71777 確定事項 5、Codex triage: #13126 j#71786 item 4)。owner の原発話は「メインブランチにマージした時に、オーナーにプッシュ承認を求める。反応がない場合はプッシュせずローカルの commit を積んでいくフロー」であり、実装者提案 (staging branch + Redmine Version close = publication checkpoint) に owner が同意したものである。
+
+integration と publication を 2 層に分離する。前者は lane base の鮮度維持のための自律操作、後者は公開履歴を進める owner-gated な checkpoint であり、両者を混同しない。
+
+### integration 層: staging branch への自律 push
+
+- UserStory が close された後、coordinator は staging branch (例 `main-next`) へ owner 承認なしに自律 push してよい。目的は各 sublane が cut し直す lane base の鮮度維持であり、公開ではない。
+- これは `## Integration disposition と push authority` の integration disposition (`merge` / `patch_equivalent` / `explicit_deferral`) の到達先を、`origin/main` ではなく staging branch にすることを既定にする。disposition journal の記録義務は変わらない。
+- staging branch への push は Redmine Version close でも release tag でも package version bump でもない。統合の鮮度維持であって、下記 publication 層の昇格ではない。
+
+### publication 層: Redmine Version close = `origin/main` 昇格 checkpoint
+
+- **Redmine Version の close が `origin/main` への昇格 checkpoint である。** staging branch に積んだ commit を `origin/main` へ push するのは、この checkpoint を通ってからに限る。
+- **owner の承認行為は Redmine Version close の UI 操作そのもので成立してよい。** publication のために別建ての pane approval を必須化しない。Redmine Version を close する owner 操作が、その Redmine Version scope の公開昇格に対する承認である。
+- これは `## Owner 承認の集約` の owner-approval-waiting の一種であり、単一の coordinator 窓口へ集約するという境界は変わらない。publication 待ちは pane ではなく durable record 上に住み、pane 数に依存せず列挙できる。
+- 昇格の対象は *開発履歴の公開* であって package release ではない (release gate 分離は次節)。
+
+### release gate は publication とは別である
+
+- release — release tag、package version bump、publish — は publication checkpoint とは別の release gate であり、開発系 project の opt-in である。Redmine Version close が公開昇格を通しても、それ自体は release tag や package version の決定を含まない。
+- **Redmine Version を release scope 化しない。** Redmine Version 名は roadmap / milestone / acceptance grouping surface であって、package release 番号の決定でも active lane-set authority でもない (#13024 の現行 guideline を維持)。用語規律: 裸の「バージョン」を使わず、Redmine Version / release tag / package version を必ず修飾する (#13162)。
+- release / publish は引き続き release carve-out として direct_owner 承認を要する。publication checkpoint はそれを代替しない。
+
+### 無応答分岐: checkpoint 未反応時は staging に積む
+
+owner が publication checkpoint に反応しない場合、coordinator は `origin/main` へ push しない。staging branch に commit を積み続け、待機を durable record に記録する:
+
+- 待機は `push_waiting` 相当の state として記録する: どの staging branch head が publication 待ちか、どの Redmine Version の close を待つか、どの UserStory 群が既に integration 済みか。pane の沈黙や `status` / `doctor` から待機を推測しない。
+- `push_waiting` は破壊的でも不可逆でもない安全な待機 state であり、owner が checkpoint に応じるまで graceful に留まる。lane を無言で凍結させず、待機の理由と解除条件 (対象 Redmine Version の close) を durable anchor 付きで残す (`## Coordinator stop と next-action 標準` の stop 提示と同じ形)。
+
+### Redmine Version close 前の readiness checklist
+
+publication checkpoint を owner に提示する前に、coordinator は readiness を durable record で確認する:
+
+- 対象 Redmine Version scope の UserStory 群がすべて close 済みである (`## Owner 承認の集約` と Close Gate に従い、pane ではなく durable record から列挙する)。
+- 昇格対象 commit の verification が green で durable record に記録済みである。
+- 既存の module-health / runtime 参照と結線する: module_health baseline の警告や `## Runtime fingerprint 検証規律` の fingerprint 不一致など未解消の signal を residual として明示し、PASS に混ぜない。
+- staging branch head が `origin` から到達可能である (`### gate へ commit hash を記録する前の origin 到達性 preflight` を昇格対象 commit へ適用する)。
+
+readiness が満たされない項目は checklist に residual として残し、「全部 ready」と表現しない (`## Backlog reconciliation gate (deferred intent の即時 durable 分類)` の未分類 intent を残さない原則)。
+
+### 手動 Redmine Version close 手順 (MCP tool 整備前)
+
+- **Redmine Version の close 操作を実行する MCP tool は未整備である。存在しない tool をあるものとして扱わない。** rename / close / lock / delete を実行できる live executor はまだ配線されていない (整備予定は epic_ladder #13136)。
+- 整備されるまでは、owner が Redmine UI で対象 Redmine Version を close する手動手順を経る。coordinator は readiness summary と対象 Redmine Version を owner へ提示し、owner の UI close 操作を publication checkpoint の承認として扱う。close 後、coordinator が `origin/main` への push を実行する (push authority は `## Integration disposition と push authority` のとおり coordinator が所有する)。
+- Redmine Version object の status 更新面が使えない状況での代替記録 (readiness summary を durable anchor に残して先へ進み、後で status を同期する) は既存運用のとおりであり、本節はそれを昇格 checkpoint の承認手順として位置づけ直すだけである。
+
+### 本 doctrine が緩めない境界
+
+- **checkpoint は self-authorization ではない。** owner が Redmine Version を close するまで、coordinator は staging branch から `origin/main` へ push しない。integration 層の自律 push (staging branch) は publication 層の承認を代替しない。
+- **release gate を publication に畳み込まない。** Redmine Version close は開発履歴の公開 checkpoint であって、release tag / package version / publish の承認ではない。それらは別 gate で direct_owner 承認を要する。
+- **durable record が正本であり続ける。** staging branch head、`push_waiting` state、readiness checklist、手動 close の承認はすべて Redmine journal に記録し、pane scrollback / `status` / `doctor` から推測しない。
+- **operator 固有の構成を OSS 既定に持ち込まない。** 具体的な staging branch 名、publication の cadence、どの Redmine Version をいつ close するかの private policy は operator の runtime policy である (採用 repo の public / private 境界規約を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は *integration / publication の 2 層分離、Redmine Version close = `origin/main` 昇格 checkpoint、release gate 分離、無応答時の `push_waiting` 記録、readiness checklist、MCP tool 整備前の手動 close 手順* である。具体的な branch 名と cadence は operator のものである。
+
 ## 既存 project の sublane 導入
 
 上の sublane 各節は、project が既に governed scaffold を持っている場合に coordinator がこのフローをどう運用するかを記述している。本節は repo-local runbook `vibes/docs/logics/existing-project-sublane-adoption.md` (Redmine #12423) の portable な抽出である: すなわち、code・router・ticket lifecycle・固有 docs を既に持つ**既存** project を、**既存の routing を壊さずに** governed scaffold と sublane フローへ載せる方法である。これは `--with-sublane-flow` opt-in profile (`vibes/docs/profiles/sublane-flow-runtime-profile.md`) から到達できる採用者向け手順である。dogfood 固有の lane 数、cockpit 構成、絶対 path はこの配布本文には置かない。
