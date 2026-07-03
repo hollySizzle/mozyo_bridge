@@ -401,6 +401,27 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
         self.assertIn("turn start unconfirmed", stdout)
 
+    def test_codex_standard_explicit_zero_landing_timeout_disables_observation(self) -> None:
+        # Redmine #13166 j#71985 finding 1: an explicit `--landing-timeout 0` must
+        # reach the turn-start observation as window 0.0 (observation disabled) —
+        # the legacy `or 8.0` marker-gate coercion must not swallow it. With the
+        # observation disabled, a pane that never advances after Enter still
+        # resolves `sent` / `ok` instead of blocking `turn_start_unconfirmed`.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._codex_standard_argv() + ["--landing-timeout", "0"],
+            pane=dict(self._CODEX_PANE),
+            enter_advances_pane=False,
+        )
+        self.assertEqual(0, result)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        enter_calls = [c for c in sent if c == ("send-keys", "-t", "%2", "Enter")]
+        self.assertEqual(1, len(enter_calls))
+        # The telemetry records the disabled observation (window 0s, 0 polls).
+        self.assertIn("Turn start:", stdout)
+        self.assertIn("window 0s", stdout)
+
     def test_claude_standard_skips_turn_start_observation(self) -> None:
         # Redmine #13166 scope guard: the claude rail is unchanged — it resolves
         # `sent` / `ok` on marker observed + Enter without a turn-start block even

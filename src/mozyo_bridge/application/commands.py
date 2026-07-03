@@ -60,6 +60,7 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
 )
 from mozyo_bridge.application.turn_start_observation import (  # noqa: F401
     observe_codex_turn_start as _observe_codex_turn_start,
+    resolve_turn_start_window as _resolve_turn_start_window,
     turn_start_record_lines as _turn_start_record_lines,
 )
 from mozyo_bridge.application.handoff_target_activation_command import (
@@ -2903,6 +2904,9 @@ def orchestrate_handoff(
     # marker+body sitting in the composer. Only codex standard reaches this — the
     # claude rail and the queue-enter rail keep their prior behavior untouched.
     codex_standard_rail = mode == MODE_STANDARD and receiver == "codex"
+    turn_start_window = _resolve_turn_start_window(
+        getattr(args, "landing_timeout", None), landing_timeout
+    )
     turn_start_baseline = (
         capture_pane(target, landing_lines) if codex_standard_rail else None
     )
@@ -2953,7 +2957,7 @@ def orchestrate_handoff(
             baseline_capture=turn_start_baseline or "",
             capture=capture_pane,
             sleep=time.sleep,
-            window_seconds=landing_timeout,
+            window_seconds=turn_start_window,
             lines=landing_lines,
         )
         turn_start_lines = _turn_start_record_lines(turn_start)

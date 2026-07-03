@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3284
+    lines: 3288
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -959,6 +959,9 @@ allowlist:
       threading ``turn_start_lines`` into the sent-path emit/persist. The
       read-only observation loop, the pure activity classifier, and the record-line
       renderer live in the new ``application/turn_start_observation.py``, not here.
+      REV2 (j#71985 finding 1) 3284 -> 3288: the raw --landing-timeout ->
+      observation-window call-site only (the derivation itself is
+      ``turn_start_observation.resolve_turn_start_window``, not here).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

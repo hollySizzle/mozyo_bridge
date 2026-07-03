@@ -12,9 +12,28 @@ from mozyo_bridge.application.turn_start_observation import (
     TURN_START_OBSERVE_INTERVAL_SECONDS,
     TurnStartObservation,
     observe_codex_turn_start,
+    resolve_turn_start_window,
     submit_activity_observed,
     turn_start_record_lines,
 )
+
+
+class ResolveTurnStartWindowTest(unittest.TestCase):
+    """Raw ``--landing-timeout`` arg -> observation window (j#71985 finding 1)."""
+
+    def test_unset_arg_keeps_coerced_default(self) -> None:
+        self.assertEqual(resolve_turn_start_window(None, 8.0), 8.0)
+
+    def test_explicit_zero_disables_observation(self) -> None:
+        # The legacy marker-gate coercion turns an explicit 0 into 8.0; the
+        # observation window must not inherit that swallow.
+        self.assertEqual(resolve_turn_start_window(0.0, 8.0), 0.0)
+
+    def test_explicit_negative_disables_observation(self) -> None:
+        self.assertEqual(resolve_turn_start_window(-1.0, 8.0), 0.0)
+
+    def test_explicit_positive_uses_coerced_window(self) -> None:
+        self.assertEqual(resolve_turn_start_window(5.0, 5.0), 5.0)
 
 
 class SubmitActivityObservedTest(unittest.TestCase):

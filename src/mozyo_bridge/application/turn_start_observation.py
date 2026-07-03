@@ -133,6 +133,24 @@ def observe_codex_turn_start(
     )
 
 
+def resolve_turn_start_window(
+    raw_landing_timeout: object, coerced_window: float
+) -> float:
+    """The observation window from the raw ``--landing-timeout`` arg (j#71985).
+
+    The orchestrator's legacy marker-gate coercion (``float(raw or 8.0)``) swallows
+    an explicit ``0``, so the observation window is derived here from the raw arg
+    instead: an unset arg (``None``) keeps the caller's coerced default, while an
+    explicit non-positive value returns ``0.0`` — which
+    :func:`observe_codex_turn_start` documents as "observation disabled". The
+    marker gate's own coercion is deliberately left untouched (pre-#13166
+    semantics for every rail).
+    """
+    if raw_landing_timeout is None:
+        return coerced_window
+    return 0.0 if float(raw_landing_timeout) <= 0 else coerced_window  # type: ignore[arg-type]
+
+
 def turn_start_record_lines(observation: TurnStartObservation) -> List[str]:
     """Render the additive ``- Turn start:`` durable-record telemetry (pure).
 
@@ -167,6 +185,7 @@ __all__ = [
     "TURN_START_OBSERVE_INTERVAL_SECONDS",
     "TurnStartObservation",
     "observe_codex_turn_start",
+    "resolve_turn_start_window",
     "submit_activity_observed",
     "turn_start_record_lines",
 ]
