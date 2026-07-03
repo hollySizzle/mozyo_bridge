@@ -11,7 +11,11 @@ synthetic :class:`LaunchOps` — no real tmux server, no ``os.execvp``. They pin
   the JSON payload path, and the text attach outcome (attach argv + no-attach),
 - the ``CockpitLayoutUseCase`` walk: the preset and no-workspace refusals, the
   JSON / dry-run non-mutating paths, the reuse-vs-build execute messages, and the
-  mid-build ``SystemExit`` teardown (kill-session then re-raise).
+  mid-build ``SystemExit`` teardown (kill-session then re-raise),
+- the terminal delivery tails (#13105): the exact ``emit`` / ``die`` / ``attach``
+  branch order the thin handlers used to carry — JSON short-circuit,
+  notice-before-die, the ``end=""`` pre-attach block, the ``--no-attach`` hint,
+  and the exec attach.
 
 The end-to-end behavior over the real tmux helpers stays pinned by the
 ``cmd_mozyo`` / ``cmd_layout_apply`` characterization tests
@@ -30,12 +34,16 @@ from pathlib import Path
 from mozyo_bridge.application.launch_command import (
     AgentWindowLaunchUseCase,
     CockpitLayoutUseCase,
+    LayoutLaunchOutcome,
+    MozyoLaunchOutcome,
     MozyoLaunchUseCase,
     _parse_mozyo_window_rows,
     attach_argv,
     attach_command_line,
     build_cockpit_layout_json_payload,
     build_mozyo_json_payload,
+    deliver_layout_launch_outcome,
+    deliver_mozyo_launch_outcome,
     new_agent_session_argv,
     new_agent_window_argv,
     render_cockpit_layout_dry_run,
@@ -82,6 +90,8 @@ class _FakeLaunchOps:
         self.calls: list[tuple] = []
         self.setup_args: argparse.Namespace | None = None
         self.attached: list[list[str]] = []
+        self.emitted: list[tuple[str, str]] = []
+        self.died: list[str] = []
 
     # -- mozyo reads --
     def require_tmux(self) -> None:
@@ -121,6 +131,14 @@ class _FakeLaunchOps:
     def attach(self, argv: list[str]):
         self.attached.append(list(argv))
         raise RuntimeError("attach")
+
+    def emit(self, text: str, end: str = "\n") -> None:
+        self.emitted.append((text, end))
+
+    def die(self, message: str):
+        # Mirror the live ``die`` contract: never returns.
+        self.died.append(message)
+        raise SystemExit(message)
 
     # -- layout reads --
     def resolve_cockpit_workspaces(self, args: argparse.Namespace) -> list:
@@ -365,6 +383,107 @@ class CockpitLayoutUseCaseTest(unittest.TestCase):
             CockpitLayoutUseCase(ops).run(_layout_args())
         kill = [c for c in ops.calls if c[0] == "run_tmux" and c[1][:1] == ("kill-session",)]
         self.assertTrue(kill, "expected a kill-session teardown before re-raise")
+
+
+class MozyoLaunchDeliveryTest(unittest.TestCase):
+    """The ``cmd_mozyo`` terminal tail, byte-for-byte over the fake port (#13105)."""
+
+    def test_json_short_circuits_without_attach(self) -> None:
+        ops = _FakeLaunchOps()
+        rc = deliver_mozyo_launch_outcome(MozyoLaunchOutcome(json_stdout='{"a": 1}'), ops)
+        self.assertEqual(0, rc)
+        self.assertEqual([('{"a": 1}', "\n")], ops.emitted)
+        self.assertEqual([], ops.attached)
+        self.assertEqual([], ops.died)
+
+    def test_notice_prints_before_die(self) -> None:
+        # The non-JSON legacy notice must land before a late failure's die,
+        # matching the original handler ordering.
+        ops = _FakeLaunchOps()
+        outcome = MozyoLaunchOutcome(notice="legacy notice", error_message="boom")
+        with self.assertRaises(SystemExit):
+            deliver_mozyo_launch_outcome(outcome, ops)
+        self.assertEqual([("legacy notice", "\n")], ops.emitted)
+        self.assertEqual(["boom"], ops.died)
+        self.assertEqual([], ops.attached)
+
+    def test_no_attach_prints_block_and_hint(self) -> None:
+        ops = _FakeLaunchOps()
+        outcome = MozyoLaunchOutcome(
+            pre_attach_text="session=s created=-\nINDEX\tNAME\tPROCESS\n",
+            attach_command="tmux attach -t s",
+            attach_argv=("tmux", "attach", "-t", "s"),
+            no_attach=True,
+        )
+        self.assertEqual(0, deliver_mozyo_launch_outcome(outcome, ops))
+        # The pre-attach block carries its own trailing newline -> end="".
+        self.assertEqual(
+            [
+                ("session=s created=-\nINDEX\tNAME\tPROCESS\n", ""),
+                ("attach: tmux attach -t s", "\n"),
+            ],
+            ops.emitted,
+        )
+        self.assertEqual([], ops.attached)
+
+    def test_attach_path_drives_port_attach(self) -> None:
+        ops = _FakeLaunchOps()
+        outcome = MozyoLaunchOutcome(
+            pre_attach_text="session=s created=-\nINDEX\tNAME\tPROCESS\n",
+            attach_command="tmux -CC attach -t s",
+            attach_argv=("tmux", "-CC", "attach", "-t", "s"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "attach"):
+            deliver_mozyo_launch_outcome(outcome, ops)
+        self.assertEqual([["tmux", "-CC", "attach", "-t", "s"]], ops.attached)
+
+
+class LayoutLaunchDeliveryTest(unittest.TestCase):
+    """The ``cmd_layout_apply`` terminal tail, byte-for-byte over the fake port (#13105)."""
+
+    def test_refusal_dies_first(self) -> None:
+        ops = _FakeLaunchOps()
+        with self.assertRaises(SystemExit):
+            deliver_layout_launch_outcome(LayoutLaunchOutcome(error_message="nope"), ops)
+        self.assertEqual(["nope"], ops.died)
+        self.assertEqual([], ops.emitted)
+        self.assertEqual([], ops.attached)
+
+    def test_json_and_dry_run_short_circuit(self) -> None:
+        ops = _FakeLaunchOps()
+        self.assertEqual(0, deliver_layout_launch_outcome(LayoutLaunchOutcome(json_stdout="{}"), ops))
+        self.assertEqual(0, deliver_layout_launch_outcome(LayoutLaunchOutcome(dry_run_stdout="cockpit plan:"), ops))
+        self.assertEqual([("{}", "\n"), ("cockpit plan:", "\n")], ops.emitted)
+        self.assertEqual([], ops.attached)
+
+    def test_no_attach_prints_lines_and_hint(self) -> None:
+        ops = _FakeLaunchOps()
+        outcome = LayoutLaunchOutcome(
+            pre_attach_lines=("cockpit built: session=mozyo-cockpit columns=1 codex=70% claude=30%",),
+            attach_command="tmux attach -t mozyo-cockpit",
+            attach_argv=("tmux", "attach", "-t", "mozyo-cockpit"),
+            no_attach=True,
+        )
+        self.assertEqual(0, deliver_layout_launch_outcome(outcome, ops))
+        self.assertEqual(
+            [
+                ("cockpit built: session=mozyo-cockpit columns=1 codex=70% claude=30%", "\n"),
+                ("attach: tmux attach -t mozyo-cockpit", "\n"),
+            ],
+            ops.emitted,
+        )
+        self.assertEqual([], ops.attached)
+
+    def test_attach_path_drives_port_attach(self) -> None:
+        ops = _FakeLaunchOps()
+        outcome = LayoutLaunchOutcome(
+            pre_attach_lines=("cockpit session 'mozyo-cockpit' already exists; attaching without rebuild (reuse over duplicate panes)",),
+            attach_command="tmux attach -t mozyo-cockpit",
+            attach_argv=("tmux", "attach", "-t", "mozyo-cockpit"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "attach"):
+            deliver_layout_launch_outcome(outcome, ops)
+        self.assertEqual([["tmux", "attach", "-t", "mozyo-cockpit"]], ops.attached)
 
 
 class _FakeAgentWindowOps:

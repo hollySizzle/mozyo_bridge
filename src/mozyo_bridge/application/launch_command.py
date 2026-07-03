@@ -28,9 +28,14 @@ attach). This module carves that into an OOP-first boundary under #12638:
   real side effects unchanged.
 - :class:`MozyoLaunchUseCase` / :class:`CockpitLayoutUseCase` compose the port
   and the policy and return a typed :class:`MozyoLaunchOutcome` /
-  :class:`LayoutLaunchOutcome`. The thin ``cmd_mozyo`` / ``cmd_layout_apply``
-  handlers render that outcome (print, ``die``, attach) — they own stdout and the
-  terminal attach so the use cases stay exercisable with a synthetic fake.
+  :class:`LayoutLaunchOutcome`.
+- :func:`deliver_mozyo_launch_outcome` / :func:`deliver_layout_launch_outcome`
+  own the terminal tail (#13105): they render the outcome through the port's
+  ``emit`` sink / ``die`` abort and drive the terminal ``os.execvp`` attach via
+  ``ops.attach``, so the whole flow — decision, rendering, and delivery — stays
+  exercisable with a synthetic fake. The ``cmd_mozyo`` / ``cmd_layout_apply``
+  handlers in :mod:`commands` are one-line parser-bound wrappers over run +
+  deliver.
 
 Behavior-preserving: the refusal wording, the stdout/stderr text, the tmux side
 effects, and the exit codes are unchanged from the original command bodies.
@@ -223,6 +228,10 @@ class LaunchOps(Protocol):
 
     def attach(self, argv: list[str]) -> NoReturn: ...
 
+    def emit(self, text: str, end: str = "\n") -> None: ...
+
+    def die(self, message: str) -> NoReturn: ...
+
     def resolve_cockpit_workspaces(self, args: argparse.Namespace) -> list: ...
 
     def agent_launch_command(
@@ -280,6 +289,13 @@ class LiveLaunchOps:
     def attach(self, argv: list[str]) -> NoReturn:
         os.execvp("tmux", argv)
         raise AssertionError("unreachable")  # pragma: no cover - execvp replaces process
+
+    def emit(self, text: str, end: str = "\n") -> None:
+        print(text, end=end)
+
+    def die(self, message: str) -> NoReturn:
+        self._commands().die(message)
+        raise AssertionError("unreachable")  # pragma: no cover - die raises SystemExit
 
     def resolve_cockpit_workspaces(self, args: argparse.Namespace) -> list:
         return self._commands()._resolve_cockpit_workspaces(args)
@@ -564,6 +580,74 @@ class CockpitLayoutUseCase:
             attach_argv=tuple(attach_argv(session, control_mode)),
             no_attach=no_attach,
         )
+
+
+# --- Terminal delivery (#13105) ------------------------------------------------
+#
+# The outcome-rendering / attach tails that historically closed the thin
+# ``cmd_mozyo`` / ``cmd_layout_apply`` handler bodies. They own the branch order
+# byte-for-byte (JSON / notice / die / pre-attach text / no-attach hint / exec
+# attach) and render through the :class:`LaunchOps` port — ``emit`` for stdout,
+# ``die`` for the fail-closed abort, ``attach`` for the terminal ``os.execvp``
+# process replacement — so the live ``commands.die`` / ``commands.os.execvp``
+# patch seams keep intercepting and a synthetic fake can pin the exact delivery.
+
+
+def deliver_mozyo_launch_outcome(
+    outcome: MozyoLaunchOutcome, ops: LaunchOps
+) -> int:
+    """Render a :class:`MozyoLaunchOutcome` to the terminal and attach.
+
+    Byte-for-byte the tail the ``cmd_mozyo`` handler carried: the single
+    ``--json`` block short-circuits; the non-JSON legacy notice prints before
+    the pre-attach block *and* before a late select-window ``die``, matching
+    the original ordering; the pre-attach block emits with ``end=""`` (it
+    carries its own trailing newline); ``--no-attach`` prints the attach hint
+    and returns; otherwise the port's ``attach`` replaces the process.
+    """
+
+    if outcome.json_stdout is not None:
+        ops.emit(outcome.json_stdout)
+        return 0
+    if outcome.notice:
+        ops.emit(outcome.notice)
+    if outcome.error_message is not None:
+        ops.die(outcome.error_message)
+    if outcome.pre_attach_text is not None:
+        ops.emit(outcome.pre_attach_text, end="")
+    if outcome.no_attach:
+        ops.emit(f"attach: {outcome.attach_command}")
+        return 0
+    ops.attach(list(outcome.attach_argv))
+    raise AssertionError("unreachable")  # pragma: no cover - attach never returns
+
+
+def deliver_layout_launch_outcome(
+    outcome: LayoutLaunchOutcome, ops: LaunchOps
+) -> int:
+    """Render a :class:`LayoutLaunchOutcome` to the terminal and attach.
+
+    Byte-for-byte the tail the ``cmd_layout_apply`` handler carried: a refusal
+    dies first; the ``--json`` / ``--dry-run`` blocks short-circuit without
+    attaching; the reuse-or-built pre-attach lines print before the
+    ``--no-attach`` hint or the terminal attach through the port.
+    """
+
+    if outcome.error_message is not None:
+        ops.die(outcome.error_message)
+    if outcome.json_stdout is not None:
+        ops.emit(outcome.json_stdout)
+        return 0
+    if outcome.dry_run_stdout is not None:
+        ops.emit(outcome.dry_run_stdout)
+        return 0
+    for line in outcome.pre_attach_lines:
+        ops.emit(line)
+    if outcome.no_attach:
+        ops.emit(f"attach: {outcome.attach_command}")
+        return 0
+    ops.attach(list(outcome.attach_argv))
+    raise AssertionError("unreachable")  # pragma: no cover - attach never returns
 
 
 # --- Agent window launch primitives (#12970) ---------------------------------
