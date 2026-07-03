@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_impact import (  # noqa: E402
+    DOCS_LANE,
     FALLBACK_FULL,
     FALLBACK_NEIGHBOR,
     NEIGHBOR_FALLBACK,
@@ -71,19 +72,59 @@ class ParseSourceTargetTest(unittest.TestCase):
         self.assertIsNone(target.epic)
         self.assertEqual(target.module_stem, "cli_handoff")
 
-    def test_init_module_is_other(self) -> None:
+    def test_epic_init_maps_to_its_own_epic_context(self) -> None:
+        # #13078: a package marker is an exports/wiring change and maps to its
+        # bounded context instead of falling out as "other" -> full.
         target = parse_source_target(
             "src/mozyo_bridge/e_110_execution_platform/__init__.py"
         )
-        self.assertEqual(target.kind, "other")
+        self.assertEqual(target.kind, "numbered_source")
+        self.assertEqual(target.epic, "e_110_execution_platform")
+        self.assertIsNone(target.feature)
+        self.assertEqual(target.module_stem, "e_110_execution_platform")
+
+    def test_package_init_maps_to_its_feature_context(self) -> None:
+        target = parse_source_target(
+            "src/mozyo_bridge/e_110_execution_platform/"
+            "f_140_delegated_coordinator_nested_handoff/domain/"
+            "presentation_pkg/__init__.py"
+        )
+        self.assertEqual(target.kind, "numbered_source")
+        self.assertEqual(target.epic, "e_110_execution_platform")
+        self.assertEqual(
+            target.feature, "f_140_delegated_coordinator_nested_handoff"
+        )
+        self.assertEqual(target.layer, "domain")
+        self.assertEqual(target.module_stem, "presentation_pkg")
+
+    def test_flat_init_is_flat_source_named_by_its_package(self) -> None:
+        # Outside the numbered layout there is no context to focus on; the flat
+        # handling fail-closes to full when no stem test exists.
+        target = parse_source_target("src/mozyo_bridge/application/__init__.py")
+        self.assertEqual(target.kind, "flat_source")
+        self.assertEqual(target.module_stem, "application")
+
+    def test_cataloged_docs_markdown_is_docs_kind(self) -> None:
+        # #13078: vibes/docs markdown belongs to the docs validation lane.
+        self.assertEqual(
+            parse_source_target("vibes/docs/specs/x.md").kind, "docs"
+        )
 
     def test_test_path_is_test_kind(self) -> None:
         target = parse_source_target("tests/unit/e_110_execution_platform/x/test_foo.py")
         self.assertEqual(target.kind, "test")
 
     def test_non_source_path_is_other(self) -> None:
-        self.assertEqual(parse_source_target("README.md").kind, "other")
-        self.assertEqual(parse_source_target("vibes/docs/specs/x.md").kind, "other")
+        # Distributed doc surfaces carry content-parity tests; they and any
+        # non-markdown path stay conservative ("other" -> full escalation).
+        for path in (
+            "README.md",
+            "skills/mozyo-bridge-agent/references/workflow.md",
+            ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
+            "vibes/docs/logics/notes.txt",
+            "pyproject.toml",
+        ):
+            self.assertEqual(parse_source_target(path).kind, "other", path)
 
 
 class ResolveNumberedTest(unittest.TestCase):
@@ -227,6 +268,112 @@ class ResolveOtherKindsTest(unittest.TestCase):
         self.assertEqual(res.fallback.kind, FALLBACK_FULL)
 
 
+class DocsLaneAndPackageInitTest(unittest.TestCase):
+    """#13078: docs-lane classification + package `__init__.py` context mapping.
+
+    The fail-closed contract (#12752 AC3) is unchanged — these specs pin that
+    the two refined path families stop escalating a typical governed diff to
+    full while true unknowns still do.
+    """
+
+    def test_docs_path_resolves_to_docs_lane_without_fallback(self) -> None:
+        plan = resolve_impact(
+            ["vibes/docs/logics/unit-target-model.md"], test_files=TEST_FILES
+        )
+        res = plan.resolutions[0]
+        self.assertEqual(res.status, DOCS_LANE)
+        self.assertIsNone(res.fallback)
+        self.assertEqual(res.direct_tests, ())
+        self.assertEqual(res.neighbor_tests, ())
+        self.assertFalse(plan.has_unmapped)
+
+    def test_mixed_governed_diff_stays_focused_with_docs_note(self) -> None:
+        # Acceptance (#13078 / j#71212): the typical governed diff — src +
+        # tests + vibes/docs (+ a package __init__) — keeps its focused test
+        # selection instead of escalating to full, and the docs-lane duty is
+        # surfaced machine-readably on the plan notes.
+        plan = resolve_impact(
+            [
+                "src/mozyo_bridge/e_110_execution_platform/"
+                "f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py",
+                "tests/unit/e_110_execution_platform/"
+                "f_140_delegated_coordinator_nested_handoff/test_delegation_route_planner.py",
+                "vibes/docs/logics/unit-target-model.md",
+                "src/mozyo_bridge/e_110_execution_platform/"
+                "f_140_delegated_coordinator_nested_handoff/__init__.py",
+            ],
+            test_files=TEST_FILES,
+        )
+        self.assertEqual(plan.recommendation, "selected")
+        self.assertTrue(plan.selected_tests)
+        self.assertTrue(any("docs lane" in note for note in plan.notes))
+
+    def test_feature_init_selects_the_feature_context_tests(self) -> None:
+        plan = resolve_impact(
+            [
+                "src/mozyo_bridge/e_110_execution_platform/"
+                "f_140_delegated_coordinator_nested_handoff/__init__.py"
+            ],
+            test_files=TEST_FILES,
+        )
+        res = plan.resolutions[0]
+        # No test_f_140_... stem test exists -> neighbor fallback over the
+        # feature's own tests, never an unmapped full escalation.
+        self.assertEqual(res.status, NEIGHBOR_FALLBACK)
+        self.assertEqual(plan.recommendation, "selected")
+        self.assertIn(
+            "tests/unit/e_110_execution_platform/"
+            "f_140_delegated_coordinator_nested_handoff/test_grandchild_dispatch.py",
+            plan.selected_tests,
+        )
+        self.assertNotIn(
+            "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff.py",
+            plan.selected_tests,
+        )
+
+    def test_epic_init_selects_the_epic_context_tests(self) -> None:
+        plan = resolve_impact(
+            ["src/mozyo_bridge/e_110_execution_platform/__init__.py"],
+            test_files=TEST_FILES,
+        )
+        res = plan.resolutions[0]
+        self.assertEqual(res.status, NEIGHBOR_FALLBACK)
+        self.assertEqual(plan.recommendation, "selected")
+        self.assertIn(
+            "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff.py",
+            plan.selected_tests,
+        )
+
+    def test_flat_init_without_stem_test_stays_full(self) -> None:
+        # 分類不能 -> 従来どおり full (j#71212): a flat package marker has no
+        # bounded context and no stem test -> unmapped full escalation.
+        plan = resolve_impact(
+            ["src/mozyo_bridge/application/__init__.py"], test_files=TEST_FILES
+        )
+        self.assertEqual(plan.resolutions[0].status, UNMAPPED)
+        self.assertEqual(plan.recommendation, "full")
+
+    def test_unknown_context_init_stays_full(self) -> None:
+        plan = resolve_impact(
+            ["src/mozyo_bridge/e_999_new_context/f_110_new_feature/__init__.py"],
+            test_files=TEST_FILES,
+        )
+        self.assertEqual(plan.resolutions[0].status, UNMAPPED)
+        self.assertEqual(plan.recommendation, "full")
+
+    def test_non_docs_markdown_still_escalates_to_full(self) -> None:
+        plan = resolve_impact(
+            [
+                "src/mozyo_bridge/e_110_execution_platform/"
+                "f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py",
+                "skills/mozyo-bridge-agent/references/workflow.md",
+            ],
+            test_files=TEST_FILES,
+        )
+        self.assertTrue(plan.has_unmapped)
+        self.assertEqual(plan.recommendation, "full")
+
+
 class AggregatePlanTest(unittest.TestCase):
     def test_any_unmapped_escalates_whole_plan_to_full(self) -> None:
         plan = resolve_impact(
@@ -262,13 +409,16 @@ class AggregatePlanTest(unittest.TestCase):
     def test_empty_selection_backstops_to_full(self) -> None:
         # Defense-in-depth: even if some resolution path produced an empty
         # selection while looking "mappable", the aggregate never returns
-        # selected with nothing to run.
+        # selected with nothing to run. A docs-only change set is the concrete
+        # post-#13078 case: DOCS_LANE selects no tests, so the plan escalates
+        # to full (the docs-parity tests live there) rather than selected+[].
         plan = resolve_impact(
-            ["src/mozyo_bridge/e_110_execution_platform/__init__.py"],
+            ["vibes/docs/logics/unit-target-model.md"],
             test_files=TEST_FILES,
         )
-        # __init__ is "other" -> unmapped -> full (covered), but assert the
-        # aggregate never yields selected+empty.
+        self.assertEqual(plan.recommendation, "full")
+        self.assertEqual(plan.selected_tests, ())
+        self.assertIn("only documentation paths changed", plan.fallback.reason)
         self.assertFalse(
             plan.recommendation == "selected" and not plan.selected_tests
         )

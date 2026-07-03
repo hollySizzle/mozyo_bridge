@@ -21,6 +21,13 @@ machine-readable ``kind`` (``neighbor`` / ``full``) and a human reason, and the
 aggregate :class:`ImpactPlan` escalates its recommendation to the full suite the
 moment any changed path is unmapped.
 
+Redmine #13078 refines the classification without relaxing that contract: a
+cataloged documentation path (``vibes/docs/**/*.md``) resolves to the *docs
+validation lane* (:data:`DOCS_LANE`) instead of escalating the test suite, and
+a package ``__init__.py`` maps to its bounded context (an exports/wiring change
+runs the package's tests) instead of being unmapped. True unknowns — other doc
+surfaces, config/build/CI files, non-layout sources — still escalate to full.
+
 This module is pure: :func:`resolve_impact` takes the changed paths plus the
 already-listed test files and computes a plan with no I/O. :func:`list_test_files`
 is the only filesystem read, and :func:`resolve_impact_for_repo` wires the two
@@ -49,11 +56,19 @@ RESOLVED = "resolved"  # bounded context known, at least one direct test found
 NEIGHBOR_FALLBACK = "neighbor_fallback"  # context known, no direct test
 STEM_RESOLVED = "stem_resolved"  # non-numbered source, matched by file stem only
 TEST_CHANGED = "test_changed"  # the changed path is itself a test file
+DOCS_LANE = "docs_lane"  # documentation path -> docs validation lane (#13078)
 UNMAPPED = "unmapped"  # cannot be mapped to any test -> full-suite fallback
 
 # Fallback kinds (machine-readable; never fail-open).
 FALLBACK_NEIGHBOR = "neighbor"
 FALLBACK_FULL = "full"
+
+#: Documentation trees whose changes are verified by the docs lane
+#: (``mozyo-bridge docs validate`` / ``docs audit-impact``), not by escalating
+#: the TEST suite to full (Redmine #13078). Deliberately narrow: distributed
+#: doc surfaces (``skills/**``, ``plugins/**``, ``.mozyo-bridge/rules/**``,
+#: ``README.md``) carry content-parity tests, so they stay full-escalating.
+_DOCS_LANE_PREFIXES: tuple[str, ...] = ("vibes/docs/",)
 
 
 def _to_posix(path: str) -> str:
@@ -165,13 +180,48 @@ def parse_source_target(path: str) -> SourceTarget:
     if posix.startswith(f"{TESTS_ROOT}/") and Path(posix).name.startswith("test_"):
         return SourceTarget(path=posix, kind="test", module_stem=Path(posix).stem)
 
+    if posix.endswith(".md") and posix.startswith(_DOCS_LANE_PREFIXES):
+        # Cataloged documentation: its verification lane is the docs tooling,
+        # never a full test-suite escalation (#13078). The classification is
+        # prefix-narrow so any other doc surface stays conservative.
+        return SourceTarget(path=posix, kind="docs")
+
     if posix.startswith(SRC_PREFIX) and posix.endswith(".py"):
         rel = posix[len(SRC_PREFIX) :]
         parts = rel.split("/")
         name = parts[-1]
         if name == "__init__.py":
-            # Package markers carry no module-level tests of their own.
-            return SourceTarget(path=posix, kind="other")
+            # A package-marker change is an exports/wiring change: map it to
+            # its package's bounded context (the affected import/export
+            # surface) instead of escalating to full (#13078). Outside the
+            # numbered layout no context can be derived, so it falls through
+            # to the flat handling, which fail-closes to full when no stem
+            # test exists.
+            pkg_parts = parts[:-1]
+            pkg_stem = pkg_parts[-1] if pkg_parts else "mozyo_bridge"
+            epic = (
+                pkg_parts[0]
+                if pkg_parts and _EPIC_RE.match(pkg_parts[0])
+                else None
+            )
+            if epic is None:
+                return SourceTarget(
+                    path=posix, kind="flat_source", module_stem=pkg_stem
+                )
+            feature = (
+                pkg_parts[1]
+                if len(pkg_parts) >= 2 and _FEATURE_RE.match(pkg_parts[1])
+                else None
+            )
+            layer = next((p for p in pkg_parts if p in _DDD_LAYERS), None)
+            return SourceTarget(
+                path=posix,
+                kind="numbered_source",
+                epic=epic,
+                feature=feature,
+                layer=layer,
+                module_stem=pkg_stem,
+            )
         stem = Path(name).stem
         epic = parts[0] if parts and _EPIC_RE.match(parts[0]) else None
         feature = None
@@ -355,6 +405,19 @@ def _resolve_one(target: SourceTarget, test_files: tuple[str, ...]) -> TestImpac
             direct_tests=(target.path,),
             notes=("changed path is a test module",),
         )
+    if target.kind == "docs":
+        # Cataloged documentation is verified by the docs lane, not by the test
+        # suite (#13078): it selects no tests and never escalates the plan to
+        # full by itself. The aggregate plan surfaces the docs-lane commands.
+        return TestImpact(
+            path=target.path,
+            status=DOCS_LANE,
+            notes=(
+                "documentation path; verify via the docs lane "
+                "(mozyo-bridge docs validate / docs audit-impact), not by "
+                "escalating the test suite",
+            ),
+        )
     if target.kind == "numbered_source":
         return _resolve_numbered(target, test_files)
     if target.kind == "flat_source":
@@ -405,6 +468,18 @@ def resolve_impact(paths: list[str], *, test_files: tuple[str, ...]) -> ImpactPl
             notes=("empty change set",),
         )
 
+    # Docs-lane paths never escalate the test plan by themselves, but their
+    # verification duty must not go silent (#13078): the plan carries the
+    # docs-lane commands as a machine-readable note.
+    docs_lane = [r.path for r in resolutions if r.status == DOCS_LANE]
+    notes: list[str] = []
+    if docs_lane:
+        notes.append(
+            "docs-lane path(s) changed; also run the docs lane: "
+            "`mozyo-bridge docs validate --repo .` and "
+            "`mozyo-bridge docs audit-impact --staged --check-generated`"
+        )
+
     unmapped = [r.path for r in resolutions if r.status == UNMAPPED]
     if unmapped:
         reason = (
@@ -416,28 +491,41 @@ def resolve_impact(paths: list[str], *, test_files: tuple[str, ...]) -> ImpactPl
             selected_tests=tuple(selected),
             recommendation="full",
             fallback=Fallback(kind=FALLBACK_FULL, reason=reason, roots=(TESTS_ROOT,)),
+            notes=tuple(notes),
         )
 
     # Backstop: if the focused resolution somehow yields nothing runnable, never
     # report "selected" with an empty set (which a runner reads as fail-open).
-    # Escalate to the full suite instead.
+    # Escalate to the full suite instead. A docs-only change set lands here
+    # deliberately: the docs lane verifies the content, and the full suite (the
+    # docs-parity tests live there) stays the fail-closed test-side backstop.
     if not selected:
+        docs_only = bool(docs_lane) and len(docs_lane) == len(resolutions)
+        reason = (
+            "only documentation paths changed; no focused test targets — run "
+            "the docs lane, with the full suite (docs-parity tests) as the "
+            "fail-closed backstop"
+            if docs_only
+            else "focused resolution produced no runnable test targets; "
+            "escalating to full suite"
+        )
         return ImpactPlan(
             resolutions=resolutions,
             selected_tests=(),
             recommendation="full",
             fallback=Fallback(
                 kind=FALLBACK_FULL,
-                reason="focused resolution produced no runnable test targets; "
-                "escalating to full suite",
+                reason=reason,
                 roots=(TESTS_ROOT,),
             ),
+            notes=tuple(notes),
         )
 
     return ImpactPlan(
         resolutions=resolutions,
         selected_tests=tuple(selected),
         recommendation="selected",
+        notes=tuple(notes),
     )
 
 
