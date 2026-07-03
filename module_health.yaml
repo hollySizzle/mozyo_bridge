@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3477
+    lines: 3392
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -864,6 +864,25 @@ allowlist:
       seams importable, and the relocated ``cmd_doctor`` resolves them through
       this module's globals at call time. 3507 -> 3477 is a 30-line net removal
       and the post-merge ``commands.py`` line count is 3477.
+      Lowered 3477 -> 3392 for the #13123 handoff delivery record facade
+      cleanup: the delivery-record output/persistence helper tail
+      (``_emit_outcome`` / ``_submit_lines_for`` / ``_record_format_from_args``
+      / ``_record_command_from_args`` / ``_emit_receipt`` /
+      ``_maybe_persist_delivery_record``) moved bodily into the #12981
+      ``application/handoff_delivery_command.py`` boundary: pure
+      ``submit_lines_for`` / ``record_command_from_args`` args projections, a
+      ``DeliveryRecordUseCase.record_format_from_args`` validation whose
+      ``die`` stays behind the port (routed through ``commands.die`` at call
+      time), and ``deliver_outcome`` / ``deliver_receipt`` /
+      ``record_format_from_args`` / ``maybe_persist_delivery_record`` live
+      composition roots. ``commands.py`` re-exports the six historical
+      ``_``-prefixed names so the ``orchestrate_handoff`` terminal paths (and
+      the ``emit=`` callback into the f_140 gateway-route gate) are unchanged;
+      the now-unused ``RECORD_FORMAT_BOTH`` / ``RECORD_FORMATS`` /
+      ``submit_record_lines`` imports were dropped. 3477 -> 3392 is an 85-line
+      net removal and the post-carve ``commands.py`` line count is 3392.
+      ``test_handoff_delivery_command`` adds the args-projection /
+      record-format-validation / re-export-identity specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -22,9 +22,23 @@ from mozyo_bridge.application.pane_primitive_command import (
     PanePrimitiveOutcome,
     PanePrimitiveUseCase,
 )
-from mozyo_bridge.application.handoff_delivery_command import (
+# The handoff delivery-record output/persistence seams moved bodily into the
+# ``handoff_delivery_command`` boundary (#13123, after the #12981 body carve);
+# they are re-exported under the historical ``_``-prefixed names so the
+# ``orchestrate_handoff`` call sites (including the ``emit=`` callback handed to
+# the f_140 gateway-route gate) and any ``commands.*`` importer are unchanged.
+# ``_emit_receipt`` has no remaining caller here (the receipt is emitted inside
+# ``DeliveryRecordUseCase.maybe_persist``) and is kept importable for
+# compatibility only.
+from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     DeliveryRecordUseCase,
     LiveDeliveryRecordOps,
+    deliver_outcome as _emit_outcome,
+    deliver_receipt as _emit_receipt,
+    maybe_persist_delivery_record as _maybe_persist_delivery_record,
+    record_command_from_args as _record_command_from_args,
+    record_format_from_args as _record_format_from_args,
+    submit_lines_for as _submit_lines_for,
 )
 from mozyo_bridge.application.commands_common import (
     config_path_from_args,
@@ -91,8 +105,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     MODES,
     QueueEnterRetryOutcome,
     RECEIVERS,
-    RECORD_FORMAT_BOTH,
-    RECORD_FORMATS,
     SOURCES,
     SOURCE_TICKETLESS,
     TargetActivationOutcome,
@@ -135,9 +147,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
     TicketlessWorkIntake,
     TicketlessWorkIntakeError,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
-    submit_record_lines,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -1722,107 +1731,13 @@ def cmd_notify_claude_legacy_task(args: argparse.Namespace) -> int:
     return _notify_command_use_case().run_claude_legacy_task(args)
 
 
-def _emit_outcome(
-    outcome,
-    *,
-    record_format: str = RECORD_FORMAT_BOTH,
-    command: str | None = None,
-    recovery_command: str | None = None,
-    duplicate_lane_panes: list[str] | None = None,
-    role_profile_contract: str | None = None,
-    retry: QueueEnterRetryOutcome | None = None,
-    activation: TargetActivationOutcome | None = None,
-    submit_lines: list[str] | None = None,
-) -> None:
-    """Thin seam over :meth:`DeliveryRecordUseCase.emit_outcome` (#12981).
-
-    Kept module-level with the identical signature because ``orchestrate_handoff``
-    calls it on every terminal path and passes it as the ``emit=`` callback to the
-    gateway-route gate; the body moved to
-    ``application/handoff_delivery_command.py``.
-    """
-    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_outcome(
-        outcome,
-        record_format=record_format,
-        command=command,
-        recovery_command=recovery_command,
-        duplicate_lane_panes=duplicate_lane_panes,
-        role_profile_contract=role_profile_contract,
-        retry=retry,
-        activation=activation,
-        submit_lines=submit_lines,
-    )
-
-
-def _submit_lines_for(args: argparse.Namespace, outcome) -> list[str] | None:
-    """Build the additive q-enter `- Submit:` telemetry lines, or None.
-
-    Redmine #12705: only the LLM-facing q-enter front door sets
-    ``args.submit_intent`` (+ the deterministic ``args.submit_delivery_id`` it
-    already printed in its own envelope), so a normal `handoff send` / `reply`
-    has no submit telemetry and its record is byte-identical. The composer-residue
-    classification is a pure projection of the transport ``(status, reason)``, so
-    it cannot drift from the rail's own marker/rollback decision.
-    """
-    intent = getattr(args, "submit_intent", None)
-    if not intent:
-        return None
-    delivery_id = getattr(args, "submit_delivery_id", None) or "—"
-    return submit_record_lines(
-        status=outcome.status,
-        reason=outcome.reason,
-        intent=intent,
-        delivery_id=delivery_id,
-    )
-
-
-def _record_format_from_args(args: argparse.Namespace) -> str:
-    raw = getattr(args, "record_format", None) or RECORD_FORMAT_BOTH
-    if raw not in RECORD_FORMATS:
-        die(f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {raw!r}")
-    return raw
-
-
-def _record_command_from_args(args: argparse.Namespace) -> str | None:
-    command = getattr(args, "record_command", None)
-    if command:
-        return str(command)
-    return None
-
-
-def _emit_receipt(receipt, *, record_format: str) -> None:
-    """Thin seam over :meth:`DeliveryRecordUseCase.emit_receipt` (#12981)."""
-    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_receipt(
-        receipt, record_format=record_format
-    )
-
-
-def _maybe_persist_delivery_record(
-    args: argparse.Namespace,
-    outcome,
-    *,
-    duplicate_lane_panes: list[str] | None,
-    record_format: str,
-    retry: QueueEnterRetryOutcome | None = None,
-    activation: TargetActivationOutcome | None = None,
-) -> None:
-    """Thin seam over :meth:`DeliveryRecordUseCase.maybe_persist` (#12981).
-
-    The opt-in ``--persist-delivery`` durable persistence wiring (Redmine #12311 /
-    #12347) — build the note, pick the credential-safe live Redmine transport by
-    source, resolve the sink, persist, and emit the receipt — moved to
-    ``application/handoff_delivery_command.py``; the live transport / sink
-    resolution now flows through the injected port. Kept module-level because
-    ``orchestrate_handoff`` calls it on the typed terminal paths.
-    """
-    DeliveryRecordUseCase(LiveDeliveryRecordOps()).maybe_persist(
-        args,
-        outcome,
-        duplicate_lane_panes=duplicate_lane_panes,
-        record_format=record_format,
-        retry=retry,
-        activation=activation,
-    )
+# The delivery-record output/persistence helper tail (``_emit_outcome`` /
+# ``_submit_lines_for`` / ``_record_format_from_args`` /
+# ``_record_command_from_args`` / ``_emit_receipt`` /
+# ``_maybe_persist_delivery_record``) moved bodily into the
+# ``handoff_delivery_command`` boundary (#13123) and is re-exported at the top of
+# this module, so the ``orchestrate_handoff`` terminal paths below keep calling
+# the historical names unchanged.
 
 
 def _window_active_pane_id(target_info: dict) -> str | None:

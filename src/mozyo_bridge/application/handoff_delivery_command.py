@@ -46,6 +46,22 @@ constants / ``SOURCE_REDMINE``) are imported directly from the handoff domain,
 exactly as ``commands.py`` did. This is a behavior-preserving restructuring: the
 stdout record block, the JSON outcome line, the persistence receipt, and the
 stderr marker-timeout trailer are byte-for-byte identical to the original bodies.
+
+The #13123 facade cleanup moved the remaining ``commands.py`` delivery-record
+helper tail bodily into this boundary:
+
+- the pure args projections :func:`submit_lines_for` /
+  :func:`record_command_from_args`,
+- the args validation :meth:`DeliveryRecordUseCase.record_format_from_args`
+  (``die`` stays behind the port so a bad ``--record-format`` fails exactly as
+  before),
+- and the live composition roots :func:`deliver_outcome` /
+  :func:`deliver_receipt` / :func:`maybe_persist_delivery_record` /
+  :func:`record_format_from_args` that construct the use case over
+  :class:`LiveDeliveryRecordOps` per call, exactly as the ``commands`` seams did.
+
+``commands.py`` re-exports them under the historical ``_``-prefixed names so
+``orchestrate_handoff`` call sites and any ``commands.*`` importer are unchanged.
 """
 
 from __future__ import annotations
@@ -68,6 +84,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery
     DeliveryReceipt,
     PERSIST_TRANSPORT_ERROR,
     build_delivery_record_note,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
+    submit_record_lines,
 )
 
 if TYPE_CHECKING:  # avoid importing argparse on the hot path
@@ -111,6 +130,36 @@ def marker_timeout_guidance_lines(receiver: str, retry_budget: int) -> List[str]
             "error verbatim in the durable record before escalating."
         ),
     ]
+
+
+def submit_lines_for(args: "argparse.Namespace", outcome) -> List[str] | None:
+    """Build the additive q-enter `- Submit:` telemetry lines, or None.
+
+    Redmine #12705: only the LLM-facing q-enter front door sets
+    ``args.submit_intent`` (+ the deterministic ``args.submit_delivery_id`` it
+    already printed in its own envelope), so a normal `handoff send` / `reply`
+    has no submit telemetry and its record is byte-identical. The composer-residue
+    classification is a pure projection of the transport ``(status, reason)``, so
+    it cannot drift from the rail's own marker/rollback decision.
+    """
+    intent = getattr(args, "submit_intent", None)
+    if not intent:
+        return None
+    delivery_id = getattr(args, "submit_delivery_id", None) or "—"
+    return submit_record_lines(
+        status=outcome.status,
+        reason=outcome.reason,
+        intent=intent,
+        delivery_id=delivery_id,
+    )
+
+
+def record_command_from_args(args: "argparse.Namespace") -> str | None:
+    """The user-supplied free-text ``--record-command``, or ``None``."""
+    command = getattr(args, "record_command", None)
+    if command:
+        return str(command)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +211,20 @@ class DeliveryRecordUseCase:
 
     def __init__(self, ops: DeliveryRecordOps) -> None:
         self._ops = ops
+
+    def record_format_from_args(self, args: "argparse.Namespace") -> str:
+        """Resolve ``--record-format`` from ``args``, failing closed on a bad value.
+
+        Defaults to ``both`` when the flag is absent; an out-of-set value routes
+        through the port's ``die`` so the CLI error is identical to the original
+        ``commands`` body.
+        """
+        raw = getattr(args, "record_format", None) or RECORD_FORMAT_BOTH
+        if raw not in RECORD_FORMATS:
+            self._ops.die(
+                f"--record-format must be one of {sorted(RECORD_FORMATS)}; got {raw!r}"
+            )
+        return raw
 
     def emit_outcome(
         self,
@@ -368,3 +431,89 @@ class LiveDeliveryRecordOps:
             source=source,
             redmine_transport=redmine_transport,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Live composition roots (#13123)
+# --------------------------------------------------------------------------- #
+#
+# The ``commands.py`` delivery-record seams were one-line constructions of
+# :class:`DeliveryRecordUseCase` over :class:`LiveDeliveryRecordOps`; they moved
+# here bodily so the boundary owns its own composition. ``commands.py``
+# re-exports them under the historical ``_``-prefixed names (``_emit_outcome`` /
+# ``_emit_receipt`` / ``_maybe_persist_delivery_record`` /
+# ``_record_format_from_args``), so every ``orchestrate_handoff`` terminal path —
+# including the ``emit=`` callback handed to the f_140 gateway-route gate — and
+# any ``commands.*`` importer are unchanged. The use case is constructed per
+# call, exactly as the original seams did.
+
+
+def deliver_outcome(
+    outcome,
+    *,
+    record_format: str = RECORD_FORMAT_BOTH,
+    command: str | None = None,
+    recovery_command: str | None = None,
+    duplicate_lane_panes: list[str] | None = None,
+    role_profile_contract: str | None = None,
+    retry: QueueEnterRetryOutcome | None = None,
+    activation: TargetActivationOutcome | None = None,
+    submit_lines: list[str] | None = None,
+) -> None:
+    """Live :meth:`DeliveryRecordUseCase.emit_outcome` (was ``commands._emit_outcome``)."""
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_outcome(
+        outcome,
+        record_format=record_format,
+        command=command,
+        recovery_command=recovery_command,
+        duplicate_lane_panes=duplicate_lane_panes,
+        role_profile_contract=role_profile_contract,
+        retry=retry,
+        activation=activation,
+        submit_lines=submit_lines,
+    )
+
+
+def deliver_receipt(receipt, *, record_format: str) -> None:
+    """Live :meth:`DeliveryRecordUseCase.emit_receipt` (was ``commands._emit_receipt``)."""
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_receipt(
+        receipt, record_format=record_format
+    )
+
+
+def record_format_from_args(args: "argparse.Namespace") -> str:
+    """Live :meth:`DeliveryRecordUseCase.record_format_from_args`.
+
+    ``die`` routes through :class:`LiveDeliveryRecordOps` — i.e. through the
+    ``commands`` module at call time — so a monkeypatched ``commands.die`` still
+    intercepts a bad ``--record-format`` exactly as before.
+    """
+    return DeliveryRecordUseCase(LiveDeliveryRecordOps()).record_format_from_args(args)
+
+
+def maybe_persist_delivery_record(
+    args: "argparse.Namespace",
+    outcome,
+    *,
+    duplicate_lane_panes: list[str] | None,
+    record_format: str,
+    retry: QueueEnterRetryOutcome | None = None,
+    activation: TargetActivationOutcome | None = None,
+) -> None:
+    """Live :meth:`DeliveryRecordUseCase.maybe_persist`.
+
+    The opt-in ``--persist-delivery`` durable persistence wiring (Redmine #12311 /
+    #12347) — build the note, pick the credential-safe live Redmine transport by
+    source, resolve the sink, persist, and emit the receipt — with the live
+    transport / sink resolution flowing through the injected port. Called by
+    ``orchestrate_handoff`` on the typed terminal paths (was
+    ``commands._maybe_persist_delivery_record``).
+    """
+    DeliveryRecordUseCase(LiveDeliveryRecordOps()).maybe_persist(
+        args,
+        outcome,
+        duplicate_lane_panes=duplicate_lane_panes,
+        record_format=record_format,
+        retry=retry,
+        activation=activation,
+    )
