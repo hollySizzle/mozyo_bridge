@@ -119,7 +119,7 @@ escalation trigger 一覧 (実装者 Claude がユーザー窓口 Codex へ esca
 - Feature は Epic 配下の継続的な機能カテゴリを表す。例: `Redmine 統治プリセット`, `Workspace 横断セッション管理`, `VS Code Agent Pane PoC`。
 - UserStory は実際に受け入れ条件を持ち、review / owner close approval / close の対象になる完了単位である。
 - Task / Test / Bug は UserStory の実装・検証・不具合対応の内訳であり、replayable journal と commit / validation record が揃えば close する。
-- Version は release / milestone の完了管理に使う。Epic / Feature の close で release 完了を表現しない。
+- Redmine Version は release / milestone の完了管理に使う。Epic / Feature の close で release 完了を表現しない。
 - Version は、関連 issue が複数 Feature / UserStory に分かれる場合の roadmap の候補範囲 (grouping surface) でもある。同じ stabilization、UX 改善、dogfooding batch、acceptance batch に属する work package は、親子関係を無理に寄せず同じ Version に割り当てて束ねてもよい。Version は親子関係の代替でも、active lane-set の正本でもなく、進捗・残 scope・release readiness を横断して見るための planning axis である。
 - Redmine Version / issue `fixed_version` は実行レーン配置の source of truth ではない。標準の実行・dispatch 単位は UserStory (`1US=1作業単位`; granularity は `epic|feature|user_story|leaf_issue` の設定 enum、正本は `vibes/docs/specs/work-unit-granularity-config.md`)、受け入れ単位も UserStory、active lane-set は coordinator が Redmine journal、branch ancestry、changed paths、merge state、owner / release gate、live callback state から都度決める。`leaf_issue` 単位の dispatch は central preset の `us_level_audit.task_level例外` に該当する場合の例外、`epic` / `feature` は explicit owner/operator decision なしに implementation dispatch しない。
 - coordinator は `fixed_version` で候補を絞ってよいが、Version が同じことを理由に直列化したり、Version が違うことを理由に無条件で並列化したりしない。dispatch / hold の理由は concrete conflict cost、dependency、gate、integration backlog、callback / review / close drain のいずれかとして durable record に残す。

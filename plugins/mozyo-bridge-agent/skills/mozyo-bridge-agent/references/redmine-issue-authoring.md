@@ -50,19 +50,24 @@ Redmine Version の役割は 2 語で書き分ける。
 
 本 doc および過去記述で使う「lane-inventory bucket」「Version-as-inventory」「(roadmap / milestone / acceptance の) grouping surface」等の表現は、すべて **候補範囲** の言い換えである (規範は同一で呼称のみ異なる)。歴史記述・既存 journal を遡及的に書き換えない。
 
-**裸の「バージョン」を使わない。** workflow docs / journal / narrative では **Redmine Version** / **release tag** / **package version** のいずれかを常に修飾して書く。裸の「バージョン」「Version」単独は Redmine Version・package release 番号・tag のいずれとも読めて誤読を生むため、散文では使わない (code 識別子・CLI 名・field 名・既存 journal の引用は literal のまま維持する)。
+**裸の「バージョン」を使わない。** workflow docs / journal / narrative では **Redmine Version** / **release tag** / **package version** のいずれかを常に修飾して書く。裸の「バージョン」「Version」単独は Redmine Version・package release 番号・tag のいずれとも読めて誤読を生むためである。
+
+- **節・段落の初出で修飾すれば以後は省略してよい** (`references/workflow.md` の narrative issue 参照規則 `#<id> <短い概要>` と同型)。ある節・段落の初出で `Redmine Version` と明示すれば、同一節・段落内の後続の `Version` 単独は、その節・段落の主題である Redmine Version の省略として許容する。節・段落・turn をまたいだら再度修飾する。
+- **常時修飾が必要な文脈** (省略規定を適用しない): release tag / package version と併記・対比される箇所、文書をまたぐ参照、journal / narrative の単発言及 — 読み手が節の主題文脈を持たない場所。ここでは初出省略に頼らず毎回修飾する。
+- **literal 除外**: code 識別子 / CLI 名 / field 名 / 既存 journal 引用は現行どおり literal を保ち、本規律の対象外。
+- **適用範囲は非遡及。** 既存文書の全量遡及書き換えは行わない。本規律は新規・変更する規範文から適用する (歴史記述・既存 journal の非遡及と同じ思想)。
 
 Redmine Version は **planning / release-readiness / lane-inventory bucket (= 候補範囲)** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される version 番号の正本は tag / package metadata / release notes / release journal であり、Version 名に将来の package 番号を先入れしない。
 
 サイズと lifecycle:
 
-- **1 Version は概ね 10〜20 UserStory を目安とする。** 小さすぎる Version は sublane のチケット在庫を枯らし、大きすぎる Version は readiness window として機能しなくなる。その兆候で分割・統合する。
+- **1 Redmine Version は概ね 10〜20 UserStory を目安とする。** 小さすぎる Version は sublane のチケット在庫を枯らし、大きすぎる Version は readiness window として機能しなくなる。その兆候で分割・統合する。
 - **Version は候補がある状態で作り、先回りして作らない。** 空の Version を placeholder として先行作成しない。埋めるべき候補 US が存在するときに作成・選択する。
 - **follow-up は関連する既存 Version を優先する。** follow-up US はテーマを継続する Version に入れる。follow-up の波ごとに新規 Version を乱造しない。
 
 dispatch 候補の選定:
 
-1. **current Version 内の ready UserStory を優先する** — Version-as-inventory model の目的そのものである。
+1. **current Redmine Version 内の ready UserStory を優先する** — Version-as-inventory model の目的そのものである。
 2. current Version の ready 在庫が枯れたときのみ、関連 Feature 配下の US または隣接する (テーマ継続の) Version から補充し、**補充理由を dispatch decision journal に残す**。
 3. Version 所属は durable-record gate を上書きしない: US が dispatch 可能なのは record が ready だからであり、どの bucket にいるかではない。Version が同じ / 違うこと自体は直列化・並列化いずれの理由にもならない。
 
