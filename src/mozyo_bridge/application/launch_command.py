@@ -64,6 +64,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     InvalidPermissionMode,
     permission_mode_flag,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_model_policy import (
+    InvalidClaudeModel,
+    claude_model_flag,
+)
 
 
 # --- Pure policy: attach form, window parsing, payload / text rendering. -------
@@ -716,12 +720,29 @@ def _claude_permission_mode_flag(
         commands.die(str(exc))
 
 
+def _claude_model_flag(agent: str, model: str | None) -> str:
+    """`` --model <token>`` suffix for a managed Claude pane, or ``""``.
+
+    Delegates to the pure policy resolver (Codex / ``None`` render nothing;
+    a Claude pane with a valid token renders the flag) and turns an invalid
+    token into a hard CLI error so a typo / injection cannot silently reach —
+    or corrupt — the launch command (#13155).
+    """
+    from mozyo_bridge.application import commands
+
+    try:
+        return claude_model_flag(agent, model)
+    except InvalidClaudeModel as exc:
+        commands.die(str(exc))
+
+
 def _agent_launch_command(
     agent: str,
     session: str,
     cwd: str | None,
     *,
     permission_mode_default: str | None = None,
+    claude_model: str | None = None,
 ) -> str:
     """The shell command tmux runs for a new agent pane, with OTel env.
 
@@ -729,6 +750,11 @@ def _agent_launch_command(
     Claude permission mode (cockpit / sublane pass ``auto``; the standalone
     path passes ``None`` to preserve the historical bare ``claude`` launch).
     The ``MOZYO_CLAUDE_PERMISSION_MODE`` env var still overrides it.
+
+    ``claude_model`` (#13155) is the repo-configured Claude launch model token;
+    when set for a Claude pane it appends ``--model <token>`` after the
+    permission-mode flag. ``None`` (the default) appends nothing, so an
+    unconfigured launch is byte-for-byte the historical command.
     """
     from mozyo_bridge.application import commands
 
@@ -741,6 +767,7 @@ def _agent_launch_command(
     return (
         f"env {env_pairs} {AGENT_COMMANDS[agent]}"
         f"{_claude_permission_mode_flag(agent, policy_default=permission_mode_default)}"
+        f"{_claude_model_flag(agent, claude_model)}"
     )
 
 

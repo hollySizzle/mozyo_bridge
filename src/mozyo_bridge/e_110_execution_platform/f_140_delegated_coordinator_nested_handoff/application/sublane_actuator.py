@@ -185,7 +185,14 @@ class LiveSublaneActuatorOps:
         return int(args.func(args))
 
     def append_lane_column(self, worktree_path: str) -> None:
-        rc = self._drive_cli(["cockpit", "append", "--repo", worktree_path, "--no-attach"])
+        # #13155: append the repo-configured Claude launch model when set (else historical argv).
+        from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+
+        argv = ["cockpit", "append", "--repo", worktree_path, "--no-attach"]
+        model = load_repo_local_config(worktree_path).agent_launch.sublane_claude_model
+        if model:
+            argv += ["--claude-model", model]
+        rc = self._drive_cli(argv)
         if rc != 0:
             raise RuntimeError(
                 f"cockpit append failed for worktree {worktree_path!r} (exit {rc})"

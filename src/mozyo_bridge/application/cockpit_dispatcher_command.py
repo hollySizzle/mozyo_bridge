@@ -430,7 +430,7 @@ class CockpitLaunchFlowOps(Protocol):
 
     def resolve_workspace_lane(self, repo_root: str, workspace_id: Any) -> Any: ...
 
-    def agent_launch_command(self, role: str, session: str, repo_root: str) -> str: ...
+    def agent_launch_command(self, role: str, session: str, repo_root: str, *, claude_model: str | None = None) -> str: ...  # noqa: E501
 
     def require_tmux(self) -> None: ...
 
@@ -569,13 +569,12 @@ class LiveCockpitLaunchFlowOps:
     def resolve_workspace_lane(self, repo_root: str, workspace_id: Any) -> Any:
         return self._commands()._resolve_workspace_lane(repo_root, workspace_id)
 
-    def agent_launch_command(self, role: str, session: str, repo_root: str) -> str:
-        # Cockpit / sublane append: same reproducible auto policy (#11925).
+    def agent_launch_command(self, role: str, session: str, repo_root: str, *, claude_model: str | None = None) -> str:  # noqa: E501
+        # Cockpit / sublane append: reproducible auto (#11925) + optional model (#13155).
         return self._commands()._agent_launch_command(
-            role,
-            session,
-            repo_root,
+            role, session, repo_root,
             permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+            claude_model=claude_model,
         )
 
     def require_tmux(self) -> None:
@@ -704,6 +703,7 @@ class CockpitDispatchUseCase:
         reset_mode = route == ROUTE_RESET
         inspect_only = dry_run or json_output
         no_attach = bool(getattr(args, "no_attach", False))
+        claude_model = getattr(args, "claude_model", None)  # #13155; None = historical cmd
 
         repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
         cwd_root = str(Path(repo).expanduser().resolve())
@@ -732,7 +732,7 @@ class CockpitDispatchUseCase:
         )
 
         def launch(role: str, ws: Any) -> str:
-            return self._ops.agent_launch_command(role, session, ws.repo_root)
+            return self._ops.agent_launch_command(role, session, ws.repo_root, claude_model=claude_model)  # noqa: E501
 
         # Read-only state read drives the create/append/focus decision.
         # `--dry-run` / `--json` only read (never mutate) — the column read /

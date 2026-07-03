@@ -9,3 +9,5 @@ presentation:
       - when:
           repo_label: mozyo-giken-3800-mozyo-bridge
         group_id: project:mozyo_bridge
+agent_launch:
+  sublane_claude_model: claude-opus-4-8

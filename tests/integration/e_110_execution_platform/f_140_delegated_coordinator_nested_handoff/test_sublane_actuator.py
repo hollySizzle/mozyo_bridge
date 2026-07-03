@@ -416,5 +416,67 @@ class RenderTests(unittest.TestCase):
         self.assertIsInstance(payload["steps"], list)
 
 
+class LiveAppendLaneArgvTest(unittest.TestCase):
+    """The #13155 launch-model threading into the live ``cockpit append`` argv.
+
+    Exercises :meth:`LiveSublaneActuatorOps.append_lane_column` against a real
+    worktree ``.mozyo-bridge/config.yaml``, patching ``_drive_cli`` to capture the
+    argv it drives (no tmux / CLI execution).
+    """
+
+    def _argv_for(self, config_text):
+        import tempfile
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
+            LiveSublaneActuatorOps,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            wt = Path(d)
+            if config_text is not None:
+                (wt / ".mozyo-bridge").mkdir()
+                (wt / ".mozyo-bridge" / "config.yaml").write_text(
+                    config_text, encoding="utf-8"
+                )
+            ops = LiveSublaneActuatorOps(repo_root=wt)
+            captured = {}
+
+            def _capture(argv):
+                captured["argv"] = argv
+                return 0
+
+            # LiveSublaneActuatorOps is a frozen dataclass, so patch the class
+            # attribute (MagicMock is not a descriptor -> called with just argv).
+            with patch.object(LiveSublaneActuatorOps, "_drive_cli", side_effect=_capture):
+                ops.append_lane_column(str(wt))
+            return str(wt), captured["argv"]
+
+    def test_no_config_is_historical_argv(self):
+        wt, argv = self._argv_for(None)
+        self.assertEqual(
+            argv, ["cockpit", "append", "--repo", wt, "--no-attach"]
+        )
+        self.assertNotIn("--claude-model", argv)
+
+    def test_config_without_model_is_historical_argv(self):
+        wt, argv = self._argv_for("version: 1\n")
+        self.assertEqual(
+            argv, ["cockpit", "append", "--repo", wt, "--no-attach"]
+        )
+
+    def test_configured_model_appends_claude_model_flag(self):
+        wt, argv = self._argv_for(
+            "agent_launch:\n  sublane_claude_model: claude-opus-4-8\n"
+        )
+        self.assertEqual(
+            argv,
+            [
+                "cockpit", "append", "--repo", wt, "--no-attach",
+                "--claude-model", "claude-opus-4-8",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

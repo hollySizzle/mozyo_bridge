@@ -53,6 +53,7 @@ domain layer.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
@@ -91,6 +92,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "delegation",
         "sublane_integration",
         "work_unit",
+        "agent_launch",
     }
 )
 
@@ -112,6 +114,23 @@ SUBLANE_INTEGRATION_KEYS: frozenset[str] = frozenset(
 #: the sublane integration flow is unaffected by the defaults.
 DEFAULT_MANAGE_WORKTREE: bool = True
 DEFAULT_MERGE_ON_RETIRE: bool = True
+
+#: The closed set of recognized keys inside the ``agent_launch`` sub-record
+#: (Redmine #13155): the per-role / lane managed-pane launch model knob. ``version``
+#: is optional and defaults to :data:`REPO_LOCAL_CONFIG_VERSION`; ``sublane_claude_model``
+#: names a single Claude model token appended as ``--model <token>`` at the sublane
+#: managed-pane launch chokepoint. It carries *launch-model intent only* — never a shell
+#: string, and never any routing / owner-approval / close / send authority — and an unset
+#: value is byte-for-byte the historical launch command.
+AGENT_LAUNCH_KEYS: frozenset[str] = frozenset({"version", "sublane_claude_model"})
+
+#: The permitted shape of a launch model token (Redmine #13155). A single opaque token —
+#: a leading alphanumeric then alphanumerics / ``.`` / ``_`` / ``-`` — so a config value
+#: can never smuggle a space, empty value, shell metacharacter, flag, or path into the
+#: launch command. Kept intentionally identical to the flag-policy module's regex
+#: (:data:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_model_policy.MODEL_TOKEN_PATTERN`);
+#: the two are small and deliberately duplicated so neither layer depends on the other.
+_MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]+$")
 
 #: The closed set of recognized keys inside the ``presentation`` sub-record.
 #: ``version`` / ``surface`` select the projection *surface* (#12189); the
@@ -542,6 +561,87 @@ class SublaneIntegrationConfig:
 
 
 @dataclass(frozen=True)
+class AgentLaunchConfig:
+    """The per-role / lane managed-pane launch model knob (Redmine #13155).
+
+    This is the typed *field contract* for the ``agent_launch`` block of
+    ``.mozyo-bridge/config.yaml``. It lets a repo pin which Claude *model* the
+    sublane managed-pane launch chokepoint requests, without touching the launch
+    command's byte shape when unset.
+
+    One value field:
+
+    - :attr:`sublane_claude_model` — a single opaque model *token* (e.g.
+      ``claude-opus-4-8``) appended as ``--model <token>`` to a managed Claude
+      pane's launch command at the sublane append chokepoint. ``None`` (the
+      default) appends nothing, so the launch command is byte-for-byte the
+      historical one. The value is **not** an opaque shell string: it must match
+      :data:`_MODEL_TOKEN_RE` (a leading alphanumeric then alphanumerics / ``.`` /
+      ``_`` / ``-``), so a space, empty string, flag, path, or shell
+      metacharacter fails closed with :class:`RepoLocalConfigError` rather than
+      reaching a launch command.
+
+    Boundary, kept enforced in code (this is *launch-model intent*, not authority):
+
+    - **Config-only, never a shell string.** The single value is a validated
+      model token; it can never carry a command, flag list, redirect, or path.
+    - **Claude-only, non-retroactive.** The token only affects a managed Claude
+      pane mozyo *launches* (the sublane append path); a Codex pane and any
+      already-running pane are untouched — the same posture as the reproducible
+      permission-mode policy (#11925).
+    - **Behavior-preserving default.** No key ⇒ ``None`` ⇒ no ``--model`` flag,
+      so a repo with no ``agent_launch`` block launches exactly as before.
+    """
+
+    version: int = REPO_LOCAL_CONFIG_VERSION
+    sublane_claude_model: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        model = self.sublane_claude_model
+        if model is not None and (
+            not isinstance(model, str) or not _MODEL_TOKEN_RE.match(model)
+        ):
+            raise RepoLocalConfigError(
+                "agent launch config 'sublane_claude_model' must be a single model "
+                f"token matching {_MODEL_TOKEN_RE.pattern} (no spaces, empty value, or "
+                "shell metacharacters), or omitted for the historical launch command; "
+                f"got {model!r}"
+            )
+
+    @classmethod
+    def default(cls) -> "AgentLaunchConfig":
+        """The behavior-preserving default: no launch-model override."""
+        return cls()
+
+    @classmethod
+    def from_record(
+        cls, record: "Optional[Mapping[str, object]]" = None
+    ) -> "AgentLaunchConfig":
+        """Normalize an ``agent_launch`` sub-record into a typed policy.
+
+        ``None`` or an empty mapping yields the behavior-preserving default. A
+        non-mapping record, a boundary-crossing / unknown key, an unsupported
+        version, or a ``sublane_claude_model`` that is neither ``None`` nor a
+        valid single model token fails closed with :class:`RepoLocalConfigError`.
+        """
+        if record is None:
+            return cls.default()
+        if not isinstance(record, Mapping):
+            raise RepoLocalConfigError(
+                "agent launch config record must be a mapping (a YAML table), got "
+                f"{type(record).__name__}"
+            )
+        _reject_boundary_and_unknown_keys(
+            record, allowed=AGENT_LAUNCH_KEYS, source="agent launch config"
+        )
+        version = _checked_version(record, source="agent launch config")
+        return cls(
+            version=version,
+            sublane_claude_model=record.get("sublane_claude_model"),
+        )
+
+
+@dataclass(frozen=True)
 class RepoLocalConfig:
     """The closed top-level ``.mozyo-bridge/config.yaml`` record (schema only).
 
@@ -570,6 +670,9 @@ class RepoLocalConfig:
     )
     work_unit: WorkUnitGranularityConfig = field(
         default_factory=WorkUnitGranularityConfig.default
+    )
+    agent_launch: AgentLaunchConfig = field(
+        default_factory=AgentLaunchConfig.default
     )
 
     @classmethod
@@ -669,6 +772,12 @@ class RepoLocalConfig:
             raise RepoLocalConfigError(
                 f"work_unit config is invalid: {exc}"
             ) from exc
+        # The per-role / lane launch model knob (#13155) is parsed by its own
+        # self-contained sub-record, which raises RepoLocalConfigError directly, so
+        # the single fail-closed boundary holds without re-wrapping. An absent
+        # ``agent_launch`` block resolves to the behavior-preserving default (no
+        # ``--model`` flag), so a repo with no block launches exactly as before.
+        agent_launch = AgentLaunchConfig.from_record(record.get("agent_launch"))
         return cls(
             cli=cli,
             providers=providers,
@@ -676,6 +785,7 @@ class RepoLocalConfig:
             delegation=delegation,
             sublane_integration=sublane_integration,
             work_unit=work_unit,
+            agent_launch=agent_launch,
         )
 
 
@@ -688,9 +798,11 @@ __all__ = (
     "SUBLANE_INTEGRATION_KEYS",
     "DEFAULT_MANAGE_WORKTREE",
     "DEFAULT_MERGE_ON_RETIRE",
+    "AGENT_LAUNCH_KEYS",
     "RepoLocalConfigError",
     "PresentationSelectionConfig",
     "SublaneIntegrationConfig",
+    "AgentLaunchConfig",
     "RepoLocalConfig",
     "DelegationConfig",
     "DelegationConfigError",

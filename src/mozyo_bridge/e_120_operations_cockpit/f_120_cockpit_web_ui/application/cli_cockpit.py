@@ -214,6 +214,17 @@ def register(sub) -> None:
         help="On first-time create, build the cockpit but do not attach.",
     )
     cockpit.add_argument(
+        "--claude-model",
+        dest="claude_model",
+        default=None,
+        help=(
+            "Redmine #13155: launch a managed Claude pane with `--model <token>`. "
+            "Applies to Claude panes only; Codex is untouched. Omitted keeps the "
+            "historical launch command. A value must be a single model token "
+            "(e.g. `claude-opus-4-8`)."
+        ),
+    )
+    cockpit.add_argument(
         "--confirm",
         dest="confirm",
         action="store_true",

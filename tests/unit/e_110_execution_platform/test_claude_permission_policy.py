@@ -176,6 +176,54 @@ class LaunchChokepointTest(unittest.TestCase):
             )
 
 
+class LaunchChokepointModelFlagTest(unittest.TestCase):
+    """`_agent_launch_command` renders the #13155 `--model` flag after the mode."""
+
+    def _command(self, agent, *, policy_default=None, claude_model=None, env=None):
+        from mozyo_bridge.application.commands import _agent_launch_command
+
+        with patch.dict("os.environ", env or {}, clear=True):
+            return _agent_launch_command(
+                agent,
+                "mozyo-demo",
+                cwd=None,
+                permission_mode_default=policy_default,
+                claude_model=claude_model,
+            )
+
+    def test_model_flag_renders_after_permission_mode(self) -> None:
+        cmd = self._command(
+            "claude", policy_default="auto", claude_model="claude-opus-4-8"
+        )
+        self.assertTrue(
+            cmd.endswith(" claude --permission-mode auto --model claude-opus-4-8"),
+            cmd,
+        )
+
+    def test_model_flag_without_permission_mode(self) -> None:
+        cmd = self._command("claude", policy_default=None, claude_model="sonnet")
+        self.assertTrue(cmd.endswith(" claude --model sonnet"), cmd)
+        self.assertNotIn("--permission-mode", cmd)
+
+    def test_no_model_is_byte_identical_to_historical(self) -> None:
+        # Characterization: an unset model leaves the launch command exactly as
+        # it was before #13155 — no `--model` fragment anywhere.
+        with_model_unset = self._command("claude", policy_default="auto")
+        historical = self._command("claude", policy_default="auto", claude_model=None)
+        self.assertEqual(with_model_unset, historical)
+        self.assertTrue(historical.endswith(" claude --permission-mode auto"), historical)
+        self.assertNotIn("--model", historical)
+
+    def test_codex_never_gets_model_flag(self) -> None:
+        cmd = self._command("codex", claude_model="claude-opus-4-8")
+        self.assertTrue(cmd.endswith(" codex"), cmd)
+        self.assertNotIn("--model", cmd)
+
+    def test_invalid_model_is_hard_error(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._command("claude", policy_default="auto", claude_model="bad; rm -rf")
+
+
 class CockpitDryRunPolicyTest(unittest.TestCase):
     """End-to-end: `mozyo layout --dry-run` plans reproducible auto Claude.
 

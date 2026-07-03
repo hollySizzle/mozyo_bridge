@@ -38,6 +38,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_project_config import DelegationConfig
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+    AgentLaunchConfig,
     DEFAULT_MANAGE_WORKTREE,
     DEFAULT_MERGE_ON_RETIRE,
     DEFAULT_PRESENTATION_SURFACE,
@@ -90,11 +91,15 @@ class ValidRecordTest(unittest.TestCase):
                 "cli": {"disabled": ["cockpit"]},
                 "providers": {"selections": {"ticket": "redmine"}},
                 "presentation": {"surface": SURFACE_TEXT},
+                "agent_launch": {"sublane_claude_model": "claude-opus-4-8"},
             }
         )
         self.assertEqual(config.cli.disabled, frozenset({"cockpit"}))
         self.assertEqual(config.providers.selections, (("ticket", "redmine"),))
         self.assertEqual(config.presentation.surface, SURFACE_TEXT)
+        self.assertEqual(
+            config.agent_launch.sublane_claude_model, "claude-opus-4-8"
+        )
 
     def test_partial_record_only_cli(self) -> None:
         config = RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}})
@@ -633,6 +638,71 @@ class WorkUnitGranularityWiringTest(unittest.TestCase):
     def test_non_mapping_record_fails_closed(self) -> None:
         with self.assertRaises(RepoLocalConfigError):
             RepoLocalConfig.from_record({"work_unit": "user_story"})
+
+
+class AgentLaunchConfigTest(unittest.TestCase):
+    """The per-role / lane managed-pane launch model knob (Redmine #13155)."""
+
+    def test_default_is_behavior_preserving(self) -> None:
+        default = AgentLaunchConfig.default()
+        self.assertIsNone(default.sublane_claude_model)
+        self.assertEqual(RepoLocalConfig.default().agent_launch, default)
+
+    def test_none_and_empty_resolve_to_default(self) -> None:
+        self.assertEqual(
+            AgentLaunchConfig.from_record(None), AgentLaunchConfig.default()
+        )
+        self.assertEqual(
+            AgentLaunchConfig.from_record({}), AgentLaunchConfig.default()
+        )
+
+    def test_missing_block_keeps_default(self) -> None:
+        config = RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}})
+        self.assertEqual(config.agent_launch, AgentLaunchConfig.default())
+
+    def test_full_record_maps_model(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"agent_launch": {"sublane_claude_model": "claude-opus-4-8"}}
+        )
+        self.assertEqual(
+            config.agent_launch.sublane_claude_model, "claude-opus-4-8"
+        )
+
+    def test_explicit_supported_version_accepted(self) -> None:
+        config = AgentLaunchConfig.from_record(
+            {"version": REPO_LOCAL_CONFIG_VERSION, "sublane_claude_model": "sonnet"}
+        )
+        self.assertEqual(config.sublane_claude_model, "sonnet")
+
+    def test_invalid_model_value_fails_closed(self) -> None:
+        # Not an opaque shell string: empty, whitespace, shell metachars, spaces,
+        # flag-shaped, and non-string values all fail closed.
+        for bad in ("", "   ", "opus 4", "opus;rm", "-model", "a b", 5, True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    AgentLaunchConfig.from_record({"sublane_claude_model": bad})
+
+    def test_invalid_model_via_top_level_record(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"agent_launch": {"sublane_claude_model": "bad; rm -rf"}}
+            )
+
+    def test_direct_construction_validates_model(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig(sublane_claude_model="has space")
+
+    def test_unknown_key_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record({"sublane_claud_model": "sonnet"})
+
+    def test_non_mapping_record_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"agent_launch": ["sonnet"]})
+
+    def test_unsupported_version_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record({"version": 2})
 
 
 if __name__ == "__main__":

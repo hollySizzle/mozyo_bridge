@@ -163,6 +163,7 @@ class FakeOps:
         self.executed: list[tuple] = []
         self.group_action = None  # (action, plan, blocked_reason, window)
         self.group_action_calls: list[dict] = []
+        self.launch_calls: list[dict] = []
 
     def resolve_project_scope_fields(self, cwd, repo_root):
         return repo_root, (None, None, None), None
@@ -173,7 +174,10 @@ class FakeOps:
     def resolve_workspace_lane(self, repo_root, workspace_id):
         return LaneIdentity(DEFAULT_LANE, None)
 
-    def agent_launch_command(self, role, session, repo_root):
+    def agent_launch_command(self, role, session, repo_root, *, claude_model=None):
+        self.launch_calls.append(
+            {"role": role, "repo_root": repo_root, "claude_model": claude_model}
+        )
         return f"{role}-cmd"
 
     def require_tmux(self):
@@ -471,6 +475,27 @@ class CockpitDispatchUseCaseTest(unittest.TestCase):
         self.assertEqual(ops.require_tmux_calls, 0)
         self.assertEqual(ops.executed, [])
         self.assertTrue(ops.emitted[0].startswith("cockpit plan: action=create"))
+
+    def test_claude_model_flag_threads_into_launch(self) -> None:
+        # #13155: the `--claude-model` value reaches every agent_launch_command
+        # call the create/append flow drives.
+        ops = FakeOps(columns=None)
+        self._run(_args(dry_run=True, claude_model="claude-opus-4-8"), ops)
+        self.assertTrue(ops.launch_calls)
+        self.assertTrue(
+            all(c["claude_model"] == "claude-opus-4-8" for c in ops.launch_calls),
+            ops.launch_calls,
+        )
+
+    def test_no_claude_model_defaults_to_none(self) -> None:
+        # Unset flag ⇒ None ⇒ historical launch command (behavior-preserving).
+        ops = FakeOps(columns=None)
+        self._run(_args(dry_run=True), ops)
+        self.assertTrue(ops.launch_calls)
+        self.assertTrue(
+            all(c["claude_model"] is None for c in ops.launch_calls),
+            ops.launch_calls,
+        )
 
     def test_json_run_emits_the_payload(self) -> None:
         ops = FakeOps(columns=None, session_present=True)
