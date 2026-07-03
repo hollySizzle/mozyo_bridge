@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3581
+    lines: 3557
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -823,6 +823,18 @@ allowlist:
       net removal and the post-carve ``commands.py`` line count is 3581.
       ``test_cockpit_dispatcher_command`` adds the pure route/decision/rendering
       + fake-port use-case specifications.
+      Lowered 3581 -> 3557 for the #13105 launch attach terminal-exec facade
+      tranche: the ``cmd_mozyo`` / ``cmd_layout_apply`` outcome-rendering /
+      attach / no-attach / json / dry-run terminal tails moved to the new
+      ``deliver_mozyo_launch_outcome`` / ``deliver_layout_launch_outcome``
+      delivery functions in ``application/launch_command.py``, rendering
+      through the extended ``LaunchOps`` port (``emit`` stdout sink + ``die``
+      fail-closed abort; the live adapter routes ``commands.die`` at call time
+      and ``attach`` keeps calling ``os.execvp``, so the ``commands.die`` /
+      ``commands.os.execvp`` patch seams are unchanged). Both handlers stay as
+      parser-bound wrappers over run + deliver. 3581 -> 3557 is a 24-line net
+      removal and the post-carve ``commands.py`` line count is 3557.
+      ``test_launch_command`` adds the fake-port delivery-tail specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

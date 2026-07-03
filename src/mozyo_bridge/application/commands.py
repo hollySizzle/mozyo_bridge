@@ -619,34 +619,21 @@ def cmd_mozyo(args: argparse.Namespace) -> int:
     still overrides the resolved name (Redmine #10796).
 
     The session-name resolution guards, the JSON payload, the session/window-table
-    rendering, and the attach-command form live behind the ``launch_command``
-    boundary (#12933 / #12984); this handler stays thin — it runs the use case,
-    prints the rendered outcome, and does the terminal ``os.execvp`` attach through
-    the live adapter.
+    rendering, the attach-command form, and the outcome delivery — stdout, the
+    fail-closed ``die``, and the terminal ``os.execvp`` attach — live behind the
+    ``launch_command`` boundary (#12933 / #12984 / #13105); this handler is a
+    parser-bound wrapper over run + deliver. The live adapter routes ``die``
+    through this module and ``attach`` through :func:`os.execvp` at call time, so
+    the ``commands.die`` / ``commands.os.execvp`` patch seams keep intercepting.
     """
     from mozyo_bridge.application.launch_command import (
         LiveLaunchOps,
         MozyoLaunchUseCase,
+        deliver_mozyo_launch_outcome,
     )
 
     ops = LiveLaunchOps()
-    outcome = MozyoLaunchUseCase(ops).run(args)
-    if outcome.json_stdout is not None:
-        print(outcome.json_stdout)
-        return 0
-    # The non-JSON legacy notice prints before the pre-attach block (and before a
-    # late select-window failure), matching the original ordering.
-    if outcome.notice:
-        print(outcome.notice)
-    if outcome.error_message is not None:
-        die(outcome.error_message)
-    if outcome.pre_attach_text is not None:
-        print(outcome.pre_attach_text, end="")
-    if outcome.no_attach:
-        print(f"attach: {outcome.attach_command}")
-        return 0
-    ops.attach(list(outcome.attach_argv))
-    raise AssertionError("unreachable")
+    return deliver_mozyo_launch_outcome(MozyoLaunchUseCase(ops).run(args), ops)
 
 
 def _resolve_project_scope_fields(
@@ -752,33 +739,22 @@ def cmd_layout_apply(args: argparse.Namespace) -> int:
     the layout's source of truth; `--cc` only swaps the attach for control mode.
     `--json` / `--dry-run` emit the planned tmux commands without touching tmux.
 
-    The preset/workspace guards, the plan JSON, and the dry-run text live behind
-    the ``launch_command`` boundary (#12933); this handler stays thin — it runs
-    the use case, prints the outcome, and does the terminal ``os.execvp`` attach
-    through the live adapter.
+    The preset/workspace guards, the plan JSON, the dry-run text, and the outcome
+    delivery — stdout, the fail-closed ``die``, and the terminal ``os.execvp``
+    attach — live behind the ``launch_command`` boundary (#12933 / #13105); this
+    handler is a parser-bound wrapper over run + deliver. The live adapter routes
+    ``die`` through this module and ``attach`` through :func:`os.execvp` at call
+    time, so the ``commands.die`` / ``commands.os.execvp`` patch seams keep
+    intercepting.
     """
     from mozyo_bridge.application.launch_command import (
         CockpitLayoutUseCase,
         LiveLaunchOps,
+        deliver_layout_launch_outcome,
     )
 
     ops = LiveLaunchOps()
-    outcome = CockpitLayoutUseCase(ops).run(args)
-    if outcome.error_message is not None:
-        die(outcome.error_message)
-    if outcome.json_stdout is not None:
-        print(outcome.json_stdout)
-        return 0
-    if outcome.dry_run_stdout is not None:
-        print(outcome.dry_run_stdout)
-        return 0
-    for line in outcome.pre_attach_lines:
-        print(line)
-    if outcome.no_attach:
-        print(f"attach: {outcome.attach_command}")
-        return 0
-    ops.attach(list(outcome.attach_argv))
-    raise AssertionError("unreachable")
+    return deliver_layout_launch_outcome(CockpitLayoutUseCase(ops).run(args), ops)
 
 
 def _read_cockpit_columns(session: str, window: str | None = None):
