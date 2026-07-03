@@ -82,6 +82,7 @@ from .constants import (
     DELEGATION_WINDOW_POLICY_SHARED,
     GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
     GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+    GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW,
     GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
     GROUPING_CONFIG_KEYS,
     GROUPING_DEFAULTS_KEYS,
@@ -99,6 +100,7 @@ from .constants import (
     STATUS_DESIRED_UNIT_MISSING,
     STATUS_IDENTITY_CONFLICT,
     STATUS_UNGROUPED,
+    SUBLANE_WINDOW_KEY_PREFIX,
     UNIT_OVERRIDE_KEYS,
 )
 from .degraded import diagnose_unit_overrides
@@ -113,8 +115,10 @@ from .errors import PresentationGroupingConfigError
 from .placement import (
     GroupPlacement,
     GroupWindowDecision,
+    SublaneWindowDecision,
     resolve_group_window_placement,
     resolve_launch_placement,
+    resolve_sublane_window_placement,
 )
 
 __all__ = (
@@ -149,7 +153,9 @@ __all__ = (
     "STATUS_IDENTITY_CONFLICT",
     "GROUP_WINDOW_SURFACE_COCKPIT_COLUMN",
     "GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW",
+    "GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW",
     "GROUP_WINDOW_SURFACE_NORMAL_WINDOW",
+    "SUBLANE_WINDOW_KEY_PREFIX",
     "PresentationGroupingConfigError",
     "ProjectGroup",
     "MembershipRule",
@@ -158,8 +164,10 @@ __all__ = (
     "LaunchContext",
     "GroupPlacement",
     "GroupWindowDecision",
+    "SublaneWindowDecision",
     "PresentationGroupingConfig",
     "resolve_launch_placement",
     "resolve_group_window_placement",
+    "resolve_sublane_window_placement",
     "diagnose_unit_overrides",
 )

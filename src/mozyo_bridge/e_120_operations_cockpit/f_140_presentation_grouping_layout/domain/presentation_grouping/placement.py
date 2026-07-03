@@ -23,8 +23,13 @@ from typing import Optional
 from .config import LaunchContext, PresentationGroupingConfig
 from .constants import (
     _PRESENTATION_MODE_TO_SURFACE,
+    DEFAULT_DELEGATION_WINDOW_POLICY,
+    DEFAULT_LANE,
+    DELEGATION_WINDOW_POLICY_MODES,
+    DELEGATION_WINDOW_POLICY_SHARED,
     GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
     GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+    GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW,
     GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_MODES,
     PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
@@ -34,6 +39,7 @@ from .constants import (
     STATUS_DEFAULT,
     STATUS_IDENTITY_CONFLICT,
     STATUS_UNGROUPED,
+    SUBLANE_WINDOW_KEY_PREFIX,
 )
 from .errors import PresentationGroupingConfigError
 
@@ -354,4 +360,172 @@ def resolve_group_window_placement(
         label=placement.label,
         degraded=True,
         diagnostic=diagnostic,
+    )
+
+
+@dataclass(frozen=True)
+class SublaneWindowDecision:
+    """The desired / executed sublane separate-window placement (Redmine #13015).
+
+    Resolved from the repo-local ``delegation_window_policy`` plus the launching
+    Unit's lane identity, for the expected ``cockpit main window -> project
+    window -> sublane window`` topology. Display-only, exactly like
+    :class:`GroupWindowDecision`: it describes *where* the launcher lays the
+    sublane out and is never a routing / approval / close authority and never a
+    guaranteed tmux window / iTerm tab / OS window.
+
+    - :attr:`policy` is the effective ``separate`` | ``shared`` policy.
+    - :attr:`separated` says whether the launcher executes the sublane's own
+      tmux window *now* (`True` only when nothing degrades the request).
+    - :attr:`executed_surface` is ``lane_tmux_window`` when separated, else the
+      behavior-preserving ``cockpit_column``.
+    - :attr:`group_id` / :attr:`desired_window_name` satisfy the same decision
+      protocol :func:`~mozyo_bridge.application.cockpit_group_window_command.resolve_group_window_action`
+      reads: the deterministic ``lane:<workspace_id>/<lane_id>`` window key the
+      create plan stamps as the window-level ``@mozyo_group_id`` marker, and the
+      public-safe display name (the lane label).
+    - :attr:`degraded` + :attr:`diagnostic` record an explicit,
+      machine-readable fallback (acceptance #13015: visible degrade, never a
+      silent reroute) whenever ``separate`` is desired but this launch keeps the
+      shared-column placement.
+    """
+
+    policy: str
+    lane_id: str
+    lane_label: Optional[str]
+    separated: bool
+    executed_surface: str
+    group_id: Optional[str] = None
+    desired_window_name: Optional[str] = None
+    degraded: bool = False
+    diagnostic: Optional[str] = None
+
+    def as_dict(self) -> "dict[str, object]":
+        return {
+            "window_policy": self.policy,
+            "lane_id": self.lane_id,
+            "lane_label": self.lane_label,
+            "separated": self.separated,
+            "executed_surface": self.executed_surface,
+            "window_key": self.group_id,
+            "desired_window_name": self.desired_window_name,
+            "degraded": self.degraded,
+            "diagnostic": self.diagnostic,
+        }
+
+
+def _effective_delegation_window_policy(policy: object) -> str:
+    """Fail-soft policy echo: an unexpected value degrades to the default.
+
+    The config parser (:func:`~.validation._checked_delegation_window_policy`)
+    is the fail-closed boundary; by the time a policy reaches this placement
+    resolver it is normally already a valid mode. Mirrors
+    :func:`~.delegation_window._effective_policy` so the placement and the
+    display projection never disagree on the effective mode.
+    """
+    if isinstance(policy, str) and policy in DELEGATION_WINDOW_POLICY_MODES:
+        return policy
+    return DEFAULT_DELEGATION_WINDOW_POLICY
+
+
+def resolve_sublane_window_placement(
+    delegation_window_policy: object,
+    *,
+    workspace_id: str,
+    lane_id: Optional[str],
+    lane_label: Optional[str],
+    group_window_executing: bool,
+    cockpit_window_present: bool,
+) -> Optional[SublaneWindowDecision]:
+    """Resolve the launcher placement of a launching *sublane* (Redmine #13015).
+
+    Connects the ``delegation_window_policy`` display knob to the cockpit
+    append actuation: under ``separate`` (the documented default) a launching
+    sublane — a non-default lane, i.e. a worktree / clone / relocated checkout
+    of an already-known workspace — is placed in its own explicit sublane tmux
+    window instead of being silently appended as a column inside the project
+    window. Pure and display-only: it maps identity facts the caller already
+    resolved to a desired/executed placement; it reads no tmux / config file,
+    creates nothing, and carries no routing / approval authority.
+
+    Outcomes:
+
+    - the primary checkout (``lane_id`` empty / ``default``) -> ``None``: not a
+      sublane; the project-window / shared-column flows apply unchanged.
+    - ``shared`` -> a non-degraded ``cockpit_column`` decision: the operator
+      opted the sublane into the project window / shared column, so the column
+      placement *is* the faithful execution.
+    - ``separate`` with the faithful per-Project-Group window flow executing
+      (``group_window_executing``) and a live cockpit window to add to
+      (``cockpit_window_present``) -> ``separated=True``: the launcher places
+      the sublane in its own tmux window, keyed
+      ``lane:<workspace_id>/<lane_id>`` and named after the lane label. The
+      same cross-window ``workspace + lane`` duplicate gate and pane-identity
+      stamping the Project Group windows use (#12330) apply.
+    - ``separate`` otherwise -> an explicit degraded ``cockpit_column``
+      fallback whose :attr:`~SublaneWindowDecision.diagnostic` names the
+      boundary (machine-readable via
+      :meth:`~SublaneWindowDecision.as_dict`, journalable from the ``--json``
+      payload): either the repo did not opt into the faithful
+      ``project_group_tmux_window`` presentation this actuation rides on, or
+      the cockpit session is only now bootstrapping.
+    """
+    lane = (lane_id or "").strip() or DEFAULT_LANE
+    if lane == DEFAULT_LANE:
+        return None
+
+    policy = _effective_delegation_window_policy(delegation_window_policy)
+    if policy == DELEGATION_WINDOW_POLICY_SHARED:
+        return SublaneWindowDecision(
+            policy=policy,
+            lane_id=lane,
+            lane_label=lane_label,
+            separated=False,
+            executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+        )
+
+    if not group_window_executing:
+        return SublaneWindowDecision(
+            policy=policy,
+            lane_id=lane,
+            lane_label=lane_label,
+            separated=False,
+            executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+            degraded=True,
+            diagnostic=(
+                "delegation_window_policy 'separate' desires an explicit sublane "
+                "tmux window, but the separate-window actuation rides the faithful "
+                "project_group_tmux_window presentation, which is not executing "
+                "here; this launch keeps the sublane in the shared cockpit column. "
+                "Opt in with presentation.project_group_presentation: "
+                "project_group_tmux_window, or silence this with "
+                "presentation.delegation_window_policy: shared."
+            ),
+        )
+
+    if not cockpit_window_present:
+        return SublaneWindowDecision(
+            policy=policy,
+            lane_id=lane,
+            lane_label=lane_label,
+            separated=False,
+            executed_surface=GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
+            degraded=True,
+            diagnostic=(
+                "delegation_window_policy 'separate' desires an explicit sublane "
+                "tmux window, but the cockpit session has no managed cockpit "
+                "window yet (session bootstrap); this launch creates the shared "
+                "cockpit window with the sublane as its first column."
+            ),
+        )
+
+    window_name = (lane_label or "").strip() or lane
+    return SublaneWindowDecision(
+        policy=policy,
+        lane_id=lane,
+        lane_label=lane_label,
+        separated=True,
+        executed_surface=GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW,
+        group_id=f"{SUBLANE_WINDOW_KEY_PREFIX}{workspace_id}/{lane}",
+        desired_window_name=window_name,
     )

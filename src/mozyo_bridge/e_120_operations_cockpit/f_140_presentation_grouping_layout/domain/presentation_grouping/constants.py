@@ -187,6 +187,24 @@ GROUP_WINDOW_SURFACE_COCKPIT_COLUMN: str = "cockpit_column"
 GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW: str = "group_tmux_window"
 GROUP_WINDOW_SURFACE_NORMAL_WINDOW: str = "normal_window"
 
+#: The sublane separate-window placement *surface* (Redmine #13015): a launching
+#: sublane (a non-default lane — worktree / clone / relocated checkout) laid out
+#: in its own explicit sublane tmux window under
+#: ``delegation_window_policy: separate``, completing the expected
+#: ``cockpit main window -> project window -> sublane window`` topology. Like the
+#: other surfaces this names *how* the sublane is laid out — a tmux-layer request
+#: only, never routing / approval / close authority and never a guaranteed
+#: window / iTerm tab / OS window.
+GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW: str = "lane_tmux_window"
+
+#: Deterministic window-key prefix for a sublane's own window (Redmine #13015).
+#: The launcher stamps ``lane:<workspace_id>/<lane_id>`` as the window-level
+#: ``@mozyo_group_id`` marker so it can relocate the sublane's existing window
+#: without trusting window names; the ``lane:`` prefix namespaces these keys away
+#: from configured Project Group ids. Display grouping only — never Unit identity
+#: (that stays on the pane options) and never a routing key.
+SUBLANE_WINDOW_KEY_PREFIX: str = "lane:"
+
 #: Map each desired ``project_group_presentation`` mode to its placement surface.
 _PRESENTATION_MODE_TO_SURFACE: "dict[str, str]" = {
     PROJECT_GROUP_PRESENTATION_SAME_COLUMN: GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,

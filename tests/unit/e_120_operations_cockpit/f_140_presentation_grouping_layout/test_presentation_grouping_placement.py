@@ -27,8 +27,11 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (
+    DELEGATION_WINDOW_POLICY_SEPARATE,
+    DELEGATION_WINDOW_POLICY_SHARED,
     GROUP_WINDOW_SURFACE_COCKPIT_COLUMN,
     GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW,
+    GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW,
     GROUP_WINDOW_SURFACE_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_NORMAL_WINDOW,
     PROJECT_GROUP_PRESENTATION_SAME_COLUMN,
@@ -36,13 +39,16 @@ from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.do
     STATUS_CONFIGURED,
     STATUS_DEFAULT,
     STATUS_UNGROUPED,
+    SUBLANE_WINDOW_KEY_PREFIX,
     GroupPlacement,
     GroupWindowDecision,
     LaunchContext,
     PresentationGroupingConfig,
     PresentationGroupingConfigError,
+    SublaneWindowDecision,
     resolve_group_window_placement,
     resolve_launch_placement,
+    resolve_sublane_window_placement,
 )
 
 
@@ -329,6 +335,108 @@ class ResolveGroupWindowPlacementTest(unittest.TestCase):
             },
         )
         # No routing / pane / target keys leak into the display payload.
+        for forbidden in ("pane", "target", "route", "pane_id", "command"):
+            self.assertNotIn(forbidden, payload)
+
+
+class ResolveSublaneWindowPlacementTest(unittest.TestCase):
+    """The sublane separate-window placement resolver (Redmine #13015).
+
+    Connects ``delegation_window_policy`` to the cockpit-append actuation: a
+    launching sublane (non-default lane) under ``separate`` gets its own sublane
+    tmux window when the faithful group-window flow executes; every other case
+    is either the honored ``shared`` column or an explicit machine-readable
+    degraded fallback. Pure: no tmux, no IO.
+    """
+
+    def _resolve(self, policy=DELEGATION_WINDOW_POLICY_SEPARATE, **over):
+        base = dict(
+            workspace_id="wsX",
+            lane_id="lane-abc123def456",
+            lane_label="issue_9999_topic",
+            group_window_executing=True,
+            cockpit_window_present=True,
+        )
+        base.update(over)
+        return resolve_sublane_window_placement(policy, **base)
+
+    def test_primary_checkout_is_not_a_sublane(self) -> None:
+        for lane in (None, "", "  ", "default"):
+            self.assertIsNone(self._resolve(lane_id=lane))
+
+    def test_separate_executes_the_lane_window(self) -> None:
+        decision = self._resolve()
+        self.assertIsInstance(decision, SublaneWindowDecision)
+        self.assertTrue(decision.separated)
+        self.assertEqual(
+            decision.executed_surface, GROUP_WINDOW_SURFACE_LANE_TMUX_WINDOW
+        )
+        self.assertFalse(decision.degraded)
+        self.assertIsNone(decision.diagnostic)
+        # The deterministic window key the create plan stamps as the
+        # window-level marker: lane-scoped, namespaced away from config groups.
+        self.assertEqual(
+            decision.group_id,
+            f"{SUBLANE_WINDOW_KEY_PREFIX}wsX/lane-abc123def456",
+        )
+        # Public-safe window name: the lane label.
+        self.assertEqual(decision.desired_window_name, "issue_9999_topic")
+
+    def test_separate_without_lane_label_names_the_window_by_lane_id(self) -> None:
+        decision = self._resolve(lane_label=None)
+        self.assertEqual(decision.desired_window_name, "lane-abc123def456")
+
+    def test_shared_keeps_the_column_without_degrading(self) -> None:
+        decision = self._resolve(policy=DELEGATION_WINDOW_POLICY_SHARED)
+        self.assertFalse(decision.separated)
+        self.assertEqual(
+            decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN
+        )
+        self.assertFalse(decision.degraded)
+        self.assertIsNone(decision.diagnostic)
+        self.assertIsNone(decision.group_id)
+
+    def test_separate_degrades_when_group_flow_is_not_executing(self) -> None:
+        # `same_cockpit_column` compat (or `normal_window`): the actuation rides
+        # the faithful group-window flow, so the fallback is explicit, never
+        # silent.
+        decision = self._resolve(group_window_executing=False)
+        self.assertFalse(decision.separated)
+        self.assertEqual(
+            decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN
+        )
+        self.assertTrue(decision.degraded)
+        self.assertIn("project_group_tmux_window", decision.diagnostic)
+
+    def test_separate_degrades_on_session_bootstrap(self) -> None:
+        decision = self._resolve(cockpit_window_present=False)
+        self.assertFalse(decision.separated)
+        self.assertTrue(decision.degraded)
+        self.assertIn("bootstrap", decision.diagnostic)
+
+    def test_unexpected_policy_fails_soft_to_the_default_separate(self) -> None:
+        # The config parser is the fail-closed boundary; the resolver echoes the
+        # documented default for drift, mirroring the display resolver.
+        decision = self._resolve(policy="split_screen")
+        self.assertEqual(decision.policy, DELEGATION_WINDOW_POLICY_SEPARATE)
+        self.assertTrue(decision.separated)
+
+    def test_as_dict_is_public_safe_display_only(self) -> None:
+        payload = self._resolve().as_dict()
+        self.assertEqual(
+            set(payload),
+            {
+                "window_policy",
+                "lane_id",
+                "lane_label",
+                "separated",
+                "executed_surface",
+                "window_key",
+                "desired_window_name",
+                "degraded",
+                "diagnostic",
+            },
+        )
         for forbidden in ("pane", "target", "route", "pane_id", "command"):
             self.assertNotIn(forbidden, payload)
 

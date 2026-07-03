@@ -389,6 +389,29 @@ class PresentationGroupingWiringTest(unittest.TestCase):
                 {"presentation": {"project_group_presentation": "iterm_tab"}}
             )
 
+    def test_delegation_window_policy_defaults_to_separate(self) -> None:
+        config = RepoLocalConfig.from_record({"presentation": {"surface": "text"}})
+        self.assertEqual(
+            config.presentation.grouping.delegation_window_policy, "separate"
+        )
+
+    def test_delegation_window_policy_is_settable_under_presentation(self) -> None:
+        # #13015: the #12467 window-separation knob is forwarded through the
+        # presentation block so a project can actually opt into `shared`.
+        for mode in ("separate", "shared"):
+            config = RepoLocalConfig.from_record(
+                {"presentation": {"delegation_window_policy": mode}}
+            )
+            self.assertEqual(
+                config.presentation.grouping.delegation_window_policy, mode
+            )
+
+    def test_invalid_delegation_window_policy_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"presentation": {"delegation_window_policy": "split_screen"}}
+            )
+
     def test_dangling_group_reference_fails_closed_as_repo_local_error(self) -> None:
         with self.assertRaises(RepoLocalConfigError):
             RepoLocalConfig.from_record(

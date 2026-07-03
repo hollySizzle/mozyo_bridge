@@ -114,10 +114,13 @@ DEFAULT_MANAGE_WORKTREE: bool = True
 DEFAULT_MERGE_ON_RETIRE: bool = True
 
 #: The closed set of recognized keys inside the ``presentation`` sub-record.
-#: ``version`` / ``surface`` select the projection *surface* (#12189); the three
+#: ``version`` / ``surface`` select the projection *surface* (#12189); the
 #: grouping keys (#12286) carry the desired presentation *grouping* config — the
-#: Project Group layer (``project_groups`` / ``grouping``) and the whole-view
-#: display-placement mode (``project_group_presentation``) — delegated to
+#: Project Group layer (``project_groups`` / ``grouping``), the whole-view
+#: display-placement mode (``project_group_presentation``), and the
+#: delegated-tree / sublane window-separation policy
+#: (``delegation_window_policy``, #12467 display + #13015 launcher placement) —
+#: delegated to
 #: :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`.
 PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
     {
@@ -126,6 +129,7 @@ PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
         "project_groups",
         "grouping",
         "project_group_presentation",
+        "delegation_window_policy",
     }
 )
 
@@ -133,7 +137,12 @@ PRESENTATION_SELECTION_KEYS: frozenset[str] = frozenset(
 #: :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`).
 #: A separate set so the surface-selection keys and the grouping keys never blur.
 PRESENTATION_GROUPING_SUBKEYS: frozenset[str] = frozenset(
-    {"project_groups", "grouping", "project_group_presentation"}
+    {
+        "project_groups",
+        "grouping",
+        "project_group_presentation",
+        "delegation_window_policy",
+    }
 )
 
 #: The default projection surface — the current built-in behavior. Selecting no
@@ -341,8 +350,10 @@ class PresentationSelectionConfig:
       cannot add a surface, supply a renderer / module / callable, address a
       target / pane / route, send / approve / close anything, or grant authority.
     - :attr:`grouping` carries the desired presentation *grouping* config — the
-      Project Group layer (``project_groups`` / ``grouping``) and the whole-view
-      ``project_group_presentation`` display-placement mode (#12286) — parsed by
+      Project Group layer (``project_groups`` / ``grouping``), the whole-view
+      ``project_group_presentation`` display-placement mode (#12286), and the
+      ``delegation_window_policy`` window-separation knob (#12467 / #13015) —
+      parsed by
       :class:`~mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping.PresentationGroupingConfig`,
       itself display-only and fail-closed (no routing / approval / window
       guarantee).
@@ -379,7 +390,8 @@ class PresentationSelectionConfig:
         grouping config. A non-mapping record, a boundary-crossing / unknown key,
         an unsupported version, or a non-string / unrecognized surface fails
         closed. The grouping sub-keys (``project_groups`` / ``grouping`` /
-        ``project_group_presentation``) are forwarded to
+        ``project_group_presentation`` / ``delegation_window_policy``) are
+        forwarded to
         :meth:`PresentationGroupingConfig.from_record`, whose own
         :class:`PresentationGroupingConfigError` (an undeclared group, an invalid
         placement mode, a boundary-shaped grouping key, …) is re-raised as a

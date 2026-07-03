@@ -564,6 +564,129 @@ class CockpitDispatchUseCaseTest(unittest.TestCase):
         self.assertIn("(window 'grp-win'); focused it.", ops.emitted[0])
 
 
+class SublaneSeparateWindowTest(unittest.TestCase):
+    """Sublane separate-window actuation through the dispatcher (Redmine #13015).
+
+    Under `delegation_window_policy: separate` (the default) a sublane lane
+    whose repo faithfully executes `project_group_tmux_window` routes through
+    the group-window action with the lane-scoped decision — its own sublane
+    window — while every fallback stays the shared column with the reason
+    recorded machine-readably on the `sublane_window` payload field.
+    """
+
+    GROUP_ON = {"presentation": {"project_group_presentation":
+                                 "project_group_tmux_window"}}
+
+    def _sublane_ops(self, record=None, *, columns="default", policy=None,
+                     lane=LaneIdentity("lane-abc", "issue_42_topic")):
+        rec = dict(record if record is not None else self.GROUP_ON)
+        if policy is not None:
+            rec.setdefault("presentation", {})
+            rec["presentation"] = dict(rec["presentation"])
+            rec["presentation"]["delegation_window_policy"] = policy
+        ops = FakeOps(
+            columns=(
+                [_column("%1", workspace_id="wsB")] if columns == "default"
+                else columns
+            ),
+            grouping_config=RepoLocalConfig.from_record(rec),
+        )
+        ops.resolve_workspace_lane = lambda repo_root, workspace_id: lane
+        return ops
+
+    def _run(self, args, ops):
+        routes = FakeRoutes()
+        outcome = CockpitDispatchUseCase(routes, ops).run(args)
+        return outcome, routes
+
+    def test_sublane_routes_to_its_own_window_with_the_lane_key(self) -> None:
+        ops = self._sublane_ops()
+        plan = SimpleNamespace(commands=[])
+        ops.group_action = ("group_create", plan, None, "issue_42_topic")
+        outcome, _routes = self._run(_args(), ops)
+        self.assertEqual(outcome, CockpitDispatchOutcome(exit_code=0))
+        decision = ops.group_action_calls[0]["decision"]
+        self.assertTrue(decision.separated)
+        self.assertEqual(decision.group_id, "lane:wsX/lane-abc")
+        self.assertEqual(decision.desired_window_name, "issue_42_topic")
+        self.assertTrue(ops.executed[0][1])  # create keeps the rollback boundary
+        self.assertTrue(
+            ops.emitted[0].startswith("created sublane window 'issue_42_topic'")
+        )
+
+    def test_sublane_append_notice_names_the_sublane_window(self) -> None:
+        ops = self._sublane_ops()
+        plan = SimpleNamespace(commands=[])
+        ops.group_action = ("group_append", plan, None, "issue_42_topic")
+        _outcome, _routes = self._run(_args(), ops)
+        self.assertIn(
+            "as a new column to sublane window 'issue_42_topic'", ops.emitted[0]
+        )
+
+    def test_shared_policy_keeps_the_project_group_column(self) -> None:
+        ops = self._sublane_ops(policy="shared")
+        plan = SimpleNamespace(commands=[])
+        ops.group_action = ("group_append", plan, None, "grp-win")
+        _outcome, _routes = self._run(_args(), ops)
+        # The group-window flow still runs, but with the PRESENTATION decision
+        # (the project window), never the lane-scoped one.
+        decision = ops.group_action_calls[0]["decision"]
+        self.assertFalse(hasattr(decision, "separated"))
+        self.assertIn("to Project Group window 'grp-win'", ops.emitted[0])
+
+    def test_same_column_compat_records_the_fallback_machine_readably(self) -> None:
+        ops = self._sublane_ops(record={"presentation": {}})
+        outcome, _routes = self._run(_args(json_output=True), ops)
+        self.assertEqual(outcome.exit_code, 0)
+        payload = json.loads("\n".join(ops.emitted))
+        sub = payload["sublane_window"]
+        self.assertEqual(sub["window_policy"], "separate")
+        self.assertFalse(sub["separated"])
+        self.assertTrue(sub["degraded"])
+        self.assertIn("project_group_tmux_window", sub["diagnostic"])
+        # The shared-column action itself is unchanged (append beside wsB).
+        self.assertEqual(payload["action"], "append")
+
+    def test_same_column_real_run_emits_the_fallback_notice(self) -> None:
+        ops = self._sublane_ops(record={"presentation": {}})
+        _outcome, _routes = self._run(_args(), ops)
+        self.assertTrue(ops.emitted[0].startswith("appended 'sessX' as a new column"))
+        self.assertTrue(
+            any("delegation_window_policy 'separate'" in ln for ln in ops.emitted)
+        )
+
+    def test_bootstrap_degrades_and_still_creates_the_session(self) -> None:
+        ops = self._sublane_ops(columns=None)
+        outcome, _routes = self._run(_args(json_output=True), ops)
+        self.assertEqual(outcome.exit_code, 0)
+        payload = json.loads("\n".join(ops.emitted))
+        self.assertEqual(payload["action"], "create")
+        self.assertTrue(payload["sublane_window"]["degraded"])
+        self.assertIn("bootstrap", payload["sublane_window"]["diagnostic"])
+
+    def test_primary_checkout_payload_carries_no_sublane_window(self) -> None:
+        ops = FakeOps(columns=[_column("%1", workspace_id="wsB")])
+        routes = FakeRoutes()
+        outcome = CockpitDispatchUseCase(routes, ops).run(_args(json_output=True))
+        self.assertEqual(outcome.exit_code, 0)
+        payload = json.loads("\n".join(ops.emitted))
+        self.assertIsNone(payload["sublane_window"])
+
+    def test_dry_run_renders_the_sublane_window_line(self) -> None:
+        ops = self._sublane_ops()
+        plan = SimpleNamespace(commands=[])
+        ops.group_action = ("group_create", plan, None, "issue_42_topic")
+        _outcome, _routes = self._run(_args(dry_run=True), ops)
+        self.assertEqual(ops.executed, [])  # dry-run never mutates
+        self.assertTrue(
+            any(
+                "delegation_window_policy=separate -> sublane window "
+                "'issue_42_topic'" in ln
+                for ln in ops.emitted
+            )
+        )
+
+
 class BoundaryWiringTest(unittest.TestCase):
     """The live adapters and the `commands` thin wrapper stay wired (#13011)."""
 

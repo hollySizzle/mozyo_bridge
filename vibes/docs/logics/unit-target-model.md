@@ -356,6 +356,19 @@ iTerm2 の version / preference に依存する presentation result である。
 には一切使わない。Target resolver は Project Group tab ではなく、Unit -> role ->
 TargetRecord の preflight で配送先を決める。
 
+Redmine #13015 は faithful `project_group_tmux_window` 実行の上に sublane 分離を
+重ねる: `delegation_window_policy: separate` (既定、正本は
+`delegated-coordinator-cockpit-display.md` `## window 分離方針`) の下で、非 default
+lane (worktree / clone / relocated checkout) の launch は Project Group window 内の
+column ではなく専用 sublane tmux window として配置され、期待 topology
+`cockpit main window -> project window -> sublane window` が actuation で満たされる。
+sublane window は window-level `@mozyo_group_id` marker に `lane:<workspace_id>/<lane_id>`
+key を stamp して再配置に使い (window 名は表示のみ)、cross-window duplicate gate と
+pane identity stamping は Project Group window と同一。配置できない場合の fallback
+(`same_cockpit_column` compat / session bootstrap / `shared` 選択) は `--json` の
+`sublane_window` field に machine-readable に記録され、silent reroute しない。
+routing / approval / close authority に使わない点は変わらない。
+
 > 実装メモ (#12264): 本 Project Group read model の **生成 (home-state projection)** は
 > `src/mozyo_bridge/domain/grouped_read_model.py` に実装済み
 > (`build_grouped_read_model`)。入力は #12263 の desired presentation config /

@@ -47,6 +47,13 @@ adopt-advisory and degraded-presentation notices, and the attach /
 ``--no-attach`` tail are unchanged from the original command body. This module
 reuses the #12977 plan executor via the port; it never reimplements executor
 semantics.
+
+Redmine #13015 adds the sublane separate-window placement on top: under
+``delegation_window_policy: separate`` a sublane whose repo faithfully executes
+``project_group_tmux_window`` gets its own sublane tmux window via the same
+group-window action machinery; every fallback to the shared column is recorded
+machine-readably on the ``sublane_window`` payload field (never a silent
+reroute), and the ``same_cockpit_column`` default flow itself is unchanged.
 """
 
 from __future__ import annotations
@@ -79,6 +86,7 @@ from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.do
     LaunchContext,
     resolve_group_window_placement,
     resolve_launch_placement,
+    resolve_sublane_window_placement,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfigError,
@@ -255,6 +263,7 @@ def build_cockpit_json_payload(
     presentation_decision: Any,
     presentation_blocked: Optional[str],
     group_window: Optional[str],
+    sublane_decision: Any = None,
 ) -> dict:
     """The ``mozyo cockpit --json`` payload (pure projection, #11803/#12739)."""
     payload = plan.as_dict() if plan is not None else {}
@@ -279,6 +288,10 @@ def build_cockpit_json_payload(
     )
     payload["presentation_blocked"] = presentation_blocked
     payload["group_window"] = group_window
+    # #13015: sublane window decision + machine-readable degraded fallback.
+    payload["sublane_window"] = (
+        sublane_decision.as_dict() if sublane_decision is not None else None
+    )
     return payload
 
 
@@ -293,6 +306,7 @@ def render_cockpit_dry_run_lines(
     presentation_decision: Any,
     presentation_blocked: Optional[str],
     group_window: Optional[str],
+    sublane_decision: Any = None,
 ) -> list[str]:
     """The ``mozyo cockpit --dry-run`` plan text (pure rendering, #11803)."""
     lines = [
@@ -312,11 +326,24 @@ def render_cockpit_dry_run_lines(
     elif presentation_decision is not None and presentation_decision.degraded:
         lines.append(f"  presentation: {presentation_decision.diagnostic}")
     if group_window is not None:
-        lines.append(
-            f"  presentation: project_group_tmux_window -> Project Group window "
-            f"{group_window!r} (tmux window requested, never guaranteed; "
-            "display only)"
-        )
+        if sublane_decision is not None and getattr(
+            sublane_decision, "separated", False
+        ):
+            # #13015: the plan targets the lane's own sublane window.
+            lines.append(
+                f"  presentation: delegation_window_policy=separate -> sublane "
+                f"window {group_window!r} (tmux window requested, never "
+                "guaranteed; display only)"
+            )
+        else:
+            lines.append(
+                f"  presentation: project_group_tmux_window -> Project Group window "
+                f"{group_window!r} (tmux window requested, never guaranteed; "
+                "display only)"
+            )
+    elif sublane_decision is not None and getattr(sublane_decision, "degraded", False):
+        # #13015: explicit sublane-window fallback, never silent.
+        lines.append(f"  presentation: {sublane_decision.diagnostic}")
     if adopt_advisory is not None and adopt_advisory.message:
         lines.append(f"  {adopt_advisory.message}")
     return lines
@@ -771,6 +798,7 @@ class CockpitDispatchUseCase:
         # a silent reroute. Display-only: never a routing / approval authority.
         presentation_decision = None
         presentation_blocked = None
+        grouping = None
         try:
             grouping = self._ops.load_presentation_grouping(repo_root)
             placement = resolve_launch_placement(
@@ -803,14 +831,35 @@ class CockpitDispatchUseCase:
             == GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW
         )
 
+        # Sublane separate-window placement (Redmine #13015): under
+        # `delegation_window_policy: separate` a launching sublane gets its OWN
+        # tmux window, riding the faithful group-window flow (#12330); every
+        # other case keeps the shared column, with the fallback recorded
+        # machine-readably on the decision (never a silent reroute).
+        sublane_decision = None
+        if grouping is not None and presentation_blocked is None:
+            sublane_decision = resolve_sublane_window_placement(
+                grouping.delegation_window_policy,
+                workspace_id=workspace.workspace_id, lane_id=workspace.lane_id,
+                lane_label=workspace.lane_label,
+                group_window_executing=faithful_group,
+                cockpit_window_present=columns is not None,
+            )
+        sublane_separate = sublane_decision is not None and sublane_decision.separated
+
+        # The sublane's own window (when separated) wins over the project-group
+        # window; both run through the same group-window action machinery.
+        window_decision = None
+        if sublane_separate:
+            window_decision = sublane_decision
+        elif faithful_group and columns is not None:
+            window_decision = presentation_decision
+
         group_window = None
-        if faithful_group and columns is not None:
+        if window_decision is not None:
             action, plan, blocked_reason, group_window = self._ops.group_window_action(
-                workspace,
-                session,
-                decision=presentation_decision,
-                codex_ratio=codex_ratio,
-                launch=launch,
+                workspace, session, decision=window_decision,
+                codex_ratio=codex_ratio, launch=launch,
             )
         else:
             action, plan, blocked_reason = resolve_shared_cockpit_action(
@@ -836,6 +885,7 @@ class CockpitDispatchUseCase:
                 presentation_decision=presentation_decision,
                 presentation_blocked=presentation_blocked,
                 group_window=group_window,
+                sublane_decision=sublane_decision,
             )
             self._ops.emit(
                 json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -852,6 +902,7 @@ class CockpitDispatchUseCase:
                 presentation_decision=presentation_decision,
                 presentation_blocked=presentation_blocked,
                 group_window=group_window,
+                sublane_decision=sublane_decision,
             ):
                 self._ops.emit(line)
             return CockpitDispatchOutcome(exit_code=0)
@@ -880,16 +931,19 @@ class CockpitDispatchUseCase:
                 )
                 return CockpitDispatchOutcome(exit_code=0)
             self._ops.execute_plan(plan, cleanup_captured=True)
+            window_noun = (
+                "sublane window" if sublane_separate else "Project Group window"
+            )
             if action == GROUP_ACTION_CREATE:
                 self._ops.emit(
-                    f"created Project Group window {group_window!r} in cockpit "
+                    f"created {window_noun} {group_window!r} in cockpit "
                     f"{session!r} for {workspace.label!r}; switch to it with your tmux "
                     "window keys (no new iTerm window opened)."
                 )
             else:
                 self._ops.emit(
-                    f"appended {workspace.label!r} as a new column to Project Group "
-                    f"window {group_window!r} in cockpit {session!r}; switch to it with "
+                    f"appended {workspace.label!r} as a new column to {window_noun} "
+                    f"{group_window!r} in cockpit {session!r}; switch to it with "
                     "your tmux window keys (no new iTerm window opened)."
                 )
             if adopt_advisory is not None and adopt_advisory.message:
@@ -910,6 +964,8 @@ class CockpitDispatchUseCase:
                 self._ops.emit(f"  {adopt_advisory.message}")
             if presentation_decision is not None and presentation_decision.degraded:
                 self._ops.emit(f"  presentation: {presentation_decision.diagnostic}")
+            if sublane_decision is not None and sublane_decision.degraded:
+                self._ops.emit(f"  presentation: {sublane_decision.diagnostic}")
             if no_attach:
                 self._ops.emit(f"attach: tmux -CC attach -t {session}")
                 return CockpitDispatchOutcome(exit_code=0)
@@ -939,4 +995,6 @@ class CockpitDispatchUseCase:
             self._ops.emit(f"  {adopt_advisory.message}")
         if presentation_decision is not None and presentation_decision.degraded:
             self._ops.emit(f"  presentation: {presentation_decision.diagnostic}")
+        if sublane_decision is not None and sublane_decision.degraded:
+            self._ops.emit(f"  presentation: {sublane_decision.diagnostic}")
         return CockpitDispatchOutcome(exit_code=0)

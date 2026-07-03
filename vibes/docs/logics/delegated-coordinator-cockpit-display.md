@@ -119,6 +119,16 @@ worktree / lane を作る actuator ではない。子 coordinator が孫 dispatc
 だけ、または同じ lane 内の Claude へ Redmine anchor を渡しただけでは、3-window
 display acceptance を満たしたとは扱わない。
 
+補足 (#13015): 本 policy は launcher の **placement 判断** には接続されている。
+`mozyo cockpit append` (sublane actuator が駆動する経路を含む) は、`separate` の
+下で faithful `project_group_tmux_window` 実行時に、launch 対象の sublane
+(非 default lane) を project window 内の column ではなく専用 sublane tmux window
+として配置し、配置できない場合の fallback を `--json` の `sublane_window` field に
+machine-readable に記録する (silent reroute しない)。これは **既に launch される
+lane の置き場所** を policy に従わせるだけであり、上記の境界 — policy が worktree /
+lane を新規作成しないこと、3-window acceptance には孫 lane の実体化 + durable
+record + live projection が要ること — は変わらない。
+
 3-window / delegated-tree display の full PASS には、少なくとも次のいずれかが
 Redmine から replay でき、かつ live projection に反映されている必要がある。
 
