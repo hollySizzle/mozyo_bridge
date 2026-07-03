@@ -18,6 +18,7 @@ description: Follow the mozyo_bridge project workflow for ticket-driven work (Re
 
 - 作業実行規約: `references/workflow.md`
 - Redmine issue の起票粒度と Version 運用: `references/redmine-issue-authoring.md`
+- Subagent / background 委譲基準と hidden-worker 境界: `references/subagent-delegation.md`
 - Project map と正本 routing: `references/project-map.md`
 - Release と検証 check: `references/release.md`
 - tmux 通知動作の安全規約: `references/safety.md`

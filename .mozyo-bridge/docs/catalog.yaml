@@ -286,6 +286,17 @@ documents:
       - spec-work-unit-granularity-config
       - logic-redmine-version-operation-surface
 
+  - id: skill-subagent-delegation-reference
+    type: rule
+    status: active
+    canonical_path: skills/mozyo-bridge-agent/references/subagent-delegation.md
+    purpose: subagent / background 委譲基準と hidden-worker 禁止規約との境界 guideline。
+    audit_role: skill_subagent_delegation_rule
+    related_document_refs:
+      - skill-workflow-reference
+      - rule-project-agent-workflow
+      - rule-workflow-docs-boundary
+
   - id: skill-project-map-reference
     type: spec
     status: active
@@ -1665,6 +1676,7 @@ file_conventions:
       - skill-workflow-reference
       - skill-project-map-reference
       - skill-redmine-issue-authoring-reference
+      - skill-subagent-delegation-reference
       - logic-skill-distribution
       - skill-safety-reference
 
