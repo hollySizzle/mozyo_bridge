@@ -57,7 +57,7 @@ Redmine Version の役割は 2 語で書き分ける。
 - **literal 除外**: code 識別子 / CLI 名 / field 名 / 既存 journal 引用は現行どおり literal を保ち、本規律の対象外。
 - **適用範囲は非遡及。** 既存文書の全量遡及書き換えは行わない。本規律は新規・変更する規範文から適用する (歴史記述・既存 journal の非遡及と同じ思想)。
 
-Redmine Version は **planning / release-readiness / lane-inventory bucket (= 候補範囲)** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される version 番号の正本は tag / package metadata / release notes / release journal であり、Version 名に将来の package 番号を先入れしない。
+Redmine Version は **planning / release-readiness / lane-inventory bucket (= 候補範囲)** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される package version の正本は tag / package metadata / release notes / release journal であり、Redmine Version 名に将来の package 番号を先入れしない。
 
 サイズと lifecycle:
 

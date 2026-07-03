@@ -126,9 +126,9 @@ escalation trigger 一覧 (実装者 Claude がユーザー窓口 Codex へ esca
 - active lane-set は ready work unit 数最大化問題として扱う (標準単位は UserStory)。local soft profile の範囲で、期待される merge conflict / module_health baseline conflict / shared invariant conflict / rework cost を増やさない ready work unit を優先的に載せる。管理が面倒、pane が多い、1 lane が既に動いている、という coordinator 都合は stop reason ではない。
 - Smoke / acceptance / real-machine rerun は実装 blocker と混ぜず、最後に owner 承認付きの run window として扱う。実装 blocker が残る間は blocker issue を実装候補として扱い、smoke issue は実行承認まで hold する。
 - 親 UserStory が umbrella として複数 roadmap / acceptance group にまたがる場合、親へ fixed_version を一括 propagation しない。子 issue の実行可否は各 leaf の durable record と live integration state から読み、親 issue には umbrella / cross-group であることと close 条件を journal / description に記録する。
-- Redmine Version 名に将来の package release 番号 (`v0.10.x` など) を先入れしない。Version は作業テーマ / roadmap grouping / acceptance bundle の名前であり、package version の正本ではない。
+- Redmine Version 名に将来の package release 番号 (`v0.10.x` など) を先入れしない。Redmine Version は作業テーマ / roadmap grouping / acceptance bundle の名前であり、package version の正本ではない。
 - Package release 番号は release gate で、実際に release candidate に含める commit、互換性、release notes、tag / publish scope を確認してから決める。正本は Git tag、package metadata、release notes、release journal であり、Redmine Version 名ではない。
-- 既存の番号付き Version 名は歴史記録として残してよいが、新規 roadmap group 作成時は semver 風の番号を避ける。番号付き Version を改名する場合は、参照 issue / journal / roadmap への影響を Redmine に記録し、release / tag / publish / version bump とは別作業として扱う。
+- 既存の番号付き Redmine Version 名は歴史記録として残してよいが、新規 roadmap group 作成時は semver 風の番号を避ける。番号付き Redmine Version を改名する場合は、参照 issue / journal / roadmap への影響を Redmine に記録し、release / tag / publish / version bump とは別作業として扱う。
 - 将来 `lane_group` / `lane_set` 相当の Redmine custom field や workflow DB が整備された場合も、それは candidate grouping / decision support であり、active lane-set の正本にはしない。active lane-set の authority は coordinator の drain / dispatch decision journal と、その根拠になる Redmine issue / journal / Git state / gate state である。
 
 進捗管理と構造管理を混同しない。進捗・完了判定は UserStory、child issues、Version で行う。Epic / Feature は「この領域が project 上まだ有効か」を表す構造 node であり、配下 UserStory がすべて close されても自動 close しない。
