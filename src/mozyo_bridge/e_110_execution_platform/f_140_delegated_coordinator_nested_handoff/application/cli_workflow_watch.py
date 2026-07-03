@@ -32,8 +32,16 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json as _json
+import sys
 from pathlib import Path
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+    _repo_root_from_args,
+    load_workflow_binding,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
+)
 from mozyo_bridge.core.state.workflow_runtime_store import (
     META_CAPACITY,
     META_OWNER_OR_RELEASE_GATE,
@@ -308,7 +316,11 @@ def _candidate_from_record(rec) -> RouteCandidate | None:
 
 
 def evaluate_intake_from_store(
-    store: WorkflowRuntimeStore, markers, *, extra_route_records=()
+    store: WorkflowRuntimeStore,
+    markers,
+    *,
+    extra_route_records=(),
+    binding: RoleProviderBinding | None = None,
 ) -> EventIntakeOutcome:
     """Read persisted runtime state from ``store`` and fold the new markers in (pure read).
 
@@ -317,8 +329,10 @@ def evaluate_intake_from_store(
     the ``--route-identity`` specs supplied in *this* invocation — they are merged after the
     persisted routes (recorded order: persisted oldest, this-run newest) so a route supplied
     alongside a marker resolves that same marker's action, instead of only taking effect on
-    the next run. Does **not** persist — the caller decides whether to write the accepted
-    events (``--dry-run`` skips the write).
+    the next run. ``binding`` is the #12673 role->provider binding (the #13157 config
+    override, or the compatibility default when ``None``); it is threaded into both the
+    enrichment and the watcher's stricter ambiguity check. Does **not** persist — the caller
+    decides whether to write the accepted events (``--dry-run`` skips the write).
     """
     recorded = _recorded_events(store)
     meta = store.read_meta()
@@ -338,6 +352,7 @@ def evaluate_intake_from_store(
         ready_overlapping_work=_int_meta(meta, META_READY_OVERLAP),
         capacity_remaining=_int_meta(meta, META_CAPACITY),
         owner_or_release_gate_active=_bool_meta(meta, META_OWNER_OR_RELEASE_GATE),
+        binding=binding,
     )
 
 
@@ -352,12 +367,19 @@ def cmd_workflow_watch(args: argparse.Namespace) -> int:
     markdown with ``--journal``. Never sends; always returns 0 (the result is a record).
     """
     store = _store_from_args(args)
+    binding, warnings = load_workflow_binding(_repo_root_from_args(args))
+    # Advisory (non-blocking) binding warnings to stderr so the single structured envelope
+    # on stdout stays clean (#13157).
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     # Redmine-sourced structured markers (the event source) first, then explicit --marker
     # specs (debug / supplemental); both feed the same intake. Duplicate anchors across the
     # two are deduplicated by the intake's redmine:<issue>:<journal> suppression.
     markers = _markers_from_redmine_json(args) + tuple(getattr(args, "marker", None) or ())
     routes = list(getattr(args, "route_identity", None) or ())
-    outcome = evaluate_intake_from_store(store, markers, extra_route_records=routes)
+    outcome = evaluate_intake_from_store(
+        store, markers, extra_route_records=routes, binding=binding
+    )
 
     if not getattr(args, "dry_run", False):
         accepted = outcome.accepted_events
@@ -488,6 +510,17 @@ def register_watch(workflow_sub) -> None:
         help=(
             "Emit the durable record markdown (intake summary + command-result record) for "
             "the Redmine journal (takes precedence over --json)."
+        ),
+    )
+    watch.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Repo root whose .mozyo-bridge/config.yaml provides the role->provider binding "
+            "override (Redmine #13157). A missing file / provider_binding block threads the "
+            "compatibility default (codex/claude). Defaults to the resolved repo root."
         ),
     )
     watch.add_argument(

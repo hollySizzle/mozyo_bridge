@@ -229,6 +229,65 @@ class JournalTest(unittest.TestCase):
         self.assertIn("- target_issue: 12858", text)
 
 
+class ProviderBindingWiringTest(unittest.TestCase):
+    """`--repo` config live-wires the #12673 role->provider binding (Redmine #13157)."""
+
+    def _run_with_repo(self, argv):
+        parser = build_parser()
+        ns = parser.parse_args(argv)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = ns.func(ns)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _repo_with_binding(self, body: str) -> str:
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        cfg_dir = Path(tmp) / ".mozyo-bridge"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.yaml").write_text(body, encoding="utf-8")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        return tmp
+
+    def test_no_provider_binding_block_is_behavior_preserving(self):
+        repo = self._repo_with_binding("cli:\n  disabled: []\n")
+        rc, text, err = self._run_with_repo(
+            ["workflow", "runtime", "--event", "13157:review_request", "--repo", repo]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("owner_role: auditor", text)
+        # Default binding: auditor runs on codex, no warning.
+        self.assertIn("provider: codex", text)
+        self.assertIn("role_provider: auditor via codex", text)
+        self.assertEqual(err.strip(), "")
+
+    def test_override_is_reflected_and_warns(self):
+        repo = self._repo_with_binding(
+            "provider_binding:\n  bindings:\n    auditor: claude\n"
+        )
+        rc, text, err = self._run_with_repo(
+            ["workflow", "runtime", "--event", "13157:review_request", "--repo", repo]
+        )
+        self.assertEqual(rc, 0)
+        # The rebind is reflected in the observable provider / role_provider display.
+        self.assertIn("provider: claude", text)
+        self.assertIn("role_provider: auditor via claude", text)
+        # auditor now == implementer (both claude) -> advisory warning on stderr, not stdout.
+        self.assertIn("warning:", err)
+        self.assertIn("auditor and implementer", err)
+        self.assertNotIn("warning:", text)
+
+    def test_unknown_role_in_config_fails_closed(self):
+        repo = self._repo_with_binding(
+            "provider_binding:\n  bindings:\n    reviewer: claude\n"
+        )
+        with self.assertRaises(Exception):
+            self._run_with_repo(
+                ["workflow", "runtime", "--event", "13157:review_request", "--repo", repo]
+            )
+
+
 class ParseErrorTest(unittest.TestCase):
     def test_malformed_event_rejected(self):
         with self.assertRaises(SystemExit):

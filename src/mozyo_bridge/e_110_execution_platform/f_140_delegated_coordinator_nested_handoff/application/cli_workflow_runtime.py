@@ -30,8 +30,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json as _json
+import sys
 from pathlib import Path
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+    _repo_root_from_args,
+    load_workflow_binding,
+)
 from mozyo_bridge.core.state.workflow_runtime_store import (
     META_CAPACITY,
     META_OWNER_OR_RELEASE_GATE,
@@ -282,8 +287,18 @@ def _command_result_from_args(args: argparse.Namespace) -> WorkflowCommandResult
     next action enriched with route_identity / anchor / risk_level / requires_confirmation
     / blocked_reason. Route candidates come from the supplied ``--route-identity`` specs
     (provider role + public-safe pointer; a malformed identity is skipped so its lane fails
-    closed), and each lane's anchor is its latest supplied event id. No pane id is emitted.
+    closed), and each lane's anchor is its latest supplied event id. The role->provider
+    binding is resolved from ``--repo``'s repo-local config (#13157) and threaded into the
+    enrichment so a configured rebind (e.g. ``auditor: claude``) is reflected in the
+    ``provider`` / ``role_provider`` display and the route selection; an unconfigured repo
+    threads the compatibility default (behavior-preserving). No pane id is emitted.
     """
+    binding, warnings = load_workflow_binding(_repo_root_from_args(args))
+    # Advisory (non-blocking) binding warnings — e.g. auditor and implementer bound to the
+    # same provider (#13157). Emitted to stderr so the single structured envelope on stdout
+    # (text / --json / --journal) stays clean.
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     events = _events_from_args(args)
     state = evaluate_workflow_runtime(
         events,
@@ -308,7 +323,7 @@ def _command_result_from_args(args: argparse.Namespace) -> WorkflowCommandResult
         issue_anchors[event.issue] = event.event_id
 
     next_action = derive_workflow_next_action(
-        state, issue_routes=issue_routes, issue_anchors=issue_anchors
+        state, issue_routes=issue_routes, issue_anchors=issue_anchors, binding=binding
     )
     return WorkflowCommandResult(state=state, next_action=next_action)
 
@@ -484,6 +499,18 @@ def register_runtime(workflow_sub) -> None:
             "last_seen_pane_id, never a routing key), observed. The route_identity in "
             "`workflow resume` output is the public-safe pointer; the pane id is never "
             "emitted."
+        ),
+    )
+    runtime.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Repo root whose .mozyo-bridge/config.yaml provides the role->provider binding "
+            "override (Redmine #13157). A missing file / provider_binding block threads the "
+            "compatibility default (codex/claude), so an unconfigured repo is unchanged. "
+            "Defaults to the resolved repo root."
         ),
     )
     runtime.add_argument(

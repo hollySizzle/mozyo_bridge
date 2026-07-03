@@ -46,6 +46,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     PresentationSelectionConfig,
     RepoLocalConfig,
     RepoLocalConfigError,
+    RoleProviderBindingConfig,
     SublaneIntegrationConfig,
     WorkUnitGranularityConfig,
 )
@@ -703,6 +704,50 @@ class AgentLaunchConfigTest(unittest.TestCase):
     def test_unsupported_version_fails_closed(self) -> None:
         with self.assertRaises(RepoLocalConfigError):
             AgentLaunchConfig.from_record({"version": 2})
+
+
+class ProviderBindingConfigTest(unittest.TestCase):
+    """The role -> provider binding override sub-record (Redmine #13157)."""
+
+    def test_default_is_behavior_preserving(self) -> None:
+        default = RoleProviderBindingConfig.default()
+        self.assertEqual(RepoLocalConfig.default().provider_binding, default)
+        self.assertEqual(default.advisory_warnings(), ())
+
+    def test_missing_block_keeps_default(self) -> None:
+        config = RepoLocalConfig.from_record({"cli": {"disabled": ["cockpit"]}})
+        self.assertEqual(
+            config.provider_binding, RoleProviderBindingConfig.default()
+        )
+
+    def test_override_maps_through_top_level(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"provider_binding": {"bindings": {"auditor": "claude"}}}
+        )
+        self.assertEqual(
+            config.provider_binding.binding.provider_for("auditor"), "claude"
+        )
+
+    def test_unknown_role_via_top_level_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"provider_binding": {"bindings": {"reviewer": "claude"}}}
+            )
+
+    def test_unknown_sub_key_via_top_level_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"provider_binding": {"binding": {}}})
+
+    def test_non_mapping_block_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"provider_binding": ["auditor=claude"]})
+
+    def test_provider_binding_is_a_recognized_top_level_key(self) -> None:
+        # It is NOT rejected as an unknown top-level key or a boundary-shaped key.
+        config = RepoLocalConfig.from_record({"provider_binding": {}})
+        self.assertEqual(
+            config.provider_binding, RoleProviderBindingConfig.default()
+        )
 
 
 if __name__ == "__main__":

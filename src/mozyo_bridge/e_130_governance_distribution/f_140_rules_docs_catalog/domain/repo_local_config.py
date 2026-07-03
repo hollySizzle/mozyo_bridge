@@ -19,6 +19,11 @@ internal selection records:
   (Redmine #13002): the governed work-unit granularity for sublane dispatch
   (``epic`` / ``feature`` / ``user_story`` / ``leaf_issue``). Default
   (``user_story``) is the standard governed unit.
+- ``provider_binding`` -> :class:`mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding_config.RoleProviderBindingConfig`
+  (Redmine #13157): role -> runtime-provider binding overrides that live-wire the
+  #12673 ``RoleProviderBinding`` seam. The role vocabulary is closed (an unknown
+  role fails closed) while the provider vocabulary stays open. Default (no
+  overrides) is the legacy codex/claude map, so it is behavior-preserving.
 
 Boundary, kept enforced in code (this is *schema only*):
 
@@ -66,6 +71,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WorkUnitGranularityConfig,
     WorkUnitGranularityError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding_config import (
+    RoleProviderBindingConfig,
+    RoleProviderBindingConfigError,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import CliCompositionConfig
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
@@ -93,6 +102,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "sublane_integration",
         "work_unit",
         "agent_launch",
+        "provider_binding",
     }
 )
 
@@ -645,10 +655,11 @@ class AgentLaunchConfig:
 class RepoLocalConfig:
     """The closed top-level ``.mozyo-bridge/config.yaml`` record (schema only).
 
-    Composes the six configurable surfaces — :attr:`cli`, :attr:`providers`,
+    Composes the configurable surfaces — :attr:`cli`, :attr:`providers`,
     :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration`,
-    :attr:`work_unit` — each behavior-preserving by default. The default (no
-    fields set) reproduces the current ``mozyo-bridge`` behavior exactly.
+    :attr:`work_unit`, :attr:`agent_launch`, :attr:`provider_binding` — each
+    behavior-preserving by default. The default (no fields set) reproduces the
+    current ``mozyo-bridge`` behavior exactly.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -673,6 +684,9 @@ class RepoLocalConfig:
     )
     agent_launch: AgentLaunchConfig = field(
         default_factory=AgentLaunchConfig.default
+    )
+    provider_binding: RoleProviderBindingConfig = field(
+        default_factory=RoleProviderBindingConfig.default
     )
 
     @classmethod
@@ -778,6 +792,19 @@ class RepoLocalConfig:
         # ``agent_launch`` block resolves to the behavior-preserving default (no
         # ``--model`` flag), so a repo with no block launches exactly as before.
         agent_launch = AgentLaunchConfig.from_record(record.get("agent_launch"))
+        # The role -> provider binding override knob (#13157) live-wires the #12673
+        # RoleProviderBinding seam. It is parsed by its own self-contained domain schema;
+        # its RoleProviderBindingConfigError is re-raised as a RepoLocalConfigError so the
+        # loader keeps a single fail-closed boundary. An absent ``provider_binding`` block
+        # resolves to the legacy codex/claude default, so it stays behavior-preserving.
+        try:
+            provider_binding = RoleProviderBindingConfig.from_record(
+                record.get("provider_binding")
+            )
+        except RoleProviderBindingConfigError as exc:
+            raise RepoLocalConfigError(
+                f"provider_binding config is invalid: {exc}"
+            ) from exc
         return cls(
             cli=cli,
             providers=providers,
@@ -786,6 +813,7 @@ class RepoLocalConfig:
             sublane_integration=sublane_integration,
             work_unit=work_unit,
             agent_launch=agent_launch,
+            provider_binding=provider_binding,
         )
 
 
@@ -803,6 +831,8 @@ __all__ = (
     "PresentationSelectionConfig",
     "SublaneIntegrationConfig",
     "AgentLaunchConfig",
+    "RoleProviderBindingConfig",
+    "RoleProviderBindingConfigError",
     "RepoLocalConfig",
     "DelegationConfig",
     "DelegationConfigError",

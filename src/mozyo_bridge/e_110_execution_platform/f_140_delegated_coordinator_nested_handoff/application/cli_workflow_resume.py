@@ -28,9 +28,17 @@ from __future__ import annotations
 
 import argparse
 import json as _json
+import sys
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+    _repo_root_from_args,
+    load_workflow_binding,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
+)
 from mozyo_bridge.core.state.workflow_runtime_store import (
     META_CAPACITY,
     META_OWNER_OR_RELEASE_GATE,
@@ -104,6 +112,8 @@ def assemble_command_result(
     event_rows: Iterable[WorkflowEventRow],
     route_rows: Iterable[WorkflowRouteRow],
     meta: Mapping[str, str],
+    *,
+    binding: RoleProviderBinding | None = None,
 ) -> WorkflowCommandResult:
     """Fold persisted runtime state into the enriched command result (pure given rows).
 
@@ -114,7 +124,10 @@ def assemble_command_result(
       skipped rather than failing the whole resume. Selection by owner_role + fail-closed on
       no provider match happens in :func:`derive_workflow_next_action`;
     - the latest persisted event id per issue is that lane's durable anchor;
-    - the advisory meta reproduces the ready-work / capacity / owner-gate inputs.
+    - the advisory meta reproduces the ready-work / capacity / owner-gate inputs;
+    - ``binding`` is the #12673 role->provider binding (the #13157 config override, or the
+      compatibility default when ``None``) the enrichment resolves the provider / route
+      through.
     """
     events = [_event_from_row(row) for row in event_rows]
 
@@ -148,14 +161,26 @@ def assemble_command_result(
         state,
         issue_routes=issue_routes,
         issue_anchors=issue_anchors,
+        binding=binding,
     )
     return WorkflowCommandResult(state=state, next_action=next_action)
 
 
-def resume_command_result(store: WorkflowResumeStore) -> WorkflowCommandResult:
-    """Read the persisted runtime state from ``store`` and assemble the command result."""
+def resume_command_result(
+    store: WorkflowResumeStore, *, binding: RoleProviderBinding | None = None
+) -> WorkflowCommandResult:
+    """Read the persisted runtime state from ``store`` and assemble the command result.
+
+    ``binding`` is the #12673 role->provider binding (the #13157 config override, or the
+    compatibility default when ``None``); it is threaded into the enrichment so a configured
+    rebind is reflected in the resumed ``provider`` / ``role_provider`` display and route
+    selection.
+    """
     return assemble_command_result(
-        store.read_events(), store.read_route_identities(), store.read_meta()
+        store.read_events(),
+        store.read_route_identities(),
+        store.read_meta(),
+        binding=binding,
     )
 
 
@@ -175,7 +200,12 @@ def cmd_workflow_resume(args: argparse.Namespace) -> int:
     with ``--journal``. Always returns 0: the result is advisory and never blocks. A pane
     id is never emitted.
     """
-    result = resume_command_result(_store_from_args(args))
+    binding, warnings = load_workflow_binding(_repo_root_from_args(args))
+    # Advisory (non-blocking) binding warnings to stderr so the single structured envelope
+    # on stdout stays clean (#13157).
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    result = resume_command_result(_store_from_args(args), binding=binding)
     if getattr(args, "as_journal", False):
         print(render_command_result_journal(result))
     elif getattr(args, "as_json", False):
@@ -209,6 +239,17 @@ def register_resume(workflow_sub) -> None:
         help=(
             "Explain the current workflow state and the next action from persisted mozyo "
             "DB runtime state (enriched next_action). Advisory; never blocks."
+        ),
+    )
+    resume.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Repo root whose .mozyo-bridge/config.yaml provides the role->provider binding "
+            "override (Redmine #13157). A missing file / provider_binding block threads the "
+            "compatibility default (codex/claude). Defaults to the resolved repo root."
         ),
     )
     resume.add_argument(

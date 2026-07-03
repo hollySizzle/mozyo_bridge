@@ -58,6 +58,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_CONCLUSIONS,
     REVIEW_PENDING,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    RoleProviderBinding,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_next_action import (
     BLOCKED_NONE,
     RISK_HIGH,
@@ -301,7 +304,10 @@ def classify_intake(
 
 
 def select_route(
-    owner_role: str, candidates: Sequence[RouteCandidate]
+    owner_role: str,
+    candidates: Sequence[RouteCandidate],
+    *,
+    binding: RoleProviderBinding | None = None,
 ) -> tuple[str, str]:
     """Watcher route selection: ambiguity-aware + fail-closed (pure).
 
@@ -321,9 +327,12 @@ def select_route(
     Distinctness is by pointer string: the same route recorded twice is not ambiguous; two
     different routes for the same provider is. Uses the shared #12671 role->provider binding
     (:func:`...workflow_next_action.expected_provider_for`) so the watcher and ``resume``
-    never drift.
+    never drift. ``binding`` is the #12673 role->provider binding (the #13157 config-driven
+    override, or the compatibility default when ``None``); it must be the SAME binding the
+    matching :func:`derive_workflow_next_action` resolved through, so the watcher's stricter
+    ambiguity check and the enrichment's route selection agree on the expected provider.
     """
-    expected = expected_provider_for(owner_role)
+    expected = expected_provider_for(owner_role, binding=binding)
     if expected is None:
         return "", ""
     matching = [c.pointer for c in candidates if c.provider_role == expected]
@@ -409,6 +418,7 @@ def classify_pending_action(
     next_action: WorkflowNextAction,
     *,
     issue_routes: Mapping[str, Sequence[RouteCandidate]] | None = None,
+    binding: RoleProviderBinding | None = None,
 ) -> PendingWorkflowAction:
     """Classify an enriched next action into a pending action (pure).
 
@@ -438,7 +448,9 @@ def classify_pending_action(
         # The next action resolved a route via last-write-wins; the watcher additionally
         # refuses an ambiguous target. Only routing actions reach here (route_identity is
         # only set for them), so a non-routing owner never trips this.
-        _pointer, reason = select_route(next_action.owner_role, routes.get(target, ()))
+        _pointer, reason = select_route(
+            next_action.owner_role, routes.get(target, ()), binding=binding
+        )
         if reason == FAILED_ROUTE_AMBIGUOUS:
             escalated = _escalate(next_action.risk_level, RISK_HIGH)
             failed_next = WorkflowNextAction(
@@ -480,6 +492,7 @@ def evaluate_event_intake(
     ready_overlapping_work: int = 0,
     capacity_remaining: int = 0,
     owner_or_release_gate_active: bool = False,
+    binding: RoleProviderBinding | None = None,
 ) -> EventIntakeOutcome:
     """Fold newly observed markers into a pending workflow action (pure given inputs).
 
@@ -494,8 +507,12 @@ def evaluate_event_intake(
 
     ``recorded_events`` / ``known_event_ids`` come from the persisted store; passing the
     recorded events keeps a lane's prior state in the fold even when this batch only adds a
-    later journal. Routes / advisory inputs come from the store too. This function performs
-    no I/O — persistence and rendering are the caller's job.
+    later journal. Routes / advisory inputs come from the store too. ``binding`` is the
+    #12673 role->provider binding (the #13157 config override, or the compatibility default
+    when ``None``); it is threaded into both the enrichment (route selection / provider
+    display) and the watcher's stricter ambiguity check so both resolve the owner's expected
+    provider through the same binding. This function performs no I/O — persistence and
+    rendering are the caller's job.
     """
     recorded = tuple(recorded_events)
     known = list(known_event_ids) or [e.event_id for e in recorded]
@@ -519,10 +536,12 @@ def evaluate_event_intake(
         owner_or_release_gate_active=owner_or_release_gate_active,
     )
     next_action = derive_workflow_next_action(
-        state, issue_routes=issue_routes, issue_anchors=issue_anchors
+        state, issue_routes=issue_routes, issue_anchors=issue_anchors, binding=binding
     )
     command_result = WorkflowCommandResult(state=state, next_action=next_action)
-    pending = classify_pending_action(next_action, issue_routes=issue_routes)
+    pending = classify_pending_action(
+        next_action, issue_routes=issue_routes, binding=binding
+    )
     return EventIntakeOutcome(
         intake=intake, command_result=command_result, pending_action=pending
     )
