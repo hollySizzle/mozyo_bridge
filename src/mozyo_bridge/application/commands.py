@@ -22,6 +22,10 @@ from mozyo_bridge.application.pane_primitive_command import (
     PanePrimitiveOutcome,
     PanePrimitiveUseCase,
 )
+from mozyo_bridge.application.handoff_target_activation_command import (
+    LiveTargetActivationOps,
+    TargetActivationUseCase,
+)
 from mozyo_bridge.application.handoff_delivery_command import (
     DeliveryRecordUseCase,
     LiveDeliveryRecordOps,
@@ -1826,52 +1830,49 @@ def _maybe_persist_delivery_record(
 
 
 def _window_active_pane_id(target_info: dict) -> str | None:
-    """Best-effort id of the currently-active pane in the target's window.
+    """Thin seam over :meth:`TargetActivationUseCase.window_active_pane_id` (#13124).
 
-    Reads a live `pane_lines()` snapshot (Redmine #12597) and returns the id of
-    the *other* pane that is the active split of the target pane's window, so the
-    durable record can show which pane was active before
-    standard_target_admission activated the target. Returns `None` when it cannot
-    be observed (no window location, snapshot failure, or no other active pane);
-    a failure here must never break delivery.
+    The best-effort previously-active-pane observation (Redmine #12597) moved to
+    ``application/handoff_target_activation_command.py``; the live adapter reads
+    the ``pane_lines()`` snapshot through :mod:`pane_resolver` at call time, so
+    the observation seam and the never-break-delivery degrade are unchanged.
     """
-    location = target_info.get("location") or ""
-    window_prefix = location.rsplit(".", 1)[0] if "." in location else location
-    if not window_prefix:
-        return None
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-
-    try:
-        for pane in _pr.pane_lines():
-            if pane.get("id") == target_info.get("id"):
-                continue
-            pane_loc = pane.get("location") or ""
-            pane_window = (
-                pane_loc.rsplit(".", 1)[0] if "." in pane_loc else pane_loc
-            )
-            if pane_window == window_prefix and pane.get("pane_active") == "1":
-                return pane.get("id")
-    except (Exception, SystemExit):
-        return None
-    return None
+    return TargetActivationUseCase(LiveTargetActivationOps()).window_active_pane_id(
+        target_info
+    )
 
 
 def _activate_target_pane(target_info: dict) -> TargetActivationOutcome:
-    """Activate an admitted inactive split via `tmux select-pane` (Redmine #12597).
+    """Thin seam over :meth:`TargetActivationUseCase.activate_target_pane` (#13124).
 
-    Pane SELECTION only — never raw `send-keys` / `paste-buffer` / low-level
-    `type` / `keys` as a delivery recovery path. Captures the previously-active
-    pane first so the durable record can show the active化 / restore facts; the
-    optional restore runs after delivery on the sent terminal path.
+    The standard_target_admission `tmux select-pane` activation (Redmine #12597
+    — pane SELECTION only, never raw key injection) moved to
+    ``application/handoff_target_activation_command.py``; the live adapter
+    routes ``run_tmux`` through this module at call time. Kept module-level
+    because ``orchestrate_handoff`` calls it on the deferred-activation path.
     """
-    target = target_info["id"]
-    previous = _window_active_pane_id(target_info)
-    run_tmux("select-pane", "-t", target)
-    return TargetActivationOutcome(
-        activated=True,
-        target_pane=target,
-        previous_active_pane=previous,
-        restored=False,
+    return TargetActivationUseCase(LiveTargetActivationOps()).activate_target_pane(
+        target_info
+    )
+
+
+def _maybe_restore_previous_active(
+    target_activation: TargetActivationOutcome | None,
+    *,
+    restore_previous_active: bool,
+) -> TargetActivationOutcome | None:
+    """Thin seam over :meth:`TargetActivationUseCase.maybe_restore_previous_active` (#13124).
+
+    The post-delivery focus restore (Redmine #12597 — pane selection only,
+    best-effort: a vanished pane must not break the already-completed send)
+    moved to ``application/handoff_target_activation_command.py``. Kept
+    module-level because ``orchestrate_handoff`` calls it on the sent terminal
+    path.
+    """
+    return TargetActivationUseCase(
+        LiveTargetActivationOps()
+    ).maybe_restore_previous_active(
+        target_activation, restore_previous_active=restore_previous_active
     )
 
 
@@ -3260,21 +3261,10 @@ def orchestrate_handoff(
     # and the policy asks to restore focus, re-select the previously-active pane
     # after delivery. Pane selection only, best-effort (a vanished pane must not
     # break the already-completed send), and the restore fact is recorded.
-    if (
-        target_activation is not None
-        and admission_policy.restore_previous_active
-        and target_activation.previous_active_pane
-    ):
-        try:
-            run_tmux("select-pane", "-t", target_activation.previous_active_pane)
-            target_activation = TargetActivationOutcome(
-                activated=True,
-                target_pane=target_activation.target_pane,
-                previous_active_pane=target_activation.previous_active_pane,
-                restored=True,
-            )
-        except (Exception, SystemExit):
-            pass
+    target_activation = _maybe_restore_previous_active(
+        target_activation,
+        restore_previous_active=admission_policy.restore_previous_active,
+    )
     _emit_outcome(
         outcome,
         record_format=record_format,

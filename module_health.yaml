@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3477
+    lines: 3467
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -864,6 +864,24 @@ allowlist:
       seams importable, and the relocated ``cmd_doctor`` resolves them through
       this module's globals at call time. 3507 -> 3477 is a 30-line net removal
       and the post-merge ``commands.py`` line count is 3477.
+      Lowered 3477 -> 3467 for the #13124 handoff target-activation facade
+      cleanup: the standard_target_admission activation/restore tail (#12597)
+      — the ``_window_active_pane_id`` observation, the
+      ``_activate_target_pane`` `select-pane` activation, and the
+      ``orchestrate_handoff`` post-delivery focus-restore block — moved into
+      the new ``application/handoff_target_activation_command.py`` boundary (a
+      ``TargetActivationOps`` port + ``LiveTargetActivationOps`` adapter and a
+      ``TargetActivationUseCase`` with ``window_active_pane_id`` /
+      ``activate_target_pane`` / ``maybe_restore_previous_active``). The two
+      helpers stay here as thin seams plus a new
+      ``_maybe_restore_previous_active`` seam on the sent terminal path; the
+      adapter resolves ``commands.run_tmux`` and ``pane_resolver.pane_lines``
+      at call time, so the queue-enter activation / restore /
+      ``--no-target-activation`` characterization tests keep intercepting
+      unchanged and the admission gate itself is untouched. 3477 -> 3467 is a
+      10-line net removal and the post-merge ``commands.py`` line count is
+      3467. ``test_handoff_target_activation_command`` adds the fake-port
+      use-case specifications.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
