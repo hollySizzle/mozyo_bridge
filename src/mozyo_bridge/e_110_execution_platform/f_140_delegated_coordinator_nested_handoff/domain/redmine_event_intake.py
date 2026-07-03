@@ -464,6 +464,9 @@ def classify_pending_action(
                 requires_confirmation=True,
                 blocked_reason=FAILED_ROUTE_AMBIGUOUS,
                 reason=next_action.reason,
+                # Keep the enrichment's resolved provider (#12673 binding surface): the
+                # fail-closed rebuild must not drop the rebound provider (#13157 j#71977).
+                provider=next_action.provider,
             )
             return PendingWorkflowAction(
                 status=PENDING_FAILED,

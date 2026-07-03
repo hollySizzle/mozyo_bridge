@@ -244,6 +244,28 @@ class ClassifyPendingActionTest(unittest.TestCase):
         self.assertTrue(pending.next_action.requires_confirmation)
         self.assertEqual(pending.next_action.risk_level, RISK_HIGH)
 
+    def test_ambiguous_route_failure_preserves_provider_under_rebind(self):
+        # j#71977: the fail-closed route_ambiguous rebuild must keep the enrichment's
+        # resolved provider — under an auditor -> claude rebind the failed pending action
+        # still reports provider "claude", not the dataclass default "".
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+            RoleProviderBinding,
+        )
+
+        binding = RoleProviderBinding.default().with_overrides({"auditor": "claude"})
+        routes = {
+            "12672": [
+                RouteCandidate(provider_role="claude", pointer="p-a"),
+                RouteCandidate(provider_role="claude", pointer="p-b"),
+            ]
+        }
+        pending = classify_pending_action(
+            _next_action(provider="claude"), issue_routes=routes, binding=binding
+        )
+        self.assertEqual(pending.status, PENDING_FAILED)
+        self.assertEqual(pending.failed_reason, FAILED_ROUTE_AMBIGUOUS)
+        self.assertEqual(pending.next_action.provider, "claude")
+
     def test_single_route_requires_confirmation_is_needs_confirmation(self):
         routes = {"12672": [RouteCandidate(provider_role="codex", pointer="p-a")]}
         pending = classify_pending_action(
