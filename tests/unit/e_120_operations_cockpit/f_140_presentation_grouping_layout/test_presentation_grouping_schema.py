@@ -387,19 +387,20 @@ class DelegationWindowPolicyConfigTest(unittest.TestCase):
     fail-closed. A closed display-only vocabulary that never becomes routing
     authority, mirroring the ``project_group_presentation`` contract."""
 
-    def test_default_is_separate(self) -> None:
+    def test_default_is_shared(self) -> None:
+        # #13085: the default is the single sublane host window (`shared`).
         config = PresentationGroupingConfig.from_record(None)
         self.assertEqual(
             config.delegation_window_policy, DEFAULT_DELEGATION_WINDOW_POLICY
         )
         self.assertEqual(
-            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SEPARATE
+            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SHARED
         )
 
     def test_missing_field_preserves_default(self) -> None:
         config = PresentationGroupingConfig.from_record({"version": 1})
         self.assertEqual(
-            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SEPARATE
+            config.delegation_window_policy, DELEGATION_WINDOW_POLICY_SHARED
         )
 
     def test_explicit_modes_round_trip(self) -> None:
@@ -542,7 +543,8 @@ class DelegationWindowResolverTest(unittest.TestCase):
         # the fail-closed boundary. An unknown value resolves under the default.
         win = self._resolve("bogus")
         self.assertEqual(win.policy, DEFAULT_DELEGATION_WINDOW_POLICY)
-        self.assertTrue(win.separated)  # default `separate`
+        self.assertFalse(win.separated)  # default `shared` (#13085)
+        self.assertEqual(win.window_group, "wsA/root")
 
     def test_payload_carries_no_routing_or_authority_field(self) -> None:
         payload = self._resolve(DELEGATION_WINDOW_POLICY_SHARED).as_payload()

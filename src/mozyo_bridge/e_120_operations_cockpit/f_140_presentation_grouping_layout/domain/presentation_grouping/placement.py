@@ -440,22 +440,26 @@ def resolve_sublane_window_placement(
     """Resolve the launcher placement of a launching *sublane* (Redmine #13015).
 
     Connects the ``delegation_window_policy`` display knob to the cockpit
-    append actuation: under ``separate`` (the documented default) a launching
-    sublane — a non-default lane, i.e. a worktree / clone / relocated checkout
-    of an already-known workspace — is placed in its own explicit sublane tmux
-    window instead of being silently appended as a column inside the project
-    window. Pure and display-only: it maps identity facts the caller already
-    resolved to a desired/executed placement; it reads no tmux / config file,
-    creates nothing, and carries no routing / approval authority.
+    append actuation: under the opt-in ``separate`` a launching sublane — a
+    non-default lane, i.e. a worktree / clone / relocated checkout of an
+    already-known workspace — is placed in its own explicit sublane tmux
+    window instead of being appended as a column inside the project window.
+    Under ``shared`` (the documented default since Redmine #13085 / #13081)
+    every sublane reuses the single project/common sublane host window. Pure
+    and display-only: it maps identity facts the caller already resolved to a
+    desired/executed placement; it reads no tmux / config file, creates
+    nothing, and carries no routing / approval authority.
 
     Outcomes:
 
     - the primary checkout (``lane_id`` empty / ``default``) -> ``None``: not a
       sublane; the project-window / shared-column flows apply unchanged.
-    - ``shared`` -> a non-degraded ``cockpit_column`` decision: the operator
-      opted the sublane into the project window / shared column, so the column
-      placement *is* the faithful execution.
-    - ``separate`` with the faithful per-Project-Group window flow executing
+    - ``shared`` (the default) -> a non-degraded ``cockpit_column`` decision:
+      the sublane stays in the single project/common host window — the project
+      window when the faithful group-window flow executes, else the shared
+      cockpit column — so the host-window placement *is* the faithful
+      execution and a second sublane never adds a window.
+    - ``separate`` (opt-in) with the faithful per-Project-Group window flow executing
       (``group_window_executing``) and a live cockpit window to add to
       (``cockpit_window_present``) -> ``separated=True``: the launcher places
       the sublane in its own tmux window, keyed

@@ -565,13 +565,15 @@ class CockpitDispatchUseCaseTest(unittest.TestCase):
 
 
 class SublaneSeparateWindowTest(unittest.TestCase):
-    """Sublane separate-window actuation through the dispatcher (Redmine #13015).
+    """Sublane window actuation through the dispatcher (Redmine #13015 / #13085).
 
-    Under `delegation_window_policy: separate` (the default) a sublane lane
-    whose repo faithfully executes `project_group_tmux_window` routes through
-    the group-window action with the lane-scoped decision — its own sublane
-    window — while every fallback stays the shared column with the reason
-    recorded machine-readably on the `sublane_window` payload field.
+    Under the opt-in `delegation_window_policy: separate` a sublane lane whose
+    repo faithfully executes `project_group_tmux_window` routes through the
+    group-window action with the lane-scoped decision — its own sublane
+    window. Under `shared` (the #13085 default) the sublane reuses the single
+    project/common host window, and every `separate` fallback stays the shared
+    column with the reason recorded machine-readably on the `sublane_window`
+    payload field.
     """
 
     GROUP_ON = {"presentation": {"project_group_presentation":
@@ -600,7 +602,8 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         return outcome, routes
 
     def test_sublane_routes_to_its_own_window_with_the_lane_key(self) -> None:
-        ops = self._sublane_ops()
+        # Opt-in `separate` (#13015); no longer the default (#13085).
+        ops = self._sublane_ops(policy="separate")
         plan = SimpleNamespace(commands=[])
         ops.group_action = ("group_create", plan, None, "issue_42_topic")
         outcome, _routes = self._run(_args(), ops)
@@ -615,7 +618,7 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         )
 
     def test_sublane_append_notice_names_the_sublane_window(self) -> None:
-        ops = self._sublane_ops()
+        ops = self._sublane_ops(policy="separate")
         plan = SimpleNamespace(commands=[])
         ops.group_action = ("group_append", plan, None, "issue_42_topic")
         _outcome, _routes = self._run(_args(), ops)
@@ -634,8 +637,35 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         self.assertFalse(hasattr(decision, "separated"))
         self.assertIn("to Project Group window 'grp-win'", ops.emitted[0])
 
+    def test_default_policy_reuses_the_project_host_window(self) -> None:
+        # #13085 acceptance: with NO delegation_window_policy configured, a
+        # second sublane appends into the single project/common host window
+        # instead of spawning its own lane window.
+        ops = self._sublane_ops()
+        plan = SimpleNamespace(commands=[])
+        ops.group_action = ("group_append", plan, None, "grp-win")
+        _outcome, _routes = self._run(_args(), ops)
+        decision = ops.group_action_calls[0]["decision"]
+        self.assertFalse(hasattr(decision, "separated"))
+        self.assertIn("to Project Group window 'grp-win'", ops.emitted[0])
+
+    def test_default_policy_payload_is_shared_and_not_degraded(self) -> None:
+        # #13085: the default host-window reuse is the faithful execution —
+        # recorded as `shared`, never a degraded fallback.
+        ops = self._sublane_ops()
+        plan = SimpleNamespace(commands=[], as_dict=lambda: {})
+        ops.group_action = ("group_append", plan, None, "grp-win")
+        outcome, _routes = self._run(_args(json_output=True), ops)
+        self.assertEqual(outcome.exit_code, 0)
+        payload = json.loads("\n".join(ops.emitted))
+        sub = payload["sublane_window"]
+        self.assertEqual(sub["window_policy"], "shared")
+        self.assertFalse(sub["separated"])
+        self.assertFalse(sub["degraded"])
+        self.assertIsNone(sub["diagnostic"])
+
     def test_same_column_compat_records_the_fallback_machine_readably(self) -> None:
-        ops = self._sublane_ops(record={"presentation": {}})
+        ops = self._sublane_ops(record={"presentation": {}}, policy="separate")
         outcome, _routes = self._run(_args(json_output=True), ops)
         self.assertEqual(outcome.exit_code, 0)
         payload = json.loads("\n".join(ops.emitted))
@@ -648,7 +678,7 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         self.assertEqual(payload["action"], "append")
 
     def test_same_column_real_run_emits_the_fallback_notice(self) -> None:
-        ops = self._sublane_ops(record={"presentation": {}})
+        ops = self._sublane_ops(record={"presentation": {}}, policy="separate")
         _outcome, _routes = self._run(_args(), ops)
         self.assertTrue(ops.emitted[0].startswith("appended 'sessX' as a new column"))
         self.assertTrue(
@@ -656,7 +686,7 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         )
 
     def test_bootstrap_degrades_and_still_creates_the_session(self) -> None:
-        ops = self._sublane_ops(columns=None)
+        ops = self._sublane_ops(columns=None, policy="separate")
         outcome, _routes = self._run(_args(json_output=True), ops)
         self.assertEqual(outcome.exit_code, 0)
         payload = json.loads("\n".join(ops.emitted))
@@ -673,7 +703,7 @@ class SublaneSeparateWindowTest(unittest.TestCase):
         self.assertIsNone(payload["sublane_window"])
 
     def test_dry_run_renders_the_sublane_window_line(self) -> None:
-        ops = self._sublane_ops()
+        ops = self._sublane_ops(policy="separate")
         plan = SimpleNamespace(commands=[])
         ops.group_action = ("group_create", plan, None, "issue_42_topic")
         _outcome, _routes = self._run(_args(dry_run=True), ops)

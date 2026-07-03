@@ -498,7 +498,7 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     # display preference, so it is read per distinct repo (memoized) from
     # `.mozyo-bridge/config.yaml` and resolved per candidate against the #12466
     # breadcrumb. Display-only and fail-soft: any load / parse failure falls back
-    # to the documented default (`separate`) and never blocks this read-only
+    # to the documented default (`shared`, #13085) and never blocks this read-only
     # table, and the resolved fields are never folded into the canonical
     # `TargetRecord` routing projection (`to_dict`).
     from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (

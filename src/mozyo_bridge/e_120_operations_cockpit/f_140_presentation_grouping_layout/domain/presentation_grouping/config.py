@@ -354,8 +354,9 @@ class PresentationGroupingConfig:
     #: metadata, never routing / approval / window guarantee.
     project_group_presentation: str = DEFAULT_PROJECT_GROUP_PRESENTATION
     #: Desired window-separation policy for a delegated-coordinator tree (#12467).
-    #: ``separate`` (default) projects a delegated coordinator and its grandchild
-    #: worker to distinct windows; ``shared`` folds them into one display group.
+    #: ``shared`` (default, #13085) folds them into one display group / single
+    #: sublane host window; ``separate`` opts a delegated coordinator and its
+    #: grandchild worker into distinct windows.
     #: Display-only metadata, never routing / approval / send-preflight authority.
     delegation_window_policy: str = DEFAULT_DELEGATION_WINDOW_POLICY
 

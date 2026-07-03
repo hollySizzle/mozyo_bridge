@@ -48,12 +48,12 @@ adopt-advisory and degraded-presentation notices, and the attach /
 reuses the #12977 plan executor via the port; it never reimplements executor
 semantics.
 
-Redmine #13015 adds the sublane separate-window placement on top: under
-``delegation_window_policy: separate`` a sublane whose repo faithfully executes
-``project_group_tmux_window`` gets its own sublane tmux window via the same
-group-window action machinery; every fallback to the shared column is recorded
-machine-readably on the ``sublane_window`` payload field (never a silent
-reroute), and the ``same_cockpit_column`` default flow itself is unchanged.
+Redmine #13015 adds the sublane separate-window placement on top: the opt-in
+``delegation_window_policy: separate`` gives a sublane whose repo faithfully
+executes ``project_group_tmux_window`` its own tmux window via the group-window
+action machinery; every fallback is recorded machine-readably on the
+``sublane_window`` payload field (never a silent reroute). Redmine #13085 makes
+``shared`` the default: a sublane reuses the single project/common host window.
 """
 
 from __future__ import annotations
@@ -831,11 +831,11 @@ class CockpitDispatchUseCase:
             == GROUP_WINDOW_SURFACE_GROUP_TMUX_WINDOW
         )
 
-        # Sublane separate-window placement (Redmine #13015): under
-        # `delegation_window_policy: separate` a launching sublane gets its OWN
-        # tmux window, riding the faithful group-window flow (#12330); every
-        # other case keeps the shared column, with the fallback recorded
-        # machine-readably on the decision (never a silent reroute).
+        # Sublane window placement (#13015 / #13085): the opt-in `separate`
+        # gives a launching sublane its OWN tmux window via the faithful
+        # group-window flow (#12330); `shared` (the default) and every fallback
+        # keep the single project/common host window (any degrade recorded on
+        # the decision, never a silent reroute).
         sublane_decision = None
         if grouping is not None and presentation_blocked is None:
             sublane_decision = resolve_sublane_window_placement(

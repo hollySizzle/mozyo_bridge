@@ -414,12 +414,17 @@ class ResolveSublaneWindowPlacementTest(unittest.TestCase):
         self.assertTrue(decision.degraded)
         self.assertIn("bootstrap", decision.diagnostic)
 
-    def test_unexpected_policy_fails_soft_to_the_default_separate(self) -> None:
+    def test_unexpected_policy_fails_soft_to_the_default_shared(self) -> None:
         # The config parser is the fail-closed boundary; the resolver echoes the
-        # documented default for drift, mirroring the display resolver.
+        # documented default (#13085: `shared`, the single sublane host window)
+        # for drift, mirroring the display resolver.
         decision = self._resolve(policy="split_screen")
-        self.assertEqual(decision.policy, DELEGATION_WINDOW_POLICY_SEPARATE)
-        self.assertTrue(decision.separated)
+        self.assertEqual(decision.policy, DELEGATION_WINDOW_POLICY_SHARED)
+        self.assertFalse(decision.separated)
+        self.assertEqual(
+            decision.executed_surface, GROUP_WINDOW_SURFACE_COCKPIT_COLUMN
+        )
+        self.assertFalse(decision.degraded)
 
     def test_as_dict_is_public_safe_display_only(self) -> None:
         payload = self._resolve().as_dict()

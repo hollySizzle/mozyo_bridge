@@ -139,8 +139,9 @@ def _checked_delegation_window_policy(
     """Return the desired delegated-coordinator window-separation policy, fail-closed.
 
     ``delegation_window_policy`` is optional and defaults to
-    :data:`DEFAULT_DELEGATION_WINDOW_POLICY` (``separate``), so a missing field
-    preserves the documented default. Any value outside
+    :data:`DEFAULT_DELEGATION_WINDOW_POLICY` (``shared``, the single sublane
+    host window, Redmine #13085), so a missing field preserves the documented
+    default. Any value outside
     :data:`DELEGATION_WINDOW_POLICY_MODES` — including a boundary- / authority-
     shaped string — is rejected rather than silently normalized; the policy is a
     closed display-only vocabulary, never a routing / approval target (Redmine

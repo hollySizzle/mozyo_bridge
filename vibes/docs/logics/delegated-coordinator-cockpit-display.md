@@ -20,7 +20,7 @@ retirement の正本は `vibes/docs/logics/coordinator-sublane-development-flow.
 親子孫の関係 (governance truth)   -> Redmine issue parent link + dispatch journal
 lane identity (routing truth)     -> @mozyo_workspace_id / @mozyo_lane_id / @mozyo_agent_role + live preflight
 delegation reference (display)    -> parent lane / delegation root への projection breadcrumb
-window 分離 (display)             -> 既定 separate、project policy で調整可能
+window 分離 (display)             -> 既定 shared (単一 host window)、project policy で調整可能
 retire owner (governance)         -> 委譲した coordinator (不在時は ancestor へ escalate)
 ```
 
@@ -95,14 +95,24 @@ window をまたいで pane を動かしても、委譲関係・routing・retire
 
 ## window 分離方針
 
-### 既定: separate window
+### 既定: shared (単一 sublane host window 再利用)
 
-子 coordinator と孫 worker は **既定で別 window (別 cockpit column / tab)** とする。
+子 coordinator・孫 worker・launch される sublane は **既定で project/common の単一
+sublane host window に集約** する (`shared`、Redmine #13085 / #13081)。新規 sublane
+は既定 host window (faithful `project_group_tmux_window` 実行時は project group
+window、それ以外は shared cockpit column) を作成/再利用し、2 本目以降の sublane が
+window を増やさない。
 
-理由: delegated coordinator は callback drain / audit 待ちで `callback_due` /
+理由 (#13081 owner intent): 人間 operator が各 sublane を常時見に行く前提は置かない。
+人間が見るのは stall / active / held などの状態確認レベルであり、UI の主目的は
+可視鑑賞ではなく routing / lifecycle / read-model の一貫性である。lane ごとの
+window 分裂は、stale lane を window 数から推測するという運用負荷を生んだ。
+
+`separate` は **opt-in** として保持する (#12467 表示 + #13015 launcher actuation)。
+delegated coordinator は callback drain / audit 待ちで `callback_due` /
 `review_waiting` を抱えやすく、孫 worker は `implementing` であることが多い。両者を
-同じ表示単位に混ぜると、責務境界と callback 待ち状態が読みづらくなる
-(US #12391 背景)。別 window にすると attention state
+独立 window で読みたい project (US #12391 背景) は
+`delegation_window_policy: separate` を宣言すると、attention state
 (`cockpit-attention-state.md`) を coordinator 行と worker 行で独立に projection
 できる。
 
@@ -119,12 +129,14 @@ worktree / lane を作る actuator ではない。子 coordinator が孫 dispatc
 だけ、または同じ lane 内の Claude へ Redmine anchor を渡しただけでは、3-window
 display acceptance を満たしたとは扱わない。
 
-補足 (#13015): 本 policy は launcher の **placement 判断** には接続されている。
-`mozyo cockpit append` (sublane actuator が駆動する経路を含む) は、`separate` の
-下で faithful `project_group_tmux_window` 実行時に、launch 対象の sublane
-(非 default lane) を project window 内の column ではなく専用 sublane tmux window
-として配置し、配置できない場合の fallback を `--json` の `sublane_window` field に
-machine-readable に記録する (silent reroute しない)。これは **既に launch される
+補足 (#13015 / #13085): 本 policy は launcher の **placement 判断** には接続されて
+いる。`mozyo cockpit append` (sublane actuator が駆動する経路を含む) は、opt-in の
+`separate` の下で faithful `project_group_tmux_window` 実行時に、launch 対象の
+sublane (非 default lane) を project window 内の column ではなく専用 sublane tmux
+window として配置し、配置できない場合の fallback を `--json` の `sublane_window`
+field に machine-readable に記録する (silent reroute しない)。既定の `shared` では
+sublane は単一 host window に留まり、`sublane_window` は非 degraded の
+`cockpit_column` decision として記録される。これは **既に launch される
 lane の置き場所** を policy に従わせるだけであり、上記の境界 — policy が worktree /
 lane を新規作成しないこと、3-window acceptance には孫 lane の実体化 + durable
 record + live projection が要ること — は変わらない。
@@ -168,15 +180,16 @@ display PASS として扱えない**。gate も display/audit のみで routing 
 
 ### project policy で調整可能な部分
 
-window をまとめたい project は、`unit-presentation-state-db.md` の repo-local
+window 分離方針を変えたい project は、`unit-presentation-state-db.md` の repo-local
 `presentation` config (desired declaration) で表示だけを調整できる。調整は
 declarative metadata に限り、route / target / approval を持たない (同 doc の
 `#### schema field contract` / fallback matrix を正本とする)。
 
 調整可能 (display knob):
 
-- `delegation_window_policy`: `separate` (既定) | `shared`。子 coordinator と孫
-  worker を別 window にするか同 group に並べるか。
+- `delegation_window_policy`: `shared` (既定、#13085) | `separate` (opt-in)。子
+  coordinator と孫 worker (および launch される sublane) を単一 host window に
+  集約するか、別 window にするか。
 - 並び順 / `position` / `pinned` / `hidden` / `label_override` (public-safe)。
 - delegation 深さの表示有無 (depth badge / indent などの projection)。
 
@@ -368,7 +381,7 @@ OSS default に入れてよいもの:
 
 - generic な lane_kind enum / delegation depth 概念。
 - delegation reference の user option 名と projection record schema。
-- window 分離の既定 (separate) と display knob 名。
+- window 分離の既定 (shared、単一 sublane host window 再利用) と display knob 名。
 - retire owner / ordering の portable rule と退役 fixed-field。
 
 入れてはいけないもの:

@@ -399,8 +399,8 @@ class AgentsTargetsCommandTest(unittest.TestCase):
     def test_json_adds_additive_delegation_window_projection(self) -> None:
         # #12467: agents targets --json gains a `delegation_window` projection
         # sibling to the #12466 `delegation` record. With no repo-local config the
-        # policy is the documented default `separate`, so a derived grandchild
-        # (depth 2) projects to its own window.
+        # policy is the documented default `shared` (#13085), so a derived
+        # grandchild (depth 2) folds onto its tree root's window group.
         rc, out = self._run([
             _pane("%1", "mozyo-cockpit:0.0", window_name="codex",
                   agent_role="codex", lane_id="lane-root",
@@ -420,9 +420,9 @@ class AgentsTargetsCommandTest(unittest.TestCase):
         # #12466 record stays present and unchanged alongside the new sibling.
         self.assertIn("delegation", by_pane["%3"])
         win = by_pane["%3"]["delegation_window"]
-        self.assertEqual("separate", win["window_policy"])
-        self.assertTrue(win["window_separated"])
-        self.assertEqual("wsA/lane-impl", win["window_group"])
+        self.assertEqual("shared", win["window_policy"])
+        self.assertFalse(win["window_separated"])
+        self.assertEqual("wsA/lane-root", win["window_group"])
         self.assertEqual("resolved", win["window_status"])
         # Root coordinator is its own top-of-tree window under any policy.
         self.assertTrue(by_pane["%1"]["delegation_window"]["window_separated"])

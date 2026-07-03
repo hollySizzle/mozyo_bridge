@@ -242,7 +242,7 @@ the schema field contract that implementation must preserve:
 ```yaml
 presentation:
   version: 1
-  delegation_window_policy: separate   # separate (既定) | shared。window 分離方針 (#12467/#13015)
+  delegation_window_policy: shared   # shared (既定、#13085) | separate (opt-in)。window 分離方針 (#12467/#13015)
   project_groups:
     - group_id: "project:<public-label>"
       label: "<public display label>"
@@ -303,12 +303,13 @@ surface, and not a dynamic predicate language.
   invent workspace identity, lane identity, routing target, or workflow state.
 
 `presentation.delegation_window_policy`
-: `separate` (既定) | `shared`。window 分離方針 (#12467)。表示語彙と display
-  projection の正本は `delegated-coordinator-cockpit-display.md` `## window
-  分離方針`。#13015 で launcher placement にも接続された: `separate` の下では
-  faithful `project_group_tmux_window` 実行時に sublane (非 default lane) を
+: `shared` (既定、#13085) | `separate` (opt-in)。window 分離方針 (#12467)。表示語彙と
+  display projection の正本は `delegated-coordinator-cockpit-display.md` `## window
+  分離方針`。#13015 で launcher placement にも接続された: opt-in の `separate` の
+  下では faithful `project_group_tmux_window` 実行時に sublane (非 default lane) を
   project window 内 column ではなく専用 sublane tmux window として配置し、
   fallback は `--json` の `sublane_window` field に machine-readable に記録される。
+  既定の `shared` では sublane は単一 project/common host window に留まる。
   routing / approval / close authority を持たず、window / tab を保証しない点は
   他の presentation key と同じ。invalid value は fail-closed。
 

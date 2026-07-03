@@ -98,7 +98,7 @@ depth 2 = grandchild implementation lane (孫 lane)
 | 孫 dispatch を許可するか (`enable_grandchild_dispatch`) | project knob | `false` | 本書 |
 | 委譲 depth 上限 (`max_delegation_depth`, ceiling 2) | project knob (hard ceiling 固定) | `1` | 本書 |
 | 同時 child/grandchild lane 数 (`max_active_child_lanes`) | project knob (spine と min) | `1` | 本書 + spine |
-| window 分離 (`delegation_window_policy`) | project knob | `separate` | `delegated-coordinator-cockpit-display.md` |
+| window 分離 (`delegation_window_policy`) | project knob | `shared` (#13085) | `delegated-coordinator-cockpit-display.md` |
 | no-dispatch 記録粒度 (`decision_record_policy`) | project knob | `minimal` | 本書 + spine `### 孫 dispatch / context 保護` |
 | owner approval 単一集約 (parent coordinator) | **固定 invariant** | — | role-profile / spine / preset `### Owner Close Approval Delegation` |
 | parent issue close は最上位 coordinator のみ | **固定 invariant** | — | role-profile |

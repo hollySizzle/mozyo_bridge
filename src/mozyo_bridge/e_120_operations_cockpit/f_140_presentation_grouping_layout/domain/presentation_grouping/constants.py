@@ -135,15 +135,18 @@ DEFAULT_PROJECT_GROUP_PRESENTATION: str = PROJECT_GROUP_PRESENTATION_SAME_COLUMN
 #: or send preflight. It is a display knob in the existing
 #: ``unit_overrides`` / ``defaults`` family and adds no new authority key:
 #:
-#: - ``separate`` (the default) keeps the documented behavior — a delegated
+#: - ``shared`` (the default since Redmine #13085 / #13081) folds the delegated
+#:   coordinator and its grandchild into one display group, and — through the
+#:   #13015 launcher placement — keeps every launching sublane inside the single
+#:   project/common sublane host window instead of spawning one tmux window per
+#:   lane. Choosing ``shared`` never relaxes the fixed invariants (cross-lane
+#:   handoff still routes through the target-lane Codex gateway; owner approval
+#:   still aggregates to the parent coordinator; durable callback requirements
+#:   still hold);
+#: - ``separate`` is the opt-in per-lane window topology — a delegated
 #:   coordinator (depth 1) and its grandchild worker (depth 2) each project to
 #:   their own window so a ``callback_due`` / ``review_waiting`` coordinator row
-#:   and an ``implementing`` worker row stay independently readable;
-#: - ``shared`` is an opt-in request to fold the delegated coordinator and its
-#:   grandchild into one display group. Choosing ``shared`` never relaxes the
-#:   fixed invariants (cross-lane handoff still routes through the target-lane
-#:   Codex gateway; owner approval still aggregates to the parent coordinator;
-#:   durable callback requirements still hold).
+#:   and an ``implementing`` worker row stay independently readable.
 #:
 #: Naming any other value fails closed.
 DELEGATION_WINDOW_POLICY_SEPARATE: str = "separate"
@@ -155,9 +158,11 @@ DELEGATION_WINDOW_POLICY_MODES: frozenset[str] = frozenset(
     }
 )
 
-#: Missing ``delegation_window_policy`` preserves the documented default: a
-#: delegated coordinator and its grandchild worker project to separate windows.
-DEFAULT_DELEGATION_WINDOW_POLICY: str = DELEGATION_WINDOW_POLICY_SEPARATE
+#: Missing ``delegation_window_policy`` preserves the documented default: one
+#: shared project/common sublane host window — a delegated coordinator, its
+#: grandchild worker, and every launching sublane fold into the single host
+#: window (Redmine #13085 / #13081; ``separate`` is the opt-in).
+DEFAULT_DELEGATION_WINDOW_POLICY: str = DELEGATION_WINDOW_POLICY_SHARED
 
 #: The default lane id every non-lane construction lands on (mirrors
 #: :data:`mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout.DEFAULT_LANE`). Kept as a local

@@ -357,15 +357,19 @@ iTerm2 の version / preference に依存する presentation result である。
 TargetRecord の preflight で配送先を決める。
 
 Redmine #13015 は faithful `project_group_tmux_window` 実行の上に sublane 分離を
-重ねる: `delegation_window_policy: separate` (既定、正本は
+重ねる: `delegation_window_policy: separate` (opt-in。#13085 以降の既定は `shared`
+= 単一 sublane host window 再利用。正本は
 `delegated-coordinator-cockpit-display.md` `## window 分離方針`) の下で、非 default
 lane (worktree / clone / relocated checkout) の launch は Project Group window 内の
-column ではなく専用 sublane tmux window として配置され、期待 topology
+column ではなく専用 sublane tmux window として配置され、opt-in topology
 `cockpit main window -> project window -> sublane window` が actuation で満たされる。
+既定の `shared` では新規 sublane は project/common の単一 host window (faithful
+実行時は Project Group window、それ以外は shared cockpit column) を再利用し、
+2 本目以降の sublane が window を増やさない (#13085)。
 sublane window は window-level `@mozyo_group_id` marker に `lane:<workspace_id>/<lane_id>`
 key を stamp して再配置に使い (window 名は表示のみ)、cross-window duplicate gate と
 pane identity stamping は Project Group window と同一。配置できない場合の fallback
-(`same_cockpit_column` compat / session bootstrap / `shared` 選択) は `--json` の
+(`same_cockpit_column` compat / session bootstrap / 既定 `shared`) は `--json` の
 `sublane_window` field に machine-readable に記録され、silent reroute しない。
 routing / approval / close authority に使わない点は変わらない。
 

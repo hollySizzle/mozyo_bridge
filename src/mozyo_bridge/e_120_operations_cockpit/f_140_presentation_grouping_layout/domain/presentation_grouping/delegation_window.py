@@ -22,7 +22,7 @@ Boundaries (kept enforced in code):
   depth > 2), yields a window display that withholds the separate/shared decision
   rather than fabricating one — it never raises and never blocks a read-only
   table. An unexpected policy value falls back to the documented default
-  (``separate``); the *config* layer is the fail-closed boundary
+  (``shared``, #13085); the *config* layer is the fail-closed boundary
   (:func:`~.validation._checked_delegation_window_policy`), this display layer
   degrades gracefully.
 """

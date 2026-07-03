@@ -389,15 +389,16 @@ class PresentationGroupingWiringTest(unittest.TestCase):
                 {"presentation": {"project_group_presentation": "iterm_tab"}}
             )
 
-    def test_delegation_window_policy_defaults_to_separate(self) -> None:
+    def test_delegation_window_policy_defaults_to_shared(self) -> None:
+        # #13085: the default is the single sublane host window (`shared`).
         config = RepoLocalConfig.from_record({"presentation": {"surface": "text"}})
         self.assertEqual(
-            config.presentation.grouping.delegation_window_policy, "separate"
+            config.presentation.grouping.delegation_window_policy, "shared"
         )
 
     def test_delegation_window_policy_is_settable_under_presentation(self) -> None:
         # #13015: the #12467 window-separation knob is forwarded through the
-        # presentation block so a project can actually opt into `shared`.
+        # presentation block so a project can actually opt into `separate`.
         for mode in ("separate", "shared"):
             config = RepoLocalConfig.from_record(
                 {"presentation": {"delegation_window_policy": mode}}
