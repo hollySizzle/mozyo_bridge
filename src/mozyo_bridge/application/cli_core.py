@@ -46,6 +46,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
     cmd_sublane_start,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher import (
+    cmd_sublane_dispatch_worker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     cmd_sublane_list,
     cmd_sublane_retire,
@@ -389,6 +392,60 @@ def register_lifecycle(sub) -> None:
     add_repo_option(sublane_create)
     _add_lifecycle_json(sublane_create)
     sublane_create.set_defaults(func=cmd_sublane_start)
+
+    # Worker-dispatch ack drive (Redmine #12988): the lane gateway forwards the
+    # anchored implementation_request to its same-lane worker and records the
+    # measured delivery ACK as `worker_dispatched` / worker_dispatch_confirmed=
+    # true; any failure keeps the fail-closed `gateway_notified` semantics.
+    sublane_dispatch_worker = sublane_sub.add_parser(
+        "dispatch-worker",
+        help=(
+            "Drive the same-lane gateway -> worker implementation_request "
+            "forward and record the measured worker-dispatch delivery ACK "
+            "(Redmine #12988): only a submit-complete send yields "
+            "`worker_dispatched` / worker_dispatch_confirmed=true; a failed or "
+            "unresolved drive fails closed and the lane's recorded state stays "
+            "`gateway_notified`. Default is a dry-run preview; --execute sends. "
+            "Run from (or with --repo pointing at) the lane worktree."
+        ),
+    )
+    sublane_dispatch_worker.add_argument(
+        "--issue", required=True, help="Redmine issue id"
+    )
+    sublane_dispatch_worker.add_argument(
+        "--lane-label",
+        dest="lane_label",
+        required=True,
+        help="Lane label the resolved lane must match (e.g. issue_<id>_<slug>)",
+    )
+    sublane_dispatch_worker.add_argument(
+        "--journal",
+        default=None,
+        help="Durable-anchor journal id the forwarded implementation_request "
+        "carries. Required for --execute (worker dispatch is never unanchored).",
+    )
+    sublane_dispatch_worker.add_argument(
+        "--execute",
+        action="store_true",
+        help="Drive the live same-lane worker send. Default: dry-run preview, "
+        "no side effects.",
+    )
+    sublane_dispatch_worker.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Preview the resolved worker transfer without sending. Wins over "
+        "--execute when both are given.",
+    )
+    sublane_dispatch_worker.add_argument(
+        "--target-repo",
+        dest="target_repo",
+        default="auto",
+        help="Target-repo identity gate for the worker send (default: auto).",
+    )
+    add_repo_option(sublane_dispatch_worker)
+    _add_lifecycle_json(sublane_dispatch_worker)
+    sublane_dispatch_worker.set_defaults(func=cmd_sublane_dispatch_worker)
 
     sublane_list = sublane_sub.add_parser(
         "list",

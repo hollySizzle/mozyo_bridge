@@ -139,11 +139,14 @@ BLOCKED_REASONS = frozenset(
 #: candidate (classify with ``sublane callback-recovery --dispatch-delivered``).
 DISPATCH_GATEWAY_NOTIFIED = "gateway_notified"
 #: The same-lane worker actually received / acked the dispatched
-#: implementation_request. The current creation-side actuator does NOT reach this
-#: state — it only notifies the gateway — so this token names the honest target a
-#: follow-up worker-dispatch/ack step must reach before a lane counts as worker-
-#: started. Kept in the vocabulary so the coordinator record and the
-#: :attr:`SublaneActuationOutcome.worker_dispatch_confirmed` signal can
+#: implementation_request. The creation-side actuator does NOT reach this
+#: state — it only notifies the gateway. The state is reached by the #12988
+#: worker-dispatch ack drive (``mozyo-bridge sublane dispatch-worker
+#: --execute``, :mod:`...application.sublane_worker_dispatcher`): the lane
+#: gateway forwards the anchored request to its same-lane worker and only a
+#: measured delivery ACK promotes the record to this token. It is a delivery
+#: ACK, never worker progress / completion. The coordinator record and the
+#: :attr:`SublaneActuationOutcome.worker_dispatch_confirmed` signal use it to
 #: distinguish "gateway notified" from "worker dispatched".
 DISPATCH_WORKER_DISPATCHED = "worker_dispatched"
 #: Dispatch was intentionally skipped (``--no-dispatch``).
@@ -325,10 +328,11 @@ def _next_action(outcome: SublaneActuationOutcome) -> str:
         return (
             "gateway notified only — worker dispatch NOT yet confirmed. The "
             "gateway must forward the implementation_request to the same-lane "
-            "worker and a worker-dispatch ack must land; until then treat this as "
-            "a `no_progress_after_handoff` candidate (classify with `mozyo-bridge "
-            "sublane callback-recovery --dispatch-delivered`). Confirm the lane "
-            "with `sublane list --json`"
+            "worker with the #12988 ack drive (`mozyo-bridge sublane "
+            "dispatch-worker --execute`) so a measured worker-dispatch ack "
+            "lands; until then treat this as a `no_progress_after_handoff` "
+            "candidate (classify with `mozyo-bridge sublane callback-recovery "
+            "--dispatch-delivered`). Confirm the lane with `sublane list --json`"
         )
     if outcome.dispatch_result == DISPATCH_WORKER_DISPATCHED:
         return (

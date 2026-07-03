@@ -400,6 +400,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn("gateway_notified", text)
         self.assertIn("worker dispatch NOT confirmed", text)
         self.assertIn("callback-recovery", text)
+        # #12988: the render points at the ack drive that promotes the state.
+        self.assertIn("sublane dispatch-worker --execute", text)
         # the executed reason itself carries the honest clause
         self.assertIn("worker dispatch NOT yet confirmed", outcome.reason)
 

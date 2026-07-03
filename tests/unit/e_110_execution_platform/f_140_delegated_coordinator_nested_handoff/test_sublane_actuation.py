@@ -95,11 +95,13 @@ class JournalRenderTests(unittest.TestCase):
     def test_gateway_notified_next_action_is_honest_about_worker(self):
         # #12986: the record must NOT claim the gateway already routed to the
         # worker; it must flag worker dispatch as unconfirmed and point at the
-        # callback-recovery classifier.
+        # callback-recovery classifier. #12988: it also points at the ack drive
+        # that can actually promote the state.
         text = render_actuation_journal(_outcome())
         self.assertIn("worker dispatch NOT yet confirmed", text)
         self.assertIn("no_progress_after_handoff", text)
         self.assertIn("callback-recovery", text)
+        self.assertIn("sublane dispatch-worker --execute", text)
 
     def test_worker_dispatched_next_action_awaits_callback(self):
         text = render_actuation_journal(
