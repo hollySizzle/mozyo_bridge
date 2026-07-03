@@ -36,6 +36,10 @@ attach). This module carves that into an OOP-first boundary under #12638:
   exercisable with a synthetic fake. The ``cmd_mozyo`` / ``cmd_layout_apply``
   handlers in :mod:`commands` are one-line parser-bound wrappers over run +
   deliver.
+- The agent launch helper tail (#13120) — ``_claude_permission_mode_flag`` /
+  ``_agent_launch_command`` / ``_record_managed_pane_created`` — lives here
+  next to the adapters that consume it; :mod:`commands` re-exports the legacy
+  names so the ``commands.*`` import / monkeypatch seams are unchanged.
 
 Behavior-preserving: the refusal wording, the stdout/stderr text, the tmux side
 effects, and the exit codes are unchanged from the original command bodies.
@@ -52,10 +56,13 @@ from pathlib import Path
 from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
+    AGENT_COMMANDS,
     AGENT_LABELS,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+    InvalidPermissionMode,
+    permission_mode_flag,
 )
 
 
@@ -650,6 +657,140 @@ def deliver_layout_launch_outcome(
     raise AssertionError("unreachable")  # pragma: no cover - attach never returns
 
 
+# --- Agent launch helpers (#13120) --------------------------------------------
+#
+# The agent launch helper tail that every managed-pane creation chokepoint
+# drives historically lived as procedural bodies in
+# :mod:`mozyo_bridge.application.commands`:
+#
+# - ``_claude_permission_mode_flag`` — the ``--permission-mode`` suffix for
+#   managed Claude panes (#11857 / #11925).
+# - ``_agent_launch_command`` — the env-wrapped shell command tmux runs for a
+#   new agent pane, with the OTel bootstrap env (#11676).
+# - ``_record_managed_pane_created`` — the best-effort desired-state
+#   ``created`` event + runtime marker at the pane-creation boundary (#11726).
+#
+# The bodies now live here, next to the launch adapters that consume them;
+# ``commands`` re-exports the legacy names so existing imports and monkeypatch
+# targets (``commands._agent_launch_command``) keep resolving to one source of
+# truth. The side-effect seams the bodies drive (``die`` / ``otel_bootstrap_env``
+# / ``resolve_canonical_session``) still resolve *through the* :mod:`commands`
+# *module at call time*, so the characterization tests that patch
+# ``mozyo_bridge.application.commands.<fn>`` keep intercepting and no import
+# cycle is introduced.
+
+# Redmine #11857 / #11925: reproducible permission mode for managed Claude
+# panes. Operators kept forgetting to Shift+Tab cockpit / sublane Claude
+# panes into auto mode, which stalled multi-sublane dogfooding. The launch
+# command appends `--permission-mode <mode>` at every managed-pane
+# chokepoint (cockpit, layout, sublane, standalone agent windows). Cockpit
+# / sublane creation passes a launch-context policy default of `auto`
+# (#11925) so future managed Claude panes are reproducibly auto without an
+# env var; the standalone `mozyo` window path passes no default, so its
+# historical bare `claude` launch never changes silently. The env var
+# `MOZYO_CLAUDE_PERMISSION_MODE` remains the compatibility / explicit
+# override rail and wins when set. The flag is Claude-only — Codex launches
+# are untouched. A CLI `--permission-mode` flag overrides settings.json's
+# permissions.defaultMode for that one session only; it neither reads nor
+# writes any user / project settings file, so it cannot conflict with
+# local on-disk settings, and it is non-retroactive (already-running panes
+# keep their mode). Resolution lives in the pure policy module so `doctor`
+# introspects the same precedence.
+
+
+def _claude_permission_mode_flag(
+    agent: str, *, policy_default: str | None = None
+) -> str:
+    """`--permission-mode <mode>` suffix for managed Claude panes, or ``""``.
+
+    Delegates to the pure policy resolver (env override > launch-context
+    policy default > none) and turns an invalid value into a hard CLI error
+    so a typo cannot silently fall back to a default-permission pane the
+    operator did not intend.
+    """
+    from mozyo_bridge.application import commands
+
+    try:
+        return permission_mode_flag(agent, policy_default=policy_default)
+    except InvalidPermissionMode as exc:
+        commands.die(str(exc))
+
+
+def _agent_launch_command(
+    agent: str,
+    session: str,
+    cwd: str | None,
+    *,
+    permission_mode_default: str | None = None,
+) -> str:
+    """The shell command tmux runs for a new agent pane, with OTel env.
+
+    ``permission_mode_default`` is the launch-context policy default for the
+    Claude permission mode (cockpit / sublane pass ``auto``; the standalone
+    path passes ``None`` to preserve the historical bare ``claude`` launch).
+    The ``MOZYO_CLAUDE_PERMISSION_MODE`` env var still overrides it.
+    """
+    from mozyo_bridge.application import commands
+
+    env_pairs = " ".join(
+        f"{key}={shlex.quote(value)}"
+        for key, value in sorted(
+            commands.otel_bootstrap_env(agent, session, cwd).items()
+        )
+    )
+    return (
+        f"env {env_pairs} {AGENT_COMMANDS[agent]}"
+        f"{_claude_permission_mode_flag(agent, policy_default=permission_mode_default)}"
+    )
+
+
+def _record_managed_pane_created(
+    agent: str, session: str, pane_id: str, cwd: str | None
+) -> None:
+    """Append a desired-state ``created`` event at the pane-creation boundary.
+
+    Redmine #11726: this is the one mozyo command boundary that *creates*
+    a managed pane, so it is where the desired-state event log records the
+    intent (what mozyo built, in which session, for which agent). Strictly
+    best-effort — any failure is swallowed (``record_managed_event``
+    returns None) so the desired-state log can never break session
+    creation, exactly like the OTel/telemetry posture. It records intent
+    only; it does not read or write liveness, handoff target resolution,
+    or preflight, which stay live-tmux-authoritative (#11698 invariant).
+    The pane also gets the secondary ``@mozyo_managed`` runtime marker, so
+    a running managed pane is classifiable even before registry
+    registration.
+    """
+    try:
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.managed_marker import mark_target
+        from mozyo_bridge.managed_events import (
+            KIND_CREATED,
+            record_managed_event,
+        )
+
+        workspace_id = None
+        if cwd:
+            workspace_id = commands.resolve_canonical_session(cwd).workspace_id
+        # repo_root is NFD-normalized inside record_managed_event (#11625).
+        record_managed_event(
+            command="mozyo",
+            event_kind=KIND_CREATED,
+            pane_id=pane_id,
+            mozyo_session=session,
+            workspace_id=workspace_id,
+            repo_root=cwd,
+            intent={"agent": agent, "window": agent},
+        )
+        # Secondary runtime marker; primary managed signal is the registry
+        # anchor. Non-fatal — a marker failure must not fail creation.
+        mark_target(pane_id)
+    except Exception:
+        # Whole boundary is best-effort: desired-state recording must never
+        # break the session/pane the operator asked mozyo to create.
+        pass
+
+
 # --- Agent window launch primitives (#12970) ---------------------------------
 #
 # The lower-level pane-creation helpers that ``ensure_repo_session_windows`` (and
@@ -737,8 +878,10 @@ class LiveAgentWindowLaunchOps:
     ``mozyo_bridge.application.commands.<fn>`` keep intercepting the live side
     effects, and this module keeps no import cycle with ``commands``. The
     env-wrapped launch string and the best-effort desired-state ``created`` event
-    stay owned by ``commands._agent_launch_command`` /
-    ``commands._record_managed_pane_created`` (both still ``commands.*`` seams).
+    bodies moved into this module (#13120) but stay ``commands.*`` seams:
+    ``commands`` re-exports ``_agent_launch_command`` /
+    ``_record_managed_pane_created`` and this adapter still resolves them
+    through ``commands`` at call time.
     """
 
     @staticmethod
