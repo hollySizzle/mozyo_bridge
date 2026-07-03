@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3531
+    lines: 3507
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -842,6 +842,18 @@ allowlist:
       parser-bound wrappers over run + deliver. 3555 -> 3531 is a 24-line net
       removal and the post-merge ``commands.py`` line count is 3531.
       ``test_launch_command`` adds the fake-port delivery-tail specifications.
+      Lowered 3531 -> 3507 for the #13106 cockpit read / session-helper facade
+      tranche: the ``_rightmost_codex_anchor`` geometry pick and the
+      ``_cockpit_session_present`` / ``_session_attached_clients_result`` /
+      ``_source_session_cleanup_note`` read bodies moved to the #12971
+      ``application/cockpit_read_command.py`` boundary (pure
+      ``rightmost_codex_anchor`` / ``project_nonempty_lines`` /
+      ``source_session_cleanup_note_text`` plus ``session_present`` /
+      ``attached_clients_result`` / ``source_session_cleanup_note`` use-case
+      reads over a ``session_exists``-extended port); the ``commands.*`` names
+      stay as thin wrappers so the monkeypatch seams are unchanged. 3531 ->
+      3507 is a 24-line net removal and the post-merge ``commands.py`` line
+      count is 3507.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

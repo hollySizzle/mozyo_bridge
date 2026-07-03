@@ -10,7 +10,12 @@ pin:
 - the ``CockpitReadUseCase`` walk: the tolerant ``None`` / ``[]`` degradation on a
   raised read or a non-zero returncode, and the managed-window discovery that
   composes over the ``read_columns`` seam and filters to windows carrying a
-  managed pane.
+  managed pane,
+- the #13106 session-helper reads: the pure ``rightmost_codex_anchor`` pick /
+  ``project_nonempty_lines`` parse / cleanup-note wording, and the
+  ``session_present`` / ``attached_clients_result`` /
+  ``source_session_cleanup_note`` use-case walks with their known/unknown and
+  gone/alive distinctions.
 
 The end-to-end behavior over the live ``commands.run_tmux`` /
 ``commands._read_cockpit_columns`` seams stays pinned by the cockpit
@@ -34,6 +39,9 @@ from mozyo_bridge.application.cockpit_read_command import (
     project_columns,
     project_geometry,
     project_managed_window_rows,
+    project_nonempty_lines,
+    rightmost_codex_anchor,
+    source_session_cleanup_note_text,
 )
 
 
@@ -54,12 +62,17 @@ class _FakeCockpitReadOps:
         run_result: argparse.Namespace | None = None,
         run_raises: BaseException | None = None,
         columns_by_window: dict | None = None,
+        session_present: bool = True,
+        session_raises: BaseException | None = None,
     ) -> None:
         self._run_result = run_result if run_result is not None else _result()
         self._run_raises = run_raises
         self._columns_by_window = columns_by_window or {}
+        self._session_present = session_present
+        self._session_raises = session_raises
         self.run_calls: list[tuple] = []
         self.read_columns_calls: list[tuple] = []
+        self.session_exists_calls: list[str] = []
 
     def run_tmux(self, *args, **kwargs):
         self.run_calls.append((args, kwargs))
@@ -70,6 +83,12 @@ class _FakeCockpitReadOps:
     def read_columns(self, session, window):
         self.read_columns_calls.append((session, window))
         return self._columns_by_window.get(window)
+
+    def session_exists(self, session):
+        self.session_exists_calls.append(session)
+        if self._session_raises is not None:
+            raise self._session_raises
+        return self._session_present
 
 
 class PureProjectionTest(unittest.TestCase):
@@ -224,6 +243,139 @@ class ReadManagedWindowsUseCaseTest(unittest.TestCase):
     def test_managed_windows_degrades_to_empty_list(self) -> None:
         self.assertEqual([], CockpitReadUseCase(_FakeCockpitReadOps(run_result=_result(returncode=1))).read_managed_windows("s"))
         self.assertEqual([], CockpitReadUseCase(_FakeCockpitReadOps(run_raises=OSError())).read_managed_windows("s"))
+
+
+class SessionHelperPureTest(unittest.TestCase):
+    """The #13106 session-helper pure projections / wording."""
+
+    def test_rightmost_codex_anchor_picks_by_geometry(self) -> None:
+        codex = [
+            {"pane_id": "%mid", "pane_left": 40, "pane_width": 40},
+            {"pane_id": "%rightmost", "pane_left": 80, "pane_width": 40},
+            {"pane_id": "%left", "pane_left": 0, "pane_width": 40},
+        ]
+        self.assertEqual("%rightmost", rightmost_codex_anchor(codex))
+
+    def test_rightmost_tie_breaks_on_right_edge_then_pane_id(self) -> None:
+        # Same left: the wider pane (larger right edge) wins.
+        codex = [
+            {"pane_id": "%a", "pane_left": 40, "pane_width": 20},
+            {"pane_id": "%b", "pane_left": 40, "pane_width": 40},
+        ]
+        self.assertEqual("%b", rightmost_codex_anchor(codex))
+        # Missing geometry defaults to 0: falls back to a stable pane-id order.
+        codex = [{"pane_id": "%1"}, {"pane_id": "%3"}, {"pane_id": "%2"}]
+        self.assertEqual("%3", rightmost_codex_anchor(codex))
+
+    def test_rightmost_empty_is_none(self) -> None:
+        self.assertIsNone(rightmost_codex_anchor([]))
+
+    def test_project_nonempty_lines_strips_and_drops_blanks(self) -> None:
+        self.assertEqual(
+            ("/dev/ttys003", "/dev/ttys004"),
+            project_nonempty_lines("/dev/ttys003\n\n  /dev/ttys004  \n"),
+        )
+        self.assertEqual((), project_nonempty_lines(""))
+        self.assertEqual((), project_nonempty_lines(None))  # type: ignore[arg-type]
+
+    def test_cleanup_note_wording(self) -> None:
+        gone = source_session_cleanup_note_text("src", False, "?")
+        self.assertEqual(
+            "source session 'src' is now empty and was closed by tmux "
+            "(both agent panes moved out); not killed explicitly.",
+            gone,
+        )
+        alive = source_session_cleanup_note_text("src", True, "2")
+        self.assertEqual(
+            "source session 'src' still has 2 pane(s) and was left intact "
+            "(not killed).",
+            alive,
+        )
+
+
+class SessionPresentUseCaseTest(unittest.TestCase):
+    def test_present_probes_the_session(self) -> None:
+        ops = _FakeCockpitReadOps(session_present=True)
+        self.assertTrue(CockpitReadUseCase(ops).session_present("s"))
+        self.assertEqual(["s"], ops.session_exists_calls)
+        self.assertFalse(
+            CockpitReadUseCase(_FakeCockpitReadOps(session_present=False)).session_present("s")
+        )
+
+    def test_any_error_degrades_to_false(self) -> None:
+        self.assertFalse(
+            CockpitReadUseCase(_FakeCockpitReadOps(session_raises=OSError())).session_present("s")
+        )
+        self.assertFalse(
+            CockpitReadUseCase(_FakeCockpitReadOps(session_raises=SystemExit(2))).session_present("s")
+        )
+
+
+class AttachedClientsResultUseCaseTest(unittest.TestCase):
+    def test_empty_session_is_no_clients_known_without_a_read(self) -> None:
+        ops = _FakeCockpitReadOps()
+        self.assertEqual(((), True), CockpitReadUseCase(ops).attached_clients_result(""))
+        self.assertEqual([], ops.run_calls)
+
+    def test_success_reads_list_clients_and_projects(self) -> None:
+        ops = _FakeCockpitReadOps(run_result=_result(stdout="/dev/ttys003\n/dev/ttys004\n"))
+        clients, known = CockpitReadUseCase(ops).attached_clients_result("mozyo-cockpit")
+        self.assertEqual(("/dev/ttys003", "/dev/ttys004"), clients)
+        self.assertTrue(known)
+        (args, kwargs) = ops.run_calls[0]
+        self.assertEqual(
+            ("list-clients", "-t", "mozyo-cockpit", "-F", "#{client_tty}"), args
+        )
+        self.assertEqual({"check": False}, kwargs)
+
+    def test_success_empty_is_known(self) -> None:
+        ops = _FakeCockpitReadOps(run_result=_result(stdout=""))
+        self.assertEqual(((), True), CockpitReadUseCase(ops).attached_clients_result("s"))
+
+    def test_failed_read_is_unknown(self) -> None:
+        # Non-zero exit and a raised read both fail closed to "unknown".
+        self.assertEqual(
+            ((), False),
+            CockpitReadUseCase(_FakeCockpitReadOps(run_result=_result(returncode=1))).attached_clients_result("s"),
+        )
+        self.assertEqual(
+            ((), False),
+            CockpitReadUseCase(_FakeCockpitReadOps(run_raises=RuntimeError("no server"))).attached_clients_result("s"),
+        )
+
+
+class SourceSessionCleanupNoteUseCaseTest(unittest.TestCase):
+    def test_absent_session_reports_closed_by_tmux(self) -> None:
+        ops = _FakeCockpitReadOps(session_present=False)
+        note = CockpitReadUseCase(ops).source_session_cleanup_note("src")
+        self.assertIn("closed by tmux", note)
+        self.assertIn("not killed explicitly", note)
+        # No pane-count read on an absent session.
+        self.assertEqual([], ops.run_calls)
+
+    def test_alive_session_reports_remaining_pane_count(self) -> None:
+        ops = _FakeCockpitReadOps(run_result=_result(stdout="%1\n%2\n"))
+        note = CockpitReadUseCase(ops).source_session_cleanup_note("src")
+        self.assertIn("still has 2 pane(s)", note)
+        self.assertIn("left intact", note)
+        (args, kwargs) = ops.run_calls[0]
+        self.assertEqual(("list-panes", "-s", "-t", "src", "-F", "#{pane_id}"), args)
+        self.assertEqual({"check": False}, kwargs)
+
+    def test_unreadable_pane_count_degrades_to_question_mark(self) -> None:
+        for ops in (
+            _FakeCockpitReadOps(run_result=_result(returncode=1)),
+            _FakeCockpitReadOps(run_raises=RuntimeError("boom")),
+        ):
+            note = CockpitReadUseCase(ops).source_session_cleanup_note("src")
+            self.assertIn("still has ? pane(s)", note)
+
+    def test_unprobeable_session_reads_as_gone(self) -> None:
+        # session_exists raising degrades to "absent" — same as the original body.
+        ops = _FakeCockpitReadOps(session_raises=OSError())
+        self.assertIn(
+            "closed by tmux", CockpitReadUseCase(ops).source_session_cleanup_note("src")
+        )
 
 
 if __name__ == "__main__":
