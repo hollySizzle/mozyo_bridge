@@ -372,16 +372,16 @@ def build_restamp_failure_message(
 ) -> str:
     """The command-grained fail-closed abort message (#13160 REV3).
 
-    Distinguishes three states so a mid-pane failure is never misreported:
+    Distinguishes the failing pane from every other pane so a failure is
+    never misreported (#13160 REV4 refines REV3 per j#71854):
 
     - ``fully_restamped`` panes had every ``set-option`` land;
     - the failing ``pane_id`` is reported PARTIAL when ``applied_in_pane`` is
       non-empty (the option(s) that already landed on it plus the one that
-      failed), else it is folded into the untouched count as "left unchanged";
-    - the panes after it were never attempted.
-
-    "left unchanged" is used only for panes with zero applied commands — never
-    for the partially-restamped pane.
+      failed), and "attempted but left unchanged" when its first command
+      failed — it was attempted either way, so it is never counted as
+      "not attempted";
+    - only the panes after it were never attempted.
     """
 
     failed_desc = _describe_option(failed_argv)
@@ -397,12 +397,15 @@ def build_restamp_failure_message(
             f"Pane {pane_id} is PARTIALLY restamped: {applied_descs} applied, "
             f"{failed_desc} failed."
         )
-        unchanged = not_attempted
     else:
-        # Nothing landed on the failing pane — it is unchanged, like the rest.
-        unchanged = not_attempted + 1
+        # The failing pane's first command was issued and failed: attempted,
+        # but nothing landed — state it explicitly, never as "not attempted".
+        parts.append(
+            f"Pane {pane_id} was attempted but left unchanged: "
+            f"{failed_desc} failed."
+        )
     parts.append(
-        f"{unchanged} pane(s) were left unchanged (not attempted). "
+        f"{not_attempted} pane(s) were left unchanged (not attempted). "
         f"Re-run `mozyo cockpit restamp` to reconcile "
         f"(already-correct panes are no-ops)."
     )

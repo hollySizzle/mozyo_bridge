@@ -389,9 +389,10 @@ class HandleRestampUseCaseTest(unittest.TestCase):
             ("set-option", "-p", "-t", "%1", "@mozyo_lane_id", "default"), ops.applied
         )
 
-    def test_apply_failure_on_first_command_reports_unchanged_not_partial(self) -> None:
+    def test_apply_failure_on_first_command_reports_attempted_not_partial(self) -> None:
         # Single pane, single command fails -> zero applied on it: it is
-        # "left unchanged", not PARTIAL (REV3 constraint iii).
+        # "attempted but left unchanged" (never PARTIAL, and never counted as
+        # "not attempted" — the failed command WAS issued; #13160 REV4 / j#71854).
         ops = FakeRestampOps(
             panes=[_pane("%1", lane_id="lane-old1", lane_label="issue_x")],
             recompute=_Recompute({"/checkout/main": LaneIdentity("default", None)}),
@@ -405,7 +406,8 @@ class HandleRestampUseCaseTest(unittest.TestCase):
         message = ops.died[0]
         self.assertIn("Restamped 0 of 1 pane(s) fully.", message)
         self.assertNotIn("PARTIALLY restamped", message)
-        self.assertIn("1 pane(s) were left unchanged", message)
+        self.assertIn("Pane %1 was attempted but left unchanged: '@mozyo_lane_id default' failed.", message)
+        self.assertIn("0 pane(s) were left unchanged (not attempted)", message)
 
     def test_mid_pane_command_failure_is_reported_as_partial(self) -> None:
         # REV3 core case: a pane whose recompute yields a lane *label* emits two
