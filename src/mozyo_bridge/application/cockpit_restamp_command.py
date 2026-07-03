@@ -348,6 +348,67 @@ class LiveCockpitRestampOps:
         print(text)
 
 
+def _describe_option(argv: tuple) -> str:
+    """A compact ``'<option> <value>'`` description of a restamp ``set-option``.
+
+    ``('set-option', '-p', '-t', pane, OPTION, VALUE)`` -> ``'OPTION VALUE'``;
+    an unset ``('set-option', '-p', '-u', '-t', pane, OPTION)`` -> ``'OPTION
+    (unset)'``. Pane-independent, so the same option reads the same everywhere.
+    """
+
+    if "-u" in argv:
+        return f"'{argv[-1]} (unset)'"
+    return f"'{argv[-2]} {argv[-1]}'"
+
+
+def build_restamp_failure_message(
+    *,
+    pane_id: str,
+    failed_argv: tuple,
+    detail: str,
+    fully_restamped: int,
+    total: int,
+    applied_in_pane: tuple,
+) -> str:
+    """The command-grained fail-closed abort message (#13160 REV3).
+
+    Distinguishes three states so a mid-pane failure is never misreported:
+
+    - ``fully_restamped`` panes had every ``set-option`` land;
+    - the failing ``pane_id`` is reported PARTIAL when ``applied_in_pane`` is
+      non-empty (the option(s) that already landed on it plus the one that
+      failed), else it is folded into the untouched count as "left unchanged";
+    - the panes after it were never attempted.
+
+    "left unchanged" is used only for panes with zero applied commands — never
+    for the partially-restamped pane.
+    """
+
+    failed_desc = _describe_option(failed_argv)
+    not_attempted = total - fully_restamped - 1
+    parts = [
+        f"cockpit restamp step failed (pane {pane_id}): "
+        f"`tmux {' '.join(failed_argv)}` -> {detail}.",
+        f"Restamped {fully_restamped} of {total} pane(s) fully.",
+    ]
+    if applied_in_pane:
+        applied_descs = ", ".join(_describe_option(a) for a in applied_in_pane)
+        parts.append(
+            f"Pane {pane_id} is PARTIALLY restamped: {applied_descs} applied, "
+            f"{failed_desc} failed."
+        )
+        unchanged = not_attempted
+    else:
+        # Nothing landed on the failing pane — it is unchanged, like the rest.
+        unchanged = not_attempted + 1
+    parts.append(
+        f"{unchanged} pane(s) were left unchanged (not attempted). "
+        f"Re-run `mozyo cockpit restamp` to reconcile "
+        f"(already-correct panes are no-ops)."
+    )
+    return " ".join(parts)
+
+
 class CockpitRestampUseCase:
     """Re-derive + re-apply cockpit pane lane identity through the injected port.
 
@@ -360,7 +421,7 @@ class CockpitRestampUseCase:
         self._ops = ops
 
     def _apply(self, plan: RestampPlan) -> None:
-        """Apply the drift set-options pane-by-pane, fail-closed (#13160 REV2).
+        """Apply the drift set-options, fail-closed with command-grained accounting.
 
         Matches the fail-fast flavor of the other cockpit mutators
         (``cockpit_repair_command._run_fail_fast`` for reset / rebalance /
@@ -370,30 +431,35 @@ class CockpitRestampUseCase:
         a set of independent per-pane metadata corrections (no cross-pane
         transaction / rollback), so a stop-on-first-failure abort is the safe
         choice — a ``set-option`` failure usually signals the pane / tmux is in
-        an unexpected state where continuing would compound the confusion. The
-        abort message names the pane, the exact failing ``tmux`` command, the
-        tmux detail, and how many panes were fully restamped before the failure,
-        so the half-restamp reality is auditable; re-running is safe because
-        already-correct panes are strict no-ops.
+        an unexpected state where continuing would compound the confusion.
+
+        A pane can carry more than one ``set-option`` (``@mozyo_lane_id`` plus a
+        ``@mozyo_lane_label`` set/unset), so the accounting is *command-grained*
+        (#13160 REV3): the abort message distinguishes the panes fully restamped,
+        the failing pane's own partial state (the commands that already landed on
+        it versus the one that failed), and the panes never attempted — so a pane
+        left half-restamped is reported as PARTIAL, never as "left unchanged".
+        Re-running is safe because already-correct panes are strict no-ops.
         """
         from mozyo_bridge.application.cockpit_repair_command import result_detail
 
         total = len(plan.drifts)
-        restamped = 0
-        for drift in plan.drifts:
+        for index, drift in enumerate(plan.drifts):
+            applied_in_pane: list[tuple] = []
             for argv in drift.commands:
                 result = self._ops.apply_command(argv)
                 if getattr(result, "returncode", 0) != 0:
-                    detail = result_detail(result) or "nonzero exit"
                     self._ops.die(
-                        f"cockpit restamp step failed (pane {drift.pane_id}): "
-                        f"`tmux {' '.join(argv)}` -> {detail}. "
-                        f"Restamped {restamped} of {total} pane(s) before the "
-                        f"failure; the remaining pane(s) were left unchanged. "
-                        f"Re-run `mozyo cockpit restamp` to continue "
-                        f"(already-correct panes are no-ops)."
+                        build_restamp_failure_message(
+                            pane_id=drift.pane_id,
+                            failed_argv=tuple(argv),
+                            detail=result_detail(result) or "nonzero exit",
+                            fully_restamped=index,
+                            total=total,
+                            applied_in_pane=tuple(applied_in_pane),
+                        )
                     )
-            restamped += 1
+                applied_in_pane.append(tuple(argv))
 
     def handle(
         self,

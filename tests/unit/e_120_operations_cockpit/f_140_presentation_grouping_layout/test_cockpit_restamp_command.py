@@ -70,10 +70,15 @@ class _Result:
 class FakeRestampOps:
     """Recording :class:`CockpitRestampOps` fake — no tmux."""
 
-    def __init__(self, *, panes, recompute, fail_pane=None, fail_stderr="boom"):
+    def __init__(
+        self, *, panes, recompute, fail_pane=None, fail_option=None, fail_stderr="boom"
+    ):
         self._panes = panes
         self._recompute = recompute
         self._fail_pane = fail_pane
+        # When set, only the ``set-option`` touching this option fails (so a pane
+        # with two commands can fail on its SECOND one — the REV3 mid-pane case).
+        self._fail_option = fail_option
         self._fail_stderr = fail_stderr
         self.emitted: list[str] = []
         self.applied: list[tuple] = []
@@ -92,8 +97,10 @@ class FakeRestampOps:
     def apply_command(self, argv):
         self.applied.append(tuple(argv))
         pane = argv[argv.index("-t") + 1]
+        option = argv[-1] if "-u" in argv else argv[-2]
         if self._fail_pane is not None and pane == self._fail_pane:
-            return _Result(returncode=1, stderr=self._fail_stderr)
+            if self._fail_option is None or option == self._fail_option:
+                return _Result(returncode=1, stderr=self._fail_stderr)
         return _Result(returncode=0)
 
     def die(self, message):
@@ -374,13 +381,17 @@ class HandleRestampUseCaseTest(unittest.TestCase):
         self.assertIn("pane %2", message)
         self.assertIn("tmux set-option -p -t %2 @mozyo_lane_id default", message)
         self.assertIn("tmux: pane not found", message)
-        self.assertIn("Restamped 1 of 2 pane(s) before the failure", message)
+        self.assertIn("Restamped 1 of 2 pane(s) fully.", message)
+        # %2's only command failed (nothing landed on it) -> not PARTIAL.
+        self.assertNotIn("PARTIALLY restamped", message)
         # %1 was applied before the abort; %2's failing command was attempted.
         self.assertIn(
             ("set-option", "-p", "-t", "%1", "@mozyo_lane_id", "default"), ops.applied
         )
 
-    def test_apply_failure_on_first_pane_reports_zero_restamped(self) -> None:
+    def test_apply_failure_on_first_command_reports_unchanged_not_partial(self) -> None:
+        # Single pane, single command fails -> zero applied on it: it is
+        # "left unchanged", not PARTIAL (REV3 constraint iii).
         ops = FakeRestampOps(
             panes=[_pane("%1", lane_id="lane-old1", lane_label="issue_x")],
             recompute=_Recompute({"/checkout/main": LaneIdentity("default", None)}),
@@ -391,7 +402,70 @@ class HandleRestampUseCaseTest(unittest.TestCase):
                 "mozyo-cockpit", _WS, json_output=False, dry_run=False
             )
         self.assertEqual(2, cm.exception.code)
-        self.assertIn("Restamped 0 of 1 pane(s) before the failure", ops.died[0])
+        message = ops.died[0]
+        self.assertIn("Restamped 0 of 1 pane(s) fully.", message)
+        self.assertNotIn("PARTIALLY restamped", message)
+        self.assertIn("1 pane(s) were left unchanged", message)
+
+    def test_mid_pane_command_failure_is_reported_as_partial(self) -> None:
+        # REV3 core case: a pane whose recompute yields a lane *label* emits two
+        # commands (@mozyo_lane_id then @mozyo_lane_label); the SECOND fails.
+        # A first, unrelated pane restamps fully before it.
+        ops = FakeRestampOps(
+            panes=[
+                _pane("%4", lane_id="lane-old4", lane_label=""),
+                _pane("%5", lane_id="default", lane_label="", repo_root="/wt/five"),
+            ],
+            recompute=_Recompute(
+                {
+                    "/checkout/main": LaneIdentity("default", None),
+                    "/wt/five": LaneIdentity("lane-abc123", "feature-5"),
+                }
+            ),
+            fail_pane="%5",
+            fail_option="@mozyo_lane_label",
+            fail_stderr="tmux: option write failed",
+        )
+        with self.assertRaises(SystemExit) as cm:
+            CockpitRestampUseCase(ops).handle(
+                "mozyo-cockpit", _WS, json_output=False, dry_run=False
+            )
+        # (iii) non-zero CLI exit.
+        self.assertEqual(2, cm.exception.code)
+        message = ops.died[0]
+        # (ii) fully-restamped / not-attempted counts are correct: %4 fully done,
+        # %5 partial, none left unattempted.
+        self.assertIn("Restamped 1 of 2 pane(s) fully.", message)
+        self.assertIn("0 pane(s) were left unchanged", message)
+        # (i) the failing pane's partial state shows BOTH the applied command and
+        # the failed command (never "left unchanged" for %5).
+        self.assertIn("Pane %5 is PARTIALLY restamped", message)
+        self.assertIn("'@mozyo_lane_id lane-abc123' applied", message)
+        self.assertIn("'@mozyo_lane_label feature-5' failed", message)
+        # The @mozyo_lane_id set landed on %5 before the label set failed.
+        self.assertIn(
+            ("set-option", "-p", "-t", "%5", "@mozyo_lane_id", "lane-abc123"),
+            ops.applied,
+        )
+
+    def test_mid_pane_unset_label_failure_is_partial(self) -> None:
+        # A polluted pane recomputes to `default` with no label: commands are
+        # (@mozyo_lane_id set, @mozyo_lane_label unset); the unset fails.
+        ops = FakeRestampOps(
+            panes=[_pane("%6", lane_id="lane-poison", lane_label="stale")],
+            recompute=_Recompute({"/checkout/main": LaneIdentity("default", None)}),
+            fail_pane="%6",
+            fail_option="@mozyo_lane_label",
+        )
+        with self.assertRaises(SystemExit) as cm:
+            CockpitRestampUseCase(ops).handle(
+                "mozyo-cockpit", _WS, json_output=False, dry_run=False
+            )
+        self.assertEqual(2, cm.exception.code)
+        message = ops.died[0]
+        self.assertIn("Pane %6 is PARTIALLY restamped", message)
+        self.assertIn("'@mozyo_lane_id default' applied", message)
+        self.assertIn("'@mozyo_lane_label (unset)' failed", message)
 
 
 if __name__ == "__main__":
