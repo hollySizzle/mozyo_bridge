@@ -14,16 +14,23 @@ code — so a single use case serves both:
   leaving the ``cmd_doctor_instruction`` / ``cmd_instruction_doctor`` adapters
   thin composition roots that only print the outcome's stdout and return its
   exit code.
+- :func:`cmd_doctor_instruction` / :func:`cmd_instruction_doctor`: those thin
+  composition roots themselves, moved here from the orchestration module in the
+  #13104 wrapper facade cleanup. :mod:`mozyo_bridge.application.commands`
+  re-exports both so the parser bindings and the ``commands.cmd_*`` import /
+  monkeypatch surface are unchanged.
 
 The runner and text renderer are injected callables so the thin adapters can
 hand the use case the ``doctor_instruction`` / ``instruction_doctor`` module
-functions resolved lazily *at call time*. That keeps the existing monkeypatch
-seams (tests patch ``doctor_instruction.run_doctor`` / ``.run_instruction_doctor``
-/ ``.doctor_target`` and drive the commands through ``args.func(args)``) driving
-the live or patched diagnostic unchanged. This module never reads the
+functions resolved lazily *at call time* (imported inside the adapter bodies).
+That keeps the existing monkeypatch seams (tests patch
+``doctor_instruction.run_doctor`` / ``.run_instruction_doctor`` /
+``.doctor_target`` and drive the commands through ``args.func(args)``) driving
+the live or patched diagnostic unchanged. The use case never reads the
 filesystem, never imports the diagnostic modules or the sibling
 :mod:`mozyo_bridge.application.doctor_command` boundary, and never owns stdout
-itself; rendering stays side-effect free.
+itself; rendering stays side-effect free, and the one ``print(...)`` per command
+lives in its adapter.
 """
 
 from __future__ import annotations
@@ -78,3 +85,36 @@ class InstructionCommandUseCase:
             stdout=stdout,
             exit_code=0 if result["ok"] else 1,
         )
+
+
+def cmd_doctor_instruction(args: argparse.Namespace) -> int:
+    # Thin handler over ``InstructionCommandUseCase`` above (#12930). Lazy
+    # imports preserve the ``doctor_instruction`` monkeypatch seams
+    # (``commands`` re-exports this adapter, #13104).
+    from mozyo_bridge.application.doctor_instruction import (
+        format_doctor_instruction_text,
+        run_doctor_instruction,
+    )
+
+    outcome = InstructionCommandUseCase(
+        run_doctor_instruction, format_doctor_instruction_text
+    ).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
+
+
+def cmd_instruction_doctor(args: argparse.Namespace) -> int:
+    # Thin handler mirroring ``cmd_doctor_instruction`` over the shared
+    # ``InstructionCommandUseCase`` (#12930). Lazy imports preserve the
+    # ``instruction_doctor`` monkeypatch seams (``commands`` re-exports this
+    # adapter, #13104).
+    from mozyo_bridge.application.instruction_doctor import (
+        format_instruction_doctor_text,
+        run_instruction_doctor,
+    )
+
+    outcome = InstructionCommandUseCase(
+        run_instruction_doctor, format_instruction_doctor_text
+    ).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code

@@ -11,15 +11,21 @@ the orchestration module into one bounded command boundary:
   the json/text rendering decision and the ``result["ok"]`` -> exit-code mapping,
   leaving the ``cmd_instruction_install`` adapter a thin composition root that
   only prints the outcome's stdout and returns its exit code.
+- :func:`cmd_instruction_install`: that thin composition root itself, moved here
+  from the orchestration module in the #13104 wrapper facade cleanup.
+  :mod:`mozyo_bridge.application.commands` re-exports it so the parser binding
+  and the ``commands.cmd_instruction_install`` import / monkeypatch surface are
+  unchanged.
 
 The runner and text renderer are injected callables so the thin adapter can hand
 the use case the :mod:`mozyo_bridge.application.instruction_install` module
-functions resolved lazily *at call time*. That keeps the existing monkeypatch
-seams (tests patch / import ``instruction_install.run_instruction_install`` /
+functions resolved lazily *at call time* (imported inside the adapter body).
+That keeps the existing monkeypatch seams (tests patch / import
+``instruction_install.run_instruction_install`` /
 ``.format_instruction_install_text`` and drive the command through
-``args.func(args)``) driving the live or patched install unchanged. This module
-never reads the filesystem, never imports the install module, and never owns
-stdout itself; rendering stays side-effect free.
+``args.func(args)``) driving the live or patched install unchanged. The use case
+never reads the filesystem and never owns stdout itself; rendering stays
+side-effect free, and the one ``print(...)`` lives in the adapter.
 
 The sibling doctor/instruction boundary
 (:mod:`mozyo_bridge.application.doctor_instruction_command`, Redmine #12930)
@@ -82,3 +88,19 @@ class InstructionInstallUseCase:
             stdout=stdout,
             exit_code=0 if result["ok"] else 1,
         )
+
+
+def cmd_instruction_install(args: argparse.Namespace) -> int:
+    # Thin handler over ``InstructionInstallUseCase`` above (#12935). Lazy
+    # imports preserve the ``instruction_install`` monkeypatch seams
+    # (``commands`` re-exports this adapter, #13104).
+    from mozyo_bridge.application.instruction_install import (
+        format_instruction_install_text,
+        run_instruction_install,
+    )
+
+    outcome = InstructionInstallUseCase(
+        run_instruction_install, format_instruction_install_text
+    ).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code

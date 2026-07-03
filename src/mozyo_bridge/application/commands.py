@@ -7,8 +7,16 @@ import sys
 import time
 from pathlib import Path
 
-from mozyo_bridge.application.doctor import format_doctor_text, run_doctor
-from mozyo_bridge.application.doctor_command import DoctorCommandUseCase
+# ``run_doctor`` / ``format_doctor_text`` stay importable here as the preserved
+# ``commands.run_doctor`` / ``commands.format_doctor_text`` monkeypatch seams:
+# the ``cmd_doctor`` adapter (moved to ``doctor_command``, #13104) resolves them
+# through this module's globals at call time. ``DoctorCommandUseCase`` /
+# ``cmd_doctor`` are re-exported for the pre-move import surface.
+from mozyo_bridge.application.doctor import format_doctor_text, run_doctor  # noqa: F401
+from mozyo_bridge.application.doctor_command import (  # noqa: F401
+    DoctorCommandUseCase,
+    cmd_doctor,
+)
 from mozyo_bridge.application.pane_primitive_command import (
     LivePanePrimitiveOps,
     PanePrimitiveOutcome,
@@ -3417,59 +3425,21 @@ from mozyo_bridge.application.cockpit_group_window_command import (  # noqa: E40
 )
 
 
-def cmd_doctor(args: argparse.Namespace) -> int:
-    # Thin handler: the doctor run, the json/text rendering decision, and the
-    # exit-code mapping live behind the ``doctor_command`` boundary (#12927).
-    # ``run_doctor`` / ``format_doctor_text`` are passed as this module's globals
-    # resolved at call time, so the ``commands.*`` monkeypatch tests are unchanged.
-    outcome = DoctorCommandUseCase(run_doctor, format_doctor_text).execute(args)
-    print(outcome.stdout)
-    return outcome.exit_code
-
-
-def cmd_doctor_instruction(args: argparse.Namespace) -> int:
-    # Thin handler over the ``doctor_instruction_command`` boundary (#12930): the
-    # run + json/text render + exit-code mapping live there. Lazy imports preserve
-    # the ``doctor_instruction`` monkeypatch seams.
-    from mozyo_bridge.application.doctor_instruction import (
-        format_doctor_instruction_text,
-        run_doctor_instruction,
-    )
-    from mozyo_bridge.application.doctor_instruction_command import InstructionCommandUseCase
-
-    outcome = InstructionCommandUseCase(run_doctor_instruction, format_doctor_instruction_text).execute(args)
-    print(outcome.stdout)
-    return outcome.exit_code
-
-
-def cmd_instruction_doctor(args: argparse.Namespace) -> int:
-    # Thin handler mirroring ``cmd_doctor_instruction`` over the shared
-    # ``doctor_instruction_command`` boundary (#12930). Lazy imports preserve the
-    # ``instruction_doctor`` monkeypatch seams.
-    from mozyo_bridge.application.instruction_doctor import (
-        format_instruction_doctor_text,
-        run_instruction_doctor,
-    )
-    from mozyo_bridge.application.doctor_instruction_command import InstructionCommandUseCase
-
-    outcome = InstructionCommandUseCase(run_instruction_doctor, format_instruction_doctor_text).execute(args)
-    print(outcome.stdout)
-    return outcome.exit_code
-
-
-def cmd_instruction_install(args: argparse.Namespace) -> int:
-    # Thin handler over the ``instruction_install_command`` boundary (#12935): the
-    # run + json/text render + exit-code mapping live there. Lazy imports preserve
-    # the ``instruction_install`` monkeypatch seams.
-    from mozyo_bridge.application.instruction_install import (
-        format_instruction_install_text,
-        run_instruction_install,
-    )
-    from mozyo_bridge.application.instruction_install_command import InstructionInstallUseCase
-
-    outcome = InstructionInstallUseCase(run_instruction_install, format_instruction_install_text).execute(args)
-    print(outcome.stdout)
-    return outcome.exit_code
+# Compatibility re-export (#13104): the doctor/instruction thin command
+# adapters moved into their bounded command modules (``cmd_doctor`` is
+# re-exported with ``DoctorCommandUseCase`` in the line-1 import block above).
+# Re-export the ``runtime-config`` family adapters so the parser bindings
+# (``cli.py`` / ``cli_runtime_config.py`` import them from here) and existing
+# ``commands.cmd_*`` imports keep resolving. Both modules import their
+# diagnostic/install runners only lazily inside the adapter bodies, so these
+# top-level imports introduce no cycle.
+from mozyo_bridge.application.doctor_instruction_command import (  # noqa: E402,F401
+    cmd_doctor_instruction,
+    cmd_instruction_doctor,
+)
+from mozyo_bridge.application.instruction_install_command import (  # noqa: E402,F401
+    cmd_instruction_install,
+)
 
 
 # --- Compatibility facade: handlers split into family modules (#12142, #12154). ---

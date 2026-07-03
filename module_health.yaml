@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3507
+    lines: 3477
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -854,6 +854,16 @@ allowlist:
       stay as thin wrappers so the monkeypatch seams are unchanged. 3531 ->
       3507 is a 24-line net removal and the post-merge ``commands.py`` line
       count is 3507.
+      Lowered 3507 -> 3477 for the #13104 doctor/instruction wrapper facade
+      cleanup: the ``cmd_doctor`` / ``cmd_doctor_instruction`` /
+      ``cmd_instruction_doctor`` / ``cmd_instruction_install`` thin adapter
+      bodies moved into their bounded command modules (``doctor_command`` /
+      ``doctor_instruction_command`` / ``instruction_install_command``);
+      ``commands.py`` re-exports the four names, keeps the
+      ``commands.run_doctor`` / ``commands.format_doctor_text`` monkeypatch
+      seams importable, and the relocated ``cmd_doctor`` resolves them through
+      this module's globals at call time. 3507 -> 3477 is a 30-line net removal
+      and the post-merge ``commands.py`` line count is 3477.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

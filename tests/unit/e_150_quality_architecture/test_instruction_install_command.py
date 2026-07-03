@@ -11,7 +11,10 @@ install``):
   rendering branches,
 - that the runner and the renderer are *injected* callables the use case calls
   (so the thin adapter can hand it the ``instruction_install`` module functions
-  resolved at call time, preserving that module's monkeypatch seams).
+  resolved at call time, preserving that module's monkeypatch seams),
+- the relocated ``cmd_instruction_install`` adapter (#13104): re-exported from
+  ``commands`` as the same object, resolving the install module lazily at call
+  time, printing the outcome's stdout once, and returning its exit code.
 
 The end-to-end behavior over the real ``run_instruction_install`` /
 ``format_instruction_install_text`` install stays pinned by the CLI tests in
@@ -109,22 +112,68 @@ class InstructionInstallUseCaseTest(unittest.TestCase):
 
     def test_use_case_never_imports_the_install_or_diagnostic_modules(self) -> None:
         # The write-side entry keeps its own boundary; it must not couple to the
-        # install module (side effects stay behind the injected runner) nor to the
-        # #12930 diagnostic boundary (this tranche does not touch that surface).
+        # #12930 diagnostic boundary (this tranche does not touch that surface),
+        # not even lazily. The install module may be imported *only* lazily
+        # inside the relocated ``cmd_instruction_install`` adapter body (#13104),
+        # never at module import time, so importing this boundary stays
+        # cycle-free and side-effect free.
         import ast
 
         import mozyo_bridge.application.instruction_install_command as mod
 
         with open(mod.__file__, encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
-        imported: list[str] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                imported.append(node.module)
-            elif isinstance(node, ast.Import):
-                imported.extend(alias.name for alias in node.names)
-        self.assertFalse([m for m in imported if "instruction_install" in m])
-        self.assertFalse([m for m in imported if "doctor_instruction_command" in m])
+
+        def modules_of(nodes: list[ast.stmt]) -> list[str]:
+            found: list[str] = []
+            for node in nodes:
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    found.append(node.module)
+                elif isinstance(node, ast.Import):
+                    found.extend(alias.name for alias in node.names)
+            return found
+
+        top_level = modules_of(tree.body)
+        self.assertFalse([m for m in top_level if m.endswith("instruction_install")])
+
+        everywhere = modules_of(list(ast.walk(tree)))
+        self.assertFalse(
+            [m for m in everywhere if m.endswith("doctor_instruction_command")]
+        )
+
+
+class RelocatedAdapterTest(unittest.TestCase):
+    """Pin the #13104 move: the adapter lives here, ``commands`` re-exports it."""
+
+    def test_commands_re_export_is_same_object(self) -> None:
+        from mozyo_bridge.application import commands, instruction_install_command
+
+        self.assertIs(
+            commands.cmd_instruction_install,
+            instruction_install_command.cmd_instruction_install,
+        )
+
+    def test_cmd_instruction_install_resolves_seams_at_call_time(self) -> None:
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from mozyo_bridge.application.instruction_install_command import (
+            cmd_instruction_install,
+        )
+
+        args = argparse.Namespace(json=False)
+        with patch(
+            "mozyo_bridge.application.instruction_install.run_instruction_install",
+            return_value=_result(ok=False),
+        ), patch(
+            "mozyo_bridge.application.instruction_install.format_instruction_install_text",
+            return_value="patched install text",
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            exit_code = cmd_instruction_install(args)
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual("patched install text\n", stdout.getvalue())
 
 
 if __name__ == "__main__":

@@ -11,7 +11,11 @@ tmux server, no filesystem. They pin:
   (so the thin ``cmd_doctor`` adapter can hand it the ``commands.*`` globals
   resolved at call time, preserving the existing monkeypatch surface),
 - the relocated pure ``format_doctor_text`` still renders the same legacy text
-  and is re-exported from ``doctor`` for backward-compatible importers.
+  and is re-exported from ``doctor`` for backward-compatible importers,
+- the relocated ``cmd_doctor`` adapter (#13104): re-exported from ``commands``
+  as the same object, resolving the ``commands.run_doctor`` /
+  ``commands.format_doctor_text`` seams at call time, printing the outcome's
+  stdout once, and returning its exit code.
 
 The end-to-end behavior over the real ``run_doctor`` / section collectors stays
 pinned by the ``cmd_doctor`` characterization tests in
@@ -138,7 +142,12 @@ class DoctorCommandPublicSurfaceTest(unittest.TestCase):
         from mozyo_bridge.application import doctor_command
 
         self.assertEqual(
-            ["DoctorCommandOutcome", "DoctorCommandUseCase", "format_doctor_text"],
+            [
+                "DoctorCommandOutcome",
+                "DoctorCommandUseCase",
+                "cmd_doctor",
+                "format_doctor_text",
+            ],
             doctor_command.__all__,
         )
 
@@ -159,6 +168,38 @@ class DoctorCommandPublicSurfaceTest(unittest.TestCase):
                 hasattr(doctor_command, name),
                 f"{name} declared in __all__ but not defined",
             )
+
+
+class CmdDoctorRelocatedAdapterTest(unittest.TestCase):
+    """Pin the #13104 move: the adapter lives here, ``commands`` re-exports it."""
+
+    def test_commands_re_export_is_same_object(self) -> None:
+        from mozyo_bridge.application import commands, doctor_command
+
+        self.assertIs(commands.cmd_doctor, doctor_command.cmd_doctor)
+
+    def test_adapter_resolves_commands_seams_at_call_time(self) -> None:
+        # Patching the ``commands``-module globals must still steer the moved
+        # adapter: the runner/renderer are resolved through ``commands`` when
+        # ``cmd_doctor`` runs, not bound at import time.
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from mozyo_bridge.application.doctor_command import cmd_doctor
+
+        args = argparse.Namespace(json=False)
+        with patch(
+            "mozyo_bridge.application.commands.run_doctor",
+            return_value=_minimal_result(ok=False),
+        ), patch(
+            "mozyo_bridge.application.commands.format_doctor_text",
+            return_value="patched doctor text",
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            exit_code = cmd_doctor(args)
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual("patched doctor text\n", stdout.getvalue())
 
 
 if __name__ == "__main__":

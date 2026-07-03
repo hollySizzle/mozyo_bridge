@@ -17,15 +17,20 @@ command boundary:
   json/text rendering decision and the ``result["ok"]`` -> exit-code mapping,
   leaving ``cmd_doctor`` a thin composition root that only prints the outcome's
   stdout and returns its exit code.
+- :func:`cmd_doctor`: that thin composition root itself, moved here from the
+  orchestration module in the #13104 wrapper facade cleanup.
+  :mod:`mozyo_bridge.application.commands` re-exports it so the parser binding
+  and the ``commands.cmd_doctor`` import / monkeypatch surface are unchanged.
 
 The use case takes the runner and the text renderer as injected callables so the
 thin ``cmd_doctor`` adapter can hand it the ``commands``-module globals resolved
-*at call time*. That keeps the existing ``commands.run_doctor`` /
+*at call time* (imported lazily inside the adapter body, so no import cycle with
+the ``commands`` facade). That keeps the existing ``commands.run_doctor`` /
 ``commands.format_doctor_text`` monkeypatch integration tests (and the status
 command's doctor-tail continuation, which routes through ``commands.cmd_doctor``)
-driving the live or patched doctor unchanged. This module never reads the
-filesystem, never imports :mod:`mozyo_bridge.application.doctor`, and never owns
-stdout itself; rendering stays side-effect free.
+driving the live or patched doctor unchanged. The use case never reads the
+filesystem and never owns stdout itself; rendering stays side-effect free, and
+the one ``print(...)`` lives in the ``cmd_doctor`` adapter.
 """
 
 from __future__ import annotations
@@ -39,11 +44,13 @@ from typing import Any, Callable
 # the pure renderer re-exported by :mod:`mozyo_bridge.application.doctor` for the
 # ``doctor.format_doctor_text`` / ``commands.format_doctor_text`` compatibility
 # facade; ``DoctorCommandUseCase`` / ``DoctorCommandOutcome`` are the command
-# wrapper the thin ``cmd_doctor`` adapter composes. ``_format_skill_block`` is an
+# wrapper the thin ``cmd_doctor`` adapter composes; ``cmd_doctor`` is that
+# adapter, re-exported by ``commands.py`` (#13104). ``_format_skill_block`` is an
 # internal helper of ``format_doctor_text`` and is intentionally excluded.
 __all__ = [
     "DoctorCommandOutcome",
     "DoctorCommandUseCase",
+    "cmd_doctor",
     "format_doctor_text",
 ]
 
@@ -381,3 +388,19 @@ class DoctorCommandUseCase:
             stdout=stdout,
             exit_code=0 if result["ok"] else 1,
         )
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    # Thin handler: the doctor run, the json/text rendering decision, and the
+    # exit-code mapping live in ``DoctorCommandUseCase`` above (#12927). The
+    # runner / renderer are the ``commands``-module globals resolved lazily at
+    # call time, so the ``commands.run_doctor`` / ``commands.format_doctor_text``
+    # monkeypatch tests are unchanged and no import cycle is introduced
+    # (``commands`` re-exports this adapter, #13104).
+    from mozyo_bridge.application import commands as _commands
+
+    outcome = DoctorCommandUseCase(
+        _commands.run_doctor, _commands.format_doctor_text
+    ).execute(args)
+    print(outcome.stdout)
+    return outcome.exit_code
