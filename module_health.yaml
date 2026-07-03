@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3581
+    lines: 3555
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -823,6 +823,13 @@ allowlist:
       net removal and the post-carve ``commands.py`` line count is 3581.
       ``test_cockpit_dispatcher_command`` adds the pure route/decision/rendering
       + fake-port use-case specifications.
+      Lowered 3581 -> 3555 for the #13103 init pane marker binding tranche:
+      ``_bind_agent_pane_markers`` (the role/workspace pane-option stamping on
+      an adopted pane) moved into ``application/init_command.py`` next to the
+      ``LiveInitWorkspaceOps.bind_agent_pane_markers`` adapter that consumes
+      it; ``run_tmux`` resolves through ``commands`` at call time so the
+      ``commands.run_tmux`` patch seam is unchanged, and ``commands.py``
+      re-exports the legacy name alongside the #12979 helper tail.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

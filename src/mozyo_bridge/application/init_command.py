@@ -239,7 +239,8 @@ class LiveInitWorkspaceOps:
     def bind_agent_pane_markers(
         self, target: str, agent: str, workspace_id: str | None, notes: list[str]
     ) -> None:
-        self._commands()._bind_agent_pane_markers(target, agent, workspace_id, notes)
+        # Pane-option marker stamping; owned by this boundary (#13103).
+        _bind_agent_pane_markers(target, agent, workspace_id, notes)
 
 
 # --- Pure fail-closed policy: exact legacy `die` messages. --------------------
@@ -609,3 +610,40 @@ def _write_vscode_session_name(root: Path, session_name: str) -> tuple[Path, boo
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(new_text, encoding="utf-8")
     return settings_path, True, None
+
+
+def _bind_agent_pane_markers(
+    target: str, agent: str, workspace_id: str | None, notes: list[str]
+) -> None:
+    """Stamp `@mozyo_agent_role` (+ `@mozyo_workspace_id`) on an adopted pane.
+
+    Reuses the cockpit identity options (`domain.cockpit_layout`) so a normal
+    `init`-adopted pane carries the same machine-readable role/workspace markers
+    a cockpit pane does, which is what makes `agents`/`session list` report it as
+    a `pane_option` / strong role rather than inferring the role from the window
+    name alone. Best-effort: a non-zero tmux exit is noted but never aborts the
+    already-completed adoption.
+
+    Moved from ``application/commands.py`` as part of the #12638 OOP-first carve
+    (#13103); ``commands.py`` re-exports the legacy name. ``run_tmux`` resolves
+    *through the* :mod:`commands` *module at call time* so the characterization
+    tests that patch ``mozyo_bridge.application.commands.run_tmux`` keep
+    intercepting the marker writes.
+    """
+    from mozyo_bridge.application import commands
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLE_OPTION, WORKSPACE_OPTION
+
+    role_result = commands.run_tmux(
+        "set-option", "-p", "-t", target, ROLE_OPTION, agent, check=False
+    )
+    if role_result.returncode == 0:
+        notes.append(f"bound role marker {ROLE_OPTION}={agent} on {target}")
+    else:
+        notes.append(
+            f"warning: could not set {ROLE_OPTION} on {target} "
+            f"(role still resolves from the window name)"
+        )
+    if workspace_id:
+        commands.run_tmux(
+            "set-option", "-p", "-t", target, WORKSPACE_OPTION, workspace_id, check=False
+        )

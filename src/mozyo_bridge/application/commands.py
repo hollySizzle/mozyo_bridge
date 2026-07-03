@@ -3433,16 +3433,18 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-# Compatibility re-export (#12979): the workspace/session config helper tail
-# (`_confident_workspace_root` / `_is_fallback_session_name` /
-# `_agent_window_conflict` / `_write_vscode_session_name`) moved into the
-# `init_command` boundary that consumes them. Re-export the legacy names so
-# existing imports (`commands._confident_workspace_root` /
+# Compatibility re-export (#12979, #13103): the workspace/session config helper
+# tail (`_confident_workspace_root` / `_is_fallback_session_name` /
+# `_agent_window_conflict` / `_write_vscode_session_name`) and the pane-option
+# marker stamping (`_bind_agent_pane_markers`) moved into the `init_command`
+# boundary that consumes them. Re-export the legacy names so existing imports
+# (`commands._confident_workspace_root` /
 # `commands._is_fallback_session_name` are exercised directly by tests) keep
 # resolving byte-for-byte. `init_command` imports `commands` only lazily, so this
 # top-level import introduces no cycle.
 from mozyo_bridge.application.init_command import (  # noqa: E402
     _agent_window_conflict,
+    _bind_agent_pane_markers,
     _confident_workspace_root,
     _is_fallback_session_name,
     _write_vscode_session_name,
@@ -3461,34 +3463,6 @@ from mozyo_bridge.application.cockpit_group_window_command import (  # noqa: E40
     GROUP_ACTION_FOCUS,
     GROUP_ACTIONS,
 )
-
-
-def _bind_agent_pane_markers(
-    target: str, agent: str, workspace_id: str | None, notes: list[str]
-) -> None:
-    """Stamp `@mozyo_agent_role` (+ `@mozyo_workspace_id`) on an adopted pane.
-
-    Reuses the cockpit identity options (`domain.cockpit_layout`) so a normal
-    `init`-adopted pane carries the same machine-readable role/workspace markers
-    a cockpit pane does, which is what makes `agents`/`session list` report it as
-    a `pane_option` / strong role rather than inferring the role from the window
-    name alone. Best-effort: a non-zero tmux exit is noted but never aborts the
-    already-completed adoption.
-    """
-    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import ROLE_OPTION, WORKSPACE_OPTION
-
-    role_result = run_tmux("set-option", "-p", "-t", target, ROLE_OPTION, agent, check=False)
-    if role_result.returncode == 0:
-        notes.append(f"bound role marker {ROLE_OPTION}={agent} on {target}")
-    else:
-        notes.append(
-            f"warning: could not set {ROLE_OPTION} on {target} "
-            f"(role still resolves from the window name)"
-        )
-    if workspace_id:
-        run_tmux(
-            "set-option", "-p", "-t", target, WORKSPACE_OPTION, workspace_id, check=False
-        )
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

@@ -37,6 +37,7 @@ from mozyo_bridge.application.init_command import (
     InitWorkspaceOps,
     LiveInitWorkspaceOps,
     _agent_window_conflict,
+    _bind_agent_pane_markers,
     _confident_workspace_root,
     _is_fallback_session_name,
     _write_vscode_session_name,
@@ -488,6 +489,73 @@ class WorkspaceConfigHelperTest(unittest.TestCase):
         self.assertIs(commands._is_fallback_session_name, _is_fallback_session_name)
         self.assertIs(commands._agent_window_conflict, _agent_window_conflict)
         self.assertIs(commands._write_vscode_session_name, _write_vscode_session_name)
+        self.assertIs(commands._bind_agent_pane_markers, _bind_agent_pane_markers)
+
+
+class BindAgentPaneMarkersTest(unittest.TestCase):
+    """Pin the pane-option marker stamping moved into this boundary (#13103).
+
+    ``run_tmux`` is resolved through the ``commands`` module at call time, so
+    patching ``commands.run_tmux`` intercepts exactly like the ``cmd_init``
+    characterization tests do.
+    """
+
+    def _run(
+        self,
+        *,
+        workspace_id: str | None,
+        role_returncode: int = 0,
+    ) -> tuple[list[tuple], list[str]]:
+        from unittest.mock import patch
+
+        calls: list[tuple] = []
+        notes: list[str] = []
+
+        def fake_run_tmux(*tmux_args, **_):
+            calls.append(tmux_args)
+            returncode = role_returncode if len(calls) == 1 else 0
+            return argparse.Namespace(returncode=returncode, stdout="", stderr="")
+
+        with patch(
+            "mozyo_bridge.application.commands.run_tmux", side_effect=fake_run_tmux
+        ):
+            _bind_agent_pane_markers("%5", "claude", workspace_id, notes)
+        return calls, notes
+
+    def test_stamps_role_and_workspace_markers_with_notes(self) -> None:
+        calls, notes = self._run(workspace_id="ws-1")
+        self.assertEqual(
+            [
+                ("set-option", "-p", "-t", "%5", "@mozyo_agent_role", "claude"),
+                ("set-option", "-p", "-t", "%5", "@mozyo_workspace_id", "ws-1"),
+            ],
+            calls,
+        )
+        self.assertEqual(
+            ["bound role marker @mozyo_agent_role=claude on %5"], notes
+        )
+
+    def test_skips_workspace_marker_without_workspace_id(self) -> None:
+        calls, notes = self._run(workspace_id=None)
+        self.assertEqual(
+            [("set-option", "-p", "-t", "%5", "@mozyo_agent_role", "claude")], calls
+        )
+        self.assertEqual(
+            ["bound role marker @mozyo_agent_role=claude on %5"], notes
+        )
+
+    def test_failed_role_write_notes_warning_and_never_raises(self) -> None:
+        calls, notes = self._run(workspace_id="ws-1", role_returncode=1)
+        # Best-effort: the failure becomes a warning note; the workspace marker
+        # write is still attempted and the adoption is never aborted.
+        self.assertEqual(2, len(calls))
+        self.assertEqual(
+            [
+                "warning: could not set @mozyo_agent_role on %5 "
+                "(role still resolves from the window name)"
+            ],
+            notes,
+        )
 
 
 if __name__ == "__main__":
