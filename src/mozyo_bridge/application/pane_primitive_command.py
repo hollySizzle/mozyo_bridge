@@ -28,6 +28,14 @@ serves the family:
 - :class:`PanePrimitiveUseCase`: composes the port into the six behavior-preserving
   flows, leaving the ``cmd_*`` adapters thin composition roots that only print the
   outcome's stdout and return its exit code.
+- ``cmd_id`` / ``cmd_resolve`` / ``cmd_read`` / ``cmd_type`` / ``cmd_message`` /
+  ``cmd_keys`` and their ``_emit_pane_primitive_outcome`` print helper: those thin
+  composition roots themselves, moved here from ``commands.py`` (Redmine #13121)
+  and re-exported there so the ``commands.cmd_*`` import surface, the cli /
+  cli_core / cli_handoff parser bindings (``func.__name__`` unchanged), and the
+  tests that patch ``commands.cmd_read`` / ``.cmd_message`` / ``.cmd_keys`` keep
+  working (the notify / session-bootstrap internal callers resolve the handlers
+  through the ``commands`` module attributes at call time).
 
 The strict-rail ``message`` submission (marker observed → Enter, else ``C-u``
 rollback + ``marker_timeout`` die) and its stderr guidance trailer are preserved
@@ -314,3 +322,38 @@ class PanePrimitiveUseCase:
         self._ops.run_tmux("send-keys", "-t", target, *args.keys)
         self._ops.clear_read(target)
         return PanePrimitiveOutcome(exit_code=0)
+
+
+# Thin composition roots (moved from ``commands.py``, Redmine #13121): print the
+# outcome's stdout and return its exit code, nothing else. Parser-bound through
+# the ``commands`` re-export so ``func.__name__`` and the ``commands.cmd_*``
+# monkeypatch seams are unchanged; the live port keeps resolving every primitive
+# through the ``commands`` module globals at call time (#12932).
+def _emit_pane_primitive_outcome(outcome: PanePrimitiveOutcome) -> int:
+    if outcome.stdout is not None:
+        print(outcome.stdout, end=outcome.stdout_end)
+    return outcome.exit_code
+
+
+def cmd_id(_: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).id(_))
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).resolve(args))
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).read(args))
+
+
+def cmd_type(args: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).type_text(args))
+
+
+def cmd_message(args: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).message(args))
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).keys(args))

@@ -17,10 +17,28 @@ from mozyo_bridge.application.doctor_command import (  # noqa: F401
     DoctorCommandUseCase,
     cmd_doctor,
 )
-from mozyo_bridge.application.pane_primitive_command import (
+# The ``cmd_id`` / ``cmd_resolve`` / ``cmd_read`` / ``cmd_type`` / ``cmd_message``
+# / ``cmd_keys`` thin adapters and their ``_emit_pane_primitive_outcome`` print
+# helper moved to ``pane_primitive_command`` next to the use case they compose
+# (#13121); all are re-exported so the ``commands.cmd_*`` import surface, the
+# cli / cli_core / cli_handoff parser bindings, and the tests that patch
+# ``commands.cmd_read`` / ``.cmd_message`` / ``.cmd_keys`` are unchanged (the
+# notify / session-bootstrap internal callers resolve the handlers through this
+# module's attributes at call time). ``LivePanePrimitiveOps`` keeps routing every
+# tmux / pane / read-marker primitive through this module's globals at call time,
+# so the ``commands.require_tmux`` / ``.run_tmux`` / ``.wait_for_text`` /
+# ``.capture_pane`` monkeypatch seams are unchanged (#12932).
+from mozyo_bridge.application.pane_primitive_command import (  # noqa: F401
     LivePanePrimitiveOps,
     PanePrimitiveOutcome,
     PanePrimitiveUseCase,
+    _emit_pane_primitive_outcome,
+    cmd_id,
+    cmd_keys,
+    cmd_message,
+    cmd_read,
+    cmd_resolve,
+    cmd_type,
 )
 from mozyo_bridge.application.handoff_delivery_command import (
     DeliveryRecordUseCase,
@@ -263,42 +281,12 @@ def _agents_target_candidates(args: argparse.Namespace) -> list:
 
 
 # The ``cmd_id`` / ``cmd_resolve`` / ``cmd_read`` / ``cmd_type`` / ``cmd_message``
-# / ``cmd_keys`` low-level pane/debug primitives were carved into an OOP-first
-# command boundary (Redmine #12932 / #12638): a ``PanePrimitiveOps`` port over
-# every tmux / pane / read-marker primitive, a ``LivePanePrimitiveOps`` adapter
-# that routes those primitives through this module's globals at call time (so the
-# existing ``commands.*`` monkeypatch seams are unchanged), a ``PanePrimitiveUseCase``
-# owning the six behavior-preserving flows, and a ``PanePrimitiveOutcome`` value
-# object. The ``cmd_*`` handlers below stay thin composition roots (kept as
-# module-level names so the cli_core / cli / cli_handoff parser bindings and the
-# ``rollback_unsubmitted_input`` / notify internal callers that reference them —
-# and the tests that patch ``commands.cmd_read`` / ``.cmd_message`` / ``.cmd_keys``
-# — are unchanged). The ``_emit_message_gate_guidance`` trailer moved with the
-# family to ``pane_primitive_command.py`` (routed via the port); the sibling
+# / ``cmd_keys`` pane primitive adapters (the #12932 / #12638 OOP-first carve)
+# and their ``_emit_pane_primitive_outcome`` print helper moved to
+# ``pane_primitive_command.py`` next to the ``PanePrimitiveUseCase`` they compose
+# (#13121); all are re-exported at the top of this module. The sibling
 # ``_emit_handoff_marker_timeout_guidance`` below stays here (its caller is the
 # out-of-scope ``orchestrate_handoff`` strict rail).
-
-
-def _emit_pane_primitive_outcome(outcome: PanePrimitiveOutcome) -> int:
-    if outcome.stdout is not None:
-        print(outcome.stdout, end=outcome.stdout_end)
-    return outcome.exit_code
-
-
-def cmd_id(_: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).id(_))
-
-
-def cmd_resolve(args: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).resolve(args))
-
-
-def cmd_read(args: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).read(args))
-
-
-def cmd_type(args: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).type_text(args))
 
 
 def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
@@ -311,14 +299,6 @@ def _emit_handoff_marker_timeout_guidance(receiver: str) -> None:
     ``orchestrate_handoff`` strict rail.
     """
     DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_marker_timeout_guidance(receiver)
-
-
-def cmd_message(args: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).message(args))
-
-
-def cmd_keys(args: argparse.Namespace) -> int:
-    return _emit_pane_primitive_outcome(PanePrimitiveUseCase(LivePanePrimitiveOps()).keys(args))
 
 
 # Per-agent window status-bar styling under the bare-`mozyo` window model.
