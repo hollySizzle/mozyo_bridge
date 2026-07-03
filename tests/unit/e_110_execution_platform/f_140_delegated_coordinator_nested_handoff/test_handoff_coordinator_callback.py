@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (  # noqa: E402
+    _no_coordinator_message,
     coordinator_codex_candidates,
     resolve_coordinator_codex,
     resolve_target,
@@ -204,6 +205,62 @@ class ResolveTargetCoordinatorTest(unittest.TestCase):
         self.assertIn("multiple default-lane Codex", message)
         self.assertIn("%953", message)
         self.assertIn("%955", message)
+
+
+class NoCoordinatorCanonicalHintTest(unittest.TestCase):
+    """The no-coordinator message points at the real cause (#13152)."""
+
+    # A workspace whose only panes are the sublane — no default-lane Codex.
+    PANES = [SUBLANE_CLAUDE, SUBLANE_CODEX]
+
+    def test_generic_hint_without_canonical_state(self) -> None:
+        message = _no_coordinator_message(self.PANES, SUBLANE_CLAUDE)
+        self.assertIn("no default-lane (coordinator) Codex pane", message)
+        self.assertNotIn("registry defect", message)
+
+    def test_dead_canonical_names_the_registry_defect(self) -> None:
+        canonical_state = {
+            "canonical_path": "/gone/main",
+            "exists": False,
+            "is_dir": False,
+            "is_git": None,
+            "is_main_worktree": None,
+        }
+        message = _no_coordinator_message(
+            self.PANES, SUBLANE_CLAUDE, canonical_state=canonical_state
+        )
+        self.assertIn("registry defect", message)
+        self.assertIn("#13152", message)
+        self.assertIn("/gone/main", message)
+        self.assertIn("workspace register", message)
+
+    def test_worktree_canonical_names_the_registry_defect(self) -> None:
+        canonical_state = {
+            "canonical_path": "/repo/.git/worktrees/wt",
+            "exists": True,
+            "is_dir": True,
+            "is_git": True,
+            "is_main_worktree": False,
+        }
+        message = _no_coordinator_message(
+            self.PANES, SUBLANE_CLAUDE, canonical_state=canonical_state
+        )
+        self.assertIn("registry defect", message)
+        self.assertIn("#13152", message)
+
+    def test_healthy_canonical_keeps_generic_hint(self) -> None:
+        canonical_state = {
+            "canonical_path": "/repo",
+            "exists": True,
+            "is_dir": True,
+            "is_git": True,
+            "is_main_worktree": True,
+        }
+        message = _no_coordinator_message(
+            self.PANES, SUBLANE_CLAUDE, canonical_state=canonical_state
+        )
+        self.assertIn("no default-lane (coordinator) Codex pane", message)
+        self.assertNotIn("registry defect", message)
 
 
 if __name__ == "__main__":

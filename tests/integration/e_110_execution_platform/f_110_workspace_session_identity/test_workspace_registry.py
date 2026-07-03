@@ -13,6 +13,8 @@ import argparse
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -667,6 +669,7 @@ class DoctorWorkspaceRegistrySectionTest(WorkspaceRegistryBase):
                 "anchor",
                 "consistency",
                 "home_registry",
+                "identity",
                 "next_action",
                 "registration",
                 "runtime",
@@ -705,6 +708,119 @@ class DoctorWorkspaceRegistrySectionTest(WorkspaceRegistryBase):
         self.assertIn("workspace_registry:", text)
         self.assertIn("home_registry:", text)
         self.assertIn("runtime:", text)
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+class RegisterCanonicalMoveGuardTest(WorkspaceRegistryBase):
+    """Canonical-path move guard (Redmine #13152).
+
+    Covers the three branches: a linked git worktree is refused outright; a
+    move off a still-live plain checkout needs ``--move``; a move off a dead
+    (removed) canonical_path is allowed.
+    """
+
+    def _init_git_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        _git(path, "init", "-q")
+        _git(path, "config", "user.email", "t@example.com")
+        _git(path, "config", "user.name", "Test")
+        (path / "README").write_text("x\n", encoding="utf-8")
+        _git(path, "add", "-A")
+        _git(path, "commit", "-q", "-m", "init")
+
+    def _copy_anchor(self, src: Path, dst: Path) -> None:
+        """Duplicate ``src``'s anchor into ``dst`` — the tracked-anchor bug shape."""
+        dst_anchor = dst / ANCHOR_RELATIVE
+        dst_anchor.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src / ANCHOR_RELATIVE, dst_anchor)
+
+    def test_linked_worktree_register_is_refused(self) -> None:
+        main = Path(self._tmp.name) / "gitmain"
+        self._init_git_repo(main)
+        first = register_workspace(main, home=self.home)
+
+        worktree = Path(self._tmp.name) / "gitwt"
+        _git(main, "worktree", "add", "-q", str(worktree))
+        # The bug's shape: the worktree carries a duplicated anchor (same id).
+        self._copy_anchor(main, worktree)
+
+        with self.assertRaises(SystemExit):
+            register_workspace(worktree, home=self.home)
+        # Canonical path unmoved: still the main checkout.
+        row = load_workspace_by_path(main, home=self.home)
+        self.assertIsNotNone(row)
+        self.assertEqual(row.canonical_path, str(main.resolve()))
+        self.assertEqual(row.workspace_id, first.record.workspace_id)
+
+    def test_live_canonical_move_needs_move_flag(self) -> None:
+        register_workspace(self.repo, home=self.home)
+        clone = Path(self._tmp.name) / "workspaces" / "clone-repo"
+        clone.mkdir(parents=True)
+        self._copy_anchor(self.repo, clone)
+
+        # self.repo still exists -> refuse without --move.
+        with self.assertRaises(SystemExit):
+            register_workspace(clone, home=self.home)
+        self.assertEqual(
+            load_workspace_by_path(self.repo, home=self.home).canonical_path,
+            str(self.repo.resolve()),
+        )
+
+        # Explicit --move relocates the identity.
+        result = register_workspace(clone, home=self.home, allow_move=True)
+        self.assertEqual(result.record.canonical_path, str(clone.resolve()))
+        self.assertIn("workspace moved", " ".join(result.notes))
+        self.assertIsNone(load_workspace_by_path(self.repo, home=self.home))
+
+    def test_probe_canonical_liveness_classifies_checkouts(self) -> None:
+        from mozyo_bridge.workspace_registry import probe_canonical_liveness
+
+        # Dead path.
+        dead = probe_canonical_liveness(str(Path(self._tmp.name) / "nope"))
+        self.assertFalse(dead["exists"])
+        self.assertFalse(dead["is_dir"])
+
+        # Plain (non-git) directory: exists, not a git checkout.
+        plain = probe_canonical_liveness(str(self.repo))
+        self.assertTrue(plain["is_dir"])
+        self.assertFalse(plain["is_git"])
+        self.assertIsNone(plain["is_main_worktree"])
+
+        # Real git main checkout vs a linked worktree.
+        main = Path(self._tmp.name) / "gitmain2"
+        self._init_git_repo(main)
+        worktree = Path(self._tmp.name) / "gitwt2"
+        _git(main, "worktree", "add", "-q", str(worktree))
+
+        main_state = probe_canonical_liveness(str(main))
+        self.assertTrue(main_state["is_git"])
+        self.assertTrue(main_state["is_main_worktree"])
+
+        wt_state = probe_canonical_liveness(str(worktree))
+        self.assertTrue(wt_state["is_git"])
+        self.assertFalse(wt_state["is_main_worktree"])
+
+    def test_dead_canonical_move_is_allowed(self) -> None:
+        first = register_workspace(self.repo, home=self.home)
+        relocated = Path(self._tmp.name) / "workspaces" / "relocated-repo"
+        relocated.mkdir(parents=True)
+        self._copy_anchor(self.repo, relocated)
+        # The original checkout is gone (genuine relocation) -> move allowed.
+        shutil.rmtree(self.repo)
+
+        result = register_workspace(relocated, home=self.home)
+        self.assertEqual(result.outcome, REGISTER_UPDATED)
+        self.assertEqual(result.record.workspace_id, first.record.workspace_id)
+        self.assertEqual(result.record.canonical_path, str(relocated.resolve()))
+        self.assertEqual(len(list_workspaces(home=self.home)), 1)
 
 
 if __name__ == "__main__":

@@ -211,12 +211,19 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     the existing workspace id and canonical session name; when the home
     registry was lost, the anchor restores the same identity. The canonical
     session name is derived from the path only on first registration.
+
+    Registration refuses to relocate an already-registered identity's
+    canonical_path onto a linked git worktree, and refuses to move it off a
+    still-live checkout without ``--move`` (Redmine #13152), so a worktree /
+    clone cannot hijack the coordinator lane.
     """
     from mozyo_bridge.workspace_registry import register_workspace
 
     repo_root = repo_root_from_args(args)
     result = register_workspace(
-        repo_root, project_name=getattr(args, "name", None)
+        repo_root,
+        project_name=getattr(args, "name", None),
+        allow_move=bool(getattr(args, "move", False)),
     )
     if getattr(args, "as_json", False):
         import json as _json

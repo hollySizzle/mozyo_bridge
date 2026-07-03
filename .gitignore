@@ -21,6 +21,14 @@ venv/
 # merge when present. Never commit it.
 .mozyo-bridge/docs/catalog.local.yaml
 
+# Workspace-identity recovery anchors (Redmine #13152). These are per-checkout
+# runtime state written by `mozyo-bridge workspace register`; committing them
+# duplicates one checkout's canonical identity into every clone / git worktree,
+# where a `register` then hijacks the home-registry canonical_path and breaks
+# coordinator resolution. Keep them untracked so each checkout owns its own.
+.mozyo-bridge/workspace.json
+.mozyo-bridge/workspace-anchor.json
+
 # Local secrets and release credentials
 .env
 .env.*

@@ -40,11 +40,25 @@ HOME = Path("/home/.mozyo_bridge")
 @dataclass
 class _Record:
     workspace_id: str = "ws-1"
+    canonical_path: str = "/repo"
     canonical_session: str = "repo-session"
     display_path: str = "/repo"
     preset: str = "redmine-governed"
     preset_version: str = "2026-06-21"
     last_seen: str = "2026-06-30T00:00:00Z"
+
+
+def _liveness(**overrides: Any) -> dict[str, Any]:
+    """A healthy canonical_path liveness fact by default (#13152)."""
+    base = {
+        "canonical_path": "/repo",
+        "exists": True,
+        "is_dir": True,
+        "is_git": True,
+        "is_main_worktree": True,
+    }
+    base.update(overrides)
+    return base
 
 
 @dataclass
@@ -75,6 +89,7 @@ class _FakeWorkspaceRegistryReads:
     anchor_names: _AnchorNames = field(default_factory=_AnchorNames)
     resolved: _Resolved = field(default_factory=_Resolved)
     live_sessions: set[str] | None = None
+    canonical_state: dict[str, Any] | None = None
     loaded: bool = False
 
     def inspect_registry_health(self, home: Path | None) -> dict[str, Any]:
@@ -101,6 +116,11 @@ class _FakeWorkspaceRegistryReads:
 
     def live_session_names(self) -> set[str] | None:
         return self.live_sessions
+
+    def probe_canonical_liveness(self, canonical_path: str | None) -> dict[str, Any]:
+        if self.canonical_state is not None:
+            return {**self.canonical_state, "canonical_path": canonical_path}
+        return _liveness(canonical_path=canonical_path)
 
 
 def _health(status: str, **extra: Any) -> dict[str, Any]:
@@ -131,6 +151,7 @@ class SectionShapeTest(unittest.TestCase):
                 "anchor",
                 "consistency",
                 "runtime",
+                "identity",
                 "next_action",
             ],
             list(result.keys()),
@@ -319,6 +340,59 @@ class RuntimeLayerTest(unittest.TestCase):
         )
         no_row = _FakeWorkspaceRegistryReads(health=_health(REGISTRY_HEALTH_MISSING))
         self.assertIsNone(_evaluate(no_row)["runtime"]["last_seen"])
+
+
+class IdentityInvariantTest(unittest.TestCase):
+    """Canonical_path identity invariant (#13152)."""
+
+    def test_live_main_worktree_canonical_is_ok(self) -> None:
+        reads = _FakeWorkspaceRegistryReads(
+            health=_health(REGISTRY_HEALTH_OK),
+            record=_Record(canonical_path="/repo"),
+            anchor={"workspace_id": "ws-1"},
+            canonical_state=_liveness(),
+        )
+        result = _evaluate(reads)
+        self.assertEqual("ok", result["identity"]["status"])
+        self.assertEqual("ok", result["status"])
+
+    def test_dead_canonical_path_is_drifted_with_repair_hint(self) -> None:
+        reads = _FakeWorkspaceRegistryReads(
+            health=_health(REGISTRY_HEALTH_OK),
+            record=_Record(canonical_path="/gone"),
+            anchor={"workspace_id": "ws-1"},
+            canonical_state=_liveness(exists=False, is_dir=False, is_git=None,
+                                      is_main_worktree=None),
+        )
+        result = _evaluate(reads)
+        self.assertEqual("missing", result["identity"]["status"])
+        self.assertEqual("drifted", result["status"])
+        self.assertTrue(
+            any("does not exist" in a and "#13152" in a for a in result["next_action"])
+        )
+
+    def test_worktree_canonical_path_is_drifted_with_move_hint(self) -> None:
+        reads = _FakeWorkspaceRegistryReads(
+            health=_health(REGISTRY_HEALTH_OK),
+            record=_Record(canonical_path="/worktree"),
+            anchor={"workspace_id": "ws-1"},
+            canonical_state=_liveness(is_main_worktree=False),
+        )
+        result = _evaluate(reads)
+        self.assertEqual("not-main-worktree", result["identity"]["status"])
+        self.assertEqual("drifted", result["status"])
+        self.assertTrue(
+            any("linked git worktree" in a and "--move" in a
+                for a in result["next_action"])
+        )
+
+    def test_unregistered_identity_is_unknown_not_checked(self) -> None:
+        reads = _FakeWorkspaceRegistryReads(
+            health=_health(REGISTRY_HEALTH_MISSING), record=None
+        )
+        result = _evaluate(reads)
+        self.assertEqual("unknown", result["identity"]["status"])
+        self.assertEqual("ok", result["status"])
 
 
 class UseCaseAndPortTest(unittest.TestCase):

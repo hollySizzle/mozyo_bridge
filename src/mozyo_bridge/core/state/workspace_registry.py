@@ -462,6 +462,118 @@ def inspect_registry_health(home: Path | None = None) -> dict:
     return info
 
 
+# --- git worktree probing (Redmine #13152) ----------------------------------
+#
+# A linked git worktree shares its object store with a main checkout but keeps a
+# distinct working tree. Before #13152 the git-tracked anchor was duplicated into
+# every worktree, so `workspace register` run from a worktree upserted the
+# worktree path as the identity's canonical_path — relocating the coordinator
+# lane onto a sublane and breaking `coordinator` resolution (pane_resolver
+# reported "no default-lane Codex", the exact opposite of the real cause).
+# Registration now refuses to move an identity's canonical_path onto a linked
+# worktree, and `doctor` verifies the recorded canonical_path is a live main
+# worktree.
+
+
+def _checkout_git_dirs(repo_root: Path | str) -> tuple[str, str] | None:
+    """Best-effort ``(git_dir, git_common_dir)`` for ``repo_root`` (absolute).
+
+    Both are resolved to absolute, symlink-free paths. Returns ``None`` for a
+    non-git path, a missing git binary, or any git error, so callers degrade to
+    the backward-compatible behavior. Never raises.
+    """
+    import subprocess
+
+    try:
+        if not Path(repo_root).is_dir():
+            return None
+    except OSError:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [
+        line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+    ]
+    if len(lines) != 2:
+        return None
+
+    def _abs(raw: str) -> str:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path(repo_root) / candidate
+        try:
+            return str(candidate.resolve())
+        except OSError:
+            return str(candidate)
+
+    return _abs(lines[0]), _abs(lines[1])
+
+
+def _is_linked_worktree(repo_root: Path | str) -> bool:
+    """True when ``repo_root`` is a *linked* git worktree (#13152).
+
+    A linked worktree points ``git_dir`` at ``.../.git/worktrees/<name>`` while
+    the common dir stays the source repo; the main worktree has them equal. A
+    non-git / unreadable path is not a linked worktree (returns ``False``).
+    """
+    dirs = _checkout_git_dirs(repo_root)
+    if dirs is None:
+        return False
+    return dirs[0] != dirs[1]
+
+
+def probe_canonical_liveness(canonical_path: str | None) -> dict:
+    """Classify a registered ``canonical_path`` for the doctor identity invariant.
+
+    Read-only. Reports whether the recorded canonical checkout still exists as a
+    directory and, when it is a git checkout, whether it is the *main* worktree
+    (``git_dir == git_common_dir``). A registry whose canonical_path is a dead
+    path or a linked worktree is the #13152 failure mode that silently breaks
+    ``coordinator`` resolution.
+    """
+    info: dict = {
+        "canonical_path": canonical_path,
+        "exists": False,
+        "is_dir": False,
+        "is_git": None,
+        "is_main_worktree": None,
+    }
+    if not canonical_path:
+        return info
+    path = Path(canonical_path)
+    try:
+        info["exists"] = path.exists()
+        info["is_dir"] = path.is_dir()
+    except OSError:
+        return info
+    if not info["is_dir"]:
+        return info
+    dirs = _checkout_git_dirs(path)
+    if dirs is None:
+        info["is_git"] = False
+        return info
+    info["is_git"] = True
+    info["is_main_worktree"] = dirs[0] == dirs[1]
+    return info
+
+
 # --- registration -----------------------------------------------------------
 
 
@@ -470,6 +582,7 @@ def register_workspace(
     *,
     home: Path | None = None,
     project_name: str | None = None,
+    allow_move: bool = False,
 ) -> RegisterResult:
     """Create or refresh this workspace's registry row and local anchor.
 
@@ -486,6 +599,20 @@ def register_workspace(
 
     ``project_name`` overrides the readable name; default is the directory
     basename (which may be non-ASCII — readability beats slug purity here).
+
+    Canonical-path move guard (Redmine #13152): the upsert would set this
+    identity's ``canonical_path`` to ``repo_root``. When that would *move* an
+    existing identity's canonical_path the write is gated:
+
+    - from a **linked git worktree** the move (or seeding a pre-existing
+      identity) is refused outright — a worktree must never own an identity's
+      canonical_path, because that relocates the coordinator lane onto a sublane;
+    - from a normal checkout, if the currently-registered canonical_path is a
+      **live directory** the move is refused unless ``allow_move`` is set
+      (the ``workspace register --move`` flag), so a clone/copy cannot silently
+      steal the identity;
+    - if the currently-registered canonical_path **no longer exists** (a genuine
+      relocation) the move proceeds as before, keeping the "workspace moved" note.
     """
     resolved = Path(repo_root).expanduser().resolve()
     if not resolved.is_dir():
@@ -538,6 +665,43 @@ def register_workspace(
         canonical_session = derive_session_name(resolved).name
         existing_by_id = None
         outcome = REGISTER_CREATED
+
+    # Canonical-path move guard (Redmine #13152). See the docstring: gate any
+    # write that would relocate an existing identity's canonical_path so a linked
+    # worktree / clone cannot hijack the coordinator lane.
+    existing_canonical = (
+        existing_by_id.canonical_path if existing_by_id is not None else None
+    )
+    would_move = existing_canonical is not None and existing_canonical != str(resolved)
+    if _is_linked_worktree(resolved):
+        if would_move:
+            die(
+                f"refusing to move workspace '{workspace_id}' canonical path onto "
+                f"a linked git worktree ({resolved}). Its canonical checkout is "
+                f"{existing_canonical}; run `mozyo-bridge workspace register` from "
+                "that main checkout instead (Redmine #13152)."
+            )
+        if existing_by_id is None and anchor is not None:
+            die(
+                f"refusing to seed workspace '{workspace_id}' from a linked git "
+                f"worktree ({resolved}); a worktree must not own an identity's "
+                "canonical path. Run `mozyo-bridge workspace register` from the "
+                "workspace's main checkout instead (Redmine #13152)."
+            )
+    elif would_move:
+        try:
+            existing_is_dir = Path(existing_canonical).is_dir()
+        except OSError:
+            existing_is_dir = False
+        if existing_is_dir and not allow_move:
+            die(
+                f"workspace '{workspace_id}' is already registered at "
+                f"{existing_canonical}, which still exists. Refusing to move its "
+                f"canonical path to {resolved} without confirmation. If this is a "
+                "genuine relocation re-run with `--move`; if you are in a clone or "
+                "worktree, register from the original checkout instead "
+                "(Redmine #13152)."
+            )
 
     preset, preset_version = read_scaffold_preset(resolved)
     display = _display_path(resolved)

@@ -89,6 +89,9 @@ class WorkspaceRegistryReads(Protocol):
     def live_session_names(self) -> set[str] | None:
         ...
 
+    def probe_canonical_liveness(self, canonical_path: str | None) -> dict[str, Any]:
+        ...
+
 
 class LiveWorkspaceRegistryReads:
     """Live adapter: the real workspace-registry / anchor / tmux reads (#11426).
@@ -149,6 +152,14 @@ class LiveWorkspaceRegistryReads:
 
         return _doctor._live_session_names()
 
+    def probe_canonical_liveness(self, canonical_path: str | None) -> dict[str, Any]:
+        # Identity invariant (#13152): the registered canonical_path must be a
+        # live directory and, if a git checkout, the main worktree — otherwise
+        # `coordinator` resolution silently fails closed. Read-only.
+        from mozyo_bridge import workspace_registry as wr
+
+        return wr.probe_canonical_liveness(canonical_path)
+
 
 def evaluate_workspace_registry_section(
     target: Path, home: Path | None, reads: WorkspaceRegistryReads
@@ -172,9 +183,13 @@ def evaluate_workspace_registry_section(
     registry with a recovery anchor, or a missing anchor are all normal,
     recoverable states and stay ``ok`` with an actionable hint.
 
-    Re-assembles the legacy dict byte-for-byte (key order ``status`` / ``target``
-    / ``home_registry`` / ``registration`` / ``anchor`` / ``consistency`` /
-    ``runtime`` / ``next_action``).
+    Also reports an **identity** layer (Redmine #13152): whether the registered
+    ``canonical_path`` is a live directory and the git *main* worktree. A dead
+    path or a linked-worktree canonical_path flips the section ``drifted`` with a
+    repair hint, because it silently breaks ``coordinator`` resolution.
+
+    Dict key order: ``status`` / ``target`` / ``home_registry`` / ``registration``
+    / ``anchor`` / ``consistency`` / ``runtime`` / ``identity`` / ``next_action``.
     """
     health = reads.inspect_registry_health(home)
     registry_usable = health["status"] in (
@@ -290,6 +305,46 @@ def evaluate_workspace_registry_section(
         "reason": runtime_reason,
     }
 
+    # --- identity invariant layer (Redmine #13152) -------------------------
+    # A registered workspace's canonical_path must be a live directory and, when
+    # it is a git checkout, the *main* worktree. A dead path or a linked-worktree
+    # canonical_path is the failure mode that breaks `coordinator` resolution
+    # (pane_resolver finds no default-lane Codex). Only checked when we trust a
+    # registry row; otherwise the invariant is "unknown".
+    if record is not None and registry_usable:
+        liveness = reads.probe_canonical_liveness(record.canonical_path)
+        if not liveness.get("exists") or not liveness.get("is_dir"):
+            identity_status = "missing"
+            identity_detail = (
+                f"registered canonical_path {record.canonical_path} does not "
+                "exist; `coordinator` resolution cannot find the main checkout"
+            )
+        elif liveness.get("is_git") and liveness.get("is_main_worktree") is False:
+            identity_status = "not-main-worktree"
+            identity_detail = (
+                f"registered canonical_path {record.canonical_path} is a linked "
+                "git worktree, not the main checkout; the coordinator lane was "
+                "relocated onto a sublane"
+            )
+        else:
+            identity_status = "ok"
+            identity_detail = "registered canonical_path is a live main checkout"
+    else:
+        liveness = reads.probe_canonical_liveness(None)
+        identity_status = "unknown"
+        identity_detail = (
+            "no trusted registry row; canonical_path invariants not checked"
+        )
+    identity = {
+        "status": identity_status,
+        "detail": identity_detail,
+        "canonical_path": liveness.get("canonical_path"),
+        "exists": liveness.get("exists"),
+        "is_dir": liveness.get("is_dir"),
+        "is_git": liveness.get("is_git"),
+        "is_main_worktree": liveness.get("is_main_worktree"),
+    }
+
     # --- overall status + next actions -------------------------------------
     if health["status"] == REGISTRY_HEALTH_UNREADABLE:
         section_status = "error"
@@ -348,6 +403,26 @@ def evaluate_workspace_registry_section(
                 "already falls back to path derivation)"
             )
 
+    # Identity-invariant escalation (#13152): a dead / worktree canonical_path is
+    # a real defect — flip the section non-green and point at the true fix (run
+    # `workspace register` from the main checkout) regardless of the other layers.
+    if identity_status in ("missing", "not-main-worktree"):
+        if section_status == "ok":
+            section_status = "drifted"
+        if identity_status == "missing":
+            next_action.append(
+                f"registered canonical_path {record.canonical_path} does not "
+                "exist; run `mozyo-bridge workspace register` from the "
+                "workspace's main checkout to repair it (Redmine #13152)"
+            )
+        else:
+            next_action.append(
+                f"registered canonical_path {record.canonical_path} is a linked "
+                "git worktree, not the main checkout; run `mozyo-bridge workspace "
+                "register --move` from the main checkout to restore the "
+                "coordinator lane (Redmine #13152)"
+            )
+
     return {
         "status": section_status,
         "target": str(target),
@@ -359,6 +434,7 @@ def evaluate_workspace_registry_section(
             "detail": consistency_detail,
         },
         "runtime": runtime,
+        "identity": identity,
         "next_action": next_action,
     }
 

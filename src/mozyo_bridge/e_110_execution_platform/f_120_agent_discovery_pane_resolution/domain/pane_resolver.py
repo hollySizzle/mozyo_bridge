@@ -508,11 +508,68 @@ def resolve_coordinator_codex(
     return None
 
 
+def _canonical_state_is_broken(canonical_state: dict[str, object] | None) -> bool:
+    """True when a canonical_path liveness fact shows a dead / non-main path (#13152).
+
+    Pure. ``canonical_state`` is a
+    ``workspace_registry.probe_canonical_liveness`` mapping (or ``None``). A dead
+    path (missing / not a dir) or a git checkout that is a linked worktree rather
+    than the main worktree is "broken" — the #13152 registry-hijack signature.
+    """
+    if not canonical_state:
+        return False
+    if not canonical_state.get("exists") or not canonical_state.get("is_dir"):
+        return True
+    return bool(
+        canonical_state.get("is_git")
+        and canonical_state.get("is_main_worktree") is False
+    )
+
+
+def _sender_canonical_state(
+    sender: dict[str, str] | None,
+) -> dict[str, object] | None:
+    """Best-effort registry canonical_path liveness for the sender workspace (#13152).
+
+    Impure (registry read), kept out of the pure :func:`_no_coordinator_message`
+    builder. Returns ``None`` on any error / unknown workspace so the caller
+    degrades to the generic no-coordinator hint.
+    """
+    if sender is None:
+        return None
+    sender_ws, _sender_lane = _pane_lane_identity(sender)
+    if not sender_ws:
+        return None
+    try:
+        from mozyo_bridge.workspace_registry import (
+            load_workspace_by_id,
+            probe_canonical_liveness,
+        )
+
+        record = load_workspace_by_id(sender_ws)
+        if record is None:
+            return None
+        return probe_canonical_liveness(record.canonical_path)
+    except Exception:
+        return None
+
+
 def _no_coordinator_message(
     panes: list[dict[str, str]],
     sender: dict[str, str] | None,
+    *,
+    canonical_state: dict[str, object] | None = None,
 ) -> str:
-    """Fail-closed guidance when the coordinator Codex cannot be resolved (#12015)."""
+    """Fail-closed guidance when the coordinator Codex cannot be resolved (#12015).
+
+    ``canonical_state`` (Redmine #13152) is the optional liveness fact for the
+    sender workspace's registered ``canonical_path`` (from
+    ``workspace_registry.probe_canonical_liveness``), supplied by the impure
+    caller so this stays a pure message builder. When the registry canonical_path
+    is a dead / non-main-worktree path, the no-candidate branch names that true
+    cause — the registry was hijacked — instead of the misleading "stand up a
+    Codex pane in the main checkout" hint (which is the opposite of the fix).
+    """
     if sender is None:
         return (
             "cannot resolve `coordinator`: the sender pane is unknown (run from "
@@ -528,6 +585,18 @@ def _no_coordinator_message(
             "(see `mozyo-bridge agents targets`)."
         )
     candidates = coordinator_codex_candidates(panes, sender_ws)
+    if not candidates and _canonical_state_is_broken(canonical_state):
+        canonical_path = canonical_state.get("canonical_path") if canonical_state else None
+        where = f" ({canonical_path})" if canonical_path else ""
+        return (
+            "cannot resolve `coordinator`: the registered canonical_path for "
+            f"workspace {sender_ws!r}{where} does not point at a live main "
+            "checkout (it is missing or a linked worktree), so the coordinator "
+            "lane cannot be found. This is a registry defect, not a missing "
+            "Codex pane: run `mozyo-bridge workspace register` from the "
+            "workspace's main checkout to repair it (Redmine #13152), or name the "
+            "coordinator Codex explicitly with `--target %pane`."
+        )
     if not candidates:
         reason = (
             f"no default-lane (coordinator) Codex pane was found in workspace "
@@ -671,7 +740,11 @@ def resolve_target(target: str) -> str:
         coordinator = resolve_coordinator_codex(panes, sender)
         if coordinator is not None:
             return coordinator["id"]
-        die(_no_coordinator_message(panes, sender))
+        die(
+            _no_coordinator_message(
+                panes, sender, canonical_state=_sender_canonical_state(sender)
+            )
+        )
         raise AssertionError("unreachable")
     if target not in AGENT_LABELS:
         die(

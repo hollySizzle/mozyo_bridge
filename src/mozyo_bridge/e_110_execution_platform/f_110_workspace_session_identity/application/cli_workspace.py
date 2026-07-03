@@ -51,6 +51,17 @@ def register(sub) -> None:
         ),
     )
     workspace_register.add_argument(
+        "--move",
+        action="store_true",
+        help=(
+            "Allow relocating an already-registered workspace's canonical path "
+            "to this checkout even when the previously registered checkout still "
+            "exists (Redmine #13152). Without it, registration refuses the move so "
+            "a clone/copy cannot hijack the identity; a linked git worktree is "
+            "always refused regardless of this flag."
+        ),
+    )
+    workspace_register.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
