@@ -284,7 +284,9 @@ class CockpitRestampOps(Protocol):
     the cockpit window is absent); ``recompute_lane`` re-derives the lane
     identity for a pane's ``repo_root`` (reading the current registry canonical);
     ``require_tmux`` gates the mutating path; ``apply_command`` runs one
-    ``set-option`` argv; ``emit`` is the stdout line sink.
+    ``set-option`` argv and *returns* the tmux result (so a non-zero exit is
+    observable, never swallowed); ``die`` is the fail-closed abort; ``emit`` is
+    the stdout line sink.
     """
 
     def read_panes(self, session: str) -> Optional[list]: ...
@@ -293,7 +295,9 @@ class CockpitRestampOps(Protocol):
 
     def require_tmux(self) -> None: ...
 
-    def apply_command(self, argv: tuple) -> None: ...
+    def apply_command(self, argv: tuple) -> Any: ...
+
+    def die(self, message: str) -> None: ...
 
     def emit(self, text: str) -> None: ...
 
@@ -332,8 +336,13 @@ class LiveCockpitRestampOps:
     def require_tmux(self) -> None:
         self._commands().require_tmux()
 
-    def apply_command(self, argv: tuple) -> None:
-        self._commands().run_tmux(*argv, check=False)
+    def apply_command(self, argv: tuple) -> Any:
+        # Return the result so the use case can fail closed on a non-zero exit
+        # rather than silently reporting a half-restamp as success.
+        return self._commands().run_tmux(*argv, check=False)
+
+    def die(self, message: str) -> None:
+        return self._commands().die(message)
 
     def emit(self, text: str) -> None:
         print(text)
@@ -349,6 +358,42 @@ class CockpitRestampUseCase:
 
     def __init__(self, ops: CockpitRestampOps) -> None:
         self._ops = ops
+
+    def _apply(self, plan: RestampPlan) -> None:
+        """Apply the drift set-options pane-by-pane, fail-closed (#13160 REV2).
+
+        Matches the fail-fast flavor of the other cockpit mutators
+        (``cockpit_repair_command._run_fail_fast`` for reset / rebalance /
+        reconcile): each ``set-option`` result is inspected and the FIRST
+        non-zero exit aborts via :meth:`CockpitRestampOps.die` rather than
+        letting the caller report a half-restamp as ``applied=True``. Restamp is
+        a set of independent per-pane metadata corrections (no cross-pane
+        transaction / rollback), so a stop-on-first-failure abort is the safe
+        choice — a ``set-option`` failure usually signals the pane / tmux is in
+        an unexpected state where continuing would compound the confusion. The
+        abort message names the pane, the exact failing ``tmux`` command, the
+        tmux detail, and how many panes were fully restamped before the failure,
+        so the half-restamp reality is auditable; re-running is safe because
+        already-correct panes are strict no-ops.
+        """
+        from mozyo_bridge.application.cockpit_repair_command import result_detail
+
+        total = len(plan.drifts)
+        restamped = 0
+        for drift in plan.drifts:
+            for argv in drift.commands:
+                result = self._ops.apply_command(argv)
+                if getattr(result, "returncode", 0) != 0:
+                    detail = result_detail(result) or "nonzero exit"
+                    self._ops.die(
+                        f"cockpit restamp step failed (pane {drift.pane_id}): "
+                        f"`tmux {' '.join(argv)}` -> {detail}. "
+                        f"Restamped {restamped} of {total} pane(s) before the "
+                        f"failure; the remaining pane(s) were left unchanged. "
+                        f"Re-run `mozyo cockpit restamp` to continue "
+                        f"(already-correct panes are no-ops)."
+                    )
+            restamped += 1
 
     def handle(
         self,
@@ -374,9 +419,7 @@ class CockpitRestampUseCase:
         applied = False
         if present and plan.would_apply and not dry_run and not json_output:
             self._ops.require_tmux()
-            for drift in plan.drifts:
-                for argv in drift.commands:
-                    self._ops.apply_command(argv)
+            self._apply(plan)
             applied = True
 
         if json_output:

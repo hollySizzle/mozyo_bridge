@@ -178,10 +178,13 @@ def register(sub) -> None:
             "instead of leaving you to infer it from `status`'s `agent window "
             "missing`. Both take `--json` for UI / tests; cockpit membership is a "
             "display/liveness projection, never Redmine workflow / close truth. "
-            "Without "
-            "`--confirm` every other sub-action is detect-only / preview and "
-            "mutates nothing; `--dry-run` / `--json` always preview without "
-            "mutating."
+            "Without `--confirm` every other sub-action — EXCEPT `restamp` — is "
+            "detect-only / preview and mutates nothing. `restamp` is the one "
+            "sub-action that applies by default (it needs no `--confirm`): its "
+            "lane-identity re-derivation is a benign, idempotent metadata "
+            "correction, so its preview is `--dry-run` / `--json` and a bare "
+            "`mozyo cockpit restamp` applies the drift fixes. For every "
+            "sub-action, `--dry-run` / `--json` always preview without mutating."
         ),
     )
     cockpit.add_argument(

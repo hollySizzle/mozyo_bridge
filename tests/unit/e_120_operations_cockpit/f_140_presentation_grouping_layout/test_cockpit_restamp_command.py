@@ -58,14 +58,26 @@ class _Recompute:
         return self._table[repo_root]
 
 
+class _Result:
+    """Minimal ``run_tmux``-style result the use case inspects."""
+
+    def __init__(self, returncode=0, stderr="", stdout=""):
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
 class FakeRestampOps:
     """Recording :class:`CockpitRestampOps` fake — no tmux."""
 
-    def __init__(self, *, panes, recompute):
+    def __init__(self, *, panes, recompute, fail_pane=None, fail_stderr="boom"):
         self._panes = panes
         self._recompute = recompute
+        self._fail_pane = fail_pane
+        self._fail_stderr = fail_stderr
         self.emitted: list[str] = []
         self.applied: list[tuple] = []
+        self.died: list[str] = []
         self.require_tmux_calls = 0
 
     def read_panes(self, session):
@@ -79,6 +91,14 @@ class FakeRestampOps:
 
     def apply_command(self, argv):
         self.applied.append(tuple(argv))
+        pane = argv[argv.index("-t") + 1]
+        if self._fail_pane is not None and pane == self._fail_pane:
+            return _Result(returncode=1, stderr=self._fail_stderr)
+        return _Result(returncode=0)
+
+    def die(self, message):
+        self.died.append(message)
+        raise SystemExit(2)
 
     def emit(self, text):
         self.emitted.append(text)
@@ -322,6 +342,56 @@ class HandleRestampUseCaseTest(unittest.TestCase):
         self.assertEqual([], ops.applied)
         self.assertEqual(0, ops.require_tmux_calls)
         self.assertIn("no cockpit window", "\n".join(ops.emitted))
+
+    def test_apply_failure_fails_closed_with_partial_detail(self) -> None:
+        # Two drifted panes; the set-option on the SECOND one fails.
+        ops = FakeRestampOps(
+            panes=[
+                _pane("%1", lane_id="lane-old1", lane_label=""),
+                _pane("%2", lane_id="lane-old2", lane_label="", repo_root="/checkout/two"),
+            ],
+            recompute=_Recompute(
+                {
+                    "/checkout/main": LaneIdentity("default", None),
+                    "/checkout/two": LaneIdentity("default", None),
+                }
+            ),
+            fail_pane="%2",
+            fail_stderr="tmux: pane not found",
+        )
+        with self.assertRaises(SystemExit) as cm:
+            CockpitRestampUseCase(ops).handle(
+                "mozyo-cockpit", _WS, json_output=False, dry_run=False
+            )
+        # (c) non-zero CLI exit.
+        self.assertEqual(2, cm.exception.code)
+        # (a) never reported a successful "restamped N pane(s)." line.
+        self.assertNotIn("restamped 2 pane(s).", "\n".join(ops.emitted))
+        # (b) the abort names the failing pane, its exact command, the detail,
+        # and the half-restamp reality (pane %1 landed before %2 failed).
+        self.assertEqual(1, len(ops.died))
+        message = ops.died[0]
+        self.assertIn("pane %2", message)
+        self.assertIn("tmux set-option -p -t %2 @mozyo_lane_id default", message)
+        self.assertIn("tmux: pane not found", message)
+        self.assertIn("Restamped 1 of 2 pane(s) before the failure", message)
+        # %1 was applied before the abort; %2's failing command was attempted.
+        self.assertIn(
+            ("set-option", "-p", "-t", "%1", "@mozyo_lane_id", "default"), ops.applied
+        )
+
+    def test_apply_failure_on_first_pane_reports_zero_restamped(self) -> None:
+        ops = FakeRestampOps(
+            panes=[_pane("%1", lane_id="lane-old1", lane_label="issue_x")],
+            recompute=_Recompute({"/checkout/main": LaneIdentity("default", None)}),
+            fail_pane="%1",
+        )
+        with self.assertRaises(SystemExit) as cm:
+            CockpitRestampUseCase(ops).handle(
+                "mozyo-cockpit", _WS, json_output=False, dry_run=False
+            )
+        self.assertEqual(2, cm.exception.code)
+        self.assertIn("Restamped 0 of 1 pane(s) before the failure", ops.died[0])
 
 
 if __name__ == "__main__":
