@@ -15,6 +15,12 @@ These exercise the ``handoff_delivery_command`` boundary directly — the pure
   ``transport_error`` receipt on any sink failure;
 - ``emit_marker_timeout_guidance`` — the three stderr hint lines.
 
+The #13123 facade cleanup moved the remaining ``commands.py`` delivery-record
+helper tail here; the added specs pin the pure args projections
+(``submit_lines_for`` / ``record_command_from_args``), the
+``record_format_from_args`` validation through the ``die`` port, and the
+``commands.*`` re-export identity.
+
 The end-to-end behavior over the real ``commands.*`` helpers +
 ``orchestrate_handoff`` stays pinned by the ``handoff`` CLI characterization tests
 under ``tests/integration/.../f_130_handoff_routing/`` and
@@ -33,6 +39,8 @@ import unittest
 from mozyo_bridge.application.handoff_delivery_command import (
     DeliveryRecordUseCase,
     marker_timeout_guidance_lines,
+    record_command_from_args,
+    submit_lines_for,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     PERSIST_OK,
@@ -254,6 +262,86 @@ class MaybePersistTest(unittest.TestCase):
             f"- Durable delivery record not persisted (reason: {PERSIST_TRANSPORT_ERROR})",
             buf.getvalue(),
         )
+
+
+class SubmitLinesForTest(unittest.TestCase):
+    def test_no_submit_intent_yields_none(self) -> None:
+        # A normal `handoff send` / `reply` has no q-enter telemetry, so its
+        # record stays byte-identical (Redmine #12705).
+        self.assertIsNone(submit_lines_for(argparse.Namespace(), _outcome()))
+        self.assertIsNone(
+            submit_lines_for(argparse.Namespace(submit_intent=""), _outcome())
+        )
+
+    def test_intent_renders_submit_lines_with_delivery_id(self) -> None:
+        args = argparse.Namespace(
+            submit_intent="reply", submit_delivery_id="q-abc123"
+        )
+        lines = submit_lines_for(args, _outcome())
+        assert lines is not None
+        self.assertIn("intent `reply`", lines[0])
+        self.assertIn("delivery id `q-abc123`", lines[0])
+        self.assertTrue(any("Composer residue" in line for line in lines))
+
+    def test_missing_delivery_id_falls_back_to_em_dash(self) -> None:
+        args = argparse.Namespace(submit_intent="worker_dispatch")
+        lines = submit_lines_for(args, _outcome())
+        assert lines is not None
+        self.assertIn("delivery id `—`", lines[0])
+
+
+class RecordArgsProjectionTest(unittest.TestCase):
+    def test_record_command_absent_or_empty_is_none(self) -> None:
+        self.assertIsNone(record_command_from_args(argparse.Namespace()))
+        self.assertIsNone(
+            record_command_from_args(argparse.Namespace(record_command=""))
+        )
+
+    def test_record_command_is_stringified(self) -> None:
+        self.assertEqual(
+            "mozyo-bridge handoff send",
+            record_command_from_args(
+                argparse.Namespace(record_command="mozyo-bridge handoff send")
+            ),
+        )
+
+    def test_record_format_defaults_to_both(self) -> None:
+        uc = DeliveryRecordUseCase(_FakeDeliveryRecordOps())
+        self.assertEqual(RECORD_FORMAT_BOTH, uc.record_format_from_args(argparse.Namespace()))
+        self.assertEqual(
+            RECORD_FORMAT_BOTH,
+            uc.record_format_from_args(argparse.Namespace(record_format=None)),
+        )
+
+    def test_record_format_passes_valid_value_through(self) -> None:
+        uc = DeliveryRecordUseCase(_FakeDeliveryRecordOps())
+        self.assertEqual(
+            RECORD_FORMAT_JSON,
+            uc.record_format_from_args(argparse.Namespace(record_format=RECORD_FORMAT_JSON)),
+        )
+
+    def test_bad_record_format_routes_to_die(self) -> None:
+        ops = _FakeDeliveryRecordOps()
+        uc = DeliveryRecordUseCase(ops)
+        with self.assertRaises(SystemExit):
+            uc.record_format_from_args(argparse.Namespace(record_format="bogus"))
+        self.assertEqual(1, len(ops.died))
+        self.assertIn("--record-format must be one of", ops.died[0])
+
+
+class CommandsReExportTest(unittest.TestCase):
+    def test_commands_re_exports_are_same_objects(self) -> None:
+        from mozyo_bridge.application import commands
+        from mozyo_bridge.application import handoff_delivery_command as hdc
+
+        self.assertIs(commands._emit_outcome, hdc.deliver_outcome)
+        self.assertIs(commands._emit_receipt, hdc.deliver_receipt)
+        self.assertIs(
+            commands._maybe_persist_delivery_record, hdc.maybe_persist_delivery_record
+        )
+        self.assertIs(commands._record_format_from_args, hdc.record_format_from_args)
+        self.assertIs(commands._record_command_from_args, hdc.record_command_from_args)
+        self.assertIs(commands._submit_lines_for, hdc.submit_lines_for)
 
 
 class MarkerTimeoutGuidanceTest(unittest.TestCase):
