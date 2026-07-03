@@ -1326,6 +1326,39 @@ def _cockpit_group_window_action(
     )
 
 
+def _handle_cockpit_restamp(args: argparse.Namespace) -> int:
+    """`mozyo cockpit restamp` — re-derive drifted pane lane identity (#13160).
+
+    Thin wrapper over
+    :class:`~mozyo_bridge.application.cockpit_restamp_command.CockpitRestampUseCase`.
+    Resolves the cockpit session + the target ``workspace_id`` (from ``--repo`` /
+    cwd via :func:`resolve_canonical_session`), then re-derives the lane identity
+    of that workspace's cockpit panes and re-applies ``set-option`` only where the
+    stamp drifted. Kept as a module-level function so the ``commands`` seam is the
+    live-ops boundary (``run_tmux`` / ``_resolve_workspace_lane`` patch points).
+    ``--dry-run`` / ``--json`` preview without mutating.
+    """
+    from mozyo_bridge.application.cockpit_restamp_command import (
+        CockpitRestampUseCase,
+        LiveCockpitRestampOps,
+    )
+    from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
+        COCKPIT_SESSION_DEFAULT,
+    )
+
+    session = getattr(args, "cockpit_session", None) or COCKPIT_SESSION_DEFAULT
+    repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
+    repo_root = str(Path(repo).expanduser().resolve())
+    canon = resolve_canonical_session(repo_root)
+    workspace_id = getattr(canon, "workspace_id", None) or canon.name
+    return CockpitRestampUseCase(LiveCockpitRestampOps()).handle(
+        session,
+        workspace_id,
+        json_output=bool(getattr(args, "json_output", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+
+
 def cmd_cockpit(args: argparse.Namespace) -> int:
     """`mozyo cockpit` — append/focus the current workspace in the cockpit (#11803).
 
@@ -1344,7 +1377,15 @@ def cmd_cockpit(args: argparse.Namespace) -> int:
     fresh-create terminal attach comes back as
     ``CockpitDispatchOutcome.attach_session`` so the ``os.execvp`` process
     replacement (and its ``commands.os.execvp`` patch seam) stays here.
+
+    The ``restamp`` sub-action (#13160) short-circuits before the dispatcher: it
+    is a whole-cockpit lane-identity maintenance action that shares no code path
+    with the create/append/focus flow (and keeps the 1000-line dispatcher module
+    untouched).
     """
+    if getattr(args, "action", None) == "restamp":
+        return _handle_cockpit_restamp(args)
+
     from mozyo_bridge.application.cockpit_dispatcher_command import (
         CockpitDispatchUseCase,
         LiveCockpitLaunchFlowOps,

@@ -123,7 +123,7 @@ def register(sub) -> None:
         nargs="?",
         choices=[
             "append", "adopt", "reset", "rebuild", "doctor-geometry",
-            "peer-adopt", "rebalance", "reconcile", "list", "status",
+            "peer-adopt", "rebalance", "reconcile", "restamp", "list", "status",
         ],
         default=None,
         help=(
@@ -159,7 +159,17 @@ def register(sub) -> None:
             "each tangled cell into clean per-Unit columns (order preserved) via "
             "`swap-pane` + a checksum-valid `select-layout`, killing no pane and "
             "reading Unit identity from pane options; it fails closed on an "
-            "unidentified pane (#12133 scope). `list` and `status` (Redmine "
+            "unidentified pane (#12133 scope). `restamp` (Redmine #13160) is the "
+            "sanctioned lane-identity recovery after a workspace-registry "
+            "`canonical_path` repair: it recomputes each cockpit pane's lane id "
+            "from its authoritative `@mozyo_repo_root` (reading the current "
+            "registry canonical) and re-applies `set-option` ONLY to panes whose "
+            "stamped `@mozyo_lane_id` / `@mozyo_lane_label` drifted — a pane "
+            "already in sync gets no `set-option`. It touches identity metadata "
+            "only (no pane kill / move / split, no routing-authority change); a "
+            "different-workspace pane and a pane with no mozyo identity are left "
+            "untouched, and `--dry-run` / `--json` preview the diff without "
+            "mutating. `list` and `status` (Redmine "
             "#12341) are read-only operator-facing membership summaries: `list` "
             "enumerates the workspaces loaded in the cockpit (workspace label/id, "
             "repo root, window, Codex/Claude pane ids, geometry status, registry/"

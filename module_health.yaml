@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3167
+    lines: 3208
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -946,6 +946,12 @@ allowlist:
       Integration after #13123 reconciled the cumulative #13122 + #13120 +
       #13121 + #13123 + #13124 facade removals to a post-merge
       ``commands.py`` line count of 3167.
+      Raised 3167 -> 3208 for the #13160 cockpit lane-identity restamp wiring:
+      the thin ``_handle_cockpit_restamp`` handler + the ``cmd_cockpit``
+      ``restamp`` short-circuit (which keeps the 1000-line
+      ``cockpit_dispatcher_command.py`` untouched). The recompute + drift-diff +
+      set-option planner and use case live in the new
+      ``cockpit_restamp_command.py``, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
