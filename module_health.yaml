@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3477
+    lines: 3376
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -864,6 +864,19 @@ allowlist:
       seams importable, and the relocated ``cmd_doctor`` resolves them through
       this module's globals at call time. 3507 -> 3477 is a 30-line net removal
       and the post-merge ``commands.py`` line count is 3477.
+      Lowered 3477 -> 3376 for the #13122 cockpit membership/status read facade
+      cleanup: the ``_membership_observations_from_windows`` /
+      ``_resolve_registry_facts`` / ``_collect_cockpit_membership`` /
+      ``_handle_cockpit_list`` / ``_handle_cockpit_status`` thin adapter bodies
+      moved into the #12976 ``application/cockpit_membership_command.py``
+      boundary they were wrapping; ``commands.py`` re-exports the five names so
+      the ``cockpit_dispatcher_command`` / ``commands_status`` call-time routes
+      and the membership characterization patch seams
+      (``commands._resolve_registry_facts`` et al.) keep resolving, and the
+      relocated adapters still route ``commands._cockpit_unit_repo_root`` and
+      the other environment reads through this module at call time. 3477 ->
+      3376 is a 101-line net removal and the post-merge ``commands.py`` line
+      count is 3376.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

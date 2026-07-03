@@ -32,9 +32,14 @@ This module carves that into an OOP-first boundary under #12638:
   ``._resolve_workspace_lane`` keep intercepting unchanged, and this module never
   imports :mod:`commands` at module scope (no import cycle).
 - :class:`CockpitMembershipUseCase` composes the ports + projections into the
-  ``collect`` report and the ``list`` / ``status`` outcomes; the thin
-  :mod:`commands` wrappers build the live ops, run the use case, and print the
-  rendered text.
+  ``collect`` report and the ``list`` / ``status`` outcomes.
+- The thin command adapters (``_membership_observations_from_windows`` /
+  ``_resolve_registry_facts`` / ``_collect_cockpit_membership`` /
+  ``_handle_cockpit_list`` / ``_handle_cockpit_status``) build the live ops, run
+  the use case, and print the rendered text. They moved here from
+  :mod:`commands` under #13122 and are re-exported there, so the existing
+  ``commands.*`` import / monkeypatch seams keep resolving; each still routes its
+  environment reads through the :mod:`commands` module at call time.
 
 Behavior-preserving: the read tolerance (a missing tmux / registry degrades to
 an empty / unresolved projection rather than raising), the projected report /
@@ -46,8 +51,10 @@ command bodies.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json as _json
+import os
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -474,3 +481,99 @@ class CockpitMembershipUseCase:
         return CockpitStatusOutcome(
             report=single, query=query, query_label=match.label, ok=match.ok
         )
+
+
+# --- Thin command adapters: the ``commands.*`` compatibility surface (#13122). --
+
+
+def _membership_observations_from_windows(managed_windows: Any, session: str):
+    """Group managed-cockpit-window columns into per-Unit observations (#12341).
+
+    Reshapes the ``_read_managed_cockpit_windows`` output (a list of windows,
+    each with its `columns`) into one :class:`MembershipObservation` per
+    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes
+    and resolving each Unit's live checkout root from its pane cwd (so a
+    worktree / lane reports its own path, not the registry canonical — review
+    j#62643). Role-less columns (no ``workspace_id``) are skipped here — they
+    surface as a cockpit-wide warning from the geometry diagnosis instead.
+    """
+    from mozyo_bridge.application import commands
+
+    # The repo-root resolution is routed through
+    # ``commands._cockpit_unit_repo_root`` at call time so the membership tests
+    # that patch that seam keep intercepting.
+    return build_membership_observations(
+        managed_windows,
+        session,
+        lambda codex_pane, claude_pane: commands._cockpit_unit_repo_root(
+            session, codex_pane, claude_pane
+        ),
+    )
+
+
+def _resolve_registry_facts(workspace_id: str) -> RegistryFacts:
+    """Resolve a cockpit workspace id's registry / anchor facts (#12341, read-only).
+
+    A cockpit pane carries only its ``@mozyo_workspace_id``; the human label and
+    repo root live in the home registry, and the anchor presence in the workspace
+    itself. Tolerant: a missing / unreadable registry degrades to "unresolved"
+    (label falls back to the id, repo root empty) rather than raising, so the
+    membership view never aborts on a thin identity record.
+    """
+    return RegistryFactsUseCase(LiveRegistryFactsOps()).resolve(workspace_id)
+
+
+def _collect_cockpit_membership(session: str) -> CockpitMembershipReport:
+    """Project the live cockpit into a membership report (#12341, read-only).
+
+    Reads every managed cockpit window (shared `cockpit` window + #12330 Project
+    Group windows) for the loaded Units, runs the existing read-only geometry
+    diagnosis on the `cockpit` window for drift findings, resolves each Unit's
+    registry / anchor facts, and hands them all to the pure
+    :func:`project_membership_report`. All reads are tolerant: a missing tmux /
+    cockpit degrades to an empty report, so `cockpit list` / `status` never
+    abort. The live adapter routes every read (managed windows / geometry / unit
+    repo root / registry facts) through the :mod:`commands` module at call time,
+    so the membership characterization tests that patch those seams keep
+    intercepting.
+    """
+    return CockpitMembershipUseCase(LiveCockpitMembershipOps()).collect(session)
+
+
+def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
+    """`mozyo cockpit list` — operator-facing cockpit membership summary (#12341).
+
+    Read-only: enumerates the workspaces loaded in the cockpit, each with its
+    workspace label / id, repo root, window, Codex / Claude pane ids, geometry
+    status, and registry / anchor presence (scaffold / root-hardening notes split
+    into a warning bucket). Always exits ``0`` — an empty cockpit is a valid
+    state, not an error. Cockpit membership is a display / liveness projection,
+    never Redmine workflow truth.
+    """
+    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).list(session)
+    print(outcome.render(json_output=json_output))
+    return outcome.exit_code
+
+
+def _handle_cockpit_status(
+    args: argparse.Namespace, session: str, *, json_output: bool
+) -> int:
+    """`mozyo cockpit status --repo <repo>` — repo-scoped cockpit membership (#12341).
+
+    Read-only: resolves the repo's workspace identity (registry → anchor →
+    derivation, the same chain the rest of the cockpit uses) and reports whether
+    it is loaded in the cockpit, with its panes / geometry / registry presence.
+    When the workspace is absent it says so explicitly (the #12339 mis-read)
+    instead of staying silent. Mirrors `doctor-geometry`'s exit convention: ``0``
+    when the workspace is a loaded member with healthy geometry, ``1`` otherwise
+    (absent, missing peer, or a geometry warning) — so a script can branch on the
+    code while still parsing the full report from stdout.
+    """
+    # The repo argument extraction stays here (argparse-facing); the use case is
+    # handed a resolved repo path and owns the identity / projection.
+    repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
+    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).status(
+        session=session, repo=repo
+    )
+    print(outcome.render(json_output=json_output))
+    return outcome.exit_code

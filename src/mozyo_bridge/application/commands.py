@@ -1243,125 +1243,6 @@ def _cockpit_unit_repo_root(session: str, *pane_ids: str) -> str:
     return UnitRepoRootUseCase(LiveUnitRepoRootOps()).resolve(session, *pane_ids)
 
 
-def _membership_observations_from_windows(managed_windows, session: str):
-    """Group managed-cockpit-window columns into per-Unit observations (#12341).
-
-    Reshapes the :func:`_read_managed_cockpit_windows` output (a list of windows,
-    each with its `columns`) into one
-    :class:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership.MembershipObservation` per
-    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude panes
-    and resolving each Unit's live checkout root from its pane cwd (so a worktree /
-    lane reports its own path, not the registry canonical — review j#62643).
-    Role-less columns (no ``workspace_id``) are skipped here — they surface as a
-    cockpit-wide warning from the geometry diagnosis instead.
-    """
-    from mozyo_bridge.application.cockpit_membership_command import (
-        build_membership_observations,
-    )
-
-    # Thin wrapper over the #12976 membership boundary. The repo-root resolution
-    # is routed through ``commands._cockpit_unit_repo_root`` at call time so the
-    # membership tests that patch that seam keep intercepting.
-    return build_membership_observations(
-        managed_windows,
-        session,
-        lambda codex_pane, claude_pane: _cockpit_unit_repo_root(
-            session, codex_pane, claude_pane
-        ),
-    )
-
-
-def _resolve_registry_facts(workspace_id: str):
-    """Resolve a cockpit workspace id's registry / anchor facts (#12341, read-only).
-
-    A cockpit pane carries only its ``@mozyo_workspace_id``; the human label and
-    repo root live in the home registry, and the anchor presence in the workspace
-    itself. Tolerant: a missing / unreadable registry degrades to "unresolved"
-    (label falls back to the id, repo root empty) rather than raising, so the
-    membership view never aborts on a thin identity record.
-    """
-    from mozyo_bridge.application.cockpit_membership_command import (
-        LiveRegistryFactsOps,
-        RegistryFactsUseCase,
-    )
-
-    # Thin wrapper over the #12976 membership boundary; the live adapter routes
-    # the ``workspace_registry`` reads at call time.
-    return RegistryFactsUseCase(LiveRegistryFactsOps()).resolve(workspace_id)
-
-
-def _collect_cockpit_membership(session: str):
-    """Project the live cockpit into a membership report (#12341, read-only).
-
-    Reads every managed cockpit window (shared `cockpit` window + #12330 Project
-    Group windows) for the loaded Units, runs the existing read-only geometry
-    diagnosis on the `cockpit` window for drift findings, resolves each Unit's
-    registry / anchor facts, and hands them all to the pure
-    :func:`mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership.project_membership_report`. All
-    reads are tolerant: a missing tmux / cockpit degrades to an empty report, so
-    `cockpit list` / `status` never abort.
-    """
-    from mozyo_bridge.application.cockpit_membership_command import (
-        CockpitMembershipUseCase,
-        LiveCockpitMembershipOps,
-    )
-
-    # Thin wrapper over the #12976 membership boundary. The live adapter routes
-    # every read (managed windows / geometry / unit repo root / registry facts)
-    # through this module at call time, so the membership characterization tests
-    # that patch those seams keep intercepting.
-    return CockpitMembershipUseCase(LiveCockpitMembershipOps()).collect(session)
-
-
-def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
-    """`mozyo cockpit list` — operator-facing cockpit membership summary (#12341).
-
-    Read-only: enumerates the workspaces loaded in the cockpit, each with its
-    workspace label / id, repo root, window, Codex / Claude pane ids, geometry
-    status, and registry / anchor presence (scaffold / root-hardening notes split
-    into a warning bucket). Always exits ``0`` — an empty cockpit is a valid
-    state, not an error. Cockpit membership is a display / liveness projection,
-    never Redmine workflow truth.
-    """
-    from mozyo_bridge.application.cockpit_membership_command import (
-        CockpitMembershipUseCase,
-        LiveCockpitMembershipOps,
-    )
-
-    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).list(session)
-    print(outcome.render(json_output=json_output))
-    return outcome.exit_code
-
-
-def _handle_cockpit_status(
-    args: argparse.Namespace, session: str, *, json_output: bool
-) -> int:
-    """`mozyo cockpit status --repo <repo>` — repo-scoped cockpit membership (#12341).
-
-    Read-only: resolves the repo's workspace identity (registry → anchor →
-    derivation, the same chain the rest of the cockpit uses) and reports whether
-    it is loaded in the cockpit, with its panes / geometry / registry presence.
-    When the workspace is absent it says so explicitly (the #12339 mis-read)
-    instead of staying silent. Mirrors `doctor-geometry`'s exit convention: ``0``
-    when the workspace is a loaded member with healthy geometry, ``1`` otherwise
-    (absent, missing peer, or a geometry warning) — so a script can branch on the
-    code while still parsing the full report from stdout.
-    """
-    from mozyo_bridge.application.cockpit_membership_command import (
-        CockpitMembershipUseCase,
-        LiveCockpitMembershipOps,
-    )
-
-    # The repo argument extraction stays here (argparse-facing); the use case is
-    # handed a resolved repo path and owns the identity / projection.
-    repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
-    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).status(
-        session=session, repo=repo
-    )
-    print(outcome.render(json_output=json_output))
-    return outcome.exit_code
-
-
 def _cockpit_peer_adopt_use_case():
     """Build the #12978 :class:`CockpitPeerAdoptUseCase` over the live ops.
 
@@ -3439,6 +3320,24 @@ from mozyo_bridge.application.doctor_instruction_command import (  # noqa: E402,
 )
 from mozyo_bridge.application.instruction_install_command import (  # noqa: E402,F401
     cmd_instruction_install,
+)
+
+# Compatibility re-export (#13122): the cockpit membership/status read thin
+# adapters moved into the `cockpit_membership_command` boundary they were
+# wrapping (#12976). Re-export the legacy names so the existing seams keep
+# resolving: the `cockpit_dispatcher_command` routes
+# `commands._handle_cockpit_list` / `._handle_cockpit_status` and the status
+# integration routes `commands._collect_cockpit_membership` /
+# `._resolve_registry_facts` at call time, and the membership characterization
+# tests patch those names on this module. `cockpit_membership_command` imports
+# `commands` only lazily (in its live adapter / repo-root routing), so this
+# top-level import introduces no cycle.
+from mozyo_bridge.application.cockpit_membership_command import (  # noqa: E402,F401
+    _collect_cockpit_membership,
+    _handle_cockpit_list,
+    _handle_cockpit_status,
+    _membership_observations_from_windows,
+    _resolve_registry_facts,
 )
 
 
