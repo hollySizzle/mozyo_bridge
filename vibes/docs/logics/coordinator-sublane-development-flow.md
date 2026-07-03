@@ -79,7 +79,7 @@ structured field である。
 
 Redmine Version は semantic version number を含む名前にしない。Version 名は日本語を基本に、
 日付・優先度・作業窓を表す計画枠として付ける。番号付き release name にはしない。Version は
-roadmap / milestone / acceptance bundle の grouping surface であり、active lane-set の正本ではない。
+roadmap / milestone / acceptance bundle の候補範囲 (grouping surface) であり、active lane-set の正本ではない。
 Version rename / lock / close / delete と Version 内 open leaf issue listing は #12651 で操作手段を
 確定する対象であり、誤作成や retirement cleanup はそこへ残す。Redmine subject も日本語を基本にし、
 固定フィールド名、CLI 名、コード識別子、固有 provider 名だけを literal token として残す。

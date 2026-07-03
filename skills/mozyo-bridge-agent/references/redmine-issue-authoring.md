@@ -41,7 +41,18 @@ Scope / Close conditions / Non-goals は normalized intent から導く。後か
 
 ## Version 運用
 
-Redmine Version は **planning / release-readiness / lane-inventory bucket** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される version 番号の正本は tag / package metadata / release notes / release journal であり、Version 名に将来の package 番号を先入れしない。
+### 語彙 (Redmine Version の役割の書き分け)
+
+Redmine Version の役割は 2 語で書き分ける。
+
+- **候補範囲 (candidate grouping)** — dispatch 候補の探索・planning・readiness window の入れ物。「current Version 内の ready US を優先的に見る」というときの、その見る範囲がこれである。
+- **authority ではない** — dispatch / hold / 直列化 / 並列化の判断は durable-record gate と dispatch decision が持つ。Version 所属それ自体は判断の根拠にならない。
+
+本 doc および過去記述で使う「lane-inventory bucket」「Version-as-inventory」「(roadmap / milestone / acceptance の) grouping surface」等の表現は、すべて **候補範囲** の言い換えである (規範は同一で呼称のみ異なる)。歴史記述・既存 journal を遡及的に書き換えない。
+
+**裸の「バージョン」を使わない。** workflow docs / journal / narrative では **Redmine Version** / **release tag** / **package version** のいずれかを常に修飾して書く。裸の「バージョン」「Version」単独は Redmine Version・package release 番号・tag のいずれとも読めて誤読を生むため、散文では使わない (code 識別子・CLI 名・field 名・既存 journal の引用は literal のまま維持する)。
+
+Redmine Version は **planning / release-readiness / lane-inventory bucket (= 候補範囲)** — リリース計画、スプリント相当の grouping、readiness window、lane dispatch の主候補範囲 — である。**package version の正本ではない**: 出荷される version 番号の正本は tag / package metadata / release notes / release journal であり、Version 名に将来の package 番号を先入れしない。
 
 サイズと lifecycle:
 
