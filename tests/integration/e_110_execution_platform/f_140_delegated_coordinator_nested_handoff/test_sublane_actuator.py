@@ -514,6 +514,38 @@ class LiveAppendLaneArgvTest(unittest.TestCase):
             ],
         )
 
+    def test_planned_worktree_resolves_model_from_source_repo(self):
+        # j#71880: the normal `sublane start --dry-run` previews a worktree that
+        # does NOT exist yet. The launch model must come from the source repo's
+        # config, so the preview still shows --claude-model before creation.
+        import tempfile
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_append_argv import (  # noqa: E501
+            resolve_append_lane_argv,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / ".mozyo-bridge").mkdir()
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "agent_launch:\n  sublane_claude_model: claude-opus-4-8\n",
+                encoding="utf-8",
+            )
+            planned = str(repo / "not-created-yet" / "lane")
+            argv = resolve_append_lane_argv(planned, config_root=repo)
+            self.assertEqual(
+                ["cockpit", "append", "--repo", planned, "--no-attach",
+                 "--claude-model", "claude-opus-4-8"],
+                argv,
+            )
+            # Unconfigured source repo: historical argv, byte-for-byte.
+            bare = Path(d) / "bare-repo"
+            bare.mkdir()
+            self.assertEqual(
+                ["cockpit", "append", "--repo", planned, "--no-attach"],
+                resolve_append_lane_argv(planned, config_root=bare),
+            )
+
     def test_live_drive_and_preview_share_one_resolver(self):
         # #13155 REV2 (c): the live drive (`append_lane_column`) and the dry-run
         # preview source (`append_lane_argv`) resolve the SAME argv from the SAME
@@ -535,8 +567,8 @@ class LiveAppendLaneArgvTest(unittest.TestCase):
                 "agent_launch:\n  sublane_claude_model: claude-opus-4-8\n",
                 encoding="utf-8",
             )
-            wt_s = str(wt)
-            expected = resolve_append_lane_argv(wt_s)
+            wt_s = str(wt / "planned-worktree")  # does not exist (j#71880)
+            expected = resolve_append_lane_argv(wt_s, config_root=wt)
             self.assertIn("--claude-model", expected)
             ops = LiveSublaneActuatorOps(repo_root=wt)
             # Preview source: what `_dry_run` renders its command string from.
