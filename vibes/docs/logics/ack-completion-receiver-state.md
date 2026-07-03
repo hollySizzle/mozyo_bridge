@@ -124,6 +124,35 @@ receiver_signal_layers:
   provider が API / URL / status update mechanics を所有しても、approval / close semantics は core /
   governed workflow が所有する。
 
+### 実測: `sent` / `ok` は turn 開始を保証しない (Redmine #13166)
+
+2026-07-03 の実測 (Redmine #13166): codex 宛の `handoff send --mode standard` が 3 件連続で
+`sent` / `ok` を報告したにもかかわらず、受信側 codex TUI は turn を開始していなかった。後発の再通知で
+内容は処理されたため、通知だけが失われる偽陽性 delivery であった。原因は、当時の strict standard rail の
+成功判定が「landing marker の pane 内観測 + Enter keypress 発行」で止まっており、submit 完了 (受信 TUI の
+turn 開始) を保証していなかったこと。busy / redraw 状態の composer に Enter が吸われても `sent` / `ok` に
+倒れていた。
+
+これは本 doc の layer 分離で言えば **layer 0 delivery ACK の精度問題** (submitted か not-submitted か) で
+あり、layer 1〜3 (runtime ack / assistant turn completion / task completion) の話ではない。修正 (#13166) は
+その layer 0 の正直さを上げるもので、completion detector を作る方向ではない:
+
+- codex `--mode standard` rail に限り、marker 観測 + Enter 発行の **後** に、受信 pane の新規出力活動を
+  read-only で観測する turn-start 検証を追加した。活動が観測できれば従来どおり `sent` / `ok`、観測できなければ
+  `blocked` / `turn_start_unconfirmed` (既存の `marker_timeout` 語彙に揃えた新 reason) で fail-closed し、
+  既存の blocked 導線に乗せる。C-u rollback も自動再送も行わず、marker+body は一度だけ type する。
+- signal に「composer からの marker 消失 (marker-absence)」ではなく「新規出力活動 (presence)」を採ったのは
+  本 doc の doctrine と C-u rollback の capture-absence 注意に整合させるため。submit 成功時、codex TUI では
+  送信済み marker が transcript に user message として残るので、marker-absence は成功の証拠にならない
+  (成功時にも present であり得る)。
+- claude rail と queue-enter rail の挙動は不変。behavioral 正本は
+  `vibes/docs/logics/tmux-send-safety-contract.md` の v0.6 節。本節はその **実測と ACK-layer 位置づけ** を
+  記録するだけであり、rail の挙動仕様を再定義しない。
+- これは tmux capture 依存の compat hardening であり、long-term direction ではない。`tmux capture-pane` を
+  観測しなくても submit / turn 開始が分かる本命は、依然として sidecar / control-event ベースの
+  receiver-state observability (段階 1 以降) と durable-ledger 側にある。#13166 の候補 2 (pending delivery
+  ledger) は本 fix の non-goal として明示的に後回しにされた。
+
 ### Minimal future runtime event vocabulary
 
 本 doc は実装 wire format を定義しないが、将来 `mozyo_bridge_pty` / sidecar / provider normalizer

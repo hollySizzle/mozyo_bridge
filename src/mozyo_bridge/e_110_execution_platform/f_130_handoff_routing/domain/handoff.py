@@ -697,6 +697,7 @@ Reason = Literal[
     "invalid_anchor",
     "invalid_args",
     "queue_enter",
+    "turn_start_unconfirmed",
     "cross_session_claude",
     "target_repo_mismatch",
     "gateway_route_blocked",
@@ -870,8 +871,9 @@ def project_last_input(
       ``ack_status="unobserved"``. The input is staged at the prompt but the
       receiver runtime has not received it as a turn, so the ACK timestamp
       does not exist yet.
-    - any ``blocked`` reason (``marker_timeout``, ``target_unavailable``,
-      ``target_not_agent``, ``invalid_anchor``, ``invalid_args``) -> ``None``.
+    - any ``blocked`` reason (``marker_timeout``, ``turn_start_unconfirmed``,
+      ``target_unavailable``, ``target_not_agent``, ``invalid_anchor``,
+      ``invalid_args``) -> ``None``.
       ACK terminal states are not receiver-runtime facts; the helper refuses
       to project them so callers cannot accidentally translate
       ``marker_timeout`` into ``process.exited`` or push ``invalid_args`` into
@@ -955,6 +957,25 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "(`read target again`, `retry`, `refresh`), record `un-notified` "
                 "in the durable record with every attempted command and observed "
                 "error verbatim."
+            ),
+        )
+    if reason == "turn_start_unconfirmed":
+        # Redmine #13166: codex standard rail observed the landing marker and
+        # pressed Enter, but the receiver TUI did not show turn-start activity
+        # within the observation window (the Enter may have been absorbed by a
+        # busy / redrawing composer). No rollback and no re-send were issued — the
+        # marker+body was typed once. The sender re-reads the receiver and, only
+        # if the turn genuinely did not start, re-issues the strict send.
+        return (
+            "sender",
+            (
+                f"read the {receiver} pane (`mozyo-bridge read {receiver}`) to "
+                "confirm whether the turn started. If it did, no action is "
+                "needed (the marker+body was typed once and Enter was pressed). "
+                "If it did not, re-issue the send under `--mode standard`; do "
+                "not blind-resend or press Enter again without re-reading, and "
+                "do not escalate to `un-notified` on a single unconfirmed "
+                "observation."
             ),
         )
     if reason == "target_unavailable":
@@ -1277,6 +1298,8 @@ def _header_label(status: Status, reason: Reason, mode: Optional[str] = None) ->
         return "sent"
     if status == "pending_input":
         return "pending input"
+    if reason == "turn_start_unconfirmed":
+        return "not delivered (turn start unconfirmed)"
     return f"not delivered ({reason})"
 
 
@@ -1310,6 +1333,15 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
             "a C-u rollback was issued and Enter was not pressed. The sender "
             "cannot verify from tmux capture that the receiver composer was "
             "cleared."
+        )
+    if reason == "turn_start_unconfirmed":
+        return (
+            "Landing marker was observed and Enter was pressed on the codex "
+            "standard rail, but the receiver pane showed no turn-start activity "
+            "within the observation window; the Enter may have been absorbed by "
+            "a busy / redrawing composer. No C-u rollback and no re-send were "
+            "issued — the marker+body was typed exactly once. The sender cannot "
+            "confirm from tmux capture that the receiver started a turn."
         )
     if reason == "target_unavailable":
         return (
@@ -1370,6 +1402,12 @@ def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Op
         return (
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; nothing was submitted at the pane."
+        )
+    if reason == "turn_start_unconfirmed":
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            "manually if action is still required; the pane notification's turn "
+            "start could not be confirmed and nothing was re-submitted."
         )
     return None
 
@@ -1499,6 +1537,7 @@ def build_delivery_record(
     retry: Optional["QueueEnterRetryOutcome"] = None,
     activation: Optional["TargetActivationOutcome"] = None,
     submit_lines: Optional[Sequence[str]] = None,
+    turn_start_lines: Optional[Sequence[str]] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -1640,6 +1679,16 @@ def build_delivery_record(
         # overrides `next_action`; the structured `(status, reason)` wire is
         # unchanged.
         lines.extend(submit_lines)
+    if turn_start_lines:
+        # Redmine #13166: additive codex standard-rail turn-start observation
+        # telemetry (window / interval / poll count + a confirmed|unconfirmed
+        # verdict). Pre-rendered by the caller via
+        # `turn_start_observation.turn_start_record_lines` (numbers + a verdict,
+        # no free text and no absolute paths), so this domain module stays a leaf
+        # the caller imports rather than the reverse. It documents the
+        # observation the rail already performed and never overrides
+        # `next_action`; the structured `(status, reason)` wire is unchanged.
+        lines.extend(turn_start_lines)
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
         # Wording Requirements. This note does NOT override `next_action`;

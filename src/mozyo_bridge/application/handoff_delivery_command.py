@@ -238,6 +238,7 @@ class DeliveryRecordUseCase:
         retry: QueueEnterRetryOutcome | None = None,
         activation: TargetActivationOutcome | None = None,
         submit_lines: list[str] | None = None,
+        turn_start_lines: list[str] | None = None,
     ) -> None:
         """Emit the structured outcome and/or the durable delivery-record text.
 
@@ -268,6 +269,7 @@ class DeliveryRecordUseCase:
                     retry=retry,
                     activation=activation,
                     submit_lines=submit_lines,
+                    turn_start_lines=turn_start_lines,
                 )
             )
             if record_format == RECORD_FORMAT_BOTH:
@@ -307,6 +309,7 @@ class DeliveryRecordUseCase:
         record_format: str,
         retry: QueueEnterRetryOutcome | None = None,
         activation: TargetActivationOutcome | None = None,
+        turn_start_lines: list[str] | None = None,
     ) -> None:
         """Best-effort durable persistence of the delivery record (Redmine #12311).
 
@@ -353,6 +356,7 @@ class DeliveryRecordUseCase:
                 duplicate_lane_panes=duplicate_lane_panes or None,
                 retry=retry,
                 activation=activation,
+                turn_start_lines=turn_start_lines,
             )
             note = build_delivery_record_note(
                 outcome,
@@ -459,6 +463,7 @@ def deliver_outcome(
     retry: QueueEnterRetryOutcome | None = None,
     activation: TargetActivationOutcome | None = None,
     submit_lines: list[str] | None = None,
+    turn_start_lines: list[str] | None = None,
 ) -> None:
     """Live :meth:`DeliveryRecordUseCase.emit_outcome` (was ``commands._emit_outcome``)."""
     DeliveryRecordUseCase(LiveDeliveryRecordOps()).emit_outcome(
@@ -471,6 +476,7 @@ def deliver_outcome(
         retry=retry,
         activation=activation,
         submit_lines=submit_lines,
+        turn_start_lines=turn_start_lines,
     )
 
 
@@ -499,6 +505,7 @@ def maybe_persist_delivery_record(
     record_format: str,
     retry: QueueEnterRetryOutcome | None = None,
     activation: TargetActivationOutcome | None = None,
+    turn_start_lines: list[str] | None = None,
 ) -> None:
     """Live :meth:`DeliveryRecordUseCase.maybe_persist`.
 
@@ -516,4 +523,5 @@ def maybe_persist_delivery_record(
         record_format=record_format,
         retry=retry,
         activation=activation,
+        turn_start_lines=turn_start_lines,
     )

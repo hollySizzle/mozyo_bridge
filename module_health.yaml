@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3208
+    lines: 3284
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -952,6 +952,13 @@ allowlist:
       ``cockpit_dispatcher_command.py`` untouched). The recompute + drift-diff +
       set-option planner and use case live in the new
       ``cockpit_restamp_command.py``, not here.
+      Raised 3208 -> 3284 for the #13166 codex standard-rail turn-start
+      verification in ``orchestrate_handoff``: the pre-Enter baseline capture,
+      the post-Enter ``_observe_codex_turn_start`` call, and the
+      ``blocked``/``turn_start_unconfirmed`` fail-closed branch (emit + die), plus
+      threading ``turn_start_lines`` into the sent-path emit/persist. The
+      read-only observation loop, the pure activity classifier, and the record-line
+      renderer live in the new ``application/turn_start_observation.py``, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -998,7 +1005,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1809
+    lines: 1858
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1097,6 +1104,15 @@ allowlist:
       the `main_lane_implementation_blocked` reason, and its next-action /
       narrative branches. Rebased onto current main from already-reviewed commit
       11700ce; moved-module architecture preserved.
+      Raised 1809 -> 1858 for the #13166 `turn_start_unconfirmed` delivery Reason:
+      the token on the `Reason` literal, the `next_action_for` /
+      `_outcome_narrative` / `_header_label` / `_receiver_contract_line` branches
+      that reference it, and the additive `turn_start_lines` kwarg on
+      `build_delivery_record` (the codex standard-rail turn-start telemetry block).
+      The read-only observation, the pure activity classifier, and the record-line
+      renderer live in the separate `application/turn_start_observation.py` (kept
+      out of this module), so only the Reason registration + record plumbing lands
+      here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

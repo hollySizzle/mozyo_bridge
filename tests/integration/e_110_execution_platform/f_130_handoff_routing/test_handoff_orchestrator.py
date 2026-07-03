@@ -176,6 +176,7 @@ class HandoffOrchestratorTest(unittest.TestCase):
         captures: list[str] | None = None,
         allow_exit: bool = False,
         pane: dict[str, str] | None = None,
+        enter_advances_pane: bool = False,
     ):
         parser = build_parser()
         args = parser.parse_args(argv)
@@ -198,6 +199,11 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                if enter_advances_pane and tmux_args[-1] == "Enter":
+                    # Redmine #13166: model a well-behaved codex receiver that
+                    # starts a turn on Enter so the codex standard-rail turn-start
+                    # observation confirms.
+                    pane_text += "\n<codex-turn-started>"
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")
@@ -321,6 +327,112 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertEqual("pending_input", outcome["status"])
         self.assertEqual("reply", outcome["kind"])
         self.assertEqual("operator", outcome["next_action_owner"])
+
+    def _codex_standard_argv(self) -> list[str]:
+        return [
+            "handoff",
+            "send",
+            "--to",
+            "codex",
+            "--source",
+            "redmine",
+            "--issue",
+            "9020",
+            "--journal",
+            "46005",
+            "--kind",
+            "review_request",
+            "--target",
+            "%2",
+            "--force",
+            "--mode",
+            "standard",
+            "--submit-delay",
+            "0",
+        ]
+
+    _CODEX_PANE = {
+        "id": "%2",
+        "location": "agents:0.1",
+        "command": "node",
+        "cwd": "/repo",
+        "window_name": "codex",
+    }
+
+    def test_codex_standard_confirms_turn_start_and_emits_sent_ok(self) -> None:
+        # Redmine #13166: codex `--mode standard` now verifies turn start after
+        # Enter. A well-behaved receiver whose pane advances confirms and the send
+        # resolves to `sent` / `ok`, with turn-start telemetry in the record.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._codex_standard_argv(),
+            pane=dict(self._CODEX_PANE),
+            enter_advances_pane=True,
+        )
+        self.assertEqual(0, result)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        self.assertEqual("codex", outcome["receiver"])
+        self.assertIn("Turn start:", stdout)
+        self.assertIn("turn start confirmed", stdout)
+
+    def test_codex_standard_unconfirmed_turn_start_blocks_without_resend(self) -> None:
+        # Redmine #13166 core regression: marker observed + Enter pressed but the
+        # receiver pane never advances (Enter absorbed by a busy composer). The
+        # rail must fail closed to `blocked` / `turn_start_unconfirmed`, and it
+        # must NOT roll back or re-issue Enter (the marker+body is typed once).
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._codex_standard_argv(),
+            pane=dict(self._CODEX_PANE),
+            enter_advances_pane=False,
+            allow_exit=True,
+        )
+        self.assertIsInstance(result, SystemExit)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("turn_start_unconfirmed", outcome["reason"])
+        self.assertEqual("sender", outcome["next_action_owner"])
+        # Exactly one Enter, and never a C-u rollback: no re-send, no new key
+        # injection recovery path.
+        enter_calls = [c for c in sent if c == ("send-keys", "-t", "%2", "Enter")]
+        self.assertEqual(1, len(enter_calls))
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+        self.assertIn("turn start unconfirmed", stdout)
+
+    def test_claude_standard_skips_turn_start_observation(self) -> None:
+        # Redmine #13166 scope guard: the claude rail is unchanged — it resolves
+        # `sent` / `ok` on marker observed + Enter without a turn-start block even
+        # when the pane does not advance after Enter.
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            [
+                "handoff",
+                "send",
+                "--to",
+                "claude",
+                "--source",
+                "asana",
+                "--kind",
+                "implementation_request",
+                "--task-id",
+                "T1",
+                "--comment-id",
+                "C1",
+                "--target",
+                "%2",
+                "--mode",
+                "standard",
+                "--submit-delay",
+                "0",
+            ],
+            enter_advances_pane=False,
+        )
+        self.assertEqual(0, result)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("sent", outcome["status"])
+        self.assertEqual("ok", outcome["reason"])
+        self.assertNotIn("Turn start:", stdout)
 
     def test_marker_timeout_rolls_back_and_emits_blocked_outcome(self) -> None:
         # Strict `--mode standard` fail-closed regression: marker miss must

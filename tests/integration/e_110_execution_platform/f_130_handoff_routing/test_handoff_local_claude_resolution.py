@@ -150,7 +150,18 @@ class HandoffLocalClaudeCliTest(unittest.TestCase):
             argv += ["--target", target]
         args = build_parser().parse_args(argv)
 
+        pane_text = ""
+
+        def fake_capture(_target, _lines):
+            return pane_text
+
         def fake_run_tmux(*a, check: bool = True):
+            # Redmine #13166: model a well-behaved codex receiver that starts a
+            # turn on Enter so the codex standard-rail turn-start observation
+            # confirms and these lane-resolution sends resolve to sent/ok.
+            nonlocal pane_text
+            if len(a) >= 3 and a[0] == "send-keys" and a[-1] == "Enter":
+                pane_text += "\n<codex-turn-started>"
             return argparse.Namespace(returncode=0, stdout="", stderr="")
 
         env = {k: v for k, v in os.environ.items() if k != "TMUX_PANE"}
@@ -158,7 +169,7 @@ class HandoffLocalClaudeCliTest(unittest.TestCase):
             env["TMUX_PANE"] = sender_pane_id
 
         with patch.object(commands, "require_tmux"), \
-            patch.object(commands, "capture_pane", return_value=""), \
+            patch.object(commands, "capture_pane", side_effect=fake_capture), \
             patch.object(commands, "run_tmux", side_effect=fake_run_tmux), \
             patch.object(commands, "wait_for_text", return_value=marker_lands), \
             patch("mozyo_bridge.application.commands.time.sleep"), \

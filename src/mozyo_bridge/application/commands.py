@@ -58,6 +58,10 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     record_format_from_args as _record_format_from_args,
     submit_lines_for as _submit_lines_for,
 )
+from mozyo_bridge.application.turn_start_observation import (  # noqa: F401
+    observe_codex_turn_start as _observe_codex_turn_start,
+    turn_start_record_lines as _turn_start_record_lines,
+)
 from mozyo_bridge.application.handoff_target_activation_command import (
     LiveTargetActivationOps,
     TargetActivationUseCase,
@@ -120,6 +124,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     KIND_LABELS,
     MODE_PENDING,
     MODE_QUEUE_ENTER,
+    MODE_STANDARD,
     MODES,
     QueueEnterRetryOutcome,
     RECEIVERS,
@@ -2890,6 +2895,18 @@ def orchestrate_handoff(
     submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
     if submit_delay:
         time.sleep(submit_delay)
+
+    # Redmine #13166: on the codex strict `--mode standard` rail, snapshot the
+    # receiver pane immediately before Enter so the post-Enter turn-start
+    # observation below has a pre-submit baseline. The marker was already observed
+    # (a marker miss died at `marker_timeout` above), so this baseline holds the
+    # marker+body sitting in the composer. Only codex standard reaches this — the
+    # claude rail and the queue-enter rail keep their prior behavior untouched.
+    codex_standard_rail = mode == MODE_STANDARD and receiver == "codex"
+    turn_start_baseline = (
+        capture_pane(target, landing_lines) if codex_standard_rail else None
+    )
+
     run_tmux("send-keys", "-t", target, "Enter")
     enter_attempts = 1
 
@@ -2920,6 +2937,63 @@ def orchestrate_handoff(
                 break
             run_tmux("send-keys", "-t", target, "Enter")
             enter_attempts += 1
+
+    # Redmine #13166: codex standard-rail turn-start verification. Marker observed
+    # + Enter issued proves the sender pressed Enter, not that the codex TUI
+    # submitted the prompt and started a turn — a busy / redrawing composer can
+    # absorb the Enter and leave the marker+body unsubmitted while the rail still
+    # reported `sent` / `ok` (the false-positive delivery this bug fixes). The rail
+    # now observes the receiver pane for post-Enter turn-start activity (read-only;
+    # no re-typed marker+body, no re-issued Enter, no auto-resend). Only the codex
+    # `--mode standard` rail runs this; claude and queue-enter are untouched.
+    turn_start_lines = None
+    if codex_standard_rail:
+        turn_start = _observe_codex_turn_start(
+            target,
+            baseline_capture=turn_start_baseline or "",
+            capture=capture_pane,
+            sleep=time.sleep,
+            window_seconds=landing_timeout,
+            lines=landing_lines,
+        )
+        turn_start_lines = _turn_start_record_lines(turn_start)
+        if not turn_start.confirmed:
+            outcome = make_outcome(
+                status="blocked",
+                reason="turn_start_unconfirmed",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=marker,
+                execution_root=execution_root,
+                role_profile=role_profile_resolution,
+                transition_role=transition_role_boundary,
+                workflow_contract=workflow_contract_bundle,
+                ticketless_callback=ticketless_callback_payload,
+                ticketless_consultation=ticketless_consultation_payload,
+                ticketless_work_intake=ticketless_work_intake_payload,
+            )
+            _emit_outcome(
+                outcome,
+                record_format=record_format,
+                command=record_command,
+                duplicate_lane_panes=duplicate_lane_panes or None,
+                role_profile_contract=role_profile_contract,
+                submit_lines=_submit_lines_for(args, outcome),
+                turn_start_lines=turn_start_lines,
+            )
+            die(
+                "handoff landing marker was observed and Enter was pressed, but the "
+                "codex receiver pane showed no turn-start activity within the "
+                "observation window; the Enter may have been absorbed by a busy / "
+                "redrawing composer. No C-u rollback and no re-send were issued (the "
+                "marker+body was typed once). Read the receiver to confirm whether "
+                "the turn started before re-issuing under --mode standard. "
+                f"target={target} marker={marker}"
+            )
+            raise AssertionError("unreachable")
 
     # Wording-layer differentiation under the relaxed `queue-enter` rail:
     # marker observed (possibly via the Enter-only retry above) → strict
@@ -2981,6 +3055,7 @@ def orchestrate_handoff(
         retry=retry_record,
         activation=target_activation,
         submit_lines=_submit_lines_for(args, outcome),
+        turn_start_lines=turn_start_lines,
     )
     _maybe_persist_delivery_record(
         args,
@@ -2989,6 +3064,7 @@ def orchestrate_handoff(
         record_format=record_format,
         retry=retry_record,
         activation=target_activation,
+        turn_start_lines=turn_start_lines,
     )
     return 0
 

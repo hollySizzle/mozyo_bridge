@@ -67,6 +67,11 @@ class QEnterFrontDoorTest(unittest.TestCase):
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                if tmux_args[-1] == "Enter":
+                    # Redmine #13166: model a well-behaved codex receiver that
+                    # starts a turn on Enter so the codex standard-rail turn-start
+                    # observation confirms and the send resolves to sent/ok.
+                    pane_text += "\n<codex-turn-started>"
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")
