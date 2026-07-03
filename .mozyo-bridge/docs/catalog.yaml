@@ -1213,6 +1213,18 @@ documents:
       - logic-module-health-gate
       - spec-project-map
 
+  - id: logic-pre-commit-focused-verification
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/pre-commit-focused-verification.md
+    purpose: "opt-in pre-commit focused verification hook (Redmine #13079) の設計正本。`scripts/pre-commit-focused.sh` が回す staged 検証 (diff --check / docs audit-impact --staged / tests resolve --staged focused 実行) と境界 (opt-in のみ・full suite を hook で回さない・governed Required Verification の代替ではない)、install / uninstall / worktree 共有挙動、resolver full 推奨時の skip-with-notice 方針を定義する。"
+    audit_role: pre_commit_focused_verification_logic
+    related_document_refs:
+      - logic-tests-placement-discovery-policy
+      - logic-test-runtime-profiling-policy
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
 file_conventions:
   - id: fc-agent-routers
     name: agent entrypoint routers
@@ -1583,6 +1595,15 @@ file_conventions:
       - logic-release-flow
       - logic-release-helper-contract
       - skill-release-reference
+
+  - id: fc-pre-commit-hook-script
+    name: opt-in pre-commit focused verification hook
+    patterns:
+      - scripts/pre-commit-focused.sh
+    severity: warn
+    document_refs:
+      - logic-pre-commit-focused-verification
+      - logic-tests-placement-discovery-policy
 
   - id: fc-skill-distribution-scripts
     name: skill distribution scripts and plugin metadata

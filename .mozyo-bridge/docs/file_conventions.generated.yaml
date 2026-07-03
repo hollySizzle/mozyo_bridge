@@ -338,6 +338,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: opt-in pre-commit focused verification hook
+  patterns:
+  - scripts/pre-commit-focused.sh
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/pre-commit-focused-verification.md と @vibes/docs/logics/tests-placement-discovery-policy.md
+    をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: skill distribution scripts and plugin metadata
   patterns:
   - scripts/install_claude_skill.sh
