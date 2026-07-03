@@ -13,7 +13,14 @@ Three concerns, each pure over caller-supplied facts:
   one :class:`SublaneLaneView` per non-default lane — issue id (parsed from the lane
   label), worktree / repo root, the gateway (``codex``) pane, the worker (``claude``)
   pane, branch (from a caller-resolved lookup), and a coarse :data:`SUBLANE_STATE_*`.
-  This is the read-only ``list`` / ``status`` projection.
+  This is the read-only ``list`` / ``status`` projection. Since #13086 the projection
+  also carries the lane's **host window identity** (session / window index / window
+  name, parsed with the same :func:`...agent_discovery.parse_location` helper the
+  ``agents list`` / ``agents targets`` records use, so the two surfaces can never
+  contradict each other) and machine-readable **stale / retire hints**
+  (:data:`STALE_HINT_*`) — decision *material* for a human / coordinator retire call,
+  never an auto-retire trigger. Window identity and hints are display / diagnosis
+  projections only; routing and callback target resolution never read them.
 
 - :func:`plan_sublane_create` composes the already-decided #12604 worktree launch action
   (:func:`...sublane_integration_policy.decide_worktree_launch`) with the pane / role /
@@ -41,8 +48,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Collection, Iterable, Mapping, Optional, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+    parse_location,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
@@ -118,16 +128,78 @@ SUBLANE_STATES = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Stale / retire hints (#13086): machine-readable retire *decision material*.
+#
+# Each hint names one observed inconsistency between the lane's identity and
+# the live inventory (or the caller-probed git facts). Hints are advisory
+# diagnosis output for a human / coordinator retire decision — they never
+# trigger a destructive retire, and routing / callback target resolution never
+# reads them. Detail-bearing hints append ``:<detail>`` after the literal
+# prefix (the ``missing_field:<name>`` convention the create plan already
+# uses).
+# ---------------------------------------------------------------------------
+
+#: The lane has no live ``codex`` gateway pane (dispatch / callback rail lost).
+STALE_HINT_GATEWAY_PANE_MISSING = "gateway_pane_missing"
+#: The lane has no live ``claude`` worker pane (implementer lost / never adopted).
+STALE_HINT_WORKER_PANE_MISSING = "worker_pane_missing"
+#: The lane's panes span more than one tmux window (`windows` lists them all) —
+#: the durable record expects one host window per lane (#13085 shared default).
+STALE_HINT_WINDOW_SPLIT = "window_split"
+#: Prefix: another live lane carries the same issue id (rendered as
+#: ``duplicate_issue_lane:<peer lane label or id>`` per duplicate peer) — one of
+#: them is likely superseded.
+STALE_HINT_DUPLICATE_ISSUE_LANE = "duplicate_issue_lane"
+#: The lane records a worktree / repo root, but it no longer resolves to a live
+#: git checkout (removed, moved, or never created).
+STALE_HINT_WORKTREE_UNRESOLVED = "worktree_unresolved"
+#: Prefix: the lane's branch is already reachable from the integration branch
+#: (rendered as ``branch_integrated:<integration branch>``) — no commit on the
+#: lane branch is unmerged, so retiring loses no work. Note the literal meaning:
+#: a freshly dispatched lane that has not committed yet also qualifies (its
+#: branch still points at an integrated commit) — combine with the issue /
+#: journal state before reading this as "the lane's work shipped".
+STALE_HINT_BRANCH_INTEGRATED = "branch_integrated"
+
+STALE_HINTS = frozenset(
+    {
+        STALE_HINT_GATEWAY_PANE_MISSING,
+        STALE_HINT_WORKER_PANE_MISSING,
+        STALE_HINT_WINDOW_SPLIT,
+        STALE_HINT_DUPLICATE_ISSUE_LANE,
+        STALE_HINT_WORKTREE_UNRESOLVED,
+        STALE_HINT_BRANCH_INTEGRATED,
+    }
+)
+
 
 @dataclass(frozen=True)
 class SublanePane:
-    """One pane belonging to a sublane (a projection of a pane-inventory row)."""
+    """One pane belonging to a sublane (a projection of a pane-inventory row).
+
+    ``session`` / ``window_index`` / ``window_name`` are the pane's host-window
+    identity (#13086), parsed from the row's ``location`` / ``window_name``
+    fields with the same :func:`parse_location` vocabulary the ``agents list`` /
+    ``agents targets`` records use — display / diagnosis metadata, never a
+    routing key.
+    """
 
     pane_id: str
     role: str
     active: bool
     command: str
     cwd: str
+    session: str = ""
+    window_index: str = ""
+    window_name: str = ""
+
+    @property
+    def window(self) -> str:
+        """The pane's ``session:window_index`` window address ('' when unknown)."""
+        if not self.session and not self.window_index:
+            return ""
+        return f"{self.session}:{self.window_index}"
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -136,12 +208,24 @@ class SublanePane:
             "active": self.active,
             "command": self.command,
             "cwd": self.cwd,
+            "session": self.session,
+            "window_index": self.window_index,
+            "window_name": self.window_name,
+            "window": self.window,
         }
 
 
 @dataclass(frozen=True)
 class SublaneLaneView:
-    """The ``list`` / ``status`` projection of a single sublane lane."""
+    """The ``list`` / ``status`` projection of a single sublane lane.
+
+    ``host_window`` / ``host_window_name`` name the single tmux window hosting
+    every pane of the lane (#13086); when the lane's panes span multiple windows
+    both are ``None``, ``windows`` lists every distinct window address, and the
+    :data:`STALE_HINT_WINDOW_SPLIT` hint is raised. ``stale_hints`` is the
+    machine-readable retire decision material — advisory only, never an
+    auto-retire trigger and never a routing input.
+    """
 
     workspace_id: str
     lane_id: str
@@ -153,6 +237,10 @@ class SublaneLaneView:
     worker_pane: Optional[str]
     state: str
     panes: Tuple[SublanePane, ...] = ()
+    host_window: Optional[str] = None
+    host_window_name: Optional[str] = None
+    windows: Tuple[str, ...] = ()
+    stale_hints: Tuple[str, ...] = ()
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -166,6 +254,10 @@ class SublaneLaneView:
             "worker_pane": self.worker_pane,
             "state": self.state,
             "panes": [p.as_payload() for p in self.panes],
+            "host_window": self.host_window,
+            "host_window_name": self.host_window_name,
+            "windows": list(self.windows),
+            "stale_hints": list(self.stale_hints),
         }
 
 
@@ -197,27 +289,87 @@ def _lane_state(gateway_pane: Optional[str], worker_pane: Optional[str]) -> str:
     return SUBLANE_STATE_DETACHED
 
 
+def _lane_windows(
+    panes: Tuple[SublanePane, ...],
+) -> Tuple[Optional[str], Optional[str], Tuple[str, ...]]:
+    """Derive ``(host_window, host_window_name, windows)`` from a lane's panes (pure).
+
+    ``windows`` is every distinct known window address, sorted. ``host_window``
+    (and its name) is set only when exactly one window hosts every
+    window-resolvable pane; a split lane or an all-unknown lane yields ``None``
+    so a caller never mistakes a guess for the host.
+    """
+    addresses = sorted({p.window for p in panes if p.window})
+    if len(addresses) != 1:
+        return None, None, tuple(addresses)
+    host = addresses[0]
+    name = next(
+        (p.window_name for p in panes if p.window == host and p.window_name), None
+    )
+    return host, name, (host,)
+
+
+def _lane_stale_hints(
+    *,
+    gateway_pane: Optional[str],
+    worker_pane: Optional[str],
+    windows: Tuple[str, ...],
+    duplicate_peers: Tuple[str, ...],
+    worktree_unresolved: bool,
+    integrated_into: Optional[str],
+) -> Tuple[str, ...]:
+    """Assemble one lane's machine-readable stale / retire hints (pure, advisory)."""
+    hints: list[str] = []
+    if not gateway_pane:
+        hints.append(STALE_HINT_GATEWAY_PANE_MISSING)
+    if not worker_pane:
+        hints.append(STALE_HINT_WORKER_PANE_MISSING)
+    if len(windows) > 1:
+        hints.append(STALE_HINT_WINDOW_SPLIT)
+    for peer in duplicate_peers:
+        hints.append(f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:{peer}")
+    if worktree_unresolved:
+        hints.append(STALE_HINT_WORKTREE_UNRESOLVED)
+    if integrated_into:
+        hints.append(f"{STALE_HINT_BRANCH_INTEGRATED}:{integrated_into}")
+    return tuple(hints)
+
+
 def project_sublanes(
     pane_rows: Iterable[Mapping[str, str]],
     *,
     branches: Optional[Mapping[str, str]] = None,
+    unresolved_worktrees: Optional[Collection[str]] = None,
+    integrated_branches: Optional[Mapping[str, str]] = None,
 ) -> list[SublaneLaneView]:
     """Fold a tmux pane inventory into one :class:`SublaneLaneView` per sublane (pure).
 
     ``pane_rows`` are the ``pane_lines`` row dicts (keys ``id`` / ``agent_role`` /
     ``workspace_id`` / ``lane_id`` / ``lane_label`` / ``lane_kind`` / ``cwd`` /
-    ``command`` / ``pane_active`` / ``repo_root_stamp`` …). Rows are grouped by
-    ``(workspace_id, lane_id)``; the coordinator / default lane is skipped
-    (:func:`_is_non_sublane_lane` — by default lane id, ``main`` label, or main / default
-    kind) so only real sublanes appear. Within a lane the first ``codex`` pane is the
-    gateway and
-    the first ``claude`` pane the worker; extra same-role panes are still listed under
-    ``panes`` but never silently promoted. ``branches`` is a caller-resolved
-    ``lane_id -> branch`` lookup (the domain never runs git); an absent entry leaves
-    ``branch`` ``None``. Lanes are returned sorted by ``(workspace_id, lane_id)`` for a
+    ``command`` / ``pane_active`` / ``location`` / ``window_name`` /
+    ``repo_root_stamp`` …). Rows are grouped by ``(workspace_id, lane_id)``; the
+    coordinator / default lane is skipped (:func:`_is_non_sublane_lane` — by default
+    lane id, ``main`` label, or main / default kind) so only real sublanes appear.
+    Within a lane the first ``codex`` pane is the gateway and the first ``claude``
+    pane the worker; extra same-role panes are still listed under ``panes`` but never
+    silently promoted. Lanes are returned sorted by ``(workspace_id, lane_id)`` for a
     stable display.
+
+    The caller-resolved lookups keep the domain IO-free (it never runs git):
+
+    - ``branches`` — ``lane_id -> branch``; an absent entry leaves ``branch`` ``None``.
+    - ``unresolved_worktrees`` — lane ids whose recorded worktree / repo root no
+      longer resolves to a live git checkout -> :data:`STALE_HINT_WORKTREE_UNRESOLVED`.
+    - ``integrated_branches`` — ``lane_id -> integration branch`` the lane's branch is
+      already reachable from -> :data:`STALE_HINT_BRANCH_INTEGRATED`.
+
+    An absent lookup entry means *unknown*, and unknown never fabricates a hint —
+    hints are advisory retire decision material, so the projection stays quiet
+    rather than guessing (#13086).
     """
     branches = branches or {}
+    unresolved_worktrees = frozenset(unresolved_worktrees or ())
+    integrated_branches = integrated_branches or {}
     grouped: dict[Tuple[str, str], list[SublanePane]] = {}
     labels: dict[Tuple[str, str], str] = {}
     repo_roots: dict[Tuple[str, str], str] = {}
@@ -233,12 +385,18 @@ def project_sublanes(
             continue
         workspace_id = (row.get("workspace_id") or "").strip()
         key = (workspace_id, lane_id)
+        session, window_index, _pane_index = parse_location(
+            (row.get("location") or "").strip()
+        )
         pane = SublanePane(
             pane_id=(row.get("id") or "").strip(),
             role=(row.get("agent_role") or "").strip(),
             active=(row.get("pane_active") or "").strip() == "1",
             command=(row.get("command") or "").strip(),
             cwd=(row.get("cwd") or "").strip(),
+            session=session,
+            window_index=window_index,
+            window_name=(row.get("window_name") or "").strip(),
         )
         grouped.setdefault(key, []).append(pane)
         # Keep the first non-empty lane label seen for the lane.
@@ -250,6 +408,14 @@ def project_sublanes(
                 (row.get("repo_root_stamp") or "").strip() or pane.cwd
             )
 
+    # Duplicate-issue detection needs the whole lane set: map each issue id to the
+    # lanes carrying it, so every duplicate lane can name its peers.
+    lanes_by_issue: dict[str, list[Tuple[str, str]]] = {}
+    for key in grouped:
+        issue = parse_issue_from_lane_label(labels.get(key, ""))
+        if issue:
+            lanes_by_issue.setdefault(issue, []).append(key)
+
     views: list[SublaneLaneView] = []
     for key in sorted(grouped):
         workspace_id, lane_id = key
@@ -257,18 +423,36 @@ def project_sublanes(
         gateway = next((p.pane_id for p in panes if p.role == GATEWAY_ROLE), None)
         worker = next((p.pane_id for p in panes if p.role == WORKER_ROLE), None)
         lane_label = labels.get(key, "")
+        issue = parse_issue_from_lane_label(lane_label)
+        host_window, host_window_name, windows = _lane_windows(panes)
+        duplicate_peers = tuple(
+            labels.get(peer) or peer[1]
+            for peer in sorted(lanes_by_issue.get(issue, []))
+            if issue and peer != key
+        )
         views.append(
             SublaneLaneView(
                 workspace_id=workspace_id,
                 lane_id=lane_id,
                 lane_label=lane_label,
-                issue=parse_issue_from_lane_label(lane_label),
+                issue=issue,
                 branch=branches.get(lane_id),
                 repo_root=repo_roots.get(key) or None,
                 gateway_pane=gateway,
                 worker_pane=worker,
                 state=_lane_state(gateway, worker),
                 panes=panes,
+                host_window=host_window,
+                host_window_name=host_window_name,
+                windows=windows,
+                stale_hints=_lane_stale_hints(
+                    gateway_pane=gateway,
+                    worker_pane=worker,
+                    windows=windows,
+                    duplicate_peers=duplicate_peers,
+                    worktree_unresolved=lane_id in unresolved_worktrees,
+                    integrated_into=integrated_branches.get(lane_id),
+                ),
             )
         )
     return views
@@ -614,6 +798,13 @@ __all__ = (
     "SUBLANE_STATE_WORKER_ONLY",
     "SUBLANE_STATE_DETACHED",
     "SUBLANE_STATES",
+    "STALE_HINT_GATEWAY_PANE_MISSING",
+    "STALE_HINT_WORKER_PANE_MISSING",
+    "STALE_HINT_WINDOW_SPLIT",
+    "STALE_HINT_DUPLICATE_ISSUE_LANE",
+    "STALE_HINT_WORKTREE_UNRESOLVED",
+    "STALE_HINT_BRANCH_INTEGRATED",
+    "STALE_HINTS",
     "SublanePane",
     "SublaneLaneView",
     "project_sublanes",

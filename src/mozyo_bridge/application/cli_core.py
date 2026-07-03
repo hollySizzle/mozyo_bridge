@@ -395,13 +395,27 @@ def register_lifecycle(sub) -> None:
         aliases=["status"],
         help=(
             "Read-only: list live sublanes (issue / worktree / gateway pane / "
-            "worker pane / branch / state) from the tmux pane inventory."
+            "worker pane / branch / state / host window) from the tmux pane "
+            "inventory, with machine-readable stale/retire hints (pane missing, "
+            "window split, duplicate issue lane, unresolved worktree; with "
+            "--integration-branch also branch-integrated). Advisory diagnosis "
+            "only: never retires, kills, or routes."
         ),
     )
     sublane_list.add_argument(
         "--lane",
         default=None,
         help="Filter to a single lane by lane id, lane label, or issue id",
+    )
+    sublane_list.add_argument(
+        "--integration-branch",
+        dest="integration_branch",
+        default=None,
+        help=(
+            "Opt-in read-only ancestry probe (git merge-base --is-ancestor): flag "
+            "lanes whose branch is already reachable from this integration branch "
+            "as branch_integrated retire candidates. Never guessed when omitted."
+        ),
     )
     add_repo_option(sublane_list)
     _add_lifecycle_json(sublane_list)

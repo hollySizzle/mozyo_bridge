@@ -12,7 +12,10 @@ Three subcommands, matching the issue scope:
 
 - ``sublane list`` / ``sublane status`` — read-only: fold the live tmux pane inventory
   into one row per sublane (issue / worktree / gateway pane / worker pane / branch /
-  state). Pure discovery; exits 0.
+  state / host window), plus the #13086 machine-readable stale / retire hints (pane
+  missing / window split / duplicate issue lane / unresolved worktree, and — opt-in
+  via ``--integration-branch`` — branch already integrated). Pure discovery and
+  advisory diagnosis material; it never retires anything and exits 0.
 - ``sublane create`` / ``sublane start`` — resolve the operator-supplied identity, probe
   git for the launch action (the pure #12604 :func:`decide_worktree_launch`), and emit a
   fail-closed, replayable :class:`SublaneCreatePlan`. It **plans**; it does not actuate
@@ -78,9 +81,12 @@ class SublaneLifecycleOps(Protocol):
     an empty list when tmux is unavailable — the surface degrades, it does not die).
     ``is_git_workspace`` / ``worktree_exists`` / ``worktree_dirty`` are the git read
     probes for the current repo root. ``branch_for`` resolves the current branch of a
-    checkout path (``None`` when it is not a resolvable git worktree). There is
-    intentionally no create / remove / merge / pane-kill method — the actuating half of
-    the lifecycle is gated (worktree-lifecycle-boundary.md).
+    checkout path (``None`` when it is not a resolvable git worktree).
+    ``branch_integrated`` is the read-only #13086 retire-material probe: whether
+    ``branch`` is already reachable from ``integration_branch`` (``None`` when the
+    probe cannot answer — unknown never fabricates a hint). There is intentionally no
+    create / remove / merge / pane-kill method — the actuating half of the lifecycle
+    is gated (worktree-lifecycle-boundary.md).
     """
 
     def pane_rows(self) -> list[dict[str, str]]: ...
@@ -92,6 +98,10 @@ class SublaneLifecycleOps(Protocol):
     def worktree_dirty(self) -> bool: ...
 
     def branch_for(self, checkout_path: str) -> Optional[str]: ...
+
+    def branch_integrated(
+        self, branch: str, integration_branch: str
+    ) -> Optional[bool]: ...
 
 
 @dataclass(frozen=True)
@@ -139,6 +149,40 @@ class LiveSublaneLifecycleOps:
         # A detached HEAD prints ``HEAD``; report that verbatim so it is not confused
         # with a named branch.
         return branch or None
+
+    def branch_integrated(
+        self, branch: str, integration_branch: str
+    ) -> Optional[bool]:
+        """Read-only ancestry probe: is ``branch`` reachable from ``integration_branch``?
+
+        ``git merge-base --is-ancestor`` answers with its exit code: 0 = ancestor
+        (integrated), 1 = not an ancestor. Any other exit (unknown ref, not a
+        repo) or an OS error is *unknown* -> ``None``, so a failed probe never
+        fabricates retire material.
+        """
+        if not branch or not integration_branch:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo_root),
+                    "merge-base",
+                    "--is-ancestor",
+                    branch,
+                    integration_branch,
+                ],
+                text=True,
+                capture_output=True,
+            )
+        except OSError:
+            return None
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -199,22 +243,51 @@ class SublaneRetireOutcome:
 
 @dataclass
 class SublaneListUseCase:
-    """Read-only ``list`` / ``status`` projection over the :class:`SublaneLifecycleOps`."""
+    """Read-only ``list`` / ``status`` projection over the :class:`SublaneLifecycleOps`.
+
+    Besides the two-pass branch lookup, the second pass feeds the pure projection
+    the #13086 stale / retire lookups: a lane whose recorded worktree resolves to
+    no branch is ``worktree_unresolved``, and — only when the caller names an
+    ``integration_branch`` (opt-in; never guessed) — a lane whose branch the
+    read-only ancestry probe reports as reachable is ``branch_integrated``.
+    Advisory diagnosis output only; nothing here retires, kills, or routes.
+    """
 
     ops: SublaneLifecycleOps
 
-    def run(self, *, lane_filter: Optional[str] = None) -> SublaneListOutcome:
+    def run(
+        self,
+        *,
+        lane_filter: Optional[str] = None,
+        integration_branch: Optional[str] = None,
+    ) -> SublaneListOutcome:
         rows = self.ops.pane_rows()
         # First pass discovers the lanes (and their repo roots); resolve each lane's
-        # branch through the port, then re-project with the branch lookup.
+        # branch through the port, then re-project with the resolved lookups.
         base = project_sublanes(rows)
         branches: dict[str, str] = {}
+        unresolved_worktrees: set[str] = set()
+        integrated_branches: dict[str, str] = {}
         for view in base:
-            if view.repo_root:
-                branch = self.ops.branch_for(view.repo_root)
-                if branch:
-                    branches[view.lane_id] = branch
-        lanes = project_sublanes(rows, branches=branches)
+            if not view.repo_root:
+                continue
+            branch = self.ops.branch_for(view.repo_root)
+            if branch:
+                branches[view.lane_id] = branch
+                if integration_branch and self.ops.branch_integrated(
+                    branch, integration_branch
+                ):
+                    integrated_branches[view.lane_id] = integration_branch
+            else:
+                # A recorded worktree that resolves to no branch is stale retire
+                # material (removed / moved / never created).
+                unresolved_worktrees.add(view.lane_id)
+        lanes = project_sublanes(
+            rows,
+            branches=branches,
+            unresolved_worktrees=unresolved_worktrees,
+            integrated_branches=integrated_branches,
+        )
         if lane_filter:
             needle = lane_filter.strip()
             lanes = [
@@ -338,6 +411,15 @@ def format_list_text(outcome: SublaneListOutcome) -> str:
             f"    gateway={lane.gateway_pane or '-'} worker={lane.worker_pane or '-'}"
             f" worktree={lane.repo_root or '-'}"
         )
+        # Host window identity (#13086): one address when the lane is intact, the
+        # full split list when its panes span windows (no guessing a host).
+        if lane.host_window:
+            name = f"({lane.host_window_name})" if lane.host_window_name else ""
+            lines.append(f"    window={lane.host_window}{name}")
+        elif lane.windows:
+            lines.append("    windows=" + ",".join(lane.windows) + " [split]")
+        if lane.stale_hints:
+            lines.append("    stale_hints: " + ", ".join(lane.stale_hints))
     return "\n".join(lines)
 
 
@@ -435,7 +517,10 @@ def _build_create_request(
 
 def cmd_sublane_list(args: argparse.Namespace) -> int:
     use_case = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=_repo_root(args)))
-    outcome = use_case.run(lane_filter=getattr(args, "lane", None))
+    outcome = use_case.run(
+        lane_filter=getattr(args, "lane", None),
+        integration_branch=getattr(args, "integration_branch", None),
+    )
     if getattr(args, "json", False):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:

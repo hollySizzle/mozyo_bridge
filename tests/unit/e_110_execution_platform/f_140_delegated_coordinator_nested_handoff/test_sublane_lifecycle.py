@@ -4,7 +4,10 @@ Pins the pure core of the ``mozyo-bridge sublane`` lifecycle MVP:
 
 - :func:`project_sublanes` — folds a tmux pane inventory into one lane view per sublane
   (default lane skipped, gateway/worker picked by role, issue parsed, branch from the
-  caller lookup, coarse state);
+  caller lookup, coarse state), plus the #13086 host-window identity (shared with the
+  ``agents list`` / ``agents targets`` discovery vocabulary) and the machine-readable
+  stale / retire hints (pane missing / window split / duplicate issue lane /
+  unresolved worktree / branch integrated — advisory, never fabricated from unknowns);
 - :func:`plan_sublane_create` — the fail-closed launch plan (missing identity, blocked
   launch, create vs reuse vs skip);
 - :func:`preflight_sublane_retire` — the fail-closed retire preflight (blocked => empty
@@ -35,6 +38,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
     CREATE_PLANNED,
+    STALE_HINT_BRANCH_INTEGRATED,
+    STALE_HINT_DUPLICATE_ISSUE_LANE,
+    STALE_HINT_GATEWAY_PANE_MISSING,
+    STALE_HINT_WINDOW_SPLIT,
+    STALE_HINT_WORKER_PANE_MISSING,
+    STALE_HINT_WORKTREE_UNRESOLVED,
     SUBLANE_STATE_ACTIVE,
     SUBLANE_STATE_GATEWAY_ONLY,
     SUBLANE_STATE_WORKER_ONLY,
@@ -140,6 +149,160 @@ class ProjectSublanesTests(unittest.TestCase):
     def test_repo_root_falls_back_to_cwd(self):
         rows = [_row(id="%1", agent_role="claude", lane_id="l1", cwd="/wt/x")]
         self.assertEqual(project_sublanes(rows)[0].repo_root, "/wt/x")
+
+
+class HostWindowProjectionTests(unittest.TestCase):
+    """#13086: lane host-window identity from the shared pane-location vocabulary."""
+
+    def test_shared_window_yields_host_window_and_name(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_100_a",
+                 location="cockpit:3.1", window_name="mozyo_bridge"),
+            _row(id="%2", agent_role="claude", lane_id="l1", lane_label="issue_100_a",
+                 location="cockpit:3.2", window_name="mozyo_bridge"),
+        ]
+        v = project_sublanes(rows)[0]
+        self.assertEqual(v.host_window, "cockpit:3")
+        self.assertEqual(v.host_window_name, "mozyo_bridge")
+        self.assertEqual(v.windows, ("cockpit:3",))
+        self.assertNotIn(STALE_HINT_WINDOW_SPLIT, v.stale_hints)
+
+    def test_pane_carries_window_identity_fields(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_100_a",
+                 location="cockpit:3.1", window_name="mozyo_bridge"),
+        ]
+        pane = project_sublanes(rows)[0].panes[0]
+        self.assertEqual(pane.session, "cockpit")
+        self.assertEqual(pane.window_index, "3")
+        self.assertEqual(pane.window_name, "mozyo_bridge")
+        self.assertEqual(pane.window, "cockpit:3")
+        payload = pane.as_payload()
+        self.assertEqual(payload["window"], "cockpit:3")
+        self.assertEqual(payload["session"], "cockpit")
+
+    def test_split_windows_yield_no_host_and_split_hint(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_100_a",
+                 location="cockpit:3.1", window_name="mozyo_bridge"),
+            _row(id="%2", agent_role="claude", lane_id="l1", lane_label="issue_100_a",
+                 location="cockpit:5.0", window_name="stray"),
+        ]
+        v = project_sublanes(rows)[0]
+        self.assertIsNone(v.host_window)
+        self.assertIsNone(v.host_window_name)
+        self.assertEqual(v.windows, ("cockpit:3", "cockpit:5"))
+        self.assertIn(STALE_HINT_WINDOW_SPLIT, v.stale_hints)
+
+    def test_unknown_location_yields_no_windows_and_no_split_hint(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_100_a"),
+            _row(id="%2", agent_role="claude", lane_id="l1", lane_label="issue_100_a"),
+        ]
+        v = project_sublanes(rows)[0]
+        self.assertIsNone(v.host_window)
+        self.assertEqual(v.windows, ())
+        self.assertNotIn(STALE_HINT_WINDOW_SPLIT, v.stale_hints)
+
+    def test_window_identity_agrees_with_agents_discovery(self):
+        # Acceptance (#13086): `agents targets` and `sublane list` must not
+        # contradict each other on pane/window identity. Both fold the same
+        # pane row through the same parse_location vocabulary.
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+            discover_agents,
+        )
+
+        row = _row(id="%9", agent_role="codex", lane_id="l1",
+                   lane_label="issue_100_a", location="mozyo-cockpit:4.2",
+                   window_name="mozyo_bridge")
+        record = discover_agents([row])[0]
+        pane = project_sublanes([row])[0].panes[0]
+        self.assertEqual(
+            (pane.session, pane.window_index, pane.window_name),
+            (record.session, record.window_index, record.window_name),
+        )
+
+
+class StaleHintTests(unittest.TestCase):
+    """#13086: machine-readable retire decision material (advisory only)."""
+
+    def _intact_rows(self, lane="l1", label="issue_100_a", window="cockpit:3"):
+        return [
+            _row(id="%1", agent_role="codex", lane_id=lane, lane_label=label,
+                 location=f"{window}.1", window_name="w"),
+            _row(id="%2", agent_role="claude", lane_id=lane, lane_label=label,
+                 location=f"{window}.2", window_name="w"),
+        ]
+
+    def test_intact_lane_has_no_hints(self):
+        v = project_sublanes(self._intact_rows())[0]
+        self.assertEqual(v.stale_hints, ())
+
+    def test_missing_worker_and_gateway_pane_hints(self):
+        gw_only = project_sublanes(
+            [_row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_1_a")]
+        )[0]
+        self.assertIn(STALE_HINT_WORKER_PANE_MISSING, gw_only.stale_hints)
+        self.assertNotIn(STALE_HINT_GATEWAY_PANE_MISSING, gw_only.stale_hints)
+        wk_only = project_sublanes(
+            [_row(id="%2", agent_role="claude", lane_id="l2", lane_label="issue_2_b")]
+        )[0]
+        self.assertIn(STALE_HINT_GATEWAY_PANE_MISSING, wk_only.stale_hints)
+
+    def test_duplicate_issue_lanes_flag_each_other(self):
+        rows = self._intact_rows(lane="l1", label="issue_100_a") + self._intact_rows(
+            lane="l2", label="issue_100_b", window="cockpit:4"
+        )
+        views = {v.lane_id: v for v in project_sublanes(rows)}
+        self.assertIn(
+            f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_100_b",
+            views["l1"].stale_hints,
+        )
+        self.assertIn(
+            f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_100_a",
+            views["l2"].stale_hints,
+        )
+
+    def test_distinct_issues_are_not_duplicates(self):
+        rows = self._intact_rows(lane="l1", label="issue_100_a") + self._intact_rows(
+            lane="l2", label="issue_200_b", window="cockpit:4"
+        )
+        for v in project_sublanes(rows):
+            self.assertFalse(
+                [h for h in v.stale_hints
+                 if h.startswith(STALE_HINT_DUPLICATE_ISSUE_LANE)]
+            )
+
+    def test_worktree_unresolved_hint_from_caller_lookup(self):
+        v = project_sublanes(
+            self._intact_rows(), unresolved_worktrees={"l1"}
+        )[0]
+        self.assertIn(STALE_HINT_WORKTREE_UNRESOLVED, v.stale_hints)
+
+    def test_branch_integrated_hint_names_the_integration_branch(self):
+        v = project_sublanes(
+            self._intact_rows(), integrated_branches={"l1": "main"}
+        )[0]
+        self.assertIn(f"{STALE_HINT_BRANCH_INTEGRATED}:main", v.stale_hints)
+
+    def test_unknown_lookups_never_fabricate_hints(self):
+        v = project_sublanes(self._intact_rows())[0]
+        self.assertNotIn(STALE_HINT_WORKTREE_UNRESOLVED, v.stale_hints)
+        self.assertFalse(
+            [h for h in v.stale_hints
+             if h.startswith(STALE_HINT_BRANCH_INTEGRATED)]
+        )
+
+    def test_payload_carries_window_and_hints(self):
+        payload = project_sublanes(
+            self._intact_rows(), integrated_branches={"l1": "main"}
+        )[0].as_payload()
+        self.assertEqual(payload["host_window"], "cockpit:3")
+        self.assertEqual(payload["host_window_name"], "w")
+        self.assertEqual(payload["windows"], ["cockpit:3"])
+        self.assertEqual(
+            payload["stale_hints"], [f"{STALE_HINT_BRANCH_INTEGRATED}:main"]
+        )
 
 
 def _req(**kw):

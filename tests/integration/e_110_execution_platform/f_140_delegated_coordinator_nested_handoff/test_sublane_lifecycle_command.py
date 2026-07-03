@@ -49,13 +49,17 @@ class FakeOps:
         worktree_exists=False,
         dirty=False,
         branches=None,
+        integrated=None,
     ):
         self._rows = rows or []
         self._git = git
         self._worktree_exists = worktree_exists
         self._dirty = dirty
         self._branches = branches or {}
+        # (branch, integration_branch) -> Optional[bool] ancestry answers (#13086).
+        self._integrated = integrated or {}
         self.branch_calls = []
+        self.integrated_calls = []
 
     def pane_rows(self):
         return list(self._rows)
@@ -72,6 +76,10 @@ class FakeOps:
     def branch_for(self, checkout_path):
         self.branch_calls.append(checkout_path)
         return self._branches.get(checkout_path)
+
+    def branch_integrated(self, branch, integration_branch):
+        self.integrated_calls.append((branch, integration_branch))
+        return self._integrated.get((branch, integration_branch))
 
 
 def _row(**kw):
@@ -113,6 +121,61 @@ class ListUseCaseTests(unittest.TestCase):
 
     def test_empty_inventory_is_no_sublanes(self):
         self.assertEqual(SublaneListUseCase(FakeOps()).run().lanes, ())
+
+    def test_unresolved_worktree_yields_stale_hint(self):
+        # #13086: a recorded worktree the port cannot resolve a branch for is
+        # stale retire material (removed / moved / never created).
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1",
+                 lane_label="issue_1_a", repo_root_stamp="/wt/gone"),
+        ]
+        outcome = SublaneListUseCase(FakeOps(rows=rows)).run()
+        self.assertIn("worktree_unresolved", outcome.lanes[0].stale_hints)
+        self.assertIsNone(outcome.lanes[0].branch)
+
+    def test_integration_branch_probe_is_opt_in(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1",
+                 lane_label="issue_1_a", repo_root_stamp="/wt/a"),
+        ]
+        ops = FakeOps(rows=rows, branches={"/wt/a": "issue_1_a"},
+                      integrated={("issue_1_a", "main"): True})
+        # Omitted -> never probed, never hinted.
+        outcome = SublaneListUseCase(ops).run()
+        self.assertEqual(ops.integrated_calls, [])
+        self.assertNotIn("branch_integrated:main", outcome.lanes[0].stale_hints)
+        # Named -> probed through the port and hinted with the branch name.
+        outcome = SublaneListUseCase(ops).run(integration_branch="main")
+        self.assertIn(("issue_1_a", "main"), ops.integrated_calls)
+        self.assertIn("branch_integrated:main", outcome.lanes[0].stale_hints)
+
+    def test_unknown_ancestry_answer_never_fabricates_hint(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1",
+                 lane_label="issue_1_a", repo_root_stamp="/wt/a"),
+        ]
+        ops = FakeOps(rows=rows, branches={"/wt/a": "issue_1_a"},
+                      integrated={})  # probe answers None (unknown)
+        outcome = SublaneListUseCase(ops).run(integration_branch="main")
+        self.assertFalse(
+            [h for h in outcome.lanes[0].stale_hints
+             if h.startswith("branch_integrated")]
+        )
+
+    def test_host_window_projected_from_pane_locations(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1", lane_label="issue_1_a",
+                 location="cockpit:3.1", window_name="mozyo_bridge"),
+            _row(id="%2", agent_role="claude", lane_id="l1", lane_label="issue_1_a",
+                 location="cockpit:3.2", window_name="mozyo_bridge"),
+        ]
+        outcome = SublaneListUseCase(FakeOps(rows=rows)).run()
+        lane = outcome.lanes[0]
+        self.assertEqual(lane.host_window, "cockpit:3")
+        self.assertEqual(lane.host_window_name, "mozyo_bridge")
+        payload = outcome.as_payload()["sublanes"][0]
+        self.assertEqual(payload["host_window"], "cockpit:3")
+        self.assertEqual(payload["stale_hints"], [])
 
 
 def _req(**kw):

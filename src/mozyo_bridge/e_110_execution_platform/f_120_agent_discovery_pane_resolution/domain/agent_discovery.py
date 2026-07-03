@@ -308,7 +308,14 @@ def resolve_agent_role(
     )
 
 
-def _parse_location(location: str) -> tuple[str, str, str]:
+def parse_location(location: str) -> tuple[str, str, str]:
+    """Split a ``session:window_index.pane_index`` pane location (pure).
+
+    The single location vocabulary every pane-inventory consumer shares: the
+    ``agents list`` / ``agents targets`` discovery records parse window identity
+    here, and the sublane inventory projection (#13086) imports this same helper
+    so the two surfaces can never disagree on what window a pane lives in.
+    """
     session, _, rest = location.partition(":")
     window_index, _, pane_index = rest.partition(".")
     return session, window_index, pane_index
@@ -338,7 +345,7 @@ def discover_agents(panes: Iterable[dict[str, str]] | None = None) -> list[Agent
     parsed: list[tuple[dict[str, str], str, str, str]] = []
     for pane in raw:
         location = pane.get("location") or ""
-        session, window_index, pane_index = _parse_location(location)
+        session, window_index, pane_index = parse_location(location)
         window_name = pane.get("window_name") or ""
         if window_name:
             window_indexes.setdefault((session, window_name), set()).add(window_index)
