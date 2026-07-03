@@ -47,7 +47,7 @@ Redmine #13148。distributed / repo-local 軸 (上記) と public / private 軸 
 ### always 規則の配置規約
 
 - **正本は常に配布 body / preset 側**。router の digest は **生成物** であり正本ではない。手書きで router に規則本文を複製しない (複製は drift 源になる)。
-- always 規則の router 到達は scaffold 生成で担保する。正本は canonical source `src/mozyo_bridge/scaffold/canonical_sources/router/bodies/always_digest.md` に「1 行 digest + `正本 path + 節名` pointer」で列挙し、`mozyo-bridge scaffold canonical` で router template へ render、`scaffold canonical --check` で正本との drift を落とす (catalog → `file_conventions.generated.yaml` の生成 + `--check` 前例に倣う)。
+- always 規則の router 到達は scaffold 生成で担保する。**digest の源は正本規則側の activation tag** — skill body / preset の該当節直下に不可視の HTML comment tag (`<!-- mozyo-bridge:activation:always id=<id> digest="<1 行 digest>" -->`) を置き、その `digest` 値が router に載る文言の正本である。canonical source `src/mozyo_bridge/scaffold/canonical_sources/router/bodies/always_digest.md` は tag の宣言 digest を集めた **render 用の中間物** であり、正本ではない。derivation test が「source tag の digest 集合 == fragment の entry 集合」を pin するため、規則の意味を変えた author は tag を更新し、それが test red → fragment 更新 → `mozyo-bridge scaffold canonical` の router render 変化 → `scaffold canonical --check` / router drift 検出、という連鎖を成す (catalog → `file_conventions.generated.yaml` の生成 + `--check` 前例に倣う)。tag の grammar は 1 箇所 (derivation test) に定義する。
 - digest の 1 行は規則そのものではなく **pointer**。本文・例外・境界は pointer 先の正本を読む。digest の文言は実在する正本の節名に合わせる (節が消えたら digest も更新する)。
 
 ### 行数上限

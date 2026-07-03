@@ -24,6 +24,29 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.cli import build_parser
 
+# Redmine #13148 REV2: single definition of the activation-tag grammar,
+# shared by the derivation tests below. Source-of-truth rules (skill body
+# / governed preset) carry an invisible HTML-comment tag that embeds the
+# exact digest line the router must show for that always rule. The digest
+# fragment (`always_digest.md`) is the render-time intermediate; this
+# grammar lets the test prove the fragment is *derived* from the tags,
+# not hand-written in parallel. `digest` runs up to the closing `"`; the
+# rule text must therefore never contain a literal double quote.
+ACTIVATION_TAG_RE = re.compile(
+    r"<!-- mozyo-bridge:activation:(?P<activation>\w+) "
+    r"id=(?P<id>[\w-]+) "
+    r'digest="(?P<digest>[^"]*)" -->'
+)
+
+
+def parse_activation_tags(text: str) -> dict[str, tuple[str, str]]:
+    """Return {id: (activation, digest)} for every activation tag in *text*."""
+    tags: dict[str, tuple[str, str]] = {}
+    for match in ACTIVATION_TAG_RE.finditer(text):
+        tags[match.group("id")] = (match.group("activation"), match.group("digest"))
+    return tags
+
+
 class DocsAuditImpactDirtyFileTest(unittest.TestCase):
     """Pin docs audit-impact + --check-generated behavior on unrelated dirty files.
 
@@ -587,6 +610,80 @@ class AlwaysRuleDigestTest(unittest.TestCase):
         self.assertIn("always", boundary)
         self.assertIn("per-task", boundary)
         self.assertIn("exceptional", boundary)
+
+    # --- Redmine #13148 REV2: derivation from source-of-truth tags. ---
+    #
+    # The heading-existence pin above cannot catch a rule whose *meaning*
+    # changed while its heading stayed. The tags below live directly on the
+    # source rules (skill body + governed preset) and embed the exact
+    # digest line; the derivation tests prove the fragment is built from
+    # those tags. A rule author who rewords a rule updates its tag, which
+    # fails these tests until the fragment (and thus the canonical render /
+    # router drift check) is updated to match — closing the chain.
+
+    SKILL_BODY_RELATIVE = Path("skills/mozyo-bridge-agent/references/workflow.md")
+    GOVERNED_PRESET_RELATIVE = Path(
+        "src/mozyo_bridge/scaffold/presets/redmine-governed/agent-workflow.md"
+    )
+    EXPECTED_TAG_IDS = frozenset(
+        {
+            "narrative-issue-labeling",
+            "response-language",
+            "no-sycophancy-evidence-provenance",
+        }
+    )
+
+    def _source_activation_tags(self) -> dict[str, tuple[str, str]]:
+        tags: dict[str, tuple[str, str]] = {}
+        for relative in (self.SKILL_BODY_RELATIVE, self.GOVERNED_PRESET_RELATIVE):
+            body = (ROOT / relative).read_text(encoding="utf-8")
+            for tag_id, value in parse_activation_tags(body).items():
+                self.assertNotIn(
+                    tag_id,
+                    tags,
+                    f"duplicate activation id {tag_id!r} across source rules; "
+                    "each always rule must have exactly one source tag.",
+                )
+                tags[tag_id] = value
+        return tags
+
+    def _digest_texts(self, router_name: str) -> list[str]:
+        # Digest entries with the leading "- " list marker stripped, so
+        # they compare directly against the tag `digest` field.
+        return [entry[2:] for entry in self._digest_entries(router_name)]
+
+    def test_source_rules_carry_expected_activation_tags(self) -> None:
+        tags = self._source_activation_tags()
+        self.assertEqual(
+            set(tags),
+            set(self.EXPECTED_TAG_IDS),
+            "source activation tag ids drifted from the expected always set; "
+            "add/remove the tag on the source rule and update EXPECTED_TAG_IDS.",
+        )
+        for tag_id, (activation, _digest) in tags.items():
+            self.assertEqual(
+                activation,
+                "always",
+                f"tag {tag_id!r} is not activation=always; only always rules "
+                "belong in the router digest.",
+            )
+
+    def test_digest_fragment_derives_from_source_tags(self) -> None:
+        # The core derivation contract: the digest lines rendered into the
+        # routers must be exactly the set of `digest` values declared by the
+        # source-rule tags — same texts, same count. A reworded rule (tag
+        # updated) or a hand-edited fragment breaks this immediately.
+        tag_digests = sorted(
+            digest for (_activation, digest) in self._source_activation_tags().values()
+        )
+        for router_name in ("AGENTS.md", "CLAUDE.md"):
+            self.assertEqual(
+                sorted(self._digest_texts(router_name)),
+                tag_digests,
+                f"{router_name} always-digest is not derived from the source "
+                "activation tags; update always_digest.md to match the tags "
+                "(or the tags to match a genuine rule change).",
+            )
 
 
 class GovernedWorkflowCanonicalTest(unittest.TestCase):
