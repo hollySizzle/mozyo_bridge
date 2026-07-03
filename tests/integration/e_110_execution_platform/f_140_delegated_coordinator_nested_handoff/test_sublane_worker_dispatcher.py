@@ -17,14 +17,19 @@ seam **without any real tmux / handoff side effect**:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher import (  # noqa: E501
+    LiveWorkerDispatchOps,
     WorkerDispatchOps,
     WorkerDispatchUseCase,
     cmd_sublane_dispatch_worker,
@@ -159,6 +164,34 @@ class ExecuteTests(unittest.TestCase):
         self.assertFalse(outcome.worker_dispatch_confirmed)
         self.assertIn("boom", outcome.reason)
 
+    def test_system_exit_from_send_is_delivery_failed_not_a_process_exit(self):
+        # Review j#71597 finding 1: the composed handoff CLI fails closed via
+        # `die()` == SystemExit, which `except Exception` never catches. A port
+        # that leaks it must still yield the fail-closed `delivery_failed`
+        # outcome — never escape the use case and skip the durable record.
+        ops = FakeWorkerDispatchOps(lane=_lane(), dispatch_error=SystemExit(2))
+        outcome = WorkerDispatchUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(outcome.dispatch_result, WORKER_DISPATCH_DELIVERY_FAILED)
+        self.assertFalse(outcome.worker_dispatch_confirmed)
+        self.assertIn(REASON_WORKER_DISPATCH_FAILED, outcome.blocked_reasons)
+        self.assertIn("SystemExit(2)", outcome.reason)
+        self.assertIn("gateway_notified", outcome.reason)
+
+    def test_system_exit_zero_never_promotes(self):
+        # An ambiguous exit (SystemExit with code 0 / None) is not a measured
+        # delivery ACK; it must stay fail-closed, never `worker_dispatched`.
+        for code in (0, None):
+            ops = FakeWorkerDispatchOps(
+                lane=_lane(), dispatch_error=SystemExit(code)
+            )
+            outcome = WorkerDispatchUseCase(ops).run(_req(), execute=True)
+            self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+            self.assertEqual(
+                outcome.dispatch_result, WORKER_DISPATCH_DELIVERY_FAILED
+            )
+            self.assertFalse(outcome.worker_dispatch_confirmed)
+
 
 class FailClosedTests(unittest.TestCase):
     def test_missing_identity_blocks_before_any_probe(self):
@@ -215,6 +248,81 @@ class FailClosedTests(unittest.TestCase):
         self.assertIn(REASON_LANE_PANE_MISSING, outcome.blocked_reasons)
         self.assertIn("gateway", outcome.reason)
         self.assertNotIn("dispatch", ops._names())
+
+
+class LiveOpsInnerCliContainmentTests(unittest.TestCase):
+    """The live adapter contains the inner CLI's SystemExit + stdout (j#71597).
+
+    The inner `handoff send` fails closed through `die()` == SystemExit and
+    prints its own delivery record to stdout. The adapter must convert the
+    exit to a plain rc (so the use case's fail-closed conversion always runs)
+    and keep the outer stdout clean (so `--execute --json` stays
+    machine-readable), surfacing the captured inner record on stderr only
+    when the send failed.
+    """
+
+    def _dispatch(self, fake_func):
+        ops = LiveWorkerDispatchOps(repo_root=Path("/wt/12988"))
+
+        class FakeParser:
+            def parse_args(self, argv):
+                return Namespace(func=fake_func)
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch(
+            "mozyo_bridge.application.cli.build_parser",
+            return_value=FakeParser(),
+        ), patch(
+            "mozyo_bridge.application.cli.normalize_paths",
+            side_effect=lambda a: a,
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = ops.dispatch_to_worker(
+                issue="12988",
+                journal="71579",
+                worker_pane="%177",
+                lane_label="issue_12988_x",
+                gateway_callback_target="%176",
+                target_repo="auto",
+            )
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_die_style_system_exit_becomes_rc_and_stdout_stays_clean(self):
+        def fake_func(args):
+            print("inner delivery record body")
+            raise SystemExit(2)
+
+        rc, out, err = self._dispatch(fake_func)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("inner delivery record body", out)
+        self.assertIn("inner delivery record body", err)
+
+    def test_ambiguous_system_exit_is_a_failure_rc(self):
+        for code in (0, None):
+            rc, out, _err = self._dispatch(
+                lambda args, code=code: (_ for _ in ()).throw(SystemExit(code))
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(out, "")
+
+    def test_successful_send_keeps_stdout_clean_and_stderr_quiet(self):
+        def fake_func(args):
+            print("inner delivery record body")
+            return 0
+
+        rc, out, err = self._dispatch(fake_func)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("inner delivery record body", out)
+        self.assertEqual(err, "")
+
+    def test_nonzero_return_surfaces_inner_record_on_stderr(self):
+        def fake_func(args):
+            print("inner delivery record body")
+            return 1
+
+        rc, out, err = self._dispatch(fake_func)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("inner delivery record body", out)
+        self.assertIn("inner delivery record body", err)
 
 
 class RenderAndCliTests(unittest.TestCase):

@@ -42,7 +42,10 @@ is the opt-in live drive, exactly like the actuator surface.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
@@ -147,9 +150,36 @@ class LiveWorkerDispatchOps:
         )
         from mozyo_bridge.application.cli import build_parser, normalize_paths
 
-        args = build_parser().parse_args(argv)
-        args = normalize_paths(args)
-        return int(args.func(args))
+        # Review j#71597: the inner `handoff send` fails closed through
+        # `die()` == `raise SystemExit`, which `except Exception` never
+        # catches, and it emits its own delivery record to stdout. Both must
+        # be contained here so the outer WorkerDispatchOutcome stays the
+        # single fail-closed, machine-readable surface: run the composed
+        # primitive under stdout capture and convert any SystemExit
+        # (including an argparse usage error) to its exit code. The captured
+        # inner record is surfaced to stderr on failure so the blocked send
+        # stays diagnosable without polluting the outer `--json` stdout.
+        inner_out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(inner_out):
+                args = build_parser().parse_args(argv)
+                args = normalize_paths(args)
+                rc = int(args.func(args) or 0)
+        except SystemExit as exc:
+            # A SystemExit is always the *fail-closed* leg here (`die()` /
+            # argparse usage error); the success leg returns an int. A
+            # non-int / None exit code is never treated as a delivery ACK —
+            # an ambiguous exit must not promote to `worker_dispatched`.
+            code = exc.code
+            rc = code if isinstance(code, int) and code != 0 else 1
+        if rc != 0:
+            captured = inner_out.getvalue().strip()
+            if captured:
+                print(
+                    "worker handoff send (inner delivery record):\n" + captured,
+                    file=sys.stderr,
+                )
+        return rc
 
 
 def _worker_dispatch_argv(
@@ -361,6 +391,15 @@ class WorkerDispatchUseCase:
                 gateway_callback_target=lane.gateway_pane,
                 target_repo=target_repo,
             )
+        except SystemExit as exc:
+            # Review j#71597: the composed handoff CLI fails closed through
+            # `die()` == SystemExit, which `except Exception` never catches.
+            # A port implementation that leaks it must still become a
+            # `delivery_failed` outcome, never a process exit that skips the
+            # durable fail-closed record.
+            code = exc.code
+            rc = code if isinstance(code, int) and code != 0 else 1
+            detail = f"worker handoff send exited: SystemExit({exc.code})"
         except Exception as exc:  # noqa: BLE001 — fail-closed on any send failure.
             rc = 1
             detail = f"worker handoff send raised: {exc}"
