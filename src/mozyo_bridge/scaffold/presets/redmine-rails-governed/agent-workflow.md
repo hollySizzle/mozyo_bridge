@@ -711,8 +711,11 @@ target repo 内で次の verification を `Implementation Done` または `Revie
 - `mozyo-bridge docs validate --check-file-coverage`
 - `mozyo-bridge docs generate-file-conventions --check` (project が file_conventions 生成物を採用している場合)
 - `mozyo-bridge docs audit-impact --all-changed --check-generated`
+- `mozyo-bridge tests resolve` (module-to-test impact resolver) で変更 path から focused tests を解決し、commit 前に実行する (例: `mozyo-bridge tests resolve --staged --format targets | xargs python -m unittest`)。
 - project の authoritative Rails test command (例: `bundle exec rspec`, `bundle exec rails test`, project が定める subset)。test 用 DB 環境変数は project-local layer の手順に従う。
 - rubocop / brakeman 等の静的検査は project ルールに従う。
+
+impact resolver の推奨が fail-closed に `full` の場合は、full suite を実行するか、この commit では実行しない明示 carve-out (理由 + full をいつ実行するか。例: push 前 / CI full lane) を Redmine journal に記録する。無言の skip は verification record にならない。resolver が repo の source layout を解決できない project では推奨は常に `full` になるため、上記 authoritative test command の実行がそのまま要件になる。
 
 `looks fine` は verification record ではない。command が走らなかった理由と、代替確認の内容を Redmine に残す。
 
