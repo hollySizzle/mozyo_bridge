@@ -73,11 +73,15 @@ class FakeActuatorOps:
         lanes=None,
         dispatch_rc=0,
         dispatch_error=None,
+        append_argv=None,
     ):
         self._git = git
         self._we = worktree_exists
         self._create_error = create_error
         self._append_error = append_error
+        # #13155: scripted `cockpit append` argv the resolver would return; None ->
+        # the historical argv for the worktree (no configured launch model).
+        self._append_argv = append_argv
         # Consumed one per read_lane call (front to back); exhausted -> None.
         self._lane_seq = list(lanes) if lanes is not None else []
         self._dispatch_rc = dispatch_rc
@@ -101,6 +105,11 @@ class FakeActuatorOps:
         self.calls.append(("append_lane_column", worktree_path))
         if self._append_error is not None:
             raise self._append_error
+
+    def append_lane_argv(self, worktree_path):
+        if self._append_argv is not None:
+            return list(self._append_argv)
+        return ["cockpit", "append", "--repo", worktree_path, "--no-attach"]
 
     def read_lane(self, worktree_path):
         self.calls.append(("read_lane", worktree_path))
@@ -155,6 +164,34 @@ class DryRunTests(unittest.TestCase):
             _req(journal=None), execute=False
         )
         self.assertEqual(outcome.status, ACTUATE_READY)
+
+    def _append_step_command(self, ops):
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=False)
+        step = next(s for s in outcome.steps if s.title == "append lane column")
+        return step.command
+
+    def test_dry_run_preview_reflects_configured_model(self):
+        # #13155 REV2: the append-step preview must show the configured launch
+        # model so an operator confirms the worker will stand up on it BEFORE run.
+        ops = FakeActuatorOps(
+            git=True,
+            append_argv=[
+                "cockpit", "append", "--repo", "/wt/12973", "--no-attach",
+                "--claude-model", "claude-opus-4-8",
+            ],
+        )
+        self.assertEqual(
+            self._append_step_command(ops),
+            "mozyo-bridge cockpit append --repo /wt/12973 --no-attach "
+            "--claude-model claude-opus-4-8",
+        )
+
+    def test_dry_run_preview_without_model_is_historical(self):
+        command = self._append_step_command(FakeActuatorOps(git=True))
+        self.assertEqual(
+            command, "mozyo-bridge cockpit append --repo /wt/12973 --no-attach"
+        )
+        self.assertNotIn("--claude-model", command)
 
 
 class MissingIdentityTests(unittest.TestCase):
@@ -476,6 +513,44 @@ class LiveAppendLaneArgvTest(unittest.TestCase):
                 "--claude-model", "claude-opus-4-8",
             ],
         )
+
+    def test_live_drive_and_preview_share_one_resolver(self):
+        # #13155 REV2 (c): the live drive (`append_lane_column`) and the dry-run
+        # preview source (`append_lane_argv`) resolve the SAME argv from the SAME
+        # resolver, so what the operator previews is byte-for-byte what runs.
+        import tempfile
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
+            LiveSublaneActuatorOps,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_append_argv import (  # noqa: E501
+            resolve_append_lane_argv,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            wt = Path(d)
+            (wt / ".mozyo-bridge").mkdir()
+            (wt / ".mozyo-bridge" / "config.yaml").write_text(
+                "agent_launch:\n  sublane_claude_model: claude-opus-4-8\n",
+                encoding="utf-8",
+            )
+            wt_s = str(wt)
+            expected = resolve_append_lane_argv(wt_s)
+            self.assertIn("--claude-model", expected)
+            ops = LiveSublaneActuatorOps(repo_root=wt)
+            # Preview source: what `_dry_run` renders its command string from.
+            self.assertEqual(ops.append_lane_argv(wt_s), expected)
+            # Live drive: what `append_lane_column` actually drives.
+            captured = {}
+
+            def _capture(argv):
+                captured["argv"] = argv
+                return 0
+
+            with patch.object(LiveSublaneActuatorOps, "_drive_cli", side_effect=_capture):
+                ops.append_lane_column(wt_s)
+            self.assertEqual(captured["argv"], expected)
 
 
 if __name__ == "__main__":

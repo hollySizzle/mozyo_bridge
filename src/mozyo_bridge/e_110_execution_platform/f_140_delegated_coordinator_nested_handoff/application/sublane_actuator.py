@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_append_argv import resolve_append_lane_argv  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
@@ -128,6 +129,8 @@ class SublaneActuatorOps(Protocol):
 
     def append_lane_column(self, worktree_path: str) -> None: ...
 
+    def append_lane_argv(self, worktree_path: str) -> list[str]: ...
+
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
 
     def dispatch_implementation_request(
@@ -184,15 +187,12 @@ class LiveSublaneActuatorOps:
         args = normalize_paths(args)
         return int(args.func(args))
 
-    def append_lane_column(self, worktree_path: str) -> None:
-        # #13155: append the repo-configured Claude launch model when set (else historical argv).
-        from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+    def append_lane_argv(self, worktree_path: str) -> list[str]:
+        # #13155: one resolver shared by the live drive below and the dry-run preview.
+        return resolve_append_lane_argv(worktree_path)
 
-        argv = ["cockpit", "append", "--repo", worktree_path, "--no-attach"]
-        model = load_repo_local_config(worktree_path).agent_launch.sublane_claude_model
-        if model:
-            argv += ["--claude-model", model]
-        rc = self._drive_cli(argv)
+    def append_lane_column(self, worktree_path: str) -> None:
+        rc = self._drive_cli(self.append_lane_argv(worktree_path))
         if rc != 0:
             raise RuntimeError(
                 f"cockpit append failed for worktree {worktree_path!r} (exit {rc})"
@@ -465,8 +465,8 @@ class SublaneActuateUseCase:
                 status=STEP_READY,
                 detail="append (or adopt) a cockpit-visible gateway + worker column and "
                 "bind the lane / role / workspace / repo-root stamps",
-                command=f"mozyo-bridge cockpit append --repo {request.worktree_path} "
-                "--no-attach",
+                # #13155: render the SAME argv the live append drives (incl. --claude-model).
+                command="mozyo-bridge " + " ".join(self.ops.append_lane_argv(request.worktree_path)),  # noqa: E501
             ),
             ActuationStep(
                 order=3,
