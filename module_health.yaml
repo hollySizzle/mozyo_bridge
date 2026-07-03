@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3282
+    lines: 3262
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -889,6 +889,20 @@ allowlist:
       post-merge ``commands.py`` line count is 3383.
       Integration after #13122 reconciled the cumulative #13122 + #13120
       facade removals to a post-merge ``commands.py`` line count of 3282.
+      Lowered 3477 -> 3457 for the #13121 pane primitive facade cleanup: the
+      ``cmd_id`` / ``cmd_resolve`` / ``cmd_read`` / ``cmd_type`` /
+      ``cmd_message`` / ``cmd_keys`` thin adapter bodies and their
+      ``_emit_pane_primitive_outcome`` print helper moved into
+      ``pane_primitive_command.py`` next to the ``PanePrimitiveUseCase`` they
+      compose (the #12932 carve); ``commands.py`` re-exports the seven names so
+      the parser bindings (``func.__name__``) and the ``commands.cmd_read`` /
+      ``.cmd_message`` / ``.cmd_keys`` monkeypatch seams are unchanged, and
+      ``LivePanePrimitiveOps`` keeps resolving every primitive through
+      ``commands`` globals at call time. 3477 -> 3457 is a 20-line net removal
+      and the post-carve ``commands.py`` line count is 3457.
+      Integration after #13120 reconciled the cumulative #13122 + #13120 +
+      #13121 facade removals to a post-merge ``commands.py`` line count of
+      3262.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
