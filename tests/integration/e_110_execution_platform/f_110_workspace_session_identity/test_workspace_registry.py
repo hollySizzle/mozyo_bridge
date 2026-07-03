@@ -51,6 +51,7 @@ from mozyo_bridge.workspace_registry import (
     REGISTRY_HEALTH_OK,
     REGISTRY_HEALTH_UNREADABLE,
     SOURCE_HOME_REGISTRY,
+    SOURCE_MAIN_WORKTREE_INHERITED,
     SOURCE_WORKSPACE_ANCHOR,
     inspect_registry_health,
     list_workspaces,
@@ -719,22 +720,27 @@ def _git(cwd: Path, *args: str) -> None:
     )
 
 
-class RegisterCanonicalMoveGuardTest(WorkspaceRegistryBase):
-    """Canonical-path move guard (Redmine #13152).
+def _init_git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "Test")
+    (path / "README").write_text("x\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "-m", "init")
 
-    Covers the three branches: a linked git worktree is refused outright; a
-    move off a still-live plain checkout needs ``--move``; a move off a dead
-    (removed) canonical_path is allowed.
+
+class RegisterCanonicalMoveGuardTest(WorkspaceRegistryBase):
+    """Worktree / canonical-path guard (Redmine #13152).
+
+    Covers: a linked worktree inherits the main identity as a no-op (never
+    hijacks canonical); an orphaned worktree fails closed; a move off a
+    still-live plain checkout needs ``--move``; a move off a dead (removed)
+    canonical_path is allowed.
     """
 
     def _init_git_repo(self, path: Path) -> None:
-        path.mkdir(parents=True, exist_ok=True)
-        _git(path, "init", "-q")
-        _git(path, "config", "user.email", "t@example.com")
-        _git(path, "config", "user.name", "Test")
-        (path / "README").write_text("x\n", encoding="utf-8")
-        _git(path, "add", "-A")
-        _git(path, "commit", "-q", "-m", "init")
+        _init_git_repo(path)
 
     def _copy_anchor(self, src: Path, dst: Path) -> None:
         """Duplicate ``src``'s anchor into ``dst`` — the tracked-anchor bug shape."""
@@ -742,23 +748,41 @@ class RegisterCanonicalMoveGuardTest(WorkspaceRegistryBase):
         dst_anchor.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src / ANCHOR_RELATIVE, dst_anchor)
 
-    def test_linked_worktree_register_is_refused(self) -> None:
+    def test_linked_worktree_register_inherits_main_identity(self) -> None:
         main = Path(self._tmp.name) / "gitmain"
         self._init_git_repo(main)
         first = register_workspace(main, home=self.home)
 
         worktree = Path(self._tmp.name) / "gitwt"
         _git(main, "worktree", "add", "-q", str(worktree))
-        # The bug's shape: the worktree carries a duplicated anchor (same id).
-        self._copy_anchor(main, worktree)
 
+        # No local anchor in the worktree (the untracked-anchor world): register
+        # is a no-op that inherits the main checkout's identity. Canonical stays
+        # at the main checkout and no worktree row is created — hijack impossible,
+        # yet `init` / `mozyo` inside the worktree still resolve an identity.
+        result = register_workspace(worktree, home=self.home)
+        self.assertEqual(result.record.workspace_id, first.record.workspace_id)
+        self.assertEqual(result.record.canonical_path, str(main.resolve()))
+        self.assertIn(
+            "identity inherited from main checkout", " ".join(result.notes)
+        )
+        self.assertEqual(len(list_workspaces(home=self.home)), 1)
+        self.assertEqual(
+            load_workspace_by_path(main, home=self.home).canonical_path,
+            str(main.resolve()),
+        )
+        self.assertIsNone(load_workspace_by_path(worktree, home=self.home))
+
+    def test_orphaned_worktree_register_fails_closed(self) -> None:
+        # A worktree whose main checkout was never registered has no identity to
+        # inherit -> fail closed rather than mint a worktree-owned identity.
+        main = Path(self._tmp.name) / "gitmain-unreg"
+        self._init_git_repo(main)
+        worktree = Path(self._tmp.name) / "gitwt-orphan"
+        _git(main, "worktree", "add", "-q", str(worktree))
         with self.assertRaises(SystemExit):
             register_workspace(worktree, home=self.home)
-        # Canonical path unmoved: still the main checkout.
-        row = load_workspace_by_path(main, home=self.home)
-        self.assertIsNotNone(row)
-        self.assertEqual(row.canonical_path, str(main.resolve()))
-        self.assertEqual(row.workspace_id, first.record.workspace_id)
+        self.assertEqual(len(list_workspaces(home=self.home)), 0)
 
     def test_live_canonical_move_needs_move_flag(self) -> None:
         register_workspace(self.repo, home=self.home)
@@ -821,6 +845,57 @@ class RegisterCanonicalMoveGuardTest(WorkspaceRegistryBase):
         self.assertEqual(result.record.workspace_id, first.record.workspace_id)
         self.assertEqual(result.record.canonical_path, str(relocated.resolve()))
         self.assertEqual(len(list_workspaces(home=self.home)), 1)
+
+
+class WorktreeIdentityInheritanceTest(WorkspaceRegistryBase):
+    """resolve_canonical_session worktree identity inheritance (Redmine #13152)."""
+
+    def test_unregistered_worktree_inherits_main_identity(self) -> None:
+        main = Path(self._tmp.name) / "wt-main"
+        _init_git_repo(main)
+        reg = register_workspace(main, home=self.home)
+        worktree = Path(self._tmp.name) / "wt-linked"
+        _git(main, "worktree", "add", "-q", str(worktree))
+
+        # The worktree has no local row / anchor -> inherit via git topology.
+        resolved = resolve_canonical_session(worktree, home=self.home)
+        self.assertEqual(resolved.workspace_id, reg.record.workspace_id)
+        self.assertEqual(resolved.name, reg.record.canonical_session)
+        self.assertEqual(resolved.source, SOURCE_MAIN_WORKTREE_INHERITED)
+
+    def test_non_git_unregistered_still_derives(self) -> None:
+        # A plain (non-git) unregistered dir keeps the pre-registry derivation
+        # fallback with workspace_id=None (inheritance never fires).
+        resolved = resolve_canonical_session(self.repo, home=self.home)
+        self.assertIsNone(resolved.workspace_id)
+        self.assertNotEqual(resolved.source, SOURCE_MAIN_WORKTREE_INHERITED)
+
+    def test_worktree_local_anchor_takes_precedence(self) -> None:
+        main = Path(self._tmp.name) / "wt-main2"
+        _init_git_repo(main)
+        register_workspace(main, home=self.home)
+        worktree = Path(self._tmp.name) / "wt-linked2"
+        _git(main, "worktree", "add", "-q", str(worktree))
+        # The worktree carries its OWN anchor (distinct id) -> anchor wins
+        # (backward compatibility), inheritance is not reached.
+        own = worktree / ANCHOR_RELATIVE
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "workspace_id": "d" * 32,
+                    "canonical_session": "mozyo-own-worktree",
+                    "project_name": "own",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        resolved = resolve_canonical_session(worktree, home=self.home)
+        self.assertEqual(resolved.workspace_id, "d" * 32)
+        self.assertEqual(resolved.source, SOURCE_WORKSPACE_ANCHOR)
 
 
 if __name__ == "__main__":

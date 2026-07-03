@@ -292,6 +292,15 @@ def _resolve_identity(
             project_name=name if isinstance(name, str) and name.strip() else None,
             source=SOURCE_WORKSPACE_ANCHOR,
         )
+    # NOTE (Redmine #13152): worktree identity inheritance is deliberately NOT
+    # applied on this inventory seam. It resolves each unregistered root through a
+    # git-topology probe would add a per-pane subprocess to the hot discovery path
+    # (`agents targets` passes ``derive_unregistered=False`` precisely to avoid
+    # touching workspace files — #12038). Inheritance lives on the *stamping* seam
+    # (`workspace_registry.resolve_canonical_session`, used by cockpit append /
+    # launch), so a worktree pane is stamped with the inherited workspace_id at
+    # creation and every downstream reader (targets, duplicate detection,
+    # coordinator resolution) uses that pane option, not this read-model.
     if not derive_unregistered:
         return WorkspaceIdentity(
             workspace_id=None,

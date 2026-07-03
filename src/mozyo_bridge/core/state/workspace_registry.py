@@ -77,6 +77,10 @@ SCAFFOLD_MANIFEST_RELATIVE = Path(".mozyo-bridge/scaffold.json")
 # layer produced the name.
 SOURCE_HOME_REGISTRY = "home-registry"
 SOURCE_WORKSPACE_ANCHOR = "workspace-anchor"
+# Identity resolved by inheriting a linked worktree's main checkout (#13152):
+# an unregistered sublane worktree with no local anchor shares the main
+# worktree's workspace_id / canonical session via git topology + the registry.
+SOURCE_MAIN_WORKTREE_INHERITED = "main-worktree-inherited"
 
 # Registration outcome markers.
 REGISTER_CREATED = "created"
@@ -506,11 +510,15 @@ def _checkout_git_dirs(repo_root: Path | str) -> tuple[str, str] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode != 0:
+    # Defensive: some callers (doctor / cockpit characterization tests) stub
+    # ``subprocess.run`` with a minimal object lacking ``stdout``; treat a
+    # missing / non-string result as "not a git checkout" rather than crashing.
+    if getattr(result, "returncode", 1) != 0:
         return None
-    lines = [
-        line.strip() for line in (result.stdout or "").splitlines() if line.strip()
-    ]
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if len(lines) != 2:
         return None
 
@@ -574,7 +582,84 @@ def probe_canonical_liveness(canonical_path: str | None) -> dict:
     return info
 
 
+def _main_worktree_root(repo_root: Path | str) -> Path | None:
+    """The main worktree root when ``repo_root`` is a *linked* worktree (#13152).
+
+    A linked worktree's ``git_common_dir`` is the source repo's ``.git`` — its
+    parent is the main worktree. Returns ``None`` for the main worktree itself, a
+    non-git path, or any probe failure (tolerant).
+    """
+    dirs = _checkout_git_dirs(repo_root)
+    if dirs is None:
+        return None
+    git_dir, common_dir = dirs
+    if git_dir == common_dir:
+        return None
+    try:
+        main_root = Path(common_dir).parent.resolve()
+    except OSError:
+        return None
+    try:
+        resolved = Path(repo_root).expanduser().resolve()
+    except OSError:
+        return None
+    if main_root == resolved:
+        return None
+    return main_root
+
+
 # --- registration -----------------------------------------------------------
+
+
+def _inherited_worktree_result(
+    resolved: Path, db_path: Path, *, home: Path | None
+) -> RegisterResult | None:
+    """No-op :class:`RegisterResult` inheriting the main worktree's identity (#13152).
+
+    Returns the main checkout's identity (workspace_id / canonical_session, with
+    canonical_path left at the main checkout) *without* writing the registry or
+    an anchor — a worktree must not own an identity's canonical_path. ``None``
+    when the worktree is orphaned (its main checkout has neither a registry row
+    nor an anchor to inherit).
+    """
+    main_root = _main_worktree_root(resolved)
+    if main_root is None:
+        return None
+    record = load_workspace_by_path(main_root, home=home)
+    if record is None:
+        anchor = read_anchor(main_root)
+        if anchor is None:
+            return None
+        # Registry row lost at the main checkout, but its anchor survives:
+        # inherit the anchored identity, canonical_path staying the main root.
+        project = anchor.get("project_name")
+        record = WorkspaceRecord(
+            workspace_id=anchor["workspace_id"],
+            canonical_path=str(main_root),
+            display_path=_display_path(main_root),
+            project_name=(
+                project
+                if isinstance(project, str) and project.strip()
+                else main_root.name
+            ),
+            canonical_session=anchor["canonical_session"],
+            preset=None,
+            preset_version=None,
+            created_at=anchor.get("created_at") or _utc_now(),
+            updated_at=anchor.get("updated_at") or _utc_now(),
+            last_seen=None,
+        )
+    note = (
+        f"linked worktree: identity inherited from main checkout {main_root}; "
+        "canonical not moved"
+    )
+    return RegisterResult(
+        record=record,
+        outcome=REGISTER_UPDATED,
+        registry_path=db_path,
+        anchor_path=anchor_path(main_root),
+        notes=(note,),
+    )
 
 
 def register_workspace(
@@ -600,17 +685,20 @@ def register_workspace(
     ``project_name`` overrides the readable name; default is the directory
     basename (which may be non-ASCII — readability beats slug purity here).
 
-    Canonical-path move guard (Redmine #13152): the upsert would set this
-    identity's ``canonical_path`` to ``repo_root``. When that would *move* an
-    existing identity's canonical_path the write is gated:
+    Worktree / canonical-path guard (Redmine #13152) — a checkout must never
+    hijack another checkout's canonical_path:
 
-    - from a **linked git worktree** the move (or seeding a pre-existing
-      identity) is refused outright — a worktree must never own an identity's
-      canonical_path, because that relocates the coordinator lane onto a sublane;
-    - from a normal checkout, if the currently-registered canonical_path is a
-      **live directory** the move is refused unless ``allow_move`` is set
-      (the ``workspace register --move`` flag), so a clone/copy cannot silently
-      steal the identity;
+    - from a **linked git worktree** registration never writes the worktree path
+      as canonical. It inherits the main worktree's identity (via git topology +
+      the registry) and returns it as a no-op (canonical stays at the main
+      checkout, note ``linked worktree: identity inherited ...``). This keeps
+      ``mozyo-bridge init`` / ``mozyo`` working inside a worktree. An orphaned
+      worktree — one whose main checkout has neither a registry row nor an anchor
+      — fails closed;
+    - from a normal checkout, if the write would *move* an existing identity's
+      canonical_path and the currently-registered path is a **live directory**,
+      the move is refused unless ``allow_move`` is set (the ``workspace register
+      --move`` flag), so a clone / copy cannot silently steal the identity;
     - if the currently-registered canonical_path **no longer exists** (a genuine
       relocation) the move proceeds as before, keeping the "workspace moved" note.
     """
@@ -635,6 +723,22 @@ def register_workspace(
             f"name is authoritative; remove the legacy "
             f"{ANCHOR_LEGACY_RELATIVE.as_posix()} after confirming the new "
             f"anchor is correct, then re-run `mozyo-bridge workspace register`."
+        )
+
+    # Linked git worktree inheritance (Redmine #13152). A worktree must never own
+    # an identity's canonical_path, so register never writes the worktree path as
+    # canonical. It inherits the main worktree's identity and returns it as a
+    # no-op (canonical stays at the main checkout) — this keeps `mozyo-bridge
+    # init` / `mozyo` working inside a worktree while making a hijack impossible.
+    # An orphaned worktree (no main-checkout identity to inherit) fails closed.
+    if _is_linked_worktree(resolved):
+        inherited = _inherited_worktree_result(resolved, db_path, home=home)
+        if inherited is not None:
+            return inherited
+        die(
+            f"cannot register linked git worktree {resolved}: its main checkout "
+            "has no registered identity to inherit. Run `mozyo-bridge workspace "
+            "register` from the main checkout first (Redmine #13152)."
         )
 
     anchor = read_anchor(resolved)
@@ -666,29 +770,15 @@ def register_workspace(
         existing_by_id = None
         outcome = REGISTER_CREATED
 
-    # Canonical-path move guard (Redmine #13152). See the docstring: gate any
-    # write that would relocate an existing identity's canonical_path so a linked
-    # worktree / clone cannot hijack the coordinator lane.
+    # Canonical-path move guard for non-worktree checkouts (Redmine #13152).
+    # Linked worktrees are handled earlier by inheritance and never reach here,
+    # so this only gates a clone / copy / relocation that would move an existing
+    # identity's canonical_path off a still-live checkout without confirmation.
     existing_canonical = (
         existing_by_id.canonical_path if existing_by_id is not None else None
     )
     would_move = existing_canonical is not None and existing_canonical != str(resolved)
-    if _is_linked_worktree(resolved):
-        if would_move:
-            die(
-                f"refusing to move workspace '{workspace_id}' canonical path onto "
-                f"a linked git worktree ({resolved}). Its canonical checkout is "
-                f"{existing_canonical}; run `mozyo-bridge workspace register` from "
-                "that main checkout instead (Redmine #13152)."
-            )
-        if existing_by_id is None and anchor is not None:
-            die(
-                f"refusing to seed workspace '{workspace_id}' from a linked git "
-                f"worktree ({resolved}); a worktree must not own an identity's "
-                "canonical path. Run `mozyo-bridge workspace register` from the "
-                "workspace's main checkout instead (Redmine #13152)."
-            )
-    elif would_move:
+    if would_move:
         try:
             existing_is_dir = Path(existing_canonical).is_dir()
         except OSError:
@@ -816,12 +906,15 @@ def resolve_canonical_session(
     home: Path | None = None,
     derive_unregistered: bool = True,
 ) -> ResolvedSession:
-    """Resolve the workspace's session name: registry → anchor → derivation.
+    """Resolve the session name: registry → anchor → worktree inheritance → derivation.
 
     Read-only by contract. A registered canonical session name always wins
-    over re-deriving from the path; path derivation is reached only for
-    never-registered workspaces (and is then byte-identical to the
-    pre-registry behavior of `derive_session_name`).
+    over re-deriving from the path. Before falling back to path derivation, an
+    unregistered *linked git worktree* inherits its main checkout's identity
+    (workspace_id + canonical session) so a sublane keeps the parent
+    workspace_id without a duplicated anchor (Redmine #13152). Path derivation is
+    reached only for never-registered, non-worktree workspaces (and is then
+    byte-identical to the pre-registry behavior of `derive_session_name`).
 
     ``derive_unregistered=False`` makes the never-registered branch degrade to
     the path-hash fallback (`derive_session_name_without_defaults`) instead of
@@ -853,6 +946,38 @@ def resolve_canonical_session(
             workspace_id=anchor["workspace_id"],
             identifier=None,
         )
+
+    # Linked worktree identity inheritance (Redmine #13152). A sublane worktree no
+    # longer carries a duplicated anchor (anchors are untracked), so an
+    # unregistered worktree with no local row / anchor inherits the *main*
+    # worktree's identity via git topology + the home registry instead of
+    # collapsing to a path-derived name with ``workspace_id=None`` (which would
+    # drop the shared workspace_id that workspace-scoped routing — `--target
+    # coordinator`, queue-enter admission, duplicate detection — depends on). A
+    # local registry row / anchor still wins above, so this is a pure additive
+    # fallback that keeps registered / anchored worktrees backward-compatible.
+    main_root = _main_worktree_root(resolved)
+    if main_root is not None:
+        main_record = load_workspace_by_path(main_root, home=home)
+        if main_record is not None and _is_safe_session_name(
+            main_record.canonical_session
+        ):
+            return ResolvedSession(
+                name=main_record.canonical_session,
+                source=SOURCE_MAIN_WORKTREE_INHERITED,
+                repo_root=resolved,
+                workspace_id=main_record.workspace_id,
+                identifier=None,
+            )
+        main_anchor = read_anchor(main_root)
+        if main_anchor is not None:
+            return ResolvedSession(
+                name=main_anchor["canonical_session"],
+                source=SOURCE_MAIN_WORKTREE_INHERITED,
+                repo_root=resolved,
+                workspace_id=main_anchor["workspace_id"],
+                identifier=None,
+            )
 
     derived = (
         derive_session_name(resolved)
