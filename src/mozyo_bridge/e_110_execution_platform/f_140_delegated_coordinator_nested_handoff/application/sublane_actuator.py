@@ -188,9 +188,7 @@ class LiveSublaneActuatorOps:
         return int(args.func(args))
 
     def append_lane_argv(self, worktree_path: str) -> list[str]:
-        # #13155: one resolver shared by the live drive below and the dry-run
-        # preview; the launch config comes from THIS repo (the planned worktree
-        # may not exist yet at preview time — j#71880).
+        # #13155: one resolver for live drive + preview; config from THIS repo (j#71880).
         return resolve_append_lane_argv(worktree_path, config_root=self.repo_root)
 
     def append_lane_column(self, worktree_path: str) -> None:
