@@ -888,15 +888,12 @@ def _rightmost_codex_anchor(codex_columns) -> str | None:
     deterministic even when geometry is missing (defaults to 0 → a stable
     pane-id ordering).
     """
-    if not codex_columns:
-        return None
+    from mozyo_bridge.application.cockpit_read_command import rightmost_codex_anchor
 
-    def _key(col):
-        left = col.get("pane_left") or 0
-        width = col.get("pane_width") or 0
-        return (left, left + width, col.get("pane_id") or "")
-
-    return max(codex_columns, key=_key).get("pane_id")
+    # Thin wrapper over the pure #13106 boundary pick; the append / adopt /
+    # dispatcher live adapters keep routing ``commands._rightmost_codex_anchor``
+    # at call time, so their monkeypatch seam is unchanged.
+    return rightmost_codex_anchor(codex_columns)
 
 
 def _cockpit_session_present(session: str) -> bool:
@@ -907,10 +904,15 @@ def _cockpit_session_present(session: str) -> bool:
     cleanup never kills) a pre-existing session. Tolerant: any tmux error
     degrades to ``False``.
     """
-    try:
-        return bool(session_exists(session))
-    except (Exception, SystemExit):
-        return False
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
+    )
+
+    # Thin wrapper over the #13106 session-helper reads on the cockpit read
+    # boundary; the live adapter resolves ``commands.session_exists`` at call
+    # time, so the tests patching that name still intercept.
+    return CockpitReadUseCase(LiveCockpitReadOps()).session_present(session)
 
 
 def _session_attached_clients_result(session: str) -> tuple[tuple[str, ...], bool]:
@@ -924,22 +926,15 @@ def _session_attached_clients_result(session: str) -> tuple[tuple[str, ...], boo
     no client" shape, which is safe there because a failed read on a source
     session that may not even exist means there is no live client to protect.
     """
-    if not session:
-        return (), True
-    try:
-        result = run_tmux(
-            "list-clients", "-t", session, "-F", "#{client_tty}", check=False
-        )
-    except (Exception, SystemExit):
-        return (), False
-    if getattr(result, "returncode", 1) != 0:
-        return (), False
-    clients = tuple(
-        line.strip()
-        for line in (getattr(result, "stdout", "") or "").splitlines()
-        if line.strip()
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
     )
-    return clients, True
+
+    # Thin wrapper over the #13106 session-helper reads on the cockpit read
+    # boundary; the live adapter resolves ``commands.run_tmux`` at call time,
+    # so the tests patching that name still feed this read.
+    return CockpitReadUseCase(LiveCockpitReadOps()).attached_clients_result(session)
 
 
 def _session_attached_clients(session: str) -> tuple[str, ...]:
@@ -965,36 +960,17 @@ def _source_session_cleanup_note(source_session: str) -> str:
     state — gone (tmux closed it) or still alive with N remaining pane(s), left
     intact — so the operator sees exactly what happened. Tolerant / read-only.
     """
-    try:
-        present = bool(session_exists(source_session))
-    except (Exception, SystemExit):
-        present = False
-    if not present:
-        return (
-            f"source session {source_session!r} is now empty and was closed by "
-            f"tmux (both agent panes moved out); not killed explicitly."
-        )
-    remaining = "?"
-    try:
-        result = run_tmux(
-            "list-panes", "-s", "-t", source_session, "-F", "#{pane_id}",
-            check=False,
-        )
-        if getattr(result, "returncode", 1) == 0:
-            remaining = str(
-                len(
-                    [
-                        ln
-                        for ln in (getattr(result, "stdout", "") or "").splitlines()
-                        if ln.strip()
-                    ]
-                )
-            )
-    except (Exception, SystemExit):
-        pass
-    return (
-        f"source session {source_session!r} still has {remaining} pane(s) and was "
-        f"left intact (not killed)."
+    from mozyo_bridge.application.cockpit_read_command import (
+        CockpitReadUseCase,
+        LiveCockpitReadOps,
+    )
+
+    # Thin wrapper over the #13106 session-helper reads on the cockpit read
+    # boundary; the live adapter resolves ``commands.session_exists`` /
+    # ``commands.run_tmux`` at call time, so the adopt tests patching those
+    # names still drive both the presence probe and the pane count.
+    return CockpitReadUseCase(LiveCockpitReadOps()).source_session_cleanup_note(
+        source_session
     )
 
 

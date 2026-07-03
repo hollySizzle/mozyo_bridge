@@ -34,9 +34,26 @@ This module carves that into an OOP-first boundary under #12638:
   ``_read_cockpit_geometry`` wrappers in :mod:`commands` build the live ops and
   run the use case.
 
+The #13106 tranche extends the same boundary with the residual cockpit
+session-helper reads that still lived procedurally in :mod:`commands`:
+
+- ``_rightmost_codex_anchor`` — the pure geometry pick of the visually rightmost
+  codex column (#11849 tie-break), now :func:`rightmost_codex_anchor`.
+- ``_cockpit_session_present`` — the tolerant ``has-session`` read (#11803),
+  now :meth:`CockpitReadUseCase.session_present` over the port's
+  ``session_exists``.
+- ``_session_attached_clients_result`` — the ``list-clients`` read that
+  distinguishes "no client" from "could not read" (#11814 review j#57928), now
+  :meth:`CockpitReadUseCase.attached_clients_result`.
+- ``_source_session_cleanup_note`` — the explicit never-implicit-kill
+  post-adopt source-session report (#11898), now
+  :meth:`CockpitReadUseCase.source_session_cleanup_note` composing the pure
+  :func:`source_session_cleanup_note_text` wording.
+
 Behavior-preserving: the read tolerance (a missing tmux binary / server or a
 missing window degrades to ``None`` / ``[]`` rather than raising), the parsed
-dict shapes, and the ``cockpit list`` / ``cockpit status`` / ``cockpit
+dict shapes, the attached-client known/unknown distinction, the cleanup-note
+wording, and the ``cockpit list`` / ``cockpit status`` / ``cockpit
 doctor-geometry`` CLI output + exit conventions are unchanged from the original
 command bodies.
 """
@@ -187,6 +204,62 @@ def project_geometry(stdout: str) -> list[dict]:
     return panes
 
 
+def rightmost_codex_anchor(codex_columns) -> str | None:
+    """The codex pane id of the visually rightmost cockpit column (#11849, pure).
+
+    `tmux list-panes` enumeration order is NOT layout order, so anchoring an
+    append on the last-listed codex pane can split a middle column and crush the
+    layout. Pick by geometry instead: the largest ``pane_left``, tie-broken by
+    the right edge (``pane_left + pane_width``) then ``pane_id`` so it stays
+    deterministic even when geometry is missing (defaults to 0 → a stable
+    pane-id ordering).
+    """
+
+    if not codex_columns:
+        return None
+
+    def _key(col):
+        left = col.get("pane_left") or 0
+        width = col.get("pane_width") or 0
+        return (left, left + width, col.get("pane_id") or "")
+
+    return max(codex_columns, key=_key).get("pane_id")
+
+
+def project_nonempty_lines(stdout: str) -> tuple[str, ...]:
+    """The stripped non-empty lines of a single-field ``-F`` read.
+
+    Serves both the ``list-clients`` client-tty parse and the ``list-panes``
+    pane-id count of the session-helper reads.
+    """
+
+    return tuple(
+        line.strip() for line in (stdout or "").splitlines() if line.strip()
+    )
+
+
+def source_session_cleanup_note_text(
+    source_session: str, present: bool, remaining: str
+) -> str:
+    """The post-adopt source-session cleanup wording (#11898, pure).
+
+    Adopt never kills the source session explicitly; tmux closes a session whose
+    last pane is moved away. This states which of the two outcomes happened —
+    gone (closed by tmux) or still alive with ``remaining`` pane(s), left
+    intact — byte-for-byte as the original ``commands`` body reported it.
+    """
+
+    if not present:
+        return (
+            f"source session {source_session!r} is now empty and was closed by "
+            f"tmux (both agent panes moved out); not killed explicitly."
+        )
+    return (
+        f"source session {source_session!r} still has {remaining} pane(s) and was "
+        f"left intact (not killed)."
+    )
+
+
 # --- Port + live adapter over the ``commands`` seams. -------------------------
 
 
@@ -195,15 +268,18 @@ class CockpitReadOps(Protocol):
     """Port: the side effects the cockpit read use case needs from its environment.
 
     ``run_tmux`` is the read-only tmux query; ``read_columns`` is the per-window
-    column read the managed-window discovery composes over. The live adapter
-    routes both through the :mod:`commands` module so the monkeypatched
-    characterization tests still intercept, and so this module never imports
-    :mod:`commands` at module scope (no import cycle).
+    column read the managed-window discovery composes over; ``session_exists``
+    is the session-presence probe the session-helper reads need (#13106). The
+    live adapter routes all three through the :mod:`commands` module so the
+    monkeypatched characterization tests still intercept, and so this module
+    never imports :mod:`commands` at module scope (no import cycle).
     """
 
     def run_tmux(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def read_columns(self, session: str, window: str | None) -> list[dict] | None: ...
+
+    def session_exists(self, session: str) -> bool: ...
 
 
 class LiveCockpitReadOps:
@@ -228,6 +304,9 @@ class LiveCockpitReadOps:
 
     def read_columns(self, session: str, window: str | None) -> list[dict] | None:
         return self._commands()._read_cockpit_columns(session, window)
+
+    def session_exists(self, session: str) -> bool:
+        return self._commands().session_exists(session)
 
 
 # --- Use case: compose the port + projection into the caller-facing shapes. ---
@@ -296,3 +375,70 @@ class CockpitReadUseCase:
         if getattr(result, "returncode", 1) != 0:
             return None
         return project_geometry(getattr(result, "stdout", "") or "")
+
+    def session_present(self, session: str) -> bool:
+        """Tolerant `has-session` for the cockpit (#11803 review).
+
+        Distinguishes "session absent" from "session present but cockpit window
+        missing", so a real-run create never `new-session`s against (and the
+        cleanup never kills) a pre-existing session. Tolerant: any tmux error
+        degrades to ``False``.
+        """
+        try:
+            return bool(self._ops.session_exists(session))
+        except (Exception, SystemExit):
+            return False
+
+    def attached_clients_result(self, session: str) -> tuple[tuple[str, ...], bool]:
+        """``(clients, known)`` for ``session`` — "no client" vs "could not read".
+
+        ``known`` is ``False`` when the tmux ``list-clients`` read failed
+        (exception or non-zero exit), so a caller can fail closed on an
+        *unknown* client state instead of mistaking it for "no client attached".
+        The destructive cockpit reset/rebuild gate needs that distinction
+        (Redmine #11814 review j#57928); adopt's tolerant
+        ``commands._session_attached_clients`` keeps the old "any error -> no
+        client" shape over this read.
+        """
+        if not session:
+            return (), True
+        try:
+            result = self._ops.run_tmux(
+                "list-clients", "-t", session, "-F", "#{client_tty}", check=False
+            )
+        except (Exception, SystemExit):
+            return (), False
+        if getattr(result, "returncode", 1) != 0:
+            return (), False
+        return project_nonempty_lines(getattr(result, "stdout", "") or ""), True
+
+    def source_session_cleanup_note(self, source_session: str) -> str:
+        """Explicit (never-implicit-kill) report of the source session after adopt (#11898).
+
+        Adopt moves only the two agent panes; tmux destroys a window/session
+        whose last pane is moved away, so an emptied source session is cleaned
+        up *by tmux*, not by an explicit ``kill-session`` from this tool
+        (acceptance: cleanup must be explicit and logged, never an implicit
+        kill). Reports the resulting state via the pure
+        :func:`source_session_cleanup_note_text` wording. Tolerant / read-only:
+        an unreadable pane count degrades to ``"?"``.
+        """
+        present = self.session_present(source_session)
+        remaining = "?"
+        if present:
+            try:
+                result = self._ops.run_tmux(
+                    "list-panes", "-s", "-t", source_session, "-F", "#{pane_id}",
+                    check=False,
+                )
+                if getattr(result, "returncode", 1) == 0:
+                    remaining = str(
+                        len(
+                            project_nonempty_lines(
+                                getattr(result, "stdout", "") or ""
+                            )
+                        )
+                    )
+            except (Exception, SystemExit):
+                pass
+        return source_session_cleanup_note_text(source_session, present, remaining)
