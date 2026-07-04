@@ -48,6 +48,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
+    REASON_INVALID_PAYLOAD,
     REASON_INVALID_TARGET,
     REASON_TRANSPORT_ERROR,
     TerminalTransportConfig,
@@ -74,6 +75,13 @@ _HANDLE_KEYS = ("name", "agent", "target", "id", "handle")
 # The herdr JSON keys the ``agent list`` payload's row array may live under when
 # the payload is an object rather than a bare array.
 _LIST_KEYS = ("agents", "panes", "items")
+
+# An ``agent list`` payload may wrap the rows one level down under an envelope
+# key (e.g. ``{"result": {"agents": [...]}}``); these are the recognised envelope
+# keys scanned before giving up. A payload with none of :data:`_LIST_KEYS` at the
+# top level and no recognised envelope is treated as *unrecognisable* (fail
+# closed), distinct from a recognised-but-empty list.
+_LIST_ENVELOPE_KEYS = ("result", "data")
 
 
 class HerdrCliAgentStateReader:
@@ -133,11 +141,23 @@ class HerdrCliAgentStateReader:
     def list_agent_states(self) -> AgentStateListResult:
         """Snapshot all managed agents' runtime states via ``agent list``.
 
-        Returns an :class:`AgentStateListResult`. A mechanical failure fails
-        closed with a transport reason and no rows; a successful command yields
-        one ``(handle, runtime_state)`` pair per parseable row (a row with a
-        missing / unrecognised status maps to ``unknown`` rather than being
-        dropped). A row missing a usable handle is skipped.
+        Returns an :class:`AgentStateListResult`. Failure modes, all fail-closed:
+
+        - a mechanical failure (missing binary, spawn / OS error, timeout,
+          non-zero exit) fails closed with a transport reason and no rows;
+        - a command that ran but returned a payload that is **not a recognisable
+          list schema** (non-JSON, a scalar JSON value, or an object with no
+          recognised row container) fails closed with :data:`REASON_INVALID_PAYLOAD`
+          rather than reporting an empty *success* — an unreadable list is not
+          "no agents".
+
+        On a recognised payload the read succeeds and yields one
+        ``(handle, runtime_state)`` pair per usable row (a row with a missing /
+        unrecognised status maps to ``unknown`` rather than being dropped). A row
+        that is not an object, or whose handle is missing / not a well-formed
+        target (see :func:`valid_target`), is **skipped** — one malformed row does
+        not fail the whole read — and the number skipped is recorded in the
+        result ``detail`` so the loss stays observable.
         """
         completed = self._invoke(["agent", "list", "--json"])
         if isinstance(completed, AgentStateResult):
@@ -150,7 +170,16 @@ class HerdrCliAgentStateReader:
                 REASON_TRANSPORT_ERROR,
                 _bounded_detail(completed.stderr) or f"herdr exit {completed.returncode}",
             )
-        return AgentStateListResult.observed(_extract_list(completed.stdout))
+        rows = _extract_list_rows(completed.stdout)
+        if rows is None:
+            return AgentStateListResult.failure(
+                REASON_INVALID_PAYLOAD,
+                "herdr agent list payload was not a recognised JSON array or "
+                "agents object",
+            )
+        pairs, skipped = _rows_to_state_pairs(rows)
+        detail = f"skipped {skipped} row(s) with an invalid handle" if skipped else ""
+        return AgentStateListResult.observed(pairs, detail=detail)
 
     # -- internals ------------------------------------------------------------
 
@@ -199,41 +228,65 @@ def _extract_status(stdout: object) -> Optional[str]:
     return _first_str(payload, _STATUS_KEYS)
 
 
-def _extract_list(stdout: object) -> tuple[tuple[str, str], ...]:
-    """Extract ``(handle, runtime_state)`` pairs from an ``agent list`` payload.
+def _extract_list_rows(stdout: object) -> Optional[list]:
+    """Return the recognised row list from an ``agent list`` payload, or ``None``.
 
-    Accepts either a bare JSON array of row objects or an object carrying the
-    rows under a candidate key. Each row must be an object with a usable handle
-    (first present string of :data:`_HANDLE_KEYS`); its status is mapped through
-    the core (a missing / unrecognised status becomes ``unknown``). Rows without
-    a usable handle are skipped. A non-JSON / unrecognised payload yields no
-    rows. Never raises.
+    A payload is *recognisable* iff it is a bare JSON array, an object carrying a
+    list under one of :data:`_LIST_KEYS`, or an object wrapping such a container
+    one level down under an envelope key (:data:`_LIST_ENVELOPE_KEYS`). Any of
+    those yields the row list, which may legitimately be **empty** (a recognised
+    "no agents"). Anything else — a non-JSON payload, a scalar JSON value, or an
+    object with no recognised container — is **unrecognisable** and yields
+    ``None``, so the caller fails closed rather than reporting an empty success.
+    Never raises.
     """
-    payload = _load_json(stdout)
-    rows: object
+    return _rows_from_container(_load_json(stdout))
+
+
+def _rows_from_container(payload: object) -> Optional[list]:
+    """Recursively resolve the row list from a decoded payload, or ``None``."""
     if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, Mapping):
-        rows = None
+        return payload
+    if isinstance(payload, Mapping):
         for key in _LIST_KEYS:
             candidate = payload.get(key)
             if isinstance(candidate, list):
-                rows = candidate
-                break
-        if rows is None:
-            return ()
-    else:
-        return ()
+                return candidate
+        for key in _LIST_ENVELOPE_KEYS:
+            nested = payload.get(key)
+            if isinstance(nested, Mapping):
+                rows = _rows_from_container(nested)
+                if rows is not None:
+                    return rows
+    return None
+
+
+def _rows_to_state_pairs(rows: list) -> tuple[tuple[tuple[str, str], ...], int]:
+    """Map recognised rows to ``(handle, runtime_state)`` pairs; count skips.
+
+    Each row must be an object with a handle (first present string of
+    :data:`_HANDLE_KEYS`) that, after trimming, is a well-formed target (reusing
+    the core :func:`valid_target` guard so a list row's handle is validated
+    exactly like an ``agent get`` target). Its status is mapped through the core
+    (a missing / unrecognised status becomes ``unknown``). A row that is not an
+    object, or whose handle is missing / blank / malformed, is **skipped** (never
+    a whole-payload failure); the returned int is how many rows were skipped.
+    Never raises.
+    """
     pairs: list[tuple[str, str]] = []
+    skipped = 0
     for row in rows:
         if not isinstance(row, Mapping):
+            skipped += 1
             continue
-        handle = _first_str(row, _HANDLE_KEYS)
-        if handle is None or not handle:
+        raw_handle = _first_str(row, _HANDLE_KEYS)
+        handle = raw_handle.strip() if isinstance(raw_handle, str) else ""
+        if not valid_target(handle):
+            skipped += 1
             continue
         state = map_agent_status(_first_str(row, _STATUS_KEYS))
         pairs.append((handle, state))
-    return tuple(pairs)
+    return tuple(pairs), skipped
 
 
 def _load_json(stdout: object) -> object:

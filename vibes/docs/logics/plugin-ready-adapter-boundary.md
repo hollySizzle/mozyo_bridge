@@ -1290,11 +1290,29 @@ selection and trusted-env binary resolution as the transport (#13245).
 - **Two failure modes, both fail-closed.** A *mechanical* read failure (bad
   target, missing binary, non-zero exit, timeout, OS error) yields
   `ok=False` + a `TRANSPORT_FAILURE_REASONS` reason + `state=unknown` (a failed
-  read may never assert a confident state). A *soft* failure (the command ran but
-  its JSON carried no recognised status) is a *successful* read of `unknown`
-  (`ok=True`, an observed-unknown) — distinct from could-not-observe, but both
-  fail closed for a state-only caller. `AgentStateError` subclasses
+  read may never assert a confident state). A *soft* failure (an `agent get`
+  command ran but its JSON carried no recognised status) is a *successful* read
+  of `unknown` (`ok=True`, an observed-unknown) — distinct from could-not-observe,
+  but both fail closed for a state-only caller. `AgentStateError` subclasses
   `TerminalTransportError`, so the whole seam shares one fail-closed error base.
+- **`agent list` distinguishes "recognised empty" from "unrecognisable".** A
+  recognised list payload — a bare JSON array, an object carrying the rows under
+  `agents` / `panes` / `items`, or one of those wrapped one level under a
+  `result` / `data` envelope — may legitimately be **empty** and reports
+  `ok=True` with no rows. A payload that is *not* a recognisable list schema
+  (non-JSON, a scalar JSON value, or an object with no recognised container)
+  fails closed with `ok=False` + `reason=invalid_payload` (a new
+  `TRANSPORT_FAILURE_REASONS` member) rather than pretending it observed an empty
+  set — an unreadable list is not "no agents".
+- **A malformed `agent list` row is skipped, not fatal.** Each row's handle is
+  trimmed and validated with the same core `valid_target` guard used for an
+  `agent get` target. A row that is not an object, or whose handle is missing /
+  blank / malformed (a space-bearing string, a bare `--flag`, whitespace), is
+  **skipped** so one broken row does not lose every good one; the count of
+  skipped rows is recorded in the result `detail` so the loss stays observable.
+  Contrast the payload-level `invalid_payload` failure above: a whole unreadable
+  payload fails closed, but a single bad row inside a recognised payload only
+  drops that row.
 
 ### Event-subscription semantics (issue requirement — documented, not built)
 

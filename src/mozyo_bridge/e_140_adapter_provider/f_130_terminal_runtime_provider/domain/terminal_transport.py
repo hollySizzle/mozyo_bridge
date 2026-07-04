@@ -105,6 +105,13 @@ REASON_BINARY_UNCONFIGURED = "binary_unconfigured"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
 REASON_INVALID_TARGET = "invalid_target"
 REASON_INVALID_SOURCE = "invalid_source"
+# The provider's command ran but returned a payload that could not be recognised
+# as the expected read schema (non-JSON, a scalar JSON value, or an object with
+# no recognised row container). Distinct from ``transport_error`` (a spawn / exit
+# / OS failure): the process succeeded but its output is unusable, so a read that
+# would otherwise report an *empty* success fails closed instead of pretending it
+# observed "nothing".
+REASON_INVALID_PAYLOAD = "invalid_payload"
 REASON_TRANSPORT_ERROR = "transport_error"
 
 TRANSPORT_FAILURE_REASONS: frozenset[str] = frozenset(
@@ -114,6 +121,7 @@ TRANSPORT_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_BINARY_NOT_FOUND,
         REASON_INVALID_TARGET,
         REASON_INVALID_SOURCE,
+        REASON_INVALID_PAYLOAD,
         REASON_TRANSPORT_ERROR,
     }
 )
@@ -369,6 +377,7 @@ __all__ = (
     "REASON_BACKEND_DISABLED",
     "REASON_BINARY_NOT_FOUND",
     "REASON_BINARY_UNCONFIGURED",
+    "REASON_INVALID_PAYLOAD",
     "REASON_INVALID_SOURCE",
     "REASON_INVALID_TARGET",
     "REASON_TRANSPORT_ERROR",

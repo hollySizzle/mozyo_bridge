@@ -33,6 +33,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     BACKEND_HERDR,
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
+    REASON_INVALID_PAYLOAD,
     REASON_INVALID_TARGET,
     REASON_TRANSPORT_ERROR,
     TerminalTransportConfig,
@@ -202,13 +203,106 @@ class ListAgentStatesTest(unittest.TestCase):
         result = reader.list_agent_states()
         self.assertTrue(result.ok)
         self.assertEqual(result.states, ())
+        self.assertIn("skipped 1", result.detail)
 
-    def test_non_json_is_empty_success(self) -> None:
-        runner = RecordingRunner(stdout="garbage")
+    # --- Finding 1 (j#72333): unrecognisable list payloads fail closed --------
+
+    def test_non_json_payload_fails_closed(self) -> None:
+        runner = RecordingRunner(stdout="not json")
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, REASON_INVALID_PAYLOAD)
+        self.assertEqual(result.states, ())
+
+    def test_object_without_recognised_container_fails_closed(self) -> None:
+        runner = RecordingRunner(stdout='{"unexpected": []}')
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, REASON_INVALID_PAYLOAD)
+        self.assertEqual(result.states, ())
+
+    def test_scalar_json_payload_fails_closed(self) -> None:
+        runner = RecordingRunner(stdout="123")
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, REASON_INVALID_PAYLOAD)
+        self.assertEqual(result.states, ())
+
+    def test_recognised_empty_bare_array_is_ok(self) -> None:
+        runner = RecordingRunner(stdout="[]")
         reader = HerdrCliAgentStateReader(BIN, runner=runner)
         result = reader.list_agent_states()
         self.assertTrue(result.ok)
         self.assertEqual(result.states, ())
+        self.assertEqual(result.reason, None)
+
+    def test_recognised_empty_enveloped_object_is_ok(self) -> None:
+        runner = RecordingRunner(stdout='{"result": {"agents": []}}')
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.states, ())
+        self.assertEqual(result.reason, None)
+
+    # --- Finding 2 (j#72333): invalid row handles are skipped, not returned ---
+
+    def test_space_bearing_handle_is_skipped(self) -> None:
+        runner = RecordingRunner(
+            stdout='[{"name": "bad handle", "agent_status": "working"}]'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.states, ())
+        self.assertIn("skipped 1", result.detail)
+
+    def test_blank_handle_is_skipped(self) -> None:
+        runner = RecordingRunner(
+            stdout='[{"name": "   ", "agent_status": "working"}]'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.states, ())
+        self.assertIn("skipped 1", result.detail)
+
+    def test_flag_shaped_handle_is_skipped(self) -> None:
+        runner = RecordingRunner(
+            stdout='[{"name": "--flag", "agent_status": "working"}]'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.states, ())
+        self.assertIn("skipped 1", result.detail)
+
+    def test_valid_rows_kept_when_invalid_row_mixed_in(self) -> None:
+        runner = RecordingRunner(
+            stdout='[{"name": "poc_claude", "agent_status": "working"}, '
+            '{"name": "bad handle", "agent_status": "idle"}, '
+            '{"name": "w1:p1", "agent_status": "done"}]'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            result.states,
+            (("poc_claude", RUNTIME_BUSY), ("w1:p1", RUNTIME_TURN_ENDED)),
+        )
+        self.assertIn("skipped 1", result.detail)
+
+    def test_handle_is_trimmed_before_use(self) -> None:
+        runner = RecordingRunner(
+            stdout='[{"name": "  poc_claude  ", "agent_status": "working"}]'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.list_agent_states()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.states, (("poc_claude", RUNTIME_BUSY),))
+        self.assertEqual(result.detail, "")
 
     def test_nonzero_exit_is_transport_error(self) -> None:
         runner = RecordingRunner(returncode=3, stderr="down")

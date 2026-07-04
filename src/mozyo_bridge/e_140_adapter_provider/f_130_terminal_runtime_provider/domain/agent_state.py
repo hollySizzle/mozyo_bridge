@@ -252,6 +252,13 @@ class AgentStateListResult:
     with a missing / unrecognised status maps to ``unknown`` rather than being
     dropped). On failure ``ok=False``, ``states`` is empty, and ``reason`` is a
     :data:`TRANSPORT_FAILURE_REASONS` value.
+
+    ``detail`` is a short, credential-free note. A row with an invalid handle is
+    **skipped** rather than failing the whole read (one malformed row must not
+    lose every good one); a successful read records how many rows were skipped in
+    ``detail`` so the loss is observable. A read whose *payload* could not be
+    recognised at all is a different case: that fails closed with
+    ``reason=invalid_payload`` (an unreadable list is not "no agents").
     """
 
     ok: bool
@@ -292,9 +299,9 @@ class AgentStateListResult:
 
     @classmethod
     def observed(
-        cls, states: tuple[tuple[str, str], ...]
+        cls, states: tuple[tuple[str, str], ...], *, detail: str = ""
     ) -> "AgentStateListResult":
-        return cls(ok=True, states=tuple(states), reason=None)
+        return cls(ok=True, states=tuple(states), reason=None, detail=detail)
 
     @classmethod
     def failure(cls, reason: str, detail: str = "") -> "AgentStateListResult":
