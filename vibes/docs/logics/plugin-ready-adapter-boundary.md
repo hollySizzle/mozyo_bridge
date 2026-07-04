@@ -1143,6 +1143,81 @@ have a fixed interface to build on. The existing tmux path is untouched.
   authority — a transport observes liveness and delivers sends; it never becomes
   durable identity.
 
+## Implemented herdr Durable-Identity Mapping Seam (Redmine #13247)
+
+The #13245 terminal-transport seam addresses a herdr target by a *handle* but
+deferred *which* handle is durable. #13247 lands that: a **staged seam** mapping
+a mozyo lane/workspace/role slot to a herdr **assigned name** — the handle the
+#13175 PoC proved survives a restart (experiment E10: `agent rename` names
+persist across `server stop` / restart, while `pane_id` / `terminal_id` are
+regenerated and disposable). No runtime path changes; this is a pure naming
+convention + mapping type + re-bind procedure for later US's to build on.
+
+### Where it lives
+
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/herdr_identity.py`
+  — **core**, pure. The deterministic name codec
+  (`encode_assigned_name` / `decode_assigned_name` / `encode_field`), the
+  pane/terminal-free `HerdrAgentIdentity` mapping type, the structured decode
+  result (`HerdrNameDecode`) with a closed `DECODE_FAILURE_REASONS` vocabulary,
+  and the fail-closed restart re-bind procedure (`rebind_by_name` ->
+  `HerdrRebindResult`).
+
+### Design decisions (enforced in code)
+
+- **Assigned name is the sole durable handle; pane/terminal ids are never held.**
+  `HerdrAgentIdentity` has only `(workspace_id, lane_id, role)` fields — there is
+  structurally no `pane_id` / `terminal_id` slot — so a caller cannot persist a
+  session-local locator as identity. This encodes PoC E10 directly.
+- **Consistent with the route-identity ledger (#12553).** The stable slot is the
+  same tuple the ledger uses `(workspace_id, lane_id, role)`, normalised the same
+  way (empty lane -> `default`). The herdr assigned name is the durable analogue
+  of the ledger's `pane_name`; pane/terminal ids are the disposable analogue of
+  its `last_seen_pane_id` (cache, never authority). The two identity contracts do
+  not drift.
+- **Naming convention: deterministic, round-trippable, collision-free.** A name
+  is `mzb1_<f(workspace)>_<f(role)>_<f(lane)>` where `_` is the sole delimiter and
+  `f` percent-encodes each field with a letter escape (`Z<HH>`, self-escaping) so
+  no field ever contains the delimiter or a non-`[A-Za-z0-9]` byte. Splitting on
+  `_` always yields four parts and each field decodes independently, so the
+  round-trip and injectivity hold for *arbitrary* component strings (including
+  `_` and non-ASCII). `encode`/`decode` signatures:
+  `encode_assigned_name(workspace_id, role, lane_id="") -> str`,
+  `decode_assigned_name(name) -> HerdrNameDecode`. Example:
+  `encode_assigned_name("giken-3800-mozyo-bridge", "claude", "lane_13247")` ->
+  `mzb1_gikenZ2D3800Z2DmozyoZ2Dbridge_claude_laneZ5F13247`.
+- **Conservative `[A-Za-z0-9_]` alphabet, length-capped.** The output alphabet is
+  the safe intersection of "what herdr accepted in the PoC (`poc_claude`)" and
+  "cannot smuggle a shell/argv token", so a minted name is also a valid #13245
+  transport target (`valid_target`). Names over `NAME_MAX_LENGTH` fail closed
+  rather than truncate (truncation would break injectivity).
+- **Fail-closed parse (structured, never raises).** `decode_assigned_name`
+  returns a `HerdrNameDecode` with an explicit reason from the closed set (empty /
+  illegal char / bad prefix / bad shape / bad escape / empty required / too long);
+  it never raises. Construction of an identity from an *empty required* slot does
+  raise `HerdrIdentityError`, matching the sibling domain errors.
+- **Restart re-bind by name, not by cached locator.** `rebind_by_name(name,
+  agents)` re-discovers the live target from an `agent list` snapshot by matching
+  the durable name; the recovered pane locator is transient (labelled as such and
+  omitted from `public_pointer`). Fails closed on invalid-name / not-found /
+  ambiguous (duplicate names).
+
+### Scope (staged — kept explicit)
+
+- **In scope:** the pure naming convention, the pane/terminal-free mapping type,
+  and the name -> live re-bind procedure, all covered by determinism /
+  round-trip / injectivity / fail-closed contract tests (no live binary).
+- **Out of scope (later US's / gated):** conversation *session* resume after a
+  restart (E10: sessions do not auto-revive without herdr's official integration
+  hook — the #13249-gated extension), any live-herdr test, and any wiring into
+  the live handoff / cockpit actuator.
+
+### Non-goals (unchanged, restated)
+
+- a herdr assigned name is a transport locator handle, not workflow authority: it
+  never becomes owner approval, routing authority, or ticket-state truth (the
+  durable work record stays Redmine).
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
