@@ -6,6 +6,29 @@ This document defines mandatory gates for distributing `mozyo-bridge` artifacts.
 Detailed command examples and rationale may live in `vibes/docs/logics/`, but the
 completion criteria for beta and production distribution live here.
 
+## Versioning Policy
+
+- Package version follows semantic versioning. The segment meaning is fixed:
+  - **patch** (`x.y.Z`): backward-compatible fixes that change no contract
+    (CLI surface / API / preset).
+  - **minor** (`x.Y.0`): feature additions or backend capability, backward
+    compatible.
+  - **major** (`X.0.0`): breaking contract changes to an existing CLI / API /
+    preset contract.
+- The next feature release enters the `0.10` line (a minor bump for feature
+  work).
+- A Redmine Version (e.g. `#308`) is a roadmap bucket, not a package version and
+  not a release authority. Roadmap grouping never fixes the shipped package
+  version; assigning an issue to a Redmine Version does not commit a specific
+  package version.
+- Feature work such as the herdr adapter is a minor-release candidate, but the
+  actual package version is decided only at the release gate. Neither the
+  roadmap nor this policy document may pre-fix a version number.
+- Codifying this policy performs no version bump, tag, TestPyPI / PyPI
+  publication, or GitHub Release. Version decisions, bumps, and publishes happen
+  only at the release gates defined by the Internal Beta and Production
+  Distribution sections below.
+
 ## Internal Beta Distribution
 
 - Internal beta distribution uses TestPyPI, not production PyPI.
