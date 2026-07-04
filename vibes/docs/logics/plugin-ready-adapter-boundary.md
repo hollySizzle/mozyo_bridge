@@ -1223,6 +1223,118 @@ convention + mapping type + re-bind procedure for later US's to build on.
   never becomes owner approval, routing authority, or ticket-state truth (the
   durable work record stays Redmine).
 
+## Implemented Terminal Runtime State Seam (Redmine #13246)
+
+#13245 landed the transport half of the terminal runtime adapter (the send /
+read port). #13246 lands the **state** half: a pure, fail-closed mapping from
+the state herdr reports about a pane's agent onto a small mozyo-owned **runtime
+receiver-state** vocabulary, plus the built-in herdr `agent get` / `agent list`
+reader that fills it. Same feature package, same conventions (staged seam, pure
+core + one built-in provider, fail-closed, default off, trusted-env binary,
+injected-runner tests, no live binary). The existing tmux path is untouched.
+
+### Where it lives
+
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/agent_state.py`
+  — **core**, pure. The core-owned herdr observed-status vocabulary
+  (`working` / `blocked` / `idle` / `done` / `unknown`, PoC E6 / E7 / E13 / E14),
+  the mozyo runtime receiver-state vocabulary (`busy` / `blocked` /
+  `awaiting_input` / `turn_ended` / `unknown`), the pure total mapping
+  `map_agent_status`, and the fail-closed read-result records (`AgentStateResult`
+  / `AgentStateListResult`, with an enforced ok/reason invariant and a
+  failure-degrades-to-`unknown` invariant). It imports no provider.
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_state.py`
+  — the built-in **herdr CLI state reader** (`HerdrCliAgentStateReader`) plus the
+  fail-closed selection resolver `resolve_agent_state_reader`. It wraps
+  `agent get <target> --json` / `agent list --json` as an argv subprocess through
+  an injectable runner, parses the JSON defensively for the `agent_status` token,
+  and reuses the #13245 transport plumbing (`_resolve_binary`, `HERDR_BINARY_ENV`,
+  the `Runner` shape, `COMMAND_TIMEOUT_SECONDS`, `_bounded_detail`) rather than
+  duplicating it. Dependency points provider -> core.
+
+No new config: the reader rides on the same default-off `terminal_transport.backend`
+selection and trusted-env binary resolution as the transport (#13245).
+
+### The mapping (enforced in code, `_STATUS_TO_RUNTIME`)
+
+| herdr `agent_status` | mozyo runtime receiver-state | PoC evidence | note |
+|---|---|---|---|
+| `working` | `busy` | E7 (30s / 5355 samples all working) | actively producing a turn |
+| `blocked` | `blocked` | E13 `generic_permission_prompt` / E14 `osc_title_blocked` | **runtime-observed** block (permission prompt on screen), *not* the durable-recorded `blocked` the attention model means |
+| `idle` | `awaiting_input` | E7 (`✳` title → idle) | quiet, waiting for input; caller consults tmux liveness |
+| `done` | `turn_ended` | E14 (`wait done` turn-end) | **assistant turn finished, NOT task completion / close gate** |
+| `unknown` / unrecognised / non-string / parse failure | `unknown` | E6 (`agent_status: unknown`) | fail-closed; never raises |
+
+### Design decisions (enforced in code)
+
+- **A runtime observation vocabulary, not a workflow / attention state.** herdr
+  `agent_status` is a layer-1 runtime receiver signal in the ACK / completion
+  doctrine (`vibes/docs/logics/ack-completion-receiver-state.md`). The mapping
+  target is deliberately a *different* vocabulary from the derived cockpit
+  `attention_state` (`vibes/docs/logics/cockpit-attention-state.md`), so a
+  runtime signal is never mistaken for workflow truth. This runtime state is only
+  one *input* a caller may later feed into attention derivation; wiring that in is
+  out of scope here.
+- **`done` -> `turn_ended`, never `done`.** The single load-bearing fail-closed
+  choice. herdr `done` means the assistant *turn* finished (a layer-2
+  `assistant_turn_finished` signal per the doctrine), which must never be promoted
+  to the attention model's `done` (`close_gate_satisfied`). A test pins that
+  `turn_ended` is a distinct token from the attention `done` and that the latter
+  is not in the runtime vocabulary.
+- **Everything unknown fails closed to `unknown`.** A non-string, an unrecognised
+  token, a non-JSON payload, or a missing status key all degrade to `unknown`
+  (which callers treat as "consult tmux liveness", never death or completion),
+  exactly like the OTel activity layer's `unknown`
+  (`e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.agent_activity`).
+  `map_agent_status` never raises.
+- **Two failure modes, both fail-closed.** A *mechanical* read failure (bad
+  target, missing binary, non-zero exit, timeout, OS error) yields
+  `ok=False` + a `TRANSPORT_FAILURE_REASONS` reason + `state=unknown` (a failed
+  read may never assert a confident state). A *soft* failure (the command ran but
+  its JSON carried no recognised status) is a *successful* read of `unknown`
+  (`ok=True`, an observed-unknown) — distinct from could-not-observe, but both
+  fail closed for a state-only caller. `AgentStateError` subclasses
+  `TerminalTransportError`, so the whole seam shares one fail-closed error base.
+
+### Event-subscription semantics (issue requirement — documented, not built)
+
+The issue requires the `wait agent-status` subscription semantics be pinned as a
+**design premise** for the state reader, because they constrain how a later
+caller composes a snapshot read with a wait. Established live in the PoC
+(`vibes/docs/logics/herdr-poc-13175-experiment-log.md`):
+
+- **`wait agent-status` waits for a *change* into a state, not the current
+  state** (E9 c2): a `wait --status idle` issued while *already* idle times out
+  rather than returning immediately. So a caller cannot use `wait` alone to learn
+  the current state.
+- **Therefore the reader is a snapshot / check-then-wait primitive.**
+  `read_agent_state` reports the current runtime state at call time; the
+  contract for a later turn-start caller is *read a current-state snapshot
+  before arming a wait*, so a transition that lands between the read and the wait
+  is not missed (E9's race). The snapshot API is **this US**; the wait rail —
+  arming the wait, the Codex Enter-resend (E14), and the started / blocked /
+  absent / turn-end 4-case harness — is **#13248**.
+- **Subscribe-time event delivery is a fail-safe caveat for the wait rail
+  (E14).** When a `wait done` was armed just after a `done` transition had
+  already occurred, an event returned almost immediately (~11ms observed). That
+  subscribe-time behaviour is to be confirmed against a live binary and handled
+  fail-safe in #13248; it does not affect this snapshot read model, which never
+  subscribes. Recorded here so the wait US does not re-derive it.
+
+Live verification is not required for this US (staged seam): the mapping and the
+reader are pinned through a pure fake / injected-runner, with no live herdr.
+
+### Scope (staged — kept explicit)
+
+- **In scope:** the observed-status + runtime receiver-state vocabularies, the
+  pure fail-closed mapping, the fail-closed read-result records, and the herdr
+  `agent get` / `agent list` reader + resolver, all covered by pure mapping tests
+  and injected-runner reader tests (no live binary).
+- **Out of scope (later US's):** `wait agent-status` turn-start / change
+  semantics and the 4-case harness (#13248), durable identity naming (#13247),
+  wiring this runtime state into the cockpit attention derivation, any live-herdr
+  test, and any installer / distribution.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
