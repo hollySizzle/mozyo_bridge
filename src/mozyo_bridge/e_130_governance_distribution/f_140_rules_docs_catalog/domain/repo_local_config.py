@@ -24,6 +24,12 @@ internal selection records:
   #12673 ``RoleProviderBinding`` seam. The role vocabulary is closed (an unknown
   role fails closed) while the provider vocabulary stays open. Default (no
   overrides) is the legacy codex/claude map, so it is behavior-preserving.
+- ``terminal_transport`` -> :class:`mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport.TerminalTransportConfig`
+  (Redmine #13245): selects the runtime terminal-transport backend (``tmux``
+  default = herdr off / ``herdr`` opt-in). The herdr *binary* is not a config
+  field — it comes only from the trusted environment — so this block can never
+  point the runtime at an arbitrary executable. Default (``tmux``) is
+  behavior-preserving.
 
 Boundary, kept enforced in code (this is *schema only*):
 
@@ -85,6 +91,10 @@ from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.do
     PresentationGroupingConfigError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider_registry import ProviderSelectionConfig
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    TerminalTransportConfig,
+    TerminalTransportError,
+)
 
 #: The supported repo-local config record version. ``version`` is optional in a
 #: record and defaults to this; any other value is rejected so a future,
@@ -103,6 +113,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "work_unit",
         "agent_launch",
         "provider_binding",
+        "terminal_transport",
     }
 )
 
@@ -688,6 +699,9 @@ class RepoLocalConfig:
     provider_binding: RoleProviderBindingConfig = field(
         default_factory=RoleProviderBindingConfig.default
     )
+    terminal_transport: TerminalTransportConfig = field(
+        default_factory=TerminalTransportConfig.default
+    )
 
     @classmethod
     def default(cls) -> "RepoLocalConfig":
@@ -805,6 +819,22 @@ class RepoLocalConfig:
             raise RepoLocalConfigError(
                 f"provider_binding config is invalid: {exc}"
             ) from exc
+        # The terminal-transport backend selection (#13245) picks the runtime
+        # transport backend (default ``tmux`` = herdr off). It is parsed by its
+        # own self-contained domain schema; its TerminalTransportError is
+        # re-raised as a RepoLocalConfigError so the loader keeps a single
+        # fail-closed boundary. An absent ``terminal_transport`` block resolves to
+        # the tmux default, so it stays behavior-preserving. The herdr *binary*
+        # is deliberately not a config field — it comes only from the trusted
+        # environment (see TerminalTransportConfig).
+        try:
+            terminal_transport = TerminalTransportConfig.from_record(
+                record.get("terminal_transport")
+            )
+        except TerminalTransportError as exc:
+            raise RepoLocalConfigError(
+                f"terminal_transport config is invalid: {exc}"
+            ) from exc
         return cls(
             cli=cli,
             providers=providers,
@@ -814,6 +844,7 @@ class RepoLocalConfig:
             work_unit=work_unit,
             agent_launch=agent_launch,
             provider_binding=provider_binding,
+            terminal_transport=terminal_transport,
         )
 
 
@@ -833,6 +864,8 @@ __all__ = (
     "AgentLaunchConfig",
     "RoleProviderBindingConfig",
     "RoleProviderBindingConfigError",
+    "TerminalTransportConfig",
+    "TerminalTransportError",
     "RepoLocalConfig",
     "DelegationConfig",
     "DelegationConfigError",

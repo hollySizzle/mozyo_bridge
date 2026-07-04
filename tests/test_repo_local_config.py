@@ -120,6 +120,32 @@ class ValidRecordTest(unittest.TestCase):
         self.assertEqual(config.presentation.surface, SURFACE_TEXT)
         self.assertEqual(config.cli, CliCompositionConfig.default())
 
+    def test_terminal_transport_default_is_tmux_off(self) -> None:
+        # An absent terminal_transport block resolves to tmux (herdr off),
+        # behavior-preserving.
+        config = RepoLocalConfig.from_record({})
+        self.assertEqual(config.terminal_transport.backend, "tmux")
+        self.assertFalse(config.terminal_transport.herdr_enabled)
+
+    def test_terminal_transport_herdr_selected(self) -> None:
+        config = RepoLocalConfig.from_record({"terminal_transport": {"backend": "herdr"}})
+        self.assertEqual(config.terminal_transport.backend, "herdr")
+        self.assertTrue(config.terminal_transport.herdr_enabled)
+
+    def test_terminal_transport_invalid_backend_fails_closed(self) -> None:
+        # A TerminalTransportError is re-raised as RepoLocalConfigError so the
+        # loader keeps a single fail-closed boundary.
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"terminal_transport": {"backend": "ssh"}})
+
+    def test_terminal_transport_unknown_key_fails_closed(self) -> None:
+        # The herdr binary is not a config field (trusted-env only); a
+        # herdr_binary key fails closed.
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"terminal_transport": {"herdr_binary": "/opt/herdr"}}
+            )
+
 
 class TopLevelFailClosedTest(unittest.TestCase):
     def test_non_mapping_record_rejected(self) -> None:

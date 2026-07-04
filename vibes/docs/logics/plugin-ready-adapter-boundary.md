@@ -1059,6 +1059,90 @@ journal id, so the transport returns the empty id and the sink records a
   write provider for v0.8, with no public ABI promise;
 - no release / publish / tag.
 
+## Implemented Terminal Runtime Transport Seam (Redmine #13245)
+
+The "Terminal runtime adapter" category above was deliberately deferred (medium
+first-cut score: high payoff, send-safety risk-heavy). #13245 lands its first
+concrete cut, now that the ticket (#12034) and presentation (#12156) seams have
+proven the "small pure port, one built-in provider, fail-closed" shape, and now
+that the #13175 herdr PoC
+(`vibes/docs/logics/herdr-poc-13175-experiment-log.md`) has validated a second
+terminal backend candidate end-to-end. It is a **staged seam**: a stable port +
+a pure fail-closed herdr adapter + a default-off backend selection, so the
+follow-up herdr state (#13246) / identity (#13247) / turn-start (#13248) US's
+have a fixed interface to build on. The existing tmux path is untouched.
+
+### Where it lives
+
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/terminal_transport.py`
+  — **core**, pure. The core-owned backend vocabulary (`tmux` default /
+  `herdr`), the pane-read source vocabulary (`visible` / `recent` /
+  `recent-unwrapped`, PoC E11), the closed `TRANSPORT_FAILURE_REASONS` set, the
+  target guard (`valid_target`), the fail-closed result records
+  (`TransportResult` / `PaneReadResult`, with an enforced ok/reason invariant),
+  the three-primitive `TerminalTransportPort` protocol
+  (`send_text` / `send_keys` / `read_pane`), and the default-off
+  `TerminalTransportConfig`. It imports no provider, so the dependency only ever
+  points provider -> core.
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_transport.py`
+  — the built-in **herdr CLI provider** (`HerdrCliTransport`) plus the
+  fail-closed selection resolver `resolve_terminal_transport`. It wraps the herdr
+  CLI (`pane send-text` / `pane send-keys` / `agent read`, PoC E8 / E11) as an
+  argv subprocess through an injectable runner. Dependency points provider ->
+  core.
+- `src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py`
+  — adds the `terminal_transport` block to the closed repo-local config schema,
+  behaviour-preserving by default (tmux / off).
+
+### Design decisions (enforced in code)
+
+- **CLI over socket protocol.** The PoC proved both the herdr CLI and the raw
+  Unix-socket JSON protocol underneath it. The adapter binds the **CLI**: it is
+  the documented, stable surface, whereas the socket wire protocol is an
+  internal, unpublished herdr detail (E2) carrying no compatibility promise.
+  Same posture as the Redmine note transport (#12347) over the documented HTTP
+  API. Recorded in the adapter docstring.
+- **Default off, no silent fallback.** `terminal_transport.backend` defaults to
+  `tmux`; only an explicit `herdr` selection constructs the adapter. When herdr
+  is selected but its binary is unconfigured or unresolvable,
+  `resolve_terminal_transport` raises `TerminalTransportError`
+  (`binary_unconfigured` / `binary_not_found`) — it never silently falls back to
+  tmux (Implementation Guardrail #4).
+- **Binary from the trusted environment, not the repo.** Running an arbitrary
+  executable is a code-execution vector, so the herdr binary path comes **only**
+  from `MOZYO_HERDR_BINARY` in the trusted environment, never a repo-local
+  config field. The repo-local config only *selects* the backend; it can never
+  point the runtime at a binary. This mirrors the delivery-write trusted-env
+  credential boundary (#12347).
+- **Not registered in `BUILTIN_PROVIDER_REGISTRY` yet.** Adding herdr as a second
+  `terminal_runtime` provider would make that category *ambiguous*, and
+  `resolve_selection` fails closed on an ambiguous category with no selection —
+  breaking the behaviour-preserving default resolution the CLI entrypoint
+  (#12249) relies on. Herdr is therefore an opt-in *backend flag* (default off),
+  not a registry entry, until a later US wires an explicit terminal-runtime
+  selection through the same fail-closed resolution the provider/presentation
+  selections use.
+
+### Scope (staged — kept explicit)
+
+- **In scope:** the port, the result / reason vocabulary, the default-off backend
+  config, and the pure herdr CLI adapter + fail-closed resolver, all covered by a
+  fake-port contract test and an injected-runner adapter test (no live binary).
+- **Out of scope (later US's):** turn-start / wait semantics (#13248 — the
+  check-then-wait rail and the Codex Enter-resend rail from PoC E9 / E12–E14 are
+  *not* built here; `send_text` is a bare primitive), `agent_status` mapping
+  (#13246), durable identity naming (#13247), any live-herdr test, and any
+  installer / distribution.
+
+### Non-goals (unchanged, restated for the implementation)
+
+- no third-party / arbitrary-code provider loading; herdr is the only built-in
+  terminal-transport provider and it is default off;
+- no public ABI or long-term compatibility promise for these record shapes;
+- no terminal-transport-defined workflow truth, owner approval, or routing
+  authority — a transport observes liveness and delivers sends; it never becomes
+  durable identity.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
