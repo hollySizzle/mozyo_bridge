@@ -11,3 +11,6 @@ presentation:
         group_id: project:mozyo_bridge
 agent_launch:
   sublane_claude_model: claude-opus-4-8
+provider_binding:
+  bindings:
+    coordinator: claude
