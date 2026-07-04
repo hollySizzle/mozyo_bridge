@@ -48,9 +48,13 @@ inverse. The name is built to satisfy three properties at once:
 
 1. **Deterministic** — the same slot always yields the same name (no clock, no
    counter, no randomness).
-2. **Round-trippable** — ``decode_assigned_name(encode_assigned_name(ws, role,
-   lane))`` recovers ``(ws, role, lane)`` byte-for-byte, for *any* input strings
-   (the components may themselves contain ``_`` or non-identifier bytes).
+2. **Round-trippable (normalized-slot roundtrip)** —
+   ``decode_assigned_name(encode_assigned_name(ws, role, lane))`` recovers the
+   *normalized* slot — i.e. the components after ``encode_assigned_name`` trims
+   them and maps an empty ``lane`` to :data:`DEFAULT_LANE` — for *any* input
+   strings (the components may themselves contain ``_`` or non-identifier
+   bytes). The roundtrip is byte-for-byte only over that normalized slot, not
+   over the raw pre-normalization input.
 3. **Collision-free** — distinct slots always encode to distinct names (the
    encoding is injective), so two lanes/roles can never share a durable handle.
 
@@ -198,9 +202,13 @@ REBIND_NOT_FOUND: str = "rebind_not_found"
 REBIND_AMBIGUOUS: str = "rebind_ambiguous"
 #: The supplied name is not a well-formed scheme name (fails :func:`decode_assigned_name`).
 REBIND_INVALID_NAME: str = "rebind_invalid_name"
+#: Exactly one live agent matched the name, but its row carries no usable pane
+#: locator (``pane`` / ``location`` absent or blank) — reporting success would
+#: hand a downstream a blank target (fail-open); refuse and fail closed instead.
+REBIND_MISSING_LOCATOR: str = "rebind_missing_locator"
 
 REBIND_FAIL_STATUSES: frozenset[str] = frozenset(
-    {REBIND_NOT_FOUND, REBIND_AMBIGUOUS, REBIND_INVALID_NAME}
+    {REBIND_NOT_FOUND, REBIND_AMBIGUOUS, REBIND_INVALID_NAME, REBIND_MISSING_LOCATOR}
 )
 
 # ---------------------------------------------------------------------------
@@ -547,8 +555,11 @@ def rebind_by_name(
     Fail-closed outcomes:
 
     - the name is not a well-formed scheme name -> :data:`REBIND_INVALID_NAME`;
-    - exactly one live agent matches the name -> :data:`REBIND_OK` (transient
-      locator recovered);
+    - exactly one live agent matches the name and its row carries a usable pane
+      locator -> :data:`REBIND_OK` (transient locator recovered);
+    - exactly one match but its row carries no usable pane locator (``pane`` /
+      ``location`` absent or blank) -> :data:`REBIND_MISSING_LOCATOR` (refuse to
+      report success with a blank target);
     - zero matches -> :data:`REBIND_NOT_FOUND`;
     - more than one match -> :data:`REBIND_AMBIGUOUS` (a herdr-name uniqueness
       violation; refuse to guess).
@@ -567,10 +578,22 @@ def rebind_by_name(
     ]
     considered = len(rows)
     if len(matches) == 1:
+        locator = _agent_locator(matches[0])
+        if not locator:
+            return HerdrRebindResult(
+                status=REBIND_MISSING_LOCATOR,
+                assigned_name=assigned_name,
+                identity=decoded.identity,
+                considered=considered,
+                detail=(
+                    "name matched but the live row carries no usable pane locator; "
+                    "refuse to report success"
+                ),
+            )
         return HerdrRebindResult(
             status=REBIND_OK,
             assigned_name=assigned_name,
-            locator=_agent_locator(matches[0]),
+            locator=locator,
             identity=decoded.identity,
             considered=considered,
             detail="live agent recovered by durable assigned name",
@@ -620,6 +643,7 @@ __all__ = (
     "REBIND_AMBIGUOUS",
     "REBIND_FAIL_STATUSES",
     "REBIND_INVALID_NAME",
+    "REBIND_MISSING_LOCATOR",
     "REBIND_NOT_FOUND",
     "REBIND_OK",
     "SCHEME_PREFIX",

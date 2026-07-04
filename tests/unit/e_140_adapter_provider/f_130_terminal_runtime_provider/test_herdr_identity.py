@@ -37,6 +37,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REASON_TOO_LONG,
     REBIND_AMBIGUOUS,
     REBIND_INVALID_NAME,
+    REBIND_MISSING_LOCATOR,
     REBIND_NOT_FOUND,
     REBIND_OK,
     SCHEME_PREFIX,
@@ -284,6 +285,30 @@ class RebindTest(unittest.TestCase):
         result = rebind_by_name("not-a-scheme", [{"name": "not-a-scheme", "pane": "x"}])
         self.assertEqual(result.status, REBIND_INVALID_NAME)
         self.assertTrue(result.is_fail)
+
+    def test_rebind_missing_locator_no_key(self) -> None:
+        # A single name match whose row carries no pane/location key must not be
+        # reported as a success with a blank target (fail-open); fail closed.
+        result = rebind_by_name(self.name, [{"name": self.name}])
+        self.assertEqual(result.status, REBIND_MISSING_LOCATOR)
+        self.assertFalse(result.is_rebound)
+        self.assertTrue(result.is_fail)
+        self.assertEqual(result.locator, "")
+        self.assertEqual(result.considered, 1)
+        assert result.identity is not None
+        self.assertEqual(result.identity.assigned_name, self.name)
+
+    def test_rebind_missing_locator_blank_values(self) -> None:
+        # An empty / whitespace-only pane with no location alias is unusable too.
+        for row in (
+            {"name": self.name, "pane": ""},
+            {"name": self.name, "pane": "   "},
+            {"name": self.name, "pane": "\t"},
+        ):
+            result = rebind_by_name(self.name, [row])
+            self.assertEqual(result.status, REBIND_MISSING_LOCATOR)
+            self.assertFalse(result.is_rebound)
+            self.assertEqual(result.locator, "")
 
     def test_rebind_public_pointer_has_no_locator(self) -> None:
         agents = [{"name": self.name, "pane": "w1:p1"}]

@@ -1181,7 +1181,10 @@ convention + mapping type + re-bind procedure for later US's to build on.
   no field ever contains the delimiter or a non-`[A-Za-z0-9]` byte. Splitting on
   `_` always yields four parts and each field decodes independently, so the
   round-trip and injectivity hold for *arbitrary* component strings (including
-  `_` and non-ASCII). `encode`/`decode` signatures:
+  `_` and non-ASCII). The round-trip is a **normalized-slot roundtrip**:
+  `encode_assigned_name` first trims each component and maps an empty lane to
+  `default`, and `decode` recovers that normalized slot byte-for-byte — not the
+  raw pre-normalization input. `encode`/`decode` signatures:
   `encode_assigned_name(workspace_id, role, lane_id="") -> str`,
   `decode_assigned_name(name) -> HerdrNameDecode`. Example:
   `encode_assigned_name("giken-3800-mozyo-bridge", "claude", "lane_13247")` ->
@@ -1200,7 +1203,9 @@ convention + mapping type + re-bind procedure for later US's to build on.
   agents)` re-discovers the live target from an `agent list` snapshot by matching
   the durable name; the recovered pane locator is transient (labelled as such and
   omitted from `public_pointer`). Fails closed on invalid-name / not-found /
-  ambiguous (duplicate names).
+  ambiguous (duplicate names) / missing-locator (a single name match whose live
+  row carries no usable pane locator — refuse to report success with a blank
+  target).
 
 ### Scope (staged — kept explicit)
 
