@@ -200,6 +200,26 @@ class ResolveTargetCoordinatorTest(unittest.TestCase):
         with _runtime(FULL_COCKPIT, sender_pane_id="%1072"):
             self.assertEqual("%953", resolve_target("coordinator"))
 
+    def test_coordinator_label_live_route_consumes_binding_rebind(self) -> None:
+        # Redmine #13174 j#72023: the LIVE `--target coordinator` route (not just the
+        # pure resolver) must consume the RoleProviderBinding. Under a
+        # coordinator->claude rebind the pseudo-target resolves the default-lane
+        # claude pane (%954), not the default codex pane (%953). The provider
+        # resolution is patched at its f_140 boundary (the call-time import in
+        # `resolve_target` fetches the patched attribute).
+        with _runtime(FULL_COCKPIT, sender_pane_id="%1072"), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate.resolve_coordinator_provider",
+            return_value="claude",
+        ):
+            self.assertEqual("%954", resolve_target("coordinator"))
+
+    def test_coordinator_label_live_route_default_binding_unchanged(self) -> None:
+        # Behavior-preserving: with the real (unpatched) provider resolution and the
+        # repo's committed config (no provider_binding block), the live route still
+        # resolves the default-lane Codex pane exactly as before #13174.
+        with _runtime(FULL_COCKPIT, sender_pane_id="%1072"):
+            self.assertEqual("%953", resolve_target("coordinator"))
+
     def test_same_lane_codex_behavior_unchanged(self) -> None:
         # #12011 coexistence: bare `codex` still resolves the sender lane's own
         # Codex, not the coordinator.

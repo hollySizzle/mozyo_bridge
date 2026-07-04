@@ -41,8 +41,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
     PROVIDER_CLAUDE,
+    PROVIDER_CODEX,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+    ROLE_COORDINATOR,
     ROLE_IMPLEMENTER,
 )
 
@@ -59,6 +61,21 @@ def resolve_implementer_provider(repo_root: Optional[str] = None) -> str:
     """
     binding, _warnings = load_workflow_binding(repo_root)
     return binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
+
+
+def resolve_coordinator_provider(repo_root: Optional[str] = None) -> str:
+    """The runtime provider bound to the coordinator role for ``repo_root`` (fail-closed).
+
+    The `coordinator` pseudo-target / callback resolution counterpart of
+    :func:`resolve_implementer_provider` (Redmine #13174 j#72023): loads the repo-local
+    role->provider binding and returns the provider bound to the coordinator role.
+    Under the default binding this is ``codex`` — byte-identical to the pre-#13174
+    resolution — and a broken config fails closed through the loader's
+    ``RepoLocalConfigError``. Falls back to :data:`PROVIDER_CODEX` only in the
+    impossible case of an unbound coordinator (the default always binds it).
+    """
+    binding, _warnings = load_workflow_binding(repo_root)
+    return binding.provider_for(ROLE_COORDINATOR) or PROVIDER_CODEX
 
 
 def main_lane_guard_blocked(
@@ -87,4 +104,8 @@ def main_lane_guard_blocked(
     )
 
 
-__all__ = ("main_lane_guard_blocked", "resolve_implementer_provider")
+__all__ = (
+    "main_lane_guard_blocked",
+    "resolve_coordinator_provider",
+    "resolve_implementer_provider",
+)

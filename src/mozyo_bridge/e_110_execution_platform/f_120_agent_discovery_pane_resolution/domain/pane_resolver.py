@@ -580,6 +580,7 @@ def _no_coordinator_message(
     sender: dict[str, str] | None,
     *,
     canonical_state: dict[str, object] | None = None,
+    provider: str = AGENT_KIND_CODEX,
 ) -> str:
     """Fail-closed guidance when the coordinator Codex cannot be resolved (#12015).
 
@@ -605,7 +606,7 @@ def _no_coordinator_message(
             "Name the coordinator Codex explicitly with `--target %pane` "
             "(see `mozyo-bridge agents targets`)."
         )
-    candidates = coordinator_codex_candidates(panes, sender_ws)
+    candidates = coordinator_codex_candidates(panes, sender_ws, provider=provider)
     if not candidates and _canonical_state_is_broken(canonical_state):
         canonical_path = canonical_state.get("canonical_path") if canonical_state else None
         where = f" ({canonical_path})" if canonical_path else ""
@@ -754,16 +755,32 @@ def resolve_target(target: str) -> str:
         return resolve_pane_id(target)
     if target == COORDINATOR_LABEL:
         # Workspace-scoped coordinator resolution (Redmine #12015): pick the
-        # sender workspace's default-lane Codex so a sublane callback does not
-        # need a hand-picked `%pane`. Fail-closed with concrete guidance.
+        # sender workspace's default-lane pane running the coordinator role's
+        # provider so a sublane callback does not need a hand-picked `%pane`.
+        # Role-based since Redmine #13174 (j#72023): the provider is resolved
+        # from the repo-local RoleProviderBinding (default -> codex,
+        # byte-identical) via a call-time import of the f_140 boundary — a
+        # module-level import here would create an f_120 -> f_140 import cycle
+        # (f_140 already imports this module at load). Fail-closed with
+        # concrete guidance.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
+            resolve_coordinator_provider,
+        )
+
+        coordinator_provider = resolve_coordinator_provider()
         panes = pane_lines()
         sender = _sender_pane(panes)
-        coordinator = resolve_coordinator_codex(panes, sender)
+        coordinator = resolve_coordinator_codex(
+            panes, sender, provider=coordinator_provider
+        )
         if coordinator is not None:
             return coordinator["id"]
         die(
             _no_coordinator_message(
-                panes, sender, canonical_state=_sender_canonical_state(sender)
+                panes,
+                sender,
+                canonical_state=_sender_canonical_state(sender),
+                provider=coordinator_provider,
             )
         )
         raise AssertionError("unreachable")
