@@ -203,6 +203,12 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
     session_exists,
     source_tmux_conf,
 )
+# Runtime terminal-transport backend switch (Redmine #13253). The wiring lives in
+# its own module so ``commands.py`` does not grow; the decorator resolves the
+# repo-local ``terminal_transport`` selection and, only for the opt-in herdr
+# backend, swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped
+# herdr shim around the send — the tmux default installs nothing (byte-for-byte).
+from mozyo_bridge.application.handoff_transport_wiring import bind_runtime_transport
 from mozyo_bridge.scaffold.rules import (
     PORTABLE_HOME_EXPRESSION,
     install_rules,
@@ -1588,6 +1594,7 @@ def _maybe_restore_previous_active(
     )
 
 
+@bind_runtime_transport
 def orchestrate_handoff(
     args: argparse.Namespace,
     *,

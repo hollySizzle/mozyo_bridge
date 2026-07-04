@@ -1493,6 +1493,95 @@ staged-seam posture.
   wait surface (#13254), and re-deriving the subscribe-time / stderr tokens against
   a live binary.
 
+## Implemented Terminal Runtime Live-Wiring Seam (Redmine #13253)
+
+The #13245–#13248 US's landed the built-in **terminal runtime** parts behind a
+default-off backend selection but left every one a *staged* seam — constructed and
+fake-tested, never reached by a real send. #13253 is that wiring: it makes the live
+handoff rail use the herdr transport when `terminal_transport.backend: herdr` is
+selected, and it does so at a **single injection point** without rewriting the send
+choreography.
+
+### The seam (candidate C — a tmux-shaped binding behind the existing names)
+
+The tmux physical exit is
+`e_110_execution_platform/f_130_handoff_routing/infrastructure/tmux_client.py`
+(`run_tmux` / `capture_pane`) and is **frozen** — #13253 does not touch it.
+`application/commands.py` imports those two names, and `orchestrate_handoff` calls
+them at four `send-keys` sites and five `capture` sites. Rather than edit those
+call sites, #13253 keeps them and swaps *what the two names resolve to*:
+
+- `e_140_adapter_provider/f_130_terminal_runtime_provider/application/transport_binding.py`
+  defines `TransportBinding` (a `run_tmux`-shaped callable + a `capture_pane`-shaped
+  callable + a `backend` name) and the pure resolver
+  `resolve_runtime_transport_binding(config, *, tmux_run_tmux, tmux_capture_pane,
+  env=…, runner=…, port=…)`. The tmux primitives are **injected** so this
+  adapter-layer module never imports the tmux infrastructure package.
+- `application/handoff_transport_wiring.py` holds the injection point:
+  `resolve_handoff_transport_binding(args)` reads the repo-local
+  `terminal_transport` selection **once**, and the `bind_runtime_transport`
+  decorator on `orchestrate_handoff` — the *only* change to the send path, and
+  **not** a change to `orchestrate_handoff`'s body — installs the binding.
+
+### tmux transparency (byte-for-byte) and the monkeypatch seam
+
+For the tmux backend (the default, an absent `terminal_transport` block, or a
+broken config) the resolver returns the injected tmux callables **unchanged**
+(identical objects), and the decorator installs **nothing** — it calls
+`orchestrate_handoff` straight through. So the tmux path is byte-for-byte the prior
+behaviour, and the `commands.run_tmux` / `commands.capture_pane` monkeypatch seam
+(#12932) is untouched: every existing handoff/commands test stays green with no
+edit. The transparency is pinned two ways — a resolver contract test asserts the
+returned callables are the *same objects* passed in, and the entire existing
+handoff suite runs (unchanged) under the default binding.
+
+### herdr mapping (fail-closed, no silent fallback)
+
+For the herdr backend the resolver builds a tmux-shaped shim over the #13245
+`TerminalTransportPort` and the decorator swaps it in for the send, restoring the
+tmux globals in a `finally`. The shim maps the exact tmux argv shapes the rail
+emits — nothing else:
+
+| tmux call (`orchestrate_handoff`)                  | herdr port call                                 |
+| -------------------------------------------------- | ----------------------------------------------- |
+| `run_tmux("send-keys","-t",T,"-l","--",text)`      | `port.send_text(T, text)` (composer inject)     |
+| `run_tmux("send-keys","-t",T,"Enter")`             | `port.send_keys(T, "enter")` (submit the turn)  |
+| `run_tmux("send-keys","-t",T,"C-u")`               | `port.send_keys(T, "C-u")` (composer rollback)  |
+| `capture_pane(T, lines)`                           | `port.read_pane(T, source="visible", lines=…)`  |
+
+The match is exact argv (never a prefix / substring guess): a tmux subcommand the
+shim does not recognise **fails closed** with a raised `TransportBindingError`, and
+a mapped primitive that reports `ok=False` raises the same — the herdr path never
+returns a silent success and never drops a send. Selection is fail-closed too: a
+herdr selection whose trusted-environment binary (`MOZYO_HERDR_BINARY`) is
+unconfigured / unresolvable surfaces the #13245 `TerminalTransportError` as a clean
+`die`, never a silent downgrade to tmux (j#72318).
+
+The check-then-wait event rail (`HerdrTurnStartRail`, #13248) is **not** wired here:
+#13253 reuses the unchanged tmux-shaped send/capture choreography, so it binds only
+the transport primitives. `orchestrate_handoff`'s existing codex-standard turn-start
+observation (`turn_start_observation.py`) is capture-injected and therefore works
+over herdr through the same `capture_pane` → `read_pane` mapping unchanged.
+
+### One-line cut-over / roll-back (j#72318)
+
+Selecting or reverting the backend is a **single** `terminal_transport.backend`
+line in `.mozyo-bridge/config.yaml` plus a process restart — there is no data
+migration and no persisted binding to clear, because `resolve_handoff_transport_binding`
+reads the selection fresh per process and holds no state.
+
+### Scope (staged — kept explicit)
+
+- **In scope:** the pure `config -> TransportBinding` resolver, the tmux
+  passthrough binding, the tmux-shaped herdr shim (send-text / Enter / C-u /
+  capture mapping + fail-closed on an unmapped subcommand or a failed primitive),
+  the single-injection-point decorator, and the fake-port contract + orchestrate
+  smoke tests (no live binary).
+- **Out of scope (later US's):** switching a real workspace's config to herdr and
+  the live cut-over smoke (#13254), the installer / pin config (#13249), any live
+  herdr binary run, and wiring the richer event-based `HerdrTurnStartRail` (#13248)
+  into the send.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
