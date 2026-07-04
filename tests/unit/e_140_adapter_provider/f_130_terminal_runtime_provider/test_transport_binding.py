@@ -29,19 +29,30 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     TransportBindingError,
     resolve_runtime_transport_binding,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    encode_assigned_name,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     BACKEND_TMUX,
+    REASON_INVALID_TARGET,
     SOURCE_VISIBLE,
     PaneReadResult,
     TerminalTransportConfig,
     TerminalTransportError,
     TransportResult,
+    valid_target,
 )
 
 
 class FakePort:
-    """An in-memory :class:`TerminalTransportPort` recording every primitive call."""
+    """An in-memory :class:`TerminalTransportPort` recording every primitive call.
+
+    It enforces the **same** ``valid_target`` guard the live ``HerdrCliTransport``
+    applies (Redmine #13253 j#72367), so a tmux pane id (``%N``) that reached the
+    port un-translated fails ``invalid_target`` exactly as it would live — the fake
+    can no longer mask the un-translated-target bug.
+    """
 
     backend = BACKEND_HERDR
 
@@ -53,18 +64,24 @@ class FakePort:
 
     def send_text(self, target: str, text: str) -> TransportResult:
         self.calls.append(("send_text", target, text))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return TransportResult.success() if self._send_ok else TransportResult.failure(
             "transport_error", "boom"
         )
 
     def send_keys(self, target: str, keys: str) -> TransportResult:
         self.calls.append(("send_keys", target, keys))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return TransportResult.success() if self._send_ok else TransportResult.failure(
             "transport_error", "boom"
         )
 
     def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None) -> PaneReadResult:
         self.calls.append(("read_pane", target, source, lines))
+        if not valid_target(target):
+            return PaneReadResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         if not self._read_ok:
             return PaneReadResult.failure("transport_error", "boom")
         return PaneReadResult.success(self._read_content)
@@ -211,6 +228,97 @@ class HerdrMappingTest(unittest.TestCase):
         binding = self._herdr_binding(port)
         with self.assertRaises(TransportBindingError):
             binding.capture_pane("w1:p1", 50)
+
+
+class HerdrTargetTranslationTest(unittest.TestCase):
+    """The j#72367 fix: the rail's tmux ``%N`` is translated to a herdr locator."""
+
+    NAME = encode_assigned_name("ws-1", "claude", "default")
+
+    def _binding(self, port, *, assigned_name=None, list_agents=None):
+        run_tmux, capture_pane = _sentinel_tmux()
+        return resolve_runtime_transport_binding(
+            TerminalTransportConfig(backend=BACKEND_HERDR),
+            tmux_run_tmux=run_tmux,
+            tmux_capture_pane=capture_pane,
+            port=port,
+            assigned_name=assigned_name,
+            list_agents=list_agents,
+        )
+
+    def test_untranslated_tmux_id_is_rejected_by_the_guarded_port(self) -> None:
+        # Pin the bug: a raw %N reaching the (now faithful) port fails invalid_target.
+        port = FakePort()
+        result = port.send_text("%2", "x")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, REASON_INVALID_TARGET)
+
+    def test_tmux_pane_id_translated_to_locator_before_send(self) -> None:
+        port = FakePort()
+        rows = [{"name": self.NAME, "pane": "w1:p1"}]
+        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
+        binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "MARK body")
+        # The port only ever saw the live locator, never the tmux %N.
+        self.assertEqual(port.calls, [("send_text", "w1:p1", "MARK body")])
+
+    def test_capture_target_translated_to_locator(self) -> None:
+        port = FakePort(read_content="x")
+        rows = [{"name": self.NAME, "location": "w1:p1"}]
+        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
+        binding.capture_pane("%2", 50)
+        self.assertEqual(port.calls, [("read_pane", "w1:p1", SOURCE_VISIBLE, 50)])
+
+    def test_translation_is_memoised_across_the_invocation(self) -> None:
+        port = FakePort()
+        rows = [{"name": self.NAME, "pane": "w1:p1"}]
+        fetches = {"n": 0}
+
+        def list_agents():
+            fetches["n"] += 1
+            return rows
+
+        binding = self._binding(port, assigned_name=self.NAME, list_agents=list_agents)
+        binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        binding.run_tmux("send-keys", "-t", "%2", "Enter")
+        binding.capture_pane("%2", 50)
+        self.assertEqual(fetches["n"], 1)  # one receiver, one agent-list fetch
+
+    def test_already_herdr_valid_target_passes_through_without_fetch(self) -> None:
+        port = FakePort()
+
+        def must_not_fetch():
+            raise AssertionError("a herdr-valid target must not fetch the agent list")
+
+        binding = self._binding(
+            port, assigned_name=self.NAME, list_agents=must_not_fetch
+        )
+        binding.run_tmux("send-keys", "-t", "w9:p9", "-l", "--", "body")
+        self.assertEqual(port.calls, [("send_text", "w9:p9", "body")])
+
+    def test_rebind_not_found_fails_closed_before_the_port(self) -> None:
+        port = FakePort()
+        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: [])
+        with self.assertRaises(TransportBindingError):
+            binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        self.assertEqual(port.calls, [])  # nothing was sent
+
+    def test_rebind_ambiguous_fails_closed(self) -> None:
+        port = FakePort()
+        rows = [
+            {"name": self.NAME, "pane": "w1:p1"},
+            {"name": self.NAME, "pane": "w2:p2"},
+        ]
+        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
+        with self.assertRaises(TransportBindingError):
+            binding.run_tmux("send-keys", "-t", "%2", "Enter")
+        self.assertEqual(port.calls, [])
+
+    def test_no_receiver_identity_fails_closed_on_tmux_target(self) -> None:
+        port = FakePort()
+        binding = self._binding(port)  # assigned_name / list_agents both absent
+        with self.assertRaises(TransportBindingError):
+            binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        self.assertEqual(port.calls, [])
 
 
 class HerdrResolutionFailClosedTest(unittest.TestCase):

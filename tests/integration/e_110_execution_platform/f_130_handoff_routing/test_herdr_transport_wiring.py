@@ -33,15 +33,27 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     resolve_runtime_transport_binding,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    encode_assigned_name,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
+    REASON_INVALID_TARGET,
     SOURCE_VISIBLE,
     PaneReadResult,
     TerminalTransportConfig,
     TransportResult,
+    valid_target,
 )
 
 SESSION = "mozyo-cockpit"
+
+# The receiver's durable herdr identity + the live locator its agent-list row maps
+# to. The rail hands the shim a tmux %N target; the translation boundary re-binds
+# this name against the fake agent list and rewrites %N -> this locator.
+RECEIVER_NAME = encode_assigned_name("ws-it-donyu", "claude", "default")
+RECEIVER_LOCATOR = "w1:p1"
+AGENT_ROWS = [{"name": RECEIVER_NAME, "pane": RECEIVER_LOCATOR}]
 
 
 def _pane(pane_id, location, **kw):
@@ -83,7 +95,12 @@ REPO_ROOTS = {"/ws/it-donyu": "/ws/it-donyu", "/ws/it-donyu/app": "/ws/it-donyu"
 
 
 class FakePort:
-    """An in-memory herdr :class:`TerminalTransportPort` recording every call."""
+    """An in-memory herdr port recording every call, with the live ``valid_target`` guard.
+
+    The guard mirrors ``HerdrCliTransport`` (Redmine #13253 j#72367): a tmux ``%N``
+    that reached the port un-translated fails ``invalid_target``, so the fake can no
+    longer mask the un-translated-target bug.
+    """
 
     backend = BACKEND_HERDR
 
@@ -92,14 +109,20 @@ class FakePort:
 
     def send_text(self, target, text):
         self.calls.append(("send_text", target, text))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return TransportResult.success()
 
     def send_keys(self, target, keys):
         self.calls.append(("send_keys", target, keys))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return TransportResult.success()
 
     def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None):
         self.calls.append(("read_pane", target, source, lines))
+        if not valid_target(target):
+            return PaneReadResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return PaneReadResult.success("")
 
 
@@ -133,6 +156,8 @@ class HerdrWiringSmokeTest(unittest.TestCase):
             tmux_run_tmux=_tmux_run_tmux,
             tmux_capture_pane=_tmux_capture_pane,
             port=port,
+            assigned_name=RECEIVER_NAME,
+            list_agents=lambda: AGENT_ROWS,
         )
 
         argv = [
@@ -188,15 +213,19 @@ class HerdrWiringSmokeTest(unittest.TestCase):
         self.assertIn("send_text", kinds)
         self.assertIn("send_keys", kinds)
 
+        # Every port target is the translated live locator, never the rail's tmux %N.
+        for call in port.calls:
+            self.assertEqual(call[1], RECEIVER_LOCATOR, msg=f"un-translated target: {call!r}")
+
         send_text_calls = [c for c in port.calls if c[0] == "send_text"]
         self.assertEqual(len(send_text_calls), 1)
         _, target, text = send_text_calls[0]
-        self.assertEqual(target, "%901")
+        self.assertEqual(target, RECEIVER_LOCATOR)
         self.assertIn("herdr smoke", text)
 
         enter_calls = [c for c in port.calls if c[0] == "send_keys" and c[2] == "enter"]
         self.assertEqual(len(enter_calls), 1)
-        self.assertEqual(enter_calls[0][1], "%901")
+        self.assertEqual(enter_calls[0][1], RECEIVER_LOCATOR)
 
         # The read maps to the visible source (the tmux capture equivalent).
         read_calls = [c for c in port.calls if c[0] == "read_pane"]
@@ -220,17 +249,23 @@ class StatefulFakePort:
 
     def send_text(self, target, text):
         self.calls.append(("send_text", target, text))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         self.composer += text
         return TransportResult.success()
 
     def send_keys(self, target, keys):
         self.calls.append(("send_keys", target, keys))
+        if not valid_target(target):
+            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         if keys == "enter":
             self.composer = ""
         return TransportResult.success()
 
     def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None):
         self.calls.append(("read_pane", target, source, lines))
+        if not valid_target(target):
+            return PaneReadResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
         return PaneReadResult.success(self.composer)
 
 
@@ -262,6 +297,8 @@ class HerdrInactiveTargetActivationTest(unittest.TestCase):
             tmux_run_tmux=_tmux_unused,
             tmux_capture_pane=_tmux_unused,
             port=port,
+            assigned_name=RECEIVER_NAME,
+            list_agents=lambda: AGENT_ROWS,
         )
 
         argv = [
@@ -320,11 +357,14 @@ class HerdrInactiveTargetActivationTest(unittest.TestCase):
         self.assertIsNotNone(outcome, msg=out.getvalue())
         self.assertEqual(outcome.get("status"), "sent")
 
-        # Delivery reached the herdr port: composer inject + submit.
+        # Delivery reached the herdr port: composer inject + submit, at the
+        # translated live locator (never the rail's tmux %2).
         self.assertTrue([c for c in port.calls if c[0] == "send_text"])
         self.assertTrue(
             [c for c in port.calls if c[0] == "send_keys" and c[2] == "enter"]
         )
+        for call in port.calls:
+            self.assertEqual(call[1], RECEIVER_LOCATOR, msg=f"un-translated target: {call!r}")
         # The durable record still documents the #12597 activation fact.
         self.assertIn("- Activation:", out.getvalue())
 

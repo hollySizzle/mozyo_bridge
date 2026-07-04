@@ -43,6 +43,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     TransportBinding,
     resolve_runtime_transport_binding,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    HerdrIdentityError,
+    encode_assigned_name,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     TerminalTransportError,
@@ -51,7 +55,49 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
     capture_pane as _tmux_capture_pane,
     run_tmux as _tmux_run_tmux,
 )
+from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
 from mozyo_bridge.shared.errors import die
+
+
+def _resolve_receiver_assigned_name(args: argparse.Namespace) -> str:
+    """Mint the receiver's durable herdr assigned name for this send (fail-closed).
+
+    The receiver's identity slot is ``(workspace_id, role, lane)`` — the same slot
+    the route-identity ledger and #13247 use. ``role`` is the handoff receiver
+    (``--to claude|codex``); ``workspace_id`` and ``lane`` come from the repo
+    context (``resolve_canonical_session`` + the ``_resolve_workspace_lane`` probe),
+    normalised exactly as #13247 prescribes (an empty lane -> ``default``). The name
+    is minted with #13247 ``encode_assigned_name``; a missing role / workspace (an
+    empty required component) fails closed with a clean ``die`` — a herdr send must
+    not proceed without a durable receiver handle to translate its tmux target to.
+    """
+    role = getattr(args, "to", None)
+    repo_root = repo_root_from_args(args)
+    try:
+        workspace_id = resolve_canonical_session(repo_root).workspace_id
+    except Exception:  # pragma: no cover - defensive; unresolvable workspace context
+        workspace_id = None
+    # The lane probe lives in ``commands`` (git checkout facts + registered
+    # canonical path); resolve it lazily to avoid an import cycle, and degrade to
+    # the #13247 default lane if it cannot be derived.
+    lane_id = ""
+    try:
+        from mozyo_bridge.application import commands
+
+        lane_id = getattr(
+            commands._resolve_workspace_lane(str(repo_root), workspace_id), "lane_id", ""
+        )
+    except Exception:  # pragma: no cover - defensive; lane probe is best-effort
+        lane_id = ""
+    try:
+        return encode_assigned_name(workspace_id or "", role or "", lane_id or "")
+    except HerdrIdentityError as exc:
+        die(
+            "terminal transport backend 'herdr' is selected but the receiver's herdr "
+            f"identity could not be resolved (role={role!r}, workspace_id={workspace_id!r}): "
+            f"{exc}"
+        )
+        raise AssertionError("unreachable")
 
 
 def resolve_handoff_transport_binding(
@@ -63,8 +109,13 @@ def resolve_handoff_transport_binding(
     ``terminal_transport`` block, or a broken / unreadable config) so the caller
     installs nothing; returns a herdr :class:`TransportBinding` when the herdr
     backend is selected and its trusted-environment binary resolves. A herdr
-    selection whose binary is unconfigured / unresolvable fails closed with a
-    clean ``die`` (never a silent tmux fallback).
+    selection whose binary is unconfigured / unresolvable, or whose receiver herdr
+    identity cannot be minted, fails closed with a clean ``die`` (never a silent
+    tmux fallback).
+
+    For the herdr backend the receiver's durable assigned name is minted here (from
+    ``--to`` + the repo workspace/lane context) and handed to the binding so the
+    shim can translate the rail's tmux target (``%N``) into a live herdr locator.
     """
     try:
         config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
@@ -74,11 +125,13 @@ def resolve_handoff_transport_binding(
         return None
     if config.backend != BACKEND_HERDR:
         return None
+    assigned_name = _resolve_receiver_assigned_name(args)
     try:
         return resolve_runtime_transport_binding(
             config,
             tmux_run_tmux=_tmux_run_tmux,
             tmux_capture_pane=_tmux_capture_pane,
+            assigned_name=assigned_name,
         )
     except TerminalTransportError as exc:
         die(f"terminal transport backend 'herdr' is selected but unavailable: {exc}")

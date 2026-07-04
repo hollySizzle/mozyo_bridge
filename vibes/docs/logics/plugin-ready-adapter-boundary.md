@@ -1585,6 +1585,42 @@ the transport primitives. `orchestrate_handoff`'s existing codex-standard turn-s
 observation (`turn_start_observation.py`) is capture-injected and therefore works
 over herdr through the same `capture_pane` → `read_pane` mapping unchanged.
 
+### Target translation: tmux `%N` → live herdr locator (finding-2 fix, j#72367)
+
+`orchestrate_handoff` resolves its send target through the **tmux** pane resolver,
+so the target the rail hands the shim is a tmux pane id (`%N`). The live
+`HerdrCliTransport` guards every primitive with the domain `valid_target` regex,
+which rejects a leading `%` (`invalid_target`) — so an un-translated `%N` makes
+*every* live herdr send fail before typing (a fake port without the guard hid this;
+the regression fakes now carry the same guard). The shim therefore runs each
+send/capture target through a target translator (using the #13247/#13246 durable
+identity parts) before the port call:
+
+- a target that is already herdr-valid (a `mzb1_…` assigned name or a `w1:p1` live
+  locator — anything `valid_target` accepts) is **passed through** unchanged;
+- a tmux `%N` is mapped to the **receiver's** live locator by re-binding the
+  receiver's durable assigned name against a fresh `agent list` snapshot.
+
+Resolution procedure (per invocation, one receiver):
+
+1. **Identity slot.** `role` = the handoff receiver (`--to claude|codex`);
+   `workspace_id` + `lane` come from the repo context (`resolve_canonical_session` +
+   the `_resolve_workspace_lane` probe), normalised exactly as #13247 prescribes
+   (empty lane → `default`). Minted with #13247 `encode_assigned_name`; a missing
+   role / workspace fails closed with a `die` before any send.
+2. **Live snapshot.** `agent list --json` via the same trusted-environment binary as
+   the transport (the rows carry the durable `name` + the transient `pane` locator);
+   the row extraction reuses the #13246 defensive parser.
+3. **Re-bind.** #13247 `rebind_by_name(assigned_name, rows)` → the live locator. The
+   result is memoised, so the one receiver triggers one `agent list` fetch.
+
+Fail-closed before typing (no silent send to a bad target): an un-resolvable
+receiver identity, or a re-bind failure (`rebind_invalid_name` / `…_not_found` /
+`…_ambiguous` / `…_missing_locator`), raises a `TransportBindingError` (or a `die`
+for the identity step) **before** any port call — the send never lands on a guessed
+or blank target. `select-pane` is the sole target that is *not* translated: it is a
+no-op that never reaches the port (only checked well-formed).
+
 ### One-line cut-over / roll-back (j#72318)
 
 Selecting or reverting the backend is a **single** `terminal_transport.backend`
@@ -1597,9 +1633,10 @@ reads the selection fresh per process and holds no state.
 - **In scope:** the pure `config -> TransportBinding` resolver, the tmux
   passthrough binding, the tmux-shaped herdr shim (send-text / Enter / C-u /
   capture maps, the `select-pane` target-checked no-op, and fail-closed on any
-  other subcommand or a failed primitive), the single-injection-point decorator,
-  and the fake-port contract + orchestrate smoke + inactive-target-activation tests
-  (no live binary).
+  other subcommand or a failed primitive), the tmux-`%N` → live-herdr-locator
+  target translation (identity mint + `agent list` re-bind, fail-closed before
+  typing), the single-injection-point decorator, and the fake-port contract +
+  orchestrate smoke + inactive-target-activation + translation tests (no live binary).
 - **Out of scope (later US's):** switching a real workspace's config to herdr and
   the live cut-over smoke (#13254), the installer / pin config (#13249), any live
   herdr binary run, and wiring the richer event-based `HerdrTurnStartRail` (#13248)

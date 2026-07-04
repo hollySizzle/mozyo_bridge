@@ -23,10 +23,28 @@ the two callables those names resolve to:
   seam (#12932) is untouched and every existing handoff test stays green.
 - **herdr backend (opt-in).** The binding's callables are a *tmux-shaped shim*
   over the #13245 :class:`~...domain.terminal_transport.TerminalTransportPort`:
-  the four tmux argv shapes the rail emits are mapped onto the port's
-  ``send_text`` / ``send_keys`` / ``read_pane`` primitives. A tmux subcommand the
-  shim does not recognise **fails closed** with an explicit error — it is never
-  silently ignored or passed through, so the shim can never quietly drop a send.
+  the tmux argv shapes the rail emits are mapped onto the port's ``send_text`` /
+  ``send_keys`` / ``read_pane`` primitives. A tmux subcommand the shim does not
+  recognise **fails closed** with an explicit error — it is never silently ignored
+  or passed through, so the shim can never quietly drop a send.
+
+Target translation (Redmine #13253 j#72367)
+--------------------------------------------
+``orchestrate_handoff`` resolves its send target through the *tmux* pane resolver,
+so the target the rail hands the shim is a tmux pane id (``%N``). The live
+``HerdrCliTransport`` guards every primitive with the domain ``valid_target``
+regex, which rejects a leading ``%`` (``invalid_target``) — so an un-translated
+``%N`` would make *every* herdr send fail before typing. The shim therefore runs
+each send/capture target through a :class:`_HerdrTargetTranslator` first: a
+target that is already herdr-valid (a ``mzb1_…`` assigned name or a ``w1:p1`` live
+locator) passes through, and a tmux ``%N`` is mapped to the **receiver's** live
+locator by re-binding the receiver's durable assigned name — minted from its
+``(workspace_id, role, lane)`` slot via #13247 ``encode_assigned_name`` — against a
+fresh ``agent list`` snapshot (#13246 read surface + #13247 ``rebind_by_name``). A
+re-bind failure (``rebind_invalid_name`` / ``…_not_found`` / ``…_ambiguous`` /
+``…_missing_locator``) fails closed **before** the port call, so a send never lands
+on a guessed or blank target. ``select-pane`` is the sole exception: it is a no-op
+that never reaches the port, so it is not translated (only checked well-formed).
 
 Fail-closed selection (Redmine #13253 j#72318, no silent tmux fallback):
 
@@ -96,27 +114,44 @@ Scope (staged seam — kept explicit so it does not drift):
 
 from __future__ import annotations
 
+import functools
+import os
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    rebind_by_name,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     BACKEND_TMUX,
+    REASON_BINARY_NOT_FOUND,
+    REASON_BINARY_UNCONFIGURED,
     SOURCE_VISIBLE,
     TerminalTransportConfig,
     TerminalTransportError,
     TerminalTransportPort,
+    valid_target,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
+    _extract_list_rows,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
+    COMMAND_TIMEOUT_SECONDS,
+    HERDR_BINARY_ENV,
     Runner,
-    resolve_terminal_transport,
+    HerdrCliTransport,
+    _resolve_binary,
 )
 
 #: A tmux-shaped ``run_tmux(*args, check=True) -> CompletedProcess`` callable.
 RunTmux = Callable[..., "subprocess.CompletedProcess[str]"]
 #: A tmux-shaped ``capture_pane(target, lines) -> str`` callable.
 CapturePane = Callable[[str, int], str]
+#: A live ``agent list`` snapshot provider: returns the raw herdr row mappings
+#: (``name`` + transient ``pane`` locator) that :func:`rebind_by_name` consumes.
+AgentListProvider = Callable[[], Sequence[Mapping[str, object]]]
 
 
 class TransportBindingError(TerminalTransportError):
@@ -145,6 +180,70 @@ class TransportBinding:
     capture_pane: CapturePane
 
 
+class _HerdrTargetTranslator:
+    """Translate a rail-supplied tmux target into a live herdr locator (Redmine #13253 j#72367).
+
+    ``orchestrate_handoff`` resolves its send target through the tmux pane resolver,
+    so the target the rail hands the shim is a **tmux pane id** (``%N``). The live
+    :class:`~...infrastructure.herdr_transport.HerdrCliTransport` guards every
+    primitive with the domain :func:`valid_target` regex, which rejects a leading
+    ``%`` (``invalid_target``) — so an un-translated ``%N`` would make *every* herdr
+    send fail before typing. This translator closes that gap using the durable
+    identity components (#13247 / #13246):
+
+    - a target that is already herdr-valid (a ``mzb1_…`` assigned name or a
+      ``w1:p1`` live locator — anything :func:`valid_target` accepts) is passed
+      through unchanged;
+    - a tmux-shaped target (``%N``) is mapped to the **receiver's** live locator by
+      re-binding the receiver's durable assigned name against a fresh ``agent list``
+      snapshot (:func:`rebind_by_name`). One handoff invocation addresses one
+      receiver, so the mapping is memoised the first time it resolves.
+
+    Fail-closed (no silent send to a bad target): a tmux target with no resolvable
+    receiver identity, or a re-bind that fails (``rebind_invalid_name`` /
+    ``rebind_not_found`` / ``rebind_ambiguous`` / ``rebind_missing_locator``),
+    raises :class:`TransportBindingError` carrying the #13247 status *before* any
+    port call — the send never lands on a guessed or blank target.
+    """
+
+    def __init__(
+        self,
+        *,
+        assigned_name: Optional[str],
+        list_agents: Optional[AgentListProvider],
+    ):
+        self._assigned_name = assigned_name
+        self._list_agents = list_agents
+        self._cache: dict = {}
+
+    def translate(self, target: object) -> str:
+        # Already a herdr-valid handle (assigned name / live locator): pass through.
+        if valid_target(target):
+            return target  # type: ignore[return-value]
+        if not isinstance(target, str) or not target:
+            raise TransportBindingError(
+                f"herdr transport received an unusable target {target!r}; refusing to send"
+            )
+        if target in self._cache:
+            return self._cache[target]
+        if not self._assigned_name or self._list_agents is None:
+            raise TransportBindingError(
+                f"herdr backend selected but no receiver herdr identity is available to "
+                f"translate the tmux target {target!r} (assigned_name="
+                f"{self._assigned_name!r}); refusing to send to an un-translatable target"
+            )
+        rows = self._list_agents()
+        result = rebind_by_name(self._assigned_name, rows)
+        if result.is_fail:
+            raise TransportBindingError(
+                f"herdr target translation failed for tmux target {target!r} "
+                f"(assigned_name={self._assigned_name}, status={result.status}): "
+                f"{result.detail}"
+            )
+        self._cache[target] = result.locator
+        return result.locator
+
+
 class _HerdrTmuxShim:
     """A tmux-shaped adapter over a :class:`TerminalTransportPort` (herdr).
 
@@ -170,6 +269,12 @@ class _HerdrTmuxShim:
     handle through to tmux. A mapped primitive that reports ``ok=False``, or a
     ``select-pane`` with a malformed target, raises :class:`TransportBindingError` —
     the herdr path never returns a silent success and never falls back to tmux.
+
+    The rail's target is a tmux pane id (``%N``); every mapped primitive first runs
+    it through the :class:`_HerdrTargetTranslator` so the port only ever sees a
+    live herdr locator (a re-bind failure fails closed before the port call).
+    ``select-pane`` is a no-op and so is *not* translated (it never reaches the
+    port); its target is only checked for well-formedness.
     """
 
     #: The literal enter token the rail's ``send-keys … Enter`` maps to, matching
@@ -180,8 +285,9 @@ class _HerdrTmuxShim:
     #: to herdr ``pane send-keys`` unchanged.
     _ROLLBACK_KEYS = "C-u"
 
-    def __init__(self, port: TerminalTransportPort):
+    def __init__(self, port: TerminalTransportPort, translator: _HerdrTargetTranslator):
         self._port = port
+        self._translator = translator
 
     def run_tmux(self, *args: str, check: bool = True) -> "subprocess.CompletedProcess[str]":
         """Map a tmux ``send-keys`` / ``select-pane`` invocation; fail closed otherwise.
@@ -194,18 +300,24 @@ class _HerdrTmuxShim:
         fail-closed contract).
         """
         if len(args) >= 3 and args[0] == "send-keys" and args[1] == "-t":
-            target = args[2]
+            raw_target = args[2]
             rest = tuple(args[3:])
+            # Translate the rail's tmux target (``%N``) to a live herdr locator only
+            # for a recognised send shape (a re-bind failure fails closed here);
+            # an unmapped send-keys shape falls through to the final raise untouched.
             if len(rest) == 3 and rest[0] == "-l" and rest[1] == "--":
+                target = self._translator.translate(raw_target)
                 self._require_ok(self._port.send_text(target, rest[2]), "send_text")
                 return _ok_completed(args)
             if len(rest) == 1:
                 if rest[0] == "Enter":
+                    target = self._translator.translate(raw_target)
                     self._require_ok(
                         self._port.send_keys(target, self._ENTER_KEYS), "send_keys(enter)"
                     )
                     return _ok_completed(args)
                 if rest[0] == self._ROLLBACK_KEYS:
+                    target = self._translator.translate(raw_target)
                     self._require_ok(
                         self._port.send_keys(target, self._ROLLBACK_KEYS),
                         "send_keys(C-u)",
@@ -240,6 +352,7 @@ class _HerdrTmuxShim:
 
     def capture_pane(self, target: str, lines: int) -> str:
         """Map ``capture_pane`` onto the herdr port's ``read_pane`` (visible source)."""
+        target = self._translator.translate(target)
         result = self._port.read_pane(target, source=SOURCE_VISIBLE, lines=lines)
         if not result.ok:
             raise TransportBindingError(
@@ -282,6 +395,74 @@ def _well_formed_pane_target(target: object) -> bool:
     )
 
 
+def _resolve_herdr_binary(
+    config: TerminalTransportConfig, env: Optional[Mapping[str, str]]
+) -> str:
+    """Resolve the trusted-environment herdr binary for a herdr selection (fail-closed).
+
+    Rides on exactly the same ``MOZYO_HERDR_BINARY`` + PATH-key resolution the
+    #13245 / #13246 resolvers use (:data:`HERDR_BINARY_ENV`, :func:`_resolve_binary`),
+    so the shim's port and its ``agent list`` fetch never point at different
+    binaries. Raises :class:`TerminalTransportError` (``binary_unconfigured`` /
+    ``binary_not_found``) — never a silent fallback to tmux.
+    """
+    source_env: Mapping[str, str] = env if env is not None else os.environ
+    raw = source_env.get(HERDR_BINARY_ENV)
+    binary = raw.strip() if isinstance(raw, str) else ""
+    if not binary:
+        raise TerminalTransportError(
+            f"terminal transport backend 'herdr' is selected but no herdr binary is "
+            f"configured in the trusted environment ({HERDR_BINARY_ENV}); refusing to "
+            f"fall back to tmux",
+            reason=REASON_BINARY_UNCONFIGURED,
+        )
+    resolved = _resolve_binary(binary, source_env)
+    if resolved is None:
+        raise TerminalTransportError(
+            f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
+            f"executable file or on the trusted environment PATH; refusing to fall "
+            f"back to tmux",
+            reason=REASON_BINARY_NOT_FOUND,
+        )
+    return resolved
+
+
+def _fetch_agent_list_rows(
+    binary: str, runner: Optional[Runner]
+) -> Sequence[Mapping[str, object]]:
+    """Run herdr ``agent list --json`` and return its raw rows (fail-closed).
+
+    The rows carry the durable ``name`` and the transient ``pane`` locator that
+    :func:`rebind_by_name` matches; the row extraction reuses the #13246 defensive
+    parser (:func:`_extract_list_rows`). Any mechanical failure (missing binary,
+    spawn / OS error, timeout, non-zero exit) or an unrecognisable payload raises
+    :class:`TransportBindingError` so target translation fails closed rather than
+    re-binding against an empty list.
+    """
+    run = runner if runner is not None else subprocess.run
+    argv = [binary, "agent", "list", "--json"]
+    try:
+        completed = run(argv, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS)
+    except FileNotFoundError:
+        raise TransportBindingError(f"herdr binary not found: {binary!r}")
+    except subprocess.TimeoutExpired:
+        raise TransportBindingError("herdr agent list timed out")
+    except OSError as exc:
+        raise TransportBindingError(
+            f"herdr agent list failed ({exc.__class__.__name__})"
+        )
+    if completed.returncode != 0:
+        raise TransportBindingError(
+            f"herdr agent list exited {completed.returncode}"
+        )
+    rows = _extract_list_rows(completed.stdout)
+    if rows is None:
+        raise TransportBindingError(
+            "herdr agent list payload was not a recognised JSON array or agents object"
+        )
+    return rows
+
+
 def resolve_runtime_transport_binding(
     config: Optional[TerminalTransportConfig] = None,
     *,
@@ -290,6 +471,8 @@ def resolve_runtime_transport_binding(
     env: Optional[Mapping[str, str]] = None,
     runner: Optional[Runner] = None,
     port: Optional[TerminalTransportPort] = None,
+    assigned_name: Optional[str] = None,
+    list_agents: Optional[AgentListProvider] = None,
 ) -> TransportBinding:
     """Resolve the :class:`TransportBinding` for a ``terminal_transport`` selection.
 
@@ -301,14 +484,19 @@ def resolve_runtime_transport_binding(
     *unchanged* (the binding's callables are identical objects, so the tmux path is
     byte-for-byte the current behaviour).
 
-    Fail-closed selection (no silent tmux fallback once herdr is selected):
+    For the herdr backend, ``assigned_name`` is the **receiver's** durable herdr
+    assigned name (#13247, minted from its ``(workspace_id, role, lane)`` slot) and
+    ``list_agents`` is a live ``agent list`` snapshot provider; together they let
+    the shim translate the rail's tmux target (``%N``) into a live herdr locator
+    (:class:`_HerdrTargetTranslator`). When ``port`` is not injected they are
+    resolved from the same trusted-environment binary as the port, so a real send
+    re-binds against the live agent list; tests inject ``port`` + ``list_agents`` +
+    ``assigned_name`` directly.
 
-    - the default / tmux backend returns a passthrough binding over the injected
-      tmux callables;
-    - the herdr backend resolves the #13245 transport port (or uses an injected
-      ``port`` for tests) and returns a tmux-shaped shim binding; an unconfigured
-      or unresolvable herdr binary raises :class:`TerminalTransportError` from
-      :func:`resolve_terminal_transport`.
+    Fail-closed selection (no silent tmux fallback once herdr is selected): the
+    default / tmux backend returns a passthrough binding over the injected tmux
+    callables; a herdr selection whose binary is unconfigured / unresolvable raises
+    :class:`TerminalTransportError`.
     """
     if config is None:
         config = TerminalTransportConfig.default()
@@ -319,18 +507,24 @@ def resolve_runtime_transport_binding(
             capture_pane=tmux_capture_pane,
         )
     resolved_port: Optional[TerminalTransportPort]
+    fetch: Optional[AgentListProvider] = list_agents
     if port is not None:
         resolved_port = port
     else:
         # Fail-closed: raises TerminalTransportError when the herdr binary is
-        # unconfigured / unresolvable — never a silent downgrade to tmux.
-        resolved_port = resolve_terminal_transport(config, env=env, runner=runner)
+        # unconfigured / unresolvable — never a silent downgrade to tmux. The port
+        # and the agent-list fetch share the one resolved binary.
+        binary = _resolve_herdr_binary(config, env)
+        resolved_port = HerdrCliTransport(binary, runner=runner)
+        if fetch is None:
+            fetch = functools.partial(_fetch_agent_list_rows, binary, runner)
     if resolved_port is None:
         raise TransportBindingError(
             "terminal transport backend 'herdr' is selected but no transport port "
             "could be resolved; refusing to fall back to tmux"
         )
-    shim = _HerdrTmuxShim(resolved_port)
+    translator = _HerdrTargetTranslator(assigned_name=assigned_name, list_agents=fetch)
+    shim = _HerdrTmuxShim(resolved_port, translator)
     return TransportBinding(
         backend=BACKEND_HERDR,
         run_tmux=shim.run_tmux,
@@ -339,6 +533,7 @@ def resolve_runtime_transport_binding(
 
 
 __all__ = (
+    "AgentListProvider",
     "CapturePane",
     "RunTmux",
     "TransportBinding",
