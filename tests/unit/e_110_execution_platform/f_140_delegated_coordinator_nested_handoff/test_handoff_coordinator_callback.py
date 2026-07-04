@@ -213,6 +213,16 @@ class ResolveTargetCoordinatorTest(unittest.TestCase):
         ):
             self.assertEqual("%954", resolve_target("coordinator"))
 
+    def test_missing_coordinator_message_names_rebound_provider(self) -> None:
+        # j#72027: under a coordinator->claude rebind the fail-closed guidance must
+        # direct the operator at the provider actually being sought — a fixed
+        # "Codex" hint would tell them to stand up the wrong pane.
+        panes = [SUBLANE_CLAUDE, SUBLANE_CODEX]  # coordinator lane absent
+        message = _no_coordinator_message(panes, SUBLANE_CLAUDE, provider="claude")
+        self.assertIn("no default-lane (coordinator) claude pane", message)
+        self.assertIn("running claude pane", message)
+        self.assertNotIn("Codex", message)
+
     def test_coordinator_label_live_route_default_binding_unchanged(self) -> None:
         # Behavior-preserving: with the real (unpatched) provider resolution and the
         # repo's committed config (no provider_binding block), the live route still
@@ -244,7 +254,7 @@ class ResolveTargetCoordinatorTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     resolve_target("coordinator")
         message = err.getvalue()
-        self.assertIn("no default-lane (coordinator) Codex", message)
+        self.assertIn("no default-lane (coordinator) codex", message)
         self.assertIn(WS_BRIDGE, message)
 
     def test_ambiguous_coordinator_fails_closed_with_candidates(self) -> None:
@@ -259,7 +269,7 @@ class ResolveTargetCoordinatorTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     resolve_target("coordinator")
         message = err.getvalue()
-        self.assertIn("multiple default-lane Codex", message)
+        self.assertIn("multiple default-lane codex", message)
         self.assertIn("%953", message)
         self.assertIn("%955", message)
 
@@ -272,7 +282,7 @@ class NoCoordinatorCanonicalHintTest(unittest.TestCase):
 
     def test_generic_hint_without_canonical_state(self) -> None:
         message = _no_coordinator_message(self.PANES, SUBLANE_CLAUDE)
-        self.assertIn("no default-lane (coordinator) Codex pane", message)
+        self.assertIn("no default-lane (coordinator) codex pane", message)
         self.assertNotIn("registry defect", message)
 
     def test_dead_canonical_names_the_registry_defect(self) -> None:
@@ -316,7 +326,7 @@ class NoCoordinatorCanonicalHintTest(unittest.TestCase):
         message = _no_coordinator_message(
             self.PANES, SUBLANE_CLAUDE, canonical_state=canonical_state
         )
-        self.assertIn("no default-lane (coordinator) Codex pane", message)
+        self.assertIn("no default-lane (coordinator) codex pane", message)
         self.assertNotIn("registry defect", message)
 
 

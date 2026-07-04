@@ -582,7 +582,7 @@ def _no_coordinator_message(
     canonical_state: dict[str, object] | None = None,
     provider: str = AGENT_KIND_CODEX,
 ) -> str:
-    """Fail-closed guidance when the coordinator Codex cannot be resolved (#12015).
+    """Fail-closed guidance when the coordinator pane cannot be resolved (#12015).
 
     ``canonical_state`` (Redmine #13152) is the optional liveness fact for the
     sender workspace's registered ``canonical_path`` (from
@@ -595,7 +595,7 @@ def _no_coordinator_message(
     if sender is None:
         return (
             "cannot resolve `coordinator`: the sender pane is unknown (run from "
-            "inside the lane's pane). Name the coordinator Codex explicitly with "
+            "inside the lane's pane). Name the coordinator pane explicitly with "
             "`--target %pane` (see `mozyo-bridge agents targets`)."
         )
     sender_ws, _sender_lane = _pane_lane_identity(sender)
@@ -603,7 +603,7 @@ def _no_coordinator_message(
         return (
             "cannot resolve `coordinator`: the sender pane carries no workspace "
             "identity, so its workspace's coordinator lane cannot be selected. "
-            "Name the coordinator Codex explicitly with `--target %pane` "
+            "Name the coordinator pane explicitly with `--target %pane` "
             "(see `mozyo-bridge agents targets`)."
         )
     candidates = coordinator_codex_candidates(panes, sender_ws, provider=provider)
@@ -615,15 +615,15 @@ def _no_coordinator_message(
             f"workspace {sender_ws!r}{where} does not point at a live main "
             "checkout (it is missing or a linked worktree), so the coordinator "
             "lane cannot be found. This is a registry defect, not a missing "
-            "Codex pane: run `mozyo-bridge workspace register` from the "
+            f"{provider} pane: run `mozyo-bridge workspace register` from the "
             "workspace's main checkout to repair it (Redmine #13152), or name the "
-            "coordinator Codex explicitly with `--target %pane`."
+            "coordinator pane explicitly with `--target %pane`."
         )
     if not candidates:
         reason = (
-            f"no default-lane (coordinator) Codex pane was found in workspace "
+            f"no default-lane (coordinator) {provider} pane was found in workspace "
             f"{sender_ws!r}. Ensure the workspace's main checkout has a running "
-            "Codex pane"
+            f"{provider} pane"
         )
     else:
         listed = ", ".join(
@@ -631,11 +631,11 @@ def _no_coordinator_message(
             for pane in sorted(candidates, key=lambda pane: pane.get("id") or "")
         )
         reason = (
-            f"multiple default-lane Codex panes resolved in workspace "
+            f"multiple default-lane {provider} panes resolved in workspace "
             f"{sender_ws!r}: {listed}"
         )
     return (
-        f"cannot resolve `coordinator`: {reason}. Name the coordinator Codex "
+        f"cannot resolve `coordinator`: {reason}. Name the coordinator pane "
         "explicitly with `--target %pane` (see `mozyo-bridge agents targets`)."
     )
 
@@ -789,7 +789,7 @@ def resolve_target(target: str) -> str:
             f"unknown target '{target}'. Pass a tmux pane id (`%nnn`), a "
             "location (`session:window.pane`), an agent label "
             f"({', '.join(sorted(AGENT_LABELS))}), or `{COORDINATOR_LABEL}` "
-            "(the sender workspace's main coordinator Codex)."
+            "(the sender workspace's main coordinator pane)."
         )
     session = current_session_name()
     if not session:
