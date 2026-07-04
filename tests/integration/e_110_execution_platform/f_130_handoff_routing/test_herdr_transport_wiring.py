@@ -235,15 +235,20 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
 class TargetIdentityProjectionUnitTest(unittest.TestCase):
     """`_resolve_target_assigned_name` mints from the TARGET pane, fail-closed."""
 
-    def test_name_is_minted_from_the_target_pane_slot(self) -> None:
+    def test_name_is_minted_from_the_strong_target_pane_slot(self) -> None:
         from mozyo_bridge.application import handoff_transport_wiring as w
 
+        # agent_role="claude" -> pane-option role -> strong / non-ambiguous.
         pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
         with patch.object(w, "_pane_info", return_value=pane):
-            name = w._resolve_target_assigned_name("%2")
+            name = w._resolve_target_assigned_name("%2", receiver="claude")
         self.assertEqual(name, encode_assigned_name("ws-target", "claude", "lane-x"))
 
-    def test_unknown_role_fails_closed(self) -> None:
+    def test_weak_process_only_role_fails_closed(self) -> None:
+        # j#72380 minimal repro: no @mozyo_agent_role option and a non-agent window
+        # name, so the role is only WEAKLY inferred from the `claude` process
+        # basename. It must NOT mint an identity (could mis-send to another pane in
+        # the same slot).
         from mozyo_bridge.application import handoff_transport_wiring as w
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
             TransportBindingError,
@@ -253,11 +258,57 @@ class TargetIdentityProjectionUnitTest(unittest.TestCase):
             _target_pane(workspace_id="ws-target", lane_id="lane-x"),
             agent_role="",
             window_name="zsh",
-            command="zsh",
+            command="claude",
         )
         with patch.object(w, "_pane_info", return_value=pane):
             with self.assertRaises(TransportBindingError):
-                w._resolve_target_assigned_name("%2")
+                w._resolve_target_assigned_name("%2", receiver="claude")
+
+    def test_ambiguous_role_fails_closed(self) -> None:
+        # An ambiguous projection must fail closed (binds_receiver requires
+        # not ambiguous). Constructed by projecting an ambiguous PreflightTarget.
+        from mozyo_bridge.application import handoff_transport_wiring as w
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+            PreflightTarget,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
+            TransportBindingError,
+        )
+
+        ambiguous = PreflightTarget(
+            pane_id="%2",
+            role="claude",
+            role_source="pane_option",
+            confidence="strong",
+            ambiguous=True,
+            view_kind="agent",
+            workspace_id="ws-target",
+            lane_id="lane-x",
+            window_name="claude",
+            pane_option_role="claude",
+        )
+        with patch.object(w, "_pane_info", return_value={}), patch.object(
+            w, "project_preflight_target", return_value=ambiguous
+        ):
+            with self.assertRaises(TransportBindingError):
+                w._resolve_target_assigned_name("%2", receiver="claude")
+
+    def test_cross_bound_role_fails_closed(self) -> None:
+        # A strong `codex` pane targeted by --to claude does not bind the receiver.
+        from mozyo_bridge.application import handoff_transport_wiring as w
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
+            TransportBindingError,
+        )
+
+        pane = dict(
+            _target_pane(workspace_id="ws-target", lane_id="lane-x"),
+            agent_role="codex",
+            window_name="codex",
+            command="codex",
+        )
+        with patch.object(w, "_pane_info", return_value=pane):
+            with self.assertRaises(TransportBindingError):
+                w._resolve_target_assigned_name("%2", receiver="claude")
 
     def test_missing_workspace_fails_closed(self) -> None:
         from mozyo_bridge.application import handoff_transport_wiring as w
@@ -268,7 +319,7 @@ class TargetIdentityProjectionUnitTest(unittest.TestCase):
         pane = _target_pane(workspace_id="", lane_id="lane-x")
         with patch.object(w, "_pane_info", return_value=pane):
             with self.assertRaises(TransportBindingError):
-                w._resolve_target_assigned_name("%2")
+                w._resolve_target_assigned_name("%2", receiver="claude")
 
 
 if __name__ == "__main__":  # pragma: no cover

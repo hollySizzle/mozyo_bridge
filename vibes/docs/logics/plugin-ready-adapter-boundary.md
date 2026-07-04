@@ -1612,8 +1612,13 @@ cross-lane sends). It is resolved **lazily**, the first time the shim sees the
    (the rail's own projection: the #11822 role resolver + the pane's
    `(workspace_id, lane)`), giving the target pane's `(workspace_id, role, lane)`
    slot — normalised exactly as #13247 prescribes (`_normalize_lane_display` ==
-   `_norm_lane`, empty → `default`). Minted with #13247 `encode_assigned_name`. An
-   unknown / weak role or a missing `workspace_id` (an unregistered pane) fails
+   `_norm_lane`, empty → `default`). The identity is minted (#13247
+   `encode_assigned_name`) **only when the pane strongly, non-ambiguously binds the
+   receiver** — reusing the rail's own `PreflightTarget.binds_receiver` predicate
+   (`role == receiver`, `confidence == strong`, `not ambiguous`, Redmine #13253
+   j#72381). A merely *weakly*-inferred role (a bare `node` / process-basename
+   signal, no `@mozyo_agent_role` option or agent window name), an ambiguous or
+   cross-bound role, or a missing `workspace_id` (an unregistered pane) fails
    closed **before** any send.
 2. **Live snapshot.** `agent list --json` via the same trusted-environment binary as
    the transport (the rows carry the durable `name` + the transient `pane` locator);

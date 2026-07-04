@@ -45,11 +45,13 @@ against a fresh ``agent list`` snapshot (#13246 read surface + #13247
 (``pane_info`` → ``project_preflight_target`` → #13247 ``encode_assigned_name``),
 **not** the sender / current-repo context (Redmine #13253 j#72373) — and it is
 resolved *lazily*, at the moment the shim first sees the ``%N``, so it runs after
-``orchestrate_handoff`` has resolved the concrete target pane. A target pane whose
-identity cannot be projected (unregistered / unknown role / missing workspace), or
-a re-bind failure (``rebind_invalid_name`` / ``…_not_found`` / ``…_ambiguous`` /
-``…_missing_locator``), fails closed **before** the port call, so a send never lands
-on a guessed, blank, or sender-context locator. ``select-pane`` is the sole
+``orchestrate_handoff`` has resolved the concrete target pane. A target pane that
+does not **strongly, non-ambiguously bind the receiver** (a weakly-inferred /
+ambiguous / cross-bound role, or a missing workspace — the wiring reuses the rail's
+``PreflightTarget.binds_receiver`` predicate), or a re-bind failure
+(``rebind_invalid_name`` / ``…_not_found`` / ``…_ambiguous`` / ``…_missing_locator``),
+fails closed **before** the port call, so a send never lands on a guessed, blank,
+weakly-identified, or sender-context locator. ``select-pane`` is the sole
 exception: it is a no-op that never reaches the port, so it is not translated (only
 checked well-formed).
 

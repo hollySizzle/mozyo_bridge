@@ -64,12 +64,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 )
 from mozyo_bridge.shared.errors import die
 
-#: The role tokens a target pane may resolve to that we can mint an identity for.
-#: An ``unknown`` / weakly-typed pane fails closed rather than guessing a handle.
-_KNOWN_ROLES = frozenset({"claude", "codex"})
 
-
-def _resolve_target_assigned_name(target: str) -> str:
+def _resolve_target_assigned_name(target: str, *, receiver: str) -> str:
     """Project *the target pane's* stable identity to its herdr assigned name (fail-closed).
 
     Redmine #13253 j#72373: the translation identity must come from the **target
@@ -81,17 +77,26 @@ def _resolve_target_assigned_name(target: str) -> str:
 
     It is called *lazily* by the translator the first time the shim sees the target's
     ``%N``, so it runs after ``orchestrate_handoff`` has resolved the concrete target
-    pane. A pane with no projectable identity (an unknown / weak role, or a missing
-    ``workspace_id`` — e.g. an unregistered pane) fails closed with a
-    :class:`TransportBindingError` *before* any send, so a herdr send never re-binds
-    against a guessed or sender-context handle.
+    pane.
+
+    The identity is only minted when the target pane **strongly and non-ambiguously
+    binds the receiver** — reusing the rail's own
+    :meth:`PreflightTarget.binds_receiver` predicate (role == receiver, ``confidence
+    == strong``, ``not ambiguous``, Redmine #13253 j#72381). A pane whose role is
+    only *weakly* inferred (a bare ``node`` / process-basename signal without a
+    ``@mozyo_agent_role`` option or an agent window name), ambiguous, cross-bound to
+    the other role, or missing a ``workspace_id`` (an unregistered pane) fails closed
+    with a :class:`TransportBindingError` *before* any send — a herdr send never
+    re-binds against a guessed, weakly-typed, or sender-context handle.
     """
     preflight = project_preflight_target(_pane_info(target))
-    if preflight.role not in _KNOWN_ROLES or not preflight.workspace_id:
+    if not preflight.binds_receiver(receiver) or not preflight.workspace_id:
         raise TransportBindingError(
-            "herdr target-pane identity could not be projected for target "
-            f"{target!r} (role={preflight.role!r}, workspace_id="
-            f"{preflight.workspace_id!r}); refusing to send to an un-translatable target"
+            "herdr target-pane identity could not be strongly bound for target "
+            f"{target!r} (role={preflight.role!r}, receiver={receiver!r}, "
+            f"confidence={preflight.confidence!r}, ambiguous={preflight.ambiguous}, "
+            f"workspace_id={preflight.workspace_id!r}); refusing to send to an "
+            "un-translatable / weakly-identified target"
         )
     try:
         return encode_assigned_name(
@@ -116,9 +121,11 @@ def resolve_handoff_transport_binding(
     ``die`` (never a silent tmux fallback).
 
     For the herdr backend the binding is handed the lazy
-    :func:`_resolve_target_assigned_name` resolver, so the shim mints the assigned
-    name from the **target pane's** stable identity (not the sender context, Redmine
-    #13253 j#72373) the first time it sees the rail's tmux target.
+    :func:`_resolve_target_assigned_name` resolver (curried with the ``--to``
+    receiver, so it can require the target pane to *strongly bind that receiver*),
+    so the shim mints the assigned name from the **target pane's** stable identity
+    (not the sender context, Redmine #13253 j#72373) the first time it sees the
+    rail's tmux target.
     """
     try:
         config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
@@ -128,12 +135,15 @@ def resolve_handoff_transport_binding(
         return None
     if config.backend != BACKEND_HERDR:
         return None
+    receiver = getattr(args, "to", None) or ""
     try:
         return resolve_runtime_transport_binding(
             config,
             tmux_run_tmux=_tmux_run_tmux,
             tmux_capture_pane=_tmux_capture_pane,
-            resolve_assigned_name=_resolve_target_assigned_name,
+            resolve_assigned_name=functools.partial(
+                _resolve_target_assigned_name, receiver=receiver
+            ),
         )
     except TerminalTransportError as exc:
         die(f"terminal transport backend 'herdr' is selected but unavailable: {exc}")
