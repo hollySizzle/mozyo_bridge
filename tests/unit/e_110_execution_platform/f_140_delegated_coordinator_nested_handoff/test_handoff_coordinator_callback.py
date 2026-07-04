@@ -196,6 +196,24 @@ class ResolveCoordinatorCodexTest(unittest.TestCase):
 
 
 class ResolveTargetCoordinatorTest(unittest.TestCase):
+    # The LIVE `--target coordinator` route resolves the coordinator's provider from
+    # the repo-local RoleProviderBinding (Redmine #13174) via a call-time import of the
+    # f_140 boundary. These cases pin the *default* binding (coordinator -> codex), but
+    # the repo's committed config carries a bounded trial rebind
+    # (`provider_binding.coordinator: claude`, Redmine #13229) that would otherwise leak
+    # into the resolver and steer the route at the default-lane claude pane. Isolate the
+    # default-binding premise from the workspace trial config by patching the boundary to
+    # the default coordinator provider (mirrors the #13254 transport isolation). Cases
+    # that assert a rebind re-patch this same attribute inside a `with`, which wins.
+    def setUp(self) -> None:
+        self._default_provider_patch = patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.main_lane_guard_gate.resolve_coordinator_provider",
+            return_value="codex",
+        )
+        self._default_provider_patch.start()
+        self.addCleanup(self._default_provider_patch.stop)
+
     def test_coordinator_label_resolves_to_main_codex(self) -> None:
         with _runtime(FULL_COCKPIT, sender_pane_id="%1072"):
             self.assertEqual("%953", resolve_target("coordinator"))

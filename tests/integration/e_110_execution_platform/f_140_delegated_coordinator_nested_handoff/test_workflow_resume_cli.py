@@ -65,10 +65,19 @@ class RegistrationTest(unittest.TestCase):
 
 
 class PersistResumeLoopTest(_StoreCase):
+    # The persist->resume loop pins the *default* role->provider binding (coordinator
+    # -> codex): the persisted route is role=codex and the enriched decision must
+    # resolve the coordinator owner against that same provider. The repo's committed
+    # config carries a bounded trial rebind (`provider_binding.coordinator: claude`,
+    # Redmine #13229) that these tests must be independent of, mirroring the #13254
+    # transport isolation. Point `--repo` at the config-less temp dir (`resolve_repo_root`
+    # uses an explicit `--repo` verbatim, so a dir with no `.mozyo-bridge/config.yaml`
+    # threads `RoleProviderBinding.default()`) instead of the workspace's real config.
     def _persist(self):
         rc, _ = _run(
             [
                 "workflow", "runtime",
+                "--repo", self._tmp.name,
                 "--event", "12671:review_request,id=12671:68864,commit=1",
                 "--event", "12671:review,id=12671:68900,conclusion=approved,commit=1",
                 "--ready-independent", "1", "--capacity", "2",
@@ -82,7 +91,10 @@ class PersistResumeLoopTest(_StoreCase):
 
     def test_resume_reproduces_enriched_next_action(self):
         self._persist()
-        rc, text = _run(["workflow", "resume", "--store-path", self.store_path, "--json"])
+        rc, text = _run(
+            ["workflow", "resume", "--repo", self._tmp.name,
+             "--store-path", self.store_path, "--json"]
+        )
         self.assertEqual(rc, 0)
         payload = json.loads(text)
         na = payload["workflow"]["next_action"]
