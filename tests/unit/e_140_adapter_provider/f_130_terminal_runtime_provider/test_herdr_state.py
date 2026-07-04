@@ -79,7 +79,7 @@ class ReadAgentStateTest(unittest.TestCase):
         self.assertEqual(result.state, RUNTIME_BUSY)
         self.assertEqual(result.raw_status, "working")
         self.assertEqual(
-            runner.calls[0][0], [BIN, "agent", "get", "poc_claude", "--json"]
+            runner.calls[0][0], [BIN, "agent", "get", "poc_claude"]
         )
 
     def test_each_status_maps(self) -> None:
@@ -168,7 +168,7 @@ class ListAgentStatesTest(unittest.TestCase):
         runner = RecordingRunner(stdout="[]")
         reader = HerdrCliAgentStateReader(BIN, runner=runner)
         reader.list_agent_states()
-        self.assertEqual(runner.calls[0][0], [BIN, "agent", "list", "--json"])
+        self.assertEqual(runner.calls[0][0], [BIN, "agent", "list"])
 
     def test_bare_array_payload(self) -> None:
         runner = RecordingRunner(

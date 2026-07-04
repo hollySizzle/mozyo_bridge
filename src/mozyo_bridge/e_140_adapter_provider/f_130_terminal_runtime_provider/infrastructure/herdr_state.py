@@ -125,7 +125,7 @@ class HerdrCliAgentStateReader:
             return AgentStateResult.failure(
                 REASON_INVALID_TARGET, f"invalid target handle: {target!r}"
             )
-        completed = self._invoke(["agent", "get", target, "--json"])
+        completed = self._invoke(["agent", "get", target])
         if isinstance(completed, AgentStateResult):
             return completed  # a fail-closed spawn / timeout outcome
         if completed.returncode != 0:
@@ -159,7 +159,7 @@ class HerdrCliAgentStateReader:
         not fail the whole read — and the number skipped is recorded in the
         result ``detail`` so the loss stays observable.
         """
-        completed = self._invoke(["agent", "list", "--json"])
+        completed = self._invoke(["agent", "list"])
         if isinstance(completed, AgentStateResult):
             # Re-shape the shared spawn / timeout failure into the list result.
             return AgentStateListResult.failure(

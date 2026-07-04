@@ -93,7 +93,7 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
         def fake_run(argv, capture_output=None, text=None, timeout=None, **kw):
             # Only the herdr binary is ever spawned on this path.
             rest = list(argv[1:])
-            if rest[:3] == ["agent", "list", "--json"]:
+            if rest[:2] == ["agent", "list"]:
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=json.dumps({"agents": agent_rows}), stderr=""
                 )
