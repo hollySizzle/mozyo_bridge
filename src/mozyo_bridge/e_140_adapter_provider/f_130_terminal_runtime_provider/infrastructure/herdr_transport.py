@@ -163,7 +163,11 @@ class HerdrCliTransport:
             return PaneReadResult.failure(
                 REASON_INVALID_TARGET, f"invalid target handle: {target!r}"
             )
-        if source not in PANE_READ_SOURCES:
+        # Check the type before the membership test: ``source not in
+        # PANE_READ_SOURCES`` raises ``TypeError`` for an unhashable ``source``
+        # (e.g. a list), which would escape the fail-closed contract. A non-str
+        # source is always invalid, so reject it first.
+        if not isinstance(source, str) or source not in PANE_READ_SOURCES:
             return PaneReadResult.failure(
                 REASON_INVALID_SOURCE,
                 f"unknown pane read source {source!r}; expected one of "
@@ -312,27 +316,33 @@ def resolve_terminal_transport(
             f"to fall back to tmux",
             reason=REASON_BINARY_UNCONFIGURED,
         )
-    resolved = _resolve_binary(binary)
+    resolved = _resolve_binary(binary, source_env)
     if resolved is None:
         raise TerminalTransportError(
             f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
-            f"executable file or on PATH; refusing to fall back to tmux",
+            f"executable file or on the trusted environment PATH; refusing to fall "
+            f"back to tmux",
             reason=REASON_BINARY_NOT_FOUND,
         )
     return HerdrCliTransport(resolved, runner=runner)
 
 
-def _resolve_binary(binary: str) -> Optional[str]:
+def _resolve_binary(binary: str, source_env: Mapping[str, str]) -> Optional[str]:
     """Resolve ``binary`` to an executable path, or ``None`` if unresolvable.
 
     A path-shaped value (containing a separator) must be an existing executable
-    file; a bare name is resolved on ``PATH`` via :func:`shutil.which`.
+    file; a bare name is resolved on the **trusted environment's** ``PATH`` (the
+    same env the binary token itself came from), not the ambient process ``PATH``
+    — so a supplied trusted env fully determines resolution and an entry present
+    only on the ambient PATH is not silently picked up. When ``source_env`` is
+    the ambient ``os.environ`` (the default), this is byte-for-byte the previous
+    behaviour.
     """
     if os.sep in binary or (os.altsep and os.altsep in binary):
         if os.path.isfile(binary) and os.access(binary, os.X_OK):
             return binary
         return None
-    return shutil.which(binary)
+    return shutil.which(binary, path=source_env.get("PATH"))
 
 
 __all__ = (

@@ -121,6 +121,19 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual(transport.read_pane("w1:p1", source="nope").reason, REASON_INVALID_SOURCE)
         self.assertEqual(runner.calls, [])
 
+    def test_non_str_source_fails_closed_without_spawn(self) -> None:
+        # Finding 1 (j#72296): an unhashable / non-str source must not raise a
+        # TypeError from the membership test; it fails closed as invalid_source
+        # and never spawns a subprocess.
+        runner = RecordingRunner()
+        transport = HerdrCliTransport(BIN, runner=runner)
+        for bad in ([], {}, 5, None, ("visible",)):
+            with self.subTest(bad=bad):
+                result = transport.read_pane("w1:p1", source=bad)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason, REASON_INVALID_SOURCE)
+        self.assertEqual(runner.calls, [])
+
     def test_bad_lines_never_spawns(self) -> None:
         runner = RecordingRunner()
         transport = HerdrCliTransport(BIN, runner=runner)
@@ -203,6 +216,48 @@ class ResolverTest(unittest.TestCase):
 
     def test_none_config_defaults_to_off(self) -> None:
         self.assertIsNone(resolve_terminal_transport(None, env={}))
+
+    def test_bare_name_resolves_on_trusted_env_path(self) -> None:
+        # Finding 2 (j#72296): a bare binary name resolves against the *supplied
+        # trusted env's* PATH, not the ambient process PATH.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            binpath = os.path.join(tmp, "herdr")
+            with open(binpath, "w") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(binpath, os.stat(binpath).st_mode | stat.S_IXUSR)
+            transport = resolve_terminal_transport(
+                TerminalTransportConfig(backend=BACKEND_HERDR),
+                env={HERDR_BINARY_ENV: "herdr", "PATH": tmp},
+            )
+            self.assertIsInstance(transport, HerdrCliTransport)
+            # Resolved to the executable inside the trusted-env PATH dir.
+            self.assertEqual(transport._binary, binpath)
+
+    def test_bare_name_not_on_trusted_env_path_fails_closed(self) -> None:
+        # Finding 2 (j#72296): a bare name present only on the *ambient* PATH but
+        # absent from the trusted-env PATH is NOT resolved — fail closed.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as ambient, tempfile.TemporaryDirectory() as trusted:
+            # Put an executable ``herdr`` on the ambient PATH only.
+            ambient_bin = os.path.join(ambient, "herdr")
+            with open(ambient_bin, "w") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(ambient_bin, os.stat(ambient_bin).st_mode | stat.S_IXUSR)
+            prev_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = ambient + os.pathsep + prev_path
+            try:
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_terminal_transport(
+                        TerminalTransportConfig(backend=BACKEND_HERDR),
+                        # trusted PATH points at an empty dir (no herdr)
+                        env={HERDR_BINARY_ENV: "herdr", "PATH": trusted},
+                    )
+                self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
+            finally:
+                os.environ["PATH"] = prev_path
 
 
 if __name__ == "__main__":
