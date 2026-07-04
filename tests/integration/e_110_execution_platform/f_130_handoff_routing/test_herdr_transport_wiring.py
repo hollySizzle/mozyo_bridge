@@ -204,5 +204,130 @@ class HerdrWiringSmokeTest(unittest.TestCase):
         self.assertEqual(read_calls[0][2], SOURCE_VISIBLE)
 
 
+class StatefulFakePort:
+    """A herdr port that echoes the injected composer, so the marker lands.
+
+    Models a well-behaved receiver: ``send_text`` appends to the composer,
+    ``read_pane`` returns it (so the landing-marker wait observes the marker),
+    and ``send_keys enter`` submits (clears the composer).
+    """
+
+    backend = BACKEND_HERDR
+
+    def __init__(self):
+        self.calls: list = []
+        self.composer = ""
+
+    def send_text(self, target, text):
+        self.calls.append(("send_text", target, text))
+        self.composer += text
+        return TransportResult.success()
+
+    def send_keys(self, target, keys):
+        self.calls.append(("send_keys", target, keys))
+        if keys == "enter":
+            self.composer = ""
+        return TransportResult.success()
+
+    def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None):
+        self.calls.append(("read_pane", target, source, lines))
+        return PaneReadResult.success(self.composer)
+
+
+class HerdrInactiveTargetActivationTest(unittest.TestCase):
+    """The finding-1 regression: default queue-enter + inactive admitted target.
+
+    The target-activation tail (#12597) resolves ``run_tmux("select-pane", …)``
+    through ``commands`` at call time. Under the herdr binding the whole
+    ``commands.run_tmux`` is swapped for the shim, so before the finding-1 fix the
+    activation raised ``TransportBindingError`` and the send crashed. With the fix
+    ``select-pane`` is a target-validated no-op, so the admitted inactive split is
+    activated and delivered to over the herdr port without error.
+    """
+
+    def test_queue_enter_inactive_admitted_target_activates_and_sends_over_herdr(
+        self,
+    ) -> None:
+        from mozyo_bridge.application import commands  # noqa: F401
+        from mozyo_bridge.application import handoff_transport_wiring
+        from mozyo_bridge.application.cli import build_parser
+
+        port = StatefulFakePort()
+
+        def _tmux_unused(*a, **k):
+            raise AssertionError("tmux primitive must not be called under herdr")
+
+        binding = resolve_runtime_transport_binding(
+            TerminalTransportConfig(backend=BACKEND_HERDR),
+            tmux_run_tmux=_tmux_unused,
+            tmux_capture_pane=_tmux_unused,
+            port=port,
+        )
+
+        argv = [
+            "handoff", "send", "--to", "claude",
+            "--source", "asana", "--kind", "implementation_request",
+            "--task-id", "T1", "--comment-id", "C1",
+            "--target", "%2", "--mode", "queue-enter",
+        ]
+        args = build_parser().parse_args(argv)
+
+        inactive_pane = {
+            "id": "%2",
+            "location": "agents:0.1",
+            "command": "node",
+            "cwd": "/repo",
+            "window_name": "claude",
+            "pane_active": "0",
+            "workspace_id": "ws-1",
+        }
+
+        raised: list = []
+
+        with patch("mozyo_bridge.application.commands.require_tmux"), \
+            patch.object(
+                handoff_transport_wiring,
+                "resolve_handoff_transport_binding",
+                return_value=binding,
+            ), \
+            patch("mozyo_bridge.application.commands.time.sleep"), \
+            patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value="agents",
+            ), \
+            patch(
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
+            ), \
+            patch(
+                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
+                return_value=[inactive_pane],
+            ), \
+            contextlib.redirect_stdout(io.StringIO()) as out, \
+            contextlib.redirect_stderr(io.StringIO()):
+            try:
+                result = args.func(args)
+            except SystemExit as exc:
+                result = exc
+            except Exception as exc:  # pragma: no cover - the bug we are fixing
+                raised.append(exc)
+                result = None
+
+        # The activation select-pane must NOT have raised (finding-1 fix).
+        self.assertEqual(raised, [], msg=f"send raised under herdr: {raised!r}")
+        self.assertEqual(result, 0)
+
+        outcome = _outcome_from(out.getvalue())
+        self.assertIsNotNone(outcome, msg=out.getvalue())
+        self.assertEqual(outcome.get("status"), "sent")
+
+        # Delivery reached the herdr port: composer inject + submit.
+        self.assertTrue([c for c in port.calls if c[0] == "send_text"])
+        self.assertTrue(
+            [c for c in port.calls if c[0] == "send_keys" and c[2] == "enter"]
+        )
+        # The durable record still documents the #12597 activation fact.
+        self.assertIn("- Activation:", out.getvalue())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

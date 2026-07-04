@@ -1540,14 +1540,19 @@ handoff suite runs (unchanged) under the default binding.
 For the herdr backend the resolver builds a tmux-shaped shim over the #13245
 `TerminalTransportPort` and the decorator swaps it in for the send, restoring the
 tmux globals in a `finally`. The shim maps the exact tmux argv shapes the rail
-emits — nothing else:
+reaches under the binding — that set was enumerated exhaustively (Redmine #13253
+j#72361) from the send body (`commands.py` strict/queue-enter rail), the
+target-activation tail (`handoff_target_activation_command.py`), and the
+`wait_for_text` loop (`session_bootstrap_command.py` → `commands.capture_pane`):
 
-| tmux call (`orchestrate_handoff`)                  | herdr port call                                 |
-| -------------------------------------------------- | ----------------------------------------------- |
-| `run_tmux("send-keys","-t",T,"-l","--",text)`      | `port.send_text(T, text)` (composer inject)     |
-| `run_tmux("send-keys","-t",T,"Enter")`             | `port.send_keys(T, "enter")` (submit the turn)  |
-| `run_tmux("send-keys","-t",T,"C-u")`               | `port.send_keys(T, "C-u")` (composer rollback)  |
-| `capture_pane(T, lines)`                           | `port.read_pane(T, source="visible", lines=…)`  |
+| tmux op reached under the binding                  | classification | herdr handling                                  |
+| -------------------------------------------------- | -------------- | ----------------------------------------------- |
+| `send-keys -t T -l -- <text>`                      | map            | `port.send_text(T, text)` (composer inject)     |
+| `send-keys -t T Enter`                             | map            | `port.send_keys(T, "enter")` (submit the turn)  |
+| `send-keys -t T C-u`                               | map            | `port.send_keys(T, "C-u")` (composer rollback)  |
+| `capture_pane(T, lines)`                           | map            | `port.read_pane(T, source="visible", lines=…)`  |
+| `select-pane -t T` (activate + restore, #12597)    | no-op (target checked) | success, no port call — see below       |
+| anything else                                      | fail-closed    | raise `TransportBindingError`                   |
 
 The match is exact argv (never a prefix / substring guess): a tmux subcommand the
 shim does not recognise **fails closed** with a raised `TransportBindingError`, and
@@ -1556,6 +1561,23 @@ returns a silent success and never drops a send. Selection is fail-closed too: a
 herdr selection whose trusted-environment binary (`MOZYO_HERDR_BINARY`) is
 unconfigured / unresolvable surfaces the #13245 `TerminalTransportError` as a clean
 `die`, never a silent downgrade to tmux (j#72318).
+
+**`select-pane` → target-checked no-op (finding-1 fix, j#72361).** The #12597
+target-activation tail activates an admitted inactive split — and optionally
+restores focus after delivery — via `run_tmux("select-pane","-t",T)`, resolved
+through `commands.run_tmux` at call time. Because the decorator swaps the *whole*
+`commands.run_tmux` for the shim, that `select-pane` reaches the shim; under the
+default queue-enter rail an inactive admitted target always activates, so the
+initial implementation crashed it with `TransportBindingError`. The fix maps
+`select-pane` to a **no-op success**: pane *focus* is a tmux composer-landing
+concern, and herdr lands text in a receiver's composer without focusing its pane
+(every PoC #13175 injection, E8 / E12–E14, succeeded against a non-focused pane), so
+there is nothing for herdr to do. It is a no-op rather than a tmux pass-through
+because passing the handle to a tmux client would hand a herdr target to tmux. The
+target is still checked for well-formedness (non-empty, no whitespace) so a garbage
+handle fails closed — deliberately **not** the strict herdr-handle `valid_target`
+guard, which rejects the tmux pane ids (`%N`) the activation tail passes and which,
+for a no-op that spawns no subprocess, is unwarranted.
 
 The check-then-wait event rail (`HerdrTurnStartRail`, #13248) is **not** wired here:
 #13253 reuses the unchanged tmux-shaped send/capture choreography, so it binds only
@@ -1574,13 +1596,15 @@ reads the selection fresh per process and holds no state.
 
 - **In scope:** the pure `config -> TransportBinding` resolver, the tmux
   passthrough binding, the tmux-shaped herdr shim (send-text / Enter / C-u /
-  capture mapping + fail-closed on an unmapped subcommand or a failed primitive),
-  the single-injection-point decorator, and the fake-port contract + orchestrate
-  smoke tests (no live binary).
+  capture maps, the `select-pane` target-checked no-op, and fail-closed on any
+  other subcommand or a failed primitive), the single-injection-point decorator,
+  and the fake-port contract + orchestrate smoke + inactive-target-activation tests
+  (no live binary).
 - **Out of scope (later US's):** switching a real workspace's config to herdr and
   the live cut-over smoke (#13254), the installer / pin config (#13249), any live
   herdr binary run, and wiring the richer event-based `HerdrTurnStartRail` (#13248)
-  into the send.
+  into the send — that rail integration was **split out of #13253 into the
+  follow-up #13255** (j#72361).
 
 ## Follow-up Split
 

@@ -153,6 +153,30 @@ class HerdrMappingTest(unittest.TestCase):
         binding.run_tmux("send-keys", "-t", "w1:p1", "C-u")
         self.assertEqual(port.calls, [("send_keys", "w1:p1", "C-u")])
 
+    def test_select_pane_valid_target_is_noop_success(self) -> None:
+        # #12597 activate / restore: herdr lands without pane focus, so select-pane
+        # is a no-op success — it never reaches the port and never fails the send.
+        port = FakePort()
+        binding = self._herdr_binding(port)
+        completed = binding.run_tmux("select-pane", "-t", "%2")
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(port.calls, [])
+
+    def test_select_pane_restore_target_is_noop_success(self) -> None:
+        # The restore-focus tail issues the same select-pane shape against the
+        # previously-active pane; it is the same no-op.
+        port = FakePort()
+        binding = self._herdr_binding(port)
+        binding.run_tmux("select-pane", "-t", "%3")
+        self.assertEqual(port.calls, [])
+
+    def test_select_pane_malformed_target_fails_closed(self) -> None:
+        port = FakePort()
+        binding = self._herdr_binding(port)
+        with self.assertRaises(TransportBindingError):
+            binding.run_tmux("select-pane", "-t", "bad target")
+        self.assertEqual(port.calls, [])
+
     def test_capture_pane_maps_to_read_pane_visible(self) -> None:
         port = FakePort(read_content="rendered pane")
         binding = self._herdr_binding(port)

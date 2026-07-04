@@ -43,16 +43,55 @@ backend is a single ``terminal_transport.backend`` line in
 selection fresh per process and holds no state, so there is no data migration and
 no persisted binding to clear.
 
+Exhaustive audit of the tmux calls reachable under the binding (Redmine #13253 j#72361)
+---------------------------------------------------------------------------------------
+The decorator swaps the ``commands`` module's ``run_tmux`` / ``capture_pane`` for
+this shim, so the shim must handle *every* tmux op ``orchestrate_handoff`` resolves
+through those two names for the length of a send. That set was enumerated from the
+send body (``commands.py`` strict/queue-enter rail), the target-activation tail
+(``handoff_target_activation_command.py`` — activate + restore), and the
+``wait_for_text`` loop (``session_bootstrap_command.py`` → ``commands.capture_pane``):
+
+| tmux op reached under the binding                  | classification | herdr handling                                   |
+| -------------------------------------------------- | -------------- | ------------------------------------------------ |
+| ``send-keys -t T -l -- <text>``                    | map            | ``send_text(T, text)``                           |
+| ``send-keys -t T Enter``                           | map            | ``send_keys(T, "enter")``                        |
+| ``send-keys -t T C-u``                             | map            | ``send_keys(T, "C-u")``                          |
+| ``capture-pane`` (via ``capture_pane(T, lines)``)  | map            | ``read_pane(T, source="visible", lines=lines)``  |
+| ``select-pane -t T`` (activate + restore, #12597)  | no-op (valid target checked) | success, no port call — see below   |
+| anything else                                      | fail-closed    | raise :class:`TransportBindingError`             |
+
+``select-pane`` is mapped to a **target-validated no-op success**, not a herdr
+call and not a tmux pass-through. Rationale (kept enforced in the docstring and the
+design doc): pane *selection* is a tmux composer-landing concern (#12597 — activate
+an admitted inactive split before typing, then optionally restore focus). herdr
+lands text in a receiver's composer **without** needing the pane focused — every
+PoC #13175 injection (experiments E8 / E12–E14) succeeded against a non-focused
+pane — so there is nothing for herdr to do on a ``select-pane``. Passing the tmux
+handle through to a tmux client would be wrong (it hands a herdr target to tmux),
+so the shim absorbs it as a no-op. The target is still checked for well-formedness
+(non-empty, no whitespace) so a malformed handle fails closed rather than being
+silently absorbed — but *not* with the strict herdr-handle ``valid_target`` guard,
+which is the subprocess-safety regex for ``window:pane`` / agent-name handles and
+rejects the tmux pane ids (``%N``) the activation tail actually passes; a no-op runs
+no subprocess, so that stricter guard is unwarranted here. ``run_tmux``'s return for
+``select-pane`` is ignored by both call sites (``activate_target_pane`` /
+``maybe_restore_previous_active``), but the shim still returns a success
+``CompletedProcess`` for signature parity.
+
 Scope (staged seam — kept explicit so it does not drift):
 
 - **In scope:** the pure ``config -> TransportBinding`` resolver, the tmux
-  passthrough binding, and the tmux-shaped herdr shim (send-text / enter / C-u /
-  capture mapping + fail-closed on an unmapped subcommand).
-- **Out of scope (later US's):** switching a real workspace's config to herdr
-  (#13254), any live herdr binary run, and wiring the richer event-based
-  :class:`~...domain.turn_start_rail.HerdrTurnStartRail` (#13248) into the send —
-  #13253 reuses the existing tmux-shaped send/capture choreography unchanged, so
-  it binds only the transport primitives, not the turn-start orchestration.
+  passthrough binding, and the tmux-shaped herdr shim (the send-text / Enter / C-u /
+  capture maps, the ``select-pane`` target-validated no-op, and fail-closed on any
+  other subcommand or a failed primitive).
+- **Out of scope (later US's):** switching a real workspace's config to herdr and
+  the live cut-over smoke (#13254), any live herdr binary run, and wiring the
+  richer event-based :class:`~...domain.turn_start_rail.HerdrTurnStartRail` (#13248)
+  into the send — that rail integration was split out of #13253 into the follow-up
+  **#13255** (Redmine #13253 j#72361). #13253 reuses the existing tmux-shaped
+  send/capture choreography unchanged, so it binds only the transport primitives,
+  not the turn-start orchestration.
 """
 
 from __future__ import annotations
@@ -109,22 +148,28 @@ class TransportBinding:
 class _HerdrTmuxShim:
     """A tmux-shaped adapter over a :class:`TerminalTransportPort` (herdr).
 
-    Maps the four tmux argv shapes the handoff rail emits onto the port's three
-    primitives; anything else fails closed. The mapping is intentionally an exact
-    argv match (never a prefix / substring guess) so a new tmux call the rail
-    might grow can never be silently mis-routed — an unrecognised shape raises
-    :class:`TransportBindingError`.
+    Maps the tmux argv shapes the handoff rail reaches under the binding onto the
+    port's primitives (or a no-op for pane selection); anything else fails closed.
+    The mapping is intentionally an exact argv match (never a prefix / substring
+    guess) so a new tmux call the rail might grow can never be silently mis-routed —
+    an unrecognised shape raises :class:`TransportBindingError`. The reachable set
+    was enumerated exhaustively in the module docstring's audit table.
 
     | tmux call (rail)                                   | herdr port call                                  |
     | -------------------------------------------------- | ------------------------------------------------ |
     | ``run_tmux("send-keys","-t",T,"-l","--",text)``    | ``send_text(T, text)`` (inject composer body)    |
     | ``run_tmux("send-keys","-t",T,"Enter")``           | ``send_keys(T, "enter")`` (submit the turn)      |
     | ``run_tmux("send-keys","-t",T,"C-u")``             | ``send_keys(T, "C-u")`` (composer rollback)      |
+    | ``run_tmux("select-pane","-t",T)``                 | *no-op success* (target validated; see below)    |
     | ``capture_pane(T, lines)``                         | ``read_pane(T, source="visible", lines=lines)``  |
 
-    A mapped primitive that reports ``ok=False`` raises :class:`TransportBindingError`
-    carrying the port's failure reason — the herdr path never returns a silent
-    success and never falls back to tmux.
+    ``select-pane`` (the #12597 activate-inactive-split / restore-focus tail) is a
+    tmux composer-landing concern with no herdr equivalent — herdr injects into a
+    receiver's composer without focusing its pane — so the shim absorbs it as a
+    target-validated no-op rather than mapping it to the port or passing a herdr
+    handle through to tmux. A mapped primitive that reports ``ok=False``, or a
+    ``select-pane`` with a malformed target, raises :class:`TransportBindingError` —
+    the herdr path never returns a silent success and never falls back to tmux.
     """
 
     #: The literal enter token the rail's ``send-keys … Enter`` maps to, matching
@@ -139,12 +184,14 @@ class _HerdrTmuxShim:
         self._port = port
 
     def run_tmux(self, *args: str, check: bool = True) -> "subprocess.CompletedProcess[str]":
-        """Map a tmux ``send-keys`` invocation onto the herdr port; fail closed.
+        """Map a tmux ``send-keys`` / ``select-pane`` invocation; fail closed otherwise.
 
-        Only the ``send-keys`` shapes the handoff rail emits are recognised. The
+        Only the ``send-keys`` send shapes and the ``select-pane`` pane-selection
+        shape the handoff rail reaches under the binding are recognised. The
         ``check`` flag is accepted for signature parity with the tmux client but is
-        irrelevant here: a failed herdr primitive always raises regardless of
-        ``check`` (a silent non-zero would defeat the fail-closed contract).
+        irrelevant here: a failed herdr primitive (or a malformed target) always
+        raises regardless of ``check`` (a silent non-zero would defeat the
+        fail-closed contract).
         """
         if len(args) >= 3 and args[0] == "send-keys" and args[1] == "-t":
             target = args[2]
@@ -164,10 +211,31 @@ class _HerdrTmuxShim:
                         "send_keys(C-u)",
                     )
                     return _ok_completed(args)
+        if len(args) == 3 and args[0] == "select-pane" and args[1] == "-t":
+            # #12597 activate-inactive-split / restore-focus. Pane focus is a tmux
+            # composer-landing concern; herdr lands without focusing the pane, so
+            # this is a no-op — but the target is still checked for well-formedness
+            # so a malformed handle fails closed rather than being silently absorbed.
+            #
+            # NB: this deliberately does NOT use the domain ``valid_target`` guard.
+            # That guard is the subprocess-safety regex for *herdr* handles
+            # (``window:pane`` / agent name) and rejects a leading ``%``, but the
+            # activation tail's target is a tmux pane id (``%N``, from
+            # ``target_info["id"]``). ``select-pane`` runs no subprocess here (it is
+            # a no-op), so the strict argv-injection guard is unwarranted; a minimal
+            # non-empty / no-whitespace check is the right fail-closed shape.
+            target = args[2]
+            if not _well_formed_pane_target(target):
+                raise TransportBindingError(
+                    f"herdr transport received a select-pane with a malformed target "
+                    f"{target!r}; refusing to absorb it"
+                )
+            return _ok_completed(args)
         raise TransportBindingError(
             "herdr transport cannot map tmux invocation "
             f"{list(args)!r}; only the handoff send-keys shapes "
-            "(literal text / Enter / C-u) are supported — refusing to run it"
+            "(literal text / Enter / C-u) and select-pane are supported — "
+            "refusing to run it"
         )
 
     def capture_pane(self, target: str, lines: int) -> str:
@@ -198,6 +266,20 @@ def _ok_completed(args: "tuple[str, ...]") -> "subprocess.CompletedProcess[str]"
     reading ``returncode`` / ``stdout`` sees a well-formed success.
     """
     return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+
+def _well_formed_pane_target(target: object) -> bool:
+    """A minimal fail-closed guard for a ``select-pane`` no-op target.
+
+    ``select-pane`` is absorbed as a no-op (no subprocess, no port call), so the
+    strict herdr-handle ``valid_target`` guard is unwarranted and would wrongly
+    reject the tmux pane ids (``%N``) the activation tail actually passes. A target
+    is well-formed here iff it is a non-empty string with no whitespace — enough to
+    reject empty / garbage handles while accepting a tmux pane id or location.
+    """
+    return isinstance(target, str) and bool(target) and not any(
+        c.isspace() for c in target
+    )
 
 
 def resolve_runtime_transport_binding(
