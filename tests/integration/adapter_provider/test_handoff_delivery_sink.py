@@ -25,6 +25,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
+from tests.integration.e_110_execution_platform.f_130_handoff_routing import (  # noqa: E402,F401
+    setUpModule,
+    tearDownModule,
+)
+
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     DeliveryRecordError,
