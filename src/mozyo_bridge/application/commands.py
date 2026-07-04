@@ -141,7 +141,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     build_notification_body,
     evaluate_standard_target_admission,
     is_explicit_pane_target,
-    main_lane_implementation_request_blocked,
     make_outcome,
     normalize_anchor,
     resolve_queue_enter_retry_policy,
@@ -2026,26 +2025,27 @@ def orchestrate_handoff(
     preflight_target = project_preflight_target(target_info)
 
     # Main-lane implementation-dispatch guard (Redmine #12441; prevention note
-    # #12438 j#63436). In the managed cockpit / sublane operating model (epic
-    # #12366; `vibes/docs/logics/coordinator-sublane-development-flow.md`) the
-    # main-unit Claude is not an implementer; implementation-shaped work defaults
-    # to a cockpit-visible sublane, so a direct `handoff send --to claude --kind
-    # implementation_request` into the cockpit's default/main-lane Claude is a
-    # process gap (#12438 j#63432/j#63434). Fail closed in EVERY mode (the
-    # resolved target's lane/view is known here, before the mode-scoped binding
-    # gate below) unless an explicit `--main-lane-exception` references an
-    # owner/operator decision. Deliberately scoped to cockpit panes: a plain
-    # `normal_window` Claude (unmanaged repo, no sublane model), a same-lane
-    # *sublane* Claude (non-`default` lane), a `--to codex` gateway dispatch, and
-    # any non-`implementation_request` notification to the main-lane Claude are
-    # all unaffected.
-    if main_lane_implementation_request_blocked(
-        receiver=receiver,
-        kind=kind,
-        target_lane_id=preflight_target.lane_id,
-        target_is_cockpit_pane=(preflight_target.view_kind == VIEW_KIND_COCKPIT_PANE),
-        target_binds_claude=preflight_target.binds_receiver("claude"),
-        has_main_lane_exception=bool(getattr(args, "main_lane_exception", None)),
+    # #12438 j#63436; role-based since Redmine #13174). In the managed cockpit /
+    # sublane operating model (epic #12366;
+    # `vibes/docs/logics/coordinator-sublane-development-flow.md`) the main-unit
+    # implementer surface is not where implementation runs; implementation-shaped
+    # work defaults to a cockpit-visible sublane, so a direct `implementation_request`
+    # into the cockpit's default/main-lane implementer pane is a process gap (#12438
+    # j#63432/j#63434). The guard reasons about the implementer *role*: the boundary
+    # resolves the implementer's runtime provider from the repo-local RoleProviderBinding
+    # (#12673/#13157; default -> `claude`, byte-identical) and fails closed in EVERY mode
+    # (the resolved target's lane/view is known here, before the mode-scoped binding gate
+    # below) unless an explicit `--main-lane-exception` references an owner/operator
+    # decision. Deliberately scoped to cockpit panes: a plain `normal_window` agent, a
+    # same-lane *sublane* implementer (non-`default` lane), a dispatch to any non-implementer
+    # provider (the gateway route), and any non-`implementation_request` notification are all
+    # unaffected. The binding wiring lives in the f_140 `main_lane_guard_gate` seam.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
+        main_lane_guard_blocked,
+    )
+
+    if main_lane_guard_blocked(
+        args, receiver=receiver, kind=kind, preflight_target=preflight_target
     ):
         _emit_outcome(
             make_outcome(

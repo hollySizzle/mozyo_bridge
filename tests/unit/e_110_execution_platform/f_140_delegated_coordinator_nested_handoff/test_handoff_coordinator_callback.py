@@ -122,6 +122,43 @@ class CoordinatorCandidatesTest(unittest.TestCase):
         self.assertNotIn("%1071", [p["id"] for p in cands])
 
 
+class CoordinatorProviderRebindTest(unittest.TestCase):
+    """Role-based coordinator provider (Redmine #13174).
+
+    The coordinator pseudo-target resolves the coordinator *role*'s runtime provider;
+    it defaults to Codex (byte-identical to pre-#13174), while a rebind can resolve the
+    coordinator to a different default-lane surface.
+    """
+
+    def test_default_provider_resolves_default_lane_codex(self) -> None:
+        # Behavior-preserving: no explicit provider -> the default-lane Codex (%953).
+        self.assertEqual(
+            ["%953"], [p["id"] for p in coordinator_codex_candidates(FULL_COCKPIT, WS_BRIDGE)]
+        )
+        self.assertEqual(
+            "%953", resolve_coordinator_codex(FULL_COCKPIT, SUBLANE_CLAUDE)["id"]
+        )
+
+    def test_rebound_provider_resolves_default_lane_that_surface(self) -> None:
+        # coordinator rebound to claude (#13126 topology): the callback resolves the
+        # default-lane claude pane (%954), not the codex pane.
+        self.assertEqual(
+            ["%954"],
+            [
+                p["id"]
+                for p in coordinator_codex_candidates(
+                    FULL_COCKPIT, WS_BRIDGE, provider="claude"
+                )
+            ],
+        )
+        self.assertEqual(
+            "%954",
+            resolve_coordinator_codex(
+                FULL_COCKPIT, SUBLANE_CLAUDE, provider="claude"
+            )["id"],
+        )
+
+
 class ResolveCoordinatorCodexTest(unittest.TestCase):
     def test_sublane_sender_resolves_main_coordinator(self) -> None:
         self.assertEqual(

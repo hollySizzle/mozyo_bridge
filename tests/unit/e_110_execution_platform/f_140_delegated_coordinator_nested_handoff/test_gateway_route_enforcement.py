@@ -264,5 +264,82 @@ class DecisionShapeTest(unittest.TestCase):
         self.assertNotIn("%", payload["suggested_safe_route"] or "")
 
 
+class WorkerProviderRebindTest(unittest.TestCase):
+    """Role-based worker discrimination (Redmine #13174).
+
+    The authority decision — worker (terminal same-lane hop) vs gateway (route head)
+    — keys on the implementer (worker) *role*'s runtime provider, which the caller
+    resolves from the binding. ``worker_provider`` unset falls back to ``claude`` so
+    the default binding is byte-identical; a rebind moves which receiver is treated as
+    the worker.
+    """
+
+    def test_unset_worker_provider_is_byte_identical_to_claude(self) -> None:
+        base = dict(
+            kind="implementation_request",
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-coordinator",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub-12642",
+        )
+        # Default: receiver=claude is the worker -> cross-lane bypass blocks.
+        self.assertTrue(_decide(receiver="claude", **base).is_blocked)
+        self.assertTrue(
+            _decide(receiver="claude", worker_provider="claude", **base).is_blocked
+        )
+        # Explicit worker_provider="claude" matches the unset fallback exactly.
+        self.assertEqual(
+            _decide(receiver="claude", **base).to_dict(),
+            _decide(receiver="claude", worker_provider="claude", **base).to_dict(),
+        )
+
+    def test_rebound_worker_provider_blocks_that_receiver_cross_lane(self) -> None:
+        # implementer rebound to codex: a governed kind `--to codex` to a cross-lane
+        # pane is now the worker bypass and fails closed.
+        decision = _decide(
+            kind="implementation_request",
+            receiver="codex",
+            worker_provider="codex",
+            sender_identity_known=True,
+            sender_lane_id="lane-coordinator",
+            target_lane_id="lane-sub-12642",
+            target_role="codex",
+        )
+        self.assertTrue(decision.is_blocked)
+        self.assertEqual(BLOCKED_DIRECT_WORKER_BYPASS, decision.blocked_reason)
+
+    def test_rebound_leaves_other_provider_as_gateway_head(self) -> None:
+        # With the worker bound to codex, `--to claude` is now the non-worker
+        # (gateway/coordinator) route head and is always allowed.
+        decision = _decide(
+            kind="implementation_request",
+            receiver="claude",
+            worker_provider="codex",
+            sender_identity_known=True,
+            sender_lane_id="lane-coordinator",
+            target_lane_id="lane-sub-12642",
+            target_role="claude",
+        )
+        self.assertEqual(ROUTE_ALLOWED, decision.verdict)
+        self.assertTrue(decision.governed)
+
+    def test_rebound_worker_same_lane_terminal_hop_allowed(self) -> None:
+        # The same-lane gateway -> worker terminal hop is still allowed under a rebind.
+        decision = _decide(
+            kind="implementation_request",
+            receiver="codex",
+            worker_provider="codex",
+            sender_identity_known=True,
+            sender_workspace_id="ws-a",
+            sender_lane_id="lane-sub-12642",
+            target_workspace_id="ws-a",
+            target_lane_id="lane-sub-12642",
+            target_role="codex",
+        )
+        self.assertEqual(ROUTE_ALLOWED, decision.verdict)
+        self.assertTrue(decision.same_unit)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

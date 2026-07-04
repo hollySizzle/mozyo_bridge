@@ -145,6 +145,16 @@ class GatewayRouteRequest:
     the way, mirroring the cross-session ``--to claude`` gate which is skipped when
     the sender session is unknown. ``allow_direct_worker`` is the explicit
     durable-exception flag.
+
+    ``worker_provider`` is the runtime provider bound to the **implementer (worker)
+    role** for this repo (Redmine #13174). The authority decision — "is this delivery
+    addressed to a worker (and thus the terminal ``gateway -> worker`` hop that must be
+    same-lane), or to the gateway (the always-allowed route head)?" — keys on the role,
+    not a literal ``claude``. The caller resolves it from the repo-local
+    :class:`RoleProviderBinding` and threads it in; ``None`` (or empty) falls back to
+    :data:`PROVIDER_CLAUDE`, so the default binding is byte-identical to the pre-#13174
+    gate. The ``receiver`` token itself stays a delivery attribute — the gate only
+    compares it against the role-resolved worker provider.
     """
 
     kind: Optional[str]
@@ -156,6 +166,7 @@ class GatewayRouteRequest:
     target_lane_id: Optional[str] = None
     target_role: Optional[str] = None
     allow_direct_worker: bool = False
+    worker_provider: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +269,10 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     """
     kind = _norm(request.kind)
     receiver = _norm(request.receiver)
+    # Role-based worker discrimination (Redmine #13174): the "worker" hop is the
+    # implementer role's runtime provider, resolved by the caller from the binding.
+    # Default (unset) -> claude, so the pre-#13174 behavior is byte-identical.
+    worker_provider = _norm(request.worker_provider) or PROVIDER_CLAUDE
 
     def _allowed(*, governed: bool, same_unit: Optional[bool]) -> GatewayRouteDecision:
         return GatewayRouteDecision(
@@ -274,9 +289,10 @@ def decide_gateway_route(request: GatewayRouteRequest) -> GatewayRouteDecision:
     if kind not in GATEWAY_GOVERNED_KINDS:
         return _allowed(governed=False, same_unit=None)
 
-    # Governed kind. A delivery to the Codex gateway is the governed route head
-    # (coordinator -> sublane Codex gateway), always allowed.
-    if receiver != PROVIDER_CLAUDE:
+    # Governed kind. A delivery to a non-worker provider is the governed route head
+    # (coordinator -> sublane gateway, the gateway provider under this binding),
+    # always allowed.
+    if receiver != worker_provider:
         return _allowed(governed=True, same_unit=None)
 
     # Governed kind addressed to a Claude worker. When the sender's own lane Unit

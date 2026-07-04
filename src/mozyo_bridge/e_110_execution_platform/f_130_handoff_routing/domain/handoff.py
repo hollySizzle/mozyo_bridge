@@ -1074,46 +1074,46 @@ def main_lane_implementation_request_blocked(
     kind: "Optional[str]",
     target_lane_id: "Optional[str]",
     target_is_cockpit_pane: bool,
-    target_binds_claude: bool,
+    target_binds_implementer: bool,
+    implementer_provider: str,
     has_main_lane_exception: bool,
 ) -> bool:
-    """True when a Claude ``implementation_request`` to the main lane must fail closed.
+    """True when an implementer ``implementation_request`` to the main lane must fail closed.
 
     The mechanical control behind the main-lane dispatch guard (Redmine #12441 /
     prevention note #12438 j#63436). In the managed cockpit / sublane operating
     model (epic #12366; ``coordinator-sublane-development-flow.md``) the
-    main-*unit* Claude is not an implementer — implementation-shaped work defaults
-    to a cockpit-visible sublane — so a direct ``handoff send --to claude --kind
-    implementation_request`` into the cockpit's default/main-lane Claude is a
-    process gap (#12438 j#63432/j#63434). This predicate returns ``True`` exactly
-    when the send must be rejected:
+    main-*unit* implementer surface is not where implementation runs, so a direct
+    ``implementation_request`` into the cockpit's default/main-lane implementer pane
+    is a process gap (#12438 j#63432/j#63434).
 
-    - the receiver is ``claude`` (a ``--to codex`` gateway dispatch is unaffected),
-    - the intent is ``implementation_request`` (read-only investigation, summary,
-      design consultation, custom hold/stop, and ``reply`` notifications to the
-      main-lane Claude are unaffected),
-    - the resolved target genuinely **is** the cockpit main-lane Claude: it is a
-      managed cockpit pane (``target_is_cockpit_pane``), it strongly binds the
-      ``claude`` role (``target_binds_claude``), and its lane normalizes to the
-      main lane. The guard is deliberately scoped to the cockpit/sublane model
-      where the main-unit-vs-sublane split exists: a plain ``normal_window``
-      Claude in an unmanaged repo carries no sublane role and is unaffected; a
-      same-lane *sublane* Claude (non-``default`` lane) is the sanctioned
-      implementer route and is unaffected; and a pane that does not bind
-      ``claude`` (e.g. a cockpit pane marked ``codex``) is left to the
-      receiver-binding gate's role-mismatch rejection rather than mislabeled a
-      main-lane block, and
-    - no explicit ``main_lane_exception`` (a referenced owner/operator decision)
-      was supplied.
+    Role-based (Redmine #13174): the guard keys on the **implementer role**, not a
+    literal ``claude`` token. The caller resolves the implementer's runtime provider
+    from the :class:`RoleProviderBinding` and threads it in as ``implementer_provider``
+    (the pane binding is tested against it via ``target_binds_implementer``). Under the
+    default binding the implementer is ``claude`` so behavior is byte-for-byte the
+    pre-#13174 guard; under a rebind (e.g. a ``coordinator``-on-``claude`` topology) it
+    follows the binding rather than mis-blocking the coordinator pane or missing the real
+    implementer pane. Role identity resolves first; the provider is only a delivery attr.
+
+    Returns ``True`` exactly when the send must be rejected: the receiver is the
+    implementer provider (any other provider — e.g. the ``--to codex`` gateway under the
+    default binding — is unaffected); the intent is ``implementation_request`` (read-only
+    / design / summary / ``reply`` are unaffected); the resolved target genuinely **is**
+    the cockpit main-lane implementer pane (``target_is_cockpit_pane`` and
+    ``target_binds_implementer`` and its lane normalizes to the main lane — a
+    ``normal_window`` agent, a same-lane *sublane* implementer, or a pane not binding the
+    implementer provider is unaffected); and no explicit ``main_lane_exception`` was set.
 
     Pure and side-effect-free; the lane id is normalized the same way the
     discovery resolver normalizes it (empty / missing -> ``default``).
     """
-    if not (target_is_cockpit_pane and target_binds_claude):
+    if not (target_is_cockpit_pane and target_binds_implementer):
         return False
     normalized_lane = (target_lane_id or "").strip() or MAIN_LANE_ID
     return (
-        receiver == "claude"
+        bool(implementer_provider)
+        and receiver == implementer_provider
         and kind == "implementation_request"
         and normalized_lane == MAIN_LANE_ID
         and not has_main_lane_exception

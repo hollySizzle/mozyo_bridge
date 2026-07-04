@@ -36,7 +36,8 @@ class MainLanePredicateTest(unittest.TestCase):
             kind="implementation_request",
             target_lane_id="default",
             target_is_cockpit_pane=True,
-            target_binds_claude=True,
+            target_binds_implementer=True,
+            implementer_provider="claude",
             has_main_lane_exception=False,
         )
         kwargs.update(overrides)
@@ -56,16 +57,18 @@ class MainLanePredicateTest(unittest.TestCase):
         self.assertFalse(self._blocked(target_lane_id="lane-5ba25a56f773"))
 
     def test_normal_window_main_lane_not_blocked(self) -> None:
-        # A plain unmanaged-repo Claude (normal_window) carries no sublane role,
+        # A plain unmanaged-repo agent (normal_window) carries no sublane role,
         # so the cockpit/sublane guard does not apply.
         self.assertFalse(self._blocked(target_is_cockpit_pane=False))
 
-    def test_pane_not_binding_claude_left_to_binding_gate(self) -> None:
-        # A cockpit pane that does not strongly bind claude (e.g. marked codex)
+    def test_pane_not_binding_implementer_left_to_binding_gate(self) -> None:
+        # A cockpit pane that does not strongly bind the implementer provider
         # is a role-mismatch for the binding gate, not a main-lane block.
-        self.assertFalse(self._blocked(target_binds_claude=False))
+        self.assertFalse(self._blocked(target_binds_implementer=False))
 
     def test_codex_gateway_dispatch_allowed(self) -> None:
+        # Under the default binding the implementer is `claude`; a dispatch to any
+        # other provider (the gateway route) is not the guarded implementer send.
         self.assertFalse(self._blocked(receiver="codex"))
 
     def test_non_implementation_main_lane_notification_allowed(self) -> None:
@@ -77,6 +80,42 @@ class MainLanePredicateTest(unittest.TestCase):
 
     def test_explicit_exception_allows_main_lane(self) -> None:
         self.assertFalse(self._blocked(has_main_lane_exception=True))
+
+    # --- Role-based rebind (Redmine #13174) -------------------------------------
+    #
+    # The guard reasons about the implementer *role*, whose runtime provider the
+    # caller resolves from the binding. These cases pin that the predicate keys on
+    # `implementer_provider`, not a hard-coded `claude`, so a rebind (e.g. a
+    # coordinator-on-claude topology that moves the implementer to codex) neither
+    # mis-blocks the non-implementer provider nor misses the real implementer pane.
+
+    def test_rebound_implementer_provider_blocks_that_receiver(self) -> None:
+        # implementer rebound to codex: an implementation_request to the main-lane
+        # codex pane is now the guarded send and fails closed.
+        self.assertTrue(
+            self._blocked(receiver="codex", implementer_provider="codex")
+        )
+
+    def test_rebound_implementer_leaves_other_provider_unblocked(self) -> None:
+        # With the implementer bound to codex, a `--to claude` send (claude is now
+        # e.g. the coordinator seat, not the implementer) is NOT a main-lane block.
+        self.assertFalse(
+            self._blocked(receiver="claude", implementer_provider="codex")
+        )
+
+    def test_receiver_provider_mismatch_not_blocked(self) -> None:
+        # A receiver that is not the resolved implementer provider is never guarded.
+        self.assertFalse(
+            self._blocked(receiver="claude", implementer_provider="codex")
+        )
+        self.assertFalse(
+            self._blocked(receiver="codex", implementer_provider="claude")
+        )
+
+    def test_empty_implementer_provider_fails_open_not_crash(self) -> None:
+        # Defensive: an empty resolved provider never keys the guard on `""` (the
+        # boundary always resolves a real provider; this only pins the predicate).
+        self.assertFalse(self._blocked(receiver="", implementer_provider=""))
 
 
 if __name__ == "__main__":

@@ -26,11 +26,20 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     make_outcome,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+    load_workflow_binding,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (
     GatewayRouteRequest,
     decide_gateway_route,
     render_block_die_message,
     render_exception_advisory,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    PROVIDER_CLAUDE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+    ROLE_IMPLEMENTER,
 )
 from mozyo_bridge.shared.errors import die
 
@@ -60,6 +69,13 @@ def enforce_gateway_route(
     Returns ``None`` (and raises nothing) for an allowed route.
     """
     sender_ws, sender_lane = current_pane_lane_unit()
+    # Role-based worker discrimination (Redmine #13174): resolve the implementer
+    # (worker) role's runtime provider from the repo-local binding (#12673/#13157;
+    # default -> claude, byte-identical) so the authority decision keys on the role,
+    # not the literal `claude` receiver token. A broken config fails closed through
+    # the loader's RepoLocalConfigError.
+    binding, _warnings = load_workflow_binding()
+    worker_provider = binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
     decision = decide_gateway_route(
         GatewayRouteRequest(
             kind=kind,
@@ -71,6 +87,7 @@ def enforce_gateway_route(
             target_lane_id=preflight_target.lane_id,
             target_role=preflight_target.role,
             allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
+            worker_provider=worker_provider,
         )
     )
     if decision.is_blocked:

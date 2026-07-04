@@ -437,32 +437,46 @@ def duplicate_pane_record_row(pane: dict[str, str]) -> str:
     )
 
 
-def _is_strong_codex(pane: dict[str, str]) -> bool:
-    """True when ``pane`` strongly, non-ambiguously resolves to the Codex role."""
+def _is_strong_provider(pane: dict[str, str], provider: str) -> bool:
+    """True when ``pane`` strongly, non-ambiguously resolves to ``provider``'s role."""
     resolution = resolve_agent_role(
         pane_option_role=pane.get("agent_role"),
         window_name=pane.get("window_name"),
         process=pane.get("command"),
     )
     return (
-        resolution.role == AGENT_KIND_CODEX
+        resolution.role == provider
         and resolution.confidence == CONFIDENCE_STRONG
         and not resolution.ambiguous
     )
 
 
+def _is_strong_codex(pane: dict[str, str]) -> bool:
+    """True when ``pane`` strongly, non-ambiguously resolves to the Codex role."""
+    return _is_strong_provider(pane, AGENT_KIND_CODEX)
+
+
 def coordinator_codex_candidates(
     panes: list[dict[str, str]],
     workspace_id: str,
+    *,
+    provider: str = AGENT_KIND_CODEX,
 ) -> list[dict[str, str]]:
-    """Default-lane (coordinator) Codex panes in ``workspace_id`` (Redmine #12015).
+    """Default-lane (coordinator) panes bound to ``provider`` in ``workspace_id``.
 
-    The coordinator lane is a workspace's primary checkout — the lane the cockpit
-    stamps as :data:`DEFAULT_LANE` (``cockpit_layout.resolve_lane_identity``),
-    as opposed to a linked-worktree / clone sublane that carries a hashed lane
-    id. Its owner-facing actor is the Codex pane. Candidates are deduplicated by
-    ``pane_id`` (grouped-session views collapse to one). Identity comes from the
-    live tmux ``@mozyo_*`` pane options in ``panes``, never a pane title.
+    Redmine #12015 (role-based provider since Redmine #13174). The coordinator lane
+    is a workspace's primary checkout — the lane the cockpit stamps as
+    :data:`DEFAULT_LANE` (``cockpit_layout.resolve_lane_identity``), as opposed to a
+    linked-worktree / clone sublane that carries a hashed lane id. Its owner-facing
+    actor is the pane running the **coordinator role's** runtime provider.
+
+    ``provider`` defaults to :data:`~...agent_discovery.AGENT_KIND_CODEX` so an
+    unconfigured / default-binding callback resolves the coordinator to the Codex
+    pane exactly as before #13174; the caller resolves the coordinator role's provider
+    from the :class:`RoleProviderBinding` and passes it here when a rebind moves the
+    coordinator to a different surface. Candidates are deduplicated by ``pane_id``
+    (grouped-session views collapse to one). Identity comes from the live tmux
+    ``@mozyo_*`` pane options in ``panes``, never a pane title.
     """
     unique: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -470,7 +484,7 @@ def coordinator_codex_candidates(
         pane_ws, pane_lane = _pane_lane_identity(pane)
         if pane_ws != workspace_id or pane_lane != DEFAULT_LANE:
             continue
-        if not _is_strong_codex(pane):
+        if not _is_strong_provider(pane, provider):
             continue
         pane_id = pane.get("id") or ""
         if pane_id in seen:
@@ -483,26 +497,33 @@ def coordinator_codex_candidates(
 def resolve_coordinator_codex(
     panes: list[dict[str, str]],
     sender: dict[str, str] | None,
+    *,
+    provider: str = AGENT_KIND_CODEX,
 ) -> dict[str, str] | None:
-    """The main coordinator Codex pane for the sender's workspace (Redmine #12015).
+    """The main coordinator pane for the sender's workspace (Redmine #12015).
 
-    A sublane resolves its coordinator by selecting the Codex pane that shares
-    its own ``workspace_id`` and sits in the :data:`DEFAULT_LANE`. This is the
-    sanctioned cross-lane sublane->coordinator callback path (Codex-to-Codex; see
-    ``skills/mozyo-bridge-agent/references/workflow.md`` ``## Owner Approval
-    Aggregation`` and ``## Sublane Coordinator Callback``). It is strictly
-    **workspace-scoped**: it never reaches another
-    workspace's coordinator (that is the cross-workspace consult primitive's job,
-    Redmine #11779), and it stays fail-closed — returns ``None`` when the sender
-    is unknown, carries no workspace identity, or the match is not unique. Live
-    tmux pane options are the identity source, never a pane title.
+    A sublane resolves its coordinator by selecting the pane that shares its own
+    ``workspace_id``, sits in the :data:`DEFAULT_LANE`, and runs the coordinator
+    role's runtime provider. This is the sanctioned cross-lane sublane->coordinator
+    callback path (see ``skills/mozyo-bridge-agent/references/workflow.md`` ``## Owner
+    Approval Aggregation`` and ``## Sublane Coordinator Callback``). It is strictly
+    **workspace-scoped**: it never reaches another workspace's coordinator (that is
+    the cross-workspace consult primitive's job, Redmine #11779), and it stays
+    fail-closed — returns ``None`` when the sender is unknown, carries no workspace
+    identity, or the match is not unique. Live tmux pane options are the identity
+    source, never a pane title.
+
+    ``provider`` is the coordinator role's runtime provider; it defaults to
+    :data:`~...agent_discovery.AGENT_KIND_CODEX` (Redmine #13174), so the default
+    binding resolves the coordinator to Codex exactly as before, while a rebind can
+    resolve it to a different surface.
     """
     if sender is None:
         return None
     sender_ws, _sender_lane = _pane_lane_identity(sender)
     if not sender_ws:
         return None
-    candidates = coordinator_codex_candidates(panes, sender_ws)
+    candidates = coordinator_codex_candidates(panes, sender_ws, provider=provider)
     if len(candidates) == 1:
         return candidates[0]
     return None
