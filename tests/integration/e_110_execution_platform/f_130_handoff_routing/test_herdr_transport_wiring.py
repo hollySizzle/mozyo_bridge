@@ -1,28 +1,29 @@
-"""Herdr live-wiring smoke for ``orchestrate_handoff`` (Redmine #13253).
+"""Herdr live-wiring integration for ``orchestrate_handoff`` (Redmine #13253).
 
-Drives the real ``mozyo-bridge handoff send`` CLI path end to end with the
-runtime transport binding resolved to the **herdr** backend over an in-memory
-fake port (no live herdr binary, no tmux server). It proves the single injection
-point (the ``_bind_runtime_transport`` decorator) swaps the send/capture
-primitives so the unchanged send choreography lands on the herdr port:
+Drives the real ``mozyo-bridge handoff send`` CLI path end to end **through the
+real** ``resolve_handoff_transport_binding`` (no patch of the resolver) with a
+repo-local ``terminal_transport: herdr`` config, a trusted-env fake herdr binary,
+and a faked ``subprocess.run`` — so the whole herdr path runs: config selection,
+the target-pane identity projection (#13253 j#72373), the ``agent list`` re-bind,
+the tmux-``%N`` → live-locator translation, and the send/capture over the port.
+No live herdr binary and no tmux server.
 
-- the internal pre-type snapshot maps to ``read_pane`` (visible source);
-- the marker+body type maps to ``send_text`` (the composer injection);
-- the submit maps to ``send_keys("enter")``.
-
-The tmux-default byte-for-byte behaviour is covered by the rest of the handoff
-suite (every existing test runs with the default binding, which installs
-nothing); this file pins only the herdr branch of the wiring.
+The point of the fixtures here (j#72372 / j#72373): the translation identity must
+come from the **target pane**, not the sender / current-repo context — so the
+agent list carries both a sender row and the target-pane row, and delivery must
+land only on the target pane's locator.
 """
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import io
 import json
 import os
+import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -30,100 +31,30 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
-    resolve_runtime_transport_binding,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
-    BACKEND_HERDR,
-    REASON_INVALID_TARGET,
-    SOURCE_VISIBLE,
-    PaneReadResult,
-    TerminalTransportConfig,
-    TransportResult,
-    valid_target,
-)
 
-SESSION = "mozyo-cockpit"
+SESSION = "agents"
 
-# The receiver's durable herdr identity + the live locator its agent-list row maps
-# to. The rail hands the shim a tmux %N target; the translation boundary re-binds
-# this name against the fake agent list and rewrites %N -> this locator.
-RECEIVER_NAME = encode_assigned_name("ws-it-donyu", "claude", "default")
-RECEIVER_LOCATOR = "w1:p1"
-AGENT_ROWS = [{"name": RECEIVER_NAME, "pane": RECEIVER_LOCATOR}]
+# The sender's own herdr row (a different workspace/role than the target). If the
+# translation wrongly bound to the sender, delivery would land on wS:pS.
+SENDER_NAME = encode_assigned_name("ws-sender", "codex", "default")
+SENDER_LOCATOR = "wS:pS"
 
 
-def _pane(pane_id, location, **kw):
-    base = {
-        "id": pane_id,
-        "location": location,
-        "command": kw.get("command", "node"),
-        "cwd": kw.get("cwd", "/repo"),
-        "window_name": kw.get("window_name", "cockpit"),
-        "pane_active": kw.get("pane_active", "1"),
-        "agent_role": kw.get("agent_role", ""),
-        "workspace_id": kw.get("workspace_id", ""),
-        "lane_id": kw.get("lane_id", ""),
-        "lane_label": kw.get("lane_label", ""),
+def _target_pane(*, workspace_id, lane_id):
+    return {
+        "id": "%2",
+        "location": f"{SESSION}:0.1",
+        "command": "claude",
+        "cwd": "/repo",
+        "window_name": "claude",
+        "pane_active": "1",
+        "agent_role": "claude",
+        "workspace_id": workspace_id,
+        "lane_id": lane_id,
     }
-    return base
-
-
-SENDER_CODEX = _pane(
-    "%900",
-    f"{SESSION}:0.9",
-    agent_role="codex",
-    workspace_id="ws-it-donyu",
-    lane_id="lane-main",
-    command="codex",
-    cwd="/ws/it-donyu",
-)
-LOCAL_CLAUDE = _pane(
-    "%901",
-    f"{SESSION}:0.1",
-    agent_role="claude",
-    workspace_id="ws-it-donyu",
-    lane_id="lane-main",
-    command="claude",
-    cwd="/ws/it-donyu/app",
-)
-
-REPO_ROOTS = {"/ws/it-donyu": "/ws/it-donyu", "/ws/it-donyu/app": "/ws/it-donyu"}
-
-
-class FakePort:
-    """An in-memory herdr port recording every call, with the live ``valid_target`` guard.
-
-    The guard mirrors ``HerdrCliTransport`` (Redmine #13253 j#72367): a tmux ``%N``
-    that reached the port un-translated fails ``invalid_target``, so the fake can no
-    longer mask the un-translated-target bug.
-    """
-
-    backend = BACKEND_HERDR
-
-    def __init__(self):
-        self.calls: list = []
-
-    def send_text(self, target, text):
-        self.calls.append(("send_text", target, text))
-        if not valid_target(target):
-            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        return TransportResult.success()
-
-    def send_keys(self, target, keys):
-        self.calls.append(("send_keys", target, keys))
-        if not valid_target(target):
-            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        return TransportResult.success()
-
-    def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None):
-        self.calls.append(("read_pane", target, source, lines))
-        if not valid_target(target):
-            return PaneReadResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        return PaneReadResult.success("")
 
 
 def _outcome_from(stdout: str):
@@ -137,236 +68,207 @@ def _outcome_from(stdout: str):
     return outcome
 
 
-class HerdrWiringSmokeTest(unittest.TestCase):
-    def test_standard_send_lands_on_herdr_port(self) -> None:
-        from mozyo_bridge.application import commands
-        from mozyo_bridge.application import handoff_transport_wiring
-        from mozyo_bridge.application.cli import build_parser
-
-        port = FakePort()
-
-        def _tmux_run_tmux(*a, check=True):  # unused by the herdr branch
-            raise AssertionError("tmux run_tmux must not be called under herdr")
-
-        def _tmux_capture_pane(_t, _l):
-            raise AssertionError("tmux capture_pane must not be called under herdr")
-
-        binding = resolve_runtime_transport_binding(
-            TerminalTransportConfig(backend=BACKEND_HERDR),
-            tmux_run_tmux=_tmux_run_tmux,
-            tmux_capture_pane=_tmux_capture_pane,
-            port=port,
-            assigned_name=RECEIVER_NAME,
-            list_agents=lambda: AGENT_ROWS,
-        )
-
-        argv = [
-            "handoff", "send", "--to", "claude",
-            "--source", "redmine", "--issue", "13253", "--journal", "72356",
-            "--kind", "implementation_request",
-            "--mode", "standard",
-            "--landing-timeout", "0.01", "--submit-delay", "0",
-            "--summary", "herdr smoke",
-        ]
-        args = build_parser().parse_args(argv)
-
-        env = {k: v for k, v in os.environ.items() if k != "TMUX_PANE"}
-        env["TMUX_PANE"] = "%900"
-
-        with patch.object(commands, "require_tmux"), \
-            patch.object(
-                handoff_transport_wiring,
-                "resolve_handoff_transport_binding",
-                return_value=binding,
-            ), \
-            patch.object(commands, "wait_for_text", return_value=True), \
-            patch("mozyo_bridge.application.commands.time.sleep"), \
-            patch.object(commands, "current_session_name", return_value=SESSION), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name",
-                return_value=SESSION,
-            ), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
-            ), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
-                return_value=[SENDER_CODEX, LOCAL_CLAUDE],
-            ), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
-                lambda cwd: REPO_ROOTS.get(cwd),
-            ), \
-            patch.dict(os.environ, env, clear=True), \
-            contextlib.redirect_stdout(io.StringIO()) as out, \
-            contextlib.redirect_stderr(io.StringIO()):
-            with contextlib.suppress(SystemExit):
-                args.func(args)
-
-        outcome = _outcome_from(out.getvalue())
-        self.assertIsNotNone(outcome, msg=out.getvalue())
-        self.assertEqual(outcome.get("status"), "sent")
-
-        kinds = [c[0] for c in port.calls]
-        # Preflight read -> composer inject -> submit, all on the herdr port.
-        self.assertIn("read_pane", kinds)
-        self.assertIn("send_text", kinds)
-        self.assertIn("send_keys", kinds)
-
-        # Every port target is the translated live locator, never the rail's tmux %N.
-        for call in port.calls:
-            self.assertEqual(call[1], RECEIVER_LOCATOR, msg=f"un-translated target: {call!r}")
-
-        send_text_calls = [c for c in port.calls if c[0] == "send_text"]
-        self.assertEqual(len(send_text_calls), 1)
-        _, target, text = send_text_calls[0]
-        self.assertEqual(target, RECEIVER_LOCATOR)
-        self.assertIn("herdr smoke", text)
-
-        enter_calls = [c for c in port.calls if c[0] == "send_keys" and c[2] == "enter"]
-        self.assertEqual(len(enter_calls), 1)
-        self.assertEqual(enter_calls[0][1], RECEIVER_LOCATOR)
-
-        # The read maps to the visible source (the tmux capture equivalent).
-        read_calls = [c for c in port.calls if c[0] == "read_pane"]
-        self.assertTrue(read_calls)
-        self.assertEqual(read_calls[0][2], SOURCE_VISIBLE)
-
-
-class StatefulFakePort:
-    """A herdr port that echoes the injected composer, so the marker lands.
-
-    Models a well-behaved receiver: ``send_text`` appends to the composer,
-    ``read_pane`` returns it (so the landing-marker wait observes the marker),
-    and ``send_keys enter`` submits (clears the composer).
-    """
-
-    backend = BACKEND_HERDR
-
-    def __init__(self):
-        self.calls: list = []
-        self.composer = ""
-
-    def send_text(self, target, text):
-        self.calls.append(("send_text", target, text))
-        if not valid_target(target):
-            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        self.composer += text
-        return TransportResult.success()
-
-    def send_keys(self, target, keys):
-        self.calls.append(("send_keys", target, keys))
-        if not valid_target(target):
-            return TransportResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        if keys == "enter":
-            self.composer = ""
-        return TransportResult.success()
-
-    def read_pane(self, target, *, source=SOURCE_VISIBLE, lines=None):
-        self.calls.append(("read_pane", target, source, lines))
-        if not valid_target(target):
-            return PaneReadResult.failure(REASON_INVALID_TARGET, f"invalid: {target!r}")
-        return PaneReadResult.success(self.composer)
-
-
-class HerdrInactiveTargetActivationTest(unittest.TestCase):
-    """The finding-1 regression: default queue-enter + inactive admitted target.
-
-    The target-activation tail (#12597) resolves ``run_tmux("select-pane", …)``
-    through ``commands`` at call time. Under the herdr binding the whole
-    ``commands.run_tmux`` is swapped for the shim, so before the finding-1 fix the
-    activation raised ``TransportBindingError`` and the send crashed. With the fix
-    ``select-pane`` is a target-validated no-op, so the admitted inactive split is
-    activated and delivered to over the herdr port without error.
-    """
-
-    def test_queue_enter_inactive_admitted_target_activates_and_sends_over_herdr(
+class HerdrRealResolverWiringTest(unittest.TestCase):
+    def _run(
         self,
-    ) -> None:
-        from mozyo_bridge.application import commands  # noqa: F401
-        from mozyo_bridge.application import handoff_transport_wiring
+        *,
+        target_pane,
+        agent_rows,
+        mode="standard",
+        pane_active="1",
+        extra_argv=None,
+    ):
+        """Drive `handoff send` over the real herdr resolver; return (result, sends, out, err).
+
+        ``sends`` is the list of herdr port operations captured from the faked
+        subprocess as ``(op, target_locator, *rest)`` — every send/read the shim
+        performed on the port, so a test can assert which locator delivery hit.
+        """
+        from mozyo_bridge.application import commands
         from mozyo_bridge.application.cli import build_parser
 
-        port = StatefulFakePort()
+        target_pane = dict(target_pane, pane_active=pane_active)
+        sends: list = []
 
-        def _tmux_unused(*a, **k):
-            raise AssertionError("tmux primitive must not be called under herdr")
+        def fake_run(argv, capture_output=None, text=None, timeout=None, **kw):
+            # Only the herdr binary is ever spawned on this path.
+            rest = list(argv[1:])
+            if rest[:3] == ["agent", "list", "--json"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"agents": agent_rows}), stderr=""
+                )
+            if rest[:2] == ["pane", "send-text"]:
+                sends.append(("send_text", rest[2], rest[3] if len(rest) > 3 else ""))
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if rest[:2] == ["pane", "send-keys"]:
+                sends.append(("send_keys", rest[2], rest[3] if len(rest) > 3 else ""))
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if rest[:2] == ["agent", "read"]:
+                sends.append(("read", rest[2]))
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess call: {argv!r}")
 
-        binding = resolve_runtime_transport_binding(
-            TerminalTransportConfig(backend=BACKEND_HERDR),
-            tmux_run_tmux=_tmux_unused,
-            tmux_capture_pane=_tmux_unused,
-            port=port,
-            assigned_name=RECEIVER_NAME,
-            list_agents=lambda: AGENT_ROWS,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".mozyo-bridge").mkdir()
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            herdr_bin = repo / "fake-herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(
+                herdr_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
 
-        argv = [
-            "handoff", "send", "--to", "claude",
-            "--source", "asana", "--kind", "implementation_request",
-            "--task-id", "T1", "--comment-id", "C1",
-            "--target", "%2", "--mode", "queue-enter",
+            argv = [
+                "handoff", "send", "--to", "claude",
+                "--source", "asana", "--kind", "implementation_request",
+                "--task-id", "T1", "--comment-id", "C1",
+                "--target", "%2", "--mode", mode,
+                "--landing-timeout", "0.01", "--submit-delay", "0",
+            ] + (extra_argv or [])
+            args = build_parser().parse_args(argv)
+            args.repo = str(repo)
+
+            env = {k: v for k, v in os.environ.items() if k != "TMUX_PANE"}
+            env["MOZYO_HERDR_BINARY"] = str(herdr_bin)
+            env["MOZYO_REPO"] = str(repo)
+
+            with patch("subprocess.run", fake_run), \
+                patch.object(commands, "require_tmux"), \
+                patch.object(commands, "wait_for_text", return_value=True), \
+                patch("mozyo_bridge.application.commands.time.sleep"), \
+                patch.object(commands, "current_session_name", return_value=SESSION), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.current_session_name",
+                    return_value=SESSION,
+                ), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
+                ), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.resolve_target",
+                    lambda target: "%2",
+                ), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
+                    return_value=[target_pane],
+                ), \
+                patch(
+                    "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.infer_repo_root",
+                    lambda cwd: "/repo",
+                ), \
+                patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+                try:
+                    result = args.func(args)
+                except BaseException as exc:  # noqa: BLE001 - capture fail-closed outcome
+                    result = exc
+        return result, sends, out.getvalue(), err.getvalue()
+
+    def test_target_pane_identity_drives_translation_not_sender(self) -> None:
+        # Cross-lane fixture: the target pane's lane differs from any sender/current
+        # context. The agent list carries BOTH the sender row and the target row;
+        # delivery must land ONLY on the target pane's locator.
+        pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
+        target_name = encode_assigned_name("ws-target", "claude", "lane-x")
+        target_locator = "wT:pT"
+        rows = [
+            {"name": SENDER_NAME, "pane": SENDER_LOCATOR},
+            {"name": target_name, "pane": target_locator},
         ]
-        args = build_parser().parse_args(argv)
+        result, sends, out, err = self._run(target_pane=pane, agent_rows=rows)
 
-        inactive_pane = {
-            "id": "%2",
-            "location": "agents:0.1",
-            "command": "node",
-            "cwd": "/repo",
-            "window_name": "claude",
-            "pane_active": "0",
-            "workspace_id": "ws-1",
-        }
-
-        raised: list = []
-
-        with patch("mozyo_bridge.application.commands.require_tmux"), \
-            patch.object(
-                handoff_transport_wiring,
-                "resolve_handoff_transport_binding",
-                return_value=binding,
-            ), \
-            patch("mozyo_bridge.application.commands.time.sleep"), \
-            patch(
-                "mozyo_bridge.application.commands.current_session_name",
-                return_value="agents",
-            ), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.validate_target"
-            ), \
-            patch(
-                "mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_lines",
-                return_value=[inactive_pane],
-            ), \
-            contextlib.redirect_stdout(io.StringIO()) as out, \
-            contextlib.redirect_stderr(io.StringIO()):
-            try:
-                result = args.func(args)
-            except SystemExit as exc:
-                result = exc
-            except Exception as exc:  # pragma: no cover - the bug we are fixing
-                raised.append(exc)
-                result = None
-
-        # The activation select-pane must NOT have raised (finding-1 fix).
-        self.assertEqual(raised, [], msg=f"send raised under herdr: {raised!r}")
-        self.assertEqual(result, 0)
-
-        outcome = _outcome_from(out.getvalue())
-        self.assertIsNotNone(outcome, msg=out.getvalue())
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertIsNotNone(outcome, msg=out)
         self.assertEqual(outcome.get("status"), "sent")
+        # Delivery reached the port only at the TARGET pane's locator.
+        self.assertTrue(sends, msg="no herdr port ops captured")
+        targets = {op[1] for op in sends}
+        self.assertEqual(targets, {target_locator})
+        self.assertNotIn(SENDER_LOCATOR, targets)
 
-        # Delivery reached the herdr port: composer inject + submit, at the
-        # translated live locator (never the rail's tmux %2).
-        self.assertTrue([c for c in port.calls if c[0] == "send_text"])
-        self.assertTrue(
-            [c for c in port.calls if c[0] == "send_keys" and c[2] == "enter"]
+    def test_sender_only_agent_list_fails_closed(self) -> None:
+        # If only the sender's row exists (the target pane never registered its herdr
+        # name), the target-name re-bind is not-found -> fail closed. Delivery must
+        # NEVER fall back to the sender's locator.
+        pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
+        rows = [{"name": SENDER_NAME, "pane": SENDER_LOCATOR}]
+        result, sends, out, err = self._run(target_pane=pane, agent_rows=rows)
+
+        # Fail-closed: not a clean sent, and nothing delivered to the sender locator.
+        self.assertNotEqual(result, 0)
+        self.assertFalse(
+            [
+                op
+                for op in sends
+                if op[0] in ("send_text", "send_keys") and op[1] == SENDER_LOCATOR
+            ],
+            msg=f"a send leaked to the sender locator: {sends!r}",
         )
-        for call in port.calls:
-            self.assertEqual(call[1], RECEIVER_LOCATOR, msg=f"un-translated target: {call!r}")
-        # The durable record still documents the #12597 activation fact.
-        self.assertIn("- Activation:", out.getvalue())
+
+    def test_queue_enter_inactive_target_activates_and_sends_over_herdr(self) -> None:
+        # finding-1 regression, now through the real resolver: a queue-enter inactive
+        # admitted target activates (select-pane no-op) and delivers on the target
+        # locator without a TransportBindingError.
+        pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
+        target_name = encode_assigned_name("ws-target", "claude", "lane-x")
+        target_locator = "wT:pT"
+        rows = [{"name": target_name, "pane": target_locator}]
+        result, sends, out, err = self._run(
+            target_pane=pane, agent_rows=rows, mode="queue-enter", pane_active="0"
+        )
+
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent")
+        self.assertIn("- Activation:", out)
+        # Every port op targeted the translated locator (the select-pane no-op never
+        # reaches the port, so it is absent from `sends`).
+        self.assertTrue([op for op in sends if op[0] == "send_text"])
+        for op in sends:
+            self.assertEqual(op[1], target_locator, msg=f"un-translated port op: {op!r}")
+
+
+class TargetIdentityProjectionUnitTest(unittest.TestCase):
+    """`_resolve_target_assigned_name` mints from the TARGET pane, fail-closed."""
+
+    def test_name_is_minted_from_the_target_pane_slot(self) -> None:
+        from mozyo_bridge.application import handoff_transport_wiring as w
+
+        pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
+        with patch.object(w, "_pane_info", return_value=pane):
+            name = w._resolve_target_assigned_name("%2")
+        self.assertEqual(name, encode_assigned_name("ws-target", "claude", "lane-x"))
+
+    def test_unknown_role_fails_closed(self) -> None:
+        from mozyo_bridge.application import handoff_transport_wiring as w
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
+            TransportBindingError,
+        )
+
+        pane = dict(
+            _target_pane(workspace_id="ws-target", lane_id="lane-x"),
+            agent_role="",
+            window_name="zsh",
+            command="zsh",
+        )
+        with patch.object(w, "_pane_info", return_value=pane):
+            with self.assertRaises(TransportBindingError):
+                w._resolve_target_assigned_name("%2")
+
+    def test_missing_workspace_fails_closed(self) -> None:
+        from mozyo_bridge.application import handoff_transport_wiring as w
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
+            TransportBindingError,
+        )
+
+        pane = _target_pane(workspace_id="", lane_id="lane-x")
+        with patch.object(w, "_pane_info", return_value=pane):
+            with self.assertRaises(TransportBindingError):
+                w._resolve_target_assigned_name("%2")
 
 
 if __name__ == "__main__":  # pragma: no cover

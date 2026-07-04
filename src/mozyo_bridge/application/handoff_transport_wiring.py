@@ -41,6 +41,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBinding,
+    TransportBindingError,
     resolve_runtime_transport_binding,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -51,53 +52,55 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     BACKEND_HERDR,
     TerminalTransportError,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+    project_preflight_target,
+)
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
+    pane_info as _pane_info,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     capture_pane as _tmux_capture_pane,
     run_tmux as _tmux_run_tmux,
 )
-from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
 from mozyo_bridge.shared.errors import die
 
+#: The role tokens a target pane may resolve to that we can mint an identity for.
+#: An ``unknown`` / weakly-typed pane fails closed rather than guessing a handle.
+_KNOWN_ROLES = frozenset({"claude", "codex"})
 
-def _resolve_receiver_assigned_name(args: argparse.Namespace) -> str:
-    """Mint the receiver's durable herdr assigned name for this send (fail-closed).
 
-    The receiver's identity slot is ``(workspace_id, role, lane)`` — the same slot
-    the route-identity ledger and #13247 use. ``role`` is the handoff receiver
-    (``--to claude|codex``); ``workspace_id`` and ``lane`` come from the repo
-    context (``resolve_canonical_session`` + the ``_resolve_workspace_lane`` probe),
-    normalised exactly as #13247 prescribes (an empty lane -> ``default``). The name
-    is minted with #13247 ``encode_assigned_name``; a missing role / workspace (an
-    empty required component) fails closed with a clean ``die`` — a herdr send must
-    not proceed without a durable receiver handle to translate its tmux target to.
+def _resolve_target_assigned_name(target: str) -> str:
+    """Project *the target pane's* stable identity to its herdr assigned name (fail-closed).
+
+    Redmine #13253 j#72373: the translation identity must come from the **target
+    pane**, not the sender / current-repo context. This resolves the concrete pane
+    the rail is sending to (``pane_info(target)``) and reuses the rail's own
+    projection (``project_preflight_target`` — the #11822 role resolver + the
+    ``(workspace_id, lane)`` fields the pane carries) to derive the durable
+    ``(workspace_id, role, lane)`` slot, then mints the #13247 assigned name from it.
+
+    It is called *lazily* by the translator the first time the shim sees the target's
+    ``%N``, so it runs after ``orchestrate_handoff`` has resolved the concrete target
+    pane. A pane with no projectable identity (an unknown / weak role, or a missing
+    ``workspace_id`` — e.g. an unregistered pane) fails closed with a
+    :class:`TransportBindingError` *before* any send, so a herdr send never re-binds
+    against a guessed or sender-context handle.
     """
-    role = getattr(args, "to", None)
-    repo_root = repo_root_from_args(args)
-    try:
-        workspace_id = resolve_canonical_session(repo_root).workspace_id
-    except Exception:  # pragma: no cover - defensive; unresolvable workspace context
-        workspace_id = None
-    # The lane probe lives in ``commands`` (git checkout facts + registered
-    # canonical path); resolve it lazily to avoid an import cycle, and degrade to
-    # the #13247 default lane if it cannot be derived.
-    lane_id = ""
-    try:
-        from mozyo_bridge.application import commands
-
-        lane_id = getattr(
-            commands._resolve_workspace_lane(str(repo_root), workspace_id), "lane_id", ""
+    preflight = project_preflight_target(_pane_info(target))
+    if preflight.role not in _KNOWN_ROLES or not preflight.workspace_id:
+        raise TransportBindingError(
+            "herdr target-pane identity could not be projected for target "
+            f"{target!r} (role={preflight.role!r}, workspace_id="
+            f"{preflight.workspace_id!r}); refusing to send to an un-translatable target"
         )
-    except Exception:  # pragma: no cover - defensive; lane probe is best-effort
-        lane_id = ""
     try:
-        return encode_assigned_name(workspace_id or "", role or "", lane_id or "")
+        return encode_assigned_name(
+            preflight.workspace_id, preflight.role, preflight.lane_id
+        )
     except HerdrIdentityError as exc:
-        die(
-            "terminal transport backend 'herdr' is selected but the receiver's herdr "
-            f"identity could not be resolved (role={role!r}, workspace_id={workspace_id!r}): "
-            f"{exc}"
+        raise TransportBindingError(
+            f"herdr target-pane {target!r} identity could not be minted: {exc}"
         )
-        raise AssertionError("unreachable")
 
 
 def resolve_handoff_transport_binding(
@@ -109,13 +112,13 @@ def resolve_handoff_transport_binding(
     ``terminal_transport`` block, or a broken / unreadable config) so the caller
     installs nothing; returns a herdr :class:`TransportBinding` when the herdr
     backend is selected and its trusted-environment binary resolves. A herdr
-    selection whose binary is unconfigured / unresolvable, or whose receiver herdr
-    identity cannot be minted, fails closed with a clean ``die`` (never a silent
-    tmux fallback).
+    selection whose binary is unconfigured / unresolvable fails closed with a clean
+    ``die`` (never a silent tmux fallback).
 
-    For the herdr backend the receiver's durable assigned name is minted here (from
-    ``--to`` + the repo workspace/lane context) and handed to the binding so the
-    shim can translate the rail's tmux target (``%N``) into a live herdr locator.
+    For the herdr backend the binding is handed the lazy
+    :func:`_resolve_target_assigned_name` resolver, so the shim mints the assigned
+    name from the **target pane's** stable identity (not the sender context, Redmine
+    #13253 j#72373) the first time it sees the rail's tmux target.
     """
     try:
         config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
@@ -125,13 +128,12 @@ def resolve_handoff_transport_binding(
         return None
     if config.backend != BACKEND_HERDR:
         return None
-    assigned_name = _resolve_receiver_assigned_name(args)
     try:
         return resolve_runtime_transport_binding(
             config,
             tmux_run_tmux=_tmux_run_tmux,
             tmux_capture_pane=_tmux_capture_pane,
-            assigned_name=assigned_name,
+            resolve_assigned_name=_resolve_target_assigned_name,
         )
     except TerminalTransportError as exc:
         die(f"terminal transport backend 'herdr' is selected but unavailable: {exc}")

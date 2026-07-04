@@ -231,18 +231,19 @@ class HerdrMappingTest(unittest.TestCase):
 
 
 class HerdrTargetTranslationTest(unittest.TestCase):
-    """The j#72367 fix: the rail's tmux ``%N`` is translated to a herdr locator."""
+    """The j#72373 fix: the rail's tmux ``%N`` is translated to *that target pane's* locator."""
 
-    NAME = encode_assigned_name("ws-1", "claude", "default")
+    TARGET_NAME = encode_assigned_name("ws-1", "claude", "default")
+    SENDER_NAME = encode_assigned_name("ws-sender", "codex", "default")
 
-    def _binding(self, port, *, assigned_name=None, list_agents=None):
+    def _binding(self, port, *, resolve_assigned_name=None, list_agents=None):
         run_tmux, capture_pane = _sentinel_tmux()
         return resolve_runtime_transport_binding(
             TerminalTransportConfig(backend=BACKEND_HERDR),
             tmux_run_tmux=run_tmux,
             tmux_capture_pane=capture_pane,
             port=port,
-            assigned_name=assigned_name,
+            resolve_assigned_name=resolve_assigned_name,
             list_agents=list_agents,
         )
 
@@ -253,69 +254,124 @@ class HerdrTargetTranslationTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, REASON_INVALID_TARGET)
 
-    def test_tmux_pane_id_translated_to_locator_before_send(self) -> None:
+    def test_identity_resolver_is_called_with_the_actual_target(self) -> None:
+        # The name comes from resolving *the target*, not from a pre-minted constant.
         port = FakePort()
-        rows = [{"name": self.NAME, "pane": "w1:p1"}]
-        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
-        binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "MARK body")
-        # The port only ever saw the live locator, never the tmux %N.
-        self.assertEqual(port.calls, [("send_text", "w1:p1", "MARK body")])
+        seen = []
+
+        def resolve(target):
+            seen.append(target)
+            return self.TARGET_NAME
+
+        rows = [{"name": self.TARGET_NAME, "pane": "w1:p1"}]
+        binding = self._binding(port, resolve_assigned_name=resolve, list_agents=lambda: rows)
+        binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        self.assertEqual(seen, ["%2"])
+        self.assertEqual(port.calls, [("send_text", "w1:p1", "body")])
+
+    def test_target_pane_name_wins_over_a_sender_name_in_the_list(self) -> None:
+        # The minimal j#72372/j#72373 reproduction: the agent list carries BOTH the
+        # sender's and the target pane's rows; delivery must land on the TARGET's
+        # locator (resolved from the target pane identity), never the sender's.
+        port = FakePort()
+        rows = [
+            {"name": self.SENDER_NAME, "pane": "wS:pS"},
+            {"name": self.TARGET_NAME, "pane": "w1:p1"},
+        ]
+        binding = self._binding(
+            port,
+            resolve_assigned_name=lambda target: self.TARGET_NAME,
+            list_agents=lambda: rows,
+        )
+        binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        binding.run_tmux("send-keys", "-t", "%2", "Enter")
+        self.assertEqual([c[1] for c in port.calls], ["w1:p1", "w1:p1"])
+        self.assertNotIn("wS:pS", [c[1] for c in port.calls])
+
+    def test_sender_only_list_fails_closed_no_wrong_send(self) -> None:
+        # If only the sender's row exists (the target pane has not registered a herdr
+        # name), the target-name re-bind is not-found -> fail closed, never a send to
+        # the sender's locator.
+        port = FakePort()
+        rows = [{"name": self.SENDER_NAME, "pane": "wS:pS"}]
+        binding = self._binding(
+            port,
+            resolve_assigned_name=lambda target: self.TARGET_NAME,
+            list_agents=lambda: rows,
+        )
+        with self.assertRaises(TransportBindingError):
+            binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
+        self.assertEqual(port.calls, [])
 
     def test_capture_target_translated_to_locator(self) -> None:
         port = FakePort(read_content="x")
-        rows = [{"name": self.NAME, "location": "w1:p1"}]
-        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
+        rows = [{"name": self.TARGET_NAME, "location": "w1:p1"}]
+        binding = self._binding(
+            port, resolve_assigned_name=lambda t: self.TARGET_NAME, list_agents=lambda: rows
+        )
         binding.capture_pane("%2", 50)
         self.assertEqual(port.calls, [("read_pane", "w1:p1", SOURCE_VISIBLE, 50)])
 
-    def test_translation_is_memoised_across_the_invocation(self) -> None:
+    def test_translation_is_memoised_per_target(self) -> None:
         port = FakePort()
-        rows = [{"name": self.NAME, "pane": "w1:p1"}]
+        rows = [{"name": self.TARGET_NAME, "pane": "w1:p1"}]
         fetches = {"n": 0}
+        resolves = {"n": 0}
 
         def list_agents():
             fetches["n"] += 1
             return rows
 
-        binding = self._binding(port, assigned_name=self.NAME, list_agents=list_agents)
+        def resolve(_target):
+            resolves["n"] += 1
+            return self.TARGET_NAME
+
+        binding = self._binding(port, resolve_assigned_name=resolve, list_agents=list_agents)
         binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
         binding.run_tmux("send-keys", "-t", "%2", "Enter")
         binding.capture_pane("%2", 50)
-        self.assertEqual(fetches["n"], 1)  # one receiver, one agent-list fetch
+        self.assertEqual(fetches["n"], 1)  # memoised per target
+        self.assertEqual(resolves["n"], 1)
 
-    def test_already_herdr_valid_target_passes_through_without_fetch(self) -> None:
+    def test_already_herdr_valid_target_passes_through_without_resolving(self) -> None:
         port = FakePort()
 
-        def must_not_fetch():
-            raise AssertionError("a herdr-valid target must not fetch the agent list")
+        def must_not_run(*_a):
+            raise AssertionError("a herdr-valid target must not resolve identity / fetch")
 
         binding = self._binding(
-            port, assigned_name=self.NAME, list_agents=must_not_fetch
+            port, resolve_assigned_name=must_not_run, list_agents=must_not_run
         )
         binding.run_tmux("send-keys", "-t", "w9:p9", "-l", "--", "body")
         self.assertEqual(port.calls, [("send_text", "w9:p9", "body")])
 
     def test_rebind_not_found_fails_closed_before_the_port(self) -> None:
         port = FakePort()
-        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: [])
+        binding = self._binding(
+            port, resolve_assigned_name=lambda t: self.TARGET_NAME, list_agents=lambda: []
+        )
         with self.assertRaises(TransportBindingError):
             binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
         self.assertEqual(port.calls, [])  # nothing was sent
 
-    def test_rebind_ambiguous_fails_closed(self) -> None:
+    def test_unresolvable_target_identity_fails_closed(self) -> None:
+        # resolve_assigned_name raising (an unregistered / unknown target pane) must
+        # fail closed before any port call.
         port = FakePort()
-        rows = [
-            {"name": self.NAME, "pane": "w1:p1"},
-            {"name": self.NAME, "pane": "w2:p2"},
-        ]
-        binding = self._binding(port, assigned_name=self.NAME, list_agents=lambda: rows)
+
+        def resolve(target):
+            raise TransportBindingError(f"no identity for {target}")
+
+        binding = self._binding(
+            port, resolve_assigned_name=resolve, list_agents=lambda: []
+        )
         with self.assertRaises(TransportBindingError):
-            binding.run_tmux("send-keys", "-t", "%2", "Enter")
+            binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
         self.assertEqual(port.calls, [])
 
-    def test_no_receiver_identity_fails_closed_on_tmux_target(self) -> None:
+    def test_no_identity_resolver_fails_closed_on_tmux_target(self) -> None:
         port = FakePort()
-        binding = self._binding(port)  # assigned_name / list_agents both absent
+        binding = self._binding(port)  # resolve_assigned_name / list_agents both absent
         with self.assertRaises(TransportBindingError):
             binding.run_tmux("send-keys", "-t", "%2", "-l", "--", "body")
         self.assertEqual(port.calls, [])

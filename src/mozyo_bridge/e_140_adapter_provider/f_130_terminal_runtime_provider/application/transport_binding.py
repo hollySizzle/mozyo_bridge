@@ -28,8 +28,8 @@ the two callables those names resolve to:
   recognise **fails closed** with an explicit error — it is never silently ignored
   or passed through, so the shim can never quietly drop a send.
 
-Target translation (Redmine #13253 j#72367)
---------------------------------------------
+Target translation (Redmine #13253 j#72367, target-pane identity j#72373)
+-------------------------------------------------------------------------
 ``orchestrate_handoff`` resolves its send target through the *tmux* pane resolver,
 so the target the rail hands the shim is a tmux pane id (``%N``). The live
 ``HerdrCliTransport`` guards every primitive with the domain ``valid_target``
@@ -37,14 +37,21 @@ regex, which rejects a leading ``%`` (``invalid_target``) — so an un-translate
 ``%N`` would make *every* herdr send fail before typing. The shim therefore runs
 each send/capture target through a :class:`_HerdrTargetTranslator` first: a
 target that is already herdr-valid (a ``mzb1_…`` assigned name or a ``w1:p1`` live
-locator) passes through, and a tmux ``%N`` is mapped to the **receiver's** live
-locator by re-binding the receiver's durable assigned name — minted from its
-``(workspace_id, role, lane)`` slot via #13247 ``encode_assigned_name`` — against a
-fresh ``agent list`` snapshot (#13246 read surface + #13247 ``rebind_by_name``). A
-re-bind failure (``rebind_invalid_name`` / ``…_not_found`` / ``…_ambiguous`` /
-``…_missing_locator``) fails closed **before** the port call, so a send never lands
-on a guessed or blank target. ``select-pane`` is the sole exception: it is a no-op
-that never reaches the port, so it is not translated (only checked well-formed).
+locator) passes through, and a tmux ``%N`` is mapped to *that target pane's* live
+locator by resolving **the target pane's** durable assigned name and re-binding it
+against a fresh ``agent list`` snapshot (#13246 read surface + #13247
+``rebind_by_name``). The identity is projected from the **target pane's** stable
+``(workspace_id, role, lane)`` slot — the same projection the rail uses
+(``pane_info`` → ``project_preflight_target`` → #13247 ``encode_assigned_name``),
+**not** the sender / current-repo context (Redmine #13253 j#72373) — and it is
+resolved *lazily*, at the moment the shim first sees the ``%N``, so it runs after
+``orchestrate_handoff`` has resolved the concrete target pane. A target pane whose
+identity cannot be projected (unregistered / unknown role / missing workspace), or
+a re-bind failure (``rebind_invalid_name`` / ``…_not_found`` / ``…_ambiguous`` /
+``…_missing_locator``), fails closed **before** the port call, so a send never lands
+on a guessed, blank, or sender-context locator. ``select-pane`` is the sole
+exception: it is a no-op that never reaches the port, so it is not translated (only
+checked well-formed).
 
 Fail-closed selection (Redmine #13253 j#72318, no silent tmux fallback):
 
@@ -181,7 +188,7 @@ class TransportBinding:
 
 
 class _HerdrTargetTranslator:
-    """Translate a rail-supplied tmux target into a live herdr locator (Redmine #13253 j#72367).
+    """Translate a rail-supplied tmux target into a live herdr locator (Redmine #13253 j#72373).
 
     ``orchestrate_handoff`` resolves its send target through the tmux pane resolver,
     so the target the rail hands the shim is a **tmux pane id** (``%N``). The live
@@ -194,25 +201,29 @@ class _HerdrTargetTranslator:
     - a target that is already herdr-valid (a ``mzb1_…`` assigned name or a
       ``w1:p1`` live locator — anything :func:`valid_target` accepts) is passed
       through unchanged;
-    - a tmux-shaped target (``%N``) is mapped to the **receiver's** live locator by
-      re-binding the receiver's durable assigned name against a fresh ``agent list``
-      snapshot (:func:`rebind_by_name`). One handoff invocation addresses one
-      receiver, so the mapping is memoised the first time it resolves.
+    - a tmux-shaped target (``%N``) is mapped to the live locator of **that target
+      pane** by (1) resolving *that pane's* durable assigned name via the injected
+      ``resolve_assigned_name`` (which projects the **target pane's** stable
+      ``(workspace_id, role, lane)`` identity — the same projection the rail uses —
+      not the sender / current-repo context, Redmine #13253 j#72373), then (2)
+      re-binding it against a fresh ``agent list`` snapshot (:func:`rebind_by_name`).
+      The mapping is memoised **per target** (a handoff addresses one receiver, but
+      the identity is still derived from the concrete target pane every time).
 
-    Fail-closed (no silent send to a bad target): a tmux target with no resolvable
-    receiver identity, or a re-bind that fails (``rebind_invalid_name`` /
-    ``rebind_not_found`` / ``rebind_ambiguous`` / ``rebind_missing_locator``),
-    raises :class:`TransportBindingError` carrying the #13247 status *before* any
-    port call — the send never lands on a guessed or blank target.
+    Fail-closed (no silent send to a bad / wrong target): a tmux target whose pane
+    identity cannot be projected (``resolve_assigned_name`` raises), or a re-bind
+    that fails (``rebind_invalid_name`` / ``rebind_not_found`` / ``rebind_ambiguous``
+    / ``rebind_missing_locator``), raises :class:`TransportBindingError` *before* any
+    port call — the send never lands on a guessed, blank, or sender-context locator.
     """
 
     def __init__(
         self,
         *,
-        assigned_name: Optional[str],
+        resolve_assigned_name: Optional[Callable[[str], str]],
         list_agents: Optional[AgentListProvider],
     ):
-        self._assigned_name = assigned_name
+        self._resolve_assigned_name = resolve_assigned_name
         self._list_agents = list_agents
         self._cache: dict = {}
 
@@ -226,18 +237,21 @@ class _HerdrTargetTranslator:
             )
         if target in self._cache:
             return self._cache[target]
-        if not self._assigned_name or self._list_agents is None:
+        if self._resolve_assigned_name is None or self._list_agents is None:
             raise TransportBindingError(
-                f"herdr backend selected but no receiver herdr identity is available to "
-                f"translate the tmux target {target!r} (assigned_name="
-                f"{self._assigned_name!r}); refusing to send to an un-translatable target"
+                f"herdr backend selected but no target-pane identity resolver is "
+                f"available to translate the tmux target {target!r}; refusing to send "
+                "to an un-translatable target"
             )
+        # Project *the target pane's* stable identity -> its durable assigned name
+        # (fail-closed on an unregistered / unresolvable pane), never the sender's.
+        assigned_name = self._resolve_assigned_name(target)
         rows = self._list_agents()
-        result = rebind_by_name(self._assigned_name, rows)
+        result = rebind_by_name(assigned_name, rows)
         if result.is_fail:
             raise TransportBindingError(
                 f"herdr target translation failed for tmux target {target!r} "
-                f"(assigned_name={self._assigned_name}, status={result.status}): "
+                f"(assigned_name={assigned_name}, status={result.status}): "
                 f"{result.detail}"
             )
         self._cache[target] = result.locator
@@ -471,7 +485,7 @@ def resolve_runtime_transport_binding(
     env: Optional[Mapping[str, str]] = None,
     runner: Optional[Runner] = None,
     port: Optional[TerminalTransportPort] = None,
-    assigned_name: Optional[str] = None,
+    resolve_assigned_name: Optional[Callable[[str], str]] = None,
     list_agents: Optional[AgentListProvider] = None,
 ) -> TransportBinding:
     """Resolve the :class:`TransportBinding` for a ``terminal_transport`` selection.
@@ -484,14 +498,15 @@ def resolve_runtime_transport_binding(
     *unchanged* (the binding's callables are identical objects, so the tmux path is
     byte-for-byte the current behaviour).
 
-    For the herdr backend, ``assigned_name`` is the **receiver's** durable herdr
-    assigned name (#13247, minted from its ``(workspace_id, role, lane)`` slot) and
-    ``list_agents`` is a live ``agent list`` snapshot provider; together they let
-    the shim translate the rail's tmux target (``%N``) into a live herdr locator
-    (:class:`_HerdrTargetTranslator`). When ``port`` is not injected they are
-    resolved from the same trusted-environment binary as the port, so a real send
-    re-binds against the live agent list; tests inject ``port`` + ``list_agents`` +
-    ``assigned_name`` directly.
+    For the herdr backend, ``resolve_assigned_name`` is a **lazy** callable that maps
+    a rail-supplied tmux target (``%N``) to *that target pane's* durable herdr
+    assigned name — it projects the **target pane's** stable ``(workspace_id, role,
+    lane)`` identity (Redmine #13253 j#72373), not the sender / current-repo context,
+    and fails closed on an unresolvable pane. ``list_agents`` is a live ``agent list``
+    snapshot provider. Together they let the shim translate the tmux target into a
+    live herdr locator (:class:`_HerdrTargetTranslator`). When ``port`` is not
+    injected ``list_agents`` is resolved from the same trusted-environment binary as
+    the port; tests inject ``port`` + ``list_agents`` + ``resolve_assigned_name``.
 
     Fail-closed selection (no silent tmux fallback once herdr is selected): the
     default / tmux backend returns a passthrough binding over the injected tmux
@@ -523,7 +538,9 @@ def resolve_runtime_transport_binding(
             "terminal transport backend 'herdr' is selected but no transport port "
             "could be resolved; refusing to fall back to tmux"
         )
-    translator = _HerdrTargetTranslator(assigned_name=assigned_name, list_agents=fetch)
+    translator = _HerdrTargetTranslator(
+        resolve_assigned_name=resolve_assigned_name, list_agents=fetch
+    )
     shim = _HerdrTmuxShim(resolved_port, translator)
     return TransportBinding(
         backend=BACKEND_HERDR,

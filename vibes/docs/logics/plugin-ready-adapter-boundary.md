@@ -1585,7 +1585,7 @@ the transport primitives. `orchestrate_handoff`'s existing codex-standard turn-s
 observation (`turn_start_observation.py`) is capture-injected and therefore works
 over herdr through the same `capture_pane` → `read_pane` mapping unchanged.
 
-### Target translation: tmux `%N` → live herdr locator (finding-2 fix, j#72367)
+### Target translation: tmux `%N` → live herdr locator (j#72367; target-pane identity j#72373)
 
 `orchestrate_handoff` resolves its send target through the **tmux** pane resolver,
 so the target the rail hands the shim is a tmux pane id (`%N`). The live
@@ -1598,28 +1598,40 @@ identity parts) before the port call:
 
 - a target that is already herdr-valid (a `mzb1_…` assigned name or a `w1:p1` live
   locator — anything `valid_target` accepts) is **passed through** unchanged;
-- a tmux `%N` is mapped to the **receiver's** live locator by re-binding the
-  receiver's durable assigned name against a fresh `agent list` snapshot.
+- a tmux `%N` is mapped to *that target pane's* live locator by resolving **the
+  target pane's** durable assigned name and re-binding it against a fresh
+  `agent list` snapshot.
 
-Resolution procedure (per invocation, one receiver):
+The identity is derived from the **target pane**, not the sender / current-repo
+context (Redmine #13253 j#72373 — a fixed pre-mint from the CLI-executing repo's
+canonical session/lane mis-bound explicit-`%pane` + `--target-repo auto` /
+cross-lane sends). It is resolved **lazily**, the first time the shim sees the
+`%N` — i.e. *after* `orchestrate_handoff` has resolved the concrete target pane:
 
-1. **Identity slot.** `role` = the handoff receiver (`--to claude|codex`);
-   `workspace_id` + `lane` come from the repo context (`resolve_canonical_session` +
-   the `_resolve_workspace_lane` probe), normalised exactly as #13247 prescribes
-   (empty lane → `default`). Minted with #13247 `encode_assigned_name`; a missing
-   role / workspace fails closed with a `die` before any send.
+1. **Target-pane identity slot.** `pane_info(target)` → `project_preflight_target`
+   (the rail's own projection: the #11822 role resolver + the pane's
+   `(workspace_id, lane)`), giving the target pane's `(workspace_id, role, lane)`
+   slot — normalised exactly as #13247 prescribes (`_normalize_lane_display` ==
+   `_norm_lane`, empty → `default`). Minted with #13247 `encode_assigned_name`. An
+   unknown / weak role or a missing `workspace_id` (an unregistered pane) fails
+   closed **before** any send.
 2. **Live snapshot.** `agent list --json` via the same trusted-environment binary as
    the transport (the rows carry the durable `name` + the transient `pane` locator);
    the row extraction reuses the #13246 defensive parser.
 3. **Re-bind.** #13247 `rebind_by_name(assigned_name, rows)` → the live locator. The
-   result is memoised, so the one receiver triggers one `agent list` fetch.
+   result is memoised **per target**.
 
-Fail-closed before typing (no silent send to a bad target): an un-resolvable
-receiver identity, or a re-bind failure (`rebind_invalid_name` / `…_not_found` /
-`…_ambiguous` / `…_missing_locator`), raises a `TransportBindingError` (or a `die`
-for the identity step) **before** any port call — the send never lands on a guessed
-or blank target. `select-pane` is the sole target that is *not* translated: it is a
-no-op that never reaches the port (only checked well-formed).
+Fail-closed before typing (no silent send to a bad / wrong target): an
+un-projectable target-pane identity, or a re-bind failure (`rebind_invalid_name` /
+`…_not_found` / `…_ambiguous` / `…_missing_locator`), raises a `TransportBindingError`
+**before** any port call — the send never lands on a guessed, blank, or
+sender-context locator. `select-pane` is the sole target that is *not* translated:
+it is a no-op that never reaches the port (only checked well-formed). The regression
+(`test_herdr_transport_wiring.py`) drives the **real** resolver (repo config + a
+trusted-env fake binary + a faked `subprocess.run`, no patch of the resolver) with a
+cross-lane fixture where the agent list carries both the sender and the target rows,
+and asserts delivery lands only on the target pane's locator (and fails closed when
+only the sender's row exists).
 
 ### One-line cut-over / roll-back (j#72318)
 
