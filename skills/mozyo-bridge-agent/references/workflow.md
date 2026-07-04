@@ -408,7 +408,7 @@ Design Consultation は必須 close 条件ではないが、**発火した場合
 
 ### owner 窓口の集約点は main coordinator Codex の一点である
 
-owner 承認を収集する actor はちょうど 1 つ、main coordinator lane の Codex である。すべての owner-approval-waiting state は、どこで発生してもその Codex に callback され、owner は sublane pane 群に散らばった判断ではなく、統合された 1 つの queue を見る。
+owner 承認を収集する actor はちょうど 1 つ、main coordinator lane の Codex である。すべての owner-approval-waiting state は、どこで発生してもその Codex に callback され、owner は sublane pane 群に散らばった判断ではなく、統合された 1 つの queue を見る。ここで固定されているのは coordinator **role** への一点集約であり、「Codex」はその role の default provider binding を指す (provider は交換可能な delivery 属性で、binding の正本は中央 preset `### 既定役割` と #13157 provider_binding config)。provider を差し替えても集約点は coordinator role のままであり、brand へは戻さない。
 
 - **sublane は owner 承認を自 lane 内で決して解決しない。** sublane の Codex と sublane の Claude は待機 state を durable record に記録して callback する。自分の pane で owner 判断を求めたり、収集したり、批准したりしない。これは `references/safety.md` `## 結果通知の境界` および中央 preset の `### Owner Close Approval Delegation` と同じ境界 — coordinator が owner 向けやり取りを所有する — を集約方向に適用したものである。
 - **owner が一度で行動する場所が coordinator である。** すべての owner-approval-waiting state がそこに収束するため、owner は一箇所から批准 (または保留) し、結果として生じる `owner_close_approval` journal (または Design Consultation の回答、その他の owner 判断 journal) が、発生元 lane が再開の起点とする durable record として載る。
