@@ -1353,6 +1353,146 @@ reader are pinned through a pure fake / injected-runner, with no live herdr.
   wiring this runtime state into the cockpit attention derivation, any live-herdr
   test, and any installer / distribution.
 
+## Implemented Terminal Runtime Turn-Start Rail (Redmine #13248)
+
+#13245 landed the transport port (send / read primitives) and #13246 the state
+snapshot (`read_agent_state`). #13248 lands the **orchestration** layer that turns
+"inject a message" into "confirm the receiver actually *started a turn*": the
+`check-then-wait` rail the #13175 PoC established (E9 / E12–E14). Same feature
+package, same conventions (staged seam, pure core + built-in provider, fail-closed,
+default off, trusted-env binary, injected-dependency tests, no live binary). The
+existing tmux path is untouched.
+
+### Where it lives
+
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/turn_start_rail.py`
+  — **core**, pure. The closed `TURN_START_OUTCOMES` vocabulary, the structured
+  `TurnStartResult`, the injected wait-primitive *port* (`TurnStartWaitPort` /
+  `ArmedWait`) and its `WaitResult` vocabulary (`changed` / `timeout` / `absent` /
+  `error`), the pure `composer_retains_body` helper, the pure `HerdrTurnStartRail`
+  orchestrator, and the redaction-safe `turn_start_rail_record_lines` renderer.
+  `TurnStartRailError` subclasses `TerminalTransportError`, so the whole seam
+  shares one fail-closed error base. It imports no provider.
+- `src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_turn_start.py`
+  — the built-in **herdr CLI wait primitive** (`HerdrCliWaitPrimitive`, a
+  two-phase `arm` / `collect` over `wait agent-status <target> --status working
+  --timeout <ms>` via an injectable `Popen` factory) plus the fail-closed
+  `resolve_turn_start_rail` resolver that wires all three providers (transport
+  #13245, reader #13246, this wait primitive) from the one trusted-env binary.
+  Dependency points provider -> core.
+
+No new config: the rail rides on the same default-off `terminal_transport.backend`
+selection and trusted-env binary resolution as the transport (#13245).
+
+### The check-then-wait procedure (enforced in `drive_turn_start`, j#72258)
+
+1. **Pre-injection snapshot (check).** Read the current runtime state (#13246). If
+   it is anything other than `awaiting_input` — `busy` / `blocked` / `turn_ended` /
+   `unknown`, *including* an unreadable snapshot that degrades to `unknown` — the
+   rail refuses to inject and fails closed to `precondition_not_idle`: a turn on an
+   already-busy pane could not be *attributed* to this send, so injecting would
+   make a later `started` unfalsifiable.
+2. **Arm the wait first** (before injecting), so the `working` transition the
+   injection triggers cannot land in the race window between the snapshot and the
+   wait (E9 change-semantics; E12 proved arm-then-inject returns event-driven in
+   ~0.36s).
+3. **Inject** — `send_text` then `send_keys enter`. Any transport failure fails
+   closed to `inject_failed` and cancels the armed wait.
+4. **Collect the wait**, classify (see the outcome table), and on a timeout run the
+   bounded Enter-resend rail.
+
+### The six outcomes (`TURN_START_OUTCOMES`, closed set)
+
+| outcome | when | PoC evidence |
+|---|---|---|
+| `started` | wait returned the `working` transition (exit 0) | E12 / E14 (event ~0.36s) |
+| `delivered_not_started` | injected, wait timed out, re-snapshot not `blocked` (or an unclassifiable wait `error`) | E9 c1 / E13 (`working` times out) |
+| `blocked` | injected, wait timed out, re-snapshot found a **runtime** block (permission prompt on screen) | E13 / E14 (`osc_title_blocked`) |
+| `absent` | the target pane does not exist (pane-get error on the wait) | E9 c3 |
+| `precondition_not_idle` | pre-injection snapshot was not `awaiting_input` (fail-closed, never injects) | E9 (check-then-wait constraint) |
+| `inject_failed` | a `send_text` / `send_keys` transport step failed (fail-closed) | — |
+
+### Codex Enter-resend rail (E14 — enforced in code)
+
+E14 reproduced the long-known Codex TUI quirk over herdr: the injected text landed
+in the composer but the first Enter was **not** submitted, so the turn never
+started until Enter was re-sent. When the first wait times out, the rail reads the
+pane (`read_pane`) and re-sends Enter **only if the injected body is still in the
+composer** (`composer_retains_body`, whitespace-collapsed so a soft line-wrap does
+not hide it) — never re-typing the body, only the Enter — up to
+`max_enter_resends` times (config; default `1`, `0` disables it). Each resend
+re-arms a fresh wait first (the same check-then-wait order). This is agent-kind-
+agnostic bounded-retry, not Codex-special-cased. A pane read that fails or a
+composer that no longer holds the body **stops** the rail (fail-closed: never
+blindly re-Enter without confirming the stuck-composer precondition).
+
+The E14 subscribe-time caveat (a wait armed just after the transition can return an
+event in ~11ms) is handled fail-safe: **any** `changed` result (exit 0) is accepted
+as `started`, so an immediate event never becomes a false timeout. The exact
+subscribe-time delivery and the wait's non-zero stderr tokens (pane-get vs
+timeout) are confirmed against a live binary at the cutover smoke (#13254); the
+classifier's indicator set is defensive and the default is `error` (fail-closed).
+
+### Equivalence to the #13166 codex-standard turn-start guard (documented proof)
+
+The close requirement is a documented proof that this rail is equivalent-or-stronger
+to the current #13166 guard
+(`src/mozyo_bridge/application/turn_start_observation.py`, wired at
+`src/mozyo_bridge/application/commands.py:2900`–`2985`). #13166 hardened the codex
+`--mode standard` tmux rail against a false-positive `sent`: after observing the
+landing marker and pressing Enter, it snapshots the receiver pane and polls it for
+**new output activity** (`submit_activity_observed`,
+`turn_start_observation.py:75`); confirmed activity resolves `sent` / `ok`, and no
+activity within the window fails closed to `blocked` / `turn_start_unconfirmed`
+(`commands.py:2964`–`2967`). It types the marker+body **once** and never
+re-issues Enter or auto-resends (`turn_start_observation.py:20`–`22`).
+
+The cases the #13166 guard distinguishes, mapped to this rail's outcomes:
+
+| #13166 guard case (file:line) | #13166 signal | this rail's outcome | how the rail is equal-or-stronger |
+|---|---|---|---|
+| turn-start **confirmed** → `sent` / `ok` (`commands.py:2954`–`2963`) | pane-capture *advanced* past the pre-Enter snapshot (a heuristic proxy for "a turn started") | `started` | keys on herdr's **event** (`agent_status` → `working`, E12/E14), not a rendered-text diff — a positive runtime signal, so no "redraw churn looks like a turn" false positive and no "quiet turn looks like nothing" false negative (the `ack-completion-receiver-state.md` caveat that pane text is not the ACK source of truth) |
+| turn-start **unconfirmed** → `blocked` / `turn_start_unconfirmed` (`commands.py:2964`–`2967`) | no new pane activity within the window | `delivered_not_started` **and** `blocked` (split) | the rail *re-snapshots* on timeout and separates a plain unstarted turn (`delivered_not_started`) from a runtime-observed permission block (`blocked`, E13/E14) — strictly **more** discrimination than #13166's single `turn_start_unconfirmed` |
+| observation window off (`--landing-timeout 0`) → confirmed, 0 polls (`turn_start_observation.py:109`–`115`) | window disabled ⇒ do not hard-block | (no rail equivalent; the rail's wait window is always positive and its `precondition_not_idle` never injects) | the rail cannot be configured into a fail-**open** "confirm without observing" state; the closest control (`max_enter_resends 0`) only disables the *resend*, never the wait itself |
+| (not distinguished by #13166) receiver already busy before send | — | `precondition_not_idle` | the rail **refuses to inject** onto a non-idle pane so a pre-existing turn is never mis-attributed as this send's start — a fail-closed guard #13166 has no analogue for (it always types+Enters) |
+| (not distinguished by #13166) target pane absent | — (a tmux capture of a dead pane is empty, indistinguishable from "no activity") | `absent` | the wait's pane-get error (E9 c3) tells "gone" from "delivered but idle"; #13166 would report the same `turn_start_unconfirmed` for both |
+| marker+body typed once, no auto-resend (`turn_start_observation.py:20`–`22`) | — | Enter-resend rail (bounded, body-in-composer-gated) | a **superset**: the rail also types the body once (`send_text` once) and re-sends **only Enter** under the E14 stuck-composer precondition — the recovery #13166 explicitly deferred (its candidate 2), added here without ever re-injecting the body |
+
+Net: every case the #13166 guard resolves, this rail resolves at least as
+precisely, using a positive event signal instead of pane-capture heuristics, and it
+adds three fail-closed discriminations #13166 lacks (`precondition_not_idle`,
+`absent`, and the `blocked` vs `delivered_not_started` split) plus the bounded
+Enter-resend recovery. It is therefore equivalent-or-stronger and strictly more
+fail-closed. Wiring it into the live send path in place of / alongside #13166 is
+**#13253**, gated on the #13254 live smoke.
+
+### The 4-case harness (the "formal harness", CI-ised)
+
+The close requirement's "formal 4-case harness" is realised as the fake-driven
+contract test `tests/unit/.../test_turn_start_rail.py`, which runs in CI with the
+rest of the unit suite (no live herdr). It covers the four post-injection outcomes
+(`started` / `delivered_not_started` / `blocked` / `absent`), the two pre-injection
+fail-closed outcomes (`precondition_not_idle` / `inject_failed`), the check-then-
+wait *ordering* (arm before inject, asserted on an event log), and the Enter-resend
+rail (initial-timeout → resend → `started`; resend-cap → `delivered_not_started`;
+resend skipped when the composer is cleared / the read fails / the cap is 0; the
+subscribe-time immediate-`changed` fail-safe). The wait primitive itself is pinned
+in `test_herdr_turn_start.py` through an injected `Popen` factory (argv, the two-
+phase arm/collect, the double timeout, and the exit classification). **Live**
+verification of the wait surface is deferred to the #13254 cutover smoke, per the
+staged-seam posture.
+
+### Scope (staged — kept explicit)
+
+- **In scope:** the outcome / wait vocabularies, the structured `TurnStartResult`,
+  the pure `HerdrTurnStartRail` + `composer_retains_body` + record renderer, the
+  built-in herdr wait primitive + rail resolver, and the fake-driven 4-case +
+  2-precondition + Enter-resend harness (no live binary).
+- **Out of scope (later US's):** wiring this rail into the live handoff send path
+  (#13253), the installer / pin config (#13249), live smoke verification of the
+  wait surface (#13254), and re-deriving the subscribe-time / stderr tokens against
+  a live binary.
+
 ## Follow-up Split
 
 - #12002 should use this document when splitting `commands.py` / `cli.py`: separate core
