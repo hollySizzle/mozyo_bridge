@@ -15,7 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tests.integration.e_110_execution_platform.f_130_handoff_routing import (  # noqa: E402,F401
+from ..e_110_execution_platform.f_130_handoff_routing import (  # noqa: E402,F401
     setUpModule,
     tearDownModule,
 )

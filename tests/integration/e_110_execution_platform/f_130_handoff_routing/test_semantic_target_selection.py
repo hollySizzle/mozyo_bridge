@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # backend. Import the package fixture so unittest pins resolve_handoff_transport_
 # binding to the tmux default and the committed herdr cutover config does not
 # drive these sends through the herdr shim.
-from tests.integration.e_110_execution_platform.f_130_handoff_routing import (  # noqa: E402,F401
+from . import (  # noqa: E402,F401
     setUpModule,
     tearDownModule,
 )
