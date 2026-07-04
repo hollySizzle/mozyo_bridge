@@ -649,10 +649,10 @@ stop
     action: close禁止 (local-only commit を anchor にしない); reopen+correction
   - id: claude_asks_owner_directly
     条件: [agent:claude_code, owner判断:必要, codex_handoff:missing]
-    action: stopしdurable recordにowner-action-needed/design_consultation/triage-pendingを記録しCodexへ集約
+    action: stopしdurable recordにowner-action-needed/design_consultation/triage-pendingを記録しcoordinator roleへ集約 (default binding: codex)
   - id: close_approval_from_claude_pane
     条件: [approval_source:claude_pane_observation, owner_close_approval_journal:missing]
-    action: close approvalとして扱わない (Codex durable journalが先)
+    action: close approvalとして扱わない (coordinator role (default binding: codex) の durable journalが先)
   - id: task_close_without_replayable_journal
     条件: [issue:task_under_us, implementation_done_journal:missing_or_検証記録なし]
     action: close禁止 (US audit が replay できない)
