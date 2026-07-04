@@ -219,8 +219,9 @@ REBIND_FAIL_STATUSES: frozenset[str] = frozenset(
 # as identity.
 # ---------------------------------------------------------------------------
 AGENT_KEY_NAME: str = "name"
-AGENT_KEY_LOCATOR: str = "pane"
-AGENT_KEY_LOCATOR_ALIAS: str = "location"
+AGENT_KEY_LOCATOR: str = "pane_id"  # real herdr `agent list` row key (PoC #13175 E10 実測)
+AGENT_KEY_LOCATOR_ALIAS: str = "pane"
+AGENT_KEY_LOCATOR_ALIAS_2: str = "location"
 
 
 class HerdrIdentityError(ValueError):
@@ -623,12 +624,15 @@ def _agent_locator(agent: Mapping[str, object]) -> str:
     locator = _norm(agent.get(AGENT_KEY_LOCATOR))
     if not locator:
         locator = _norm(agent.get(AGENT_KEY_LOCATOR_ALIAS))
+    if not locator:
+        locator = _norm(agent.get(AGENT_KEY_LOCATOR_ALIAS_2))
     return locator
 
 
 __all__ = (
     "AGENT_KEY_LOCATOR",
     "AGENT_KEY_LOCATOR_ALIAS",
+    "AGENT_KEY_LOCATOR_ALIAS_2",
     "AGENT_KEY_NAME",
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
