@@ -64,6 +64,7 @@ terminal/transport/state 検知層の移行先候補 **herdr** に対する kill
 - 目的: live agent なしで rule の分類精度を検証する。
 - 実行: 合成 snapshot (idle / blocked / working 文言) を file にし `herdr agent explain --file <path> --agent claude --json`。
 - 結果: **blocked = 正** (`live_blocked_form` match)、**idle = 正** (安全側 fallback)。**working = 判定不能**: OSC escape 列を file に埋め込んでも `explain --file` は OSC を parse しない (osc_title region_bytes=0) ため、working rule が構造的に発火しない。
+  - codex の offline 合成テストも fallback (`default_known_agent_idle_fallback`) で inconclusive — 実行時点で codex rule cache が不在だったため rule 照合自体が行えていない (review finding 1 で記録漏れが指摘され追記)。
 - 学び (失敗): **working 検知は offline で検証できない**。`explain --file` は本文 region 専用。OSC-title 依存 rule の検証には実 PTY + TUI が必須 — これが session 2 (live) を要求した根本理由。
 
 ### E6. headless server の限界
@@ -119,6 +120,13 @@ terminal/transport/state 検知層の移行先候補 **herdr** に対する kill
 - 実行: `agent read poc_claude --source visible --lines 30` (他に `recent` / `recent-unwrapped`)。
 - 結果: 実画面 3965 bytes を JSON で取得 (truncated flag 付き)。折返し解除版 (`recent-unwrapped`) もある。
 - 学び: transport 層だけでなく観測層 (delivery record の pane-body 証跡) も API 化できる。
+
+## 環境衛生の設計ミスと訂正 (operator 指摘)
+
+- 失敗: live helper 初版 (`env.sh`) は「source して `XDG_CONFIG_HOME` 等を export する」設計だった。XDG 変数は herdr 専用ではないため、operator のシェル全体と全子プロセスに漏れる — `git` は `$XDG_CONFIG_HOME/git/config` を実設定より優先するし、herdr server 経由で **テスト対象の claude 自身も redirect された XDG を継承**していた。加えて session 1 の restart テストでは server を `env -i PATH=/usr/bin:/bin` の最小環境で再起動したため、pane shell が `claude` を PATH 解決できない事象も起きた (env 伝播の扱いの雑さとして同根)。
+- 訂正: helper を **exec ラッパー型** (`live/hb`) に書き直し、env は herdr プロセスにのみ付与。pane 内で agent を起動する際は `live/agent-clean` で XDG redirect を外す (herdr 検知に必要な `HERDR_ENV` / `HERDR_SOCKET_PATH` / `HERDR_PANE_ID` は保持)。
+- evidence への caveat: session 2 の (a)/(c) evidence は「XDG redirect を継承した claude」で取得された。OSC-title 検知・state 判定への実影響は無いと判断するが (検知は端末描画に対して動き XDG に依存しない)、厳密な再現条件として記録する。
+- 隔離の限界の明示: 本 PoC の「sandbox」は herdr のデータ置き場の分離であり、セキュリティ境界ではない。binary は user 全権限で動き実 HOME を読み書きできる。session 2 の実 HOME 使用は j#72065 の隔離 HOME 方針からの逸脱 (agent auth のため、journal 開示済み)。信頼根拠は sha256 pin と外部通信遮断の実測である。
 
 ## 運用上の細かい教訓 (tooling)
 
