@@ -41,6 +41,16 @@ import sys
 # relying on a sibling test inserting src first (Redmine #12490 j#64426).
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
+# tmux-rail transport isolation (Redmine #13254): this fake-tmux module is a
+# tmux send/capture-rail test, independent of the workspace terminal_transport
+# backend. Import the package fixture so unittest pins resolve_handoff_transport_
+# binding to the tmux default and the committed herdr cutover config does not
+# drive these sends through the herdr shim.
+from tests.integration.e_110_execution_platform.f_130_handoff_routing import (  # noqa: E402,F401
+    setUpModule,
+    tearDownModule,
+)
+
 from mozyo_bridge.application.cli import build_parser
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import MODE_QUEUE_ENTER, MODE_STANDARD
 

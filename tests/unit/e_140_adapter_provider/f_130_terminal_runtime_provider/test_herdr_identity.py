@@ -246,11 +246,13 @@ class RebindTest(unittest.TestCase):
         self.name = encode_assigned_name("ws", "claude", "lane13247")
 
     def test_rebind_ok_recovers_fresh_locator(self) -> None:
-        # Simulate a post-restart agent list: the pane locator is a *new* value,
-        # but the durable name still matches.
+        # Representative rebind path over the REAL herdr `agent list` row schema:
+        # the transient locator rides on `pane_id` (AGENT_KEY_LOCATOR, PoC #13175
+        # E10 実測). Simulate a post-restart agent list: the pane locator is a
+        # *new* value, but the durable name still matches.
         agents = [
-            {"name": "someone_else", "pane": "w0:p0"},
-            {"name": self.name, "pane": "w1:p1"},
+            {"name": "someone_else", "pane_id": "w0:p0"},
+            {"name": self.name, "pane_id": "w1:p1"},
         ]
         result = rebind_by_name(self.name, agents)
         self.assertEqual(result.status, REBIND_OK)
@@ -260,11 +262,37 @@ class RebindTest(unittest.TestCase):
         assert result.identity is not None
         self.assertEqual(result.identity.assigned_name, self.name)
 
-    def test_rebind_locator_alias(self) -> None:
+    def test_rebind_locator_alias_pane(self) -> None:
+        # Alias regression: a row that carries the transient locator under the
+        # `pane` alias (AGENT_KEY_LOCATOR_ALIAS) instead of the real `pane_id`
+        # primary key still resolves.
+        agents = [{"name": self.name, "pane": "w1:p1"}]
+        result = rebind_by_name(self.name, agents)
+        self.assertEqual(result.status, REBIND_OK)
+        self.assertEqual(result.locator, "w1:p1")
+
+    def test_rebind_locator_alias_location(self) -> None:
+        # Alias regression: the `location` alias (AGENT_KEY_LOCATOR_ALIAS_2) is the
+        # last fallback after `pane_id` and `pane`.
         agents = [{"name": self.name, "location": "w2:p3"}]
         result = rebind_by_name(self.name, agents)
         self.assertEqual(result.status, REBIND_OK)
         self.assertEqual(result.locator, "w2:p3")
+
+    def test_rebind_pane_id_primary_wins_over_aliases(self) -> None:
+        # When a row carries all three keys, the real `pane_id` primary is the one
+        # recovered — the aliases never shadow it.
+        agents = [
+            {
+                "name": self.name,
+                "pane_id": "wPRIMARY:p0",
+                "pane": "wALIAS:p1",
+                "location": "wALIAS2:p2",
+            }
+        ]
+        result = rebind_by_name(self.name, agents)
+        self.assertEqual(result.status, REBIND_OK)
+        self.assertEqual(result.locator, "wPRIMARY:p0")
 
     def test_rebind_not_found(self) -> None:
         result = rebind_by_name(self.name, [{"name": "other", "pane": "w0:p0"}])
@@ -274,8 +302,8 @@ class RebindTest(unittest.TestCase):
 
     def test_rebind_ambiguous(self) -> None:
         agents = [
-            {"name": self.name, "pane": "w1:p1"},
-            {"name": self.name, "pane": "w2:p2"},
+            {"name": self.name, "pane_id": "w1:p1"},
+            {"name": self.name, "pane_id": "w2:p2"},
         ]
         result = rebind_by_name(self.name, agents)
         self.assertEqual(result.status, REBIND_AMBIGUOUS)
@@ -311,7 +339,7 @@ class RebindTest(unittest.TestCase):
             self.assertEqual(result.locator, "")
 
     def test_rebind_public_pointer_has_no_locator(self) -> None:
-        agents = [{"name": self.name, "pane": "w1:p1"}]
+        agents = [{"name": self.name, "pane_id": "w1:p1"}]
         result = rebind_by_name(self.name, agents)
         self.assertNotIn("w1:p1", result.public_pointer())
 

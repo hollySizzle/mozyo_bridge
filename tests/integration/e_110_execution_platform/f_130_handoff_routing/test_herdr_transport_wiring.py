@@ -93,7 +93,11 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
         def fake_run(argv, capture_output=None, text=None, timeout=None, **kw):
             # Only the herdr binary is ever spawned on this path.
             rest = list(argv[1:])
-            if rest[:2] == ["agent", "list"]:
+            # Exact argv: the real herdr `agent list` read carries no extra flags
+            # (no `--json`; JSON is the default output). Pinning the whole argv
+            # means a re-introduced `--json` (or any added flag) makes this fake
+            # fall through to the AssertionError instead of silently matching.
+            if rest == ["agent", "list"]:
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=json.dumps({"agents": agent_rows}), stderr=""
                 )
@@ -174,9 +178,12 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
         pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
         target_name = encode_assigned_name("ws-target", "claude", "lane-x")
         target_locator = "wT:pT"
+        # Real herdr `agent list` row shape: the transient locator rides on the
+        # `pane_id` primary key (PoC #13175 E10 実測), pinning that the primary
+        # path resolves against pane_id, not an alias.
         rows = [
-            {"name": SENDER_NAME, "pane": SENDER_LOCATOR},
-            {"name": target_name, "pane": target_locator},
+            {"name": SENDER_NAME, "pane_id": SENDER_LOCATOR},
+            {"name": target_name, "pane_id": target_locator},
         ]
         result, sends, out, err = self._run(target_pane=pane, agent_rows=rows)
 
@@ -195,7 +202,7 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
         # name), the target-name re-bind is not-found -> fail closed. Delivery must
         # NEVER fall back to the sender's locator.
         pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
-        rows = [{"name": SENDER_NAME, "pane": SENDER_LOCATOR}]
+        rows = [{"name": SENDER_NAME, "pane_id": SENDER_LOCATOR}]
         result, sends, out, err = self._run(target_pane=pane, agent_rows=rows)
 
         # Fail-closed: not a clean sent, and nothing delivered to the sender locator.
@@ -216,7 +223,7 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
         pane = _target_pane(workspace_id="ws-target", lane_id="lane-x")
         target_name = encode_assigned_name("ws-target", "claude", "lane-x")
         target_locator = "wT:pT"
-        rows = [{"name": target_name, "pane": target_locator}]
+        rows = [{"name": target_name, "pane_id": target_locator}]
         result, sends, out, err = self._run(
             target_pane=pane, agent_rows=rows, mode="queue-enter", pane_active="0"
         )
