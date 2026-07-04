@@ -334,15 +334,17 @@ def _resolve_binary(binary: str, source_env: Mapping[str, str]) -> Optional[str]
     file; a bare name is resolved on the **trusted environment's** ``PATH`` (the
     same env the binary token itself came from), not the ambient process ``PATH``
     — so a supplied trusted env fully determines resolution and an entry present
-    only on the ambient PATH is not silently picked up. When ``source_env`` is
-    the ambient ``os.environ`` (the default), this is byte-for-byte the previous
-    behaviour.
+    only on the ambient PATH is not silently picked up. A supplied trusted env
+    that carries no ``PATH`` key resolves against an empty path (``''``), so a
+    bare name is unresolvable — it does **not** fall back to the ambient
+    ``PATH``. When ``source_env`` is the ambient ``os.environ`` (the default),
+    this is byte-for-byte the previous behaviour.
     """
     if os.sep in binary or (os.altsep and os.altsep in binary):
         if os.path.isfile(binary) and os.access(binary, os.X_OK):
             return binary
         return None
-    return shutil.which(binary, path=source_env.get("PATH"))
+    return shutil.which(binary, path=source_env.get("PATH", ""))
 
 
 __all__ = (

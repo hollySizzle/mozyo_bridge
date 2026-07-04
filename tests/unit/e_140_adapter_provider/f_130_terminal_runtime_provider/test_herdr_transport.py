@@ -259,6 +259,31 @@ class ResolverTest(unittest.TestCase):
             finally:
                 os.environ["PATH"] = prev_path
 
+    def test_bare_name_env_without_path_fails_closed(self) -> None:
+        # Finding 2 residual (j#72305): a supplied trusted env with NO ``PATH``
+        # key must not fall back to the ambient ``PATH``. A bare name is
+        # unresolvable against the empty path — fail closed.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as ambient:
+            # Put an executable ``herdr`` on the ambient PATH only.
+            ambient_bin = os.path.join(ambient, "herdr")
+            with open(ambient_bin, "w") as handle:
+                handle.write("#!/bin/sh\n")
+            os.chmod(ambient_bin, os.stat(ambient_bin).st_mode | stat.S_IXUSR)
+            prev_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = ambient + os.pathsep + prev_path
+            try:
+                with self.assertRaises(TerminalTransportError) as ctx:
+                    resolve_terminal_transport(
+                        TerminalTransportConfig(backend=BACKEND_HERDR),
+                        # trusted env carries no PATH key at all
+                        env={HERDR_BINARY_ENV: "herdr"},
+                    )
+                self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
+            finally:
+                os.environ["PATH"] = prev_path
+
 
 if __name__ == "__main__":
     unittest.main()
