@@ -41,7 +41,7 @@ REPO = "/work/repo"
 PROJECT = "cloud-drive"
 
 
-def _cand(pane_id, *, role="codex", project_scope="", lane_kind=""):
+def _cand(pane_id, *, role="codex", project_scope="", lane_kind="", repo_root=REPO):
     return TargetCandidate(
         pane_id=pane_id,
         role=role,
@@ -58,8 +58,8 @@ def _cand(pane_id, *, role="codex", project_scope="", lane_kind=""):
         lane_id="lane",
         lane_label="lane",
         repo_short="repo",
-        repo_root=REPO,
-        cwd=REPO,
+        repo_root=repo_root,
+        cwd=repo_root,
         host="host",
         view_kind=VIEW_KIND_COCKPIT_PANE,
         branch=None,
@@ -164,6 +164,51 @@ class AlignedForwardLegTest(_StoreCase):
         self.assertEqual(payload["reason"], "consultation_ready")
         self.assertEqual(payload["reconcile_disposition"], "store_aligned")
         self.assertEqual(payload["store_pending_action"]["action"], "perform_review")
+        self.assertFalse(payload["store_pending_action"]["requires_confirmation"])
+
+
+class RepoLocalBindingTest(_StoreCase):
+    """The store fold uses the same repo-local binding as resume (review j#72693).
+
+    In a provider-rebind repo (auditor -> claude), a persisted review_request + a claude
+    route resolves to a non-gating ``perform_review``. If the step folded the store with
+    the compatibility default binding (auditor -> codex) instead, the claude route would
+    not match, the action would fail closed ``route_identity_unresolved`` (gating), and the
+    live forward leg would be wrongly downgraded to blocked. Pinning ``store_aligned`` here
+    proves the step folds the store identically to resume.
+    """
+
+    def _rebind_repo(self) -> str:
+        repo = Path(self._tmp.name) / "rebind_repo"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "provider_binding:\n  version: 1\n  bindings:\n    auditor: claude\n",
+            encoding="utf-8",
+        )
+        return str(repo)
+
+    def test_step_folds_store_with_repo_local_binding(self):
+        repo = self._rebind_repo()
+        # review_request -> perform_review (auditor); route is a claude lane, matching the
+        # rebound auditor -> claude binding.
+        self._persist(
+            "13291:review_request,id=13291:72672,commit=1",
+            routes=("route_id=r,issue=13291,ws=w,role=claude,pane_name=wk,pane_id=%20",),
+        )
+        # The self lane's repo_root points at the rebind repo, so the binding resolves there.
+        candidates = [
+            _cand("%self", repo_root=repo),
+            _cand("%gw", project_scope=PROJECT, repo_root=repo),
+        ]
+        rc, text = _run_step(_args(self.store_path, dry_run=True), candidates)
+        self.assertEqual(rc, 0)
+        payload = json.loads(text)
+        # With the repo-local binding the claude route matches -> non-gating perform_review
+        # -> aligned, and the live forward leg stays a dry-run (never gated).
+        self.assertEqual(payload["execution"], "dry_run")
+        self.assertEqual(payload["reconcile_disposition"], "store_aligned")
+        self.assertEqual(payload["store_pending_action"]["action"], "perform_review")
+        self.assertEqual(payload["store_pending_action"]["blocked_reason"], "")
         self.assertFalse(payload["store_pending_action"]["requires_confirmation"])
 
 

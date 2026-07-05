@@ -105,7 +105,9 @@ def _discover_candidates() -> list:
     return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
 
 
-def _load_store_action(args: argparse.Namespace) -> tuple[object | None, str]:
+def _load_store_action(
+    args: argparse.Namespace, *, repo_root: str = ""
+) -> tuple[object | None, str]:
     """Read the persisted runtime store's overall pending action, fail-open (#13291).
 
     Returns ``(WorkflowNextAction | None, store_status)`` where ``store_status`` is one of
@@ -115,22 +117,34 @@ def _load_store_action(args: argparse.Namespace) -> tuple[object | None, str]:
     Only when the store folds cleanly is the overall :func:`derive_workflow_next_action`
     result returned with :data:`STORE_PRESENT`. Patched in tests to keep the step CLI
     hermetic from the home store. ``--store-path`` (hidden) overrides the default home
-    store; no ``--repo`` is read, so the compatibility default role->provider binding is
-    used for the store fold.
+    store.
+
+    The store fold resolves the **same** repo-local role->provider binding
+    ``workflow resume`` threads (Redmine #13291 review j#72693): the reconcile input must
+    be folded identically to resume, otherwise a provider-rebind repo (#13157) folds the
+    same store two different ways and step misclassifies a non-gating action as gating.
+    ``repo_root`` is the current self lane's repo root (from the live outcome); an empty /
+    config-less repo threads :meth:`RoleProviderBinding.default`, so an unconfigured repo
+    is unchanged. A broken config fails open here (``STORE_UNAVAILABLE`` -> live outcome),
+    keeping a live routing step working regardless of the runtime-store config.
     """
-    # Lazy import: the reconcile read reuses the resume use case / store, kept out of the
-    # step module's import surface until a step actually consults the store.
+    # Lazy import: the reconcile read reuses the resume use case / store + binding source,
+    # kept out of the step module's import surface until a step actually consults the store.
     from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStoreError
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_resume import (
         _store_from_args,
         resume_command_result,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+        load_workflow_binding,
     )
 
     try:
         store = _store_from_args(args)
         if not store.path.exists():
             return None, STORE_ABSENT
-        result = resume_command_result(store)
+        binding, _warnings = load_workflow_binding(repo_root or None)
+        result = resume_command_result(store, binding=binding)
         return result.next_action, STORE_PRESENT
     except WorkflowRuntimeStoreError:
         return None, STORE_UNAVAILABLE
@@ -317,7 +331,9 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades
     # to the live outcome unchanged (backward compatible), a gating pending action
     # fail-closed-gates a live forward leg, a pending non-gating action is surfaced.
-    store_action, store_status = _load_store_action(args)
+    # Fold the store with the SAME repo-local binding resume uses, resolved from the
+    # current self lane's repo root (review j#72693), so the reconcile input matches resume.
+    store_action, store_status = _load_store_action(args, repo_root=live.repo_root)
     reconciled = reconcile_step_with_store(live, store_action, store_status=store_status)
     outcome = reconciled.outcome
 
