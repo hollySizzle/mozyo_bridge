@@ -82,9 +82,16 @@ def _args(**overrides):
         issue=None,
         journal=None,
         callback=None,
+        store_path=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+# The persisted runtime store is read fail-open (#13291). These pre-#13291 tests assert
+# the live-only step behavior, so pin the store to absent to stay hermetic from the home
+# store (dedicated reconcile coverage lives in test_workflow_step_reconcile_cli.py).
+_ABSENT_STORE = (None, "store_absent")
 
 
 def _run(args, candidates, *, self_pane="%self"):
@@ -93,6 +100,8 @@ def _run(args, candidates, *, self_pane="%self"):
         cli_workflow, "current_pane", lambda: self_pane
     ), patch.object(
         cli_workflow, "_discover_candidates", return_value=candidates
+    ), patch.object(
+        cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
     ), contextlib.redirect_stdout(out):
         rc = cli_workflow.cmd_workflow_step(args)
     return rc, out.getvalue()
@@ -168,6 +177,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
         ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
+        ), patch.object(
             cli_project_gateway_consult, "require_tmux", lambda: None
         ), patch.object(
             cli_project_gateway_consult, "_discover_candidates", return_value=[gateway]
@@ -191,6 +202,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
+        ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
         ), patch.object(
             cli_project_gateway_consult, "require_tmux", lambda: None
         ), patch.object(
@@ -264,6 +277,8 @@ class ExecuteWorkerDispatchTest(unittest.TestCase):
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[child, worker]
         ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
+        ), patch.object(
             commands, "orchestrate_handoff", side_effect=fake_orchestrate
         ), contextlib.redirect_stdout(out):
             rc = cli_workflow.cmd_workflow_step(_args(issue="12755", journal="67549"))
@@ -308,6 +323,8 @@ class ExecuteCallbackTest(unittest.TestCase):
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[gateway, grandparent]
+        ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
         ), patch.object(
             commands, "orchestrate_handoff", side_effect=fake_orchestrate
         ), contextlib.redirect_stdout(out):

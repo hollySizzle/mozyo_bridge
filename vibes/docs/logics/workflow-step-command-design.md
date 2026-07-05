@@ -172,6 +172,43 @@ primitive (`project-gateway consult` / `child-intake` / `handoff send` /
 として残るが、通常 smoke では選ばせない。`%pane` / `q-enter` / `queue-enter` / `--mode` は
 標準 surface に出さない。
 
+## Runtime store との next-action reconcile (Redmine #13291)
+
+`workflow step` (live tmux routing) と `workflow resume` (persisted runtime store の
+lifecycle next-action) は独立 2 engine だった。#13291 で step は resume と同じ
+runtime store (`workflow-runtime.sqlite`) を **decision 入力として read** し、live 出力に
+store の pending action を reconcile する。方向は「step が runtime store を読む」であり、
+resume は報告面のまま (step は store を mutate しない)。合成は pure・fail-toward-safe で
+実装は `f_140.../domain/workflow_step_reconcile.py` に置く。
+
+合成規則は fixed vocabulary (`reconcile_disposition`) で決定的にする。序列は次の通り:
+
+1. **degrade (非破壊)**: store 不在 (`store_absent`) / 読取・schema・fold 失敗
+   (`store_unavailable`) は live 出力をそのまま返す (従来の step 出力を byte-identical に
+   維持 = 後方互換)。reconcile field は出さない。
+2. **no pending**: store の overall action が positive-occupancy な no-op
+   (`none` / `hold` / `await_implementation`) は反映対象なし (`store_no_pending_action`)。
+   live 変更なし。
+3. **aligned (surface のみ)**: pending だが gating でない action (低リスク callback delivery
+   / perform_review など、store 自身が `requires_confirmation=false` かつ
+   `blocked_reason` 空) は live 出力を変えず、store action を報告に添える
+   (`store_aligned`)。live leg が既に forward でない (blocked / no-op) 場合は gating action
+   でも surface のみ。
+4. **gates (fail-toward-safe)**: pending かつ gating な action — store 自身の vocabulary で
+   `requires_confirmation` (integrate / close / retire / dispatch-next / redeliver /
+   resolve-blocker / owner-or-release gate) または `blocked_reason` (unknown action /
+   unresolved route) — が live の forward (`ready`) leg と矛盾する場合、live leg を
+   fail-closed `blocked` に downgrade する (`store_gates_live`, reason
+   `store_pending_action_gates`)。step は未処理の workflow gate を黙って越えて forward
+   しない。安全側 (より保守的な engine) が勝ち、agent は先に `workflow resume` で
+   pending action を処理するよう案内される。
+
+gating 判定は step 独自の risk model を新設せず store engine の既存 vocabulary
+(`requires_confirmation` / `blocked_reason`) を再利用する。execution leg の自動実行化
+(actuation) は非 goal であり、reconcile は 2 decision の **合成** と、最大でも forward leg の
+拒否のみを行う。reason token / field 名の正本は実装 (`workflow_step_reconcile.py` +
+tests) とする。
+
 ## 関連正本
 
 - `vibes/docs/logics/ticketless-project-gateway-runtime-ux.md`
