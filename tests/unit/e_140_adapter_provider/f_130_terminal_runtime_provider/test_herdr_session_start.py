@@ -37,13 +37,20 @@ HERDR_ENV = "MOZYO_HERDR_BINARY"
 
 
 class _Herdr:
-    """A fake herdr CLI keyed on argv; records launch env for assertions."""
+    """A fake herdr CLI (0.7.1 shape) keyed on argv; records start argv + env.
+
+    ``agent start`` returns the real herdr 0.7.1 JSON envelope
+    (``result.type == "agent_started"``, locator at ``result.agent.pane_id``). There
+    is no ``agent rename`` branch — a stray rename call raises (the durable name is
+    applied at start).
+    """
 
     def __init__(self, *, existing_rows=None, start_locator="w1:pNEW"):
         self.existing_rows = existing_rows or []
         self.start_locator = start_locator
         self.calls: list = []
         self.launch_envs: list = []
+        self.start_argvs: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -54,11 +61,26 @@ class _Herdr:
             )
         if rest[:2] == ["agent", "start"]:
             self.launch_envs.append(env)
+            self.start_argvs.append(rest)
             return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({"pane_id": self.start_locator}), stderr=""
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "id": "cli:agent:start",
+                        "result": {
+                            "agent": {
+                                "name": rest[2],
+                                "pane_id": self.start_locator,
+                                "agent_status": "unknown",
+                            },
+                            "argv": rest,
+                            "type": "agent_started",
+                        },
+                    }
+                ),
+                stderr="",
             )
-        if rest[:2] == ["agent", "rename"]:
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected herdr call: {argv!r}")
 
 
@@ -84,7 +106,7 @@ class SessionStartTest(unittest.TestCase):
             anchor = read_anchor(repo)
         return result, anchor, repo
 
-    def test_launch_and_rename_mints_names(self) -> None:
+    def test_launch_mints_names_at_start_no_rename(self) -> None:
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             result, anchor, repo = self._prepare(
@@ -96,26 +118,32 @@ class SessionStartTest(unittest.TestCase):
             self.assertEqual(outcomes, {"claude": SLOT_LAUNCHED, "codex": SLOT_LAUNCHED})
             names = {s.provider: s.assigned_name for s in result.slots}
             self.assertEqual(names["claude"], encode_assigned_name(ws, "claude", "lane-1"))
-            # A rename was issued for each launched agent.
-            renames = [c for c in herdr.calls if c[:2] == ["agent", "rename"]]
-            self.assertEqual(len(renames), 2)
+            # The durable name is applied AT START (positional), never via rename.
+            self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "rename"]])
+            for argv in herdr.start_argvs:
+                # argv = ["agent", "start", <NAME>, "--cwd", ...]
+                self.assertEqual(argv[2], names[argv[-1]])  # -- <provider> is argv[-1]
 
-    def test_launch_injects_self_identity_env(self) -> None:
+    def test_launch_injects_self_identity_via_env_flags(self) -> None:
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             result, anchor, repo = self._prepare(
                 tmp, providers=["claude"], herdr=herdr
             )
             ws = anchor["workspace_id"]
-        self.assertEqual(len(herdr.launch_envs), 1)
-        launch_env = herdr.launch_envs[0]
-        self.assertEqual(launch_env["MOZYO_WORKSPACE_ID"], ws)
-        self.assertEqual(launch_env["MOZYO_AGENT_ROLE"], "claude")
-        self.assertEqual(launch_env["MOZYO_LANE_ID"], "lane-1")
-        # cwd pinned to the repo root in the launch argv.
-        start = [c for c in herdr.calls if c[:2] == ["agent", "start"]][0]
+        # Self-identity rides on --env flags (the client env does NOT reach the
+        # server-spawned agent), so assert the --env triplet + name positional +
+        # --cwd + --no-focus in the start argv, not the runner env kwarg.
+        start = herdr.start_argvs[0]
+        self.assertEqual(start[:3], ["agent", "start", encode_assigned_name(ws, "claude", "lane-1")])
         self.assertIn("--cwd", start)
         self.assertIn(str(repo), start)
+        self.assertIn("--no-focus", start)
+        self.assertIn(f"MOZYO_WORKSPACE_ID={ws}", start)
+        self.assertIn("MOZYO_AGENT_ROLE=claude", start)
+        self.assertIn("MOZYO_LANE_ID=lane-1", start)
+        # `-- <provider>` terminates the argv.
+        self.assertEqual(start[-2:], ["--", "claude"])
 
     def test_existing_name_is_adopted_not_relaunched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

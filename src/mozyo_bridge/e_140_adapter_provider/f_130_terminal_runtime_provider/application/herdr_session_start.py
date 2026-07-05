@@ -14,23 +14,40 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
    its ``workspace_id`` — the workspace_registry schema is unchanged (#11425);
 3. mint the durable name ``encode_assigned_name(workspace_id, provider, lane)`` (#13247);
 4. **idempotency:** if a live agent already carries that exact assigned name, *adopt*
-   it (no launch, no rename). A duplicated assigned name (more than one live agent)
-   fails closed rather than corrupting identity;
-5. otherwise launch the agent as a herdr-managed pane pinned to the repo root, with the
-   self-identity env (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``)
-   injected into its process, then rename the fresh live locator to the minted name.
+   it (no launch). A duplicated assigned name (more than one live agent) fails closed
+   rather than corrupting identity;
+5. otherwise launch the agent as a herdr-managed pane with the durable name applied
+   **at start** and the self-identity vars injected via ``--env``.
+
+Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
+(spec §5 slot-uniqueness) so the same durable name is never minted twice.
 
 The command is explicit opt-in and is **not** coupled to the ``terminal_transport``
 backend flag: you may prepare herdr identities without selecting the herdr transport,
 and vice versa (documented in ``vibes/docs/specs/herdr-native-identity.md``). In pure
 herdr operation you run both.
 
-Staged actuator, fake-tested: the herdr ``agent start`` / ``agent rename`` argv shapes
-are built here and exercised through an injected subprocess ``runner`` — no live herdr
-binary runs in tests. The precise ``agent start`` argv (cwd / command handoff) is the
-one detail the PoC log left unconfirmed (E6 recorded only its existence); it is treated
-as a staged assumption and confirmed against a live binary in the coordinator's
-post-review smoke, exactly like the sibling #13245-series seams.
+Live-measured launch contract (herdr 0.7.1, coordinator pre-smoke)
+-----------------------------------------------------------------
+The ``agent start`` shape is no longer a staged assumption — it was validated against
+a running herdr 0.7.1::
+
+    herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv...>
+
+- ``<NAME>`` is a required positional and is applied directly at start (probe:
+  ``result.agent.name == <NAME>``), so mozyo mints the durable ``mzb1_...`` name here
+  and does **not** issue a separate ``agent rename``.
+- the self-identity vars ride on repeated ``--env`` flags, **not** the client process
+  env: the server-spawned agent does not inherit the launching client's environment
+  (coordinator-measured), so ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
+  ``MOZYO_LANE_ID`` are passed as ``--env KEY=VALUE``.
+- ``--no-focus`` avoids stealing the operator's focus.
+- output is a single JSON object on stdout; the transient locator for rebind/read is
+  ``result.agent.pane_id`` under a ``result.type == "agent_started"`` envelope
+  (:func:`_parse_started_locator`, fail-closed).
+
+Tests exercise the argv + JSON parsing through an injected subprocess ``runner`` (no
+live herdr binary); the end-to-end live smoke stays the coordinator's post-review step.
 """
 
 from __future__ import annotations
@@ -189,11 +206,17 @@ def _find_named_agent(
 
 
 def _parse_started_locator(stdout: object) -> Optional[str]:
-    """Best-effort: read the live pane locator from an ``agent start`` payload.
+    """Read the live pane locator from a herdr ``agent start`` payload (fail-closed).
 
-    Defensive (the exact schema is a staged assumption): a JSON object contributes
-    the transient locator (``pane_id`` / ``pane`` / ``location``); anything else
-    yields ``None`` so the caller fails closed rather than renaming a blank handle.
+    Real herdr 0.7.1 output (coordinator-measured): a single JSON object
+
+        {"id": "cli:agent:start",
+         "result": {"agent": {"pane_id": "w1:p2", "name": "...", ...},
+                    "argv": [...], "type": "agent_started"}}
+
+    The transient locator is ``result.agent.pane_id``. Returns ``None`` (so the
+    caller fails closed) when the payload is not JSON, ``result.type`` is not
+    ``agent_started``, or the ``pane_id`` is missing / blank — never a blank handle.
     """
     if not isinstance(stdout, str):
         return None
@@ -203,7 +226,15 @@ def _parse_started_locator(stdout: object) -> Optional[str]:
         return None
     if not isinstance(payload, Mapping):
         return None
-    locator = _agent_locator(payload)
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    if _norm(result.get("type")) != "agent_started":
+        return None
+    agent = result.get("agent")
+    if not isinstance(agent, Mapping):
+        return None
+    locator = _norm(agent.get("pane_id"))
     return locator or None
 
 
@@ -314,39 +345,50 @@ def _prepare_slot(
             provider=provider,
             assigned_name=assigned_name,
             outcome=SLOT_PLANNED,
-            detail="would launch + rename (dry-run)",
+            detail="would launch (dry-run)",
         )
-    # Launch the agent with the self-identity env injected, then mint its name.
-    launch_env = dict(env)
-    launch_env[MOZYO_WORKSPACE_ID_ENV] = workspace_id
-    launch_env[MOZYO_AGENT_ROLE_ENV] = provider
-    launch_env[MOZYO_LANE_ID_ENV] = lane
+    # Launch the agent with the durable name applied at start (herdr 0.7.1 real
+    # syntax: `agent start <NAME> [--cwd] [--env K=V]... [--no-focus] -- <argv>`).
+    # The NAME positional applies directly (probe: result.agent.name == NAME), so no
+    # separate `agent rename` is needed. The self-identity vars ride on repeated
+    # `--env` flags, NOT the client process env — the server-spawned agent does not
+    # inherit the client env (coordinator-measured). `--no-focus` avoids stealing the
+    # operator's focus. The client env is still passed through for PATH etc.
     started = _invoke(
         binary,
-        ["agent", "start", "--cwd", str(repo_root), "--", provider],
+        [
+            "agent",
+            "start",
+            assigned_name,
+            "--cwd",
+            str(repo_root),
+            "--env",
+            f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
+            "--env",
+            f"{MOZYO_AGENT_ROLE_ENV}={provider}",
+            "--env",
+            f"{MOZYO_LANE_ID_ENV}={lane}",
+            "--no-focus",
+            "--",
+            provider,
+        ],
         runner,
         timeout,
-        env=launch_env,
+        env=dict(env),
     )
     locator = _parse_started_locator(started.stdout)
     if not locator or not valid_target(locator):
         raise HerdrSessionStartError(
-            f"herdr agent start for {provider!r} returned no usable live locator; "
-            "refuse to rename a blank handle"
+            f"herdr agent start for {provider!r} returned no usable live locator "
+            "(expected result.agent.pane_id in an agent_started payload); refuse to "
+            "return a blank handle"
         )
-    _invoke(
-        binary,
-        ["agent", "rename", locator, assigned_name],
-        runner,
-        timeout,
-        env=None,
-    )
     return SlotResult(
         provider=provider,
         assigned_name=assigned_name,
         outcome=SLOT_LAUNCHED,
         locator=locator,
-        detail="launched with self-identity env and renamed to the durable name",
+        detail="launched with the durable name and self-identity env (--env) at start",
     )
 
 

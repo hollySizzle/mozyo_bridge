@@ -98,23 +98,38 @@ flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。
 2. workspace を registry へ確保 (`register_workspace` / `read_anchor` を再利用) し workspace_id を得る。
-3. 要求 agent (`claude` / `codex`) を herdr 管理 agent として cwd=repo root で launch
-   (`herdr agent start`)。launch subprocess の env に `MOZYO_WORKSPACE_ID` /
-   `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID` を注入する (§2 の self-identity)。
-4. mint durable name: `encode_assigned_name(workspace_id, role, lane)` で mzb1 名を作り
-   `herdr agent rename <live_locator> <mzb1_name>` で付与する。
-5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (rename も再 launch
-   もしない)。slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
+3. mint durable name: `encode_assigned_name(workspace_id, role, lane)` で mzb1 名を作る。
+4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
+   launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /
+   `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`, §2) は `--env KEY=VALUE` で spawn 先へ渡す。
+5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
+   slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
 6. slot-uniqueness (要求側、#13261 j#72532): 要求された `(provider, lane)` slot が重複する場合は
-   **いかなる side effect (binary 解決 / registration / inventory snapshot / launch / rename) より前に**
+   **いかなる side effect (binary 解決 / registration / inventory snapshot / launch) より前に**
    fail-closed で拒否する (silent 正規化しない)。同一 slot を二重に prepare すると同じ mzb1 名を二度
    mint し read side が `multiple_matches` で落ちるため。CLI の `--agent` は repeatable のままでよい
    (重複入力を die で弾く)。
 
-> NOTE (未確認): `herdr agent start` の正確な argv (cwd / command 受け渡し) は PoC log
-> (E6) が headless での存在のみ記録し詳細を残していない。本 command は staged actuator として
-> injected runner + fake で argv 形を検証する。live binary での確定は coordinator の
-> post-review smoke に委ねる (#13245 系の staged seam と同姿勢)。
+### launch contract (herdr 0.7.1 live-measured, coordinator pre-smoke)
+
+staged assumption は解消済み。実 herdr 0.7.1 で計測した確定仕様:
+
+```
+herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv...>
+```
+
+- `<NAME>` は **必須 positional** で start 時に直接適用される (probe: `result.agent.name == <NAME>`)。
+  mozyo は mzb1 durable 名をここで付与し、**別途 `agent rename` を発行しない**。
+- self-identity var は client process env では **spawn 先に届かない** (server-spawned agent は
+  client env を継承しない、実測)。よって `--env MOZYO_WORKSPACE_ID=...` / `--env MOZYO_AGENT_ROLE=...`
+  / `--env MOZYO_LANE_ID=...` で渡す。
+- `--no-focus` で operator focus を奪わない。
+- 出力は stdout 上の単一 JSON object。rebind/read 用 transient locator は
+  `result.type == "agent_started"` envelope 下の `result.agent.pane_id`
+  (`_parse_started_locator`、type 不一致 / pane_id 欠落は fail-closed)。
+
+自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
+live smoke は coordinator の post-review step。
 
 ## 6. Close-evidence contract (pure-herdr round trip)
 
@@ -158,9 +173,10 @@ backend=`tmux` 経路は byte 不変 (全 gate は `if not herdr_send` で stric
 
 ### 残 residual (未確認事項)
 
-- **live smoke 未実施**: 実 herdr binary + 実 agent での round-trip (marker landing / turn-start) は
-  coordinator の post-review 実機 acceptance に委ねる。本 US の自動テストは fake herdr runner のみ。
-- `herdr agent start` の argv (§5 NOTE) は staged assumption のまま。
+- **live smoke 未実施**: 実 herdr binary + 実 agent での **end-to-end** round-trip (session-start →
+  handoff marker landing / turn-start) は coordinator の post-review 実機 acceptance に委ねる。
+  `agent start` の CLI 仕様自体は herdr 0.7.1 で実測済み (§5 launch contract)。本 US の自動テストは
+  fake herdr runner のみ。
 - coordinator pseudo-target (`--to coordinator`) は `resolve_herdr_target` が解決可能だが、
   `orchestrate_handoff` の `RECEIVERS` は `claude`/`codex` のみのため entry からは claude/codex を扱う。
   coordinator callback 経路の herdr 対応は別 surface。
