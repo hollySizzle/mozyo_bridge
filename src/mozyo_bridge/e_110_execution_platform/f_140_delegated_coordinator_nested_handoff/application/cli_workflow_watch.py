@@ -63,6 +63,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_intake_journal,
     render_intake_text,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+    LiveRedmineJournalError,
+    LiveRedmineJournalSource,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MappingRedmineJournalSource,
     markers_from_source,
@@ -252,6 +256,43 @@ def _markers_from_redmine_json(args: argparse.Namespace) -> tuple[JournalMarker,
     return markers_from_source(source, issue_id)
 
 
+def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
+    """Build the live poll source from daemon-trusted credentials (patchable test seam).
+
+    Isolated so a hermetic CLI test can monkeypatch it to return a source over a fake
+    transport, without touching the real environment or the network. Credentials come only
+    from env / the home credential file (never a repo-local file); an unconfigured environment
+    raises :class:`LiveRedmineJournalError`.
+    """
+    since = (getattr(args, "since", None) or "").strip() or None
+    return LiveRedmineJournalSource.from_environment(since=since)
+
+
+def _markers_from_live_poll(args: argparse.Namespace) -> tuple[JournalMarker, ...]:
+    """Read structured gate markers by polling Redmine live (opt-in ``--poll``).
+
+    Absent ``--poll`` returns ``()`` so the default path is the non-destructive snapshot /
+    ``--marker`` intake. With ``--poll`` the live adapter fetches ``--source-issue``'s journals
+    over the network (credentials from env / the home file, never repo-local) and
+    :func:`markers_from_source` extracts the structured ``[mozyo:...]`` gate markers — the same
+    read/extract boundary the snapshot path uses. A missing issue id, unconfigured credentials,
+    or a transport failure is surfaced as a ``SystemExit`` with a redacted message (never the
+    key or URL), consistent with the ``--redmine-json`` payload guard.
+    """
+    if not getattr(args, "poll", False):
+        return ()
+    issue_id = (getattr(args, "source_issue", None) or "").strip()
+    if not issue_id:
+        raise SystemExit("--poll requires --source-issue ISSUE_ID (the Redmine issue to poll)")
+    try:
+        source = _live_journal_source(args)
+        for warning in source.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        return markers_from_source(source, issue_id)
+    except LiveRedmineJournalError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _store_from_args(args: argparse.Namespace) -> WorkflowRuntimeStore:
     """Build the live store from ``--store-path`` (test/debug) or the home default."""
     raw = (getattr(args, "store_path", None) or "").strip()
@@ -372,10 +413,15 @@ def cmd_workflow_watch(args: argparse.Namespace) -> int:
     # on stdout stays clean (#13157).
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
-    # Redmine-sourced structured markers (the event source) first, then explicit --marker
-    # specs (debug / supplemental); both feed the same intake. Duplicate anchors across the
-    # two are deduplicated by the intake's redmine:<issue>:<journal> suppression.
-    markers = _markers_from_redmine_json(args) + tuple(getattr(args, "marker", None) or ())
+    # Redmine-sourced structured markers (the event source) first — a fetched snapshot
+    # (--redmine-json) and/or a live network poll (--poll --source-issue) — then explicit
+    # --marker specs (debug / supplemental); all feed the same intake. Duplicate anchors across
+    # the sources are deduplicated by the intake's redmine:<issue>:<journal> suppression.
+    markers = (
+        _markers_from_redmine_json(args)
+        + _markers_from_live_poll(args)
+        + tuple(getattr(args, "marker", None) or ())
+    )
     routes = list(getattr(args, "route_identity", None) or ())
     outcome = evaluate_intake_from_store(
         store, markers, extra_route_records=routes, binding=binding
@@ -407,12 +453,14 @@ def register_watch(workflow_sub) -> None:
         "watch",
         description=(
             "Ingest structured Redmine journal markers into a pending workflow action "
-            "(Redmine #12672). Reads the Redmine event source two ways: --redmine-json "
-            "scans a fetched issue-detail snapshot's journal entries for structured "
-            "[mozyo:...] gate markers (the durable history), and --marker supplies an "
+            "(Redmine #12672 / #13289). Reads the Redmine event source three ways: "
+            "--redmine-json scans a fetched issue-detail snapshot's journal entries for "
+            "structured [mozyo:...] gate markers (the durable history), --poll fetches the "
+            "same markers live over the network from --source-issue (opt-in, credentialed), "
+            "and --marker supplies an "
             "explicit/debug ISSUE:JOURNAL:GATE[,conclusion=,callback=,commit=,integrated=,"
             "open=,blocker=] spec (repeatable; the gate accepts the alias review_result); "
-            "both feed the same intake. The watcher keys "
+            "all feed the same intake. The watcher keys "
             "each by the durable redmine:<issue>:<journal> anchor, and folds the recorded "
             "+ newly accepted events into workflow.state + the enriched "
             "workflow.next_action — reporting it as a pending action (ready / "
@@ -452,8 +500,35 @@ def register_watch(workflow_sub) -> None:
         default=None,
         metavar="ISSUE_ID",
         help=(
-            "The Redmine issue id for --redmine-json entries when the payload's issue.id is "
-            "absent (the journal entry's own id is always the dedup anchor)."
+            "The Redmine issue id: for --redmine-json, used when the payload's issue.id is "
+            "absent; for --poll, the required issue whose journals are fetched live (the "
+            "journal entry's own id is always the dedup anchor)."
+        ),
+    )
+    watch.add_argument(
+        "--poll",
+        action="store_true",
+        dest="poll",
+        help=(
+            "Opt-in: read the Redmine event source live over the network instead of a "
+            "hand-fetched --redmine-json snapshot. Fetches --source-issue's journals via a "
+            "read-only issues/<id>.json?include=journals GET and extracts the same structured "
+            "[mozyo:...] gate markers. Requires --source-issue. Credentials come only from the "
+            "daemon-trusted env (MOZYO_REDMINE_API_KEY / MOZYO_REDMINE_URL) or the home-scoped "
+            "redmine-credentials.yaml — never a repo-local file; the API key is never echoed. "
+            "An unconfigured environment or a fetch failure fails closed with a redacted error."
+        ),
+    )
+    watch.add_argument(
+        "--since",
+        dest="since",
+        default=None,
+        metavar="UPDATED_ON",
+        help=(
+            "Cursor for --poll: an ISO updated_on timestamp (e.g. 2026-07-05T08:00:00Z). Only "
+            "journals created strictly after it are ingested; a journal without a timestamp is "
+            "kept. Optional — the durable redmine:<issue>:<journal> anchor deduplicates a "
+            "re-poll regardless, so the cursor is an efficiency filter, not a correctness gate."
         ),
     )
     watch.add_argument(

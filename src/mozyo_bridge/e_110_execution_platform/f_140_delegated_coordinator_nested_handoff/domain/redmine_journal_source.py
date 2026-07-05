@@ -30,9 +30,11 @@ Scope boundary (kept deliberately narrow, like the #12857 first slice): this rea
 shape an operator / MCP already fetched) via the pure
 :class:`MappingRedmineJournalSource`, and exposes a :class:`RedmineJournalSource` port so a
 live, credentialed auto-poll adapter (a network read using the existing read-only
-``redmine_context`` machinery + a since/updated_on cursor) drops in later. That live poll
-loop is an operational, credential-gated layer carried as an explicit follow-up; the read /
-extract / convert boundary it would feed is implemented and tested here.
+``redmine_context`` machinery + a since/updated_on cursor) drops in behind the same port. That
+live poll adapter now exists as the credential-gated
+:class:`...application.live_redmine_journal_source.LiveRedmineJournalSource` (Redmine #13289,
+wired into ``workflow watch --poll``); it reuses the read / extract / convert boundary
+implemented and tested here rather than reimplementing it.
 """
 
 from __future__ import annotations
