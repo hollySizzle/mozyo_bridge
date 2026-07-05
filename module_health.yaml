@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3374
+    lines: 3460
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -991,6 +991,18 @@ allowlist:
       ``sender_lane_unit`` so the gate enforces without a tmux
       ``current_pane_lane_unit()`` call — the gate's tmux path stays byte-identical
       when the arg is ``None``.
+      Raised 3374 -> 3460 for the #13255 herdr+standard event-driven turn-start rail
+      branch in ``orchestrate_handoff``: under ``terminal_transport.backend: herdr``
+      AND ``--mode standard`` the strict rail drives the ``HerdrTurnStartRail``
+      (stashed on the ``active_herdr_turn_start_rail`` module global by
+      ``bind_runtime_transport``) INSTEAD OF the common tmux body injection + landing
+      gate + capture-based ``_observe_standard_turn_start`` + tmux Enter; the branch
+      projects the rail outcome onto ``(status, reason)`` (via the pure
+      ``project_herdr_turn_start`` in ``turn_start_observation.py``), persists the
+      additive ``turn_start_outcome`` + telemetry via ``turn_start_rail_record_lines``,
+      and returns / dies without falling through. tmux and herdr non-standard
+      (pending / queue-enter) paths stay byte-identical. The rail orchestration +
+      record renderer live in the terminal-runtime provider, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1037,7 +1049,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1878
+    lines: 1980
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1152,6 +1164,17 @@ allowlist:
       and the more explicit `queue_enter` narrative (landing NOT pre-confirmed ->
       poll the durable record). No new Reason token; the observation logic stays in
       `application/turn_start_observation.py`.
+      Raised 1878 -> 1980 for the #13255 herdr+standard event-driven turn-start rail
+      projection: four additive `Reason` tokens (`receiver_blocked` /
+      `turn_start_absent` / `precondition_not_idle` / `inject_failed`) on the
+      literal, plus their `next_action_for` / `_outcome_narrative` /
+      `_receiver_contract_line` branches (the herdr rail's `started` -> `sent`/`ok`
+      and `delivered_not_started` -> reuse `turn_start_unconfirmed`; the four new
+      tokens distinguish a runtime block / absent pane / not-idle precondition /
+      transport inject failure). The rail orchestration + outcome vocabulary + record
+      renderer live in the terminal-runtime provider; the outcome -> wire projection
+      lives in `application/turn_start_observation.py`, so only the Reason
+      registration + wording lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
