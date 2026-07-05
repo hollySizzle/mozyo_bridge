@@ -501,20 +501,74 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(len(enters), 2, msg=f"expected one Enter re-send: {herdr.sends}")
         self.assertIn("1 Enter re-send(s)", out)
 
-    def test_queue_enter_rail_unchanged_under_herdr(self) -> None:
-        # Redmine #13255 decision 5: the queue-enter rail is NOT promoted to the
-        # event-driven rail. A herdr queue-enter send stays on the common shim-backed
-        # choreography — it never arms a `wait` and never reads state via `agent get`,
-        # and resolves to `sent` (byte-compatible with the pre-#13255 behavior).
-        herdr = _FakeHerdr([])
+    def test_queue_enter_rail_choreography_unchanged_under_herdr(self) -> None:
+        # Redmine #13255 decision 5 / #13292: the queue-enter rail is NOT promoted to
+        # the event-driven rail — it NEVER arms a `wait` and its inject -> Enter ->
+        # Enter-only retry choreography is byte-unchanged, resolving to `sent`. Redmine
+        # #13292 adds ONLY an additive, telemetry-only post-choreography `agent get`
+        # snapshot: `get` may now appear, but `wait` must NOT, and the wire is unchanged.
+        herdr = _FakeHerdr([], get_states=["working"])
         result, herdr, ws, out, err = self._run(
             agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
         )
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        # No event-driven rail on the queue-enter path.
-        self.assertFalse([op for op in herdr.sends if op[0] in ("wait", "get")], msg=herdr.sends)
+        # The queue-enter rail never arms an event wait (only the standard rail does).
+        self.assertFalse([op for op in herdr.sends if op[0] == "wait"], msg=herdr.sends)
+        # The body is injected exactly once (the additive snapshot never re-injects).
+        send_texts = [op for op in herdr.sends if op[0] == "send_text"]
+        self.assertEqual(len(send_texts), 1, msg=herdr.sends)
+        # The event rail's `turn_start_outcome` telemetry stays absent on queue-enter.
+        self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
+
+    def test_queue_enter_snapshot_records_telemetry_only(self) -> None:
+        # Redmine #13292 (design j#72759): a herdr queue-enter send takes a read-only
+        # post-choreography `agent get` snapshot and records it as the additive,
+        # telemetry-only `queue_enter_turn_start_observation` field. A `working`
+        # snapshot is a settled state (single read), but it NEVER changes the
+        # `sent` wire and never blocks.
+        herdr = _FakeHerdr([], get_states=["working"])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        # The snapshot read hit `agent get` at least once.
+        self.assertTrue([op for op in herdr.sends if op[0] == "get"], msg=herdr.sends)
+        obs = outcome.get("queue_enter_turn_start_observation")
+        self.assertIsInstance(obs, dict, msg=out)
+        self.assertEqual(obs.get("observation_kind"), "post_choreography_snapshot", msg=out)
+        self.assertEqual(obs.get("source"), "herdr_agent_get", msg=out)
+        self.assertEqual(obs.get("runtime_state"), "busy", msg=out)
+        self.assertTrue(obs.get("read_ok"), msg=out)
+        self.assertIsNone(obs.get("read_reason"), msg=out)
+        self.assertEqual(obs.get("poll_attempts"), 1, msg=out)
+        # The record line labels itself telemetry-only and does NOT reuse the event
+        # rail's wording.
+        self.assertIn("Queue-enter turn-start observation (herdr agent get)", out)
+        self.assertIn("Telemetry-only", out)
+        self.assertNotIn("Turn start (herdr rail)", out)
+
+    def test_queue_enter_snapshot_awaiting_input_is_advisory_not_block(self) -> None:
+        # Redmine #13292: an idle (awaiting_input) receiver after the choreography is
+        # "delivered but no turn observed starting" — recorded as telemetry ONLY. It
+        # MUST NOT hard-block: the `sent` contract (hard-block forbidden, #13262
+        # j#72523) is preserved.
+        herdr = _FakeHerdr([], get_states=["idle"])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertIn(outcome.get("reason"), ("ok", "queue_enter"), msg=out)
+        self.assertEqual(outcome.get("next_action_owner"), "receiver", msg=out)
+        obs = outcome.get("queue_enter_turn_start_observation")
+        self.assertIsInstance(obs, dict, msg=out)
+        self.assertEqual(obs.get("runtime_state"), "awaiting_input", msg=out)
+        self.assertTrue(obs.get("read_ok"), msg=out)
 
 
 class TmuxBackendUntouchedTest(unittest.TestCase):

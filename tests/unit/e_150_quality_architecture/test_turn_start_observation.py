@@ -9,14 +9,30 @@ from __future__ import annotations
 import unittest
 
 from mozyo_bridge.application.turn_start_observation import (
+    QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS,
+    QUEUE_ENTER_OBSERVE_WINDOW_SECONDS,
     TURN_START_OBSERVE_INTERVAL_SECONDS,
     HERDR_TURN_START_PROJECTION,
+    QueueEnterTurnStartObservation,
     TurnStartObservation,
+    observe_queue_enter_turn_start,
     observe_standard_turn_start,
     project_herdr_turn_start,
+    queue_enter_turn_start_record_lines,
     resolve_turn_start_window,
     submit_activity_observed,
     turn_start_record_lines,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
+    AgentStateResult,
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_BLOCKED,
+    RUNTIME_BUSY,
+    RUNTIME_TURN_ENDED,
+    RUNTIME_UNKNOWN,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    REASON_TRANSPORT_ERROR,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
     TURN_START_OUTCOMES,
@@ -227,6 +243,210 @@ class HerdrTurnStartProjectionTest(unittest.TestCase):
         }
         self.assertEqual(statuses, {"sent", "blocked"})
         self.assertEqual(HERDR_TURN_START_PROJECTION["started"][0], "sent")
+
+
+class _RecordingReader:
+    """A fake ``read_agent_state`` yielding a scripted sequence of results.
+
+    Consumes one result per call (repeating the last), and records how many reads
+    happened so a test can assert the poll's early-exit / window behaviour without a
+    real herdr or a real sleep.
+    """
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = 0
+
+    def __call__(self, target):
+        result = (
+            self._results[self.calls]
+            if self.calls < len(self._results)
+            else self._results[-1]
+        )
+        self.calls += 1
+        return result
+
+
+def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+class ObserveQueueEnterTurnStartTest(unittest.TestCase):
+    """Redmine #13292: the post-choreography queue-enter snapshot observation."""
+
+    def test_busy_settles_on_first_read_no_poll(self) -> None:
+        # A receiver already producing a turn is a settled state: one read, no sleep,
+        # zero added latency on the daily-driver path.
+        reader = _RecordingReader([AgentStateResult.observed(RUNTIME_BUSY)])
+        sleeps = []
+        obs = observe_queue_enter_turn_start(
+            "%1", read=reader, sleep=sleeps.append
+        )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(obs.runtime_state, RUNTIME_BUSY)
+        self.assertTrue(obs.read_ok)
+        self.assertIsNone(obs.read_reason)
+        self.assertEqual(obs.poll_attempts, 1)
+
+    def test_blocked_and_turn_ended_are_settled(self) -> None:
+        for state in (RUNTIME_BLOCKED, RUNTIME_TURN_ENDED):
+            reader = _RecordingReader([AgentStateResult.observed(state)])
+            obs = observe_queue_enter_turn_start("%1", read=reader, sleep=_no_sleep)
+            self.assertEqual(reader.calls, 1, state)
+            self.assertEqual(obs.runtime_state, state)
+            self.assertEqual(obs.poll_attempts, 1, state)
+
+    def test_awaiting_input_polls_the_full_window(self) -> None:
+        # An idle receiver is NOT settled: the poll continues to the window bound,
+        # then returns the last (still awaiting_input) read as advisory telemetry.
+        reader = _RecordingReader([AgentStateResult.observed(RUNTIME_AWAITING_INPUT)])
+        sleeps = []
+        obs = observe_queue_enter_turn_start(
+            "%1",
+            read=reader,
+            sleep=sleeps.append,
+            window_seconds=2.0,
+            interval_seconds=0.5,
+        )
+        self.assertEqual(obs.runtime_state, RUNTIME_AWAITING_INPUT)
+        self.assertTrue(obs.read_ok)
+        # window 2.0 / interval 0.5 → 4 extra reads after the immediate first = 5.
+        self.assertEqual(obs.poll_attempts, 5)
+        self.assertEqual(len(sleeps), 4)
+
+    def test_early_exit_when_a_later_poll_observes_busy(self) -> None:
+        reader = _RecordingReader(
+            [
+                AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+                AgentStateResult.observed(RUNTIME_AWAITING_INPUT),
+                AgentStateResult.observed(RUNTIME_BUSY),
+            ]
+        )
+        obs = observe_queue_enter_turn_start(
+            "%1",
+            read=reader,
+            sleep=_no_sleep,
+            window_seconds=5.0,
+            interval_seconds=0.5,
+        )
+        self.assertEqual(obs.runtime_state, RUNTIME_BUSY)
+        self.assertEqual(obs.poll_attempts, 3)
+
+    def test_read_failure_folds_to_unknown_telemetry(self) -> None:
+        # A mechanical read failure never blocks: it degrades to an unknown-state
+        # telemetry record carrying the transport failure reason.
+        reader = _RecordingReader(
+            [AgentStateResult.failure(REASON_TRANSPORT_ERROR, "herdr command timed out")]
+        )
+        obs = observe_queue_enter_turn_start(
+            "%1", read=reader, sleep=_no_sleep, window_seconds=0.0
+        )
+        self.assertEqual(obs.runtime_state, RUNTIME_UNKNOWN)
+        self.assertFalse(obs.read_ok)
+        self.assertEqual(obs.read_reason, REASON_TRANSPORT_ERROR)
+        self.assertEqual(obs.poll_attempts, 1)
+
+    def test_nonpositive_window_is_a_single_snapshot(self) -> None:
+        reader = _RecordingReader([AgentStateResult.observed(RUNTIME_AWAITING_INPUT)])
+        obs = observe_queue_enter_turn_start(
+            "%1", read=reader, sleep=_no_sleep, window_seconds=0.0
+        )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(obs.poll_attempts, 1)
+
+    def test_nonpositive_interval_falls_back_to_default(self) -> None:
+        reader = _RecordingReader([AgentStateResult.observed(RUNTIME_AWAITING_INPUT)])
+        obs = observe_queue_enter_turn_start(
+            "%1",
+            read=reader,
+            sleep=_no_sleep,
+            window_seconds=QUEUE_ENTER_OBSERVE_WINDOW_SECONDS,
+            interval_seconds=0.0,
+        )
+        # Falls back to the module default interval, so the window yields the same
+        # bounded number of reads as the default cadence.
+        expected = 1 + int(
+            QUEUE_ENTER_OBSERVE_WINDOW_SECONDS // QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS
+        )
+        self.assertEqual(obs.poll_attempts, expected)
+
+
+class QueueEnterTelemetryDictTest(unittest.TestCase):
+    def test_telemetry_dict_shape_is_provenance_tagged(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_BUSY,
+            read_ok=True,
+            read_reason=None,
+            poll_attempts=1,
+        )
+        self.assertEqual(
+            obs.to_telemetry_dict(),
+            {
+                "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get",
+                "runtime_state": "busy",
+                "read_ok": True,
+                "read_reason": None,
+                "poll_attempts": 1,
+            },
+        )
+
+    def test_telemetry_dict_carries_only_tokens_bool_numbers(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_UNKNOWN,
+            read_ok=False,
+            read_reason=REASON_TRANSPORT_ERROR,
+            poll_attempts=3,
+        )
+        d = obs.to_telemetry_dict()
+        # No free-text `detail`, no raw status, no path — the field is durable-safe.
+        self.assertNotIn("detail", d)
+        self.assertNotIn("raw_status", d)
+
+
+class QueueEnterRecordLinesTest(unittest.TestCase):
+    def test_line_labels_telemetry_only_and_avoids_event_rail_wording(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_BUSY, read_ok=True, read_reason=None, poll_attempts=1
+        )
+        (line,) = queue_enter_turn_start_record_lines(obs)
+        self.assertIn("Queue-enter turn-start observation (herdr agent get)", line)
+        self.assertIn("runtime_state busy", line)
+        self.assertIn("Telemetry-only", line)
+        # Must NOT reuse the event rail's wording, and must state it never blocks.
+        self.assertNotIn("Turn start (herdr rail)", line)
+        self.assertIn("never blocks", line)
+
+    def test_awaiting_input_line_says_delivered_not_started(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_AWAITING_INPUT,
+            read_ok=True,
+            read_reason=None,
+            poll_attempts=5,
+        )
+        (line,) = queue_enter_turn_start_record_lines(obs)
+        self.assertIn("runtime_state awaiting_input", line)
+        self.assertIn("delivered", line)
+
+    def test_failed_read_line_reports_reason(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_UNKNOWN,
+            read_ok=False,
+            read_reason=REASON_TRANSPORT_ERROR,
+            poll_attempts=1,
+        )
+        (line,) = queue_enter_turn_start_record_lines(obs)
+        self.assertIn("snapshot read failed", line)
+        self.assertIn(REASON_TRANSPORT_ERROR, line)
+
+    def test_record_line_carries_no_absolute_path(self) -> None:
+        obs = QueueEnterTurnStartObservation(
+            runtime_state=RUNTIME_BLOCKED, read_ok=True, read_reason=None, poll_attempts=2
+        )
+        (line,) = queue_enter_turn_start_record_lines(obs)
+        self.assertNotIn("/Users/", line)
+        self.assertNotIn("/home/", line)
 
 
 if __name__ == "__main__":

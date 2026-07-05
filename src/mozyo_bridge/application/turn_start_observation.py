@@ -50,8 +50,15 @@ record.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_BLOCKED,
+    RUNTIME_BUSY,
+    RUNTIME_TURN_ENDED,
+    RUNTIME_UNKNOWN,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
     OUTCOME_ABSENT,
     OUTCOME_BLOCKED,
@@ -244,12 +251,205 @@ def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
     return HERDR_TURN_START_PROJECTION[result.outcome]
 
 
+# --- queue-enter post-choreography turn-start observation (Redmine #13292) ----
+# The daily-default ``queue-enter`` rail's additive, telemetry-only turn-start
+# observation under the herdr backend (j#72602 decision 5's deferred follow-up,
+# design confirmed in #13292 j#72759). Deliberately NOT the event-driven
+# ``HerdrTurnStartRail``: that rail OWNS injection and fails closed on
+# ``precondition_not_idle``, which #13262 / the #13292 constraints forbid on
+# queue-enter (its ``sent`` / ``queue_enter`` contract must not hard-block). This
+# observation instead leaves the existing queue-enter inject → Enter → Enter-only
+# retry choreography byte-identical and, AFTER it, takes a read-only
+# ``agent get`` snapshot of the receiver's runtime state (#13246
+# ``read_agent_state``). The result is recorded as additive telemetry ONLY — it
+# never influences ``status`` / ``reason`` / ``next_action_owner`` and never blocks
+# the send; a read failure, an ``unknown`` state, or an ``awaiting_input`` (not yet
+# started) all fold to telemetry.
+#
+# It is kept structurally distinct from the event rail's ``turn_start_outcome``
+# telemetry on purpose (j#72759 answer 3): a post-hoc snapshot does not prove
+# causality (it cannot attribute an observed ``busy`` to *this* send the way an
+# armed ``wait agent-status`` transition does), so mapping ``busy`` onto the rail's
+# ``started`` token would let the #12656 ledger / an auditor misread it as an
+# event-observed turn start. The telemetry therefore carries its own
+# ``observation_kind`` / ``source`` provenance and its own field name
+# (``queue_enter_turn_start_observation``).
+
+#: The default bounded observation window (seconds) for the queue-enter snapshot
+#: poll. Advisory only: the first read is immediate (a receiver already producing
+#: a turn exits at once, zero added latency); only an ``awaiting_input`` / unknown
+#: tail polls up to this window. Deliberately short so the daily-default rail is
+#: not slowed materially when a turn did start.
+QUEUE_ENTER_OBSERVE_WINDOW_SECONDS = 2.0
+
+#: The poll cadence (seconds) inside the queue-enter observation window. The read
+#: is a snapshot (``agent get``), never a keypress, so the observation never
+#: re-injects or re-Enters.
+QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS = 0.5
+
+#: The runtime states that end the queue-enter observation poll early: a receiver
+#: producing a turn (``busy``), a runtime-observed block (``blocked``), or an
+#: assistant turn that already finished (``turn_ended``). ``awaiting_input`` (not
+#: started yet) and ``unknown`` (unreadable) keep polling until the window elapses.
+_QUEUE_ENTER_SETTLED_STATES = frozenset(
+    {RUNTIME_BUSY, RUNTIME_BLOCKED, RUNTIME_TURN_ENDED}
+)
+
+
+@dataclass(frozen=True)
+class QueueEnterTurnStartObservation:
+    """The post-choreography herdr snapshot observation for the queue-enter rail.
+
+    Telemetry-only (Redmine #13292 j#72759): recorded additively on the delivery
+    record / JSON outcome and NEVER consulted for ``status`` / ``reason`` /
+    ``next_action_owner``. Tokens + a bool + numbers only, so it is safe verbatim in
+    the pasteable durable record and the opt-in persisted note.
+
+    - ``runtime_state`` — the observed runtime receiver-state (a member of
+      :data:`RUNTIME_RECEIVER_STATES`; ``unknown`` when the read failed or the
+      status was unrecognised);
+    - ``read_ok`` — whether the final snapshot read mechanically succeeded;
+    - ``read_reason`` — on a failed read, the closed transport failure reason;
+      ``None`` on success;
+    - ``poll_attempts`` — how many ``agent get`` snapshots were taken (>= 1).
+    """
+
+    runtime_state: str
+    read_ok: bool
+    read_reason: Optional[str]
+    poll_attempts: int
+
+    def to_telemetry_dict(self) -> dict:
+        """The machine-readable queue-enter observation telemetry (Redmine #13292).
+
+        Carries its own ``observation_kind`` / ``source`` provenance so a replaying
+        auditor / the future #12656 ledger never confuses this post-hoc snapshot
+        with the event rail's armed-wait ``turn_start_outcome`` (j#72759 answer 3).
+        Tokens / bool / numbers only — no free text, no ``detail``, no absolute
+        paths, no raw herdr status.
+        """
+        return {
+            "observation_kind": "post_choreography_snapshot",
+            "source": "herdr_agent_get",
+            "runtime_state": self.runtime_state,
+            "read_ok": self.read_ok,
+            "read_reason": self.read_reason,
+            "poll_attempts": self.poll_attempts,
+        }
+
+
+def observe_queue_enter_turn_start(
+    target: str,
+    *,
+    read: Callable[[str], object],
+    sleep: Callable[[float], None],
+    window_seconds: float = QUEUE_ENTER_OBSERVE_WINDOW_SECONDS,
+    interval_seconds: float = QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS,
+) -> QueueEnterTurnStartObservation:
+    """Snapshot the receiver's runtime state AFTER the queue-enter choreography.
+
+    ``read`` is the injected snapshot reader (``read_agent_state`` in production,
+    a fake in tests); it returns a result exposing ``state`` /
+    :data:`RUNTIME_RECEIVER_STATES`, ``ok``, and ``reason``. ``sleep`` is the
+    injected clock. The first read is immediate; the poll then continues at
+    ``interval_seconds`` until a settled state (:data:`_QUEUE_ENTER_SETTLED_STATES`)
+    is observed or ``window_seconds`` elapses — a non-positive window collapses to a
+    single snapshot. This is read-only (``agent get``): it performs NO injection,
+    NO Enter, and NO C-u rollback, and it never raises out — the reader itself fails
+    closed to an ``unknown`` state, which is recorded as telemetry, never a block.
+    """
+    if interval_seconds <= 0:
+        interval_seconds = QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS
+    result = read(target)
+    attempts = 1
+    elapsed = 0.0
+    while (
+        not _queue_enter_settled(result)
+        and elapsed + interval_seconds <= window_seconds
+    ):
+        sleep(interval_seconds)
+        elapsed += interval_seconds
+        result = read(target)
+        attempts += 1
+    return QueueEnterTurnStartObservation(
+        runtime_state=getattr(result, "state", RUNTIME_UNKNOWN),
+        read_ok=bool(getattr(result, "ok", False)),
+        read_reason=getattr(result, "reason", None),
+        poll_attempts=attempts,
+    )
+
+
+def _queue_enter_settled(result: object) -> bool:
+    """True when the snapshot observed a settled runtime state (poll early-exit)."""
+    return bool(getattr(result, "ok", False)) and (
+        getattr(result, "state", RUNTIME_UNKNOWN) in _QUEUE_ENTER_SETTLED_STATES
+    )
+
+
+#: The redaction-safe human-readable detail per observed runtime state, keyed by
+#: the runtime receiver-state token. Free-text-free at the value level (no paths /
+#: raw status), just a short verdict phrase the record line quotes.
+_QUEUE_ENTER_STATE_DETAIL: dict = {
+    RUNTIME_BUSY: "receiver is producing a turn (working)",
+    RUNTIME_BLOCKED: (
+        "receiver shows a runtime-observed block (a permission prompt is on "
+        "screen); telemetry only, this is not a workflow / handoff block"
+    ),
+    RUNTIME_AWAITING_INPUT: (
+        "receiver is idle — no turn was observed starting within the window "
+        "(delivered, but a turn start was not observed)"
+    ),
+    RUNTIME_TURN_ENDED: "receiver's assistant turn had already finished",
+    RUNTIME_UNKNOWN: "receiver runtime state was unreadable / unrecognised",
+}
+
+
+def queue_enter_turn_start_record_lines(
+    observation: QueueEnterTurnStartObservation,
+) -> List[str]:
+    """Render the additive ``- Queue-enter turn-start observation:`` record line (pure).
+
+    Follows the #13166 / #13255 telemetry-line precedent: tokens + numbers + a
+    fixed verdict phrase, no free text and no absolute paths, so it is safe in the
+    pasteable delivery record and the opt-in persisted note. It explicitly labels
+    itself **telemetry-only** and does NOT reuse the event rail's
+    ``Turn start (herdr rail)`` wording — a post-hoc snapshot is a different signal
+    from an armed-wait transition. It documents the observation only and never
+    overrides ``next_action``; the ``(status, reason)`` wire is unchanged.
+    """
+    if observation.read_ok:
+        detail = _QUEUE_ENTER_STATE_DETAIL.get(
+            observation.runtime_state, "receiver runtime state observed"
+        )
+    else:
+        detail = (
+            f"the snapshot read failed (reason {observation.read_reason}); "
+            "state unknown"
+        )
+    return [
+        (
+            "- Queue-enter turn-start observation (herdr agent get): runtime_state "
+            f"{observation.runtime_state} ({observation.poll_attempts} snapshot "
+            f"read(s)) — {detail}. Telemetry-only: an additive post-choreography "
+            "snapshot; the queue-enter status / reason / next_action are unchanged "
+            "and this never blocks the send. The observation performed no injection, "
+            "no Enter, and no C-u rollback (the marker+body and Enter were the "
+            "existing queue-enter rail's, typed as before)."
+        )
+    ]
+
+
 __all__ = [
     "HERDR_TURN_START_PROJECTION",
+    "QUEUE_ENTER_OBSERVE_INTERVAL_SECONDS",
+    "QUEUE_ENTER_OBSERVE_WINDOW_SECONDS",
     "TURN_START_OBSERVE_INTERVAL_SECONDS",
+    "QueueEnterTurnStartObservation",
     "TurnStartObservation",
+    "observe_queue_enter_turn_start",
     "observe_standard_turn_start",
     "project_herdr_turn_start",
+    "queue_enter_turn_start_record_lines",
     "resolve_turn_start_window",
     "submit_activity_observed",
     "turn_start_record_lines",

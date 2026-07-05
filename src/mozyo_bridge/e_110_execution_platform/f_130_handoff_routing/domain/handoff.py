@@ -818,6 +818,22 @@ class DeliveryOutcome:
     # Tokens + numbers only, durable-record safe. `None` for the tmux/capture
     # standard rail and every non-herdr path (the explicit fallback).
     turn_start_outcome: Optional[dict[str, Any]] = None
+    # Redmine #13292: additive, telemetry-only queue-enter turn-start observation
+    # (`observation_kind` / `source` / `runtime_state` / `read_ok` / `read_reason` /
+    # `poll_attempts`), built by
+    # `turn_start_observation.QueueEnterTurnStartObservation.to_telemetry_dict`. Set
+    # ONLY on the herdr-backend queue-enter rail, from a read-only post-choreography
+    # `agent get` snapshot taken AFTER the byte-unchanged inject → Enter → retry
+    # choreography. It is deliberately SEPARATE from `turn_start_outcome` (the herdr
+    # event rail's armed-wait telemetry): a post-hoc snapshot does not prove causality
+    # the way an armed `wait agent-status` transition does, so it must not be read as
+    # an event-observed turn start (j#72602 decision 5, design confirmed #13292
+    # j#72759). Telemetry-only: it NEVER influences `status` / `reason` /
+    # `next_action_owner` and never blocks the send — a read failure / `unknown` /
+    # `awaiting_input` all just record telemetry. Tokens + bool + numbers only,
+    # durable-record safe. `None` for the tmux backend, the event-driven standard
+    # rail, and every non-queue-enter path (the explicit fallback).
+    queue_enter_turn_start_observation: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -2000,6 +2016,7 @@ def make_outcome(
     ticketless_consultation: Optional["TicketlessConsultation"] = None,
     ticketless_work_intake: Optional["TicketlessWorkIntake"] = None,
     turn_start_outcome: Optional[dict[str, Any]] = None,
+    queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -2048,6 +2065,7 @@ def make_outcome(
             else None
         ),
         turn_start_outcome=turn_start_outcome,
+        queue_enter_turn_start_observation=queue_enter_turn_start_observation,
     )
 
 
