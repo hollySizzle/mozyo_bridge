@@ -229,6 +229,24 @@ def prepare_session(
             raise HerdrSessionStartError(
                 f"unknown provider {provider!r}; expected one of {sorted(AGENT_PROVIDERS)}"
             )
+    # Reject a duplicate (provider, lane) slot BEFORE any side effect (spec §5
+    # slot-uniqueness). Every requested provider shares this run's lane, so a
+    # repeated provider is a repeated slot: it would mint the SAME
+    # `mzb1_<ws>_<role>_<lane>` name twice (two launches / two renames) — the read
+    # side then fails closed with `multiple_matches`, leaving the session unusable.
+    # Fail-closed rejection (not silent de-dup) matches the spec wording, so the CLI
+    # can keep its repeatable `--agent` flag.
+    seen_slots: set = set()
+    lane_norm = _norm(lane_id)
+    for provider in providers:
+        slot = (provider, lane_norm)
+        if slot in seen_slots:
+            raise HerdrSessionStartError(
+                f"duplicate requested slot for provider {provider!r} in lane "
+                f"{lane_norm or 'default'!r}; each (provider, lane) may be prepared "
+                "once — remove the duplicate `--agent` argument"
+            )
+        seen_slots.add(slot)
     binary = _resolve_binary_or_die(env)
 
     register_workspace(repo_root)

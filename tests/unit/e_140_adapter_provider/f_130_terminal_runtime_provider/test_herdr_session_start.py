@@ -216,6 +216,77 @@ class SessionStartTest(unittest.TestCase):
                         runner=herdr.run,
                     )
 
+    def test_duplicate_provider_slot_fails_before_side_effect(self) -> None:
+        # Redmine #13261 j#72532: a repeated provider is a repeated (provider, lane)
+        # slot; it must fail closed BEFORE any launch/rename so the read side never
+        # sees two agents minting the same mzb1 name.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["claude", "claude"],
+                        lane_id="lane-1",
+                        env={HERDR_ENV: str(binpath)},
+                        runner=herdr.run,
+                    )
+        # No side effect: not even `agent list` ran (the guard precedes binary
+        # resolution, registration, and the inventory snapshot).
+        self.assertEqual(herdr.calls, [])
+
+
+class SessionStartCliTest(unittest.TestCase):
+    def test_repeated_agent_flag_dies_fail_closed(self) -> None:
+        from mozyo_bridge.application.cli import build_parser
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = build_parser().parse_args(
+                ["herdr", "session-start", "--agent", "claude", "--agent", "claude"]
+            )
+            args.repo = str(repo)
+            with self.assertRaises(SystemExit) as ctx:
+                args.func(args)
+            # Non-zero fail-closed exit (die), not a silent success.
+            self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_default_both_providers_still_valid(self) -> None:
+        # The default invocation (no --agent) resolves to both providers with no
+        # duplicate, so the slot guard does not fire.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            prepare_session as _prepare_session,
+        )
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                result = _prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        self.assertEqual(
+            {s.provider for s in result.slots}, {"claude", "codex"}
+        )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

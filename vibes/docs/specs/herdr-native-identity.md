@@ -105,6 +105,11 @@ flow:
    `herdr agent rename <live_locator> <mzb1_name>` で付与する。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (rename も再 launch
    もしない)。slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
+6. slot-uniqueness (要求側、#13261 j#72532): 要求された `(provider, lane)` slot が重複する場合は
+   **いかなる side effect (binary 解決 / registration / inventory snapshot / launch / rename) より前に**
+   fail-closed で拒否する (silent 正規化しない)。同一 slot を二重に prepare すると同じ mzb1 名を二度
+   mint し read side が `multiple_matches` で落ちるため。CLI の `--agent` は repeatable のままでよい
+   (重複入力を die で弾く)。
 
 > NOTE (未確認): `herdr agent start` の正確な argv (cwd / command 受け渡し) は PoC log
 > (E6) が headless での存在のみ記録し詳細を残していない。本 command は staged actuator として
