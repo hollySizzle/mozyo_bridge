@@ -129,7 +129,14 @@ class HerdrRealResolverWiringTest(unittest.TestCase):
                 "--source", "asana", "--kind", "implementation_request",
                 "--task-id", "T1", "--comment-id", "C1",
                 "--target", "%2", "--mode", mode,
-                "--landing-timeout", "0.01", "--submit-delay", "0",
+                # Redmine #13262 generalized the standard-rail turn-start
+                # observation to the claude receiver. This wiring suite exercises
+                # herdr locator translation, not tmux-rail turn-start semantics, so
+                # it disables the observation with the supported `--landing-timeout
+                # 0` (window 0 => observation disabled) to keep a successful send
+                # resolving to `sent` without a tmux pane-advance capture (the herdr
+                # port has no such capture; that interaction is #13261's concern).
+                "--landing-timeout", "0", "--submit-delay", "0",
             ] + (extra_argv or [])
             args = build_parser().parse_args(argv)
             args.repo = str(repo)

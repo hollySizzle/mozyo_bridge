@@ -41,9 +41,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery
     PERSIST_DISABLED,
     PERSIST_NO_ANCHOR,
     PERSIST_OK,
-    PERSIST_PROVIDER_UNAVAILABLE,
     PERSIST_TRANSPORT_ERROR,
     PERSIST_UNSUPPORTED_SOURCE,
+    PERSIST_WRITE_OPTIN_UNSET,
     RECORD_CLASS_DELIVERY,
     RedmineDeliveryRecordSink,
     UnsupportedSourceDeliveryRecordSink,
@@ -194,12 +194,15 @@ class DeliveryRecordSinkTest(unittest.TestCase):
         self.assertFalse(receipt.persisted)
         self.assertEqual(PERSIST_UNSUPPORTED_SOURCE, receipt.reason)
 
-    def test_unwired_redmine_sink_reports_provider_unavailable(self) -> None:
+    def test_unwired_redmine_sink_reports_write_optin_unset(self) -> None:
+        # Redmine #13262: the unwired seam (opt-in unset -> no transport) now
+        # reports the distinct `write_optin_unset` reason rather than the old
+        # collapsed `provider_unavailable`.
         note = build_delivery_record_note(_redmine_outcome(), record_markdown="b")
         receipt = UnwiredDeliveryRecordSink("redmine").persist(note)
 
         self.assertFalse(receipt.persisted)
-        self.assertEqual(PERSIST_PROVIDER_UNAVAILABLE, receipt.reason)
+        self.assertEqual(PERSIST_WRITE_OPTIN_UNSET, receipt.reason)
 
     def test_redmine_sink_persists_via_injected_transport(self) -> None:
         body = build_delivery_record(_redmine_outcome())
@@ -344,6 +347,12 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         def fake_run_tmux(*tmux_args: str, check: bool = True):
             if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
                 pane_text["buf"] += tmux_args[-1]
+            elif tmux_args[:3] == ("send-keys", "-t", "%2") and tmux_args[-1] == "Enter":
+                # Redmine #13262: claude `--mode standard` now runs the turn-start
+                # observation; advance the pane on Enter so the send confirms
+                # (`sent`) and the persist-delivery wiring is exercised on the
+                # success path rather than fail-closing on turn_start_unconfirmed.
+                pane_text["buf"] += "\n<turn-started>"
             return argparse.Namespace(returncode=0, stdout="", stderr="")
 
         pane_value = {
@@ -391,10 +400,13 @@ class PersistDeliveryCliWiringTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(receipts))
         receipt = receipts[0]
-        # Live transport is deferred → fail-closed provider_unavailable, but the
-        # delivery itself was not blocked or altered.
+        # #12347 lineage staged-posture byte-compat: without the live-write env
+        # opt-in no transport is injected, so the receipt is the fail-closed
+        # unwired reason — updated to `write_optin_unset` by the Redmine #13262
+        # reason split (was `provider_unavailable`). The delivery itself is still
+        # not blocked or altered.
         self.assertFalse(receipt["persisted"])
-        self.assertEqual(PERSIST_PROVIDER_UNAVAILABLE, receipt["reason"])
+        self.assertEqual(PERSIST_WRITE_OPTIN_UNSET, receipt["reason"])
         self.assertEqual(RECORD_CLASS_DELIVERY, receipt["record_class"])
 
     def test_default_send_emits_no_receipt(self) -> None:

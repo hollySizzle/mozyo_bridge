@@ -482,6 +482,14 @@ class HandoffRecordEmissionTest(unittest.TestCase):
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                if tmux_args[-1] == "Enter":
+                    # Redmine #13262: the standard rail (now claude + codex) observes
+                    # the receiver pane for post-Enter turn-start activity. Model a
+                    # well-behaved receiver that advances on Enter so a successful
+                    # standard send confirms (`sent`) instead of fail-closing on
+                    # `turn_start_unconfirmed`. The rollback/invalid tests below die
+                    # before Enter, so this is inert for them.
+                    pane_text += "\n<turn-started>"
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")

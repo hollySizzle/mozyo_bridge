@@ -5,9 +5,9 @@ The delivery-record persistence seam (Redmine #12311) defined the narrow
 seam in core but deliberately left the live transport unwired: ticket-write is a
 per-task-review surface (``vibes/docs/logics/plugin-ready-adapter-boundary.md``
 Implementation Guardrail #6), and ``redmine_context`` is read-only by design, so
-production resolved to a fail-closed ``provider_unavailable`` receipt. #12347
-wires the real transport — the smallest credential-safe Redmine journal write
-that keeps every #12311 invariant.
+production resolved to a fail-closed staged receipt (``write_optin_unset`` when the
+live-write opt-in is unset, Redmine #13262). #12347 wires the real transport — the
+smallest credential-safe Redmine journal write that keeps every #12311 invariant.
 
 What core still owns (this module never touches): the record class
 (``delivery_notification`` is a notification pointer, never a workflow gate or
@@ -34,7 +34,8 @@ seam (existing #12311 CLI opt-in); separately,
 ``MOZYO_REDMINE_DELIVERY_WRITE`` must be set to an explicit truthy value in the
 trusted environment before any live journal write is attempted. Without the
 explicit env opt-in :func:`redmine_delivery_transport_from_env` returns ``None``
-so resolution stays the byte-compatible staged ``provider_unavailable`` posture.
+so resolution stays the byte-compatible staged ``write_optin_unset`` posture (the
+unwired sink's reason, Redmine #13262).
 Putting the second gate in the environment (not a repo file) keeps it inside the
 same trusted boundary as the credentials, so a hostile checkout can never turn a
 plain ``--persist-delivery`` into a live write.
@@ -42,7 +43,9 @@ plain ``--persist-delivery`` into a live write.
 Fail-closed reasons (all normalized to
 :data:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.PERSIST_FAILURE_REASONS`):
 
-- no/invalid trusted base URL -> ``provider_unavailable``;
+- no/invalid trusted base URL -> ``base_url_unset`` (Redmine #13262; distinct from
+  the unwired sink's ``write_optin_unset`` so a missing-URL misconfiguration is not
+  confused with the opt-in simply being unset);
 - no API key -> ``credential_missing``;
 - HTTP 401 / 403 -> ``unauthorized``;
 - any other HTTP status, network error, or unexpected failure ->
@@ -62,8 +65,8 @@ import urllib.request
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
+    PERSIST_BASE_URL_UNSET,
     PERSIST_CREDENTIAL_MISSING,
-    PERSIST_PROVIDER_UNAVAILABLE,
     PERSIST_TRANSPORT_ERROR,
     PERSIST_UNAUTHORIZED,
     DeliveryTransportError,
@@ -145,9 +148,12 @@ class RedmineNoteHttpTransport:
         base_url = self._resolved_base_url()
         if not base_url:
             # Missing or non-http(s)/host-only base: no trusted destination.
+            # Redmine #13262: this is the opt-in-set-but-misconfigured case
+            # (``base_url_unset``), distinct from the unwired sink's
+            # ``write_optin_unset`` (the opt-in was never set at all).
             raise DeliveryTransportError(
                 "no trusted Redmine base URL configured",
-                reason=PERSIST_PROVIDER_UNAVAILABLE,
+                reason=PERSIST_BASE_URL_UNSET,
             )
         api_key = self._resolved_api_key()
         if not api_key:
@@ -199,11 +205,12 @@ def redmine_delivery_transport_from_env() -> Optional[RedmineNoteHttpTransport]:
     Returns a :class:`RedmineNoteHttpTransport` only when
     ``MOZYO_REDMINE_DELIVERY_WRITE`` is an explicit truthy value in the trusted
     environment; otherwise returns ``None`` so the sink resolver stays on the
-    byte-compatible staged ``provider_unavailable`` posture. Credential presence
-    is intentionally NOT checked here: when the operator has opted in but the
-    credentials are missing, the transport fails closed at write time with the
-    explicit ``credential_missing`` reason, which is more informative than a
-    silent provider_unavailable.
+    byte-compatible staged ``write_optin_unset`` posture (the unwired sink's
+    reason, Redmine #13262). Credential presence is intentionally NOT checked here:
+    when the operator has opted in but the credentials are missing, the transport
+    fails closed at write time with the explicit ``credential_missing`` reason, and
+    a missing/invalid base URL fails closed with ``base_url_unset`` — both more
+    informative than the old collapsed ``provider_unavailable``.
     """
     if not _env_flag(os.environ.get(DELIVERY_WRITE_ENV)):
         return None

@@ -1,4 +1,4 @@
-"""Codex standard-rail turn-start observation (Redmine #13166).
+"""Standard-rail turn-start observation (Redmine #13166 / #13262).
 
 The strict ``--mode standard`` rail historically returned ``sent`` / ``ok`` as
 soon as it had (a) observed the landing marker in the receiver pane and (b)
@@ -9,8 +9,12 @@ reported ``sent`` / ``ok`` while the codex TUI never started a turn — the Ente
 was absorbed by the receiver's busy / redraw state and the marker+body stayed in
 the composer, unsubmitted. The notification was silently lost.
 
-This module adds a bounded, read-only *turn-start observation* to the codex
-``--mode standard`` rail only (Redmine #13166 adopted scope: candidate 1). After
+This module adds a bounded, read-only *turn-start observation* to the
+``--mode standard`` rail. #13166 first adopted it for the codex receiver only
+(adopted scope: candidate 1); Redmine #13262 generalizes the SAME observation to
+the claude receiver's standard rail, since claude's queue-oriented TUI can absorb
+an Enter the same way (the observation itself has always been receiver-agnostic —
+it keys on the receiver pane advancing, not on any codex-specific signal). After
 the marker is observed and Enter is issued, the rail snapshots the receiver pane
 and polls it for **new output activity** — the positive signal that the
 submitted prompt cleared the composer and the receiver began rendering a turn.
@@ -19,13 +23,16 @@ before; when it is not observed within the window the send fails closed to
 ``blocked`` / ``turn_start_unconfirmed`` (a new reason in the existing
 ``marker_timeout``-style vocabulary) and rides the existing blocked-path
 fallback. No new transport or raw ``send-keys`` recovery path is added, and no
-prompt is auto-resent — the marker+body is typed exactly once.
+prompt is auto-resent — the marker+body is typed exactly once. The queue-enter
+rail is deliberately NOT covered: its marker-unobserved path stays
+``sent`` / ``queue_enter`` (Redmine #13262 auditor boundary; a queue-enter
+contract change would need its own design record).
 
 Signal choice (new output activity, not composer-clear-via-marker-absence): the
 receiver-state doctrine (``vibes/docs/logics/ack-completion-receiver-state.md``)
 and the C-u-rollback observation caveat both warn that *absence* of the marker
 from a tmux capture does not prove the composer cleared — a submitted marker
-persists in the codex transcript as the sent user message, so marker-absence is
+persists in the receiver transcript as the sent user message, so marker-absence is
 neither a reliable submit signal here (it is present on success) nor a safe
 negative. This module therefore keys on a *presence* signal instead: the receiver
 pane advancing past the pre-Enter snapshot. This is a delivery-ACK-layer
@@ -86,7 +93,7 @@ def submit_activity_observed(baseline_capture: str, post_capture: str) -> bool:
     return _normalize(post_capture) != _normalize(baseline_capture)
 
 
-def observe_codex_turn_start(
+def observe_standard_turn_start(
     target: str,
     *,
     baseline_capture: str,
@@ -151,7 +158,11 @@ def resolve_turn_start_window(
     return 0.0 if float(raw_landing_timeout) <= 0 else coerced_window  # type: ignore[arg-type]
 
 
-def turn_start_record_lines(observation: TurnStartObservation) -> List[str]:
+def turn_start_record_lines(
+    observation: TurnStartObservation,
+    *,
+    rail_label: str = "codex standard-rail",
+) -> List[str]:
     """Render the additive ``- Turn start:`` durable-record telemetry (pure).
 
     Follows the #12580 / #12581 retry-telemetry precedent: numbers + a verdict
@@ -159,6 +170,12 @@ def turn_start_record_lines(observation: TurnStartObservation) -> List[str]:
     delivery record and the opt-in persisted note. It documents the turn-start
     observation the rail already performed and never overrides ``next_action``;
     the structured ``(status, reason)`` wire is owned by the outcome.
+
+    ``rail_label`` names the rail in the record line. It defaults to
+    ``"codex standard-rail"`` so the codex standard-rail record stays byte-identical
+    to the #13166 wording; the caller passes ``"<receiver> standard-rail"`` so the
+    Redmine #13262 claude generalization renders an accurate ``"claude standard-rail"``
+    label instead of mislabelling a claude send as codex.
     """
     verdict = "confirmed" if observation.confirmed else "unconfirmed"
     detail = (
@@ -168,7 +185,7 @@ def turn_start_record_lines(observation: TurnStartObservation) -> List[str]:
     )
     return [
         (
-            "- Turn start: codex standard-rail submit observation "
+            f"- Turn start: {rail_label} submit observation "
             f"(window {observation.window_seconds:g}s / interval "
             f"{observation.interval_seconds:g}s, {observation.polls} poll(s)) — "
             f"turn start {verdict}; {detail}. The marker+body was typed once and "
@@ -184,7 +201,7 @@ def _normalize(text: str) -> str:
 __all__ = [
     "TURN_START_OBSERVE_INTERVAL_SECONDS",
     "TurnStartObservation",
-    "observe_codex_turn_start",
+    "observe_standard_turn_start",
     "resolve_turn_start_window",
     "submit_activity_observed",
     "turn_start_record_lines",

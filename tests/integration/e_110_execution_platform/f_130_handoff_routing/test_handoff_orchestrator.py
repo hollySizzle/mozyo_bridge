@@ -256,7 +256,10 @@ class HandoffOrchestratorTest(unittest.TestCase):
     def test_standard_mode_sends_marker_body_and_enter(self) -> None:
         # Strict `--mode standard` happy path: marker observed → Enter pressed,
         # outcome `sent` / `ok` / mode=`standard`. v0.4 default is queue-enter,
-        # so this test exercises the explicit strict fallback rail.
+        # so this test exercises the explicit strict fallback rail. Redmine #13262
+        # generalized the turn-start observation to the claude standard rail, so a
+        # well-behaved receiver whose pane advances after Enter is required to
+        # confirm and resolve `sent` / `ok`.
         result, sent, stdout, _stderr, pane_text = self.run_handoff_with_fake_tmux(
             [
                 "handoff",
@@ -277,7 +280,8 @@ class HandoffOrchestratorTest(unittest.TestCase):
                 "standard",
                 "--submit-delay",
                 "0",
-            ]
+            ],
+            enter_advances_pane=True,
         )
 
         self.assertEqual(0, result)
@@ -432,38 +436,67 @@ class HandoffOrchestratorTest(unittest.TestCase):
         self.assertIn("Turn start:", stdout)
         self.assertIn("window 0s", stdout)
 
-    def test_claude_standard_skips_turn_start_observation(self) -> None:
-        # Redmine #13166 scope guard: the claude rail is unchanged — it resolves
-        # `sent` / `ok` on marker observed + Enter without a turn-start block even
-        # when the pane does not advance after Enter.
+    def _claude_standard_argv(self) -> list[str]:
+        return [
+            "handoff",
+            "send",
+            "--to",
+            "claude",
+            "--source",
+            "asana",
+            "--kind",
+            "implementation_request",
+            "--task-id",
+            "T1",
+            "--comment-id",
+            "C1",
+            "--target",
+            "%2",
+            "--mode",
+            "standard",
+            "--submit-delay",
+            "0",
+        ]
+
+    def test_claude_standard_confirms_turn_start_and_emits_sent_ok(self) -> None:
+        # Redmine #13262: the claude `--mode standard` rail now runs the same
+        # turn-start observation as codex. A well-behaved receiver whose pane
+        # advances after Enter confirms and resolves `sent` / `ok`, with claude-
+        # labelled turn-start telemetry in the record (not mislabelled as codex).
         result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
-            [
-                "handoff",
-                "send",
-                "--to",
-                "claude",
-                "--source",
-                "asana",
-                "--kind",
-                "implementation_request",
-                "--task-id",
-                "T1",
-                "--comment-id",
-                "C1",
-                "--target",
-                "%2",
-                "--mode",
-                "standard",
-                "--submit-delay",
-                "0",
-            ],
-            enter_advances_pane=False,
+            self._claude_standard_argv(),
+            enter_advances_pane=True,
         )
         self.assertEqual(0, result)
+        self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
         outcome = self._outcome_from_stdout(stdout)
         self.assertEqual("sent", outcome["status"])
         self.assertEqual("ok", outcome["reason"])
-        self.assertNotIn("Turn start:", stdout)
+        self.assertEqual("claude", outcome["receiver"])
+        self.assertIn("Turn start:", stdout)
+        self.assertIn("claude standard-rail", stdout)
+        self.assertIn("turn start confirmed", stdout)
+
+    def test_claude_standard_unconfirmed_turn_start_blocks_without_resend(self) -> None:
+        # Redmine #13262 core regression: marker observed + Enter pressed but the
+        # claude receiver pane never advances (Enter absorbed by a busy composer).
+        # The rail fails closed to `blocked` / `turn_start_unconfirmed` and must
+        # NOT roll back or re-issue Enter (the marker+body is typed once).
+        result, sent, stdout, _stderr, _pane_text = self.run_handoff_with_fake_tmux(
+            self._claude_standard_argv(),
+            enter_advances_pane=False,
+            allow_exit=True,
+        )
+        self.assertIsInstance(result, SystemExit)
+        outcome = self._outcome_from_stdout(stdout)
+        self.assertEqual("blocked", outcome["status"])
+        self.assertEqual("turn_start_unconfirmed", outcome["reason"])
+        self.assertEqual("sender", outcome["next_action_owner"])
+        enter_calls = [c for c in sent if c == ("send-keys", "-t", "%2", "Enter")]
+        self.assertEqual(1, len(enter_calls))
+        self.assertFalse(any(call == ("send-keys", "-t", "%2", "C-u") for call in sent))
+        self.assertIn("turn start unconfirmed", stdout)
 
     def test_marker_timeout_rolls_back_and_emits_blocked_outcome(self) -> None:
         # Strict `--mode standard` fail-closed regression: marker miss must

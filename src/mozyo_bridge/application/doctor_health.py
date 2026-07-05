@@ -89,8 +89,9 @@ class DoctorSectionReads(Protocol):
     """Port: collect the doctor diagnostic section map.
 
     Implementations own the external reads (CLI / rules / skills / scaffold /
-    registry / state store / nagger / launch policy / tmux / otel). The use
-    case and policy depend only on the returned ``{name: section}`` mapping.
+    registry / state store / nagger / launch policy / tmux / otel / delivery
+    env). The use case and policy depend only on the returned ``{name: section}``
+    mapping.
     """
 
     def collect_sections(self) -> dict[str, dict[str, Any]]:
@@ -134,6 +135,7 @@ class LiveDoctorSections:
             "claude_launch_policy": _doctor.doctor_claude_launch_policy_section(),
             "tmux": tmux_section,
             "otel": _doctor.doctor_otel_section(args),
+            "delivery_env": _doctor.doctor_delivery_env_section(args),
         }
 
 

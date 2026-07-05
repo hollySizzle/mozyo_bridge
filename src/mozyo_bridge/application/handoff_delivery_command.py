@@ -186,7 +186,7 @@ class DeliveryRecordOps(Protocol):
 
         Built only when the trusted ``MOZYO_REDMINE_DELIVERY_WRITE`` opt-in is set
         in the environment; otherwise ``None`` so resolution stays the
-        byte-compatible staged ``provider_unavailable`` posture.
+        byte-compatible staged ``write_optin_unset`` posture (Redmine #13262).
         """
         ...
 
@@ -335,10 +335,10 @@ class DeliveryRecordUseCase:
         explicit opt-in: ``--persist-delivery`` selects the seam, and the trusted
         ``MOZYO_REDMINE_DELIVERY_WRITE`` env flag enables the live write (resolved
         through the port). Without the env opt-in the transport is ``None`` and
-        resolution stays the byte-compatible staged ``provider_unavailable``
-        posture; with it the credential-safe transport reads the trusted base URL
-        / API key from the env at write time and fails closed
-        (``credential_missing`` / ``unauthorized`` / ``provider_unavailable`` /
+        resolution stays the byte-compatible staged ``write_optin_unset``
+        posture (Redmine #13262); with it the credential-safe transport reads the
+        trusted base URL / API key from the env at write time and fails closed
+        (``base_url_unset`` / ``credential_missing`` / ``unauthorized`` /
         ``transport_error``) without ever carrying a credential
         (``vibes/docs/logics/plugin-ready-adapter-boundary.md`` Implementation
         Guardrail #6; the credential boundary is reused verbatim from
@@ -367,9 +367,9 @@ class DeliveryRecordUseCase:
             # through the port, which returns `None` unless the explicit
             # `MOZYO_REDMINE_DELIVERY_WRITE` opt-in is set in the trusted
             # environment; otherwise resolution stays the byte-compatible staged
-            # `provider_unavailable` posture. The transport reads the trusted base
-            # URL / API key from the env at write time and fails closed without
-            # ever carrying a credential.
+            # `write_optin_unset` posture (Redmine #13262). The transport reads the
+            # trusted base URL / API key from the env at write time and fails
+            # closed without ever carrying a credential.
             redmine_transport = None
             if (outcome.source or "") == SOURCE_REDMINE:
                 redmine_transport = self._ops.redmine_delivery_transport_from_env()

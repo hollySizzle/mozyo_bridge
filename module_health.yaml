@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3295
+    lines: 3301
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -969,6 +969,12 @@ allowlist:
       ``application/handoff_transport_wiring.py`` and
       ``e_140_adapter_provider/f_130_terminal_runtime_provider/application/transport_binding.py``,
       not here.
+      Raised 3295 -> 3301 for the #13262 standard-rail turn-start generalization:
+      the gate/comment update in ``orchestrate_handoff`` that extends the #13166
+      codex turn-start observation to the claude ``--mode standard`` rail
+      (receiver-agnostic gate + receiver-labelled record line + accurate
+      comments). The observation module itself is
+      ``application/turn_start_observation.py``, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1015,7 +1021,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1858
+    lines: 1878
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1123,12 +1129,19 @@ allowlist:
       renderer live in the separate `application/turn_start_observation.py` (kept
       out of this module), so only the Reason registration + record plumbing lands
       here.
+      Raised 1858 -> 1878 for the #13262 standard-rail generalization + queue-enter
+      option (b) wording: the `turn_start_unconfirmed` narrative + `_outcome_narrative`
+      receiver threading (render "<receiver> standard rail" so a claude send is not
+      mislabelled as codex; default "codex" keeps the #13166 wording byte-for-byte),
+      and the more explicit `queue_enter` narrative (landing NOT pre-confirmed ->
+      poll the durable record). No new Reason token; the observation logic stays in
+      `application/turn_start_observation.py`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/cli_handoff.py
-    lines: 1011
+    lines: 1012
     reason: >-
       `handoff` argparse registrar (`configure_handoff_parser` + the send / reply
       / cross-workspace-consult subcommands). Pure flag wiring; the orchestration
@@ -1139,6 +1152,8 @@ allowlist:
       it to 1011. The flag is the narrow, audited escape hatch for the main-lane
       implementation_request guard; its help text carries the audit-facing
       explanation. Allowlisted rather than extracting a one-flag sibling module.
+      Raised 1011 -> 1012 for the #13262 `--persist-delivery` help-text reason
+      split (`write_optin_unset` / `base_url_unset` wording; one line).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -89,6 +89,10 @@ from mozyo_bridge.application.doctor_workspace_registry import (
     LiveWorkspaceRegistryReads,
     WorkspaceRegistrySectionUseCase,
 )
+from mozyo_bridge.application.doctor_delivery_env import (
+    DeliveryEnvSectionUseCase,
+    LiveDeliveryEnvReads,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 # The state-store collector now lives behind the ``StateStoreReads`` boundary in
@@ -537,6 +541,26 @@ def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
     / legacy section dict assembly in the pure ``evaluate_otel_section`` policy.
     """
     return OtelSectionUseCase(LiveOtelDoctorReads(args)).execute()
+
+
+def doctor_delivery_env_section(args: argparse.Namespace) -> dict[str, Any]:
+    """persist-delivery env-presence report (Redmine #13262).
+
+    Reports which of the three live-write gates (``MOZYO_REDMINE_DELIVERY_WRITE`` /
+    ``MOZYO_REDMINE_URL`` / ``MOZYO_REDMINE_API_KEY``) are set vs unset, so an
+    operator can reconcile a fail-closed ``--persist-delivery`` receipt
+    (``write_optin_unset`` / ``base_url_unset`` / ``credential_missing``) with the
+    environment. Strictly informational and credential-safe: it reports **only
+    booleans**, never a value, and never auto-enables anything.
+
+    Thin handler over
+    :class:`~mozyo_bridge.application.doctor_delivery_env.DeliveryEnvSectionUseCase`:
+    the presence read lives in :class:`LiveDeliveryEnvReads` and the section-dict
+    assembly in the pure ``evaluate_delivery_env_section`` policy. ``args`` is
+    accepted for section-collector signature parity but unused (the environment is
+    process-global).
+    """
+    return DeliveryEnvSectionUseCase(LiveDeliveryEnvReads()).execute()
 
 
 def _live_session_names() -> set[str] | None:

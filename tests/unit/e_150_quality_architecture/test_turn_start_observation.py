@@ -1,4 +1,4 @@
-"""Unit tests for the codex standard-rail turn-start observation (Redmine #13166).
+"""Unit tests for the standard-rail turn-start observation (Redmine #13166 / #13262).
 
 Fully hermetic: the pane capture and sleep are injected fakes, so nothing here
 touches a real tmux — matching the pane_resolver hermetic-test convention.
@@ -11,7 +11,7 @@ import unittest
 from mozyo_bridge.application.turn_start_observation import (
     TURN_START_OBSERVE_INTERVAL_SECONDS,
     TurnStartObservation,
-    observe_codex_turn_start,
+    observe_standard_turn_start,
     resolve_turn_start_window,
     submit_activity_observed,
     turn_start_record_lines,
@@ -65,7 +65,7 @@ class ObserveCodexTurnStartTest(unittest.TestCase):
 
     def test_confirms_when_pane_advances(self) -> None:
         slept: list[float] = []
-        obs = observe_codex_turn_start(
+        obs = observe_standard_turn_start(
             "%2",
             baseline_capture="marker body",
             capture=self._capture_sequence(["marker body\n<turn>"]),
@@ -80,7 +80,7 @@ class ObserveCodexTurnStartTest(unittest.TestCase):
     def test_unconfirmed_when_pane_frozen(self) -> None:
         # The reported bug: Enter absorbed, composer unchanged, no turn started.
         slept: list[float] = []
-        obs = observe_codex_turn_start(
+        obs = observe_standard_turn_start(
             "%2",
             baseline_capture="marker body",
             capture=lambda _t, _l: "marker body",
@@ -93,7 +93,7 @@ class ObserveCodexTurnStartTest(unittest.TestCase):
         self.assertEqual(2, obs.polls)  # 0.5 + 0.5 fills the 1.0s window
 
     def test_confirms_on_later_poll(self) -> None:
-        obs = observe_codex_turn_start(
+        obs = observe_standard_turn_start(
             "%2",
             baseline_capture="b",
             capture=self._capture_sequence(["b", "b", "b\nnew"]),
@@ -112,7 +112,7 @@ class ObserveCodexTurnStartTest(unittest.TestCase):
             calls.append((target, lines))
             return "x"
 
-        obs = observe_codex_turn_start(
+        obs = observe_standard_turn_start(
             "%2",
             baseline_capture="x",
             capture=capture,
@@ -126,7 +126,7 @@ class ObserveCodexTurnStartTest(unittest.TestCase):
 
     def test_nonpositive_interval_falls_back_to_default(self) -> None:
         slept: list[float] = []
-        observe_codex_turn_start(
+        observe_standard_turn_start(
             "%2",
             baseline_capture="a",
             capture=lambda _t, _l: "a",
@@ -158,6 +158,28 @@ class TurnStartRecordLinesTest(unittest.TestCase):
         )
         self.assertIn("turn start unconfirmed", lines[0])
         self.assertIn("4 poll(s)", lines[0])
+
+    def test_default_rail_label_is_codex_standard_rail_byte_compat(self) -> None:
+        # Redmine #13262: the default label preserves the #13166 codex wording
+        # byte-for-byte so an existing codex-standard record is unchanged.
+        lines = turn_start_record_lines(
+            TurnStartObservation(
+                confirmed=True, polls=1, window_seconds=8.0, interval_seconds=0.5
+            )
+        )
+        self.assertIn("codex standard-rail submit observation", lines[0])
+
+    def test_rail_label_renders_claude_standard_rail(self) -> None:
+        # Redmine #13262: a claude send passes "claude standard-rail" so the
+        # telemetry is not mislabelled as codex.
+        lines = turn_start_record_lines(
+            TurnStartObservation(
+                confirmed=False, polls=2, window_seconds=8.0, interval_seconds=0.5
+            ),
+            rail_label="claude standard-rail",
+        )
+        self.assertIn("claude standard-rail submit observation", lines[0])
+        self.assertNotIn("codex", lines[0])
 
     def test_record_line_carries_no_absolute_path(self) -> None:
         # Redaction: the pasteable record must not embed a filesystem path. The

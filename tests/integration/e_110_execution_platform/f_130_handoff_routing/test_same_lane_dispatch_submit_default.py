@@ -85,6 +85,13 @@ class SameLaneClaudeDispatchSubmitDefaultTest(unittest.TestCase):
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                if tmux_args[-1] == "Enter":
+                    # Redmine #13262: claude `--mode standard` now observes the
+                    # receiver pane for post-Enter turn-start activity. Advance the
+                    # pane on Enter so a submit-completing standard dispatch confirms
+                    # (`sent`) rather than fail-closing on turn_start_unconfirmed.
+                    # The pending test presses no Enter, so this stays inert there.
+                    pane_text += "\n<turn-started>"
                 sent.append(tmux_args)
                 return argparse.Namespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected tmux call: {tmux_args}")

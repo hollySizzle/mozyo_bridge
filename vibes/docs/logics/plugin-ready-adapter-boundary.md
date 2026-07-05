@@ -959,9 +959,14 @@ explicit while keeping the existing send byte-compatible and writing no ticket.
   seam does no credential handling at all.
 - **Explicit failure.** A transport reports failure through
   `DeliveryTransportError` with a reason normalized to `PERSIST_FAILURE_REASONS`
-  (`provider_unavailable` / `credential_missing` / `unauthorized` /
+  (`write_optin_unset` / `base_url_unset` / `credential_missing` / `unauthorized` /
   `unsupported_source` / `no_anchor` / `transport_error`) — never a silent
-  success (Implementation Guardrail #4).
+  success (Implementation Guardrail #4). Redmine #13262 split the former single
+  `provider_unavailable` reason into `write_optin_unset` (the live-write env opt-in
+  is unset — the unwired sink's staged posture) and `base_url_unset` (the opt-in is
+  set but the trusted base URL is missing/invalid — a misconfiguration), so the two
+  causes are machine-distinguishable; `provider_unavailable` is retired from this
+  vocabulary.
 
 ### Staged: live write was a deferred follow-up (wired in #12347)
 
@@ -969,8 +974,9 @@ At #12311, per Implementation Guardrail #6 (any new provider surface that
 **writes tickets** requires per-task review) and `redmine_context`'s
 read-only-by-design boundary, the live, credential-gated Redmine journal-write
 transport was deliberately **not** wired: production resolved to
-`UnwiredDeliveryRecordSink` (`provider_unavailable`) — the same staged-resolution
-posture as provider selection (#12249/#12251) — and the full persisted path was
+`UnwiredDeliveryRecordSink` (`write_optin_unset` since Redmine #13262; formerly
+`provider_unavailable`) — the same staged-resolution posture as provider selection
+(#12249/#12251) — and the full persisted path was
 exercised in tests through an injected `RedmineNoteTransport` fake, so no network
 ran. That live transport is now implemented under #12347 (next section); the
 staged fallback remains the byte-compatible default whenever the explicit
@@ -1021,7 +1027,8 @@ and a plain `--persist-delivery` stays byte-compatible:
 
 When the env opt-in is unset, `redmine_delivery_transport_from_env()` returns
 `None`, resolution falls back to `UnwiredDeliveryRecordSink`, and the receipt is
-the byte-compatible `provider_unavailable`.
+the byte-compatible `write_optin_unset` (Redmine #13262; formerly
+`provider_unavailable`).
 
 ### Credential boundary (reused verbatim from `redmine_context`)
 
@@ -1040,7 +1047,8 @@ Every failure is an explicit `DeliveryTransportError` reason
 (`PERSIST_FAILURE_REASONS`), surfaced through the existing
 `RedmineDeliveryRecordSink` reason-mapping, never a silent success:
 
-- no/invalid trusted base URL -> `provider_unavailable`;
+- no/invalid trusted base URL -> `base_url_unset` (Redmine #13262; formerly
+  `provider_unavailable`, now distinct from the unwired sink's `write_optin_unset`);
 - no API key -> `credential_missing`;
 - HTTP 401 / 403 -> `unauthorized`;
 - any other HTTP status, network error, or unexpected failure -> `transport_error`.

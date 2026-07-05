@@ -960,12 +960,13 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
             ),
         )
     if reason == "turn_start_unconfirmed":
-        # Redmine #13166: codex standard rail observed the landing marker and
-        # pressed Enter, but the receiver TUI did not show turn-start activity
-        # within the observation window (the Enter may have been absorbed by a
-        # busy / redrawing composer). No rollback and no re-send were issued — the
-        # marker+body was typed once. The sender re-reads the receiver and, only
-        # if the turn genuinely did not start, re-issues the strict send.
+        # Redmine #13166 / #13262: the standard rail (codex since #13166, claude
+        # since #13262) observed the landing marker and pressed Enter, but the
+        # receiver TUI did not show turn-start activity within the observation
+        # window (the Enter may have been absorbed by a busy / redrawing composer).
+        # No rollback and no re-send were issued — the marker+body was typed once.
+        # The sender re-reads the receiver and, only if the turn genuinely did not
+        # start, re-issues the strict send.
         return (
             "sender",
             (
@@ -1303,14 +1304,28 @@ def _header_label(status: Status, reason: Reason, mode: Optional[str] = None) ->
     return f"not delivered ({reason})"
 
 
-def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = None) -> str:
+def _outcome_narrative(
+    status: Status,
+    reason: Reason,
+    mode: Optional[str] = None,
+    receiver: Optional[str] = None,
+) -> str:
     if status == "sent":
         if reason == "queue_enter":
+            # Redmine #13262 option (b): make the queue-enter receipt explicit that
+            # landing was NOT pre-confirmed and that the receiver-side durable
+            # record (issue journal) polling is the authoritative fallback — the
+            # queue-enter marker-unobserved path is intentionally NOT blocked
+            # (that would be an option (c) contract change with its own design
+            # record); it stays `sent` / `queue_enter`.
             return (
                 "Landing marker was not observed in the target pane before "
                 "timeout, but Enter was issued under the queue-enter rail "
                 "because the target is a registered agent pane. No rollback "
-                "was triggered."
+                "was triggered. Landing is NOT pre-confirmed: the sender did not "
+                "verify submission, so the receiver must poll the durable record "
+                "(the issue journal) as the authoritative fallback rather than "
+                "treating the pane notification as delivery proof."
             )
         if mode == MODE_QUEUE_ENTER:
             return (
@@ -1335,9 +1350,14 @@ def _outcome_narrative(status: Status, reason: Reason, mode: Optional[str] = Non
             "cleared."
         )
     if reason == "turn_start_unconfirmed":
+        # Redmine #13166 shipped this for codex; #13262 generalized the standard
+        # rail to claude. Name the actual rail from the receiver so a claude send
+        # is not mislabelled as codex; default to "codex" preserves the #13166
+        # wording byte-for-byte for any caller that does not thread the receiver.
+        rail = f"{receiver or 'codex'} standard rail"
         return (
-            "Landing marker was observed and Enter was pressed on the codex "
-            "standard rail, but the receiver pane showed no turn-start activity "
+            f"Landing marker was observed and Enter was pressed on the {rail}, "
+            "but the receiver pane showed no turn-start activity "
             "within the observation window; the Enter may have been absorbed by "
             "a busy / redrawing composer. No C-u rollback and no re-send were "
             "issued — the marker+body was typed exactly once. The sender cannot "
@@ -1590,7 +1610,7 @@ def build_delivery_record(
         *ticketless_consultation_lines(outcome.ticketless_consultation),
         *ticketless_work_intake_lines(outcome.ticketless_work_intake),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
-        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode)}",
+        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
     ]
     if command:

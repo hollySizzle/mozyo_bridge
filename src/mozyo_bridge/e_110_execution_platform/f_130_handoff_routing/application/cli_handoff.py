@@ -412,9 +412,10 @@ def configure_handoff_parser(
             "`MOZYO_REDMINE_DELIVERY_WRITE` flag to enable the live journal "
             "write (it reuses the trusted `MOZYO_REDMINE_URL` / "
             "`MOZYO_REDMINE_API_KEY` credential boundary and fails closed on "
-            "missing / unauthorized credentials). Without that env opt-in this "
-            "stays a fail-closed `provider_unavailable` receipt, and "
-            "`source=asana` has no write provider in v0.8 (`unsupported_source`)."
+            "missing base URL (`base_url_unset`) / missing or unauthorized "
+            "credentials). Without that env opt-in this stays a fail-closed "
+            "`write_optin_unset` receipt, and `source=asana` has no write "
+            "provider in v0.8 (`unsupported_source`)."
         ),
     )
 

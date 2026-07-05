@@ -340,6 +340,22 @@ def format_doctor_text(result: dict[str, Any]) -> str:
         for note in otel.get("notes", []):
             lines.append(f"  note: {note}")
 
+    # persist-delivery env presence (Redmine #13262). Booleans only — the base URL
+    # and API key are credentials and are never rendered as values, only as
+    # set/unset (`vibes/docs/rules/public-private-boundary.md`).
+    delivery_env = sections.get("delivery_env") or {}
+    if delivery_env:
+        lines.append(f"delivery_env: {delivery_env.get('status', 'unknown')}")
+        lines.append(
+            f"  MOZYO_REDMINE_DELIVERY_WRITE: set={delivery_env.get('write_optin_set', False)}"
+        )
+        lines.append(
+            f"  MOZYO_REDMINE_URL: set={delivery_env.get('base_url_set', False)}"
+        )
+        lines.append(
+            f"  MOZYO_REDMINE_API_KEY: set={delivery_env.get('api_key_set', False)}"
+        )
+
     lines.append("")
     lines.append("result: " + ("ok" if result["ok"] else "needs attention"))
     return "\n".join(lines)

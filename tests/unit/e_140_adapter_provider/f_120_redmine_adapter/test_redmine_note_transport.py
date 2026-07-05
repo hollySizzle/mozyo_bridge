@@ -2,9 +2,11 @@
 
 Covers the explicit live-write env opt-in, the trusted-base / credential
 boundary (destination is the trusted env URL only, never a caller-supplied one),
-the fail-closed reason mapping (provider_unavailable / credential_missing /
-unauthorized / transport_error), the success path (PUT + 204 -> empty journal
-id), and the no-credential-leak guarantee on the surfaced reason.
+the fail-closed reason mapping (base_url_unset / credential_missing /
+unauthorized / transport_error; the base-URL reason is the Redmine #13262 split
+that distinguishes a missing/invalid trusted URL from the unwired sink's
+write_optin_unset), the success path (PUT + 204 -> empty journal id), and the
+no-credential-leak guarantee on the surfaced reason.
 
 Abstract placeholders are used deliberately — no personal home path or
 secret-shaped literal in tracked test files
@@ -25,8 +27,8 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
+    PERSIST_BASE_URL_UNSET,
     PERSIST_CREDENTIAL_MISSING,
-    PERSIST_PROVIDER_UNAVAILABLE,
     PERSIST_TRANSPORT_ERROR,
     PERSIST_UNAUTHORIZED,
     DeliveryTransportError,
@@ -79,20 +81,24 @@ class FromEnvOptInTest(unittest.TestCase):
 
 
 class TransportFailClosedTest(unittest.TestCase):
-    def test_missing_base_url_is_provider_unavailable(self) -> None:
+    def test_missing_base_url_is_base_url_unset(self) -> None:
+        # Redmine #13262: opt-in set (a transport exists) but no trusted base URL
+        # -> the distinct `base_url_unset` reason, not the old collapsed
+        # `provider_unavailable`.
         with patch.dict("os.environ", {API_KEY_ENV: API_KEY}, clear=True):
             transport = RedmineNoteHttpTransport()
             with self.assertRaises(DeliveryTransportError) as ctx:
                 transport.post_issue_note("12347", "note body")
-            self.assertEqual(PERSIST_PROVIDER_UNAVAILABLE, ctx.exception.reason)
+            self.assertEqual(PERSIST_BASE_URL_UNSET, ctx.exception.reason)
 
-    def test_invalid_base_url_is_provider_unavailable(self) -> None:
+    def test_invalid_base_url_is_base_url_unset(self) -> None:
+        # Redmine #13262: a non-http(s) base URL is also `base_url_unset`.
         env = {BASE_URL_ENV: "not-a-url", API_KEY_ENV: API_KEY}
         with patch.dict("os.environ", env, clear=True):
             transport = RedmineNoteHttpTransport()
             with self.assertRaises(DeliveryTransportError) as ctx:
                 transport.post_issue_note("12347", "note body")
-            self.assertEqual(PERSIST_PROVIDER_UNAVAILABLE, ctx.exception.reason)
+            self.assertEqual(PERSIST_BASE_URL_UNSET, ctx.exception.reason)
 
     def test_missing_api_key_is_credential_missing(self) -> None:
         with patch.dict("os.environ", {BASE_URL_ENV: TRUSTED_BASE}, clear=True):

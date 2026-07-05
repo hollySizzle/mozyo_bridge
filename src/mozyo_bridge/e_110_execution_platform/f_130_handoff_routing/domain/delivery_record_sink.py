@@ -45,9 +45,9 @@ dependency provider -> core. This module stays pure and import-free of that
 provider; it owns only source/anchor validation and receipt shaping. When no
 transport is injected (the default, and any caller that has not set the explicit
 ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in) resolution falls back to the
-fail-closed :class:`UnwiredDeliveryRecordSink` (``provider_unavailable``); tests
-drive the full persisted path through an injected fake transport, so no network
-runs here.
+fail-closed :class:`UnwiredDeliveryRecordSink` (``write_optin_unset``, Redmine
+#13262); tests drive the full persisted path through an injected fake transport,
+so no network runs here.
 
 Non-goals (kept explicit so the seam does not drift):
 
@@ -75,10 +75,28 @@ RECORD_CLASS_DELIVERY = "delivery_notification"
 # failure states (boundary doc Implementation Guardrail #4: provider failure
 # must be explicit — unavailable / unauthorized / ambiguous / unknown — never a
 # silent success).
+#
+# Redmine #13262: the single ``provider_unavailable`` reason previously collapsed
+# two operationally distinct fail-closed causes into one indistinguishable token,
+# so an operator could not tell "the live-write env opt-in was never set" (a plain
+# ``--persist-delivery`` with no live write configured) apart from "the opt-in was
+# set but the trusted Redmine base URL is missing / invalid" (a misconfiguration to
+# fix). They are now split into :data:`PERSIST_WRITE_OPTIN_UNSET` and
+# :data:`PERSIST_BASE_URL_UNSET`; ``provider_unavailable`` no longer has a producer
+# in this delivery path and is intentionally removed from the vocabulary.
 PERSIST_OK = "ok"
 PERSIST_DISABLED = "disabled"
 PERSIST_UNSUPPORTED_SOURCE = "unsupported_source"
-PERSIST_PROVIDER_UNAVAILABLE = "provider_unavailable"
+# The live-write env opt-in (``MOZYO_REDMINE_DELIVERY_WRITE``) is unset, so no
+# transport is injected and the unwired resolution seam fails closed. This is the
+# byte-compatible staged posture of a plain ``--persist-delivery``, not a
+# misconfiguration.
+PERSIST_WRITE_OPTIN_UNSET = "write_optin_unset"
+# The env opt-in is set (a transport is injected) but the trusted Redmine base URL
+# (``MOZYO_REDMINE_URL``) is missing or not a valid http(s) host, so there is no
+# trusted write destination. This IS a misconfiguration to fix, distinct from the
+# opt-in simply being unset.
+PERSIST_BASE_URL_UNSET = "base_url_unset"
 PERSIST_CREDENTIAL_MISSING = "credential_missing"
 PERSIST_UNAUTHORIZED = "unauthorized"
 PERSIST_NO_ANCHOR = "no_anchor"
@@ -91,7 +109,8 @@ PERSIST_FAILURE_REASONS: frozenset[str] = frozenset(
     {
         PERSIST_DISABLED,
         PERSIST_UNSUPPORTED_SOURCE,
-        PERSIST_PROVIDER_UNAVAILABLE,
+        PERSIST_WRITE_OPTIN_UNSET,
+        PERSIST_BASE_URL_UNSET,
         PERSIST_CREDENTIAL_MISSING,
         PERSIST_UNAUTHORIZED,
         PERSIST_NO_ANCHOR,
@@ -273,9 +292,11 @@ class UnwiredDeliveryRecordSink:
     (``infrastructure.redmine_note_transport``, Redmine #12347) but is gated by
     an explicit ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in: when it is unset no
     transport is injected and resolution falls back here, failing closed with
-    ``provider_unavailable`` so a plain ``--persist-delivery`` stays
-    byte-compatible. This is the same fail-closed posture as the
-    provider-selection resolution (Redmine #12249).
+    ``write_optin_unset`` (Redmine #13262) so a plain ``--persist-delivery`` stays
+    byte-compatible. That reason names the specific cause — the live-write env
+    opt-in is unset — distinct from a set-opt-in-but-missing-base-URL
+    misconfiguration (``base_url_unset``, raised by the transport). This is the
+    same fail-closed posture as the provider-selection resolution (Redmine #12249).
     """
 
     def __init__(self, source: str):
@@ -286,7 +307,7 @@ class UnwiredDeliveryRecordSink:
         return DeliveryReceipt(
             provider=self._source,
             persisted=False,
-            reason=PERSIST_PROVIDER_UNAVAILABLE,
+            reason=PERSIST_WRITE_OPTIN_UNSET,
         )
 
 
@@ -391,10 +412,10 @@ def resolve_delivery_record_sink(
     - ``enabled=False`` (the default, opt-out) -> :class:`NullDeliveryRecordSink`,
       so the handoff behavior is byte-identical.
     - ``source=redmine`` with no transport -> :class:`UnwiredDeliveryRecordSink`
-      (``provider_unavailable``): the live write is gated by the explicit
-      ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in, so without it no transport is
-      injected. With an injected transport (the env opt-in set, or a test fake)
-      -> :class:`RedmineDeliveryRecordSink`.
+      (``write_optin_unset``, Redmine #13262): the live write is gated by the
+      explicit ``MOZYO_REDMINE_DELIVERY_WRITE`` env opt-in, so without it no
+      transport is injected. With an injected transport (the env opt-in set, or a
+      test fake) -> :class:`RedmineDeliveryRecordSink`.
     - ``source=asana`` (or any non-Redmine source) ->
       :class:`UnsupportedSourceDeliveryRecordSink` (``unsupported_source``).
     """
@@ -416,13 +437,14 @@ __all__ = (
     "DeliveryReceipt",
     "DeliveryTransportError",
     "NullDeliveryRecordSink",
+    "PERSIST_BASE_URL_UNSET",
     "PERSIST_CREDENTIAL_MISSING",
     "PERSIST_DISABLED",
     "PERSIST_FAILURE_REASONS",
     "PERSIST_NO_ANCHOR",
     "PERSIST_OK",
-    "PERSIST_PROVIDER_UNAVAILABLE",
     "PERSIST_TRANSPORT_ERROR",
+    "PERSIST_WRITE_OPTIN_UNSET",
     "PERSIST_UNAUTHORIZED",
     "PERSIST_UNSUPPORTED_SOURCE",
     "RECORD_CLASS_DELIVERY",
