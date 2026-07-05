@@ -48,6 +48,24 @@ read-only 調査、検証の実行、log / diff / journal の要約を subagent 
 
 subagent は **cross-lane handoff の送信・owner 対話・gate 記録を行わない**。これらは可視 lane の agent (main-unit / sublane の責任 actor) の責務であり、subagent に委譲した瞬間に durable record と pane identity の監査可能性が崩れる。subagent の出力はあくまで委譲元へ返り、委譲元が可視 lane の actor としてそれらの action を所有する。
 
+## 活動単位の使い分け (sublane / subagent)
+
+sublane と subagent の使い分けは US 単位ではなく **活動単位** で判断する。同一 US の中でも、調査 → 実装 → 記録と活動が切り替わるたびに routing を判断し直す。
+
+```yaml
+activity_routing:
+  governed_activity:
+    対象: 実装 diff を生む作業 / gate journal 記録 / cross-lane handoff・dispatch
+    routing: mozyo-bridge sublane (可視 lane)
+    理由: durable anchor・pane identity・cross-agent audit を前提とする活動は可視 lane の actor が所有する
+  read_only_activity:
+    対象: 調査・探索・要約・検証実行・draft
+    routing: subagent / background 委譲
+    理由: dispatch authority も実装 diff も持たない (上記 (a) のとおり常時許容)
+```
+
+本 rule は target-state である。tooling の一時的な状態は routing 判断の入力にならない。governed activity を subagent へ流す唯一の例外経路は上記 (b) の explicit exception (4 条件すべて) であり、それ以外の代替経路を作らない。
+
 ## Model 選択基準
 
 - **実装 shaped lane は実装用 model を明示指定する**。起動パラメータで model を明示し、既定の親継承に依存しない。実装の質は model 選択に依存するため、暗黙の継承で意図しない model に落ちることを避ける。
