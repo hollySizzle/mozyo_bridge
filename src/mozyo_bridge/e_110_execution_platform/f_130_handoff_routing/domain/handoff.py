@@ -698,6 +698,16 @@ Reason = Literal[
     "invalid_args",
     "queue_enter",
     "turn_start_unconfirmed",
+    # Redmine #13255: the herdr+standard event-driven turn-start rail projects its
+    # closed outcome vocabulary onto these additive blocked reasons. `started` maps
+    # to `sent`/`ok` and `delivered_not_started` reuses `turn_start_unconfirmed`
+    # (above); the remaining rail outcomes each get a distinct token so an auditor
+    # can tell a runtime block from an absent pane, a not-idle precondition refusal,
+    # or a transport inject failure.
+    "receiver_blocked",
+    "turn_start_absent",
+    "precondition_not_idle",
+    "inject_failed",
     "cross_session_claude",
     "target_repo_mismatch",
     "gateway_route_blocked",
@@ -977,6 +987,56 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "not blind-resend or press Enter again without re-reading, and "
                 "do not escalate to `un-notified` on a single unconfirmed "
                 "observation."
+            ),
+        )
+    if reason == "receiver_blocked":
+        # Redmine #13255 (herdr+standard rail): the injection was delivered but the
+        # rail re-snapshotted a runtime block (a permission prompt is on the
+        # receiver). The receiver must clear the prompt before the turn can start.
+        return (
+            "sender",
+            (
+                f"read the {receiver} pane (`mozyo-bridge read {receiver}`): the "
+                "herdr turn-start rail delivered the notification but observed the "
+                "receiver in a runtime-blocked state (a permission / approval prompt "
+                "is on screen). Resolve the receiver-side prompt, then re-issue the "
+                "send under `--mode standard`; do not blind-resend."
+            ),
+        )
+    if reason == "turn_start_absent":
+        # Redmine #13255: the herdr wait reported the target pane does not exist.
+        return (
+            "sender",
+            (
+                f"verify the {receiver} herdr agent is live (`mozyo-bridge agents "
+                "list`): the herdr turn-start rail could not address the target pane "
+                "(it does not exist). Re-establish the receiver agent, then retry."
+            ),
+        )
+    if reason == "precondition_not_idle":
+        # Redmine #13255: the pre-injection snapshot found the receiver not idle, so
+        # the rail refused to inject (nothing was typed, no Enter) — a turn started
+        # while the pane was already busy could not be attributed to this send.
+        return (
+            "sender",
+            (
+                f"read the {receiver} pane (`mozyo-bridge read {receiver}`): the "
+                "herdr turn-start rail refused to inject because the receiver was "
+                "not idle (awaiting input) before the send — nothing was typed and "
+                "Enter was not pressed. Wait for the receiver to finish its current "
+                "turn, then re-issue the send under `--mode standard`."
+            ),
+        )
+    if reason == "inject_failed":
+        # Redmine #13255: a herdr transport primitive (send_text / send_keys) failed
+        # mid-injection; the armed wait was cancelled and the send fails closed.
+        return (
+            "sender",
+            (
+                "the herdr transport failed to inject the notification (a "
+                "send_text / send_keys primitive returned an error); the armed wait "
+                "was cancelled and nothing was confirmed delivered. Check the herdr "
+                f"binary / session for {receiver}, then re-issue the send."
             ),
         )
     if reason == "target_unavailable":
@@ -1363,6 +1423,34 @@ def _outcome_narrative(
             "issued — the marker+body was typed exactly once. The sender cannot "
             "confirm from tmux capture that the receiver started a turn."
         )
+    if reason == "receiver_blocked":
+        return (
+            "herdr turn-start rail (--mode standard): the notification was injected "
+            "but the wait for a turn start timed out and a re-snapshot found the "
+            "receiver in a runtime-blocked state (a permission / approval prompt is "
+            "on screen). The marker+body was typed exactly once and only Enter was "
+            "sent; no rollback and no re-send were issued."
+        )
+    if reason == "turn_start_absent":
+        return (
+            "herdr turn-start rail (--mode standard): the wait reported the target "
+            "pane does not exist, so no turn could start. The receiver agent is not "
+            "addressable; nothing was confirmed delivered."
+        )
+    if reason == "precondition_not_idle":
+        return (
+            "herdr turn-start rail (--mode standard): the pre-injection snapshot "
+            "found the receiver not idle (not awaiting input), so the rail refused "
+            "to inject — nothing was typed and Enter was not pressed. A turn started "
+            "on an already-busy pane could not be attributed to this send, so the "
+            "rail fails closed rather than injecting."
+        )
+    if reason == "inject_failed":
+        return (
+            "herdr turn-start rail (--mode standard): a transport primitive "
+            "(send_text / send_keys) failed mid-injection; the armed wait was "
+            "cancelled and the send fails closed. Nothing was confirmed delivered."
+        )
     if reason == "target_unavailable":
         return (
             "Receiver pane could not be resolved; no notification was typed."
@@ -1428,6 +1516,20 @@ def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Op
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; the pane notification's turn "
             "start could not be confirmed and nothing was re-submitted."
+        )
+    if reason in (
+        "receiver_blocked",
+        "turn_start_absent",
+        "precondition_not_idle",
+        "inject_failed",
+    ):
+        # Redmine #13255 (herdr+standard rail): all four fail-closed rail outcomes
+        # leave nothing durably submitted at the receiver, so the receiver contract
+        # is the same manual-read fallback as the other blocked paths.
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            "manually if action is still required; the herdr turn-start rail did "
+            "not confirm a turn started and nothing was submitted."
         )
     return None
 

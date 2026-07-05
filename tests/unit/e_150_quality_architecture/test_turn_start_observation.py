@@ -10,11 +10,17 @@ import unittest
 
 from mozyo_bridge.application.turn_start_observation import (
     TURN_START_OBSERVE_INTERVAL_SECONDS,
+    HERDR_TURN_START_PROJECTION,
     TurnStartObservation,
     observe_standard_turn_start,
+    project_herdr_turn_start,
     resolve_turn_start_window,
     submit_activity_observed,
     turn_start_record_lines,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
+    TURN_START_OUTCOMES,
+    TurnStartResult,
 )
 
 
@@ -192,6 +198,35 @@ class TurnStartRecordLinesTest(unittest.TestCase):
         )
         self.assertNotIn("/Users", lines[0])
         self.assertNotIn("/home", lines[0])
+
+
+class HerdrTurnStartProjectionTest(unittest.TestCase):
+    """Redmine #13255: the herdr rail outcome -> handoff ``(status, reason)`` wire."""
+
+    def test_projection_covers_every_closed_outcome(self) -> None:
+        # Total over the closed rail vocabulary: no outcome falls through to a
+        # generic reason, and no stale key lingers.
+        self.assertEqual(set(HERDR_TURN_START_PROJECTION), set(TURN_START_OUTCOMES))
+
+    def test_each_outcome_maps_to_expected_status_reason(self) -> None:
+        expected = {
+            "started": ("sent", "ok"),
+            "delivered_not_started": ("blocked", "turn_start_unconfirmed"),
+            "blocked": ("blocked", "receiver_blocked"),
+            "absent": ("blocked", "turn_start_absent"),
+            "precondition_not_idle": ("blocked", "precondition_not_idle"),
+            "inject_failed": ("blocked", "inject_failed"),
+        }
+        for outcome, (status, reason) in expected.items():
+            result = TurnStartResult(outcome=outcome)
+            self.assertEqual(project_herdr_turn_start(result), (status, reason), outcome)
+
+    def test_only_started_projects_to_sent(self) -> None:
+        statuses = {
+            status for status, _ in HERDR_TURN_START_PROJECTION.values()
+        }
+        self.assertEqual(statuses, {"sent", "blocked"})
+        self.assertEqual(HERDR_TURN_START_PROJECTION["started"][0], "sent")
 
 
 if __name__ == "__main__":

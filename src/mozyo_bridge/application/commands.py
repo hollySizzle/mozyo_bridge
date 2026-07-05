@@ -60,8 +60,12 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
 )
 from mozyo_bridge.application.turn_start_observation import (  # noqa: F401
     observe_standard_turn_start as _observe_standard_turn_start,
+    project_herdr_turn_start as _project_herdr_turn_start,
     resolve_turn_start_window as _resolve_turn_start_window,
     turn_start_record_lines as _turn_start_record_lines,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: F401
+    turn_start_rail_record_lines as _turn_start_rail_record_lines,
 )
 from mozyo_bridge.application.handoff_target_activation_command import (
     LiveTargetActivationOps,
@@ -209,6 +213,15 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 # backend, swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped
 # herdr shim around the send — the tmux default installs nothing (byte-for-byte).
 from mozyo_bridge.application.handoff_transport_wiring import bind_runtime_transport
+
+# Redmine #13255: the herdr event-driven turn-start rail installed by
+# ``bind_runtime_transport`` for the duration of a herdr send. ``None`` for the
+# tmux default (and outside a send); the herdr+standard branch of
+# ``orchestrate_handoff`` reads it to drive the rail in place of the capture-based
+# ``_observe_standard_turn_start``. Module-global (like the ``run_tmux`` /
+# ``capture_pane`` swap) so the decorator can install and restore it without
+# changing ``orchestrate_handoff``'s signature.
+active_herdr_turn_start_rail = None
 # Redmine #13261 (increment 2): under `terminal_transport.backend: herdr` the send
 # target is resolved herdr-natively (launch-time sender identity + live inventory)
 # instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
@@ -2898,6 +2911,79 @@ def orchestrate_handoff(
     # that then fails. Pane selection only; no raw key injection.
     if activate_inactive_target:
         target_activation = _activate_target_pane(target_info)
+
+    # Redmine #13255: under `terminal_transport.backend: herdr` AND `--mode standard`,
+    # the strict rail is driven by the event-driven `HerdrTurnStartRail` INSTEAD OF
+    # the common tmux body injection + landing-marker gate + capture-based
+    # `_observe_standard_turn_start` + tmux Enter below. The rail OWNS injection
+    # (snapshot → arm wait → send_text(marker+body) → send_keys(enter) → collect
+    # through the herdr transport port), so this branch runs BEFORE the common
+    # `run_tmux("send-keys", ... marker+body)` injection and returns / dies without
+    # falling through. `precondition_not_idle` (receiver not idle at the pre-snapshot)
+    # refuses to inject at all (no body, no Enter) and fails closed. tmux stays
+    # byte-identical, and herdr non-standard sends (pending / queue-enter) keep the
+    # common shim-backed choreography (auditor j#72602 decisions 1/2/3/5). The rail is
+    # stashed on `active_herdr_turn_start_rail` by `bind_runtime_transport`.
+    if herdr_send and mode == MODE_STANDARD:
+        rail = active_herdr_turn_start_rail
+        if rail is None:  # defensive: the decorator always stashes it under herdr
+            die(
+                "herdr backend selected for a --mode standard send but no turn-start "
+                "rail was installed; refusing to fall back to the capture rail. "
+                f"target={target}"
+            )
+            raise AssertionError("unreachable")
+        turn_start = rail.drive_turn_start(target, f"{marker} {body}")
+        status, reason = _project_herdr_turn_start(turn_start)
+        # Machine-readable turn-start telemetry (turn_start_outcome / snapshot_state /
+        # wait_kind / enter_resends / reclassified_blocked) for EVERY rail outcome,
+        # rendered redaction-safe by the rail's own record renderer and persisted on
+        # the delivery record (auditor j#72602 decision 4).
+        turn_start_lines = _turn_start_rail_record_lines(turn_start)
+        outcome = make_outcome(
+            status=status,
+            reason=reason,
+            receiver=receiver,
+            target=target,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            notification_marker=marker,
+            execution_root=execution_root,
+            role_profile=role_profile_resolution,
+            transition_role=transition_role_boundary,
+            workflow_contract=workflow_contract_bundle,
+            ticketless_callback=ticketless_callback_payload,
+            ticketless_consultation=ticketless_consultation_payload,
+            ticketless_work_intake=ticketless_work_intake_payload,
+        )
+        _emit_outcome(
+            outcome,
+            record_format=record_format,
+            command=record_command,
+            duplicate_lane_panes=duplicate_lane_panes or None,
+            role_profile_contract=role_profile_contract,
+            submit_lines=_submit_lines_for(args, outcome),
+            turn_start_lines=turn_start_lines,
+        )
+        if status == "sent":
+            _maybe_persist_delivery_record(
+                args,
+                outcome,
+                duplicate_lane_panes=duplicate_lane_panes,
+                record_format=record_format,
+                turn_start_lines=turn_start_lines,
+            )
+            return 0
+        die(
+            "handoff was routed through the herdr event-driven turn-start rail but "
+            f"no turn start was confirmed (rail outcome {turn_start.outcome}); the "
+            f"{receiver} receiver was not observed starting a turn. The marker+body "
+            "was typed at most once and only Enter was sent (no C-u rollback, no "
+            f"re-send). Read the receiver before re-issuing. target={target} "
+            f"marker={marker}"
+        )
+        raise AssertionError("unreachable")
 
     run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
 

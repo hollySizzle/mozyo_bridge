@@ -50,7 +50,17 @@ record.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Tuple
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
+    OUTCOME_ABSENT,
+    OUTCOME_BLOCKED,
+    OUTCOME_DELIVERED_NOT_STARTED,
+    OUTCOME_INJECT_FAILED,
+    OUTCOME_PRECONDITION_NOT_IDLE,
+    OUTCOME_STARTED,
+    TurnStartResult,
+)
 
 # The poll interval for the turn-start observation. The observation *window* is
 # supplied by the caller and is the marker gate's own ``landing_timeout`` (default
@@ -198,10 +208,43 @@ def _normalize(text: str) -> str:
     return "\n".join(line.rstrip() for line in (text or "").splitlines())
 
 
+#: The projection of the herdr event-driven turn-start rail's closed outcome
+#: vocabulary (:data:`...domain.turn_start_rail.TURN_START_OUTCOMES`) onto the
+#: handoff ``(Status, Reason)`` wire (Redmine #13255). Keeps ``Status`` at the
+#: existing 3 tokens; only ``delivered_not_started`` reuses an existing reason
+#: (``turn_start_unconfirmed``) — the machine-readable ``turn_start_outcome``
+#: telemetry (rendered by ``turn_start_rail_record_lines``) disambiguates it from
+#: the capture-based standard rail. The other four map to additive reason tokens.
+HERDR_TURN_START_PROJECTION: dict = {
+    OUTCOME_STARTED: ("sent", "ok"),
+    OUTCOME_DELIVERED_NOT_STARTED: ("blocked", "turn_start_unconfirmed"),
+    OUTCOME_BLOCKED: ("blocked", "receiver_blocked"),
+    OUTCOME_ABSENT: ("blocked", "turn_start_absent"),
+    OUTCOME_PRECONDITION_NOT_IDLE: ("blocked", "precondition_not_idle"),
+    OUTCOME_INJECT_FAILED: ("blocked", "inject_failed"),
+}
+
+
+def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
+    """Map a herdr :class:`TurnStartResult` onto the handoff ``(status, reason)`` wire.
+
+    Pure. ``result.outcome`` is a closed vocabulary (validated by
+    :class:`TurnStartResult`), so the lookup is total; a novel outcome would have
+    already been rejected at rail-result construction. The additive
+    ``turn_start_outcome`` / ``snapshot_state`` / ``wait_kind`` / ``enter_resends``
+    / ``reclassified_blocked`` telemetry is persisted separately (via
+    ``turn_start_rail_record_lines``) so an auditor can replay the rail even when
+    two rail outcomes share one wire reason.
+    """
+    return HERDR_TURN_START_PROJECTION[result.outcome]
+
+
 __all__ = [
+    "HERDR_TURN_START_PROJECTION",
     "TURN_START_OBSERVE_INTERVAL_SECONDS",
     "TurnStartObservation",
     "observe_standard_turn_start",
+    "project_herdr_turn_start",
     "resolve_turn_start_window",
     "submit_activity_observed",
     "turn_start_record_lines",

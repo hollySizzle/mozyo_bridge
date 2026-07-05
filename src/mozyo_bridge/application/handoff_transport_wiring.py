@@ -77,8 +77,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     BACKEND_HERDR,
     TerminalTransportError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
+    HerdrTurnStartRail,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (
     resolve_agent_lister,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (
+    resolve_turn_start_rail,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     capture_pane as _tmux_capture_pane,
@@ -129,31 +135,16 @@ def _herdr_native_assigned_name(
     return resolution.assigned_name
 
 
-def resolve_handoff_transport_binding(
-    args: argparse.Namespace,
-) -> Optional[TransportBinding]:
-    """Resolve the transport binding for this send, or ``None`` for the tmux default.
+def _resolve_herdr_binding(
+    args: argparse.Namespace, config
+) -> TransportBinding:
+    """Resolve the herdr :class:`TransportBinding` for an already-herdr ``config``.
 
-    Returns ``None`` when the tmux backend is in effect (the default, an absent
-    ``terminal_transport`` block, or a broken / unreadable config) so the caller
-    installs nothing; returns a herdr :class:`TransportBinding` when the herdr
-    backend is selected and its trusted-environment binary resolves.
-
-    For the herdr backend (Redmine #13261) the binding is handed a herdr-native
-    ``resolve_assigned_name`` resolver: it resolves the ``--to`` receiver against the
-    live herdr inventory scoped to the **launch-time sender identity** (env +
-    anchor), not a tmux target pane. Fail-closed ``die`` when the binary is
-    unconfigured / unresolvable, the sender identity is un-attested, or the receiver
-    does not resolve to a single live agent (never a silent tmux fallback).
+    Extracted so the config is read once and shared with the turn-start rail
+    resolution (Redmine #13255, auditor j#72602 decision 6: reuse the resolution,
+    do not add a second config read). Fail-closed ``die`` when the binary is
+    unconfigured / unresolvable (never a silent tmux fallback).
     """
-    try:
-        config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
-    except RepoLocalConfigError:
-        # A present-but-broken / unreadable config is "no usable selection", not a
-        # herdr opt-in — resolve to the tmux default rather than failing the send.
-        return None
-    if config.backend != BACKEND_HERDR:
-        return None
     repo_root = repo_root_from_args(args)
     receiver = getattr(args, "to", None) or ""
     coordinator_provider = resolve_coordinator_provider(repo_root)
@@ -183,31 +174,106 @@ def resolve_handoff_transport_binding(
         raise AssertionError("unreachable")
 
 
+def resolve_handoff_transport_binding(
+    args: argparse.Namespace,
+) -> Optional[TransportBinding]:
+    """Resolve the transport binding for this send, or ``None`` for the tmux default.
+
+    Returns ``None`` when the tmux backend is in effect (the default, an absent
+    ``terminal_transport`` block, or a broken / unreadable config) so the caller
+    installs nothing; returns a herdr :class:`TransportBinding` when the herdr
+    backend is selected and its trusted-environment binary resolves.
+
+    For the herdr backend (Redmine #13261) the binding is handed a herdr-native
+    ``resolve_assigned_name`` resolver: it resolves the ``--to`` receiver against the
+    live herdr inventory scoped to the **launch-time sender identity** (env +
+    anchor), not a tmux target pane. Fail-closed ``die`` when the binary is
+    unconfigured / unresolvable, the sender identity is un-attested, or the receiver
+    does not resolve to a single live agent (never a silent tmux fallback).
+    """
+    try:
+        config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
+    except RepoLocalConfigError:
+        # A present-but-broken / unreadable config is "no usable selection", not a
+        # herdr opt-in — resolve to the tmux default rather than failing the send.
+        return None
+    if config.backend != BACKEND_HERDR:
+        return None
+    return _resolve_herdr_binding(args, config)
+
+
+def resolve_handoff_transport_runtime(
+    args: argparse.Namespace,
+) -> "tuple[Optional[TransportBinding], Optional[HerdrTurnStartRail]]":
+    """Resolve the transport binding **and** the herdr turn-start rail in one config read.
+
+    Redmine #13255 (auditor j#72602 decision 6): under ``terminal_transport.backend:
+    herdr`` the standard rail is driven by the event-driven
+    :class:`~...domain.turn_start_rail.HerdrTurnStartRail` instead of the capture-based
+    ``_observe_standard_turn_start``. That rail is resolved here, alongside the
+    transport binding, from the *same* repo-local ``terminal_transport`` config load
+    (so there is no second config read on the send path) using the same trusted-env
+    binary posture as the binding (``resolve_turn_start_rail``: real
+    subprocess/Popen in production, injected fakes in tests via patched
+    ``subprocess.run`` / ``subprocess.Popen``).
+
+    Returns ``(None, None)`` for the tmux default / absent / broken config; returns
+    ``(binding, rail)`` for the herdr backend. The rail is resolved for every herdr
+    send (it runs no subprocess at resolution time) but is only *used* by the
+    herdr+standard branch in ``orchestrate_handoff`` — queue-enter / pending herdr
+    sends ignore it and stay on the shim-backed choreography (decision 5).
+    """
+    try:
+        config = load_repo_local_config(repo_root_from_args(args)).terminal_transport
+    except RepoLocalConfigError:
+        return None, None
+    if config.backend != BACKEND_HERDR:
+        return None, None
+    binding = _resolve_herdr_binding(args, config)
+    # The binding resolution above already died if the binary is unconfigured /
+    # unresolvable, so the rail resolution here rides the same resolved binary and
+    # cannot raise for a binary reason; any unexpected TerminalTransportError still
+    # fails closed rather than silently downgrading to tmux.
+    try:
+        rail = resolve_turn_start_rail(config)
+    except TerminalTransportError as exc:
+        die(f"terminal transport backend 'herdr' is selected but unavailable: {exc}")
+        raise AssertionError("unreachable")
+    return binding, rail
+
+
 def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
     """Install the config-selected transport binding around a handoff entry (#13253).
 
     Wraps :func:`orchestrate_handoff` without changing its body. For the herdr
     backend it swaps the ``commands`` module's ``run_tmux`` / ``capture_pane``
-    globals for the tmux-shaped herdr shim for the duration of the send and
-    restores them in a ``finally``. For the tmux default it installs nothing.
+    globals for the tmux-shaped herdr shim for the duration of the send, and (Redmine
+    #13255) stashes the resolved event-driven turn-start rail on
+    ``commands.active_herdr_turn_start_rail`` so the herdr+standard branch of
+    ``orchestrate_handoff`` can drive it in place of the capture-based observation;
+    all three are restored in a ``finally``. For the tmux default it installs nothing
+    (and leaves the rail slot ``None``).
     """
 
     @functools.wraps(fn)
     def wrapper(args: argparse.Namespace, *rest: Any, **kwargs: Any) -> int:
-        binding = resolve_handoff_transport_binding(args)
+        binding, turn_start_rail = resolve_handoff_transport_runtime(args)
         if binding is None or binding.backend != BACKEND_HERDR:
             return fn(args, *rest, **kwargs)
         from mozyo_bridge.application import commands
 
         saved_run_tmux = commands.run_tmux
         saved_capture_pane = commands.capture_pane
+        saved_rail = commands.active_herdr_turn_start_rail
         commands.run_tmux = binding.run_tmux
         commands.capture_pane = binding.capture_pane
+        commands.active_herdr_turn_start_rail = turn_start_rail
         try:
             return fn(args, *rest, **kwargs)
         finally:
             commands.run_tmux = saved_run_tmux
             commands.capture_pane = saved_capture_pane
+            commands.active_herdr_turn_start_rail = saved_rail
 
     return wrapper
 
@@ -215,4 +281,5 @@ def bind_runtime_transport(fn: Callable[..., int]) -> Callable[..., int]:
 __all__ = (
     "bind_runtime_transport",
     "resolve_handoff_transport_binding",
+    "resolve_handoff_transport_runtime",
 )
