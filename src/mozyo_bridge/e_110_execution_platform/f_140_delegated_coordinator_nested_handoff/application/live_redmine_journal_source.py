@@ -65,6 +65,32 @@ class LiveRedmineJournalError(RuntimeError):
     """
 
 
+class _RefuseRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed on any HTTP redirect so the API key never follows a 30x off the base.
+
+    Credential-boundary defense (review #13289 j#72712): stdlib
+    :meth:`urllib.request.HTTPRedirectHandler.redirect_request` copies every non-content
+    request header — including ``X-Redmine-API-Key`` — onto the redirect target ``Request``,
+    so a 30x from Redmine / an intermediary / a poisoned config would carry the key to the
+    untrusted ``Location`` host. Refusing the redirect *before* the next request is built means
+    that request is never sent: the key only ever reaches the trusted base URL. Any redirect is
+    unexpected for a read-only issue-detail GET, so failing closed (rather than following
+    same-origin only) is the simplest posture that keeps the key on the trusted host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise LiveRedmineJournalError(
+            f"redmine issue fetch received an unexpected HTTP {code} redirect; refusing to "
+            "follow it so the API key never leaves the trusted base URL. Point "
+            "MOZYO_REDMINE_URL directly at the final Redmine origin."
+        )
+
+
+#: A read-only opener whose redirect handler fails closed (see :class:`_RefuseRedirectHandler`).
+#: Built once; it holds no per-request state and performs no I/O at construction.
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_RefuseRedirectHandler())
+
+
 class LiveRedmineTransport(Protocol):
     """The injected network seam: one read-only issue-detail GET.
 
@@ -98,14 +124,16 @@ def urllib_issue_detail_fetch(
     in the ``X-Redmine-API-Key`` header — no caller-supplied URL and no key in the query
     string. Redmine's issue-detail endpoint has no journal-level ``since`` filter, so the
     cursor is applied client-side by the adapter; ``since`` is accepted here only to satisfy
-    the transport signature. Any network / decode failure is raised as
-    :class:`LiveRedmineJournalError` (its message never carries the key or the URL).
+    the transport signature. The request goes through :data:`_NO_REDIRECT_OPENER` so a 30x can
+    never carry the key off the trusted base URL (review #13289 j#72712). Any network / decode
+    failure is raised as :class:`LiveRedmineJournalError` (its message never carries the key or
+    the URL).
     """
     query = urllib.parse.urlencode({"include": "journals"})
     url = f"{base_url}/issues/{urllib.parse.quote(str(issue_id), safe='')}.json?{query}"
     request = urllib.request.Request(url, headers={"X-Redmine-API-Key": api_key})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise LiveRedmineJournalError(

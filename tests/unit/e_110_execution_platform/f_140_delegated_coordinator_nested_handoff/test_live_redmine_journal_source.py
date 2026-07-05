@@ -17,7 +17,9 @@ fake transport / injected credentials — no real network, no real environment, 
 
 from __future__ import annotations
 
+import http.server
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
     LiveRedmineJournalError,
     LiveRedmineJournalSource,
+    _RefuseRedirectHandler,
     urllib_issue_detail_fetch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
@@ -210,6 +213,65 @@ class DefaultTransportSignatureTest(unittest.TestCase):
         # The dataclass default is the real urllib transport (no accidental fake baked in).
         source = LiveRedmineJournalSource(base_url="https://x", api_key="k")
         self.assertIs(source.transport, urllib_issue_detail_fetch)
+
+
+class RedirectCredentialBoundaryTest(unittest.TestCase):
+    """The API key must never follow a 30x off the trusted base URL (review #13289 j#72712).
+
+    stdlib urllib copies non-content request headers (incl. X-Redmine-API-Key) onto a redirect
+    target Request; the default transport must refuse redirects so the key stays on the base.
+    """
+
+    def test_refuse_redirect_handler_fails_closed(self):
+        # Socket-free pin: the redirect is refused before the next Request is even built.
+        handler = _RefuseRedirectHandler()
+        with self.assertRaises(LiveRedmineJournalError):
+            handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example/")
+
+    def test_key_never_reaches_a_redirect_target(self):
+        # Loopback proof (127.0.0.1 only, no external network): the base host 302s to a second
+        # local server; that target must receive no request at all, so the key cannot leak.
+        received: list[dict] = []
+
+        class _Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                received.append(dict(self.headers))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):  # silence test server logging
+                pass
+
+        target = http.server.HTTPServer(("127.0.0.1", 0), _Target)
+        self.addCleanup(target.server_close)
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        self.addCleanup(target.shutdown)
+        target_port = target.server_address[1]
+
+        class _Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target_port}/issues/1.json")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        redirector = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+        self.addCleanup(redirector.server_close)
+        threading.Thread(target=redirector.serve_forever, daemon=True).start()
+        self.addCleanup(redirector.shutdown)
+        base_port = redirector.server_address[1]
+
+        with self.assertRaises(LiveRedmineJournalError):
+            urllib_issue_detail_fetch(
+                base_url=f"http://127.0.0.1:{base_port}",
+                api_key="LEAK-CANARY",
+                issue_id="1",
+                since=None,
+            )
+        # The redirect target was never contacted -> the key was never forwarded.
+        self.assertEqual(received, [])
 
 
 if __name__ == "__main__":
