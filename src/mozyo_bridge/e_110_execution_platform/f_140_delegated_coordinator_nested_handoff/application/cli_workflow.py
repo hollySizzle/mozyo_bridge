@@ -87,6 +87,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     callback_rail_fields,
     resolve_workflow_step,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_reconcile import (
+    STORE_ABSENT,
+    STORE_PRESENT,
+    STORE_UNAVAILABLE,
+    reconcile_step_with_store,
+)
 
 
 def _discover_candidates() -> list:
@@ -97,6 +103,39 @@ def _discover_candidates() -> list:
     predicates themselves and their near-miss reasons stay visible. Patched in tests.
     """
     return _agents_target_candidates(argparse.Namespace(agent=None, session=None))
+
+
+def _load_store_action(args: argparse.Namespace) -> tuple[object | None, str]:
+    """Read the persisted runtime store's overall pending action, fail-open (#13291).
+
+    Returns ``(WorkflowNextAction | None, store_status)`` where ``store_status`` is one of
+    the :mod:`...domain.workflow_step_reconcile` ``STORE_*`` tokens. The read is
+    non-mutating and degrades non-destructively: a missing store DB is
+    :data:`STORE_ABSENT`; any read / schema / fold error is :data:`STORE_UNAVAILABLE`.
+    Only when the store folds cleanly is the overall :func:`derive_workflow_next_action`
+    result returned with :data:`STORE_PRESENT`. Patched in tests to keep the step CLI
+    hermetic from the home store. ``--store-path`` (hidden) overrides the default home
+    store; no ``--repo`` is read, so the compatibility default role->provider binding is
+    used for the store fold.
+    """
+    # Lazy import: the reconcile read reuses the resume use case / store, kept out of the
+    # step module's import surface until a step actually consults the store.
+    from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStoreError
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_resume import (
+        _store_from_args,
+        resume_command_result,
+    )
+
+    try:
+        store = _store_from_args(args)
+        if not store.path.exists():
+            return None, STORE_ABSENT
+        result = resume_command_result(store)
+        return result.next_action, STORE_PRESENT
+    except WorkflowRuntimeStoreError:
+        return None, STORE_UNAVAILABLE
+    except Exception:  # noqa: BLE001 - fail-open: a store read never breaks a live step
+        return None, STORE_UNAVAILABLE
 
 
 def _anchor_from_args(args: argparse.Namespace) -> WorkflowAnchor | None:
@@ -266,7 +305,7 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     as_json = getattr(args, "as_json", False)
     dry_run = getattr(args, "dry_run", False)
 
-    outcome = resolve_workflow_step(
+    live = resolve_workflow_step(
         _discover_candidates(),
         self_pane=self_pane,
         anchor=_anchor_from_args(args),
@@ -274,17 +313,29 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         session=session,
     )
 
-    # Dry-run, or a non-executable outcome (blocked / grandchild Redmine-work no-op):
-    # report the resolved outcome, mutate nothing.
+    # Reconcile the live routing outcome with the persisted runtime store's pending
+    # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades
+    # to the live outcome unchanged (backward compatible), a gating pending action
+    # fail-closed-gates a live forward leg, a pending non-gating action is surfaced.
+    store_action, store_status = _load_store_action(args)
+    reconciled = reconcile_step_with_store(live, store_action, store_status=store_status)
+    outcome = reconciled.outcome
+
+    # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work
+    # no-op): report the resolved outcome, mutate nothing.
     if dry_run or not outcome.executable:
         reported = outcome
         if dry_run and outcome.executable:
             # Reflect that the executable leg was not actually run.
             reported = dataclasses.replace(outcome, execution=EXECUTION_DRY_RUN)
         if as_json:
-            print(_json.dumps(reported.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+            payload = reported.as_payload()
+            payload.update(reconciled.reconcile_payload_fields())
+            print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             _print_outcome_text(reported)
+            for line in reconciled.reconcile_text_lines():
+                print(line)
         return 0 if reported.ok else 1
 
     # Executable leg: dispatch the internal primitive.
@@ -294,6 +345,7 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         payload = executed.as_payload()
         payload["primitive_rc"] = rc
         payload["primitive_output"] = primitive_out
+        payload.update(reconciled.reconcile_payload_fields())
         print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         _print_outcome_text(executed)
@@ -301,6 +353,8 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
         if primitive_out.strip():
             print("--- primitive output ---")
             print(primitive_out, end="" if primitive_out.endswith("\n") else "\n")
+        for line in reconciled.reconcile_text_lines():
+            print(line)
     # Surface the primitive's own rc: the step resolved an executable leg, but the
     # delivery's success/fail-closed result is the primitive's (e.g. a gateway that
     # vanished between resolution and delivery), so the caller sees the real outcome.
@@ -417,6 +471,12 @@ def register(sub) -> None:
         "--callback",
         default=None,
         help=argparse.SUPPRESS,
+    )
+    step.add_argument(
+        "--store-path",
+        dest="store_path",
+        default=None,
+        help=argparse.SUPPRESS,  # test/debug override for the #13291 runtime-store read
     )
     step.set_defaults(func=cmd_workflow_step)
 
