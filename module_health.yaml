@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3460
+    lines: 3468
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1003,6 +1003,12 @@ allowlist:
       and returns / dies without falling through. tmux and herdr non-standard
       (pending / queue-enter) paths stay byte-identical. The rail orchestration +
       record renderer live in the terminal-runtime provider, not here.
+      Raised 3460 -> 3468 for the #13255 j#72695 correction: the herdr+standard branch
+      now builds the rail's structured telemetry (`TurnStartResult.to_telemetry_dict`)
+      and threads it to `make_outcome(turn_start_outcome=...)` so it lands on the JSON
+      outcome and drives the herdr-accurate delivery-record wording. Still returns /
+      dies without falling through; tmux and herdr non-standard paths stay
+      byte-identical.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1049,7 +1055,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 1980
+    lines: 2108
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1175,6 +1181,19 @@ allowlist:
       renderer live in the terminal-runtime provider; the outcome -> wire projection
       lives in `application/turn_start_observation.py`, so only the Reason
       registration + wording lands here.
+      Raised 1980 -> 2108 for the #13255 j#72695 correction (review finding P2): the
+      herdr rail's `delivered_not_started` reuses the `turn_start_unconfirmed` reason
+      but must NOT be described with the tmux/capture standard rail's landing-marker
+      wording. Adds the structured `turn_start_outcome` telemetry field on
+      `DeliveryOutcome` / `make_outcome` (built by `TurnStartResult.to_telemetry_dict`;
+      it lands in the JSON so the #12656 ledger reads it, not the reused wire reason),
+      the `_herdr_turn_start_token` helper, and herdr-discriminating branches in
+      `next_action_for` / `_outcome_narrative` / `_receiver_contract_line` (a herdr
+      `delivered_not_started` describes a herdr `wait agent-status` event-wait timeout;
+      the `receiver_blocked` wording no longer falsely claims "no re-send" since the
+      rail can bounded-resend Enter). The tmux/capture path (`turn_start_outcome=None`)
+      keeps its pre-#13255 wording byte-for-byte. The rail telemetry model stays in the
+      terminal-runtime provider; only the outcome/record plumbing lands here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

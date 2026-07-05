@@ -313,6 +313,28 @@ class TurnStartResult:
             OUTCOME_INJECT_FAILED,
         )
 
+    def to_telemetry_dict(self) -> dict:
+        """The machine-readable turn-start telemetry (Redmine #13255, j#72602 dec. 4).
+
+        Tokens + numbers only (no free text, no ``detail``, no absolute paths), so
+        it is safe to carry verbatim on the structured delivery outcome / JSON and
+        the pasteable durable record. This is the *structured* companion to the
+        human-readable :func:`turn_start_rail_record_lines`: the projection folds
+        two rail outcomes (``delivered_not_started`` / ``blocked``) onto reused
+        ``(status, reason)`` wire tokens, so an auditor (and the future #12656
+        ledger) reads THIS field — not the reason alone — to replay the rail. The
+        keys are exactly the five fields j#72602 decision 4 named:
+        ``outcome`` / ``snapshot_state`` / ``wait_kind`` / ``enter_resends`` /
+        ``reclassified_blocked``.
+        """
+        return {
+            "outcome": self.outcome,
+            "snapshot_state": self.snapshot_state,
+            "wait_kind": self.wait_kind,
+            "enter_resends": self.enter_resends,
+            "reclassified_blocked": self.reclassified_blocked,
+        }
+
 
 def _collapse_ws(text: str) -> str:
     """Collapse every whitespace run to a single space (wrapping-insensitive-ish)."""
