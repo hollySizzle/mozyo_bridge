@@ -57,6 +57,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+    cmd_herdr_session_start,
+)
 
 
 def _add_doctor_diagnostic_options(parser: argparse.ArgumentParser) -> None:
@@ -548,3 +551,53 @@ def register_lifecycle(sub) -> None:
     add_repo_option(sublane_retire)
     _add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)
+
+    # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`
+    # is the opt-in write side: it mints durable herdr assigned names for the
+    # workspace's `claude` / `codex` agents and injects their self-identity env so the
+    # herdr-native target resolution has stable identities to resolve against. Not
+    # coupled to the `terminal_transport.backend` flag; in pure-herdr operation both
+    # are used together.
+    herdr = sub.add_parser(
+        "herdr",
+        help=(
+            "Pure-herdr session helpers (Redmine #13261): mint durable herdr "
+            "assigned names for the workspace's agents (session-start)."
+        ),
+    )
+    herdr_sub = herdr.add_subparsers(dest="herdr_command", required=True)
+    herdr_session_start = herdr_sub.add_parser(
+        "session-start",
+        help=(
+            "Prepare a pure-herdr session: register the workspace, launch (or adopt) "
+            "the requested `claude` / `codex` agents as herdr-managed panes pinned to "
+            "the repo root, mint their durable `mzb1_...` assigned names, and inject "
+            "the self-identity env (MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE / "
+            "MOZYO_LANE_ID). Idempotent: an agent already carrying the slot's durable "
+            "name is adopted, not re-launched. The herdr binary comes only from the "
+            "trusted environment (MOZYO_HERDR_BINARY)."
+        ),
+    )
+    herdr_session_start.add_argument(
+        "--agent",
+        dest="agent",
+        action="append",
+        choices=["claude", "codex"],
+        help="Provider agent to prepare (repeatable). Default: both claude and codex.",
+    )
+    herdr_session_start.add_argument(
+        "--lane",
+        dest="lane",
+        default=None,
+        help="Lane id for the minted identities (default: the workspace-default lane).",
+    )
+    herdr_session_start.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Plan only: report which slots would launch / adopt without any side "
+        "effect (no launch, no rename).",
+    )
+    add_repo_option(herdr_session_start)
+    _add_lifecycle_json(herdr_session_start)
+    herdr_session_start.set_defaults(func=cmd_herdr_session_start)

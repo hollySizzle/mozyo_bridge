@@ -79,6 +79,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "init",
     "doctor",
     "sublane",
+    "herdr",
     "runtime-config",
     "instruction",
     "rules",

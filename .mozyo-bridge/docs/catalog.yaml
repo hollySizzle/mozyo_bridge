@@ -177,6 +177,22 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-herdr-native-identity
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/herdr-native-identity.md
+    purpose: 純 herdr セッション (tmux server なし) で registry/pane 解決と handoff target 解決を成立させる contract (Redmine #13261)。target authority を tmux pane user-options から herdr assigned name (durable identity) + live inventory (`agent list`) へ移す。sender self-identity は launch-time env (`MOZYO_WORKSPACE_ID`/`MOZYO_AGENT_ROLE`/`MOZYO_LANE_ID`) で fail-closed に読み workspace scope + coordinator binding context のみに使う (target authority ではない)。discovery-port 境界 (core=identity/preflight, provider=`agent list` mechanics)、workspace_registry 無変更決定 (#11425)、session-start write-side、pure-herdr round-trip の close-evidence contract、tmux freeze を定義する。
+    audit_role: herdr_native_identity_spec
+    related_document_refs:
+      - spec-route-identity-ledger
+      - logic-plugin-ready-adapter-boundary
+      - logic-tmux-send-safety-contract
+      - logic-unit-target-model
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegated-route-live-executor
     type: spec
     status: active
