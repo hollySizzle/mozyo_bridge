@@ -387,15 +387,18 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3b. Dispatch admission gate (#13290, execute path only): consult the
+        # 3b. Dispatch admission gate (#13290, live-dispatch path only): consult the
         # caller-supplied fill decision (the single #12855 authority) and fail closed
         # on a concrete stop unless an explicit override reason is supplied. When no
         # fill context is supplied the gate is not armed and this is a no-op, keeping
-        # the #12973 live-actuation contract byte-for-byte back-compatible. A dry-run
-        # never consults the gate (it performs nothing to gate).
+        # the #12973 live-actuation contract byte-for-byte back-compatible. Scoped to
+        # ``execute and dispatch`` (same as the anchor gate above): #13290 gates the
+        # ``--execute`` *dispatch*, while ``--no-dispatch`` is a create/adopt-only
+        # surface that dispatches no worker and so has nothing to gate. A dry-run
+        # (``execute=False``) likewise performs nothing to gate (Review j#72744 #2).
         fill_decision_token: Optional[str] = None
         fill_override_reason: Optional[str] = None
-        if execute:
+        if execute and dispatch:
             admission = evaluate_dispatch_admission(
                 fill_inputs, override_reason=override_fill_stop
             )
@@ -853,6 +856,8 @@ class SublaneActuateUseCase:
                 gateway_pane=gateway_pane,
                 worker_pane=worker_pane,
                 adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
             )
         steps.append(
             ActuationStep(

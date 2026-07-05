@@ -199,6 +199,45 @@ class CreateGateTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_READY)
         self.assertIsNone(outcome.fill_decision)
 
+    def test_no_dispatch_create_only_is_never_gated(self):
+        # `--no-dispatch` is a create/adopt-only surface that dispatches no worker,
+        # so the dispatch admission gate must not fire even under a stop decision
+        # (Review j#72744 #2). It parallels the anchor gate's `execute and dispatch`.
+        ops = FakeActuatorOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(), execute=True, dispatch=False, fill_inputs=_stop_inputs()
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertNotIn(REASON_FILL_STOP, outcome.blocked_reasons)
+        self.assertIsNone(outcome.fill_decision)
+        self.assertNotIn("dispatch", ops.calls)  # create/adopt only, no worker send
+
+    def test_override_survives_a_gateway_handoff_failure(self):
+        # Finding j#72744 #3: an override that passes the gate but then hits a
+        # gateway handoff (dispatch) failure must still record the override.
+        class DispatchFailsOps(FakeActuatorOps):
+            def dispatch_implementation_request(self, **kwargs):
+                self.calls.append("dispatch")
+                return 1  # non-zero -> REASON_HANDOFF_FAILED
+
+        ops = DispatchFailsOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(),
+            execute=True,
+            fill_inputs=_stop_inputs(),
+            override_fill_stop="owner intent #13229 j#72635",
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertNotIn(REASON_FILL_STOP, outcome.blocked_reasons)
+        self.assertEqual(outcome.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+        self.assertEqual(
+            outcome.fill_override_reason, "owner intent #13229 j#72635"
+        )
+        journal = render_actuation_journal(outcome)
+        self.assertIn(
+            "- fill_stop_override: owner intent #13229 j#72635", journal
+        )
+
     def test_override_survives_a_later_execution_failure(self):
         # An override that passes the gate but then hits a real actuation failure
         # must still carry the override record: the durable journal has to stay
