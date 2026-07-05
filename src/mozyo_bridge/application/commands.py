@@ -209,6 +209,15 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 # backend, swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped
 # herdr shim around the send — the tmux default installs nothing (byte-for-byte).
 from mozyo_bridge.application.handoff_transport_wiring import bind_runtime_transport
+# Redmine #13261 (increment 2): under `terminal_transport.backend: herdr` the send
+# target is resolved herdr-natively (launch-time sender identity + live inventory)
+# instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
+# routes. Strictly config-guarded; the tmux path is untouched.
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    HerdrSendEntryError,
+    herdr_backend_selected,
+    resolve_herdr_send_target,
+)
 from mozyo_bridge.scaffold.rules import (
     PORTABLE_HOME_EXPRESSION,
     install_rules,
@@ -1635,7 +1644,14 @@ def orchestrate_handoff(
     would let an explicit `%pane` for a foreign Claude pane be typed into under
     a ``to=codex`` marker, defeating the gateway boundary.
     """
-    require_tmux()
+    # Redmine #13261 (increment 2): resolve the backend once, strictly from the
+    # repo-local config, and gate every tmux-only step on it. Under the herdr backend
+    # a pure herdr session has no tmux server, so `require_tmux()` (and the tmux
+    # pane/session gates below) must not run; the target is resolved herdr-natively.
+    # The tmux default keeps `require_tmux()` and the whole tmux path byte-identical.
+    herdr_send = herdr_backend_selected(args)
+    if not herdr_send:
+        require_tmux()
 
     record_format = _record_format_from_args(args)
     record_command = _record_command_from_args(args)
@@ -1858,61 +1874,90 @@ def orchestrate_handoff(
             die(str(exc))
             raise AssertionError("unreachable")
 
-    target_arg = getattr(args, "target", None) or receiver
-    try:
-        target_info = pane_info(target_arg)
-    except SystemExit:
-        _emit_outcome(
-            make_outcome(
-                status="blocked",
-                reason="target_unavailable",
-                receiver=receiver,
-                target=None,
-                anchor=anchor,
-                mode=mode,
-                kind=kind,
-                notification_marker=None,
-                source=source,
-            ),
-            record_format=record_format,
-            command=record_command,
-        )
-        # Diagnostics only (Redmine #11776): when a `<session>:codex` gateway
-        # location fails to resolve, distinguish exact tmux window-name
-        # resolution from inventory agent_kind classification and list the
-        # session's Codex-like candidate panes. Best-effort and additive — the
-        # original resolver failure (already printed) and the blocked outcome
-        # are unchanged.
+    if herdr_send:
+        # Redmine #13261 (increment 2): pure-herdr target resolution. There is no
+        # tmux pane to read, so resolve the receiver against the live herdr inventory
+        # scoped by the launch-time sender identity (env + anchor) and synthesize a
+        # `project_preflight_target`-compatible pane record whose `id` is the live
+        # herdr locator. Fail-closed (un-attested sender / unavailable inventory /
+        # no single live agent) emits a `target_unavailable` blocked outcome and dies
+        # — never a silent tmux fallback.
         try:
-            if (
-                ":" in target_arg
-                and not target_arg.startswith("%")
-                and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
-            ):
-                from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-                from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-                    codex_gateway_candidates,
-                )
-                from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
-                    target_unavailable_codex_diagnostic,
-                )
+            target_info = resolve_herdr_send_target(args, receiver=receiver)
+        except HerdrSendEntryError as exc:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_unavailable",
+                    receiver=receiver,
+                    target=None,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            die(str(exc))
+            raise AssertionError("unreachable")
+    else:
+        target_arg = getattr(args, "target", None) or receiver
+        try:
+            target_info = pane_info(target_arg)
+        except SystemExit:
+            _emit_outcome(
+                make_outcome(
+                    status="blocked",
+                    reason="target_unavailable",
+                    receiver=receiver,
+                    target=None,
+                    anchor=anchor,
+                    mode=mode,
+                    kind=kind,
+                    notification_marker=None,
+                    source=source,
+                ),
+                record_format=record_format,
+                command=record_command,
+            )
+            # Diagnostics only (Redmine #11776): when a `<session>:codex` gateway
+            # location fails to resolve, distinguish exact tmux window-name
+            # resolution from inventory agent_kind classification and list the
+            # session's Codex-like candidate panes. Best-effort and additive — the
+            # original resolver failure (already printed) and the blocked outcome
+            # are unchanged.
+            try:
+                if (
+                    ":" in target_arg
+                    and not target_arg.startswith("%")
+                    and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
+                ):
+                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
+                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+                        codex_gateway_candidates,
+                    )
+                    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+                        target_unavailable_codex_diagnostic,
+                    )
 
-                _sess = target_arg.split(":", 1)[0]
-                _cands = [
-                    rec.to_dict()
-                    for rec in codex_gateway_candidates(_sess, _pr.pane_lines())
-                ]
-                _diag = target_unavailable_codex_diagnostic(
-                    _sess, "codex", _cands
-                )
-                print(_diag, file=sys.stderr)
-        except (Exception, SystemExit):
-            # Diagnostics are strictly best-effort. `pane_lines()` calls
-            # `die()` (SystemExit) when tmux is absent, so catch SystemExit too
-            # — a diagnostics failure must never replace the original
-            # `target_unavailable` outcome (Redmine #11778).
-            pass
-        raise
+                    _sess = target_arg.split(":", 1)[0]
+                    _cands = [
+                        rec.to_dict()
+                        for rec in codex_gateway_candidates(_sess, _pr.pane_lines())
+                    ]
+                    _diag = target_unavailable_codex_diagnostic(
+                        _sess, "codex", _cands
+                    )
+                    print(_diag, file=sys.stderr)
+            except (Exception, SystemExit):
+                # Diagnostics are strictly best-effort. `pane_lines()` calls
+                # `die()` (SystemExit) when tmux is absent, so catch SystemExit too
+                # — a diagnostics failure must never replace the original
+                # `target_unavailable` outcome (Redmine #11778).
+                pass
+            raise
 
     target = target_info["id"]
 
@@ -1930,15 +1975,21 @@ def orchestrate_handoff(
     from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
 
     duplicate_lane_panes: list[str] = []
-    try:
-        duplicate_lane_panes = [
-            _pr.duplicate_pane_record_row(pane)
-            for pane in _pr.same_lane_receiver_duplicates(
-                target_info, _pr.pane_lines(), receiver
-            )
-        ]
-    except (Exception, SystemExit):
-        duplicate_lane_panes = []
+    if not herdr_send:
+        # Redmine #13261: this same-lane-duplicate diagnostic reads a LIVE tmux pane
+        # snapshot, which has no meaning in a pure herdr session — so it is an
+        # explicit no-op under the herdr backend (an empty list), not a swallowed
+        # tmux-absence error. herdr identity uniqueness is enforced upstream by the
+        # assigned-name decode (a duplicate assigned name fails closed).
+        try:
+            duplicate_lane_panes = [
+                _pr.duplicate_pane_record_row(pane)
+                for pane in _pr.same_lane_receiver_duplicates(
+                    target_info, _pr.pane_lines(), receiver
+                )
+            ]
+        except (Exception, SystemExit):
+            duplicate_lane_panes = []
 
     # `--target-repo auto` (Redmine #11778): resolve the cross-workspace
     # identity gate from the explicitly-named pane's own cwd so the operator
@@ -2138,7 +2189,13 @@ def orchestrate_handoff(
         )
         raise AssertionError("unreachable")
 
-    if mode == MODE_QUEUE_ENTER:
+    if mode == MODE_QUEUE_ENTER and not herdr_send:
+        # Redmine #13261: this session-binding gate binds the target to the sender's
+        # *tmux session* — a concept that does not exist in a pure herdr session. It
+        # is an explicit no-op under the herdr backend: the herdr target is addressed
+        # by its live locator and is already scoped to the sender's workspace + role
+        # by the inventory decode (WU1), which supersedes tmux-session binding.
+        #
         # Step 10 (v0.3; constrained cross-session admission added in
         # Redmine #11301): session binding. queue-enter is bound to the
         # sender's tmux session by default — under marker miss it does not roll
@@ -2219,7 +2276,12 @@ def orchestrate_handoff(
     # queue-enter rail's own session check below still applies in that
     # mode. The optional ``--target-repo`` check below adds repo-mismatch
     # fail-closed on top of this gate.
-    sender_session_xw = current_session_name()
+    # Redmine #13261: the cross-session `--to claude` gate compares tmux session
+    # names. Under the herdr backend there is no tmux session (sender_session_xw is
+    # empty), so the gate below is an explicit no-op — the herdr target's audit
+    # boundary is enforced by the workspace-scoped inventory decode, not tmux-session
+    # membership.
+    sender_session_xw = "" if herdr_send else current_session_name()
     target_location_xw = target_info.get("location") or ""
     target_session_xw = (
         target_location_xw.split(":", 1)[0] if ":" in target_location_xw else ""

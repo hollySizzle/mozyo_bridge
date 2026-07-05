@@ -131,9 +131,31 @@ backend=`tmux` の挙動は byte 不変: `tmux_client.py` / `pane_resolver.py` /
 send pipeline / `handoff_transport_wiring` の tmux 経路に behavior change を入れない。
 herdr-native 解決は backend=`herdr` 選択時のみ有効。
 
-### 既知 residual (未確認事項)
+### orchestrate-entry の backend-aware target 解決 (increment 2)
 
-`orchestrate_handoff` は send target を `pane_info(target_arg)` (tmux) で先に解決するため、
-tmux server が全く無い純 herdr 実機では send-keys binding shim に到達する前に die しうる。本 US は
-frozen-tmux 制約下で target 解決 (read side) / identity mint (write side) / herdr 経路の wiring を
-提供する。`orchestrate_handoff` の target 取得を tmux 非依存にする改修は本 US scope 外 (後続 US)。
+`orchestrate_handoff` は backend=`herdr` のとき、send target を tmux `pane_info` ではなく本 spec の
+herdr-native 解決 (launch-time sender identity + live inventory) で解決し、downstream pipeline が
+消費する pane record を synthesize する。synthesize record は **normal_window** projection
+(role を `window_name` に載せ `@mozyo_agent_role` は付けない) とし、cockpit 前提の main-lane guard を
+不活性にしつつ `binds_receiver` の strong role 判定は成立させる。tmux 専用 side step は backend=`herdr`
+で明示 no-op にする (each に rationale コメント + テスト):
+
+- `require_tmux()` — herdr では skip (tmux server 前提を課さない)。
+- queue-enter の tmux-session binding gate / cross-session `--to claude` gate — herdr では no-op
+  (tmux session 概念が無く、audit boundary は workspace-scoped inventory decode が担保)。
+- same-lane duplicate pane snapshot — herdr では明示的に空 (tmux pane snapshot 依存)。identity uniqueness は
+  assigned-name decode (duplicate name は fail-closed) が担保。
+- select-pane 起点の target activation — #13253 shim の no-op 経由 (herdr は pane focus 不要)。
+
+backend=`tmux` 経路は byte 不変 (全 gate は `if not herdr_send` で strict guard)。fail-closed
+(un-attested sender env / unavailable inventory / 単一 live agent に解決しない) は structured
+`blocked` / `target_unavailable` outcome を emit して die する。
+
+### 残 residual (未確認事項)
+
+- **live smoke 未実施**: 実 herdr binary + 実 agent での round-trip (marker landing / turn-start) は
+  coordinator の post-review 実機 acceptance に委ねる。本 US の自動テストは fake herdr runner のみ。
+- `herdr agent start` の argv (§5 NOTE) は staged assumption のまま。
+- coordinator pseudo-target (`--to coordinator`) は `resolve_herdr_target` が解決可能だが、
+  `orchestrate_handoff` の `RECEIVERS` は `claude`/`codex` のみのため entry からは claude/codex を扱う。
+  coordinator callback 経路の herdr 対応は別 surface。

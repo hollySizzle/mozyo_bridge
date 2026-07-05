@@ -70,7 +70,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     HerdrAgentDiscoveryPort,
-    SenderIdentity,
     resolve_herdr_target,
     resolve_sender_identity,
 )
@@ -88,53 +87,44 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 from mozyo_bridge.shared.errors import die
 
 
-def _resolve_sender_identity_or_die(repo_root: str) -> SenderIdentity:
-    """Resolve the launch-time sender identity for a herdr send (fail-closed).
+def _herdr_native_assigned_name(
+    *,
+    receiver: str,
+    repo_root: str,
+    coordinator_provider: str,
+    lister: HerdrAgentDiscoveryPort,
+) -> str:
+    """Resolve the target receiver's live herdr assigned name (fail-closed, #13261).
 
-    Reads the sender env (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
-    ``MOZYO_LANE_ID``) and cross-checks the workspace against the repo anchor
-    (``read_anchor``). Any missing / invalid / mismatched value ``die``s with the
-    structured reason — a herdr send never proceeds on an un-attested sender.
+    A lazy *fallback* resolver for the translator: since increment 2 resolves the
+    target herdr-natively at the orchestrate entry and hands the rail the live locator
+    directly (``valid_target`` passes through unchanged), this is only reached if a
+    non-herdr-valid target ever survives to the shim. It resolves the sender identity
+    (env + anchor) and the receiver against the live inventory scoped to the sender's
+    workspace + provider role; any failure (un-attested sender, unknown receiver,
+    coordinator binding unresolved, no / multiple match, missing locator) raises
+    :class:`TransportBindingError` before any send — never a guessed target.
     """
     try:
         anchor = read_anchor(Path(repo_root))
     except (OSError, ValueError):
         anchor = None
     anchor_ws = anchor.get("workspace_id") if isinstance(anchor, dict) else None
-    resolution = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
-    if not resolution.ok or resolution.identity is None:
-        die(
-            "herdr backend selected but the sender identity is not attested "
-            f"(reason={resolution.reason}): {resolution.detail}"
+    sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+    if not sender_res.ok or sender_res.identity is None:
+        raise TransportBindingError(
+            "herdr sender identity is not attested "
+            f"(reason={sender_res.reason}): {sender_res.detail}"
         )
-        raise AssertionError("unreachable")
-    return resolution.identity
-
-
-def _herdr_native_assigned_name(
-    *,
-    receiver: str,
-    sender: SenderIdentity,
-    coordinator_provider: str,
-    lister: HerdrAgentDiscoveryPort,
-) -> str:
-    """Resolve the target receiver's live herdr assigned name (fail-closed, #13261).
-
-    Ignores the rail's tmux ``%N`` handle (there is no pane to read in a pure herdr
-    session): the receiver label is resolved against the live ``agent list`` inventory
-    scoped to the sender's workspace + the receiver's provider role. A resolution
-    failure (unknown receiver, coordinator binding unresolved, no match, multiple
-    matches, missing locator) raises :class:`TransportBindingError` before any send —
-    the shim then re-binds the returned assigned name against a fresh snapshot.
-    """
     rows = lister.list_agent_rows()
     resolution = resolve_herdr_target(
-        receiver, sender, rows, coordinator_provider=coordinator_provider
+        receiver, sender_res.identity, rows, coordinator_provider=coordinator_provider
     )
     if resolution.is_fail:
         raise TransportBindingError(
             f"herdr target resolution failed for receiver {receiver!r} in workspace "
-            f"{sender.workspace_id!r} (reason={resolution.reason}): {resolution.detail}"
+            f"{sender_res.identity.workspace_id!r} (reason={resolution.reason}): "
+            f"{resolution.detail}"
         )
     return resolution.assigned_name
 
@@ -166,7 +156,6 @@ def resolve_handoff_transport_binding(
         return None
     repo_root = repo_root_from_args(args)
     receiver = getattr(args, "to", None) or ""
-    sender = _resolve_sender_identity_or_die(repo_root)
     coordinator_provider = resolve_coordinator_provider(repo_root)
     try:
         lister = resolve_agent_lister(config)
@@ -176,7 +165,7 @@ def resolve_handoff_transport_binding(
         resolver = functools.partial(
             _herdr_native_assigned_name,
             receiver=receiver,
-            sender=sender,
+            repo_root=repo_root,
             coordinator_provider=coordinator_provider,
             lister=lister,
         )

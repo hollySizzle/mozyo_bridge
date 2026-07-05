@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3301
+    lines: 3363
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -975,6 +975,16 @@ allowlist:
       (receiver-agnostic gate + receiver-labelled record line + accurate
       comments). The observation module itself is
       ``application/turn_start_observation.py``, not here.
+      Raised 3301 -> 3363 for the #13261 (increment 2) pure-herdr backend branch in
+      ``orchestrate_handoff`` (integrated after #13262): the ``herdr_send`` config
+      gate, the herdr-native target-resolution branch (env + inventory) with its
+      ``target_unavailable`` fail-closed emit, and the strict ``if not herdr_send``
+      guards on the tmux-only steps (require_tmux, the queue-enter / cross-session
+      tmux-session gates, the duplicate-pane snapshot). The tmux path stays
+      byte-identical (every guard is config-gated). The resolution + synthesized pane
+      record live in the new
+      ``e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_send_entry.py``,
+      not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
