@@ -2359,6 +2359,16 @@ def orchestrate_handoff(
         enforce_gateway_route,
     )
 
+    # Redmine #13261 (increment 4): under the herdr backend resolve the sender lane
+    # Unit from the env-derived SenderIdentity (already resolved for the target above)
+    # so the gate enforces on the env sender lane and makes ZERO tmux calls; under tmux
+    # `sender_lane_unit` is None and the gate keeps its `current_pane_lane_unit()` path
+    # byte-identical.
+    herdr_sender_lane_unit = (
+        (target_info.get("herdr_sender_workspace_id"), target_info.get("herdr_sender_lane_id"))
+        if herdr_send
+        else None
+    )
     enforce_gateway_route(
         args,
         kind=kind,
@@ -2371,6 +2381,7 @@ def orchestrate_handoff(
         record_format=record_format,
         record_command=record_command,
         emit=_emit_outcome,
+        sender_lane_unit=herdr_sender_lane_unit,
     )
 
     expected_target_repo = getattr(args, "target_repo", None)

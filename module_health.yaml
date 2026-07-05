@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3363
+    lines: 3374
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -985,6 +985,12 @@ allowlist:
       record live in the new
       ``e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_send_entry.py``,
       not here.
+      Raised 3363 -> 3374 for the #13261 (increment 4) gateway-route sender-lane
+      wiring: under the herdr backend the env-derived sender Unit (already resolved
+      for the target) is threaded into ``enforce_gateway_route`` via
+      ``sender_lane_unit`` so the gate enforces without a tmux
+      ``current_pane_lane_unit()`` call — the gate's tmux path stays byte-identical
+      when the arg is ``None``.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

@@ -157,6 +157,13 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         # Diagnostic breadcrumb (not consumed by the pane projection): the durable
         # herdr name this locator was resolved from.
         "herdr_assigned_name": resolution.assigned_name,
+        # The env-derived SENDER Unit (Redmine #13261 increment 4). Carried on the
+        # target record so the gateway-route gate can enforce on the sender's lane
+        # without a tmux `current_pane_lane_unit()` call — the sender identity was
+        # already resolved here (single resolution, no duplication). Not part of the
+        # pane projection (project_preflight_target ignores unknown keys).
+        "herdr_sender_workspace_id": sender.workspace_id,
+        "herdr_sender_lane_id": sender.lane_id,
     }
 
 

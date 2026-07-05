@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     current_pane_lane_unit,
@@ -57,18 +57,29 @@ def enforce_gateway_route(
     record_format: str,
     record_command: str | None,
     emit: Callable[..., None],
+    sender_lane_unit: Optional[Tuple[Optional[str], Optional[str]]] = None,
 ) -> None:
     """Apply the #12918 gateway-route gate; fail closed on a cross-lane worker send.
 
-    Resolves the sender's lane Unit from the live inventory (``TMUX_PANE``; a sender
-    the inventory does not carry leaves the gate skipped, mirroring the
-    cross-session gate's skip when the sender session is unknown), runs the pure
-    policy, and on a block emits the structured ``gateway_route_blocked`` outcome
-    through ``emit`` and ``die``s before any text is typed. On an explicit durable
-    exception it prints the advisory to stderr and returns so the send proceeds.
-    Returns ``None`` (and raises nothing) for an allowed route.
+    Resolves the sender's lane Unit, runs the pure policy, and on a block emits the
+    structured ``gateway_route_blocked`` outcome through ``emit`` and ``die``s before
+    any text is typed. On an explicit durable exception it prints the advisory to
+    stderr and returns so the send proceeds. Returns ``None`` (and raises nothing) for
+    an allowed route.
+
+    Sender-lane resolution (Redmine #13261 increment 4): by default the Unit comes
+    from the live tmux inventory (``current_pane_lane_unit()`` — ``TMUX_PANE``; a
+    sender the inventory does not carry leaves the gate skipped, mirroring the
+    cross-session gate). Under the herdr backend there is no tmux to read: the caller
+    passes the env-derived ``sender_lane_unit`` (from the launch-time
+    ``MOZYO_WORKSPACE_ID`` / ``MOZYO_LANE_ID`` SenderIdentity), so the gate **enforces
+    on the env sender lane and makes zero tmux calls**. The tmux path is byte-identical
+    when ``sender_lane_unit`` is ``None``.
     """
-    sender_ws, sender_lane = current_pane_lane_unit()
+    if sender_lane_unit is not None:
+        sender_ws, sender_lane = sender_lane_unit
+    else:
+        sender_ws, sender_lane = current_pane_lane_unit()
     # Role-based worker discrimination (Redmine #13174): resolve the implementer
     # (worker) role's runtime provider from the repo-local binding (#12673/#13157;
     # default -> claude, byte-identical) so the authority decision keys on the role,
