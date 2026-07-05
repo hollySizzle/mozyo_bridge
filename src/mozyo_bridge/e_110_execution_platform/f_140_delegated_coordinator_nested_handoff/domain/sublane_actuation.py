@@ -43,6 +43,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
+    REASON_FILL_STOP,
+)
+
 # ---------------------------------------------------------------------------
 # Per-step execution status (literal; machine-readable regardless of UI language).
 # ---------------------------------------------------------------------------
@@ -103,6 +107,11 @@ REASON_HANDOFF_FAILED = "handoff_failed"
 #: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was
 #: requested without an explicit owner / operator decision anchor (durable journal id).
 REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
+#: The #13290 dispatch admission gate refused: the caller-supplied fill decision
+#: resolved to a concrete stop and no explicit override was supplied. Defined in
+#: :mod:`...domain.sublane_dispatch_admission`; re-exported here so the actuator's
+#: fail-closed reason registry stays complete.
+# (REASON_FILL_STOP imported above.)
 
 BLOCKED_REASONS = frozenset(
     {
@@ -115,6 +124,7 @@ BLOCKED_REASONS = frozenset(
         REASON_LANE_MISMATCH,
         REASON_HANDOFF_FAILED,
         REASON_WORK_UNIT_BLOCKED,
+        REASON_FILL_STOP,
     }
 )
 
@@ -223,6 +233,11 @@ class SublaneActuationOutcome:
     adopted: bool = False
     steps: Tuple[ActuationStep, ...] = ()
     blocked_reasons: Tuple[str, ...] = ()
+    # #13290 dispatch admission gate: the concrete FILL_* token the caller-supplied
+    # fill decision resolved to (``None`` when the gate was not armed), and the
+    # explicit override reason recorded when a stop was intentionally proceeded past.
+    fill_decision: Optional[str] = None
+    fill_override_reason: Optional[str] = None
 
     @property
     def is_blocked(self) -> bool:
@@ -262,6 +277,8 @@ class SublaneActuationOutcome:
             "adopted": self.adopted,
             "steps": [s.as_payload() for s in self.steps],
             "blocked_reasons": list(self.blocked_reasons),
+            "fill_decision": self.fill_decision,
+            "fill_override_reason": self.fill_override_reason,
         }
 
 
@@ -302,6 +319,14 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         f"- worker_dispatch_confirmed: {str(outcome.worker_dispatch_confirmed).lower()}",
         f"- durable_anchor: {outcome.durable_anchor or '-'}",
     ]
+    # #13290: record the consulted fill decision and any explicit override so the
+    # durable record carries the admission decision (reason + anchor) that let a
+    # stop-classified dispatch proceed. Emitted only when the gate was armed, so the
+    # not-armed / back-compat path stays byte-for-byte unchanged.
+    if outcome.fill_decision is not None:
+        lines.append(f"- fill_decision: {outcome.fill_decision}")
+    if outcome.fill_override_reason is not None:
+        lines.append(f"- fill_stop_override: {outcome.fill_override_reason}")
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
         lines.append(
@@ -366,6 +391,7 @@ __all__ = (
     "REASON_LANE_MISMATCH",
     "REASON_HANDOFF_FAILED",
     "REASON_WORK_UNIT_BLOCKED",
+    "REASON_FILL_STOP",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",
     "DISPATCH_WORKER_DISPATCHED",

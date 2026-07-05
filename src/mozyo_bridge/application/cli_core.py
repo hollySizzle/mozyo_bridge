@@ -305,6 +305,69 @@ def register_lifecycle(sub) -> None:
             help="Emit structured JSON output instead of human-readable text",
         )
 
+    def _add_dispatch_admission_flags(parser: argparse.ArgumentParser) -> None:
+        """Add the #13290 dispatch-admission gate flags to a live dispatch subparser.
+
+        When any of these are supplied the ``--execute`` dispatch consults the single
+        #12855 fill-decision authority and fails closed on a concrete stop unless an
+        explicit ``--override-fill-stop REASON`` is given (recorded to the durable
+        anchor). When none are supplied the gate is not armed and the dispatch proceeds
+        unchanged. The advisory ``workflow fill-decision`` command is untouched.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_fill import (  # noqa: E501
+            _parse_lane,
+        )
+
+        parser.add_argument(
+            "--lane",
+            action="append",
+            type=_parse_lane,
+            metavar="ISSUE:STATE",
+            help="An active lane as ISSUE:STATE (repeatable) for the dispatch "
+            "admission gate. Same vocabulary as `workflow fill-decision`. Supplying "
+            "any admission flag arms the gate on --execute.",
+        )
+        parser.add_argument(
+            "--ready-independent",
+            dest="ready_independent",
+            type=int,
+            default=0,
+            help="Count of ready implementation work items not overlapping an active "
+            "lane (dispatch admission gate).",
+        )
+        parser.add_argument(
+            "--ready-overlap",
+            dest="ready_overlap",
+            type=int,
+            default=0,
+            help="Count of ready work items overlapping an active lane (dispatch "
+            "admission gate).",
+        )
+        parser.add_argument(
+            "--capacity",
+            dest="capacity",
+            type=int,
+            default=0,
+            help="Remaining local soft-profile slots for another active sublane "
+            "(dispatch admission gate).",
+        )
+        parser.add_argument(
+            "--owner-or-release-gate",
+            dest="owner_or_release_gate",
+            action="store_true",
+            help="An owner-decision / release / credential / destructive gate is "
+            "active (forces a stop in the dispatch admission gate).",
+        )
+        parser.add_argument(
+            "--override-fill-stop",
+            dest="override_fill_stop",
+            metavar="REASON",
+            default=None,
+            help="Proceed past a fill-decision stop with an explicit reason (recorded "
+            "to the durable anchor). Required to dispatch when the gate resolves to a "
+            "stop_* decision.",
+        )
+
     sublane_create = sublane_sub.add_parser(
         "create",
         aliases=["start"],
@@ -392,6 +455,7 @@ def register_lifecycle(sub) -> None:
         default="auto",
         help="Target-repo resolution for the --execute dispatch (default: auto).",
     )
+    _add_dispatch_admission_flags(sublane_create)
     add_repo_option(sublane_create)
     _add_lifecycle_json(sublane_create)
     sublane_create.set_defaults(func=cmd_sublane_start)
@@ -446,6 +510,7 @@ def register_lifecycle(sub) -> None:
         default="auto",
         help="Target-repo identity gate for the worker send (default: auto).",
     )
+    _add_dispatch_admission_flags(sublane_dispatch_worker)
     add_repo_option(sublane_dispatch_worker)
     _add_lifecycle_json(sublane_dispatch_worker)
     sublane_dispatch_worker.set_defaults(func=cmd_sublane_dispatch_worker)
