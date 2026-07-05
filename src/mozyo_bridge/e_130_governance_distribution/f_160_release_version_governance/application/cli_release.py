@@ -205,9 +205,12 @@ def register(sub) -> None:
         action="store_true",
         help=(
             "Dispatch the TestPyPI workflow via `gh workflow run "
-            "testpypi.yml --ref main -f version=<X.Y.Z>`. Requires "
-            "--version. Run-id polling is delegated to "
-            "`release check workflow` / `release workflow wait`."
+            "testpypi.yml --ref main` (no workflow input; the run "
+            "builds the version committed in `main`'s pyproject.toml, "
+            "so bump/commit/push first). Requires --version, which is "
+            "validated and recorded as the expected version -- not "
+            "passed as a dispatch input. Run-id polling is delegated "
+            "to `release check workflow` / `release workflow wait`."
         ),
     )
     publish_mode.add_argument(
@@ -231,7 +234,11 @@ def register(sub) -> None:
     )
     release_publish.add_argument(
         "--version",
-        help="Version literal X.Y.Z for `--testpypi` workflow dispatch input",
+        help=(
+            "Expected version literal X.Y.Z for `--testpypi`. Validated "
+            "and recorded, not passed as a workflow dispatch input; the "
+            "run builds the version committed in pyproject.toml."
+        ),
     )
     release_publish.add_argument(
         "--tag",

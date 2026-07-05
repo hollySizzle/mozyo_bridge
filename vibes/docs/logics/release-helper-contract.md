@@ -44,7 +44,7 @@ repo の **現在 authoritative な release-version mirror set** を 1 つの ve
 
 publish workflow の dispatch / 状態確認に専念する helper。version 文字列の整合・gate 判定・release notes は扱わない。
 
-- `release publish --testpypi --version <X.Y.Z>` — `gh workflow run testpypi.yml --ref main -f version=X.Y.Z` 相当の dispatch を実行する。dispatch 後の run-id を active ticket に貼れる shape で stdout に出す。workflow 完了の polling はこの subcommand では行わず、`release check workflow --run-id <id>` に明示的に委ねる。
+- `release publish --testpypi --version <X.Y.Z>` — `gh workflow run testpypi.yml --ref main` 相当の dispatch を実行する (workflow input は渡さない。`testpypi.yml` の `workflow_dispatch` は input を取らず、`main` の commit 済み `pyproject.toml` version を build するため、version bump は事前に commit / push しておく)。`--version` は期待 version の validate / 記録用であり dispatch input ではない。dispatch 後の run-id を active ticket に貼れる shape で stdout に出す。workflow 完了の polling はこの subcommand では行わず、`release check workflow --run-id <id>` に明示的に委ねる。
 - `release publish --pypi --tag vX.Y.Z` — production publish の trigger を組み立てる。具体的には `gh release create vX.Y.Z --verify-tag --title "vX.Y.Z" --notes-file <path>` のドライランを出力し、release notes file path と tag が揃っていることを assert する。`--execute` flag が明示的に渡された場合のみ `gh release create` を実行する。
 - `release publish --plan` — TestPyPI / PyPI それぞれで、現在の git ref / pyproject version / 最新の `Test` workflow conclusion / TestPyPI 既存 version の有無を読み取り、operator が次に取りうる選択肢を列挙する。判定はしない。
 
