@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3468
+    lines: 3503
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1009,6 +1009,15 @@ allowlist:
       outcome and drives the herdr-accurate delivery-record wording. Still returns /
       dies without falling through; tmux and herdr non-standard paths stay
       byte-identical.
+      Raised 3468 -> 3503 for the #13292 herdr queue-enter telemetry-only turn-start
+      observation in ``orchestrate_handoff``: AFTER the byte-unchanged queue-enter
+      inject -> Enter -> Enter-only retry choreography, a herdr send now takes a
+      read-only ``read_agent_state`` snapshot (borrowed from the already-resolved
+      ``active_herdr_turn_start_rail`` reader) and records it as the additive,
+      telemetry-only ``queue_enter_turn_start_observation`` field + record line. It
+      never changes ``status`` / ``reason`` / ``next_action_owner`` and never blocks;
+      the tmux backend and non-queue-enter rails are untouched. The pure observation
+      loop + renderer live in ``application/turn_start_observation.py``, not here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1055,7 +1064,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2108
+    lines: 2126
     reason: >-
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
@@ -1194,6 +1203,15 @@ allowlist:
       rail can bounded-resend Enter). The tmux/capture path (`turn_start_outcome=None`)
       keeps its pre-#13255 wording byte-for-byte. The rail telemetry model stays in the
       terminal-runtime provider; only the outcome/record plumbing lands here.
+      Raised 2108 -> 2126 for the #13292 additive, telemetry-only
+      `queue_enter_turn_start_observation` field on `DeliveryOutcome` / `make_outcome`
+      (built by `QueueEnterTurnStartObservation.to_telemetry_dict`; it lands in the
+      JSON so the #12656 ledger can read the herdr queue-enter post-choreography
+      snapshot). It is kept SEPARATE from `turn_start_outcome` and touches NO wording
+      helper — `next_action_for` / `_outcome_narrative` / `_receiver_contract_line`
+      are unchanged, so `status` / `reason` / `next_action` stay byte-identical (a
+      post-hoc snapshot is telemetry only, never the wire). The observation model +
+      record renderer live in `application/turn_start_observation.py`.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

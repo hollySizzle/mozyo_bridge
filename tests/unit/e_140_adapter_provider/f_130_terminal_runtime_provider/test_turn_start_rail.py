@@ -339,6 +339,14 @@ class OrderingTests(unittest.TestCase):
         _rail(reader, transport, wait).drive_turn_start(TARGET, BODY)
         self.assertEqual(wait.timeouts, [DEFAULT_WAIT_TIMEOUT_MS])
 
+    def test_reader_property_exposes_injected_reader(self) -> None:
+        # Redmine #13292: the queue-enter telemetry-only observation borrows the
+        # resolved rail's state reader for a read-only snapshot (no drive_turn_start).
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_AWAITING_INPUT))
+        transport = FakeTransport()
+        wait = FakeWait(WaitResult.changed())
+        self.assertIs(_rail(reader, transport, wait).reader, reader)
+
 
 # ---------------------------------------------------------------------------
 # Codex Enter-resend rail (E14).

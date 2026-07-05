@@ -59,8 +59,10 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     submit_lines_for as _submit_lines_for,
 )
 from mozyo_bridge.application.turn_start_observation import (  # noqa: F401
+    observe_queue_enter_turn_start as _observe_queue_enter_turn_start,
     observe_standard_turn_start as _observe_standard_turn_start,
     project_herdr_turn_start as _project_herdr_turn_start,
+    queue_enter_turn_start_record_lines as _queue_enter_turn_start_record_lines,
     resolve_turn_start_window as _resolve_turn_start_window,
     turn_start_record_lines as _turn_start_record_lines,
 )
@@ -3179,6 +3181,36 @@ def orchestrate_handoff(
             )
             raise AssertionError("unreachable")
 
+    # Redmine #13292: additive, telemetry-only queue-enter turn-start observation
+    # under the herdr backend (j#72602 decision 5's deferred follow-up, design
+    # confirmed #13292 j#72759). The queue-enter inject → Enter → Enter-only retry
+    # choreography above is left BYTE-IDENTICAL; only AFTER it, and only for a herdr
+    # send, do we take a read-only `agent get` runtime-state snapshot (#13246
+    # `read_agent_state`, borrowed from the already-resolved rail's reader — no
+    # second config read, no `drive_turn_start`, no injection ownership, no
+    # `precondition_not_idle` fail-close). The result is recorded as additive
+    # telemetry ONLY: it never changes `status` / `reason` / `next_action_owner`
+    # (they stay `sent` / `ok`|`queue_enter` / `receiver`) and never blocks the send
+    # — a read failure / `unknown` / `awaiting_input` all just record telemetry. It
+    # is kept structurally separate from the event rail's `turn_start_outcome` (a
+    # post-hoc snapshot does not prove causality like an armed `wait agent-status`
+    # transition). The tmux backend and every non-queue-enter rail are untouched
+    # (`queue_enter_observation` stays `None`).
+    queue_enter_observation = None
+    if herdr_send and mode == MODE_QUEUE_ENTER:
+        rail = active_herdr_turn_start_rail
+        if rail is not None:  # always installed under herdr; skip defensively if not
+            queue_enter_snapshot = _observe_queue_enter_turn_start(
+                target,
+                read=rail.reader.read_agent_state,
+                sleep=time.sleep,
+            )
+            queue_enter_observation = queue_enter_snapshot.to_telemetry_dict()
+            # Reuse the additive `turn_start_lines` record channel (appended, never
+            # overrides `next_action`); the queue-enter renderer labels itself
+            # telemetry-only and does not reuse the event rail's wording.
+            turn_start_lines = _queue_enter_turn_start_record_lines(queue_enter_snapshot)
+
     # Wording-layer differentiation under the relaxed `queue-enter` rail:
     # marker observed (possibly via the Enter-only retry above) → strict
     # `sent`/`ok`; marker still unobserved → `sent`/`queue_enter` (sender did
@@ -3206,6 +3238,9 @@ def orchestrate_handoff(
         ticketless_callback=ticketless_callback_payload,
         ticketless_consultation=ticketless_consultation_payload,
         ticketless_work_intake=ticketless_work_intake_payload,
+        # Redmine #13292: additive, telemetry-only herdr queue-enter turn-start
+        # snapshot (`None` for tmux / non-queue-enter). Never influences the wire.
+        queue_enter_turn_start_observation=queue_enter_observation,
     )
     # Durable retry telemetry (policy + attempted count + interval) is recorded
     # in the delivery record / narrative only when the Enter-only retry actually

@@ -438,6 +438,21 @@ class HerdrTurnStartRail:
     def max_enter_resends(self) -> int:
         return self._max_enter_resends
 
+    @property
+    def reader(self):
+        """The injected #13246 state reader (``read_agent_state``).
+
+        Exposed read-only so a caller that already holds the resolved herdr rail
+        (stashed on ``commands.active_herdr_turn_start_rail`` for a herdr send) can
+        take a read-only runtime-state snapshot without resolving a second reader
+        from config. Used by the queue-enter post-choreography turn-start
+        observation (Redmine #13292): that path does NOT drive the rail (no
+        ``drive_turn_start``, no injection ownership, no ``precondition_not_idle``
+        fail-close) — it only borrows the reader for an additive, telemetry-only
+        ``agent get`` snapshot.
+        """
+        return self._reader
+
     def drive_turn_start(
         self, target: str, text: str, *, enter_keys: str = DEFAULT_ENTER_KEYS
     ) -> TurnStartResult:
