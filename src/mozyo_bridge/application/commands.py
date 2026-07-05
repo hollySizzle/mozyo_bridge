@@ -2940,6 +2940,13 @@ def orchestrate_handoff(
         # rendered redaction-safe by the rail's own record renderer and persisted on
         # the delivery record (auditor j#72602 decision 4).
         turn_start_lines = _turn_start_rail_record_lines(turn_start)
+        # Redmine #13255 j#72695: carry the SAME telemetry as a structured field on
+        # the outcome so it lands in the JSON / persisted record (an auditor / the
+        # future #12656 ledger reads this, not the reused `(status, reason)` wire
+        # alone) AND so the delivery-record wording discriminates a herdr
+        # `delivered_not_started` from the tmux/capture standard rail's
+        # `turn_start_unconfirmed`.
+        turn_start_telemetry = turn_start.to_telemetry_dict()
         outcome = make_outcome(
             status=status,
             reason=reason,
@@ -2956,6 +2963,7 @@ def orchestrate_handoff(
             ticketless_callback=ticketless_callback_payload,
             ticketless_consultation=ticketless_consultation_payload,
             ticketless_work_intake=ticketless_work_intake_payload,
+            turn_start_outcome=turn_start_telemetry,
         )
         _emit_outcome(
             outcome,

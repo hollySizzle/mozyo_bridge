@@ -212,9 +212,12 @@ def _normalize(text: str) -> str:
 #: vocabulary (:data:`...domain.turn_start_rail.TURN_START_OUTCOMES`) onto the
 #: handoff ``(Status, Reason)`` wire (Redmine #13255). Keeps ``Status`` at the
 #: existing 3 tokens; only ``delivered_not_started`` reuses an existing reason
-#: (``turn_start_unconfirmed``) — the machine-readable ``turn_start_outcome``
-#: telemetry (rendered by ``turn_start_rail_record_lines``) disambiguates it from
-#: the capture-based standard rail. The other four map to additive reason tokens.
+#: (``turn_start_unconfirmed``) — the structured ``turn_start_outcome`` telemetry
+#: carried on the ``DeliveryOutcome`` (built by
+#: ``TurnStartResult.to_telemetry_dict`` and also rendered human-readably by
+#: ``turn_start_rail_record_lines``) disambiguates it from the capture-based
+#: standard rail, both for a replaying auditor and for the delivery-record wording
+#: (Redmine #13255 j#72695). The other four map to additive reason tokens.
 HERDR_TURN_START_PROJECTION: dict = {
     OUTCOME_STARTED: ("sent", "ok"),
     OUTCOME_DELIVERED_NOT_STARTED: ("blocked", "turn_start_unconfirmed"),
@@ -231,10 +234,12 @@ def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
     Pure. ``result.outcome`` is a closed vocabulary (validated by
     :class:`TurnStartResult`), so the lookup is total; a novel outcome would have
     already been rejected at rail-result construction. The additive
-    ``turn_start_outcome`` / ``snapshot_state`` / ``wait_kind`` / ``enter_resends``
-    / ``reclassified_blocked`` telemetry is persisted separately (via
-    ``turn_start_rail_record_lines``) so an auditor can replay the rail even when
-    two rail outcomes share one wire reason.
+    ``outcome`` / ``snapshot_state`` / ``wait_kind`` / ``enter_resends``
+    / ``reclassified_blocked`` telemetry is carried separately as the structured
+    ``DeliveryOutcome.turn_start_outcome`` field (via
+    ``TurnStartResult.to_telemetry_dict``) and rendered human-readably by
+    ``turn_start_rail_record_lines`` so an auditor can replay the rail even when two
+    rail outcomes share one wire reason.
     """
     return HERDR_TURN_START_PROJECTION[result.outcome]
 

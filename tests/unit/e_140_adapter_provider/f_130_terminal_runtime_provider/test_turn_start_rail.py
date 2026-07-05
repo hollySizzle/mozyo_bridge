@@ -511,6 +511,37 @@ class ClockAndRecordTests(unittest.TestCase):
         line = turn_start_rail_record_lines(result)[0]
         self.assertIn("not-armed", line)
 
+    def test_to_telemetry_dict_carries_the_five_machine_fields(self) -> None:
+        # Redmine #13255 j#72695: the structured telemetry the delivery outcome
+        # carries (`DeliveryOutcome.turn_start_outcome`). Tokens + numbers only, the
+        # exact five fields j#72602 decision 4 named, and no bounded-text `detail`.
+        result = TurnStartResult(
+            outcome=OUTCOME_BLOCKED,
+            detail="wait timed out and a re-snapshot found a runtime block",
+            snapshot_state=RUNTIME_AWAITING_INPUT,
+            wait_kind=WAIT_TIMEOUT,
+            enter_resends=2,
+            reclassified_blocked=True,
+        )
+        self.assertEqual(
+            {
+                "outcome": OUTCOME_BLOCKED,
+                "snapshot_state": RUNTIME_AWAITING_INPUT,
+                "wait_kind": WAIT_TIMEOUT,
+                "enter_resends": 2,
+                "reclassified_blocked": True,
+            },
+            result.to_telemetry_dict(),
+        )
+        self.assertNotIn("detail", result.to_telemetry_dict())
+
+    def test_to_telemetry_dict_not_armed_wait_kind_is_none(self) -> None:
+        result = TurnStartResult(
+            outcome=OUTCOME_PRECONDITION_NOT_IDLE, snapshot_state=RUNTIME_BUSY
+        )
+        self.assertIsNone(result.to_telemetry_dict()["wait_kind"])
+        self.assertEqual(0, result.to_telemetry_dict()["enter_resends"])
+
 
 class ResultInvariantTests(unittest.TestCase):
     def test_bad_outcome_rejected(self) -> None:

@@ -804,6 +804,20 @@ class DeliveryOutcome:
     # explicit fallback); set only on the dedicated `project-gateway child-intake`
     # forward rail.
     ticketless_work_intake: Optional[dict[str, Any]] = None
+    # Redmine #13255: machine-readable herdr event-driven turn-start telemetry
+    # (`outcome` / `snapshot_state` / `wait_kind` / `enter_resends` /
+    # `reclassified_blocked`), built by `TurnStartResult.to_telemetry_dict`. The
+    # herdr projection folds `delivered_not_started` onto the reused
+    # `turn_start_unconfirmed` reason and `blocked` onto `receiver_blocked`, so this
+    # structured field — not the `(status, reason)` wire alone — is what an auditor
+    # and the future #12656 ledger read to replay the rail (j#72602 decision 4). It
+    # also drives the herdr-accurate record wording: `_outcome_narrative` /
+    # `next_action_for` / `_receiver_contract_line` discriminate on `outcome` here so
+    # a herdr `delivered_not_started` is NOT described with the tmux/capture standard
+    # rail's landing-marker language (the finding fixed by Redmine #13255 j#72695).
+    # Tokens + numbers only, durable-record safe. `None` for the tmux/capture
+    # standard rail and every non-herdr path (the explicit fallback).
+    turn_start_outcome: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -935,8 +949,37 @@ stderr trailer, and any preset wording that references the same N.
 """
 
 
-def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[NextActionOwner, str]:
-    """Return the canonical owner/action phrase for an outcome."""
+def _herdr_turn_start_token(turn_start_outcome: Optional[dict[str, Any]]) -> Optional[str]:
+    """The herdr rail's 6-token outcome from the structured telemetry, or ``None``.
+
+    ``None`` means "not the herdr event rail" (the tmux/capture standard rail and
+    every non-rail path leave ``turn_start_outcome`` unset), so the wording helpers
+    keep their pre-#13255 branches byte-identical for those paths and only render
+    the herdr-accurate text when a herdr outcome token is present.
+    """
+    if isinstance(turn_start_outcome, dict):
+        token = turn_start_outcome.get("outcome")
+        if isinstance(token, str):
+            return token
+    return None
+
+
+def next_action_for(
+    status: Status,
+    reason: Reason,
+    receiver: str,
+    *,
+    turn_start_outcome: Optional[str] = None,
+) -> tuple[NextActionOwner, str]:
+    """Return the canonical owner/action phrase for an outcome.
+
+    ``turn_start_outcome`` is the herdr event rail's 6-token outcome (``None`` for
+    the tmux/capture standard rail and non-rail paths). It disambiguates the one
+    reason the herdr projection reuses — ``delivered_not_started`` folds onto
+    ``turn_start_unconfirmed`` — so a herdr wait timeout gets an event-wait
+    next-action instead of the capture rail's landing-marker phrasing (Redmine
+    #13255 j#72695).
+    """
     if status == "sent":
         return "receiver", f"read the durable anchor and act from that record as {receiver}"
     if status == "pending_input":
@@ -967,6 +1010,26 @@ def next_action_for(status: Status, reason: Reason, receiver: str) -> tuple[Next
                 "(`read target again`, `retry`, `refresh`), record `un-notified` "
                 "in the durable record with every attempted command and observed "
                 "error verbatim."
+            ),
+        )
+    if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
+        # Redmine #13255 j#72695: the herdr event rail reuses `turn_start_unconfirmed`
+        # for `delivered_not_started`, but its signal is an event-wait timeout (herdr
+        # `wait agent-status --status working`), NOT a landing-marker / tmux-capture
+        # observation. The marker+body was injected once; the rail MAY have
+        # bounded-resent Enter (see the turn-start telemetry line for the count), so
+        # this next-action avoids the capture rail's "typed once and Enter was
+        # pressed" phrasing.
+        return (
+            "sender",
+            (
+                f"read the {receiver} pane (`mozyo-bridge read {receiver}`) to "
+                "confirm whether the turn started. If it did, no action is "
+                "needed. If it did not, re-issue the send under `--mode standard`; "
+                "the herdr rail already waited (event-driven) for a working "
+                "transition and bounded-resent Enter, so do not blind-resend "
+                "without re-reading, and do not escalate to `un-notified` on a "
+                "single unconfirmed wait timeout."
             ),
         )
     if reason == "turn_start_unconfirmed":
@@ -1369,7 +1432,17 @@ def _outcome_narrative(
     reason: Reason,
     mode: Optional[str] = None,
     receiver: Optional[str] = None,
+    *,
+    turn_start_outcome: Optional[str] = None,
 ) -> str:
+    """Render the human-readable ``- Outcome:`` narrative.
+
+    ``turn_start_outcome`` is the herdr event rail's 6-token outcome (``None`` for
+    the tmux/capture standard rail and non-rail paths); it discriminates the reused
+    ``turn_start_unconfirmed`` reason so a herdr ``delivered_not_started`` describes
+    an event-wait timeout instead of the capture rail's landing-marker observation
+    (Redmine #13255 j#72695).
+    """
     if status == "sent":
         if reason == "queue_enter":
             # Redmine #13262 option (b): make the queue-enter receipt explicit that
@@ -1409,6 +1482,24 @@ def _outcome_narrative(
             "cannot verify from tmux capture that the receiver composer was "
             "cleared."
         )
+    if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
+        # Redmine #13255 j#72695: the herdr event rail reuses `turn_start_unconfirmed`
+        # for `delivered_not_started`, but there is NO landing-marker wait and NO
+        # tmux capture on this rail — the signal is an event-wait timeout (herdr
+        # `wait agent-status --status working`). The marker+body was injected once;
+        # the rail MAY have bounded-resent Enter (the exact count is in the
+        # turn-start telemetry line), so this narrative must not claim the capture
+        # rail's "typed exactly once ... no re-send" or "cannot confirm from tmux
+        # capture" wording.
+        return (
+            "herdr turn-start rail (--mode standard): the notification was injected "
+            "and the event wait for a working transition (herdr `wait agent-status "
+            "--status working`) timed out — no turn start was observed within the "
+            "wait window. The marker+body was injected once; the rail may have "
+            "re-issued Enter within its bounded resend budget (see the turn-start "
+            "telemetry line for the exact re-send count). There is no landing-marker "
+            "or tmux-capture observation on this rail."
+        )
     if reason == "turn_start_unconfirmed":
         # Redmine #13166 shipped this for codex; #13262 generalized the standard
         # rail to claude. Name the actual rail from the receiver so a claude send
@@ -1424,12 +1515,20 @@ def _outcome_narrative(
             "confirm from tmux capture that the receiver started a turn."
         )
     if reason == "receiver_blocked":
+        # Redmine #13255 j#72695 (same-shaped-branch audit): the rail re-snapshots a
+        # runtime block only AFTER exhausting its bounded Enter-resend budget, so the
+        # marker+body was injected once but Enter MAY have been re-issued. The old
+        # "only Enter was sent; no re-send were issued" claim was false; report the
+        # bounded resend accurately (the exact count is in the turn-start telemetry
+        # line) and keep the no-C-u-rollback fact.
         return (
             "herdr turn-start rail (--mode standard): the notification was injected "
             "but the wait for a turn start timed out and a re-snapshot found the "
             "receiver in a runtime-blocked state (a permission / approval prompt is "
-            "on screen). The marker+body was typed exactly once and only Enter was "
-            "sent; no rollback and no re-send were issued."
+            "on screen). The marker+body was injected once; the rail may have "
+            "re-issued Enter within its bounded resend budget (see the turn-start "
+            "telemetry line for the exact re-send count) but no C-u rollback was "
+            "issued."
         )
     if reason == "turn_start_absent":
         return (
@@ -1500,7 +1599,13 @@ def _outcome_narrative(
     return "Handoff did not deliver; see structured outcome for details."
 
 
-def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Optional[str]:
+def _receiver_contract_line(
+    status: Status,
+    reason: Reason,
+    receiver: str,
+    *,
+    turn_start_outcome: Optional[str] = None,
+) -> Optional[str]:
     if status == "sent":
         return (
             f"Receiver-side contract: {receiver} must read the durable anchor "
@@ -1510,6 +1615,17 @@ def _receiver_contract_line(status: Status, reason: Reason, receiver: str) -> Op
         return (
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; nothing was submitted at the pane."
+        )
+    if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
+        # Redmine #13255 j#72695: the herdr rail DID inject the notification and
+        # press Enter (unlike the tmux `turn_start_unconfirmed` path's "nothing was
+        # re-submitted"); it just could not confirm a turn started before the event
+        # wait timed out. Say that accurately.
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            "manually if action is still required; the herdr turn-start rail "
+            "injected the notification but the event wait timed out without "
+            "confirming a turn started."
         )
     if reason == "turn_start_unconfirmed":
         return (
@@ -1712,7 +1828,7 @@ def build_delivery_record(
         *ticketless_consultation_lines(outcome.ticketless_consultation),
         *ticketless_work_intake_lines(outcome.ticketless_work_intake),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
-        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver)}",
+        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver, turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome))}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
     ]
     if command:
@@ -1853,7 +1969,12 @@ def build_delivery_record(
         lines.append("```text")
         lines.extend(role_profile_contract.splitlines())
         lines.append("```")
-    contract = _receiver_contract_line(outcome.status, outcome.reason, outcome.receiver)
+    contract = _receiver_contract_line(
+        outcome.status,
+        outcome.reason,
+        outcome.receiver,
+        turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome),
+    )
     if contract:
         lines.append("")
         lines.append(contract)
@@ -1878,6 +1999,7 @@ def make_outcome(
     ticketless_callback: Optional["TicketlessCallback"] = None,
     ticketless_consultation: Optional["TicketlessConsultation"] = None,
     ticketless_work_intake: Optional["TicketlessWorkIntake"] = None,
+    turn_start_outcome: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -1886,7 +2008,12 @@ def make_outcome(
     # `invalid_anchor` / `invalid_args` outcomes still carry the chosen
     # source system.
     resolved_source = anchor.source if anchor else source
-    owner, action = next_action_for(status, reason, receiver)
+    owner, action = next_action_for(
+        status,
+        reason,
+        receiver,
+        turn_start_outcome=_herdr_turn_start_token(turn_start_outcome),
+    )
     return DeliveryOutcome(
         status=status,
         reason=reason,
@@ -1920,6 +2047,7 @@ def make_outcome(
             if ticketless_work_intake
             else None
         ),
+        turn_start_outcome=turn_start_outcome,
     )
 
 

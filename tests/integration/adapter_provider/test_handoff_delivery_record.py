@@ -800,5 +800,121 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIn("Durable anchor: —", stdout)
 
 
+class HerdrTurnStartRecordWordingTest(unittest.TestCase):
+    """Redmine #13255 j#72695: the herdr rail's ``delivered_not_started`` reuses the
+    ``turn_start_unconfirmed`` reason but must NOT be described with the tmux/capture
+    standard rail's landing-marker / capture wording, and its machine-readable
+    telemetry must land structurally on the outcome JSON. The tmux/capture rail
+    (``turn_start_outcome=None``) keeps its pre-#13255 wording byte-for-byte.
+    """
+
+    def _anchor(self):
+        return normalize_anchor("redmine", issue="13255", journal="72695")
+
+    def _herdr_telemetry(self, outcome_token: str, *, snapshot="awaiting_input",
+                         wait_kind="timeout", enter_resends=0, reclassified=False):
+        return {
+            "outcome": outcome_token,
+            "snapshot_state": snapshot,
+            "wait_kind": wait_kind,
+            "enter_resends": enter_resends,
+            "reclassified_blocked": reclassified,
+        }
+
+    def test_herdr_delivered_not_started_record_has_no_capture_marker_wording(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="turn_start_unconfirmed",
+            receiver="claude",
+            target="%2",
+            anchor=self._anchor(),
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+            turn_start_outcome=self._herdr_telemetry(
+                "delivered_not_started", enter_resends=1
+            ),
+        )
+        record = build_delivery_record(outcome)
+        # The herdr rail has no landing-marker wait and no tmux capture.
+        self.assertNotIn("Landing marker was observed", record)
+        self.assertNotIn("tmux capture", record)
+        self.assertNotIn("typed exactly once", record)
+        # It DOES describe the event-wait timeout signal accurately.
+        self.assertIn("event wait", record)
+        self.assertIn("wait agent-status", record)
+        # The next-action is the herdr event-driven phrasing, not the capture rail's.
+        self.assertIn("event-driven", outcome.next_action)
+        self.assertNotIn("marker+body was typed once and Enter was pressed", outcome.next_action)
+
+    def test_herdr_delivered_not_started_carries_structured_telemetry_json(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="turn_start_unconfirmed",
+            receiver="claude",
+            target="%2",
+            anchor=self._anchor(),
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+            turn_start_outcome=self._herdr_telemetry(
+                "delivered_not_started", enter_resends=2
+            ),
+        )
+        payload = json.loads(outcome.to_json())
+        self.assertEqual(
+            {
+                "outcome": "delivered_not_started",
+                "snapshot_state": "awaiting_input",
+                "wait_kind": "timeout",
+                "enter_resends": 2,
+                "reclassified_blocked": False,
+            },
+            payload["turn_start_outcome"],
+        )
+
+    def test_herdr_receiver_blocked_record_does_not_claim_no_resend(self) -> None:
+        outcome = make_outcome(
+            status="blocked",
+            reason="receiver_blocked",
+            receiver="claude",
+            target="%2",
+            anchor=self._anchor(),
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+            turn_start_outcome=self._herdr_telemetry(
+                "blocked", wait_kind="timeout", enter_resends=1, reclassified=True
+            ),
+        )
+        record = build_delivery_record(outcome)
+        # The rail can bounded-resend Enter before the re-snapshot, so the old
+        # "no re-send were issued" claim was false.
+        self.assertNotIn("no re-send were issued", record)
+        self.assertIn("bounded resend budget", record)
+
+    def test_tmux_capture_turn_start_unconfirmed_wording_unchanged(self) -> None:
+        # The tmux/capture standard rail leaves turn_start_outcome unset — its record
+        # wording and next-action stay byte-identical to the pre-#13255 behaviour.
+        outcome = make_outcome(
+            status="blocked",
+            reason="turn_start_unconfirmed",
+            receiver="codex",
+            target="%2",
+            anchor=self._anchor(),
+            mode=MODE_STANDARD,
+            kind="implementation_request",
+            notification_marker="[marker]",
+        )
+        self.assertIsNone(outcome.turn_start_outcome)
+        record = build_delivery_record(outcome)
+        self.assertIn("Landing marker was observed and Enter was pressed", record)
+        self.assertIn("tmux capture", record)
+        self.assertNotIn("event wait", record)
+        self.assertIn("the marker+body was typed once and Enter was pressed", outcome.next_action)
+        # The structured field is absent from the JSON for the capture rail.
+        self.assertIsNone(json.loads(outcome.to_json())["turn_start_outcome"])
+
+
 if __name__ == "__main__":
     unittest.main()

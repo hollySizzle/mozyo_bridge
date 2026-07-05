@@ -411,6 +411,20 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(outcome.get("status"), "blocked", msg=out)
         self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
         self.assertIn("outcome delivered_not_started", out)
+        # Redmine #13255 j#72695: the machine-readable telemetry is a structured
+        # field on the JSON outcome (not just the human record line), so the future
+        # #12656 ledger reads it and does not have to parse prose.
+        ts = outcome.get("turn_start_outcome")
+        self.assertIsInstance(ts, dict, msg=out)
+        self.assertEqual(ts.get("outcome"), "delivered_not_started", msg=out)
+        self.assertEqual(ts.get("snapshot_state"), "awaiting_input", msg=out)
+        self.assertEqual(ts.get("wait_kind"), "timeout", msg=out)
+        # Redmine #13255 j#72695: the record wording must describe a herdr event-wait
+        # timeout, NOT the tmux/capture standard rail's landing-marker observation.
+        self.assertIn("event wait", out)
+        self.assertIn("wait agent-status", out)
+        self.assertNotIn("Landing marker was observed and Enter was pressed", out)
+        self.assertNotIn("tmux capture", out)
 
     def test_blocked_projects_to_receiver_blocked(self) -> None:
         # Wait times out; the re-snapshot finds a runtime block → `receiver_blocked`.
@@ -426,6 +440,15 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(outcome.get("reason"), "receiver_blocked", msg=out)
         self.assertIn("outcome blocked", out)
         self.assertIn("re-snapshot found block", out)
+        # Structured telemetry on the JSON outcome (reclassified block).
+        ts = outcome.get("turn_start_outcome")
+        self.assertIsInstance(ts, dict, msg=out)
+        self.assertEqual(ts.get("outcome"), "blocked", msg=out)
+        self.assertTrue(ts.get("reclassified_blocked"), msg=out)
+        # Redmine #13255 j#72695 (same-shaped-branch audit): the rail can bounded-
+        # resend Enter before the re-snapshot, so the record must not claim
+        # "no re-send were issued".
+        self.assertNotIn("no re-send were issued", out)
 
     def test_absent_projects_to_turn_start_absent(self) -> None:
         # The wait reports the target pane does not exist → `turn_start_absent`.
