@@ -265,6 +265,123 @@ class RedmineSourceTest(_StoreCase):
         self.assertIn("accepted: 1", out)
 
 
+class LivePollTest(_StoreCase):
+    """`workflow watch --poll` reads Redmine journal history live (Redmine #13289).
+
+    Hermetic: the live source's network seam is monkeypatched to a fake transport, so no real
+    Redmine / environment / secret is touched. Pins the opt-in wiring, the --source-issue
+    requirement, and that the live path feeds the same intake / persist / dedup as the snapshot.
+    """
+
+    def _patch_live_source(self, payload):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            cli_workflow_watch as mod,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+            LiveRedmineJournalSource,
+        )
+
+        def _fake_transport(*, base_url, api_key, issue_id, since):
+            return payload
+
+        def _fake_source(args):
+            since = (getattr(args, "since", None) or "").strip() or None
+            return LiveRedmineJournalSource(
+                base_url="https://redmine.example",
+                api_key="test-key",
+                transport=_fake_transport,
+                since=since,
+            )
+
+        original = mod._live_journal_source
+        mod._live_journal_source = _fake_source
+        self.addCleanup(lambda: setattr(mod, "_live_journal_source", original))
+
+    def _payload(self):
+        return {
+            "issue": {"id": "13289"},
+            "journals": [
+                {"id": "72671", "notes": "## Start\nno structured marker",
+                 "created_on": "2026-07-05T07:55:57Z"},
+                {
+                    "id": "72700",
+                    "notes": (
+                        "[mozyo:handoff:source=redmine:issue=13289:journal=72700:"
+                        "kind=review_request:to=codex]"
+                    ),
+                    "created_on": "2026-07-05T09:00:00Z",
+                },
+            ],
+        }
+
+    def test_poll_registers_flags(self):
+        parser = build_parser()
+        ns = parser.parse_args(
+            ["workflow", "watch", "--poll", "--source-issue", "13289", "--since", "2026-07-05T00:00:00Z"]
+        )
+        self.assertTrue(ns.poll)
+        self.assertEqual(ns.source_issue, "13289")
+        self.assertEqual(ns.since, "2026-07-05T00:00:00Z")
+
+    def test_poll_ingests_live_markers(self):
+        self._patch_live_source(self._payload())
+        rc, out = _run(
+            [
+                "workflow", "watch", "--poll", "--source-issue", "13289",
+                "--store-path", self.store_path,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("redmine:13289:72700 review_request -> accepted", out)
+        self.assertNotIn("redmine:13289:72671", out)
+        self.assertIn("accepted: 1", out)
+
+    def test_poll_persists_for_resume(self):
+        self._patch_live_source(self._payload())
+        _run(
+            ["workflow", "watch", "--poll", "--source-issue", "13289", "--store-path", self.store_path]
+        )
+        store = WorkflowRuntimeStore(path=Path(self.store_path))
+        self.assertEqual([r.event_id for r in store.read_events()], ["redmine:13289:72700"])
+
+    def test_poll_dedup_on_rerun(self):
+        self._patch_live_source(self._payload())
+        _run(
+            ["workflow", "watch", "--poll", "--source-issue", "13289", "--store-path", self.store_path]
+        )
+        rc, out = _run(
+            ["workflow", "watch", "--poll", "--source-issue", "13289", "--store-path", self.store_path]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted: 0 suppressed: 1", out)
+
+    def test_poll_without_source_issue_fails_closed(self):
+        self._patch_live_source(self._payload())
+        with self.assertRaises(SystemExit):
+            _run(["workflow", "watch", "--poll", "--store-path", self.store_path])
+
+    def test_no_poll_flag_does_not_read_live(self):
+        # Without --poll the live seam is never invoked (would raise if it were): default path
+        # stays the non-destructive snapshot / --marker intake.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            cli_workflow_watch as mod,
+        )
+
+        def _explode(args):
+            raise AssertionError("live source must not be built without --poll")
+
+        original = mod._live_journal_source
+        mod._live_journal_source = _explode
+        self.addCleanup(lambda: setattr(mod, "_live_journal_source", original))
+        rc, out = _run(
+            [
+                "workflow", "watch", "--marker", "13289:72700:review_request",
+                "--store-path", self.store_path,
+            ]
+        )
+        self.assertEqual(rc, 0)
+
+
 class PaneIdNeverEmittedTest(_StoreCase):
     def test_pane_id_is_not_in_output(self):
         rc, out = _run(
