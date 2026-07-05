@@ -52,6 +52,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
     LiveSublaneActuatorOps,
+    resolve_dispatch_admission_args,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     ACTUATE_BLOCKED,
@@ -60,8 +61,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_NOT_ATTEMPTED,
     DISPATCH_WORKER_DISPATCHED,
     REASON_ANCHOR_REQUIRED,
+    REASON_FILL_STOP,
     REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
+    evaluate_dispatch_admission,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
+    FillDecisionInputs,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneLaneView,
@@ -278,6 +286,8 @@ class WorkerDispatchUseCase:
         *,
         execute: bool,
         target_repo: str = "auto",
+        fill_inputs: Optional[FillDecisionInputs] = None,
+        override_fill_stop: Optional[str] = None,
     ) -> WorkerDispatchOutcome:
         # 1. Fail closed on missing identity before any probe.
         missing = request.missing_fields()
@@ -307,6 +317,31 @@ class WorkerDispatchUseCase:
                 execute=execute,
             )
 
+        # 2b. Dispatch admission gate (#13290, execute path only): consult the
+        # caller-supplied fill decision (the single #12855 authority) and fail closed
+        # on a concrete stop unless an explicit override reason is supplied. When no
+        # fill context is supplied the gate is not armed and this is a no-op, keeping
+        # the #12988 ack-drive contract byte-for-byte back-compatible. A dry-run never
+        # consults the gate (it performs no send to gate).
+        fill_decision_token: Optional[str] = None
+        fill_override_reason: Optional[str] = None
+        if execute:
+            admission = evaluate_dispatch_admission(
+                fill_inputs, override_reason=override_fill_stop
+            )
+            if admission.is_blocked:
+                return self._blocked(
+                    request,
+                    reason=admission.reason,
+                    reasons=(REASON_FILL_STOP,)
+                    + ((admission.fill_decision,) if admission.fill_decision else ()),
+                    target_repo=target_repo,
+                    execute=execute,
+                    fill_decision=admission.fill_decision,
+                )
+            fill_decision_token = admission.fill_decision
+            fill_override_reason = admission.override_reason
+
         # 3. Resolve the live lane for the worktree; no lane -> fail closed.
         lane = self.ops.read_lane(request.worktree_path)
         if lane is None:
@@ -318,6 +353,8 @@ class WorkerDispatchUseCase:
                 reasons=(REASON_LANE_NOT_RESOLVED,),
                 target_repo=target_repo,
                 execute=execute,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
             )
 
         # 4. Identity guard (j#70250): never forward #<issue> to a lane whose
@@ -336,6 +373,8 @@ class WorkerDispatchUseCase:
                 execute=execute,
                 gateway_pane=lane.gateway_pane,
                 worker_pane=lane.worker_pane,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
             )
 
         # 5. Both panes must be live: the worker is the transfer target and the
@@ -352,6 +391,8 @@ class WorkerDispatchUseCase:
                 execute=execute,
                 gateway_pane=lane.gateway_pane,
                 worker_pane=lane.worker_pane,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
             )
 
         command = _replayable_command(
@@ -422,13 +463,20 @@ class WorkerDispatchUseCase:
                 durable_anchor=(request.journal or None),
                 command=command,
                 blocked_reasons=(REASON_WORKER_DISPATCH_FAILED,),
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
             )
+        override_suffix = (
+            f" — fill-decision stop overridden (reason: {fill_override_reason})"
+            if fill_override_reason
+            else ""
+        )
         return WorkerDispatchOutcome(
             status=ACTUATE_EXECUTED,
             execute=True,
             reason="same-lane worker transfer delivery-acked "
             f"({detail}); worker_dispatch_confirmed=true (delivery ACK only — "
-            "not worker progress or completion)",
+            "not worker progress or completion)" + override_suffix,
             issue=request.issue,
             lane_label=request.lane_label,
             worktree_path=request.worktree_path,
@@ -438,6 +486,8 @@ class WorkerDispatchUseCase:
             dispatch_result=DISPATCH_WORKER_DISPATCHED,
             durable_anchor=(request.journal or None),
             command=command,
+            fill_decision=fill_decision_token,
+            fill_override_reason=fill_override_reason,
         )
 
     # -- helpers ------------------------------------------------------------
@@ -452,6 +502,8 @@ class WorkerDispatchUseCase:
         execute: bool,
         gateway_pane: Optional[str] = None,
         worker_pane: Optional[str] = None,
+        fill_decision: Optional[str] = None,
+        fill_override_reason: Optional[str] = None,
     ) -> WorkerDispatchOutcome:
         return WorkerDispatchOutcome(
             status=ACTUATE_BLOCKED,
@@ -474,6 +526,8 @@ class WorkerDispatchUseCase:
                 target_repo=target_repo,
             ),
             blocked_reasons=reasons,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
         )
 
 
@@ -527,11 +581,14 @@ def cmd_sublane_dispatch_worker(args: argparse.Namespace) -> int:
         worktree_path=str(repo_root),
         journal=getattr(args, "journal", None),
     )
+    fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
     use_case = WorkerDispatchUseCase(LiveWorkerDispatchOps(repo_root=repo_root))
     outcome = use_case.run(
         request,
         execute=execute,
         target_repo=getattr(args, "target_repo", None) or "auto",
+        fill_inputs=fill_inputs,
+        override_fill_stop=override_fill_stop,
     )
     if getattr(args, "json", False):
         print(

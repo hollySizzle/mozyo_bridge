@@ -72,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
     REASON_LAUNCH_BLOCKED,
+    REASON_FILL_STOP,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
     REASON_STAMP_FAILED,
@@ -84,6 +85,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ActuationStep,
     SublaneActuationOutcome,
     render_actuation_journal,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
+    evaluate_dispatch_admission,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
+    FillDecisionInputs,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     LAUNCH_BLOCKED,
@@ -340,6 +347,8 @@ class SublaneActuateUseCase:
         execute: bool,
         dispatch: bool = True,
         target_repo: str = "auto",
+        fill_inputs: Optional[FillDecisionInputs] = None,
+        override_fill_stop: Optional[str] = None,
     ) -> SublaneActuationOutcome:
         # 1. Fail closed on missing identity before any probe.
         missing = request.missing_fields()
@@ -378,6 +387,31 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
+        # 3b. Dispatch admission gate (#13290, execute path only): consult the
+        # caller-supplied fill decision (the single #12855 authority) and fail closed
+        # on a concrete stop unless an explicit override reason is supplied. When no
+        # fill context is supplied the gate is not armed and this is a no-op, keeping
+        # the #12973 live-actuation contract byte-for-byte back-compatible. A dry-run
+        # never consults the gate (it performs nothing to gate).
+        fill_decision_token: Optional[str] = None
+        fill_override_reason: Optional[str] = None
+        if execute:
+            admission = evaluate_dispatch_admission(
+                fill_inputs, override_reason=override_fill_stop
+            )
+            if admission.is_blocked:
+                return self._blocked(
+                    request,
+                    launch_action=None,
+                    reason=admission.reason,
+                    reasons=(REASON_FILL_STOP,)
+                    + ((admission.fill_decision,) if admission.fill_decision else ()),
+                    dispatch=dispatch,
+                    fill_decision=admission.fill_decision,
+                )
+            fill_decision_token = admission.fill_decision
+            fill_override_reason = admission.override_reason
+
         # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently
         # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
@@ -396,7 +430,14 @@ class SublaneActuateUseCase:
             return self._dry_run(request, launch, dispatch=dispatch)
 
         # 6. Live actuation, fail-closed, stopping at the first failure.
-        return self._execute(request, launch, dispatch=dispatch, target_repo=target_repo)
+        return self._execute(
+            request,
+            launch,
+            dispatch=dispatch,
+            target_repo=target_repo,
+            fill_decision=fill_decision_token,
+            fill_override_reason=fill_override_reason,
+        )
 
     # -- helpers ------------------------------------------------------------
 
@@ -412,6 +453,8 @@ class SublaneActuateUseCase:
         gateway_pane: Optional[str] = None,
         worker_pane: Optional[str] = None,
         adopted: bool = False,
+        fill_decision: Optional[str] = None,
+        fill_override_reason: Optional[str] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_BLOCKED,
@@ -430,6 +473,8 @@ class SublaneActuateUseCase:
             adopted=adopted,
             steps=steps,
             blocked_reasons=reasons,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
         )
 
     def _worktree_step_title(self, launch: WorktreeLaunchDecision) -> str:
@@ -513,6 +558,8 @@ class SublaneActuateUseCase:
         *,
         dispatch: bool,
         target_repo: str,
+        fill_decision: Optional[str] = None,
+        fill_override_reason: Optional[str] = None,
     ) -> SublaneActuationOutcome:
         steps: list[ActuationStep] = []
 
@@ -541,6 +588,8 @@ class SublaneActuateUseCase:
                     reasons=(REASON_WORKTREE_CREATE_FAILED,),
                     dispatch=dispatch,
                     steps=tuple(steps),
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
                 )
             steps.append(
                 ActuationStep(
@@ -605,6 +654,8 @@ class SublaneActuateUseCase:
                 steps=tuple(steps),
                 gateway_pane=existing.gateway_pane,
                 worker_pane=existing.worker_pane,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
             )
         adopted = bool(existing and existing.gateway_pane and existing.worker_pane)
         if adopted:
@@ -640,6 +691,8 @@ class SublaneActuateUseCase:
                     reasons=(REASON_PANE_CREATE_FAILED,),
                     dispatch=dispatch,
                     steps=tuple(steps),
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
                 )
             lane = self.ops.read_lane(request.worktree_path)
             if not (lane and lane.gateway_pane and lane.worker_pane):
@@ -660,6 +713,8 @@ class SublaneActuateUseCase:
                     reasons=(REASON_PANE_CREATE_FAILED,),
                     dispatch=dispatch,
                     steps=tuple(steps),
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
                 )
             steps.append(
                 ActuationStep(
@@ -694,6 +749,8 @@ class SublaneActuateUseCase:
                 gateway_pane=lane.gateway_pane if lane else None,
                 worker_pane=lane.worker_pane if lane else None,
                 adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
             )
         # Identity re-confirm on the resolved lane (covers the append path: an appended
         # lane whose stamped label / issue does not match the request is a mismatch too).
@@ -721,6 +778,8 @@ class SublaneActuateUseCase:
                 gateway_pane=lane.gateway_pane,
                 worker_pane=lane.worker_pane,
                 adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
             )
         gateway_pane = lane.gateway_pane
         worker_pane = lane.worker_pane
@@ -755,6 +814,8 @@ class SublaneActuateUseCase:
                 dispatch_result=DISPATCH_SKIPPED,
                 adopted=adopted,
                 steps=tuple(steps),
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
             )
 
         try:
@@ -819,6 +880,8 @@ class SublaneActuateUseCase:
             dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
             adopted=adopted,
             steps=tuple(steps),
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
         )
 
     def _executed(
@@ -832,6 +895,8 @@ class SublaneActuateUseCase:
         dispatch_result: str,
         adopted: bool,
         steps: tuple[ActuationStep, ...],
+        fill_decision: Optional[str] = None,
+        fill_override_reason: Optional[str] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_EXECUTED,
@@ -839,7 +904,8 @@ class SublaneActuateUseCase:
             reason="sublane actuated: "
             + ("adopted existing lane" if adopted else "created lane")
             + f"; launch action {launch.action!r}"
-            + self._dispatch_reason_suffix(dispatch_result),
+            + self._dispatch_reason_suffix(dispatch_result)
+            + self._fill_override_reason_suffix(fill_override_reason),
             issue=request.issue,
             lane_label=request.lane_label,
             branch=request.branch or None,
@@ -852,6 +918,8 @@ class SublaneActuateUseCase:
             durable_anchor=(request.journal or None),
             adopted=adopted,
             steps=steps,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
         )
 
     @staticmethod
@@ -869,6 +937,20 @@ class SublaneActuateUseCase:
         if dispatch_result == DISPATCH_SKIPPED:
             return " — dispatch skipped (--no-dispatch)"
         return ""
+
+    @staticmethod
+    def _fill_override_reason_suffix(fill_override_reason: Optional[str]) -> str:
+        """Spell out that a fill-decision stop was intentionally overridden (pure, #13290).
+
+        Keeps the executed outcome's reason honest: when the dispatch admission gate
+        classified a stop and the coordinator proceeded via an explicit override, the
+        record must say so (the override reason is also stored on the outcome and
+        rendered into the durable journal).
+        """
+        reason = (fill_override_reason or "").strip()
+        if not reason:
+            return ""
+        return f" — fill-decision stop overridden (reason: {reason})"
 
     def _dispatch_command(self, request: SublaneCreateRequest) -> str:
         journal = request.journal or "<journal>"
@@ -936,6 +1018,45 @@ def _repo_root(args: argparse.Namespace) -> Path:
     return Path(repo).expanduser() if repo else Path.cwd()
 
 
+def resolve_dispatch_admission_args(
+    args: argparse.Namespace,
+) -> tuple[Optional[FillDecisionInputs], Optional[str]]:
+    """Bind the #13290 dispatch-admission flags to (fill_inputs, override_reason).
+
+    Shared by ``sublane create`` and ``sublane dispatch-worker`` so the gate arms
+    identically on both live dispatch paths. ``--lane`` values are already parsed to
+    :class:`LaneState` by the argparse ``type`` at registration time.
+
+    The gate is **caller-armed**: it returns ``fill_inputs = None`` (gate not armed,
+    dispatch proceeds unchanged) unless the coordinator declared fill context — any
+    ``--lane`` / non-zero count / ``--owner-or-release-gate`` / ``--override-fill-stop``.
+    An override reason alone arms the gate (against the all-defaults
+    ``stop_no_ready_work``) so an explicit override is always a deliberate, recorded
+    act rather than a silent no-op.
+    """
+    lanes = tuple(getattr(args, "lane", None) or ())
+    ready_independent = int(getattr(args, "ready_independent", 0) or 0)
+    ready_overlap = int(getattr(args, "ready_overlap", 0) or 0)
+    capacity = int(getattr(args, "capacity", 0) or 0)
+    owner_gate = bool(getattr(args, "owner_or_release_gate", False))
+    override = (getattr(args, "override_fill_stop", None) or "").strip() or None
+
+    armed = bool(
+        lanes or ready_independent or ready_overlap or capacity or owner_gate or override
+    )
+    if not armed:
+        return None, override
+
+    fill_inputs = FillDecisionInputs(
+        lanes=lanes,
+        ready_independent_work=ready_independent,
+        ready_overlapping_work=ready_overlap,
+        capacity_remaining=capacity,
+        owner_or_release_gate_active=owner_gate,
+    )
+    return fill_inputs, override
+
+
 def cmd_sublane_start(args: argparse.Namespace) -> int:
     """``sublane create`` / ``start`` dispatcher.
 
@@ -973,12 +1094,15 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         work_unit=work_unit,
         work_unit_decision_anchor=decision_anchor,
     )
+    fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
     use_case = SublaneActuateUseCase(LiveSublaneActuatorOps(repo_root=repo_root))
     outcome = use_case.run(
         request,
         execute=execute and not dry_run,
         dispatch=not getattr(args, "no_dispatch", False),
         target_repo=getattr(args, "target_repo", None) or "auto",
+        fill_inputs=fill_inputs,
+        override_fill_stop=override_fill_stop,
     )
     if getattr(args, "json", False):
         print(
@@ -995,6 +1119,7 @@ __all__ = (
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
     "SublaneActuateUseCase",
+    "resolve_dispatch_admission_args",
     "format_actuate_text",
     "cmd_sublane_start",
 )

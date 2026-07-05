@@ -176,6 +176,11 @@ class WorkerDispatchOutcome:
     durable_anchor: Optional[str] = None
     command: Optional[str] = None
     blocked_reasons: Tuple[str, ...] = ()
+    # #13290 dispatch admission gate: the concrete FILL_* token the caller-supplied
+    # fill decision resolved to (``None`` when the gate was not armed), and the
+    # explicit override reason recorded when a stop was intentionally proceeded past.
+    fill_decision: Optional[str] = None
+    fill_override_reason: Optional[str] = None
 
     @property
     def is_blocked(self) -> bool:
@@ -212,6 +217,8 @@ class WorkerDispatchOutcome:
             "durable_anchor": self.durable_anchor,
             "command": self.command,
             "blocked_reasons": list(self.blocked_reasons),
+            "fill_decision": self.fill_decision,
+            "fill_override_reason": self.fill_override_reason,
         }
 
 
@@ -247,6 +254,13 @@ def render_worker_dispatch_journal(outcome: WorkerDispatchOutcome) -> str:
         f"- worker_dispatch_confirmed: {str(outcome.worker_dispatch_confirmed).lower()}",
         f"- durable_anchor: {outcome.durable_anchor or '-'}",
     ]
+    # #13290: record the consulted fill decision and any explicit override so the
+    # durable record carries the admission decision (reason + anchor) that let a
+    # stop-classified worker dispatch proceed. Emitted only when the gate was armed.
+    if outcome.fill_decision is not None:
+        lines.append(f"- fill_decision: {outcome.fill_decision}")
+    if outcome.fill_override_reason is not None:
+        lines.append(f"- fill_stop_override: {outcome.fill_override_reason}")
     if outcome.command:
         lines.append(f"- command: `{outcome.command}`")
     if outcome.is_blocked:
