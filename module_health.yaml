@@ -1243,32 +1243,3 @@ allowlist:
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
-
-  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator.py
-    lines: 1367
-    reason: >-
-      Creation-side live actuator (`SublaneActuateUseCase` + the `SublaneActuatorOps`
-      port / `LiveSublaneActuatorOps` adapter + the thin `cmd_sublane_start` handler).
-      Was exactly 1000 (at the ceiling) until the #13290 dispatch-admission gate wiring
-      tipped it to 1130. The gate's pure decision logic does NOT live here — it is the
-      new `domain/sublane_dispatch_admission.py` (`evaluate_dispatch_admission`),
-      delegating the concrete stop vocabulary to the single #12855 `evaluate_fill_decision`
-      authority. Only the wiring raises the count: the `fill_inputs` / `override_fill_stop`
-      params + step-3b consult in `run`, `resolve_dispatch_admission_args` (shared by the
-      sibling `sublane_worker_dispatcher`), the `_fill_override_reason_suffix` honest-record
-      helper, and threading `fill_decision` / `fill_override_reason` through the executed +
-      every post-gate blocked return. #13293 raised it to 1367 for the create-actuation
-      hardening: the pure per-step / outcome vocabulary stays in
-      `domain/sublane_actuation.py` (the `gateway_ready` field + journal line) and the git
-      command in the #12604 adapter — only the wiring lands here: the `base_ref` thread
-      into the worktree step + `_worktree_add_command`, the `quiet_stdout` `--json`
-      envelope redirect in `_drive_cli`, and the bounded, non-fatal pre-dispatch gateway
-      readiness wait (`_wait_gateway_ready` + the live `probe_gateway_ready` composing
-      `pane_info` / `is_receiver_agent_process` / `capture_pane`, the readiness
-      `ActuationStep`, and threading `gateway_ready` through the executed + blocked
-      returns). Allowlisted rather than extracting a sibling module (mirrors the
-      `cli_handoff.py` `--main-lane-exception` precedent); a follow-up decomposition of
-      this at-ceiling use case is the tracked resolution.
-    owner_issue: "#12321"
-    resolution_version: "v0.10.10 (Version #241)"
-    expires: "2027-11-30"
