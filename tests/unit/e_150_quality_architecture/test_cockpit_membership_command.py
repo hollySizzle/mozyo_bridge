@@ -126,6 +126,34 @@ class BuildMembershipObservationsTest(unittest.TestCase):
         self.assertEqual(2, len(obs))
         self.assertEqual({"default", "lane-x"}, {o.lane_id for o in obs})
 
+    def test_backend_defaults_to_tmux(self) -> None:
+        # No `backend` column key -> the observation is tmux (byte-invariant).
+        obs = build_membership_observations([_cockpit_window()], "s", lambda c, cl: "")
+        self.assertEqual("tmux", obs[0].backend)
+
+    def test_herdr_column_marks_unit_backend(self) -> None:
+        # A `backend: herdr` column threads through to the observation (#13298).
+        window = _cockpit_window(columns=[
+            {"pane_id": "%1", "workspace_id": "wsA", "role": "codex",
+             "lane_id": "default", "backend": "herdr"},
+            {"pane_id": "%2", "workspace_id": "wsA", "role": "claude",
+             "lane_id": "default", "backend": "herdr"},
+        ])
+        obs = build_membership_observations([window], "s", lambda c, cl: "")
+        self.assertEqual(1, len(obs))
+        self.assertEqual("herdr", obs[0].backend)
+
+    def test_any_non_tmux_column_marks_whole_unit(self) -> None:
+        # A single non-tmux column is enough to mark the Unit non-tmux.
+        window = _cockpit_window(columns=[
+            {"pane_id": "%1", "workspace_id": "wsA", "role": "codex",
+             "lane_id": "default"},
+            {"pane_id": "%2", "workspace_id": "wsA", "role": "claude",
+             "lane_id": "default", "backend": "herdr"},
+        ])
+        obs = build_membership_observations([window], "s", lambda c, cl: "")
+        self.assertEqual("herdr", obs[0].backend)
+
     def test_empty_windows_yield_no_observations(self) -> None:
         self.assertEqual([], build_membership_observations(None, "s", lambda c, cl: ""))
         self.assertEqual([], build_membership_observations([], "s", lambda c, cl: ""))

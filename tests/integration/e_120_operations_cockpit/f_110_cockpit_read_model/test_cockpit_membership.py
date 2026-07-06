@@ -293,6 +293,110 @@ class MembershipProjectionTest(unittest.TestCase):
         )
 
 
+class HerdrDegradeProjectionTest(unittest.TestCase):
+    """Degraded liveness projection for herdr Units (#13298 / #13263 j#72594).
+
+    A herdr-backed Unit must never show a stale tmux pane / geometry health: the
+    tmux-only fields degrade honestly. The tmux backend stays byte-invariant.
+    """
+
+    def _herdr_obs(self, **over):
+        # Deliberately carries tmux-shaped pane ids + a cockpit window so the test
+        # proves the projection ignores them and degrades, rather than passively
+        # rendering empties.
+        base = dict(codex="%99", claude="%100", window="cockpit", wid="@1")
+        base.update(over)
+        return membership.MembershipObservation(
+            workspace_id=base.get("ws", "wsH"),
+            lane_id=base.get("lane", "default"),
+            lane_label="",
+            codex_pane=base["codex"],
+            claude_pane=base["claude"],
+            window=base["window"],
+            window_id=base["wid"],
+            repo_root=base.get("repo_root", ""),
+            backend=membership.BACKEND_HERDR,
+        )
+
+    def _report(self, obs, facts=None, geometry=None):
+        return membership.project_membership_report(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[obs],
+            facts_by_workspace=facts or {"wsH": _facts(label="herdrA", repo="/repo/h")},
+            geometry=geometry,
+        )
+
+    def test_herdr_unit_degrades_every_tmux_only_field(self) -> None:
+        ws = self._report(self._herdr_obs()).workspaces[0]
+        self.assertEqual(membership.BACKEND_HERDR, ws.backend)
+        self.assertTrue(ws.member)  # loaded, just herdr-backed
+        # Structural tmux primitives -> unsupported.
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws.codex_pane)
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws.claude_pane)
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws.window)
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws.window_id)
+        # tmux liveness / health signal the cockpit cannot observe here.
+        self.assertEqual(membership.GEOM_BACKEND_UNAVAILABLE, ws.geometry_status)
+        # The degrade token must not be misread as a live pane.
+        self.assertFalse(ws.panes_present)
+        # A loaded herdr Unit is ok (not a tmux geometry fault).
+        self.assertTrue(ws.ok)
+        self.assertIn(
+            membership.WARN_TMUX_FIELDS_DEGRADED, {w.code for w in ws.warnings}
+        )
+
+    def test_herdr_unit_never_shows_stale_tmux_health(self) -> None:
+        # Even handed a *healthy* tmux geometry for the same workspace id, the
+        # herdr Unit must not borrow it: no GEOM_OK, no live pane ids leak through.
+        report = self._report(
+            self._herdr_obs(ws="wsA", codex="%99", claude="%100"),
+            facts={"wsA": _facts()},
+            geometry=_healthy_geometry(),
+        )
+        ws = report.workspaces[0]
+        self.assertNotEqual(membership.GEOM_OK, ws.geometry_status)
+        self.assertEqual(membership.GEOM_BACKEND_UNAVAILABLE, ws.geometry_status)
+        self.assertNotIn("%99", (ws.codex_pane, ws.claude_pane))
+
+    def test_report_ok_true_with_loaded_herdr_unit(self) -> None:
+        # A herdr Unit's backend_unavailable geometry must not fail report.ok.
+        self.assertTrue(self._report(self._herdr_obs()).ok)
+
+    def test_herdr_json_carries_backend_and_degrade_tokens(self) -> None:
+        ws = self._report(self._herdr_obs()).as_dict()["workspaces"][0]
+        self.assertEqual(membership.BACKEND_HERDR, ws["backend"])
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws["codex_pane"])
+        self.assertEqual(
+            membership.GEOM_BACKEND_UNAVAILABLE, ws["geometry_status"]
+        )
+        self.assertFalse(ws["panes_present"])
+
+    def test_herdr_text_names_backend_and_shows_degraded_cells(self) -> None:
+        text = membership.format_membership_text(self._report(self._herdr_obs()))
+        self.assertIn("backend: herdr", text)
+        self.assertIn(membership.FIELD_UNSUPPORTED, text)
+        self.assertIn(membership.GEOM_BACKEND_UNAVAILABLE, text)
+
+    def test_tmux_unit_backend_defaults_and_stays_unchanged(self) -> None:
+        # Regression: the default (tmux) observation is byte-invariant — backend
+        # is "tmux", the live cells are unchanged, and no backend note is emitted.
+        report = membership.project_membership_report(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[_obs()],
+            facts_by_workspace={"wsA": _facts()},
+            geometry=_healthy_geometry(),
+        )
+        ws = report.workspaces[0]
+        self.assertEqual(membership.BACKEND_TMUX, ws.backend)
+        self.assertEqual("%99", ws.codex_pane)
+        self.assertEqual(membership.GEOM_OK, ws.geometry_status)
+        self.assertTrue(ws.panes_present)
+        self.assertEqual(membership.BACKEND_TMUX, ws.as_dict()["backend"])
+        self.assertNotIn("backend:", membership.format_membership_text(report))
+
+
 class CockpitListStatusCliTest(unittest.TestCase):
     """The read-only `cmd_cockpit` `list` / `status` handlers (hermetic)."""
 
@@ -378,6 +482,39 @@ class CockpitListStatusCliTest(unittest.TestCase):
         self.assertEqual("%99", ws["codex_pane"])
         self.assertEqual("ok", ws["geometry_status"])
         self.assertTrue(ws["member"])
+
+    def _herdr_window(self):
+        # A managed cockpit window whose columns are tagged herdr-backed.
+        return [{
+            "window_id": "@1", "window": "cockpit", "group_id": "",
+            "columns": [
+                {"pane_id": "%99", "workspace_id": "wsA", "role": "codex",
+                 "lane_id": "default", "pane_left": 0, "pane_width": 80,
+                 "backend": "herdr"},
+                {"pane_id": "%100", "workspace_id": "wsA", "role": "claude",
+                 "lane_id": "default", "pane_left": 0, "pane_width": 80,
+                 "backend": "herdr"},
+            ],
+        }]
+
+    def test_list_herdr_column_degrades_json(self) -> None:
+        # End-to-end: a herdr-tagged column degrades the tmux-only fields through
+        # the whole `cockpit list` handler, never leaking the stale pane ids.
+        with self._patched(
+            windows=self._herdr_window(),
+            geo_panes=self._geo_panes(),  # tmux geometry present but must be ignored
+            facts={"wsA": _facts(label="alpha", repo="/repo/alpha")},
+        ) as commands:
+            rc, out = self._run(commands, self._args(action="list", json_output=True))
+        self.assertEqual(0, rc)
+        ws = json.loads(out)["workspaces"][0]
+        self.assertEqual("herdr", ws["backend"])
+        self.assertEqual(membership.FIELD_UNSUPPORTED, ws["codex_pane"])
+        self.assertEqual(
+            membership.GEOM_BACKEND_UNAVAILABLE, ws["geometry_status"]
+        )
+        self.assertTrue(ws["member"])
+        self.assertNotIn("%99", out)
 
     def test_list_no_cockpit_exits_zero(self) -> None:
         # No cockpit session running at all: still exit 0 (a valid state), and
