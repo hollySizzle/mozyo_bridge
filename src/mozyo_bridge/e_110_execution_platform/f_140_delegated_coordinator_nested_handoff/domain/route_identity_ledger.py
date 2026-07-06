@@ -450,19 +450,15 @@ def resolve_route(
     )
 
 
-def resolve_for_route_target(
+def enforce_route_target_guards(
     target_token: str,
     identity: RouteIdentity,
-    inventory: Sequence[Mapping[str, object]],
     *,
     cross_project: bool = False,
-) -> RouteResolution:
-    """Re-resolve a #12550 logical route target, enforcing the routing guards.
+) -> None:
+    """Run the fail-closed routing guards for a #12550 logical route target.
 
-    Bridges the planner's logical vocabulary
-    (:data:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.TARGET_SAME_LANE_WORKER`
-    and friends) to live re-resolution. Two fail-closed guards run before any
-    live match, mirroring the planner's invariants:
+    Two guards run before any live match, mirroring the planner's invariants:
 
     - A ``same_lane_worker`` (Claude) target may never be re-resolved across a
       project boundary — that is a direct cross-project Claude send and raises
@@ -473,7 +469,11 @@ def resolve_for_route_target(
       worker token to a Claude pane); a mismatch is a malformed re-resolution
       request and raises.
 
-    Once the guards pass, resolution delegates to :func:`resolve_route`.
+    Extracted so the tmux ledger resolver (:func:`resolve_for_route_target`) and
+    the backend-neutral bridge
+    (:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver.resolve_for_route_target_neutral`,
+    Redmine #13302) share the identical guard vocabulary without either forking
+    it. Returns ``None`` on success; raises on a guard violation.
     """
     expected_role = ROUTE_TARGET_EXPECTED_ROLE.get(target_token)
     if expected_role is None:
@@ -490,6 +490,24 @@ def resolve_for_route_target(
             f"route target {target_token!r} expects role {expected_role!r} but the "
             f"ledgered identity carries role {identity.role!r}"
         )
+
+
+def resolve_for_route_target(
+    target_token: str,
+    identity: RouteIdentity,
+    inventory: Sequence[Mapping[str, object]],
+    *,
+    cross_project: bool = False,
+) -> RouteResolution:
+    """Re-resolve a #12550 logical route target, enforcing the routing guards.
+
+    Bridges the planner's logical vocabulary
+    (:data:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.TARGET_SAME_LANE_WORKER`
+    and friends) to live re-resolution. The fail-closed guards
+    (:func:`enforce_route_target_guards`) run before any live match; once they
+    pass, resolution delegates to :func:`resolve_route`.
+    """
+    enforce_route_target_guards(target_token, identity, cross_project=cross_project)
     return resolve_route(identity, inventory)
 
 

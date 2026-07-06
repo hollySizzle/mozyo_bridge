@@ -22,11 +22,15 @@ contracts are exercised — ``delegated-coordinator-smoke-test-frame.md``
   (``failed_acceptance`` / ``blocked`` / ``insufficient``). The executor cannot
   upgrade a rejected plan into a live route.
 - **Re-resolve immediately before every send.** Each handoff / stamp hop
-  re-scans a freshly fetched live inventory through the ledger
-  (:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_for_route_target`),
-  so a moved pane is transparently recovered and a stale / ambiguous / missing
-  target fails closed *before* anything is sent. A cached ``last_seen_pane_id``
-  is never the send authority (#12553 Required behavior #2).
+  re-scans a freshly fetched live inventory through the backend-neutral resolver
+  (:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver.resolve_for_route_target_neutral`,
+  Redmine #13302), selected by :attr:`ExecutionContext.backend`: ``tmux`` (the
+  default) is byte-for-byte the ledger's
+  :func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_for_route_target`,
+  while ``herdr`` re-resolves the same injected snapshot as a live ``agent list``.
+  Either way a moved pane is transparently recovered and a stale / ambiguous /
+  missing target fails closed *before* anything is sent. A cached
+  ``last_seen_pane_id`` is never the send authority (#12553 Required behavior #2).
 - **Fail closed, and never count notification as evidence.** A fail-closed
   re-resolution blocks the route; a send that does not submit-complete is
   environmental; a forbidden cross-project Claude resolution is a routing
@@ -99,7 +103,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RouteIdentityLedger,
     RouteResolution,
     TARGET_UNAVAILABLE,
-    resolve_for_route_target,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
+    BACKEND_TMUX,
+    resolve_for_route_target_neutral,
 )
 
 #: A non-ledger resolution status used only inside an executor record when a hop
@@ -136,11 +143,14 @@ class DelegationRouteExecutorError(ValueError):
 
 @runtime_checkable
 class LiveInventoryProvider(Protocol):
-    """Fetches the current live pane inventory (the ``agents targets`` row shape).
+    """Fetches the current live inventory for the execution's backend.
 
     Called once per hop, immediately before re-resolution, so every send is
     matched against the *current* topology rather than a snapshot taken at plan
-    time. Returns the read-only row sequence
+    time. The row shape is the one the selected :attr:`ExecutionContext.backend`
+    expects — ``agents targets`` / ``try_pane_lines`` panes for ``tmux``, or a live
+    ``agent list`` snapshot for ``herdr`` (Redmine #13302); the backend-neutral
+    resolver normalizes either into the row sequence
     :func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_route` consumes.
     """
 
@@ -226,6 +236,15 @@ class ExecutionContext:
     callback record must account for. :attr:`contaminated` / :attr:`insufficient_read`
     carry an upstream read-boundary verdict into the classification so a
     contaminated read can never be reported as PASS.
+
+    :attr:`backend` selects the liveness backend the hop re-resolution matches
+    against (Redmine #13302): ``tmux`` (the default) re-resolves the injected
+    inventory as ``try_pane_lines`` rows — byte-for-byte the pre-#13302 behaviour
+    and record projection — while ``herdr`` re-resolves the same injected snapshot
+    as live ``agent list`` rows through the backend-neutral resolver. The backend
+    is a per-execution selector, not a per-identity field: the ledger identities
+    are backend-agnostic and the same fail-closed vocabulary is projected either
+    way.
     """
 
     source_issue: str
@@ -241,6 +260,7 @@ class ExecutionContext:
     contaminated: bool = False
     insufficient_read: bool = False
     cross_project: bool = True
+    backend: str = BACKEND_TMUX
 
 
 @dataclass(frozen=True)
@@ -536,10 +556,11 @@ class _Run:
             )
         inventory = self.executor._inventory.snapshot()
         try:
-            return resolve_for_route_target(
+            return resolve_for_route_target_neutral(
                 target_token,
                 identity,
                 inventory,
+                backend=self.context.backend,
                 cross_project=self.context.cross_project,
             )
         except DelegationRoutePlanError as exc:
@@ -580,10 +601,11 @@ class _Run:
         )
         inventory = self.executor._inventory.snapshot()
         try:
-            resolution = resolve_for_route_target(
+            resolution = resolve_for_route_target_neutral(
                 TARGET_SAME_LANE_WORKER,
                 identity,
                 inventory,
+                backend=self.context.backend,
                 cross_project=worker_cross_project,
             )
         except DelegationRoutePlanError as exc:

@@ -55,12 +55,20 @@ A decoded herdr agent can appear in a slot with **no** usable live locator (its
 ledger never hits this — a ``try_pane_lines`` row always has a pane id — but the
 herdr-identity domain treats it as a first-class fail-closed case
 (``rebind_missing_locator``: "refuse to report success with a blank target").
-:func:`resolve_route_neutral` preserves that fidelity: a clean single-identity
-match whose recovered locator is empty is downgraded from :data:`RESOLVE_OK` to
-:data:`ROUTE_LOCATOR_MISSING` rather than resolving to a blank target. It is kept
-distinct from :data:`TARGET_UNAVAILABLE` (the agent *is* live, just unaddressable)
-— the same distinction the herdr rebind draws between ``missing_locator`` and
-``not_found``.
+:func:`resolve_route_neutral` preserves that fidelity on the herdr backend: a clean
+single-identity match whose recovered locator is empty is downgraded from
+:data:`RESOLVE_OK` to :data:`ROUTE_LOCATOR_MISSING` rather than resolving to a blank
+target. It is kept distinct from :data:`TARGET_UNAVAILABLE` (the agent *is* live,
+just unaddressable) — the same distinction the herdr rebind draws between
+``missing_locator`` and ``not_found``.
+
+This downgrade is **backend-conditional (herdr only)** (Redmine #13302): the tmux
+backend never applies it, so ``resolve_route_neutral(tmux)`` is byte-for-byte the
+ledger's :func:`resolve_route` even for a malformed tmux row whose ``id`` is blank.
+This closes the #13297 j#72871 residual (a synthetic blank-id tmux row no longer
+diverges from :func:`resolve_route`) and makes the US 拘束 "tmux backend の解決結果
+は byte 不変" structural rather than dependent on the tmux input domain always
+carrying a pane id.
 
 Purity (mirrors the ledger + herdr-identity contracts): this module opens no
 subprocess, reads no env, scans no tmux, sends nothing. It is total functions over
@@ -86,6 +94,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ROUTE_LOCATOR_MISSING,
     RouteIdentity,
     RouteResolution,
+    enforce_route_target_guards,
     resolve_route,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -251,10 +260,25 @@ def resolve_route_neutral(
 
     An unsupported ``backend`` raises :class:`BackendNeutralResolverError`; every
     other outcome is a typed :class:`RouteResolution`.
+
+    The ``route_locator_missing`` downgrade is **backend-conditional (herdr only)**
+    (Redmine #13302, closing the #13297 j#72871 residual): the tmux backend never
+    downgrades, so ``resolve_route_neutral(tmux)`` is byte-for-byte the ledger's
+    :func:`resolve_route` even for a malformed tmux row whose ``id`` is blank. A
+    blank live locator is a first-class fail-closed case only on the herdr side,
+    where a decoded ``agent list`` row can genuinely lack a locator; a tmux
+    ``try_pane_lines`` row always carries a pane id, so gating the downgrade to
+    herdr changes no real tmux input and makes the "tmux 解決結果 byte 不変" 拘束
+    structural rather than input-domain-dependent.
     """
+    normalized_backend = _norm(backend)
     normalized = neutral_inventory(inventory, backend=backend)
     resolution = resolve_route(identity, normalized)
-    if resolution.status == RESOLVE_OK and not _norm(resolution.resolved_pane_id):
+    if (
+        normalized_backend == BACKEND_HERDR
+        and resolution.status == RESOLVE_OK
+        and not _norm(resolution.resolved_pane_id)
+    ):
         refreshed_identity = resolution.identity
         if refreshed_identity is not None:
             # Roll the cache back off the (blank) locator: a fail-closed result
@@ -275,6 +299,37 @@ def resolve_route_neutral(
     return resolution
 
 
+def resolve_for_route_target_neutral(
+    target_token: str,
+    identity: RouteIdentity,
+    inventory: Sequence[Mapping[str, object]],
+    *,
+    backend: str,
+    cross_project: bool = False,
+) -> RouteResolution:
+    """Re-resolve a #12550 logical route target against a backend's live inventory.
+
+    The backend-neutral analogue of the ledger's
+    :func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.resolve_for_route_target`
+    (Redmine #13302): it runs the identical fail-closed role / cross-project guards
+    (:func:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger.enforce_route_target_guards`)
+    and then delegates to :func:`resolve_route_neutral` for the selected backend.
+
+    For ``backend=tmux`` this is byte-for-byte the ledger's
+    :func:`resolve_for_route_target` — the same guards, and (since the
+    ``route_locator_missing`` downgrade is herdr-only) the same
+    :func:`resolve_route` outcome. For ``backend=herdr`` the target is re-resolved
+    against a live ``agent list`` inventory through the herdr adapter. This is the
+    live-executor wiring seam: the executor threads its ``ExecutionContext.backend``
+    here so a single re-resolution call site serves both backends without the
+    executor learning either row shape. An unsupported ``backend`` fails closed with
+    :class:`BackendNeutralResolverError`; a guard violation raises
+    :class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.DelegationRoutePlanError`.
+    """
+    enforce_route_target_guards(target_token, identity, cross_project=cross_project)
+    return resolve_route_neutral(identity, inventory, backend=backend)
+
+
 __all__ = (
     "BACKEND_HERDR",
     "BACKEND_TMUX",
@@ -285,4 +340,5 @@ __all__ = (
     "herdr_route_identity",
     "neutral_inventory",
     "resolve_route_neutral",
+    "resolve_for_route_target_neutral",
 )

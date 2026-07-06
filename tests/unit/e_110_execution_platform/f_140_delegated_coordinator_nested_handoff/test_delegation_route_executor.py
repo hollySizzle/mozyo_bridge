@@ -75,11 +75,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     StampOutcome,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
+    RESOLVE_OK,
+    ROUTE_LOCATOR_MISSING,
     RouteIdentity,
     RouteIdentityLedger,
     TARGET_AMBIGUOUS,
     TARGET_STALE,
     TARGET_UNAVAILABLE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (  # noqa: E402
+    BACKEND_HERDR,
+    herdr_route_identity,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402
+    encode_assigned_name,
 )
 
 # --- neutral placeholder identities (public/private boundary safe) ------------
@@ -566,6 +575,130 @@ class RetryIdempotenceTest(unittest.TestCase):
         self.assertEqual(
             [s.step_key for s in r1.sends], [s.step_key for s in r2.sends]
         )
+
+
+# --- herdr backend live re-resolution (#13302) --------------------------------
+
+
+def _herdr_ledger():
+    """A ledger of herdr route identities (canonical assigned-name stable labels).
+
+    Mirrors ``_ledger()`` but each identity's ``pane_name`` is the deterministic
+    canonical assigned name for its slot (via ``herdr_route_identity``), so it
+    matches the decoded ``agent list`` inventory row for that slot.
+    """
+    ledger = RouteIdentityLedger()
+    ledger.record(
+        herdr_route_identity(
+            workspace_id=WS_CHILD, role="codex", lane_id=LANE_DELEG,
+            route_id=RT_CHILD, last_seen_locator="w0:c0",
+        )
+    )
+    ledger.record(
+        herdr_route_identity(
+            workspace_id=WS_CHILD, role="codex", lane_id=LANE_GC,
+            route_id=RT_GC, last_seen_locator="w0:g0",
+        )
+    )
+    ledger.record(
+        herdr_route_identity(
+            workspace_id=WS_CHILD, role="claude", lane_id=LANE_GC,
+            route_id=RT_WORKER, last_seen_locator="w0:k0",
+        )
+    )
+    return ledger
+
+
+def _herdr_row(*, workspace_id, lane_id, role, locator):
+    """A live herdr ``agent list`` row; ``locator=None`` emits a locator-less row."""
+    row = {"name": encode_assigned_name(workspace_id, role, lane_id)}
+    if locator is not None:
+        row["pane_id"] = locator
+    return row
+
+
+def _herdr_inventory(*, worker_locator="w1:k9"):
+    """Live herdr inventory covering the child / grandchild / worker slots."""
+    return [
+        _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_DELEG, role="codex",
+                   locator="w1:c9"),
+        _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_GC, role="codex",
+                   locator="w1:g9"),
+        _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_GC, role="claude",
+                   locator=worker_locator),
+    ]
+
+
+class HerdrBackendExecutorTest(unittest.TestCase):
+    """Executor re-resolution against a live herdr ``agent list`` inventory."""
+
+    def test_herdr_route_resolves_and_passes(self):
+        handoff = FakeHandoff()
+        inv = FakeInventory(_herdr_inventory())
+        executor = _executor(inv, handoff, FakeStamp(), FakeSink())
+        result = executor.execute(
+            _grandchild_plan(), _herdr_ledger(), _context(backend=BACKEND_HERDR)
+        )
+        # Every hop resolved cleanly against the herdr inventory -> PASS.
+        self.assertEqual(result.classification, CLASS_PASS)
+        self.assertTrue(all(r.status == RESOLVE_OK for r in result.resolutions))
+        # Sends address the live herdr locators, not the cached last_seen values.
+        self.assertEqual(
+            [s.route_target for s in result.sends],
+            ["child_gateway", "grandchild_gateway", "same_lane_worker"],
+        )
+        self.assertEqual(
+            {s.pane_id for s in result.sends}, {"w1:c9", "w1:g9", "w1:k9"}
+        )
+
+    def test_herdr_locator_missing_worker_fails_closed(self):
+        # The worker agent is live in its slot but its agent-list row carries no
+        # usable locator -> route_locator_missing (herdr-only), fail closed, no
+        # blank-target send. The fail-closed vocabulary is projected unchanged.
+        handoff = FakeHandoff()
+        inv = FakeInventory(_herdr_inventory(worker_locator=None))
+        executor = _executor(inv, handoff, FakeStamp(), FakeSink())
+        result = executor.execute(
+            _grandchild_plan(), _herdr_ledger(), _context(backend=BACKEND_HERDR)
+        )
+        self.assertEqual(result.classification, CLASS_BLOCKED)
+        worker_res = result.resolutions[-1]
+        self.assertEqual(worker_res.status, ROUTE_LOCATOR_MISSING)
+        self.assertTrue(worker_res.is_fail_closed)
+        self.assertNotIn("same_lane_worker", [s.route_target for s in result.sends])
+
+    def test_herdr_ambiguous_slot_fails_closed(self):
+        # Two live agents decode to the child-gateway slot -> target_ambiguous;
+        # no send, blocked, and no downstream hops.
+        inv_rows = _herdr_inventory()
+        inv_rows.append(
+            _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_DELEG, role="codex",
+                       locator="w2:c2")
+        )
+        handoff = FakeHandoff()
+        executor = _executor(FakeInventory(inv_rows), handoff, FakeStamp(), FakeSink())
+        result = executor.execute(
+            _grandchild_plan(), _herdr_ledger(), _context(backend=BACKEND_HERDR)
+        )
+        self.assertEqual(result.classification, CLASS_BLOCKED)
+        self.assertEqual(result.resolutions[0].status, TARGET_AMBIGUOUS)
+        self.assertEqual(result.sends, ())
+
+    def test_herdr_unavailable_slot_fails_closed(self):
+        # No live claude agent for the worker slot -> target_unavailable.
+        rows = [
+            _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_DELEG, role="codex",
+                       locator="w1:c9"),
+            _herdr_row(workspace_id=WS_CHILD, lane_id=LANE_GC, role="codex",
+                       locator="w1:g9"),
+        ]
+        handoff = FakeHandoff()
+        executor = _executor(FakeInventory(rows), handoff, FakeStamp(), FakeSink())
+        result = executor.execute(
+            _grandchild_plan(), _herdr_ledger(), _context(backend=BACKEND_HERDR)
+        )
+        self.assertEqual(result.classification, CLASS_BLOCKED)
+        self.assertEqual(result.resolutions[-1].status, TARGET_UNAVAILABLE)
 
 
 if __name__ == "__main__":
