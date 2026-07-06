@@ -39,6 +39,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_STAMP_FAILED,
     REASON_WORK_UNIT_BLOCKED,
     REASON_WORKTREE_CREATE_FAILED,
+    STEP_EXECUTED,
+    STEP_READY,
+    STEP_SKIPPED,
+    render_actuation_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SublaneCreateRequest,
@@ -74,6 +78,7 @@ class FakeActuatorOps:
         dispatch_rc=0,
         dispatch_error=None,
         append_argv=None,
+        gateway_ready=True,
     ):
         self._git = git
         self._we = worktree_exists
@@ -86,6 +91,13 @@ class FakeActuatorOps:
         self._lane_seq = list(lanes) if lanes is not None else []
         self._dispatch_rc = dispatch_rc
         self._dispatch_error = dispatch_error
+        # #13293: gateway readiness probe result. A bool -> that value on every probe;
+        # a list/tuple -> consumed one per probe (front to back), last value sticky.
+        self._gateway_ready_seq = (
+            list(gateway_ready)
+            if isinstance(gateway_ready, (list, tuple))
+            else [gateway_ready]
+        )
         self.calls = []
 
     def is_git_workspace(self):
@@ -96,8 +108,9 @@ class FakeActuatorOps:
         self.calls.append(("worktree_exists", branch))
         return self._we
 
-    def create_worktree(self, *, branch, worktree_path):
-        self.calls.append(("create_worktree", branch, worktree_path))
+    def create_worktree(self, *, branch, worktree_path, base_ref=None):
+        # #13293: base_ref threaded through so the recorded call carries the pinned base.
+        self.calls.append(("create_worktree", branch, worktree_path, base_ref))
         if self._create_error is not None:
             raise self._create_error
 
@@ -116,6 +129,13 @@ class FakeActuatorOps:
         if not self._lane_seq:
             return None
         return self._lane_seq.pop(0)
+
+    def probe_gateway_ready(self, gateway_pane):
+        self.calls.append(("probe_gateway_ready", gateway_pane))
+        # Consume one scripted value per probe; the final value is sticky.
+        if len(self._gateway_ready_seq) > 1:
+            return bool(self._gateway_ready_seq.pop(0))
+        return bool(self._gateway_ready_seq[0]) if self._gateway_ready_seq else True
 
     def dispatch_implementation_request(self, **kwargs):
         self.calls.append(("dispatch", kwargs))
@@ -583,6 +603,287 @@ class LiveAppendLaneArgvTest(unittest.TestCase):
             with patch.object(LiveSublaneActuatorOps, "_drive_cli", side_effect=_capture):
                 ops.append_lane_column(wt_s)
             self.assertEqual(captured["argv"], expected)
+
+
+def _step(outcome, title):
+    return next(s for s in outcome.steps if s.title == title)
+
+
+class BaseRefContractTests(unittest.TestCase):
+    """#13293 evidence 1: --base-ref pins the worktree base (the j#72677 base trap)."""
+
+    def _create_call(self, ops):
+        return next(c for c in ops.calls if c[0] == "create_worktree")
+
+    def test_base_ref_threaded_into_create_worktree(self):
+        ops = FakeActuatorOps(git=True, worktree_exists=False, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(base_ref="origin/main"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        # the port received the pinned base positionally (branch, path, base_ref)
+        _, branch, path, base = self._create_call(ops)
+        self.assertEqual(base, "origin/main")
+        # the executed step command replays the base as the git positional
+        step = _step(outcome, "create worktree")
+        self.assertEqual(
+            step.command, "git worktree add /wt/12973 -b b origin/main"
+        )
+        self.assertIn("from base origin/main", step.detail)
+
+    def test_no_base_ref_is_historical_command(self):
+        ops = FakeActuatorOps(git=True, worktree_exists=False, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        _, branch, path, base = self._create_call(ops)
+        self.assertIsNone(base)
+        step = _step(outcome, "create worktree")
+        self.assertEqual(step.command, "git worktree add /wt/12973 -b b")
+        self.assertNotIn("from base", step.detail)
+
+    def test_dry_run_preview_reflects_base_ref(self):
+        outcome = SublaneActuateUseCase(FakeActuatorOps(git=True)).run(
+            _req(base_ref="b2de4aa"), execute=False
+        )
+        step = _step(outcome, "create worktree")
+        self.assertEqual(step.command, "git worktree add /wt/12973 -b b b2de4aa")
+
+    def test_live_git_ops_append_base_positional(self):
+        # #13293: the live git adapter appends the base as the <commit-ish> positional
+        # so a stale checkout can never silently cut the lane from an unintended base.
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
+            LiveSublaneGitOperations,
+        )
+
+        git = LiveSublaneGitOperations(repo_root=Path("/repo"))
+        seen = {}
+
+        def _fake_run(*args):
+            seen["args"] = args
+            return CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.object(LiveSublaneGitOperations, "_run", side_effect=_fake_run):
+            git.create_worktree(
+                branch="b", worktree_path="/wt", base_ref="origin/main"
+            )
+        self.assertEqual(
+            seen["args"], ("worktree", "add", "/wt", "-b", "b", "origin/main")
+        )
+
+    def test_live_git_ops_without_base_is_historical(self):
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
+            LiveSublaneGitOperations,
+        )
+
+        git = LiveSublaneGitOperations(repo_root=Path("/repo"))
+        seen = {}
+
+        def _fake_run(*args):
+            seen["args"] = args
+            return CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.object(LiveSublaneGitOperations, "_run", side_effect=_fake_run):
+            git.create_worktree(branch="b", worktree_path="/wt")
+        self.assertEqual(seen["args"], ("worktree", "add", "/wt", "-b", "b"))
+
+
+class GatewayReadinessContractTests(unittest.TestCase):
+    """#13293 evidence 3: the bounded, non-fatal pre-dispatch gateway readiness wait."""
+
+    def test_ready_on_first_probe_dispatches_into_live_composer(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()], gateway_ready=True)
+        slept = []
+        outcome = SublaneActuateUseCase(ops, sleep=slept.append).run(
+            _req(), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.gateway_ready)
+        # readiness confirmed before dispatch, and no back-off was needed
+        self.assertEqual(slept, [])
+        # the readiness step runs before dispatch (order 4 vs 5)
+        readiness = _step(outcome, "confirm gateway readiness")
+        dispatch = _step(outcome, "dispatch implementation_request")
+        self.assertEqual(readiness.status, STEP_EXECUTED)
+        self.assertLess(readiness.order, dispatch.order)
+        # the probe was consulted with the resolved gateway pane
+        self.assertIn(("probe_gateway_ready", "%120"), ops.calls)
+
+    def test_unready_then_ready_backs_off_until_ready(self):
+        # First two probes report not-ready, the third is ready -> two back-offs.
+        ops = FakeActuatorOps(
+            git=True, lanes=[None, _lane()], gateway_ready=[False, False, True]
+        )
+        slept = []
+        outcome = SublaneActuateUseCase(
+            ops, gateway_ready_probes=5, gateway_ready_interval_seconds=0.5,
+            sleep=slept.append,
+        ).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.gateway_ready)
+        self.assertEqual(slept, [0.5, 0.5])
+
+    def test_never_ready_degrades_but_still_dispatches(self):
+        # The rail is never hard-blocked: an unconfirmed readiness dispatches anyway.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()], gateway_ready=False)
+        slept = []
+        outcome = SublaneActuateUseCase(
+            ops, gateway_ready_probes=3, sleep=slept.append
+        ).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)  # NOT blocked
+        self.assertFalse(outcome.gateway_ready)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        self.assertIn("dispatch", ops._names())  # dispatch still happened
+        # probed the full window (3 probes, 2 back-offs) then degraded
+        self.assertEqual(slept, [0.5, 0.5])
+        readiness = _step(outcome, "confirm gateway readiness")
+        self.assertEqual(readiness.status, STEP_SKIPPED)
+        # the honest record warns the coordinator to watch for a no-progress lane
+        self.assertIn("readiness NOT confirmed", outcome.reason)
+        self.assertIn("- gateway_ready: false", render_actuation_journal(outcome))
+        self.assertIn("gateway_ready: false", format_actuate_text(outcome))
+
+    def test_disabled_wait_skips_probe_and_records_none(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops, gateway_ready_probes=0).run(
+            _req(), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertIsNone(outcome.gateway_ready)
+        self.assertNotIn("probe_gateway_ready", ops._names())
+        # a None readiness never renders a journal line (back-compat record)
+        self.assertNotIn("gateway_ready", render_actuation_journal(outcome))
+
+    def test_no_dispatch_never_probes_readiness(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+        self.assertIsNone(outcome.gateway_ready)
+        self.assertNotIn("probe_gateway_ready", ops._names())
+        self.assertEqual(_step(outcome, "confirm gateway readiness").status, STEP_SKIPPED)
+
+    def test_dry_run_shows_readiness_step_without_probing(self):
+        outcome = SublaneActuateUseCase(FakeActuatorOps(git=True)).run(
+            _req(), execute=False
+        )
+        readiness = _step(outcome, "confirm gateway readiness")
+        dispatch = _step(outcome, "dispatch implementation_request")
+        self.assertEqual(readiness.status, STEP_READY)
+        self.assertLess(readiness.order, dispatch.order)
+        self.assertIsNone(outcome.gateway_ready)
+
+    def test_dispatch_failure_still_records_readiness(self):
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()], dispatch_rc=1)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        self.assertTrue(outcome.gateway_ready)  # readiness was observed before the send
+
+
+class LiveGatewayReadyProbeTests(unittest.TestCase):
+    """The live ``probe_gateway_ready`` composes real pane primitives, never fatal."""
+
+    def _ops(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
+            LiveSublaneActuatorOps,
+        )
+
+        return LiveSublaneActuatorOps(repo_root=Path("/repo"))
+
+    def test_ready_when_agent_up_and_rendered(self):
+        from unittest.mock import patch
+
+        base = "mozyo_bridge.e_110_execution_platform"
+        with patch(
+            base + ".f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_info",
+            return_value={"command": "codex"},
+        ), patch(
+            base + ".f_120_agent_discovery_pane_resolution.domain.pane_resolver."
+            "is_receiver_agent_process",
+            return_value=True,
+        ), patch(
+            base + ".f_130_handoff_routing.infrastructure.tmux_client.capture_pane",
+            return_value="codex ready  context: 0%",
+        ):
+            self.assertTrue(self._ops().probe_gateway_ready("%14"))
+
+    def test_not_ready_when_process_not_agent(self):
+        from unittest.mock import patch
+
+        base = "mozyo_bridge.e_110_execution_platform"
+        with patch(
+            base + ".f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_info",
+            return_value={"command": "zsh"},
+        ), patch(
+            base + ".f_120_agent_discovery_pane_resolution.domain.pane_resolver."
+            "is_receiver_agent_process",
+            return_value=False,
+        ):
+            self.assertFalse(self._ops().probe_gateway_ready("%14"))
+
+    def test_probe_never_fatal_on_systemexit(self):
+        # pane_resolver.die() raises SystemExit when a pane disappears; the probe must
+        # swallow it and report not-ready, never crash the actuation.
+        from unittest.mock import patch
+
+        base = "mozyo_bridge.e_110_execution_platform"
+        with patch(
+            base + ".f_120_agent_discovery_pane_resolution.domain.pane_resolver.pane_info",
+            side_effect=SystemExit(1),
+        ):
+            self.assertFalse(self._ops().probe_gateway_ready("%14"))
+
+
+class JsonEnvelopeContractTests(unittest.TestCase):
+    """#13293 evidence 2: --json confines inner CLI progress text off stdout."""
+
+    def _drive_with_quiet(self, quiet):
+        import io
+        import contextlib as _ctx
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
+            LiveSublaneActuatorOps,
+        )
+
+        ops = LiveSublaneActuatorOps(repo_root=Path("/repo"), quiet_stdout=quiet)
+
+        class _Args:
+            def func(self, _a):
+                print("INNER-DELIVERY-PROGRESS")
+                return 0
+
+        fake_args = _Args()
+
+        out, err = io.StringIO(), io.StringIO()
+        # Patch the composed CLI parse so _drive_cli runs our printing stub handler.
+        with patch(
+            "mozyo_bridge.application.cli.build_parser"
+        ) as bp, patch(
+            "mozyo_bridge.application.cli.normalize_paths", side_effect=lambda a: a
+        ):
+            bp.return_value.parse_args.return_value = fake_args
+            fake_args.func = lambda a: (print("INNER-DELIVERY-PROGRESS"), 0)[1]
+            with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err):
+                rc = ops._drive_cli(["handoff", "send"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_quiet_routes_inner_text_to_stderr(self):
+        rc, out, err = self._drive_with_quiet(quiet=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")  # stdout stays a clean channel for the JSON envelope
+        self.assertIn("INNER-DELIVERY-PROGRESS", err)
+
+    def test_non_quiet_keeps_inner_text_on_stdout(self):
+        rc, out, err = self._drive_with_quiet(quiet=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("INNER-DELIVERY-PROGRESS", out)
 
 
 if __name__ == "__main__":

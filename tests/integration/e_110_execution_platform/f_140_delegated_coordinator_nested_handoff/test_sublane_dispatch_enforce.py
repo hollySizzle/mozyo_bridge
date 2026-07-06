@@ -107,7 +107,7 @@ class FakeActuatorOps:
     def worktree_exists(self, branch):
         return True  # reuse; no create_worktree
 
-    def create_worktree(self, *, branch, worktree_path):
+    def create_worktree(self, *, branch, worktree_path, base_ref=None):
         self.calls.append("create_worktree")
 
     def append_lane_column(self, worktree_path):
@@ -118,6 +118,12 @@ class FakeActuatorOps:
 
     def read_lane(self, worktree_path):
         return _lane()
+
+    def probe_gateway_ready(self, gateway_pane):
+        # #13293: this fake's lane is always ready, so the readiness wait resolves on
+        # the first probe (no back-off) and the dispatch-admission behavior is unchanged.
+        self.calls.append("probe_gateway_ready")
+        return True
 
     def dispatch_implementation_request(self, **kwargs):
         self.calls.append("dispatch")

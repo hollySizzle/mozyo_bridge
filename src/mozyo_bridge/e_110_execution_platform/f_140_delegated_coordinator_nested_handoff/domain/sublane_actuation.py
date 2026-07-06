@@ -238,6 +238,14 @@ class SublaneActuationOutcome:
     # explicit override reason recorded when a stop was intentionally proceeded past.
     fill_decision: Optional[str] = None
     fill_override_reason: Optional[str] = None
+    # #13293 gateway readiness wait: whether the freshly-launched gateway TUI was
+    # observed ready (codex foreground process + rendered pane) before the dispatch.
+    # ``True`` = confirmed ready and dispatched into a ready composer; ``False`` = the
+    # bounded wait elapsed unconfirmed and the dispatch proceeded anyway (the queue-
+    # enter rail never hard-blocks — the handoff Enter-only retry is the landing safety
+    # net, and the coordinator watches for a no-progress lane); ``None`` = not probed
+    # (dry-run, ``--no-dispatch``, wait disabled, or actuation blocked before dispatch).
+    gateway_ready: Optional[bool] = None
 
     @property
     def is_blocked(self) -> bool:
@@ -279,6 +287,7 @@ class SublaneActuationOutcome:
             "blocked_reasons": list(self.blocked_reasons),
             "fill_decision": self.fill_decision,
             "fill_override_reason": self.fill_override_reason,
+            "gateway_ready": self.gateway_ready,
         }
 
 
@@ -327,6 +336,11 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         lines.append(f"- fill_decision: {outcome.fill_decision}")
     if outcome.fill_override_reason is not None:
         lines.append(f"- fill_stop_override: {outcome.fill_override_reason}")
+    # #13293: record the pre-dispatch gateway readiness observation only when the wait
+    # actually ran (not dry-run / --no-dispatch / disabled), so the back-compat record
+    # stays byte-for-byte unchanged.
+    if outcome.gateway_ready is not None:
+        lines.append(f"- gateway_ready: {str(outcome.gateway_ready).lower()}")
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
         lines.append(

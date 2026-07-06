@@ -47,11 +47,13 @@ replayable payload; and the thin ``cmd_sublane_start`` handler owns stdout and t
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_append_argv import resolve_append_lane_argv  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
@@ -110,6 +112,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 
 # ---------------------------------------------------------------------------
+# Gateway readiness wait tuning (#13293). The pre-dispatch wait polls the gateway
+# pane up to ``DEFAULT_GATEWAY_READY_PROBES`` times at
+# ``DEFAULT_GATEWAY_READY_INTERVAL_SECONDS`` apart (≈ a 10s window by default) so a
+# freshly-launched Codex TUI has time to boot before the queue-enter dispatch — the
+# j#72677 / 5-example dispatch-loss failure mode was 100% "dispatch typed into a still-
+# booting composer". The wait NEVER hard-blocks the queue-enter rail: an unconfirmed
+# readiness degrades to a recorded ``gateway_ready=false`` and dispatches anyway.
+# ---------------------------------------------------------------------------
+
+DEFAULT_GATEWAY_READY_PROBES = 20
+DEFAULT_GATEWAY_READY_INTERVAL_SECONDS = 0.5
+#: How many rendered lines the live readiness probe captures from the gateway pane.
+GATEWAY_READY_CAPTURE_LINES = 40
+
+
+# ---------------------------------------------------------------------------
 # Injected actuation operations port.
 # ---------------------------------------------------------------------------
 
@@ -132,13 +150,27 @@ class SublaneActuatorOps(Protocol):
 
     def worktree_exists(self, branch: str) -> bool: ...
 
-    def create_worktree(self, *, branch: str, worktree_path: str) -> None: ...
+    def create_worktree(
+        self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
+    ) -> None: ...
 
     def append_lane_column(self, worktree_path: str) -> None: ...
 
     def append_lane_argv(self, worktree_path: str) -> list[str]: ...
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
+
+    def probe_gateway_ready(self, gateway_pane: str) -> bool:
+        """One non-fatal readiness snapshot of the gateway pane (#13293).
+
+        ``True`` when the gateway TUI is observed booted and rendered (its Codex
+        foreground process is up and the pane has drawn content), so a queue-enter
+        dispatch will land on a live composer rather than vanish into a still-booting
+        one. Any read failure (pane gone, not-yet-agent process, blank capture) returns
+        ``False`` — the caller polls this until ready or the bounded window elapses and
+        never treats a probe failure as fatal.
+        """
+        ...
 
     def dispatch_implementation_request(
         self,
@@ -163,9 +195,16 @@ class LiveSublaneActuatorOps:
     parser, so this adapter reuses the proven, fully-defaulted code path instead of
     reconstructing a fragile Namespace. ``read_lane`` folds the live tmux pane inventory and
     matches the lane by repo-root.
+
+    ``quiet_stdout`` (#13293): when set, the composed sub-CLI drives (cockpit append /
+    handoff send) have their stdout redirected to *stderr* so the actuator's own stdout
+    stays a single machine-readable JSON envelope — the coordinator's ``--json`` parse
+    broke on the interleaved delivery-progress text (j#72677 evidence 2). Off by default,
+    so the human-readable path keeps emitting the inner records inline on stdout.
     """
 
     repo_root: Path
+    quiet_stdout: bool = False
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
@@ -176,8 +215,12 @@ class LiveSublaneActuatorOps:
     def worktree_exists(self, branch: str) -> bool:
         return self._git().worktree_exists(branch)
 
-    def create_worktree(self, *, branch: str, worktree_path: str) -> None:
-        self._git().create_worktree(branch=branch, worktree_path=worktree_path)
+    def create_worktree(
+        self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
+    ) -> None:
+        self._git().create_worktree(
+            branch=branch, worktree_path=worktree_path, base_ref=base_ref
+        )
 
     def _drive_cli(self, argv: list[str]) -> int:
         """Parse ``argv`` with the composed CLI parser and run its handler (live).
@@ -192,6 +235,12 @@ class LiveSublaneActuatorOps:
 
         args = build_parser().parse_args(argv)
         args = normalize_paths(args)
+        # #13293: in ``--json`` mode confine the inner CLI's delivery-progress text to
+        # stderr so the actuator's stdout is a single JSON envelope; the record is still
+        # visible for diagnosis, just off the machine-readable channel.
+        if self.quiet_stdout:
+            with contextlib.redirect_stdout(sys.stderr):
+                return int(args.func(args))
         return int(args.func(args))
 
     def append_lane_argv(self, worktree_path: str) -> list[str]:
@@ -230,6 +279,30 @@ class LiveSublaneActuatorOps:
         if len(basename_matches) == 1:
             return basename_matches[0]
         return None
+
+    def probe_gateway_ready(self, gateway_pane: str) -> bool:
+        # #13293: one non-fatal readiness snapshot — the gateway's foreground process is
+        # the Codex TUI (strong per-receiver identity, the same check the queue-enter
+        # rail uses) AND the pane has rendered content (a booted TUI has drawn its UI;
+        # a blank capture is a pane still coming up). Any read failure (pane resolve /
+        # capture raising, incl. the pane_resolver `die()` == SystemExit) is treated as
+        # "not ready yet", never fatal — the caller polls this on a bounded window.
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (  # noqa: E501
+            is_receiver_agent_process,
+            pane_info,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (  # noqa: E501
+            capture_pane,
+        )
+
+        try:
+            info = pane_info(gateway_pane)
+            if not is_receiver_agent_process(info.get("command", ""), "codex"):
+                return False
+            rendered = capture_pane(gateway_pane, GATEWAY_READY_CAPTURE_LINES)
+        except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the actuation.
+            return False
+        return bool(rendered.strip())
 
     def dispatch_implementation_request(
         self,
@@ -295,6 +368,37 @@ class SublaneActuateUseCase:
 
     ops: SublaneActuatorOps
     policy: SublaneIntegrationPolicy = SublaneIntegrationPolicy.default()
+    # #13293 pre-dispatch gateway readiness wait (injectable for tests). ``probes<=0``
+    # disables the wait (back-compat immediate dispatch, ``gateway_ready`` stays None).
+    gateway_ready_probes: int = DEFAULT_GATEWAY_READY_PROBES
+    gateway_ready_interval_seconds: float = DEFAULT_GATEWAY_READY_INTERVAL_SECONDS
+    sleep: Callable[[float], None] = field(default=time.sleep)
+
+    def _wait_gateway_ready(
+        self, gateway_pane: Optional[str]
+    ) -> tuple[Optional[bool], int]:
+        """Bounded, non-fatal pre-dispatch readiness wait (#13293).
+
+        Polls :meth:`SublaneActuatorOps.probe_gateway_ready` up to
+        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart, so a
+        freshly-launched gateway TUI has time to boot before the queue-enter dispatch.
+        Returns ``(ready, probes_run)``. ``ready`` is ``None`` when the wait is disabled
+        (``probes<=0``) or no gateway pane resolved — nothing was probed. Otherwise it is
+        ``True`` on the first ready observation or ``False`` when the window elapses
+        unconfirmed. It NEVER raises and NEVER blocks the dispatch: an unconfirmed
+        ``False`` degrades to a recorded observation and the caller dispatches anyway
+        (the queue-enter rail never hard-blocks; the handoff Enter-only retry is the
+        landing safety net).
+        """
+        probes = self.gateway_ready_probes
+        if probes <= 0 or not gateway_pane:
+            return None, 0
+        for attempt in range(probes):
+            if self.ops.probe_gateway_ready(gateway_pane):
+                return True, attempt + 1
+            if attempt + 1 < probes:
+                self.sleep(self.gateway_ready_interval_seconds)
+        return False, probes
 
     @staticmethod
     def _identity_matches(
@@ -458,6 +562,7 @@ class SublaneActuateUseCase:
         adopted: bool = False,
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
+        gateway_ready: Optional[bool] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_BLOCKED,
@@ -478,7 +583,20 @@ class SublaneActuateUseCase:
             blocked_reasons=reasons,
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
+            gateway_ready=gateway_ready,
         )
+
+    @staticmethod
+    def _worktree_add_command(request: SublaneCreateRequest) -> str:
+        """The replayable ``git worktree add`` command for the request (pure, #13293).
+
+        Appends the explicit ``base_ref`` positional when supplied so the recorded /
+        previewed command matches what the live actuator runs (base off the pinned ref
+        instead of the ambient checkout HEAD).
+        """
+        base = (request.base_ref or "").strip()
+        command = f"git worktree add {request.worktree_path} -b {request.branch}"
+        return f"{command} {base}" if base else command
 
     def _worktree_step_title(self, launch: WorktreeLaunchDecision) -> str:
         if launch.action == LAUNCH_CREATE_WORKTREE:
@@ -495,7 +613,7 @@ class SublaneActuateUseCase:
         dispatch: bool,
     ) -> SublaneActuationOutcome:
         wt_command = (
-            f"git worktree add {request.worktree_path} -b {request.branch}"
+            self._worktree_add_command(request)
             if launch.action == LAUNCH_CREATE_WORKTREE
             else None
         )
@@ -524,8 +642,22 @@ class SublaneActuateUseCase:
                 "both panes and its identity stamps",
                 command=None,
             ),
+            # #13293: the pre-dispatch gateway readiness wait (bounded, non-fatal) that
+            # --execute would run before the queue-enter dispatch.
             ActuationStep(
                 order=4,
+                title="confirm gateway readiness",
+                status=STEP_READY if dispatch else STEP_SKIPPED,
+                detail="wait (bounded, non-fatal) for the gateway TUI to boot + render "
+                "before the queue-enter dispatch so the input lands on a live composer; "
+                "an unconfirmed readiness degrades to gateway_ready=false and dispatches "
+                "anyway (never hard-blocks the queue-enter rail)"
+                if dispatch
+                else "dispatch skipped (--no-dispatch); gateway readiness not probed",
+                command=None,
+            ),
+            ActuationStep(
+                order=5,
                 title="dispatch implementation_request",
                 status=STEP_READY if dispatch else STEP_SKIPPED,
                 detail="route the governed implementation_request to the gateway "
@@ -570,7 +702,9 @@ class SublaneActuateUseCase:
         if launch.action == LAUNCH_CREATE_WORKTREE:
             try:
                 self.ops.create_worktree(
-                    branch=request.branch, worktree_path=request.worktree_path
+                    branch=request.branch,
+                    worktree_path=request.worktree_path,
+                    base_ref=request.base_ref,
                 )
             except Exception as exc:  # noqa: BLE001 — surface any git failure fail-closed.
                 steps.append(
@@ -579,8 +713,7 @@ class SublaneActuateUseCase:
                         title="create worktree",
                         status=STEP_BLOCKED,
                         detail=f"git worktree add failed: {exc}",
-                        command=f"git worktree add {request.worktree_path} "
-                        f"-b {request.branch}",
+                        command=self._worktree_add_command(request),
                     )
                 )
                 return self._blocked(
@@ -600,9 +733,13 @@ class SublaneActuateUseCase:
                     title="create worktree",
                     status=STEP_EXECUTED,
                     detail=f"created worktree {request.worktree_path} on branch "
-                    f"{request.branch}",
-                    command=f"git worktree add {request.worktree_path} -b "
-                    f"{request.branch}",
+                    f"{request.branch}"
+                    + (
+                        f" from base {request.base_ref}"
+                        if (request.base_ref or "").strip()
+                        else ""
+                    ),
+                    command=self._worktree_add_command(request),
                 )
             )
         elif launch.action == LAUNCH_REUSE_WORKTREE:
@@ -797,11 +934,21 @@ class SublaneActuateUseCase:
             )
         )
 
-        # Step 4 — dispatch the governed implementation_request to the gateway.
+        # Step 4 (--no-dispatch) — nothing to dispatch, so nothing to make ready.
         if not dispatch:
             steps.append(
                 ActuationStep(
                     order=4,
+                    title="confirm gateway readiness",
+                    status=STEP_SKIPPED,
+                    detail="dispatch skipped (--no-dispatch); gateway readiness not "
+                    "probed (no queue-enter dispatch to land)",
+                    command=None,
+                )
+            )
+            steps.append(
+                ActuationStep(
+                    order=5,
                     title="dispatch implementation_request",
                     status=STEP_SKIPPED,
                     detail="dispatch skipped (--no-dispatch); create/adopt only",
@@ -821,6 +968,45 @@ class SublaneActuateUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
+        # Step 4 — pre-dispatch gateway readiness wait (#13293). Give a freshly-launched
+        # gateway TUI time to boot before the queue-enter dispatch so the input lands on
+        # a live composer instead of vanishing into a still-booting one (the j#72677 /
+        # 5-example, 100%-reproduction dispatch-loss failure mode). This NEVER hard-blocks
+        # the queue-enter rail (#13262/#13255): an unconfirmed readiness degrades to a
+        # recorded ``gateway_ready=false`` and the dispatch proceeds anyway — the handoff
+        # Enter-only retry (#12580/#12581) is the landing safety net and the coordinator
+        # watches for a no-progress lane.
+        gateway_ready, ready_probes = self._wait_gateway_ready(gateway_pane)
+        if gateway_ready is None:
+            readiness_detail = (
+                "gateway readiness wait disabled (--gateway-ready-timeout 0); "
+                "dispatching immediately"
+            )
+            readiness_status = STEP_SKIPPED
+        elif gateway_ready:
+            readiness_detail = (
+                f"gateway {gateway_pane} ready (codex TUI booted + rendered) after "
+                f"{ready_probes} probe(s); dispatching into a live composer"
+            )
+            readiness_status = STEP_EXECUTED
+        else:
+            readiness_detail = (
+                f"gateway {gateway_pane} readiness unconfirmed after {ready_probes} "
+                "probe(s); dispatching anyway (queue-enter rail never hard-blocks — the "
+                "handoff Enter-only retry is the landing safety net). Recorded "
+                "gateway_ready=false so a no-progress lane is watched for"
+            )
+            readiness_status = STEP_SKIPPED
+        steps.append(
+            ActuationStep(
+                order=4,
+                title="confirm gateway readiness",
+                status=readiness_status,
+                detail=readiness_detail,
+                command=None,
+            )
+        )
+
         try:
             rc = self.ops.dispatch_implementation_request(
                 issue=request.issue,
@@ -838,7 +1024,7 @@ class SublaneActuateUseCase:
         if rc != 0:
             steps.append(
                 ActuationStep(
-                    order=4,
+                    order=5,
                     title="dispatch implementation_request",
                     status=STEP_BLOCKED,
                     detail=dispatch_detail,
@@ -858,10 +1044,11 @@ class SublaneActuateUseCase:
                 adopted=adopted,
                 fill_decision=fill_decision,
                 fill_override_reason=fill_override_reason,
+                gateway_ready=gateway_ready,
             )
         steps.append(
             ActuationStep(
-                order=4,
+                order=5,
                 title="dispatch implementation_request",
                 status=STEP_EXECUTED,
                 # #12986: name the step for what it proves — the gateway was
@@ -887,6 +1074,7 @@ class SublaneActuateUseCase:
             steps=tuple(steps),
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
+            gateway_ready=gateway_ready,
         )
 
     def _executed(
@@ -902,6 +1090,7 @@ class SublaneActuateUseCase:
         steps: tuple[ActuationStep, ...],
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
+        gateway_ready: Optional[bool] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_EXECUTED,
@@ -910,6 +1099,7 @@ class SublaneActuateUseCase:
             + ("adopted existing lane" if adopted else "created lane")
             + f"; launch action {launch.action!r}"
             + self._dispatch_reason_suffix(dispatch_result)
+            + self._gateway_ready_reason_suffix(dispatch_result, gateway_ready)
             + self._fill_override_reason_suffix(fill_override_reason),
             issue=request.issue,
             lane_label=request.lane_label,
@@ -925,6 +1115,7 @@ class SublaneActuateUseCase:
             steps=steps,
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
+            gateway_ready=gateway_ready,
         )
 
     @staticmethod
@@ -941,6 +1132,26 @@ class SublaneActuateUseCase:
             )
         if dispatch_result == DISPATCH_SKIPPED:
             return " — dispatch skipped (--no-dispatch)"
+        return ""
+
+    @staticmethod
+    def _gateway_ready_reason_suffix(
+        dispatch_result: str, gateway_ready: Optional[bool]
+    ) -> str:
+        """Spell out an unconfirmed pre-dispatch gateway readiness (pure, #13293).
+
+        Only a gateway-notified dispatch whose pre-dispatch readiness wait elapsed
+        unconfirmed (``gateway_ready is False``) gets a clause: the input was dispatched
+        into a gateway TUI that never confirmed ready, so the coordinator is told to
+        watch for a no-progress lane. A confirmed-ready or not-probed dispatch adds
+        nothing (keeps the reason quiet in the healthy / back-compat case).
+        """
+        if dispatch_result == DISPATCH_GATEWAY_NOTIFIED and gateway_ready is False:
+            return (
+                " — WARN gateway readiness NOT confirmed before dispatch; the input may "
+                "have landed on a still-booting composer (watch for no_progress; the "
+                "handoff Enter-only retry is the landing safety net)"
+            )
         return ""
 
     @staticmethod
@@ -988,6 +1199,14 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
             f"worker={outcome.worker_pane or '-'} "
             f"adopted={str(outcome.adopted).lower()}"
         )
+    if outcome.gateway_ready is not None:
+        lines.append(f"  gateway_ready: {str(outcome.gateway_ready).lower()}")
+        if outcome.gateway_ready is False:
+            lines.append(
+                "  ! gateway readiness NOT confirmed before dispatch; the input may "
+                "have landed on a still-booting composer — watch for a no_progress "
+                "lane (the handoff Enter-only retry is the landing safety net)"
+            )
     if outcome.dispatch_target:
         lines.append(
             f"  dispatch: {outcome.dispatch_result} -> {outcome.dispatch_target}"
@@ -1098,9 +1317,24 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         upstream_coordinator=getattr(args, "upstream_coordinator", None),
         work_unit=work_unit,
         work_unit_decision_anchor=decision_anchor,
+        base_ref=getattr(args, "base_ref", None),
     )
     fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
-    use_case = SublaneActuateUseCase(LiveSublaneActuatorOps(repo_root=repo_root))
+    # #13293: in --json mode, confine the composed sub-CLI (cockpit append / handoff
+    # send) progress text to stderr so stdout is a single parseable JSON envelope.
+    json_mode = bool(getattr(args, "json", False))
+    # #13293: convert the --gateway-ready-timeout window into a bounded probe count
+    # (<=0 disables the pre-dispatch readiness wait for back-compat / non-tmux runs).
+    ready_timeout = float(getattr(args, "gateway_ready_timeout", 10.0) or 0.0)
+    interval = DEFAULT_GATEWAY_READY_INTERVAL_SECONDS
+    ready_probes = (
+        0 if ready_timeout <= 0 else max(1, round(ready_timeout / interval))
+    )
+    use_case = SublaneActuateUseCase(
+        LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=json_mode),
+        gateway_ready_probes=ready_probes,
+        gateway_ready_interval_seconds=interval,
+    )
     outcome = use_case.run(
         request,
         execute=execute and not dry_run,
@@ -1109,7 +1343,7 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         fill_inputs=fill_inputs,
         override_fill_stop=override_fill_stop,
     )
-    if getattr(args, "json", False):
+    if json_mode:
         print(
             json.dumps(
                 outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True
@@ -1121,6 +1355,9 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
 
 
 __all__ = (
+    "DEFAULT_GATEWAY_READY_PROBES",
+    "DEFAULT_GATEWAY_READY_INTERVAL_SECONDS",
+    "GATEWAY_READY_CAPTURE_LINES",
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
     "SublaneActuateUseCase",

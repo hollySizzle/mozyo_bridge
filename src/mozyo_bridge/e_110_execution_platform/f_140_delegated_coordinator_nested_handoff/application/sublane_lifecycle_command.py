@@ -512,6 +512,7 @@ def _build_create_request(
         upstream_coordinator=getattr(args, "upstream_coordinator", None),
         work_unit=work_unit,
         work_unit_decision_anchor=work_unit_decision_anchor,
+        base_ref=getattr(args, "base_ref", None),
     )
 
 

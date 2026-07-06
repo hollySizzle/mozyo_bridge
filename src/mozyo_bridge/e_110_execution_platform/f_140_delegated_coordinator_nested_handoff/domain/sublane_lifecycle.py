@@ -499,6 +499,13 @@ class SublaneCreateRequest:
     worker_role: str = WORKER_ROLE
     work_unit: str = DEFAULT_WORK_UNIT_GRANULARITY
     work_unit_decision_anchor: Optional[str] = None
+    # #13293: the explicit base ref the lane worktree is cut from. ``None`` keeps the
+    # historical ``git worktree add <path> -b <branch>`` behavior (branch off the main
+    # checkout's current HEAD); a supplied ref pins the base so a stale checkout can
+    # never silently cut a lane from an unintended commit (the j#72677 base trap). It
+    # is not part of the lane *identity* (adopt / read-back match on label / issue), so
+    # it never participates in the identity guard.
+    base_ref: Optional[str] = None
 
     def work_unit_decision(self) -> WorkUnitDispatchDecision:
         """The fail-closed #13002 work-unit dispatch decision for this request."""
@@ -615,12 +622,16 @@ def plan_sublane_create(
         )
 
     if launch.action == LAUNCH_CREATE_WORKTREE:
+        # #13293: reflect an explicit --base-ref in the planned recipe so the plan-only
+        # command and the --execute actuation cut the lane from the same base.
+        _base = (request.base_ref or "").strip()
+        _wt_command = f"git worktree add {request.worktree_path} -b {request.branch}"
         worktree_step = SublaneStep(
             order=1,
             title="create worktree",
             detail="create the lane worktree / branch with plain git (operator recipe; "
             "not actuated by this command)",
-            command=f"git worktree add {request.worktree_path} -b {request.branch}",
+            command=f"{_wt_command} {_base}" if _base else _wt_command,
         )
     elif launch.action == LAUNCH_REUSE_WORKTREE:
         worktree_step = SublaneStep(
