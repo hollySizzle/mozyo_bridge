@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3503
+    lines: 3512
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1018,6 +1018,14 @@ allowlist:
       never changes ``status`` / ``reason`` / ``next_action_owner`` and never blocks;
       the tmux backend and non-queue-enter rails are untouched. The pure observation
       loop + renderer live in ``application/turn_start_observation.py``, not here.
+      Raised 3503 -> 3512 for the #13300 herdr delivery-ledger live send-site wiring in
+      ``orchestrate_handoff``: the event rail (#13255) and the queue-enter rail (#13292)
+      each call the best-effort ``_record_herdr_send_ledger`` once per send (the event
+      rail before its sent/die branch so a delivered-not-started is recorded too; the
+      queue-enter guarded on ``herdr_send`` so the shared tmux path never appends). The
+      emission helper (which projects the outcome/retry and calls the #13296 never-raises
+      ``record_herdr_delivery``) lives in ``application/handoff_delivery_command.py`` next
+      to the sibling delivery-record seam, not here — only the two thin call sites remain.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
