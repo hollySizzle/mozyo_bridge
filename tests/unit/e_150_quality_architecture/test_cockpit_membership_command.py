@@ -522,6 +522,145 @@ class StatusOutcomeTest(unittest.TestCase):
         self.assertEqual("/repo/alpha-worktree", payload["query"]["repo_root"])
 
 
+# --- Dual-backend transition: `status` keeps every matching backend row (#13317). --
+
+
+class _FakeHerdrColumnOps:
+    """A herdr supply that returns canned `agent list` rows, or raises.
+
+    Defined once here and reused by the #13317 dual-presence and the #13303
+    collect specifications below (same construction).
+    """
+
+    def __init__(self, rows, *, error=None):
+        self._rows = rows
+        self._error = error
+
+    def read_herdr_agent_rows(self):
+        if self._error is not None:
+            raise self._error
+        return self._rows
+
+
+class StatusDualPresenceTest(unittest.TestCase):
+    """#13317 auditor j#73083 decision (a): during the herdr backend swap the same
+    ``(workspace_id, lane_id)`` slot can carry both a tmux rollback-lever Unit and a
+    live herdr Unit; ``status`` must keep BOTH rows so the live herdr agent is never
+    hidden behind the first-match tmux row (`cockpit list` already shows both). A
+    tmux-only / herdr-only / absent slot still yields a single row (byte-invariant).
+    """
+
+    def _ops(self, *, ws_id="wsA", lane_id="default", **over):
+        canon = SimpleNamespace(name="alpha", workspace_id=ws_id)
+        lane = LaneIdentity(lane_id, None)
+        base = dict(
+            windows=[_cockpit_window()], geo_panes=_geo_panes(),
+            facts={"wsA": _facts()}, canon=canon, lane=lane,
+        )
+        base.update(over)
+        return _FakeMembershipOps(**base)
+
+    def _herdr_rows_same_slot(self):
+        # A herdr Unit occupying the SAME (workspace_id, lane_id) as the tmux Unit
+        # in ``_cockpit_window`` (wsA / default), i.e. the dual-presence collision.
+        return [
+            {"name": encode_assigned_name("wsA", "codex", "default"), "pane_id": "w1:p1"},
+            {"name": encode_assigned_name("wsA", "claude", "default"), "pane_id": "w1:p2"},
+        ]
+
+    def test_dual_presence_json_keeps_both_backend_rows(self) -> None:
+        outcome = CockpitMembershipUseCase(
+            self._ops(), _FakeHerdrColumnOps(self._herdr_rows_same_slot())
+        ).status(session="s", repo="/repo/alpha")
+        payload = json.loads(outcome.render(json_output=True))
+        # Both backend rows survive — the live herdr agent is not hidden.
+        self.assertEqual(2, payload["workspace_count"])
+        backends = {w["backend"] for w in payload["workspaces"]}
+        self.assertEqual({BACKEND_TMUX, BACKEND_HERDR}, backends)
+        # The query verdict aggregates the rows: the slot is a member, exit 0.
+        self.assertTrue(payload["query"]["member"])
+        self.assertEqual(0, outcome.exit_code)
+        self.assertTrue(outcome.ok)
+
+    def test_dual_presence_rows_pin_repo_root_to_queried_checkout(self) -> None:
+        # Every matching row echoes the queried checkout (review j#62643), including
+        # the herdr row (whose live repo_root is otherwise the registry canonical).
+        outcome = CockpitMembershipUseCase(
+            self._ops(), _FakeHerdrColumnOps(self._herdr_rows_same_slot())
+        ).status(session="s", repo="/repo/alpha")
+        payload = json.loads(outcome.render(json_output=True))
+        queried = payload["query"]["repo_root"]
+        self.assertTrue(all(w["repo_root"] == queried for w in payload["workspaces"]))
+
+    def test_dual_presence_text_shows_tmux_row_and_herdr_backend_line(self) -> None:
+        text = CockpitMembershipUseCase(
+            self._ops(), _FakeHerdrColumnOps(self._herdr_rows_same_slot())
+        ).status(session="s", repo="/repo/alpha").render(json_output=False)
+        # The tmux row's live pane and the herdr backend aux line both appear.
+        self.assertIn("%99", text)
+        self.assertIn("backend: herdr", text)
+
+    def test_dual_presence_member_true_even_if_only_herdr_is_ok(self) -> None:
+        # A tmux Unit missing its claude peer (geometry warning -> not ok) alongside
+        # a healthy herdr Unit: the slot is still a member and OK (any row ok).
+        one_peer = _cockpit_window(columns=[
+            {"pane_id": "%99", "workspace_id": "wsA", "role": "codex",
+             "lane_id": "default", "pane_left": 0, "pane_width": 80},
+        ])
+        ops = self._ops(windows=[one_peer], geo_panes=[])
+        outcome = CockpitMembershipUseCase(
+            ops, _FakeHerdrColumnOps(self._herdr_rows_same_slot())
+        ).status(session="s", repo="/repo/alpha")
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertEqual(2, payload["workspace_count"])
+        self.assertTrue(payload["query"]["member"])
+        self.assertEqual(0, outcome.exit_code)
+
+    def test_tmux_only_status_is_single_row_byte_invariant(self) -> None:
+        # herdr off (default null supply) -> exactly the prior single-row projection.
+        baseline = CockpitMembershipUseCase(self._ops()).status(
+            session="s", repo="/repo/alpha"
+        )
+        with_off = CockpitMembershipUseCase(
+            self._ops(), _FakeHerdrColumnOps(None)
+        ).status(session="s", repo="/repo/alpha")
+        self.assertEqual(
+            baseline.render(json_output=True), with_off.render(json_output=True)
+        )
+        payload = json.loads(baseline.render(json_output=True))
+        self.assertEqual(1, payload["workspace_count"])
+        self.assertEqual(BACKEND_TMUX, payload["workspaces"][0]["backend"])
+
+    def test_herdr_only_status_is_single_row(self) -> None:
+        # No tmux managed windows; only a herdr Unit in the queried slot -> one row.
+        ops = self._ops(windows=[], geo_panes=None)
+        outcome = CockpitMembershipUseCase(
+            ops, _FakeHerdrColumnOps(self._herdr_rows_same_slot())
+        ).status(session="s", repo="/repo/alpha")
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertEqual(1, payload["workspace_count"])
+        self.assertEqual(BACKEND_HERDR, payload["workspaces"][0]["backend"])
+        self.assertTrue(payload["query"]["member"])
+        self.assertEqual(0, outcome.exit_code)
+
+    def test_absent_status_is_single_row_byte_invariant(self) -> None:
+        # A queried slot with no matching backend row on either side stays the single
+        # absent row (herdr Units for a different workspace do not divert it).
+        ops = self._ops()
+        ops._canon = SimpleNamespace(name="zeta", workspace_id="wsZ")
+        other_herdr = [
+            {"name": encode_assigned_name("wsQ", "codex", "default"), "pane_id": "w1:p1"},
+        ]
+        outcome = CockpitMembershipUseCase(
+            ops, _FakeHerdrColumnOps(other_herdr)
+        ).status(session="s", repo="/repo/zeta")
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertEqual(1, payload["workspace_count"])
+        self.assertFalse(payload["workspaces"][0]["member"])
+        self.assertEqual(1, outcome.exit_code)
+        self.assertIn("not loaded", outcome.render(json_output=False).lower())
+
+
 # --- Port contracts: the fake and live adapters satisfy the protocols. -------
 
 
@@ -557,19 +696,6 @@ class PortContractTest(unittest.TestCase):
 
 
 # --- Live herdr Units flow into the collect projection (#13303). -------------
-
-
-class _FakeHerdrColumnOps:
-    """A herdr supply that returns canned `agent list` rows, or raises."""
-
-    def __init__(self, rows, *, error=None):
-        self._rows = rows
-        self._error = error
-
-    def read_herdr_agent_rows(self):
-        if self._error is not None:
-            raise self._error
-        return self._rows
 
 
 class CollectHerdrMembershipTest(unittest.TestCase):
