@@ -397,6 +397,30 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(outcome.get("status"), "sent", msg=out)
         self.assertEqual(outcome.get("reason"), "ok", msg=out)
 
+    def test_done_turn_ended_injects_and_projects_to_sent_ok(self) -> None:
+        # Redmine #13319: herdr holds `done` until the next input, so a follow-up
+        # send to an agent that just finished its turn used to fail closed with
+        # `precondition_not_idle`. `turn_ended` is now an injectable pre-injection
+        # state (design j#73077): the rail injects (body once + Enter + wait) and
+        # the observed `working` transition projects to `sent` / `ok`. The snapshot
+        # is carried as `turn_ended`, never collapsed to `awaiting_input`.
+        herdr = _FakeHerdr([], get_states=["done"], wait_results=[(0, "")])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
+        # It really injected from the `done` snapshot: body typed once + Enter sent.
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1, msg=herdr.sends
+        )
+        self.assertTrue(
+            [op for op in herdr.sends if op[0] == "send_keys"], msg=herdr.sends
+        )
+        self.assertIn("snapshot turn_ended", out)
+
     def test_delivered_not_started_projects_to_turn_start_unconfirmed(self) -> None:
         # Wait times out; re-snapshot stays idle (no runtime block); the composer
         # read does not retain the body so no Enter-resend fires → delivered but not

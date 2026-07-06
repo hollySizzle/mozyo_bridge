@@ -252,14 +252,19 @@ class PreconditionTests(unittest.TestCase):
         self.assertIsNone(result.wait_kind)
         self.assertEqual(result.snapshot_state, RUNTIME_BUSY)
 
-    def test_precondition_not_idle_for_each_non_idle_state(self) -> None:
-        for state in (RUNTIME_BUSY, RUNTIME_BLOCKED, RUNTIME_TURN_ENDED, RUNTIME_UNKNOWN):
+    def test_precondition_not_idle_for_each_non_injectable_state(self) -> None:
+        # busy / blocked / unknown stay fail-closed (#13255 invariant, kept by
+        # #13319). turn_ended is now injectable and has its own success path below.
+        for state in (RUNTIME_BUSY, RUNTIME_BLOCKED, RUNTIME_UNKNOWN):
             with self.subTest(state=state):
                 reader = FakeReader(AgentStateResult.observed(state))
                 transport = FakeTransport()
                 wait = FakeWait(WaitResult.changed())
                 result = _rail(reader, transport, wait).drive_turn_start(TARGET, BODY)
                 self.assertEqual(result.outcome, OUTCOME_PRECONDITION_NOT_IDLE)
+                # Never injected and never armed a wait.
+                self.assertEqual(transport.send_text_calls, [])
+                self.assertEqual(wait.arm_count, 0)
 
     def test_unreadable_snapshot_fails_closed_to_precondition(self) -> None:
         # A mechanically failed read degrades to state=unknown -> not idle.
@@ -303,6 +308,70 @@ class PreconditionTests(unittest.TestCase):
         self.assertEqual(result.outcome, OUTCOME_INJECT_FAILED)
         self.assertIn(("cancel", 0), events)
         self.assertNotIn(("collect", 0), events)
+
+
+# ---------------------------------------------------------------------------
+# turn_ended (herdr `done`) is an injectable pre-injection state (Redmine #13319).
+# ---------------------------------------------------------------------------
+class TurnEndedInjectableTests(unittest.TestCase):
+    """#13319 / design j#73077: a `done` (turn_ended) agent accepts a follow-up send.
+
+    herdr holds `done` until the next input (measured 60s+), so `awaiting_input`
+    would never arrive and every 2nd+ send used to fail closed with
+    `precondition_not_idle`. `turn_ended` is now an injectable static state: the
+    prior turn is over, so the wait armed before injection attributes the next
+    `working` transition to this send. The `agent_state` mapping is unchanged and
+    the snapshot stays `turn_ended` through the outcome + telemetry.
+    """
+
+    def test_turn_ended_injects_and_starts(self) -> None:
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_TURN_ENDED))
+        events: list = []
+        transport = FakeTransport(events=events)
+        wait = FakeWait(WaitResult.changed())
+        wait.events = events
+        result = _rail(reader, transport, wait, events=events).drive_turn_start(
+            TARGET, BODY
+        )
+        self.assertEqual(result.outcome, OUTCOME_STARTED)
+        self.assertTrue(result.started)
+        self.assertTrue(result.delivered)
+        # The snapshot is preserved as turn_ended (never collapsed to awaiting_input).
+        self.assertEqual(result.snapshot_state, RUNTIME_TURN_ENDED)
+        self.assertEqual(result.to_telemetry_dict()["snapshot_state"], RUNTIME_TURN_ENDED)
+        # It really injected: wait armed, body typed, Enter sent (check-then-wait).
+        self.assertEqual(wait.arm_count, 1)
+        self.assertEqual(len(transport.send_text_calls), 1)
+        self.assertEqual(len(transport.send_keys_calls), 1)
+        kinds = [e[0] for e in events]
+        self.assertLess(kinds.index("arm"), kinds.index("send_text"))
+
+    def test_turn_ended_wait_armed_before_injection(self) -> None:
+        # Same check-then-wait ordering as awaiting_input: arm the wait first so the
+        # working transition cannot land in the snapshot->wait race window.
+        reader = FakeReader(AgentStateResult.observed(RUNTIME_TURN_ENDED))
+        events: list = []
+        transport = FakeTransport(events=events)
+        wait = FakeWait(WaitResult.changed())
+        wait.events = events
+        _rail(reader, transport, wait, events=events).drive_turn_start(TARGET, BODY)
+        self.assertEqual([e[0] for e in events][0], "arm")
+
+    def test_turn_ended_timeout_delivered_not_started(self) -> None:
+        # Injected from turn_ended but no turn started; re-snapshot still turn_ended
+        # (not blocked) -> delivered_not_started. snapshot_state stays turn_ended.
+        reader = FakeReader(
+            AgentStateResult.observed(RUNTIME_TURN_ENDED),
+            AgentStateResult.observed(RUNTIME_TURN_ENDED),
+        )
+        transport = FakeTransport()
+        wait = FakeWait(WaitResult.timeout())
+        result = _rail(
+            reader, transport, wait, max_enter_resends=0
+        ).drive_turn_start(TARGET, BODY)
+        self.assertEqual(result.outcome, OUTCOME_DELIVERED_NOT_STARTED)
+        self.assertEqual(result.snapshot_state, RUNTIME_TURN_ENDED)
+        self.assertFalse(result.reclassified_blocked)
 
 
 # ---------------------------------------------------------------------------
