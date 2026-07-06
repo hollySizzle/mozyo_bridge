@@ -634,6 +634,12 @@ class CockpitMembershipUseCase:
         derivation, the same chain the rest of the cockpit uses) and reports
         whether it is loaded, with its panes / geometry / registry presence. When
         the workspace is absent it says so explicitly (the #12339 mis-read).
+
+        During the herdr backend swap (#13317) the queried slot can hold both a
+        tmux rollback-lever Unit and a live herdr Unit at once; this returns every
+        matching backend row so the live herdr agent is never hidden behind the
+        tmux row (auditor j#73083 decision (a)). A tmux-only / herdr-only / absent
+        slot still yields a single row (byte-invariant).
         """
         repo_root = str(Path(repo).expanduser().resolve())
         # The operator asked about THIS checkout: report the queried repo root
@@ -649,50 +655,62 @@ class CockpitMembershipUseCase:
         facts = self._ops.resolve_registry_facts(workspace_id)
 
         report = self.collect(session)
-        match = next(
-            (
-                w
-                for w in report.workspaces
-                if w.workspace_id == workspace_id
-                and normalize_lane(w.lane_id) == target_lane
-            ),
-            None,
+        # Dual-backend transition (#13317, auditor j#73083 decision (a)): the same
+        # (workspace_id, lane_id) slot can carry BOTH a tmux rollback-lever Unit and
+        # a live herdr Unit. Keep *every* matching row rather than the historical
+        # first-match, so a live herdr agent is never hidden behind a tmux row and
+        # `status` agrees with `cockpit list` (which already shows both). Each row's
+        # repo root is pinned to the queried checkout so a worktree / lane query
+        # echoes the path the operator asked about, never the registry canonical
+        # main checkout (review j#62643). A tmux-only / herdr-only slot still yields
+        # exactly one row, so that output stays byte-invariant.
+        matches = tuple(
+            dataclasses.replace(w, repo_root=queried_root)
+            for w in report.workspaces
+            if w.workspace_id == workspace_id
+            and normalize_lane(w.lane_id) == target_lane
         )
-        if match is None:
+        if not matches:
             label = facts.label if facts.registry_present else canon.name
-            match = absent_membership(
-                session=session,
-                workspace_id=workspace_id,
-                label=label,
-                repo_root=queried_root,
-                lane_id=target_lane,
-                lane_label=lane.lane_label,
-                registry_present=facts.registry_present,
-                anchor_present=facts.anchor_present,
-                registry_canonical_path=facts.repo_root,
+            matches = (
+                absent_membership(
+                    session=session,
+                    workspace_id=workspace_id,
+                    label=label,
+                    repo_root=queried_root,
+                    lane_id=target_lane,
+                    lane_label=lane.lane_label,
+                    registry_present=facts.registry_present,
+                    anchor_present=facts.anchor_present,
+                    registry_canonical_path=facts.repo_root,
+                ),
             )
-        else:
-            # Pin the matched row's repo root to the queried checkout so a
-            # worktree / lane query echoes the path the operator asked about,
-            # never the registry canonical main checkout (review j#62643).
-            match = dataclasses.replace(match, repo_root=queried_root)
 
         single = CockpitMembershipReport(
             session=session,
             cockpit_present=report.cockpit_present,
-            workspaces=(match,),
+            workspaces=matches,
             warnings=report.warnings,
         )
+        # The query verdict aggregates the matching backend rows: the slot is a
+        # `member` if any backend row is loaded, and OK (exit 0) if any is healthy;
+        # per-row warnings / ok stay on each workspace row. For the single-row
+        # tmux-only / herdr-only / absent case this is byte-identical to the prior
+        # first-match verdict (``any`` over one element).
+        query_label = matches[0].label
         query = {
             "workspace_id": workspace_id,
-            "label": match.label,
+            "label": query_label,
             "repo_root": queried_root,
             "registry_canonical_path": facts.repo_root,
             "lane_id": target_lane,
-            "member": match.member,
+            "member": any(w.member for w in matches),
         }
         return CockpitStatusOutcome(
-            report=single, query=query, query_label=match.label, ok=match.ok
+            report=single,
+            query=query,
+            query_label=query_label,
+            ok=any(w.ok for w in matches),
         )
 
 
