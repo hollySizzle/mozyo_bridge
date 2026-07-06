@@ -46,9 +46,10 @@ import contextlib
 import io
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
     LiveSublaneActuatorOps,
@@ -87,6 +88,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 
 # ---------------------------------------------------------------------------
+# Worker readiness wait tuning (#13301). Mirrors the #13293 gateway readiness wait
+# but targets the same-lane Claude worker pane: before the queue-enter forward, the
+# drive polls the worker pane up to ``DEFAULT_WORKER_READY_PROBES`` times at
+# ``DEFAULT_WORKER_READY_INTERVAL_SECONDS`` apart (≈ a 10s window by default) so a
+# freshly-launched worker TUI has time to boot before the forward — the second-wave
+# 3/4-lane failure mode (j#72860/72861/72862) was "forward typed into a still-booting
+# worker composer", the worker-side analog of the gateway dispatch-loss the #13293
+# wait closed on the gateway pane. The wait NEVER hard-blocks the queue-enter rail:
+# an unconfirmed readiness degrades to a recorded ``worker_ready=false`` and forwards
+# anyway (the handoff Enter-only retry is the landing safety net).
+# ---------------------------------------------------------------------------
+
+DEFAULT_WORKER_READY_PROBES = 20
+DEFAULT_WORKER_READY_INTERVAL_SECONDS = 0.5
+#: How many rendered lines the live readiness probe captures from the worker pane.
+WORKER_READY_CAPTURE_LINES = 40
+
+
+# ---------------------------------------------------------------------------
 # Injected drive operations port.
 # ---------------------------------------------------------------------------
 
@@ -97,13 +117,26 @@ class WorkerDispatchOps(Protocol):
 
     ``read_lane`` resolves the lane's :class:`SublaneLaneView` from the live
     pane inventory (the same read-back the #12973 actuator confirms lanes
-    with). ``dispatch_to_worker`` routes the governed same-lane
-    ``implementation_request`` to the worker pane and returns its exit code —
-    the delivery-ACK measurement. There is intentionally no pane mutation, no
-    retire / kill method, and no Redmine IO here.
+    with). ``probe_worker_ready`` is the #13301 non-fatal readiness snapshot of
+    the same-lane worker pane. ``dispatch_to_worker`` routes the governed
+    same-lane ``implementation_request`` to the worker pane and returns its exit
+    code — the delivery-ACK measurement. There is intentionally no pane mutation,
+    no retire / kill method, and no Redmine IO here.
     """
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
+
+    def probe_worker_ready(self, worker_pane: str) -> bool:
+        """One non-fatal readiness snapshot of the same-lane worker pane (#13301).
+
+        ``True`` when the worker TUI is observed booted and rendered (its Claude
+        foreground process is up and the pane has drawn content), so a queue-enter
+        forward lands on a live composer rather than vanishing into a still-booting
+        one. Any read failure (pane gone, not-yet-agent process, blank capture)
+        returns ``False`` — the caller polls this until ready or the bounded window
+        elapses and never treats a probe failure as fatal.
+        """
+        ...
 
     def dispatch_to_worker(
         self,
@@ -114,6 +147,7 @@ class WorkerDispatchOps(Protocol):
         lane_label: str,
         gateway_callback_target: Optional[str],
         target_repo: str,
+        allow_direct_worker: bool = False,
     ) -> int: ...
 
 
@@ -138,6 +172,32 @@ class LiveWorkerDispatchOps:
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         return self._actuator_ops().read_lane(worktree_path)
 
+    def probe_worker_ready(self, worker_pane: str) -> bool:
+        # #13301: one non-fatal readiness snapshot — the worker's foreground process
+        # is the Claude TUI (strong per-receiver identity, the same check the
+        # queue-enter rail uses) AND the pane has rendered content (a booted TUI has
+        # drawn its UI; a blank capture is a pane still coming up). Any read failure
+        # (pane resolve / capture raising, incl. the pane_resolver `die()` ==
+        # SystemExit) is treated as "not ready yet", never fatal — the caller polls
+        # this on a bounded window. Mirrors LiveSublaneActuatorOps.probe_gateway_ready
+        # (#13293) with the worker's `claude` provider.
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (  # noqa: E501
+            is_receiver_agent_process,
+            pane_info,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (  # noqa: E501
+            capture_pane,
+        )
+
+        try:
+            info = pane_info(worker_pane)
+            if not is_receiver_agent_process(info.get("command", ""), "claude"):
+                return False
+            rendered = capture_pane(worker_pane, WORKER_READY_CAPTURE_LINES)
+        except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the drive.
+            return False
+        return bool(rendered.strip())
+
     def dispatch_to_worker(
         self,
         *,
@@ -147,6 +207,7 @@ class LiveWorkerDispatchOps:
         lane_label: str,
         gateway_callback_target: Optional[str],
         target_repo: str,
+        allow_direct_worker: bool = False,
     ) -> int:
         argv = _worker_dispatch_argv(
             issue=issue,
@@ -155,6 +216,7 @@ class LiveWorkerDispatchOps:
             lane_label=lane_label,
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
+            allow_direct_worker=allow_direct_worker,
         )
         from mozyo_bridge.application.cli import build_parser, normalize_paths
 
@@ -198,6 +260,7 @@ def _worker_dispatch_argv(
     lane_label: str,
     gateway_callback_target: Optional[str],
     target_repo: str,
+    allow_direct_worker: bool = False,
 ) -> list[str]:
     """The same-lane worker forward as the gateway would type it (pure).
 
@@ -206,6 +269,13 @@ def _worker_dispatch_argv(
     is the worker's same-lane callback address. The queue-enter rail keeps the
     dispatch submit-complete (#12207) with standard_target_admission covering
     the usually-inactive worker split (#12597).
+
+    ``allow_direct_worker`` (#13301) threads the explicit ``--allow-direct-worker``
+    gateway-route exception (#12918) onto the send so a drive from a pane whose lane
+    Unit differs from the worker's (e.g. a coordinator stall-drive) is admitted and
+    recorded distinctly as a ``gateway_route_exception`` instead of failing closed.
+    The same-lane gateway drive leaves it off (default), so the #12988 contract is
+    byte-for-byte back-compatible.
     """
     argv = [
         "handoff",
@@ -236,6 +306,8 @@ def _worker_dispatch_argv(
             "--profile-field",
             f"gateway_callback_target={gateway_callback_target}",
         ]
+    if allow_direct_worker:
+        argv.append("--allow-direct-worker")
     return argv
 
 
@@ -247,6 +319,7 @@ def _replayable_command(
     lane_label: str,
     gateway_callback_target: Optional[str],
     target_repo: str,
+    allow_direct_worker: bool = False,
 ) -> str:
     return "mozyo-bridge " + " ".join(
         _worker_dispatch_argv(
@@ -256,6 +329,7 @@ def _replayable_command(
             lane_label=lane_label,
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
+            allow_direct_worker=allow_direct_worker,
         )
     )
 
@@ -279,6 +353,33 @@ class WorkerDispatchUseCase:
     """
 
     ops: WorkerDispatchOps
+    # #13301 pre-dispatch worker readiness wait (injectable for tests). ``probes<=0``
+    # disables the wait (back-compat immediate forward; ``worker_ready`` stays None).
+    worker_ready_probes: int = DEFAULT_WORKER_READY_PROBES
+    worker_ready_interval_seconds: float = DEFAULT_WORKER_READY_INTERVAL_SECONDS
+    sleep: Callable[[float], None] = field(default=time.sleep)
+
+    def _wait_worker_ready(self, worker_pane: Optional[str]) -> Optional[bool]:
+        """Bounded, non-fatal pre-forward worker readiness wait (#13301).
+
+        Polls :meth:`WorkerDispatchOps.probe_worker_ready` up to
+        ``worker_ready_probes`` times, ``worker_ready_interval_seconds`` apart, so a
+        freshly-launched worker TUI has time to boot before the queue-enter forward.
+        Returns ``None`` when the wait is disabled (``probes<=0``) or no worker pane
+        resolved — nothing was probed. Otherwise ``True`` on the first ready
+        observation or ``False`` when the window elapses unconfirmed. It NEVER raises
+        and NEVER blocks the forward: an unconfirmed ``False`` degrades to a recorded
+        observation and the caller forwards anyway (mirrors the #13293 gateway wait).
+        """
+        probes = self.worker_ready_probes
+        if probes <= 0 or not worker_pane:
+            return None
+        for attempt in range(probes):
+            if self.ops.probe_worker_ready(worker_pane):
+                return True
+            if attempt + 1 < probes:
+                self.sleep(self.worker_ready_interval_seconds)
+        return False
 
     def run(
         self,
@@ -288,6 +389,7 @@ class WorkerDispatchUseCase:
         target_repo: str = "auto",
         fill_inputs: Optional[FillDecisionInputs] = None,
         override_fill_stop: Optional[str] = None,
+        allow_direct_worker: bool = False,
     ) -> WorkerDispatchOutcome:
         # 1. Fail closed on missing identity before any probe.
         missing = request.missing_fields()
@@ -402,6 +504,7 @@ class WorkerDispatchUseCase:
             lane_label=request.lane_label,
             gateway_callback_target=lane.gateway_pane,
             target_repo=target_repo,
+            allow_direct_worker=allow_direct_worker,
         )
 
         # 6. Dry-run: preview the resolved transfer; perform nothing.
@@ -420,7 +523,17 @@ class WorkerDispatchUseCase:
                 dispatch_result=DISPATCH_NOT_ATTEMPTED,
                 durable_anchor=(request.journal or None),
                 command=command,
+                allow_direct_worker=allow_direct_worker,
             )
+
+        # 6b. Pre-forward worker readiness wait (#13301, execute path only): give a
+        # freshly-launched worker TUI time to boot before the queue-enter forward, so
+        # the anchored implementation_request lands on a live composer instead of
+        # vanishing into a still-booting one (the worker-side analog of the #13293
+        # gateway wait). Bounded + non-fatal — an unconfirmed readiness degrades to a
+        # recorded worker_ready=false and forwards anyway (the queue-enter rail never
+        # hard-blocks; the handoff Enter-only retry is the landing safety net).
+        worker_ready = self._wait_worker_ready(lane.worker_pane)
 
         # 7. Live drive: the send's exit code is the delivery-ACK measurement.
         try:
@@ -431,6 +544,7 @@ class WorkerDispatchUseCase:
                 lane_label=request.lane_label,
                 gateway_callback_target=lane.gateway_pane,
                 target_repo=target_repo,
+                allow_direct_worker=allow_direct_worker,
             )
         except SystemExit as exc:
             # Review j#71597: the composed handoff CLI fails closed through
@@ -465,6 +579,8 @@ class WorkerDispatchUseCase:
                 blocked_reasons=(REASON_WORKER_DISPATCH_FAILED,),
                 fill_decision=fill_decision_token,
                 fill_override_reason=fill_override_reason,
+                worker_ready=worker_ready,
+                allow_direct_worker=allow_direct_worker,
             )
         override_suffix = (
             f" — fill-decision stop overridden (reason: {fill_override_reason})"
@@ -488,6 +604,8 @@ class WorkerDispatchUseCase:
             command=command,
             fill_decision=fill_decision_token,
             fill_override_reason=fill_override_reason,
+            worker_ready=worker_ready,
+            allow_direct_worker=allow_direct_worker,
         )
 
     # -- helpers ------------------------------------------------------------
@@ -550,6 +668,10 @@ def format_worker_dispatch_text(outcome: WorkerDispatchOutcome) -> str:
         f"  dispatch: {outcome.dispatch_result} "
         f"(worker_dispatch_confirmed={str(outcome.worker_dispatch_confirmed).lower()})"
     )
+    if outcome.worker_ready is not None:
+        lines.append(f"  worker_ready: {str(outcome.worker_ready).lower()}")
+    if outcome.allow_direct_worker:
+        lines.append("  route: --allow-direct-worker (gateway_route_exception)")
     if outcome.is_blocked:
         lines.append("  -> blocked: " + ", ".join(outcome.blocked_reasons))
     if outcome.command:
@@ -582,13 +704,24 @@ def cmd_sublane_dispatch_worker(args: argparse.Namespace) -> int:
         journal=getattr(args, "journal", None),
     )
     fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
-    use_case = WorkerDispatchUseCase(LiveWorkerDispatchOps(repo_root=repo_root))
+    # #13301: convert the --worker-ready-timeout window into a bounded probe count
+    # (<=0 disables the pre-forward readiness wait for back-compat / non-tmux runs),
+    # mirroring the #13293 gateway --gateway-ready-timeout conversion.
+    ready_timeout = float(getattr(args, "worker_ready_timeout", 10.0) or 0.0)
+    interval = DEFAULT_WORKER_READY_INTERVAL_SECONDS
+    ready_probes = 0 if ready_timeout <= 0 else max(1, round(ready_timeout / interval))
+    use_case = WorkerDispatchUseCase(
+        LiveWorkerDispatchOps(repo_root=repo_root),
+        worker_ready_probes=ready_probes,
+        worker_ready_interval_seconds=interval,
+    )
     outcome = use_case.run(
         request,
         execute=execute,
         target_repo=getattr(args, "target_repo", None) or "auto",
         fill_inputs=fill_inputs,
         override_fill_stop=override_fill_stop,
+        allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
     )
     if getattr(args, "json", False):
         print(
@@ -602,6 +735,9 @@ def cmd_sublane_dispatch_worker(args: argparse.Namespace) -> int:
 
 
 __all__ = (
+    "DEFAULT_WORKER_READY_PROBES",
+    "DEFAULT_WORKER_READY_INTERVAL_SECONDS",
+    "WORKER_READY_CAPTURE_LINES",
     "WorkerDispatchOps",
     "LiveWorkerDispatchOps",
     "WorkerDispatchUseCase",

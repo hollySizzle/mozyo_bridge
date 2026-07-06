@@ -538,6 +538,36 @@ def register_lifecycle(sub) -> None:
         default="auto",
         help="Target-repo identity gate for the worker send (default: auto).",
     )
+    # #13301: bounded pre-forward worker readiness wait. Before the --execute
+    # queue-enter forward, poll the freshly-launched same-lane worker TUI until it is
+    # booted + rendered (so the anchored implementation_request lands on a live
+    # composer, not a still-booting one — the worker-side analog of the #13293 gateway
+    # dispatch-loss failure mode; 3/4 lanes in the 2026-07-06 second wave). Never
+    # hard-blocks: an unconfirmed readiness forwards anyway and records
+    # worker_ready=false. 0 disables the wait (back-compat immediate forward).
+    sublane_dispatch_worker.add_argument(
+        "--worker-ready-timeout",
+        dest="worker_ready_timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for the same-lane worker TUI to become ready before the "
+        "--execute forward (default: 10.0; 0 disables the wait). Never hard-blocks — an "
+        "unconfirmed readiness forwards anyway and records worker_ready=false.",
+    )
+    # #13301: thread the explicit --allow-direct-worker gateway-route exception
+    # (#12918) into the same-lane worker send so a drive from a pane whose lane Unit
+    # differs from the worker's (e.g. a coordinator stall-drive) is admitted and
+    # recorded distinctly as a gateway_route_exception instead of failing closed. The
+    # same-lane gateway drive omits it (default), keeping the #12988 contract unchanged.
+    sublane_dispatch_worker.add_argument(
+        "--allow-direct-worker",
+        dest="allow_direct_worker",
+        action="store_true",
+        help="Thread the explicit --allow-direct-worker gateway-route exception "
+        "(Redmine #12918) into the worker send so a cross-lane drive (e.g. a "
+        "coordinator stall-drive) is admitted and recorded distinctly as a "
+        "gateway_route_exception instead of failing closed with gateway_route_blocked.",
+    )
     _add_dispatch_admission_flags(sublane_dispatch_worker)
     add_repo_option(sublane_dispatch_worker)
     _add_lifecycle_json(sublane_dispatch_worker)

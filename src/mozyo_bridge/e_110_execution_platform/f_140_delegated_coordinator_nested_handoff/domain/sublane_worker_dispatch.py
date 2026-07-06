@@ -181,6 +181,17 @@ class WorkerDispatchOutcome:
     # explicit override reason recorded when a stop was intentionally proceeded past.
     fill_decision: Optional[str] = None
     fill_override_reason: Optional[str] = None
+    # #13301 pre-dispatch worker readiness wait (bounded, non-fatal, mirroring the
+    # #13293 gateway readiness wait). ``None`` when the wait was not run (dry-run,
+    # disabled, or blocked before the send); ``True`` on a confirmed booted worker
+    # pane; ``False`` when the window elapsed unconfirmed and the drive forwarded
+    # anyway (the queue-enter rail never hard-blocks).
+    worker_ready: Optional[bool] = None
+    # #13301 route-gate integration: whether the explicit ``--allow-direct-worker``
+    # durable exception (#12918) was threaded into the same-lane worker send so a
+    # cross-lane drive (e.g. a coordinator stall-drive) is admitted and recorded
+    # distinctly as a ``gateway_route_exception`` instead of failing closed.
+    allow_direct_worker: bool = False
 
     @property
     def is_blocked(self) -> bool:
@@ -219,6 +230,8 @@ class WorkerDispatchOutcome:
             "blocked_reasons": list(self.blocked_reasons),
             "fill_decision": self.fill_decision,
             "fill_override_reason": self.fill_override_reason,
+            "worker_ready": self.worker_ready,
+            "allow_direct_worker": self.allow_direct_worker,
         }
 
 
@@ -261,6 +274,17 @@ def render_worker_dispatch_journal(outcome: WorkerDispatchOutcome) -> str:
         lines.append(f"- fill_decision: {outcome.fill_decision}")
     if outcome.fill_override_reason is not None:
         lines.append(f"- fill_stop_override: {outcome.fill_override_reason}")
+    # #13301: record the pre-dispatch worker readiness observation (only when the
+    # wait ran) and the explicit route-gate exception so the durable record spells
+    # out both hardening decisions — that the forward waited for a booted worker,
+    # and that a cross-lane send was admitted distinctly, not silently.
+    if outcome.worker_ready is not None:
+        lines.append(f"- worker_ready: {str(outcome.worker_ready).lower()}")
+    if outcome.allow_direct_worker:
+        lines.append(
+            "- route_exception: --allow-direct-worker "
+            "(gateway_route_exception recorded, #12918)"
+        )
     if outcome.command:
         lines.append(f"- command: `{outcome.command}`")
     if outcome.is_blocked:
