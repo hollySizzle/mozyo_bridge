@@ -155,9 +155,9 @@ class HerdrCliTransport:
         ``source`` must be one of the core-owned :data:`PANE_READ_SOURCES`;
         ``lines`` (when given) must be a positive int. On success the herdr JSON
         payload is parsed defensively for the rendered text and the ``truncated``
-        flag; if the payload is not a recognised JSON object the raw stdout is
-        returned as the content (the exact JSON schema is confirmed against a
-        live binary in a later US, per the PoC caveat).
+        flag: the live schema nests both under ``result.read`` (confirmed against
+        the live binary — Redmine #13322), with a top-level / raw-stdout fallback
+        for any other shape (:func:`_parse_read_payload`).
         """
         if not valid_target(target):
             return PaneReadResult.failure(
@@ -257,10 +257,22 @@ def _bounded_detail(text: object, *, limit: int = 200) -> str:
 def _parse_read_payload(stdout: object) -> tuple:
     """Extract ``(content, truncated)`` from a herdr ``agent read`` payload.
 
-    Defensive by design (the live JSON schema is confirmed in a later US): a JSON
-    object contributes its text field (the first present of a small candidate
-    set) and a boolean ``truncated``; anything else is treated as raw text with
-    ``truncated=False``.
+    The live herdr CLI nests the rendered text under ``result.read`` (E11 schema,
+    confirmed against the live binary — Redmine #13322):
+    ``{"result": {"read": {"text": "...", "truncated": false, ...}}}``. Extract from
+    that nested object when present, else from the top-level mapping (an
+    older/simpler shape), reading the first present of a small candidate text key
+    set and a boolean ``truncated``; anything unrecognised is treated as raw text
+    with ``truncated=False``.
+
+    Getting this nesting right matters beyond diagnostics: the Enter-resend gate
+    (:func:`~...domain.turn_start_rail.composer_retains_body`) whitespace-collapses
+    the returned content and substring-matches the injected body against it. Before
+    #13322 the nested schema fell through to the *raw JSON stdout*, whose composer
+    line-wraps are JSON-escaped ``\\n`` sequences that ``str.split`` does not treat
+    as whitespace — so a wrapped body never matched and the rail refused to resend
+    (``enter_resends=0``). Returning the decoded ``result.read.text`` (real newlines)
+    lets the collapse work and the resend gate fire.
     """
     if not isinstance(stdout, str):
         return "", False
@@ -270,15 +282,23 @@ def _parse_read_payload(stdout: object) -> tuple:
         return stdout, False
     if not isinstance(payload, Mapping):
         return stdout, False
+    # Prefer the live nested `result.read` object; fall back to the top-level
+    # mapping so a flatter/older payload shape still parses.
+    source: Mapping = payload
+    result = payload.get("result")
+    if isinstance(result, Mapping):
+        read_obj = result.get("read")
+        if isinstance(read_obj, Mapping):
+            source = read_obj
     content = None
     for key in ("content", "text", "visible", "data"):
-        value = payload.get(key)
+        value = source.get(key)
         if isinstance(value, str):
             content = value
             break
     if content is None:
         content = stdout
-    truncated = bool(payload.get("truncated", False))
+    truncated = bool(source.get("truncated", False))
     return content, truncated
 
 

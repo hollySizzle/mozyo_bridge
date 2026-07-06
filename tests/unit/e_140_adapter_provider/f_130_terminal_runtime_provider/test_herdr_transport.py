@@ -11,6 +11,7 @@ per the seam contract with no silent fallback to tmux. No subprocess spawns.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -37,6 +38,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     HERDR_BINARY_ENV,
     HerdrCliTransport,
     resolve_terminal_transport,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (
+    composer_retains_body,
 )
 
 
@@ -104,6 +108,54 @@ class ArgvConstructionTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.content, "hi there")
         self.assertTrue(result.truncated)
+
+    def test_read_pane_parses_live_nested_result_read_schema(self) -> None:
+        # Redmine #13322: the live herdr CLI nests the rendered text under
+        # `result.read`. The extractor must return the decoded `text` (real
+        # newlines) — NOT the raw JSON envelope — so the Enter-resend composer
+        # gate can whitespace-collapse and substring-match a wrapped body.
+        payload = json.dumps(
+            {
+                "id": "cli:agent:read",
+                "result": {
+                    "read": {
+                        "format": "text",
+                        "pane_id": "w1:p8",
+                        "source": "visible",
+                        "text": "line one\nline two",
+                        "truncated": True,
+                        "workspace_id": "w1",
+                    },
+                    "type": "agent_read",
+                },
+            }
+        )
+        runner = RecordingRunner(stdout=payload)
+        transport = HerdrCliTransport(BIN, runner=runner)
+        result = transport.read_pane("w1:p8")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.content, "line one\nline two")
+        self.assertTrue(result.truncated)
+
+    def test_live_nested_read_lets_resend_gate_match_wrapped_body(self) -> None:
+        # Redmine #13322 end-to-end at the parse boundary: a body the composer
+        # wrapped across lines (a real newline inside the JSON `text`) must still
+        # be recognised as retained once decoded — this is what authorises the
+        # bounded Enter-resend. Against the pre-fix raw-JSON fallback the escaped
+        # \n broke the whitespace-collapse match and enter_resends stayed 0.
+        body = "MARKER inject body that the composer wrapped onto two lines"
+        rendered_text = "› MARKER inject body that the\ncomposer wrapped onto two lines"
+        payload = json.dumps(
+            {"result": {"read": {"source": "visible", "text": rendered_text, "truncated": False}}}
+        )
+        runner = RecordingRunner(stdout=payload)
+        transport = HerdrCliTransport(BIN, runner=runner)
+        result = transport.read_pane("w1:p8")
+        self.assertTrue(result.ok)
+        self.assertTrue(composer_retains_body(result.content, body))
+        # And the pre-fix behaviour (searching the raw JSON envelope) would NOT
+        # have matched, so this pins the regression the fix closes.
+        self.assertFalse(composer_retains_body(payload, body))
 
 
 class FailClosedTest(unittest.TestCase):
