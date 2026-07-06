@@ -61,6 +61,13 @@ stable route identity を live inventory へ再照合する。
 - resolved `pane_id` を Redmine に残す場合は runtime evidence と明記し、route authority
   として扱わない。
 
+backend 中立 (#13302): executor の hop re-resolution は `ExecutionContext` の backend selector
+(既定 `tmux`) に従い、backend 中立 resolver (`resolve_for_route_target_neutral`) 経由で解決する。
+`tmux` は既存 `resolve_for_route_target` と byte 一致・record projection 不変、`herdr` は同じ
+injected live snapshot を `agent list` として再解決する。`route_locator_missing` 降格は herdr 限定
+(tmux は malformed blank-id row でも `resolve_route` と一致)。実 send path (`orchestrate_handoff`) の
+target authority は本 seam の対象外 (正本: `route-identity-ledger.md` の #13302 節)。
+
 ## Handoff 安全境界
 
 - cross-project / cross-lane Claude direct send は生成・実行しない。

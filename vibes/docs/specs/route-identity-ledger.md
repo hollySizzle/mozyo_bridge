@@ -157,6 +157,32 @@ adapter で包む。
 herdr slot の `RouteIdentity` は `herdr_route_identity(...)` で構築し、`pane_name` を
 deterministic な canonical assigned name に固定する — stable label が slot から drift しない。
 
+### Live executor 配線 + backend 条件化 (#13302)
+
+#13297 は resolver を pure staged seam として出荷し、live handoff path / state_store への
+配線を「後続判断」として defer した (#13297 j#72871 / j#72910)。#13302 はその後続判断を、
+**live executor core (`DelegationRouteExecutor`) への配線**として実装する。scope 裁定は
+#13302 j#72985 (design consultation answer)。
+
+固定境界:
+
+- **配線先は executor seam**: `ExecutionContext` に backend selector (既定 `tmux`) を持たせ、
+  `_resolve` / `_resolve_worker` の hop re-resolution を backend 中立 bridge
+  (`resolve_for_route_target_neutral`) 経由にする。`backend=tmux` は既存の
+  `resolve_for_route_target` と byte 一致 (guard・resolution・record projection いずれも不変)、
+  `backend=herdr` は同じ injected snapshot を live `agent list` として再解決する。backend は
+  per-execution selector であり per-identity field ではない (ledger identity は backend 非依存)。
+- **実 send path は対象外**: `orchestrate_handoff` (`commands.py`) の target authority
+  (tmux=`pane_info` / herdr=`resolve_herdr_target`) は本 US で変更しない。実 send path の
+  route authority 収束 (特に herdr `resolve_herdr_target` の `(workspace_id, role)` match key を
+  ledger の `(workspace_id, lane_id, role, pane_name)` へ寄せる件) は multi-lane herdr routing の
+  仕様決定と交差するため、別 US へ切り出す。
+- **`route_locator_missing` は backend 条件化 (herdr 限定)**: single match だが live locator 空の
+  降格は herdr backend でのみ発火する。tmux backend は malformed row (`id=""`) を含む synthetic
+  input でも `resolve_route_neutral(tmux) == resolve_route(...)` を保つ。これにより #13297 j#72871
+  の residual (malformed tmux row が `route_locator_missing` へ分岐する件) を、拘束「tmux backend の
+  解決結果 byte 不変」として構造的に閉じる。
+
 ## 参照正本
 
 - `vibes/docs/logics/unit-target-model.md`

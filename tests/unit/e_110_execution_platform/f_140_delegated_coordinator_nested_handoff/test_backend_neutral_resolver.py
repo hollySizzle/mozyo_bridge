@@ -38,6 +38,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RouteIdentity,
     resolve_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E402
+    resolve_for_route_target,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (  # noqa: E402
     BACKEND_HERDR,
     BACKEND_TMUX,
@@ -46,7 +49,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     herdr_inventory,
     herdr_route_identity,
     neutral_inventory,
+    resolve_for_route_target_neutral,
     resolve_route_neutral,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner import (  # noqa: E402
+    DelegationRoutePlanError,
+    TARGET_CHILD_GATEWAY,
+    TARGET_SAME_LANE_WORKER,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402
     encode_assigned_name,
@@ -158,6 +167,19 @@ class TmuxBackendByteInvarianceTests(unittest.TestCase):
             _tmux_identity(), [_tmux_pane(pane_id="%10")], backend=BACKEND_TMUX
         )
         self.assertEqual(result.status, RESOLVE_OK)
+
+    def test_tmux_blank_id_row_matches_direct_not_locator_missing(self):
+        # #13302 (closes the #13297 j#72871 residual): the route_locator_missing
+        # downgrade is herdr-only. A *malformed* tmux row whose id is blank must
+        # therefore stay byte-for-byte resolve_route (RESOLVE_OK with a blank
+        # resolved pane id), never the herdr-only ROUTE_LOCATOR_MISSING. This is
+        # what makes the "tmux 解決結果 byte 不変" 拘束 structural rather than
+        # dependent on the tmux input domain always carrying a pane id.
+        inventory = [_tmux_pane(pane_id="")]
+        result = resolve_route_neutral(_tmux_identity(), inventory, backend=BACKEND_TMUX)
+        self.assertEqual(result.status, RESOLVE_OK)
+        self.assertEqual(result.resolved_pane_id, "")
+        self._assert_same(_tmux_identity(), inventory)
 
 
 class HerdrAdapterTests(unittest.TestCase):
@@ -329,6 +351,77 @@ class NeutralInventoryTests(unittest.TestCase):
     def test_unsupported_backend_via_resolve_fails_closed(self):
         with self.assertRaises(BackendNeutralResolverError):
             resolve_route_neutral(_tmux_identity(), [], backend="ssh")
+
+
+class ResolveForRouteTargetNeutralTests(unittest.TestCase):
+    """The guarded backend-neutral bridge used by the live executor (#13302)."""
+
+    def _codex_identity(self):
+        return RouteIdentity(
+            workspace_id=WS,
+            lane_id=LANE,
+            role="codex",
+            pane_name="ws-alpha/lane-1/codex",
+            route_id="route-cgw",
+            observed_at="2026-07-06T00:00:00Z",
+            last_seen_pane_id="%10",
+        )
+
+    def test_tmux_matches_ledger_resolve_for_route_target(self):
+        # backend=tmux is byte-for-byte the ledger's guarded resolver, guards and
+        # resolution alike.
+        identity = self._codex_identity()
+        inventory = [_tmux_pane(pane_id="%30", role="codex",
+                                route_label="ws-alpha/lane-1/codex")]
+        neutral = resolve_for_route_target_neutral(
+            TARGET_CHILD_GATEWAY, identity, inventory, backend=BACKEND_TMUX
+        )
+        direct = resolve_for_route_target(TARGET_CHILD_GATEWAY, identity, inventory)
+        self.assertEqual(neutral, direct)
+        self.assertEqual(neutral.status, RESOLVE_OK)
+        self.assertEqual(neutral.resolved_pane_id, "%30")
+
+    def test_herdr_resolves_against_agent_list(self):
+        identity = herdr_route_identity(
+            workspace_id=WS, role="codex", lane_id=LANE, route_id="route-cgw"
+        )
+        inventory = [_herdr_row(role="codex", pane_id="w1:p3")]
+        result = resolve_for_route_target_neutral(
+            TARGET_CHILD_GATEWAY, identity, inventory, backend=BACKEND_HERDR
+        )
+        self.assertEqual(result.status, RESOLVE_OK)
+        self.assertEqual(result.resolved_pane_id, "w1:p3")
+
+    def test_role_mismatch_guard_raises_both_backends(self):
+        # A worker (claude) token re-resolved to a codex identity is a malformed
+        # request; the shared guard raises before any live match, on both backends.
+        identity = self._codex_identity()
+        for backend in (BACKEND_TMUX, BACKEND_HERDR):
+            with self.assertRaises(DelegationRoutePlanError):
+                resolve_for_route_target_neutral(
+                    TARGET_SAME_LANE_WORKER, identity, [], backend=backend
+                )
+
+    def test_cross_project_worker_guard_raises(self):
+        worker = RouteIdentity(
+            workspace_id=WS,
+            lane_id=LANE,
+            role="claude",
+            pane_name="ws-alpha/lane-1/claude",
+            route_id="route-worker",
+            observed_at="2026-07-06T00:00:00Z",
+        )
+        with self.assertRaises(DelegationRoutePlanError):
+            resolve_for_route_target_neutral(
+                TARGET_SAME_LANE_WORKER, worker, [], backend=BACKEND_HERDR,
+                cross_project=True,
+            )
+
+    def test_unsupported_backend_fails_closed(self):
+        with self.assertRaises(BackendNeutralResolverError):
+            resolve_for_route_target_neutral(
+                TARGET_CHILD_GATEWAY, self._codex_identity(), [], backend="ssh"
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover
