@@ -593,7 +593,15 @@ class CockpitMembershipUseCase:
         # runs on one backend, so the two inventories are disjoint by construction).
         herdr_observations, herdr_warnings = self._herdr_observations()
         observations = observations + herdr_observations
-        cockpit_present = bool(managed) or geometry.cockpit_present
+        # A live herdr Unit is a present cockpit membership just as a tmux Unit is:
+        # without this, a herdr-only environment (no tmux managed windows / geometry)
+        # would report a `member` herdr row *and* ``cockpit_present`` False, so the
+        # text says "nothing loaded" above a populated table and the JSON pairs
+        # ``cockpit_present: false`` with a member row (review j#72953). herdr off
+        # yields no herdr observations, so the tmux-only path is byte-invariant.
+        cockpit_present = (
+            bool(managed) or geometry.cockpit_present or bool(herdr_observations)
+        )
 
         facts: dict[str, object] = {}
         for obs in observations:
