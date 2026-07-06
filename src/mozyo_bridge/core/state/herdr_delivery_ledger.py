@@ -187,6 +187,19 @@ def _looks_like_path(text: str) -> bool:
     return "/" in text or "\\" in text or text.startswith("~")
 
 
+def _redact_key(key: object) -> str:
+    """A mapping key coerced to a string and path-redacted.
+
+    JSON object keys must be strings, so a non-string key is coerced first; a
+    path-shaped key (including a coerced :class:`pathlib.Path`) is replaced with
+    :data:`REDACTED_PATH` so a personal path in a ``retry`` key cannot survive the
+    way it did before Redmine #13296 j#72889 (the prior sanitizer redacted values
+    but left keys untouched).
+    """
+    text = key if isinstance(key, str) else str(key)
+    return REDACTED_PATH if _looks_like_path(text) else text
+
+
 def _redact_json_safe(value: object) -> object:
     """Recursively make a value JSON-serializable and free of absolute paths.
 
@@ -194,7 +207,9 @@ def _redact_json_safe(value: object) -> object:
     persist boundary so no row can carry a personal path (Redmine #13296 j#72883
     finding 1) and ``json.dumps`` can never raise on a non-JSON type such as
     :class:`pathlib.Path` (finding 2). Scalars pass through; a path-shaped string
-    is replaced with :data:`REDACTED_PATH`; a mapping / sequence is walked; any
+    is replaced with :data:`REDACTED_PATH`; a mapping is walked with BOTH its keys
+    (via :func:`_redact_key`) and values redacted — a path-shaped key leaks just as
+    much as a value (Redmine #13296 j#72889) — a sequence is walked; any
     other type is coerced to ``str`` (then path-redacted), which is what closes the
     ``TypeError`` hole. The whitelist projection off the ``DeliveryOutcome`` still
     keeps path-bearing outcome fields (``execution_root``) out entirely; this is
@@ -205,7 +220,9 @@ def _redact_json_safe(value: object) -> object:
     if isinstance(value, str):
         return REDACTED_PATH if _looks_like_path(value) else value
     if isinstance(value, dict):
-        return {str(k): _redact_json_safe(v) for k, v in value.items()}
+        # Redact BOTH key and value at every nesting level (Redmine #13296
+        # j#72889): a path-shaped key is a path leak just as much as a value.
+        return {_redact_key(k): _redact_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact_json_safe(v) for v in value]
     text = str(value)
