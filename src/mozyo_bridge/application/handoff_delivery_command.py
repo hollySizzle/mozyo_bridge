@@ -88,6 +88,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
     submit_record_lines,
 )
+from mozyo_bridge.core.state.herdr_delivery_ledger import record_herdr_delivery
 
 if TYPE_CHECKING:  # avoid importing argparse on the hot path
     import argparse
@@ -525,3 +526,29 @@ def maybe_persist_delivery_record(
         activation=activation,
         turn_start_lines=turn_start_lines,
     )
+
+
+def record_herdr_send_ledger(
+    outcome, *, retry_outcome: "QueueEnterRetryOutcome | None" = None
+) -> None:
+    """Emit the #13296 herdr delivery-ledger record at a live herdr send-site (#13300).
+
+    Called by ``orchestrate_handoff`` AFTER the transport outcome is finalized and
+    emitted, on each of the two herdr send rails — the #13255 event rail (carrying
+    ``turn_start_outcome``) and the #13292 queue-enter rail (carrying
+    ``queue_enter_turn_start_observation``). The ledger derives its ``rail`` /
+    ``backend`` from those telemetry fields, so the caller supplies only the additive
+    queue-enter Enter-only ``retry_outcome`` (projected here to the numbers+bool dict
+    the ledger stores) when it engaged.
+
+    :func:`record_herdr_delivery` is best-effort by contract (never raises into the
+    caller, #13296 j#72893): a ledger failure MUST NOT fail the send that triggered
+    it, exactly like the delivery-record / telemetry seams this module already owns.
+    ACK semantics — ``status`` / ``reason`` / ``next_action_owner`` — are the rails',
+    stored verbatim; the ledger reinvents no judgement. The caller passes no
+    path-bearing field (redaction is the ledger's, and its whitelist projection also
+    never reads ``execution_root``). Only the herdr send path calls this; the tmux
+    path never reaches it (close condition: tmux 経路不変).
+    """
+    retry = retry_outcome.to_dict() if retry_outcome is not None else None
+    record_herdr_delivery(outcome, retry=retry)
