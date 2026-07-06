@@ -69,7 +69,9 @@ landed in the composer but the first Enter was **not** submitted, so the turn
 never started until Enter was re-sent. When the first wait times out, the rail
 runs a bounded Enter-resend: it **reads the pane** (transport ``read_pane``) and
 re-sends Enter *only if the injected body still sits in the composer*
-(:func:`composer_retains_body`) — never re-typing the body, only the Enter — up to
+(:func:`composer_retains_body`, a whitespace-insensitive match so the composer's
+mid-token line wraps do not hide the body — Redmine #13322) — never re-typing the
+body, only the Enter — up to
 :attr:`HerdrTurnStartRail.max_enter_resends` times (config; default 1, ``0``
 disables it). Each resend re-arms a fresh wait first (the same check-then-wait
 order). This logic is agent-kind-agnostic bounded-retry, not Codex-special-cased;
@@ -367,27 +369,47 @@ class TurnStartResult:
         }
 
 
-def _collapse_ws(text: str) -> str:
-    """Collapse every whitespace run to a single space (wrapping-insensitive-ish)."""
-    return " ".join(text.split())
+def _strip_all_ws(text: str) -> str:
+    """Remove every whitespace character (a wrapping-insensitive match key).
+
+    ``str.split()`` with no argument splits on any whitespace run, so ``"".join``
+    of the pieces drops all whitespace — spaces, tabs, and the newlines a rendered
+    composer inserts at line wraps, whether at a word boundary or *mid-token*.
+    """
+    return "".join(text.split())
 
 
 def composer_retains_body(content: object, text: object) -> bool:
     """True when the injected ``text`` still appears in the pane ``content`` (pure).
 
     The Enter-resend gate (PoC E14): the rail re-sends Enter only when the injected
-    body is still sitting in the composer — the stuck-Enter signature. Both sides
-    are whitespace-collapsed (so a soft line-wrap in the rendered composer does not
-    hide the body) and a non-empty body is required. Anything non-string, or an
-    empty body, is ``False`` — a read that could not confirm retention must not
-    authorise a resend. Never raises.
+    body is still sitting in the composer — the stuck-Enter signature. The match is
+    whitespace-INSENSITIVE: all whitespace is removed from both sides before the
+    substring test.
+
+    Why remove all whitespace rather than collapse runs to a single space: a
+    rendered composer hard-wraps a long line to the pane width, and it wraps even
+    *mid-token* for an unbroken token. The real handoff marker
+    ``[mozyo:handoff:...:journal=73136:kind=...]`` renders as ``journal=7313`` +
+    newline + ``  6:kind`` (Redmine #13322, confirmed against the live codex TUI); a
+    whitespace-*collapse* would fold that wrap to a spurious space
+    (``journal=7313 6:kind``) and miss the injected ``journal=73136:kind`` — the rail
+    would then refuse to resend and report ``delivered_not_started`` with
+    ``enter_resends=0`` even though the body is plainly retained. Dropping all
+    whitespace makes the wrap — mid-token or at a word boundary — vanish, so a
+    retained body matches regardless of how the TUI folded it.
+
+    A non-empty body is still required; anything non-string, or an empty body, is
+    ``False`` — a read that could not confirm retention must not authorise a resend
+    (an empty / cleared composer therefore never matches, keeping the resend gate
+    fail-closed). Never raises.
     """
     if not isinstance(content, str) or not isinstance(text, str):
         return False
-    body = _collapse_ws(text)
+    body = _strip_all_ws(text)
     if not body:
         return False
-    return body in _collapse_ws(content)
+    return body in _strip_all_ws(content)
 
 
 #: The default raw key token submitted after the text (herdr ``pane send-keys``).

@@ -665,10 +665,24 @@ class ComposerRetainsBodyTests(unittest.TestCase):
         self.assertTrue(composer_retains_body("... " + BODY + " ...", BODY))
 
     def test_soft_wrap_tolerated(self) -> None:
-        # A rendered composer soft-wraps the body across lines; whitespace collapse
-        # keeps the match.
+        # A rendered composer soft-wraps the body across lines at a word boundary;
+        # the whitespace-insensitive match keeps it.
         wrapped = "Refs: Redmine #13248 please\nstart   the turn"
         self.assertTrue(composer_retains_body(wrapped, BODY))
+
+    def test_mid_token_wrap_tolerated(self) -> None:
+        # Redmine #13322: the composer hard-wraps a long unbroken token mid-token
+        # (the handoff marker), inserting a newline + indent inside the token. A
+        # whitespace-COLLAPSE would leave a spurious space and miss it; the
+        # whitespace-INSENSITIVE match must still recognise the retained body.
+        marker = "[mozyo:handoff:source=redmine:issue=13322:journal=73136:kind=review_request:to=codex]"
+        body = f"{marker} please start the turn"
+        rendered = (
+            "› [mozyo:handoff:source=redmine:issue=13322:journal=7313\n"
+            "  6:kind=review_request:to=codex] please start the\n"
+            "  turn"
+        )
+        self.assertTrue(composer_retains_body(rendered, body))
 
     def test_not_retained(self) -> None:
         self.assertFalse(composer_retains_body("empty composer", BODY))
