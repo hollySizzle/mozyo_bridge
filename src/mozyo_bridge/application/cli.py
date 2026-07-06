@@ -378,6 +378,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _exit_on_repo_local_config_error(exc)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
+        # Backend-aware bare `mozyo` (Redmine #13324): only the resolved repo's
+        # `terminal_transport.backend` chooses the entrypoint. `herdr` runs the
+        # single-command herdr session-start + UI attach; `tmux` / unset / absent
+        # keeps the byte-invariant tmux cockpit path. A broken config already
+        # failed closed above, so `config` here is a valid selection.
+        if config.terminal_transport.herdr_enabled:
+            from mozyo_bridge.application.herdr_launch_command import cmd_mozyo_herdr
+
+            return cmd_mozyo_herdr(args)
         return cmd_mozyo(args)
     args = normalize_paths(args)
     _warn_deprecated_alias(args)

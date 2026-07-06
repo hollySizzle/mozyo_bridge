@@ -112,6 +112,18 @@ class HerdrCliTransport:
         self._runner: Runner = runner if runner is not None else subprocess.run
         self._timeout = timeout
 
+    @property
+    def binary(self) -> str:
+        """The resolved herdr executable path this transport is bound to.
+
+        Read-only accessor so a caller that only needs the *resolved* binary
+        (e.g. the backend-aware ``mozyo`` entrypoint's herdr UI ``exec``) can
+        reuse :func:`resolve_terminal_transport`'s single fail-closed resolution
+        (and its exact ``refusing to fall back to tmux`` wording) instead of
+        re-implementing the ``MOZYO_HERDR_BINARY`` resolution.
+        """
+        return self._binary
+
     # -- primitives -----------------------------------------------------------
 
     def send_text(self, target: str, text: str) -> TransportResult:
