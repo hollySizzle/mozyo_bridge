@@ -157,6 +157,15 @@ class OutcomeTests(unittest.TestCase):
         self.assertIn("command", payload)
         self.assertEqual(payload["blocked_reasons"], [])
 
+    def test_payload_carries_hardening_fields(self):
+        # #13301: the readiness observation and route-exception flag round-trip.
+        base = _outcome().as_payload()
+        self.assertIsNone(base["worker_ready"])
+        self.assertFalse(base["allow_direct_worker"])
+        hardened = _outcome(worker_ready=False, allow_direct_worker=True).as_payload()
+        self.assertFalse(hardened["worker_ready"])
+        self.assertTrue(hardened["allow_direct_worker"])
+
 
 class RenderTests(unittest.TestCase):
     def test_executed_render_confirms_but_stays_delivery_ack_only(self):
@@ -185,6 +194,23 @@ class RenderTests(unittest.TestCase):
         # Recovery pointers stay replayable.
         self.assertIn("callback-recovery", text)
         self.assertIn("- command:", text)
+
+    def test_render_records_worker_ready_and_route_exception(self):
+        # #13301: when the readiness wait ran and the route exception was threaded,
+        # the durable record spells both out distinctly (never silently).
+        text = render_worker_dispatch_journal(
+            _outcome(worker_ready=False, allow_direct_worker=True)
+        )
+        self.assertIn("- worker_ready: false", text)
+        self.assertIn("- route_exception: --allow-direct-worker", text)
+        self.assertIn("gateway_route_exception", text)
+
+    def test_render_omits_hardening_lines_when_not_applicable(self):
+        # A drive that did not run the wait (worker_ready=None) and did not thread
+        # the exception omits both lines — no misleading "false" clutter.
+        text = render_worker_dispatch_journal(_outcome())
+        self.assertNotIn("worker_ready:", text)
+        self.assertNotIn("route_exception", text)
 
     def test_dry_run_render_points_at_execute(self):
         text = render_worker_dispatch_journal(

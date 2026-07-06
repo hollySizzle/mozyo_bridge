@@ -296,6 +296,11 @@ class FakeWorkerDispatchOps:
     def read_lane(self, worktree_path):
         return _lane()
 
+    def probe_worker_ready(self, worker_pane):
+        # #13301: the readiness probe is out of scope for the #13290 admission-gate
+        # tests; report ready immediately so the bounded wait resolves in one probe.
+        return True
+
     def dispatch_to_worker(self, **kwargs):
         self.calls.append("dispatch")
         return 0

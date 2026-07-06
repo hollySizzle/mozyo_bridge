@@ -35,6 +35,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_sublane_dispatch_worker,
     format_worker_dispatch_text,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    render_worker_dispatch_journal,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
@@ -72,17 +75,42 @@ def _lane(*, gateway="%176", worker="%177", label="issue_12988_x", issue="12988"
 
 
 class FakeWorkerDispatchOps:
-    """A scriptable :class:`WorkerDispatchOps` recording every call made to it."""
+    """A scriptable :class:`WorkerDispatchOps` recording every call made to it.
 
-    def __init__(self, *, lane=None, dispatch_rc=0, dispatch_error=None):
+    ``worker_ready`` is the constant readiness the #13301 probe reports; pass
+    ``worker_ready_sequence`` (a list of bools) to script a still-booting worker
+    that becomes ready after N unconfirmed probes.
+    """
+
+    def __init__(
+        self,
+        *,
+        lane=None,
+        dispatch_rc=0,
+        dispatch_error=None,
+        worker_ready=True,
+        worker_ready_sequence=None,
+    ):
         self._lane = lane
         self._dispatch_rc = dispatch_rc
         self._dispatch_error = dispatch_error
+        self._worker_ready = worker_ready
+        self._worker_ready_sequence = (
+            list(worker_ready_sequence)
+            if worker_ready_sequence is not None
+            else None
+        )
         self.calls = []
 
     def read_lane(self, worktree_path):
         self.calls.append(("read_lane", worktree_path))
         return self._lane
+
+    def probe_worker_ready(self, worker_pane):
+        self.calls.append(("probe_worker_ready", worker_pane))
+        if self._worker_ready_sequence:
+            return self._worker_ready_sequence.pop(0)
+        return self._worker_ready
 
     def dispatch_to_worker(self, **kwargs):
         self.calls.append(("dispatch", kwargs))
@@ -191,6 +219,130 @@ class ExecuteTests(unittest.TestCase):
                 outcome.dispatch_result, WORKER_DISPATCH_DELIVERY_FAILED
             )
             self.assertFalse(outcome.worker_dispatch_confirmed)
+
+
+class WorkerReadinessWaitTests(unittest.TestCase):
+    """#13301: bounded, non-fatal pre-forward worker readiness wait.
+
+    Mirrors the #13293 gateway readiness wait on the worker (Claude) pane: the
+    execute drive polls the worker pane until it is booted before the queue-enter
+    forward, but NEVER hard-blocks — an unconfirmed readiness records
+    ``worker_ready=false`` and forwards anyway.
+    """
+
+    def _use_case(self, ops, *, probes=20, sleeps=None):
+        return WorkerDispatchUseCase(
+            ops,
+            worker_ready_probes=probes,
+            worker_ready_interval_seconds=0.0,
+            sleep=(sleeps.append if sleeps is not None else (lambda _s: None)),
+        )
+
+    def test_ready_worker_records_true_and_forwards(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), worker_ready=True)
+        sleeps = []
+        outcome = self._use_case(ops, sleeps=sleeps).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.worker_ready)
+        self.assertTrue(outcome.worker_dispatch_confirmed)
+        # First probe was ready -> no wait slept, and the forward still happened.
+        self.assertEqual(sleeps, [])
+        self.assertIn("dispatch", ops._names())
+        # The probe targets the resolved worker pane, before the send.
+        self.assertEqual(("probe_worker_ready", "%177"), ops.calls[1])
+
+    def test_unconfirmed_readiness_degrades_but_still_forwards(self):
+        # A worker that never reports ready must NOT hard-block: worker_ready=false
+        # is recorded and the forward proceeds (the queue-enter Enter-only retry is
+        # the landing safety net).
+        ops = FakeWorkerDispatchOps(lane=_lane(), worker_ready=False)
+        sleeps = []
+        outcome = self._use_case(ops, probes=3, sleeps=sleeps).run(
+            _req(), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertFalse(outcome.worker_ready)
+        self.assertTrue(outcome.worker_dispatch_confirmed)
+        # Bounded: 3 probes, 2 inter-probe sleeps (no trailing sleep).
+        self.assertEqual(ops._names().count("probe_worker_ready"), 3)
+        self.assertEqual(len(sleeps), 2)
+        self.assertIn("dispatch", ops._names())
+
+    def test_still_booting_worker_becomes_ready_within_window(self):
+        ops = FakeWorkerDispatchOps(
+            lane=_lane(), worker_ready_sequence=[False, False, True]
+        )
+        sleeps = []
+        outcome = self._use_case(ops, probes=20, sleeps=sleeps).run(
+            _req(), execute=True
+        )
+        self.assertTrue(outcome.worker_ready)
+        # Stopped polling on the first ready observation (3rd probe), 2 sleeps.
+        self.assertEqual(ops._names().count("probe_worker_ready"), 3)
+        self.assertEqual(len(sleeps), 2)
+
+    def test_probes_zero_disables_wait_and_leaves_worker_ready_none(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), worker_ready=True)
+        outcome = self._use_case(ops, probes=0).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertIsNone(outcome.worker_ready)
+        self.assertNotIn("probe_worker_ready", ops._names())
+        self.assertIn("dispatch", ops._names())
+
+    def test_dry_run_never_probes_worker_readiness(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), worker_ready=True)
+        outcome = self._use_case(ops).run(_req(), execute=False)
+        self.assertEqual(outcome.status, ACTUATE_READY)
+        self.assertIsNone(outcome.worker_ready)
+        self.assertNotIn("probe_worker_ready", ops._names())
+
+
+class RouteGateExceptionPassthroughTests(unittest.TestCase):
+    """#13301: --allow-direct-worker threads the #12918 route exception through.
+
+    A drive from a pane whose lane Unit differs from the worker's (e.g. a
+    coordinator stall-drive) otherwise fails closed inside the inner ``handoff
+    send`` with ``gateway_route_blocked``. The flag threads the explicit durable
+    exception onto the send so the cross-lane delivery is admitted and recorded
+    distinctly, never silently.
+    """
+
+    def test_flag_threads_into_send_and_is_recorded(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), dispatch_rc=0)
+        outcome = WorkerDispatchUseCase(ops, worker_ready_probes=0).run(
+            _req(), execute=True, allow_direct_worker=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.allow_direct_worker)
+        dispatched = dict(ops.calls)["dispatch"]
+        self.assertTrue(dispatched["allow_direct_worker"])
+        # The replayable command carries the explicit exception flag.
+        self.assertIn("--allow-direct-worker", outcome.command)
+        # The durable record spells the exception out distinctly.
+        journal = render_worker_dispatch_journal(outcome)
+        self.assertIn("route_exception: --allow-direct-worker", journal)
+        self.assertIn("gateway_route_exception", journal)
+
+    def test_default_omits_flag_backcompat(self):
+        ops = FakeWorkerDispatchOps(lane=_lane(), dispatch_rc=0)
+        outcome = WorkerDispatchUseCase(ops, worker_ready_probes=0).run(
+            _req(), execute=True
+        )
+        self.assertFalse(outcome.allow_direct_worker)
+        dispatched = dict(ops.calls)["dispatch"]
+        self.assertFalse(dispatched["allow_direct_worker"])
+        self.assertNotIn("--allow-direct-worker", outcome.command)
+        self.assertNotIn("route_exception", render_worker_dispatch_journal(outcome))
+
+    def test_dry_run_previews_flag_in_command_without_sending(self):
+        ops = FakeWorkerDispatchOps(lane=_lane())
+        outcome = WorkerDispatchUseCase(ops, worker_ready_probes=0).run(
+            _req(), execute=False, allow_direct_worker=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_READY)
+        self.assertTrue(outcome.allow_direct_worker)
+        self.assertIn("--allow-direct-worker", outcome.command)
+        self.assertNotIn("dispatch", ops._names())
 
 
 class FailClosedTests(unittest.TestCase):
@@ -365,6 +517,28 @@ class RenderAndCliTests(unittest.TestCase):
         self.assertEqual(args.journal, "71524")
         self.assertFalse(args.execute)
         self.assertEqual(args.target_repo, "auto")
+        # #13301 defaults: readiness wait on (10s), route exception off.
+        self.assertEqual(args.worker_ready_timeout, 10.0)
+        self.assertFalse(args.allow_direct_worker)
+
+    def test_cli_parser_wires_worker_ready_timeout_and_allow_direct_worker(self):
+        from mozyo_bridge.application.cli import build_parser
+
+        args = build_parser().parse_args(
+            [
+                "sublane",
+                "dispatch-worker",
+                "--issue",
+                "13301",
+                "--lane-label",
+                "issue_13301_x",
+                "--worker-ready-timeout",
+                "0",
+                "--allow-direct-worker",
+            ]
+        )
+        self.assertEqual(args.worker_ready_timeout, 0.0)
+        self.assertTrue(args.allow_direct_worker)
 
 
 if __name__ == "__main__":
