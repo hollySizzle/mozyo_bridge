@@ -571,6 +571,160 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertTrue(obs.get("read_ok"), msg=out)
 
 
+class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
+    """Redmine #13300: each herdr send-site of ``orchestrate_handoff`` appends to the
+    #13296 herdr delivery ledger.
+
+    Proves the live wiring the #13296 j#72869/j#72883/j#72893 follow-up asked for:
+    the event rail (#13255) and the queue-enter rail (#13292) each emit a ledger row
+    per send, the emission records even a non-``sent`` (delivered-not-started) outcome
+    before the send fails, a ledger store failure is swallowed (never fails the send),
+    and the wire outcome is byte-unchanged (ACK semantics untouched). The runner sets
+    ``MOZYO_BRIDGE_HOME`` to a temp home so the ledger writes and is read back inside
+    the temp dir's lifetime.
+    """
+
+    def _run_and_ledger(self, *, herdr, mode="standard", sabotage_ledger=False):
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.core.state.herdr_delivery_ledger import (
+            HERDR_DELIVERY_LEDGER_FILENAME,
+            HerdrDeliveryLedger,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            (repo / ".mozyo-bridge").mkdir()
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            register_workspace(repo, home=home)
+            workspace_id = read_anchor(repo)["workspace_id"]
+            herdr.agent_rows = _same_lane_rows()(workspace_id)
+
+            herdr_bin = repo / "fake-herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(
+                herdr_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
+
+            if sabotage_ledger:
+                # Make the ledger path a directory so sqlite `connect` fails on
+                # append: exercises the real best-effort swallow at the boundary.
+                (home / HERDR_DELIVERY_LEDGER_FILENAME).mkdir()
+
+            argv = [
+                "handoff", "send", "--to", "claude",
+                "--source", "asana", "--kind", "implementation_request",
+                "--task-id", "T1", "--comment-id", "C1",
+                "--mode", mode,
+                "--landing-timeout", "0.05", "--submit-delay", "0",
+            ]
+            args = build_parser().parse_args(argv)
+            args.repo = str(repo)
+
+            env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+            env["MOZYO_HERDR_BINARY"] = str(herdr_bin)
+            env["MOZYO_REPO"] = str(repo)
+            env["MOZYO_BRIDGE_HOME"] = str(home)
+            env["MOZYO_WORKSPACE_ID"] = workspace_id
+            env["MOZYO_AGENT_ROLE"] = "codex"
+            env["MOZYO_LANE_ID"] = "lane-1"
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("subprocess.run", herdr.run))
+                stack.enter_context(patch("subprocess.Popen", herdr.popen))
+                stack.enter_context(patch("mozyo_bridge.application.commands.time.sleep"))
+                stack.enter_context(patch.dict(os.environ, env, clear=True))
+                out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                err = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                try:
+                    result = args.func(args)
+                except BaseException as exc:  # noqa: BLE001
+                    result = exc
+
+            # Read the ledger while the temp home is still alive, with `home` passed
+            # explicitly (no env dependency).
+            records = HerdrDeliveryLedger(home=home).recent()
+            return result, _outcome_from(out.getvalue()), records, out.getvalue()
+
+    def test_event_rail_sent_appends_one_delivery_outcome(self) -> None:
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, outcome, records, out = self._run_and_ledger(herdr=herdr)
+        self.assertEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(len(records), 1, msg=records)
+        rec = records[0]
+        self.assertEqual(rec.entry_kind, "delivery_outcome")
+        self.assertEqual(rec.rail, "event_rail")
+        self.assertEqual(rec.backend, "herdr")
+        self.assertEqual(rec.status, "sent")
+        self.assertEqual(rec.reason, "ok")
+        self.assertEqual(rec.receiver, "claude")
+        # The ledger correlates the row with the send via the notification marker.
+        self.assertEqual(rec.notification_marker, outcome.get("notification_marker"))
+        # The event rail carries `turn_start_outcome` telemetry; the queue-enter
+        # observation stays absent.
+        self.assertIsInstance(rec.turn_start_outcome, dict)
+        self.assertIsNone(rec.queue_enter_observation)
+
+    def test_event_rail_records_delivered_not_started_before_send_fails(self) -> None:
+        # A delivered-not-started outcome dies (nonzero), but the ledger must have
+        # already recorded it: "毎 send で ledger record を emit" includes non-`sent`.
+        herdr = _FakeHerdr(
+            [], get_states=["idle", "idle"], wait_results=[(1, "timed out")]
+        )
+        result, outcome, records, out = self._run_and_ledger(herdr=herdr)
+        self.assertNotEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(len(records), 1, msg=records)
+        rec = records[0]
+        self.assertEqual(rec.rail, "event_rail")
+        self.assertEqual(rec.status, "blocked")
+        self.assertEqual(rec.reason, "turn_start_unconfirmed")
+        self.assertEqual(
+            (rec.turn_start_outcome or {}).get("outcome"), "delivered_not_started"
+        )
+
+    def test_queue_enter_rail_appends_with_observation(self) -> None:
+        herdr = _FakeHerdr([], get_states=["working"])
+        result, outcome, records, out = self._run_and_ledger(
+            herdr=herdr, mode="queue-enter"
+        )
+        self.assertEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(len(records), 1, msg=records)
+        rec = records[0]
+        self.assertEqual(rec.entry_kind, "delivery_outcome")
+        self.assertEqual(rec.rail, "queue_enter_rail")
+        self.assertEqual(rec.backend, "herdr")
+        self.assertEqual(rec.status, "sent")
+        # The queue-enter rail carries the additive post-choreography observation;
+        # the event rail's `turn_start_outcome` stays absent.
+        self.assertIsInstance(rec.queue_enter_observation, dict)
+        self.assertEqual(
+            rec.queue_enter_observation.get("observation_kind"),
+            "post_choreography_snapshot",
+        )
+        self.assertIsNone(rec.turn_start_outcome)
+
+    def test_ledger_store_failure_does_not_fail_the_send(self) -> None:
+        # A broken ledger store (path is a directory → sqlite connect fails) is
+        # swallowed by the best-effort boundary: the send still resolves `sent`/0 and
+        # the wire outcome is unchanged. No row is readable (read also degrades).
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, outcome, records, out = self._run_and_ledger(
+            herdr=herdr, sabotage_ledger=True
+        )
+        self.assertEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "ok", msg=out)
+        self.assertEqual(records, [], msg=records)
+
+
 class TmuxBackendUntouchedTest(unittest.TestCase):
     """backend=tmux (and absent config) resolve to None — the shim installs nothing."""
 
