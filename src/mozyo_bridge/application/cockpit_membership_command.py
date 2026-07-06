@@ -62,6 +62,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     infer_repo_root,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+    BACKEND_TMUX,
     CockpitMembershipReport,
     MembershipObservation,
     RegistryFacts,
@@ -106,7 +107,7 @@ def build_membership_observations(
                 continue
             key = (workspace_id, normalize_lane(col.get("lane_id")))
             if key not in units:
-                units[key] = {"codex": "", "claude": ""}
+                units[key] = {"codex": "", "claude": "", "backend": BACKEND_TMUX}
                 order.append(key)
             role = col.get("role")
             pane_id = col.get("pane_id") or ""
@@ -114,6 +115,13 @@ def build_membership_observations(
                 units[key]["codex"] = pane_id
             elif role == ROLE_CLAUDE and not units[key]["claude"]:
                 units[key]["claude"] = pane_id
+            # A column may carry an optional ``backend`` hint (default tmux, so the
+            # live tmux read stays byte-invariant). Any non-tmux column marks the
+            # whole Unit non-tmux, so the projection degrades its tmux-only fields
+            # honestly (#13298). Live herdr-column wiring is deferred (full parity).
+            col_backend = col.get("backend") or BACKEND_TMUX
+            if col_backend != BACKEND_TMUX:
+                units[key]["backend"] = col_backend
         for key in order:
             codex_pane = units[key]["codex"]
             claude_pane = units[key]["claude"]
@@ -127,6 +135,7 @@ def build_membership_observations(
                     window=window.get("window") or "",
                     window_id=window.get("window_id") or "",
                     repo_root=repo_root_for(codex_pane, claude_pane),
+                    backend=units[key]["backend"],
                 )
             )
     return observations

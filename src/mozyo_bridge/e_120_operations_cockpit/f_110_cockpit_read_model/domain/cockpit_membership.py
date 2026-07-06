@@ -52,6 +52,29 @@ GEOM_WARNING = "warning"  # in cockpit but a warning-level geometry drift / miss
 GEOM_UNKNOWN = "unknown"  # in a non-cockpit (group) window not covered by the diagnosis
 GEOM_ABSENT = "absent"  # the workspace is not loaded in the cockpit at all
 
+# Backend kinds — which terminal transport backs a cockpit Unit (#13298 / #13263
+# j#72594). ``tmux`` is the default so every existing tmux-only projection stays
+# byte-invariant; a ``herdr`` Unit degrades its tmux-only fields honestly instead
+# of showing a stale tmux pane / geometry.
+BACKEND_TMUX = "tmux"
+BACKEND_HERDR = "herdr"
+
+# Degrade tokens for a tmux-only field observed on a non-tmux (herdr) Unit. The
+# projection must never show stale tmux health for a herdr Unit (#13263 j#72594):
+# a structural tmux primitive (pane id / tmux window) has no herdr analog, so it
+# degrades to :data:`FIELD_UNSUPPORTED`; a tmux liveness / health signal the
+# cockpit cannot observe on this backend degrades to
+# :data:`GEOM_BACKEND_UNAVAILABLE`; a field applicable in principle but not
+# resolvable degrades to :data:`FIELD_UNKNOWN`.
+FIELD_UNSUPPORTED = "unsupported"
+FIELD_BACKEND_UNAVAILABLE = "backend_unavailable"
+FIELD_UNKNOWN = "unknown"
+
+# Geometry-status degrade for a herdr Unit: tmux 2D geometry health is not
+# observable on a non-tmux backend, so the liveness cell reads
+# ``backend_unavailable`` rather than a stale ``ok`` / ``warning``.
+GEOM_BACKEND_UNAVAILABLE = FIELD_BACKEND_UNAVAILABLE
+
 # Membership-warning codes (advisory; separated from the headline membership fact
 # so `cockpit list` / `status` keep "is it loaded" distinct from "what to tidy").
 WARN_MISSING_PEER = "missing_peer"
@@ -60,6 +83,7 @@ WARN_ANCHOR_ABSENT = "workspace_anchor_absent"
 WARN_NOT_LOADED = "not_loaded"
 WARN_ROLE_LESS_PANE = "role_less_pane"
 WARN_MIXED_UNIT_COLUMN = "mixed_unit_column"
+WARN_TMUX_FIELDS_DEGRADED = "tmux_fields_degraded"
 
 
 @dataclass(frozen=True)
@@ -111,6 +135,11 @@ class MembershipObservation:
     (empty when it could not be read) — distinct from the workspace registry's
     single canonical path, so a worktree / lane reports its own checkout instead
     of the main checkout (#12341 review j#62643).
+
+    ``backend`` names the terminal transport backing the Unit (#13298). It
+    defaults to :data:`BACKEND_TMUX` so every existing tmux caller is unchanged;
+    a :data:`BACKEND_HERDR` observation makes :func:`build_membership` degrade the
+    tmux-only fields (panes / window / geometry) honestly.
     """
 
     workspace_id: str
@@ -121,6 +150,7 @@ class MembershipObservation:
     window: str
     window_id: str
     repo_root: str = ""
+    backend: str = BACKEND_TMUX
 
 
 @dataclass(frozen=True)
@@ -143,11 +173,21 @@ class WorkspaceMembership:
     anchor_present: bool
     warnings: tuple[MembershipWarning, ...] = ()
     registry_canonical_path: str = ""
+    backend: str = BACKEND_TMUX
 
     @property
     def panes_present(self) -> bool:
-        """Both the Codex and Claude panes are present in the cockpit."""
-        return bool(self.codex_pane) and bool(self.claude_pane)
+        """Both the Codex and Claude tmux panes are present in the cockpit.
+
+        A tmux-specific liveness signal: a herdr Unit has no tmux panes (its pane
+        fields carry a degrade token, not an id), so this is ``False`` on a
+        non-tmux backend rather than reading the degrade string as a live pane.
+        """
+        return (
+            self.backend == BACKEND_TMUX
+            and bool(self.codex_pane)
+            and bool(self.claude_pane)
+        )
 
     @property
     def ok(self) -> bool:
@@ -157,7 +197,13 @@ class WorkspaceMembership:
         cockpit-window geometry diagnosis) counts as ok: it is loaded with both
         peers — only :data:`GEOM_WARNING` (missing peer / drift) and
         :data:`GEOM_ABSENT` (not loaded) are not-ok.
+
+        A herdr Unit's tmux geometry is unobservable, so OK-ness reduces to "is it
+        loaded": a degraded liveness cell is honest, not a health warning — full
+        herdr parity is deferred (#13298 / #13263 j#72594).
         """
+        if self.backend != BACKEND_TMUX:
+            return self.member
         return self.member and self.geometry_status in (GEOM_OK, GEOM_UNKNOWN)
 
     def as_dict(self) -> dict:
@@ -169,6 +215,7 @@ class WorkspaceMembership:
             "lane_id": self.lane_id,
             "lane_label": self.lane_label,
             "session": self.session,
+            "backend": self.backend,
             "window": self.window,
             "window_id": self.window_id,
             "codex_pane": self.codex_pane,
@@ -201,10 +248,13 @@ class CockpitMembershipReport:
 
     @property
     def ok(self) -> bool:
-        """No loaded workspace has a geometry warning and no cockpit-wide warning."""
-        return not self.warnings and all(
-            w.geometry_status in (GEOM_OK, GEOM_UNKNOWN) for w in self.workspaces
-        )
+        """No loaded workspace is not-ok and no cockpit-wide warning.
+
+        Delegates the per-workspace verdict to :attr:`WorkspaceMembership.ok`, so a
+        herdr Unit (whose tmux geometry degrades to ``backend_unavailable``) counts
+        as ok when loaded rather than being mistaken for a geometry warning.
+        """
+        return not self.warnings and all(w.ok for w in self.workspaces)
 
     def as_dict(self) -> dict:
         return {
@@ -266,6 +316,54 @@ def _registry_warnings(facts: RegistryFacts) -> list[MembershipWarning]:
     return out
 
 
+def _degraded_membership(
+    *,
+    session: str,
+    observation: MembershipObservation,
+    facts: RegistryFacts,
+    backend: str,
+) -> WorkspaceMembership:
+    """Project a non-tmux (herdr) Unit, degrading every tmux-only field (#13298).
+
+    The Unit is loaded (``member`` True), but tmux pane ids / window / 2D geometry
+    have no honest value on a herdr backend, so each degrades to a stable token
+    instead of showing an empty cell or — worse — a stale tmux health (#13263
+    j#72594). The tmux geometry diagnosis is *not* consulted: it is scoped to tmux
+    panes and would not describe a herdr Unit. Registry / anchor advisories still
+    apply (they are backend-neutral identity facts). Full herdr cockpit parity —
+    live herdr liveness / layout / adopt — is deferred; this only makes the
+    projection stop lying.
+    """
+    warnings: list[MembershipWarning] = [
+        MembershipWarning(
+            WARN_TMUX_FIELDS_DEGRADED,
+            f"Unit is backed by {backend!r}; tmux-only fields (panes / window / "
+            "geometry) are degraded and do not reflect tmux liveness.",
+        )
+    ]
+    warnings.extend(_registry_warnings(facts))
+    repo_root = observation.repo_root or facts.repo_root
+    return WorkspaceMembership(
+        workspace_id=observation.workspace_id,
+        label=facts.label,
+        repo_root=repo_root,
+        lane_id=normalize_lane(observation.lane_id),
+        lane_label=observation.lane_label,
+        session=session,
+        window=FIELD_UNSUPPORTED,
+        window_id=FIELD_UNSUPPORTED,
+        codex_pane=FIELD_UNSUPPORTED,
+        claude_pane=FIELD_UNSUPPORTED,
+        member=True,
+        geometry_status=GEOM_BACKEND_UNAVAILABLE,
+        registry_present=facts.registry_present,
+        anchor_present=facts.anchor_present,
+        warnings=tuple(warnings),
+        registry_canonical_path=facts.repo_root,
+        backend=backend,
+    )
+
+
 def build_membership(
     *,
     session: str,
@@ -274,6 +372,17 @@ def build_membership(
     geometry: Optional[GeometryDiagnosis],
 ) -> WorkspaceMembership:
     """Project one observed cockpit Unit into a :class:`WorkspaceMembership` (pure)."""
+    backend = observation.backend or BACKEND_TMUX
+    if backend != BACKEND_TMUX:
+        # A herdr (or any non-tmux) Unit: never project a stale tmux pane /
+        # geometry — degrade the tmux-only fields honestly (#13298).
+        return _degraded_membership(
+            session=session,
+            observation=observation,
+            facts=facts,
+            backend=backend,
+        )
+
     workspace_id = observation.workspace_id
     lane_id = normalize_lane(observation.lane_id)
     codex = observation.codex_pane
@@ -350,6 +459,7 @@ def absent_membership(
     registry_present: bool,
     anchor_present: bool,
     registry_canonical_path: str = "",
+    backend: str = BACKEND_TMUX,
 ) -> WorkspaceMembership:
     """A :class:`WorkspaceMembership` for a workspace NOT loaded in the cockpit (pure).
 
@@ -393,6 +503,7 @@ def absent_membership(
         anchor_present=anchor_present,
         warnings=tuple(warnings),
         registry_canonical_path=registry_canonical_path,
+        backend=backend,
     )
 
 
@@ -488,6 +599,15 @@ def format_membership_text(
                     ]
                 )
             )
+            if ws.backend != BACKEND_TMUX:
+                # A herdr (or any non-tmux) Unit: the GEOMETRY / CODEX / CLAUDE
+                # cells above already carry degrade tokens; name the backend so the
+                # operator reads them as "not tmux" rather than a tmux fault
+                # (#13298). Only emitted for non-tmux, so tmux rows stay unchanged.
+                lines.append(
+                    f"  backend: {ws.backend} (tmux-only fields degraded — "
+                    "not tmux liveness)"
+                )
             if ws.repo_root:
                 lines.append(f"  repo: {ws.repo_root}")
             if (
