@@ -15,4 +15,4 @@ provider_binding:
   bindings:
     coordinator: claude
 terminal_transport:
-  backend: tmux
+  backend: herdr
