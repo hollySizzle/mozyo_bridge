@@ -29,6 +29,7 @@ from mozyo_bridge.core.state.herdr_delivery_ledger import (
     RAIL_EVENT,
     RAIL_OTHER,
     RAIL_QUEUE_ENTER,
+    REDACTED_PATH,
     HerdrDeliveryLedger,
     HerdrDeliveryLedgerError,
     HerdrDeliveryLedgerRecord,
@@ -336,6 +337,108 @@ class RecordBoundaryTest(unittest.TestCase):
                 home=self.home,
             )
         self.assertIsNone(result)
+
+
+class CallerSuppliedRedactionTest(unittest.TestCase):
+    """j#72883 finding 1/2: retry / disposition are sanitized at the persist boundary."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "ledger.sqlite"
+        self.home = Path(self._tmp.name) / "home"
+
+    def test_retry_abs_path_string_is_redacted_in_record_and_bytes(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        appended = ledger.append(
+            build_herdr_delivery_ledger_record(
+                _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY)),
+                retry={"marker_observed": True, "note": _SECRET_ABS_PATH},
+            )
+        )
+        # The returned record and the persisted bytes both drop the path.
+        self.assertEqual(appended.retry["note"], REDACTED_PATH)
+        self.assertEqual(appended.retry["marker_observed"], True)
+        self.assertNotIn(_SECRET_ABS_PATH.encode(), self.path.read_bytes())
+        got = ledger.recent()[0]
+        self.assertEqual(got.retry["note"], REDACTED_PATH)
+
+    def test_disposition_abs_path_string_is_redacted(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        ledger.append(
+            HerdrDeliveryLedgerRecord(
+                entry_kind=ENTRY_DISPOSITION,
+                notification_marker="m",
+                disposition=_SECRET_ABS_PATH,
+            )
+        )
+        self.assertEqual(ledger.recent()[0].disposition, REDACTED_PATH)
+        self.assertNotIn(_SECRET_ABS_PATH.encode(), self.path.read_bytes())
+
+    def test_plain_disposition_token_survives(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        ledger.append(
+            HerdrDeliveryLedgerRecord(
+                entry_kind=ENTRY_DISPOSITION,
+                notification_marker="m",
+                disposition="resend_scheduled",
+            )
+        )
+        self.assertEqual(ledger.recent()[0].disposition, "resend_scheduled")
+
+    def test_non_json_retry_value_never_raises_and_is_redacted(self) -> None:
+        # A pathlib.Path in retry would make json.dumps raise TypeError; the
+        # sanitizer coerces it, so the best-effort boundary returns a record.
+        appended = record_herdr_delivery(
+            _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY)),
+            retry={"path": Path(_SECRET_ABS_PATH)},
+            home=self.home,
+        )
+        self.assertIsNotNone(appended)
+        self.assertEqual(appended.retry["path"], REDACTED_PATH)
+        raw = herdr_delivery_ledger_path(self.home).read_bytes()
+        self.assertNotIn(_SECRET_ABS_PATH.encode(), raw)
+
+
+class RecordIdentityTest(unittest.TestCase):
+    """j#72883 finding 3: the autoincrement id is exposed as durable record identity."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "ledger.sqlite"
+
+    def test_append_returns_entry_id_and_reads_populate_it(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        unpersisted = build_herdr_delivery_ledger_record(
+            _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY))
+        )
+        self.assertIsNone(unpersisted.entry_id)  # not yet persisted
+        appended = ledger.append(unpersisted)
+        self.assertIsInstance(appended.entry_id, int)
+        self.assertIn("entry_id", appended.as_payload())
+        # The read carries the same identity.
+        got = ledger.records_for_marker("mkr-13296-abc")[0]
+        self.assertEqual(got.entry_id, appended.entry_id)
+
+    def test_distinct_entries_get_distinct_ids(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        first = ledger.append(
+            build_herdr_delivery_ledger_record(
+                _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY))
+            )
+        )
+        second = ledger.append(
+            HerdrDeliveryLedgerRecord(
+                entry_kind=ENTRY_DISPOSITION,
+                notification_marker="mkr-13296-abc",
+                disposition="resend_scheduled",
+            )
+        )
+        self.assertNotEqual(first.entry_id, second.entry_id)
+        # The causality chain preserves ascending identity order.
+        chain = ledger.records_for_marker("mkr-13296-abc")
+        self.assertEqual([r.entry_id for r in chain], [first.entry_id, second.entry_id])
 
 
 if __name__ == "__main__":
