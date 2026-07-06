@@ -43,12 +43,18 @@ Migration / recovery classification (required by #13296 for any new schema):
   future consolidation would add it as a native container table rather than a
   legacy-file component.
 
-Redaction (pasteable-record safety, #13296 / ``feedback_pasteable_records_redact_abs_paths``):
-the projection :func:`build_herdr_delivery_ledger_record` is a **whitelist** — it
-copies only token / id / number / bool fields off the outcome and never touches
-``execution_root`` or any path-bearing field, so no absolute / private path or
-secret can reach a persisted row. The two telemetry dicts are stored verbatim
-because their own contracts already forbid free text and absolute paths.
+Redaction (pasteable-record safety, #13296 / ``feedback_pasteable_records_redact_abs_paths``)
+is two-layered. (1) The projection :func:`build_herdr_delivery_ledger_record` is a
+**whitelist** — it copies only token / id / number / bool fields off the outcome
+and never touches ``execution_root`` or any path-bearing field, so no outcome path
+can reach a row. (2) The caller-supplied ``retry`` / ``disposition`` fields have no
+such contract, so :meth:`HerdrDeliveryLedger.append` runs them through
+:func:`_redact_json_safe` at the persist boundary: a path-shaped string is replaced
+with :data:`REDACTED_PATH` and any non-JSON value (e.g. a :class:`pathlib.Path`) is
+coerced, so no personal path lands in a row and ``json.dumps`` cannot raise
+(Redmine #13296 j#72883 findings 1 / 2). The two rail telemetry dicts are stored
+verbatim because their own #13255 / #13292 contracts already forbid free text and
+absolute paths.
 
 Conventions mirror the sibling home-scoped stores (a ``*_FILENAME`` constant, a
 ``*_path(home=None)`` helper resolving through
@@ -65,7 +71,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -136,6 +142,11 @@ _COLUMNS = (
     "queue_enter_observation_json, retry_json"
 )
 
+#: Read projection: the autoincrement ``id`` (record identity) then the insert
+#: columns. ``id`` is DB-assigned, so it is absent from the INSERT column list
+#: above but present on every read.
+_SELECT_COLUMNS = f"id, {_COLUMNS}"
+
 
 def herdr_delivery_ledger_path(home: Path | None = None) -> Path:
     return (home or mozyo_bridge_home()) / HERDR_DELIVERY_LEDGER_FILENAME
@@ -161,6 +172,46 @@ def _loads_or_none(value: object) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
+#: Marker a path-shaped value is replaced with before it can reach a row.
+REDACTED_PATH = "<redacted-path>"
+
+
+def _looks_like_path(text: str) -> bool:
+    """True for a string that carries a filesystem path separator / home / drive.
+
+    The caller-supplied ``retry`` / ``disposition`` telemetry is tokens + numbers
+    only by contract, so ANY ``/`` / ``\\`` / leading ``~`` / drive prefix is a
+    path leak, not legitimate content. ISO timestamps use ``-`` / ``:`` (no ``/``),
+    so they are never caught.
+    """
+    return "/" in text or "\\" in text or text.startswith("~")
+
+
+def _redact_json_safe(value: object) -> object:
+    """Recursively make a value JSON-serializable and free of absolute paths.
+
+    Applied to the caller-supplied ``retry`` / ``disposition`` fields at the
+    persist boundary so no row can carry a personal path (Redmine #13296 j#72883
+    finding 1) and ``json.dumps`` can never raise on a non-JSON type such as
+    :class:`pathlib.Path` (finding 2). Scalars pass through; a path-shaped string
+    is replaced with :data:`REDACTED_PATH`; a mapping / sequence is walked; any
+    other type is coerced to ``str`` (then path-redacted), which is what closes the
+    ``TypeError`` hole. The whitelist projection off the ``DeliveryOutcome`` still
+    keeps path-bearing outcome fields (``execution_root``) out entirely; this is
+    the second layer for the fields the ledger accepts verbatim from the caller.
+    """
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return REDACTED_PATH if _looks_like_path(value) else value
+    if isinstance(value, dict):
+        return {str(k): _redact_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_json_safe(v) for v in value]
+    text = str(value)
+    return REDACTED_PATH if _looks_like_path(text) else text
+
+
 @dataclass(frozen=True)
 class HerdrDeliveryLedgerRecord:
     """One durable herdr delivery-ledger entry.
@@ -169,8 +220,15 @@ class HerdrDeliveryLedgerRecord:
     never an absolute path or secret. ``turn_start_outcome`` (#13255) and
     ``queue_enter_observation`` (#13292) are the verbatim rail telemetry; the ledger
     stores them as-is (ACK semantics are not reinvented).
+
+    ``entry_id`` is the durable record identity — the ``id INTEGER PRIMARY KEY``
+    autoincrement assigned at :meth:`HerdrDeliveryLedger.append`. It is ``None`` on
+    a record that has not been persisted yet and populated on the append return
+    value and every read, so a caller / auditor can stably reference an individual
+    ledger entry (Redmine #13296 j#72883 finding 3).
     """
 
+    entry_id: Optional[int] = None
     entry_kind: str = ENTRY_DELIVERY_OUTCOME
     notification_marker: Optional[str] = None
     receiver: Optional[str] = None
@@ -192,6 +250,7 @@ class HerdrDeliveryLedgerRecord:
 
     def as_payload(self) -> dict:
         return {
+            "entry_id": self.entry_id,
             "recorded_at": self.recorded_at,
             "entry_kind": self.entry_kind,
             "notification_marker": self.notification_marker,
@@ -248,12 +307,28 @@ class HerdrDeliveryLedger:
         self.path = path or herdr_delivery_ledger_path(home)
 
     def append(self, record: HerdrDeliveryLedgerRecord) -> HerdrDeliveryLedgerRecord:
-        """Append one ledger entry, stamping ``recorded_at`` when absent."""
+        """Append one ledger entry, stamping ``recorded_at`` when absent.
+
+        The caller-supplied ``retry`` / ``disposition`` are run through
+        :func:`_redact_json_safe` at this persist boundary so no personal path can
+        reach a row and a non-JSON ``retry`` value cannot raise (Redmine #13296
+        j#72883 findings 1 / 2). The rail telemetry dicts are safe by their #13255 /
+        #13292 contracts and are stored verbatim. Returns a copy carrying the
+        DB-assigned ``entry_id`` (finding 3) and the redacted fields as persisted.
+        """
         recorded_at = record.recorded_at or _utc_now()
+        safe_disposition = (
+            _redact_json_safe(record.disposition)
+            if record.disposition is not None
+            else None
+        )
+        safe_retry = (
+            _redact_json_safe(record.retry) if record.retry is not None else None
+        )
         conn = _connect(self.path)
         try:
             with conn:
-                conn.execute(
+                cursor = conn.execute(
                     f"INSERT INTO herdr_delivery_ledger ({_COLUMNS}) "
                     f"VALUES ({', '.join('?' * 18)})",
                     (
@@ -271,15 +346,17 @@ class HerdrDeliveryLedger:
                         record.status,
                         record.reason,
                         record.next_action_owner,
-                        record.disposition,
+                        safe_disposition,
                         _json_or_none(record.turn_start_outcome),
                         _json_or_none(record.queue_enter_observation),
-                        _json_or_none(record.retry),
+                        _json_or_none(safe_retry),
                     ),
                 )
+                entry_id = cursor.lastrowid
         finally:
             conn.close()
         return HerdrDeliveryLedgerRecord(
+            entry_id=entry_id,
             entry_kind=record.entry_kind,
             notification_marker=record.notification_marker,
             receiver=record.receiver,
@@ -293,10 +370,10 @@ class HerdrDeliveryLedger:
             status=record.status,
             reason=record.reason,
             next_action_owner=record.next_action_owner,
-            disposition=record.disposition,
+            disposition=safe_disposition,
             turn_start_outcome=record.turn_start_outcome,
             queue_enter_observation=record.queue_enter_observation,
-            retry=record.retry,
+            retry=safe_retry,
             recorded_at=recorded_at,
         )
 
@@ -318,21 +395,22 @@ class HerdrDeliveryLedger:
 
     def recent(self, *, limit: int = 50) -> list[HerdrDeliveryLedgerRecord]:
         return self._read(
-            f"SELECT {_COLUMNS} FROM herdr_delivery_ledger ORDER BY id DESC LIMIT ?",
+            f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
+            "ORDER BY id DESC LIMIT ?",
             (limit,),
         )
 
     def records_for_marker(self, marker: str) -> list[HerdrDeliveryLedgerRecord]:
         """Causality lookup: every entry (outcome + retry + disposition) for a send."""
         return self._read(
-            f"SELECT {_COLUMNS} FROM herdr_delivery_ledger "
+            f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
             "WHERE notification_marker = ? ORDER BY id",
             (marker,),
         )
 
     def records_for_issue(self, issue_id: str) -> list[HerdrDeliveryLedgerRecord]:
         return self._read(
-            f"SELECT {_COLUMNS} FROM herdr_delivery_ledger "
+            f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
             "WHERE issue_id = ? ORDER BY id",
             (issue_id,),
         )
@@ -340,24 +418,25 @@ class HerdrDeliveryLedger:
     @staticmethod
     def _row_to_record(row: tuple) -> HerdrDeliveryLedgerRecord:
         return HerdrDeliveryLedgerRecord(
-            recorded_at=row[0],
-            entry_kind=row[1],
-            notification_marker=row[2],
-            receiver=row[3],
-            provider=row[4],
-            backend=row[5],
-            rail=row[6],
-            target=row[7],
-            source=row[8],
-            issue_id=row[9],
-            journal_id=row[10],
-            status=row[11],
-            reason=row[12],
-            next_action_owner=row[13],
-            disposition=row[14],
-            turn_start_outcome=_loads_or_none(row[15]),
-            queue_enter_observation=_loads_or_none(row[16]),
-            retry=_loads_or_none(row[17]),
+            entry_id=row[0],
+            recorded_at=row[1],
+            entry_kind=row[2],
+            notification_marker=row[3],
+            receiver=row[4],
+            provider=row[5],
+            backend=row[6],
+            rail=row[7],
+            target=row[8],
+            source=row[9],
+            issue_id=row[10],
+            journal_id=row[11],
+            status=row[12],
+            reason=row[13],
+            next_action_owner=row[14],
+            disposition=row[15],
+            turn_start_outcome=_loads_or_none(row[16]),
+            queue_enter_observation=_loads_or_none(row[17]),
+            retry=_loads_or_none(row[18]),
         )
 
 
@@ -474,7 +553,18 @@ def record_herdr_delivery(
             entry_kind=entry_kind,
         )
         return HerdrDeliveryLedger(home=home).append(record)
-    except (HerdrDeliveryLedgerError, sqlite3.DatabaseError, OSError, AttributeError):
+    except (
+        HerdrDeliveryLedgerError,
+        sqlite3.DatabaseError,
+        OSError,
+        AttributeError,
+        TypeError,
+        ValueError,
+    ):
+        # `TypeError` / `ValueError` are defense-in-depth for a non-JSON value that
+        # slipped past `_redact_json_safe`; the sanitizer already coerces such
+        # values, so this keeps the "never raises into caller" contract total
+        # (Redmine #13296 j#72883 finding 2).
         return None
 
 
@@ -489,6 +579,7 @@ __all__ = (
     "RAIL_QUEUE_ENTER",
     "RAIL_OTHER",
     "BACKEND_HERDR",
+    "REDACTED_PATH",
     "HerdrDeliveryLedgerRecord",
     "HerdrDeliveryLedgerError",
     "HerdrDeliveryLedger",
