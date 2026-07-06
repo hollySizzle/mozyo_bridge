@@ -38,13 +38,18 @@ current state nor be armed after a transition without racing it. The rail
 therefore follows a fixed order, and :meth:`HerdrTurnStartRail.drive_turn_start`
 enforces it:
 
-1. **Pre-injection snapshot (check).** Read the current runtime state (#13246). If
-   it is anything other than ``awaiting_input`` — ``busy`` / ``blocked`` /
-   ``turn_ended`` / ``unknown``, *including* an unreadable snapshot which degrades
-   to ``unknown`` — the rail refuses to inject and fails closed
+1. **Pre-injection snapshot (check).** Read the current runtime state (#13246). The
+   rail injects only from an :data:`INJECTABLE_PRECONDITION_STATES` member —
+   ``awaiting_input`` (herdr ``idle``) or ``turn_ended`` (herdr ``done``), both
+   static "waiting for the next input" states (#13319, design j#73077). Any other
+   state — ``busy`` / ``blocked`` / ``unknown``, *including* an unreadable snapshot
+   which degrades to ``unknown`` — makes the rail refuse to inject and fail closed
    (:data:`OUTCOME_PRECONDITION_NOT_IDLE`): a turn started while the pane was
    already busy could not be *attributed* to this injection, so injecting would
-   make a later ``started`` unfalsifiable.
+   make a later ``started`` unfalsifiable. ``turn_ended`` is safe because the prior
+   turn is already over, so the next ``working`` is still attributable to this send;
+   it stays ``turn_ended`` (the #13246 mapping is unchanged) and is never promoted
+   to workflow/close ``done``.
 2. **Arm the wait first** (before injecting), so the ``working`` transition the
    injection triggers cannot land in the race window between the snapshot and the
    wait (E12 proved arm-then-inject returns in ~0.36s, event-driven).
@@ -115,6 +120,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RUNTIME_AWAITING_INPUT,
     RUNTIME_BLOCKED,
     RUNTIME_RECEIVER_STATES,
+    RUNTIME_TURN_ENDED,
     RUNTIME_UNKNOWN,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -219,6 +225,31 @@ class TurnStartWaitPort(Protocol):
         ...
 
 
+# --- injectable pre-injection precondition set (core-owned, closed set) ------
+# The runtime receiver-states from which the rail is willing to inject (Redmine
+# #13319, design consultation j#73077). Both are "静止" states that hold until the
+# next input, so a wait armed before injection can attribute the subsequent
+# ``working`` transition to *this* send:
+#
+# - ``awaiting_input`` (herdr ``idle``): the composer is quiet, no turn running;
+# - ``turn_ended`` (herdr ``done``): the assistant turn finished and herdr holds
+#   ``done`` until the next input (#13319 measured it persisting 60s+, so
+#   ``wait ... --status idle`` times out). It is NOT workflow/close ``done`` (the
+#   ``agent_state`` mapping is unchanged); it is only an injectable static runtime
+#   state here — the previous turn is already over, so a next ``working`` is still
+#   attributable to this send.
+#
+# ``busy`` / ``blocked`` / ``unknown`` are deliberately excluded and keep failing
+# closed (:data:`OUTCOME_PRECONDITION_NOT_IDLE`): ``busy`` would break attribution
+# to an already-running turn, ``blocked`` is a runtime block (a permission prompt),
+# and ``unknown`` covers a read failure or a novel status. This set is the *only*
+# thing #13319 widened — the mapping, outcome vocabulary, and fail-closed rules are
+# unchanged.
+INJECTABLE_PRECONDITION_STATES: frozenset[str] = frozenset(
+    {RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED}
+)
+
+
 # --- turn-start outcome vocabulary (core-owned, closed set) ------------------
 # The closed set of results the rail reports. Four "post-injection" outcomes
 # (started / delivered-not-started / blocked / absent) plus two "pre-injection"
@@ -228,7 +259,7 @@ OUTCOME_STARTED = "started"  # wait observed the working transition (E12/E14)
 OUTCOME_DELIVERED_NOT_STARTED = "delivered_not_started"  # injected, but no turn started in the window (E9 c1/E13)
 OUTCOME_BLOCKED = "blocked"  # injected, timed out, and a re-snapshot found a runtime block (E13/E14)
 OUTCOME_ABSENT = "absent"  # the target pane does not exist (E9 c3)
-OUTCOME_PRECONDITION_NOT_IDLE = "precondition_not_idle"  # pre-injection snapshot was not awaiting_input (fail-closed)
+OUTCOME_PRECONDITION_NOT_IDLE = "precondition_not_idle"  # pre-injection snapshot was not injectable (busy/blocked/unknown) — fail-closed
 OUTCOME_INJECT_FAILED = "inject_failed"  # a send_text / send_keys transport step failed (fail-closed)
 
 TURN_START_OUTCOMES: frozenset[str] = frozenset(
@@ -462,11 +493,14 @@ class HerdrTurnStartRail:
         inject → collect (→ bounded Enter-resend → re-snapshot). Returns a
         structured :class:`TurnStartResult`; never raises.
         """
-        # --- 1. Pre-injection snapshot (check). Non-idle (or unreadable) fails
-        # closed: a turn on an already-busy pane cannot be attributed to us.
+        # --- 1. Pre-injection snapshot (check). A non-injectable (or unreadable)
+        # state fails closed: a turn on a busy/blocked/unknown pane cannot be
+        # attributed to us. Injectable = awaiting_input OR turn_ended (#13319): both
+        # are static states that hold until the next input, so the wait armed below
+        # attributes the next ``working`` transition to this send.
         snapshot = self._reader.read_agent_state(target)
         snapshot_state = snapshot.state
-        if snapshot_state != RUNTIME_AWAITING_INPUT:
+        if snapshot_state not in INJECTABLE_PRECONDITION_STATES:
             return TurnStartResult(
                 outcome=OUTCOME_PRECONDITION_NOT_IDLE,
                 detail=(
@@ -610,6 +644,7 @@ __all__ = (
     "DEFAULT_INJECT_SETTLE_SECONDS",
     "DEFAULT_MAX_ENTER_RESENDS",
     "DEFAULT_WAIT_TIMEOUT_MS",
+    "INJECTABLE_PRECONDITION_STATES",
     "OUTCOME_ABSENT",
     "OUTCOME_BLOCKED",
     "OUTCOME_DELIVERED_NOT_STARTED",
