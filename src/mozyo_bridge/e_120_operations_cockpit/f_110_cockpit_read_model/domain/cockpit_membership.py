@@ -84,6 +84,12 @@ WARN_NOT_LOADED = "not_loaded"
 WARN_ROLE_LESS_PANE = "role_less_pane"
 WARN_MIXED_UNIT_COLUMN = "mixed_unit_column"
 WARN_TMUX_FIELDS_DEGRADED = "tmux_fields_degraded"
+# Cockpit-wide advisory: the live herdr `agent list` inventory could not be read
+# (herdr backend selected but the snapshot was unreadable), so any herdr Units are
+# missing from this projection. Emitted instead of silently showing "no herdr
+# Units", so the operator never mistakes an unreadable herdr snapshot for an empty
+# one (#13303; mirrors the fail-closed herdr lister contract).
+WARN_HERDR_INVENTORY_UNAVAILABLE = "herdr_inventory_unavailable"
 
 
 @dataclass(frozen=True)
@@ -529,14 +535,20 @@ def project_membership_report(
     observations: Sequence[MembershipObservation],
     facts_by_workspace: Mapping[str, RegistryFacts],
     geometry: Optional[GeometryDiagnosis],
+    extra_warnings: Sequence[MembershipWarning] = (),
 ) -> CockpitMembershipReport:
     """Project the loaded cockpit Units into a membership report (#12341, pure).
 
-    ``observations`` are the Units read from the live managed cockpit windows;
+    ``observations`` are the Units read from the live managed cockpit windows
+    (tmux) plus any live herdr Units the application layer supplies (#13303);
     ``facts_by_workspace`` maps each ``workspace_id`` to its resolved registry /
     anchor facts; ``geometry`` is the cockpit-window geometry diagnosis (or
     ``None`` when no cockpit window exists). Workspaces are ordered by label then
     workspace id then lane so the listing is stable.
+
+    ``extra_warnings`` are cockpit-wide advisories the application layer adds that
+    the geometry diagnosis cannot see — e.g. an unreadable live herdr inventory
+    (#13303). They default to empty so a tmux-only projection is byte-invariant.
     """
     workspaces = [
         build_membership(
@@ -553,7 +565,7 @@ def project_membership_report(
         session=session,
         cockpit_present=cockpit_present,
         workspaces=tuple(workspaces),
-        warnings=tuple(_report_warnings(geometry)),
+        warnings=tuple(_report_warnings(geometry)) + tuple(extra_warnings),
     )
 
 
