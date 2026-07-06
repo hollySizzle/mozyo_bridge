@@ -386,6 +386,31 @@ class CallerSuppliedRedactionTest(unittest.TestCase):
         )
         self.assertEqual(ledger.recent()[0].disposition, "resend_scheduled")
 
+    def test_retry_path_shaped_key_is_redacted_in_record_and_bytes(self) -> None:
+        # j#72889: a path-shaped dict KEY (not just a value) must not survive.
+        ledger = HerdrDeliveryLedger(path=self.path)
+        appended = ledger.append(
+            build_herdr_delivery_ledger_record(
+                _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY)),
+                retry={_SECRET_ABS_PATH: "value"},
+            )
+        )
+        self.assertNotIn(_SECRET_ABS_PATH, appended.retry)
+        self.assertIn(REDACTED_PATH, appended.retry)
+        self.assertNotIn(_SECRET_ABS_PATH.encode(), self.path.read_bytes())
+        got = ledger.recent()[0]
+        self.assertNotIn(_SECRET_ABS_PATH, got.retry)
+
+    def test_nested_retry_path_key_and_value_are_redacted(self) -> None:
+        ledger = HerdrDeliveryLedger(path=self.path)
+        ledger.append(
+            build_herdr_delivery_ledger_record(
+                _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY)),
+                retry={"outer": {_SECRET_ABS_PATH: _SECRET_ABS_PATH}},
+            )
+        )
+        self.assertNotIn(_SECRET_ABS_PATH.encode(), self.path.read_bytes())
+
     def test_non_json_retry_value_never_raises_and_is_redacted(self) -> None:
         # A pathlib.Path in retry would make json.dumps raise TypeError; the
         # sanitizer coerces it, so the best-effort boundary returns a record.
