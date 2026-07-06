@@ -78,6 +78,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/work_unit_granularity.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_route_planner.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/route_identity_ledger.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/backend_neutral_resolver.py
   - src/mozyo_bridge/domain/handoff_route_identity.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/cli_handoff.py
   - src/mozyo_bridge/e_120_operations_cockpit/f_120_cockpit_web_ui/application/cli_cockpit.py
@@ -98,6 +99,7 @@ rules:
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_delegated_coordinator_acceptance_oracle.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_delegation_project_config.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_delegation_route_planner.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_backend_neutral_resolver.py
   - tests/scenarios/test_delegated_coordinator_route_plan.py
   - tests/regressions/test_issue_12474_delegated_route_gaps.py
   - tests/support/delegation_route_fakes.py

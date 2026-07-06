@@ -129,6 +129,34 @@ route identity resolution が成功した後の send rail は
 - lane boundary を跨ぐ request は target lane Codex gateway へ向かい、foreign Claude へ
   direct send しない。
 
+## Backend-Neutral Live Resolution (#13297)
+
+#13263 j#72594 の「operational default 前の必須線」により、live resolver は tmux pane
+inventory と herdr agent inventory の **backend 中立抽象**へ寄せる。実装は
+`backend_neutral_resolver.py` (同 bounded context) で、ledger の resolver を fork せず
+adapter で包む。
+
+固定境界:
+
+- **tmux 不変**: `backend: tmux` では live `try_pane_lines` row を無変換で
+  `resolve_route` へ渡す。tmux path の挙動は byte 不変 (backend 分岐は adapter 層に閉じる)。
+- **herdr identity source**: `backend: herdr` では live `agent list` row の **assigned
+  name** (mzb1 scheme、#13247) を identity source とする。decode した
+  `(workspace_id, lane_id, role)` を stable slot、canonical assigned name を
+  `route_label`/`pane_name` 相当の stable label とし、tmux `pane_id` を route authority に
+  しない。transient herdr locator は `last_seen_pane_id` と同じ cache/evidence 扱い。
+- **foreign agent**: mzb1 scheme でない name (managed slot 外の herdr agent) は inventory
+  正規化で除外する。
+- **fail-closed 語彙は共有**: 曖昧解決は fail-closed (`target_ambiguous`)、候補 0 は
+  `target_unavailable`、stale cache 検出は `route_identity_stale` を両 backend で継承する。
+  herdr のみ、single match だが live locator 不在の row は blank target 送信を拒否して
+  `route_locator_missing` へ降格する (herdr identity domain の `rebind_missing_locator` と
+  parity)。`resolve_route` は tmux path でこれを emit しない (`try_pane_lines` row は常に
+  pane id を持つ) ため tmux 不変は保たれる。
+
+herdr slot の `RouteIdentity` は `herdr_route_identity(...)` で構築し、`pane_name` を
+deterministic な canonical assigned name に固定する — stable label が slot から drift しない。
+
 ## 参照正本
 
 - `vibes/docs/logics/unit-target-model.md`
