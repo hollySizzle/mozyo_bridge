@@ -600,20 +600,52 @@ class StatusDualPresenceTest(unittest.TestCase):
         self.assertIn("%99", text)
         self.assertIn("backend: herdr", text)
 
-    def test_dual_presence_member_true_even_if_only_herdr_is_ok(self) -> None:
-        # A tmux Unit missing its claude peer (geometry warning -> not ok) alongside
-        # a healthy herdr Unit: the slot is still a member and OK (any row ok).
+    def _degraded_tmux_plus_healthy_herdr(self):
+        # A tmux Unit missing its claude peer (geometry warning -> ok=False) sharing
+        # the queried slot with a healthy herdr Unit (ok=True): the reviewer's
+        # `all(w.ok)` vs `any(w.ok)` split case (j#73096).
         one_peer = _cockpit_window(columns=[
             {"pane_id": "%99", "workspace_id": "wsA", "role": "codex",
              "lane_id": "default", "pane_left": 0, "pane_width": 80},
         ])
         ops = self._ops(windows=[one_peer], geo_panes=[])
-        outcome = CockpitMembershipUseCase(
+        return CockpitMembershipUseCase(
             ops, _FakeHerdrColumnOps(self._herdr_rows_same_slot())
         ).status(session="s", repo="/repo/alpha")
+
+    def test_dual_presence_member_true_even_if_only_herdr_is_ok(self) -> None:
+        # A tmux Unit missing its claude peer (geometry warning -> not ok) alongside
+        # a healthy herdr Unit: the slot is still a member and OK (any row ok).
+        outcome = self._degraded_tmux_plus_healthy_herdr()
         payload = json.loads(outcome.render(json_output=True))
         self.assertEqual(2, payload["workspace_count"])
+        self.assertEqual([False, True], sorted(w["ok"] for w in payload["workspaces"]))
         self.assertTrue(payload["query"]["member"])
+        self.assertEqual(0, outcome.exit_code)
+
+    def test_dual_presence_json_query_ok_matches_exit_verdict(self) -> None:
+        # Regression (review j#73096): with a degraded tmux row (ok=False) beside a
+        # healthy herdr row (ok=True), the JSON machine-readable query verdict must
+        # not contradict the exit code. `query.ok` mirrors exit (any row ok = True /
+        # exit 0); the top-level `ok` stays report-health (all rows -> False here),
+        # documenting the split so a consumer keys on `query.ok`, never `ok`.
+        outcome = self._degraded_tmux_plus_healthy_herdr()
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertTrue(payload["query"]["ok"])
+        self.assertEqual(0, outcome.exit_code)
+        self.assertEqual(payload["query"]["ok"], outcome.exit_code == 0)
+        # The whole-view verdict honestly reflects the degraded tmux row.
+        self.assertFalse(payload["ok"])
+
+    def test_query_ok_agrees_with_top_level_ok_for_single_healthy_row(self) -> None:
+        # A single healthy backend row: `query.ok` and the report-level `ok` agree
+        # (no split), so the new field is not a surprise on the common path.
+        outcome = CockpitMembershipUseCase(self._ops()).status(
+            session="s", repo="/repo/alpha"
+        )
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertTrue(payload["query"]["ok"])
+        self.assertTrue(payload["ok"])
         self.assertEqual(0, outcome.exit_code)
 
     def test_tmux_only_status_is_single_row_byte_invariant(self) -> None:

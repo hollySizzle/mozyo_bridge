@@ -509,6 +509,13 @@ class CockpitStatusOutcome:
 
     def render(self, *, json_output: bool) -> str:
         if json_output:
+            # The JSON carries two verdicts with distinct scopes (review j#73096):
+            # the top-level ``ok`` is report-health across every displayed row (the
+            # ``cockpit list`` semantics — in dual-presence a degraded tmux row can
+            # make it False), while ``query.ok`` is the query verdict that mirrors
+            # ``self.ok`` / :attr:`exit_code` (``any(w.ok)`` over the matching backend
+            # rows). A machine consumer keys on ``query.ok``, never the whole-view
+            # ``ok``, so the JSON verdict never contradicts the exit code.
             payload = self.report.as_dict()
             payload["query"] = dict(self.query)
             return _json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -697,6 +704,18 @@ class CockpitMembershipUseCase:
         # per-row warnings / ok stay on each workspace row. For the single-row
         # tmux-only / herdr-only / absent case this is byte-identical to the prior
         # first-match verdict (``any`` over one element).
+        #
+        # `query.ok` carries this query verdict explicitly so the JSON machine-
+        # readable verdict never disagrees with the exit code (review j#73096): the
+        # report's top-level `ok` stays report-health (`all(w.ok)`, the `cockpit
+        # list` semantics), which in dual-presence can be False when a degraded
+        # tmux row sits beside a healthy herdr row even though the query resolves to
+        # a healthy member (exit 0). `query.ok` mirrors `CockpitStatusOutcome.ok` /
+        # exit; a consumer keys on `query.ok`, not the whole-view `ok`. Added as a
+        # backward-compatible field (auditor j#73083) so existing fields are
+        # unchanged; for a single-row slot `any` over one element makes it equal the
+        # row's own ok, so tmux-only / herdr-only / absent stay byte-invariant.
+        query_ok = any(w.ok for w in matches)
         query_label = matches[0].label
         query = {
             "workspace_id": workspace_id,
@@ -705,12 +724,13 @@ class CockpitMembershipUseCase:
             "registry_canonical_path": facts.repo_root,
             "lane_id": target_lane,
             "member": any(w.member for w in matches),
+            "ok": query_ok,
         }
         return CockpitStatusOutcome(
             report=single,
             query=query,
             query_label=query_label,
-            ok=any(w.ok for w in matches),
+            ok=query_ok,
         )
 
 
