@@ -249,6 +249,104 @@ def resolve_target_role(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic target-lane derivation (Redmine #13305).
+#
+# The #13305 route-authority convergence (design record #13305 j#73008) lifts the
+# real ``handoff send`` path off the lane-less ``(workspace_id, role)`` match and
+# onto the backend-neutral route-identity authority ``(workspace_id, lane_id, role,
+# pane_name)``. A lane-unspecified send therefore must *derive* a single lane
+# deterministically before resolution — never scan all lanes for a matching role
+# (that is exactly the ambiguity the auditor rejected: with multiple lanes live, a
+# lane-less ``(ws, role)`` match is non-unique). Precedence (j#73008), highest
+# first:
+#
+#   1. an explicit lane (an explicit route identity / lane field) — used verbatim;
+#   2. a same-lane peer dispatch — a ``claude`` / ``codex`` provider receiver is a
+#      peer in the sender's own lane, so the sender's ``(workspace_id, lane_id)``
+#      is used;
+#   3. a ``coordinator`` target — the parent pseudo-target lives in the workspace
+#      default lane, never the sender's sublane;
+#   4. a legacy / default-lane call whose sender lane is unknown or already
+#      ``default`` — normalised to :data:`~...herdr_identity.DEFAULT_LANE`.
+#
+# Derivation always yields a single lane for an attested sender + known receiver;
+# the fail-closed outcome for "the derived slot is not live" happens downstream at
+# re-resolution (``target_unavailable`` / ``target_ambiguous`` /
+# ``route_locator_missing``), so a lane that cannot be matched never falls back to
+# an all-lane scan.
+# ---------------------------------------------------------------------------
+#: The derived lane came from an explicit lane / route-identity field (tier 1).
+LANE_BASIS_EXPLICIT: str = "explicit_lane"
+#: The derived lane is the sender's own lane — a same-lane peer dispatch (tier 2).
+LANE_BASIS_SENDER_SAME_LANE: str = "sender_same_lane"
+#: The derived lane is the workspace default lane for a ``coordinator`` target (tier 3).
+LANE_BASIS_COORDINATOR_DEFAULT: str = "coordinator_default"
+#: The derived lane is the default lane for a legacy / lane-unknown call (tier 4).
+LANE_BASIS_LEGACY_DEFAULT: str = "legacy_default"
+
+LANE_DERIVATION_BASES: frozenset[str] = frozenset(
+    {
+        LANE_BASIS_EXPLICIT,
+        LANE_BASIS_SENDER_SAME_LANE,
+        LANE_BASIS_COORDINATOR_DEFAULT,
+        LANE_BASIS_LEGACY_DEFAULT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class LaneDerivation:
+    """The single lane a lane-unspecified herdr send resolves against (Redmine #13305).
+
+    ``lane`` is the deterministically derived lane id (never empty); ``basis`` is
+    one of :data:`LANE_DERIVATION_BASES`, recorded so a test / audit can pin *why*
+    a given lane was chosen (the precedence, not just the value).
+    """
+
+    lane: str
+    basis: str
+
+
+def derive_target_lane(
+    receiver: object, sender: SenderIdentity, *, explicit_lane: object = None
+) -> LaneDerivation:
+    """Derive the single target lane for a herdr send, fail-closed on ambiguity later.
+
+    Applies the #13305 j#73008 precedence (explicit > sender same-lane > coordinator
+    default > legacy default). ``sender.lane_id`` is already normalised to
+    :data:`~...herdr_identity.DEFAULT_LANE` when unset, so a provider (peer) receiver
+    from a default-lane sender is recorded as :data:`LANE_BASIS_LEGACY_DEFAULT`
+    while one from a real sublane is :data:`LANE_BASIS_SENDER_SAME_LANE`.
+
+    A ``coordinator`` receiver always derives to :data:`~...herdr_identity.DEFAULT_LANE`
+    (tier 3): the coordinator pseudo-target is the workspace-level parent, never the
+    sender's sublane — a sublane worker addresses its same-lane gateway as ``codex``
+    (tier 2), and ``coordinator`` only for the workspace-default parent. This is a
+    pure function; it never fails — an unattested sender / unknown receiver is caught
+    upstream by :func:`resolve_sender_identity` / :func:`resolve_target_role`.
+    """
+    explicit = _norm(explicit_lane)
+    if explicit:
+        return LaneDerivation(lane=explicit, basis=LANE_BASIS_EXPLICIT)
+    label = _norm(receiver)
+    if label == RECEIVER_COORDINATOR:
+        return LaneDerivation(
+            lane=DEFAULT_LANE, basis=LANE_BASIS_COORDINATOR_DEFAULT
+        )
+    if label in AGENT_PROVIDERS:
+        lane = sender.lane_id or DEFAULT_LANE
+        basis = (
+            LANE_BASIS_SENDER_SAME_LANE
+            if lane != DEFAULT_LANE
+            else LANE_BASIS_LEGACY_DEFAULT
+        )
+        return LaneDerivation(lane=lane, basis=basis)
+    # Unknown receiver: the target role never resolves (resolve_target_role fails
+    # closed), so the lane is a don't-care; keep it deterministic anyway.
+    return LaneDerivation(lane=DEFAULT_LANE, basis=LANE_BASIS_LEGACY_DEFAULT)
+
+
+# ---------------------------------------------------------------------------
 # Discovery port (core-owned Protocol; provider fills it).
 # ---------------------------------------------------------------------------
 @runtime_checkable
@@ -413,6 +511,13 @@ def resolve_herdr_target(
 
 __all__ = (
     "AGENT_PROVIDERS",
+    "LANE_BASIS_COORDINATOR_DEFAULT",
+    "LANE_BASIS_EXPLICIT",
+    "LANE_BASIS_LEGACY_DEFAULT",
+    "LANE_BASIS_SENDER_SAME_LANE",
+    "LANE_DERIVATION_BASES",
+    "LaneDerivation",
+    "derive_target_lane",
     "MOZYO_AGENT_ROLE_ENV",
     "MOZYO_LANE_ID_ENV",
     "MOZYO_WORKSPACE_ID_ENV",

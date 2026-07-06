@@ -48,9 +48,17 @@ resolver はこれを fail-closed に読む。
 
 ## 3. Target-resolution semantics
 
+> **Redmine #13305 で route authority を収束 (design record #13305 j#73008)。** 本節の
+> lane-less `(workspace_id, role)` projection (`resolve_herdr_target`) は **実 `handoff send`
+> path の route authority ではなくなった**。実 send path は §3.1 の backend-neutral route
+> authority (lane-in-match `(workspace_id, lane_id, role, pane_name)`) を経由する。
+> `resolve_herdr_target` は **legacy compatibility adapter** として残し (translator fallback
+> `handoff_transport_wiring._herdr_native_assigned_name` 用)、下記手順はその legacy adapter の
+> 仕様として保持する。
+
 入力: `receiver` (`claude` / `codex` / `coordinator`)、検証済み `SenderIdentity`、live
 `agent list` rows、coordinator の provider binding。出力: 単一 target agent の assigned name +
-transient locator (`resolve_herdr_target`)。
+transient locator (`resolve_herdr_target`, **legacy adapter**)。
 
 手順:
 
@@ -74,6 +82,33 @@ transient locator (`resolve_herdr_target`)。
      `missing_locator` (空 target への送信を拒否)。
 5. 成功時は matched row の assigned name + locator + decoded identity を返す。呼び出し側は
    その assigned name を `rebind_by_name` で fresh snapshot に再照合してから port に渡す。
+
+## 3.1 実 send path route authority (Redmine #13305 収束)
+
+実 `handoff send` path (`orchestrate_handoff` → `application/herdr_send_entry.resolve_herdr_send_target`)
+は §3 の lane-less match ではなく、**単一の backend-neutral route authority** を経由する
+(`application/herdr_route_authority.resolve_herdr_route_target`)。tmux path が使う route-identity
+ledger と同じ match key `(workspace_id, lane_id, role, pane_name)` に収束させ、route authority を
+両 backend で単一化する。
+
+- **route authority = lane-in-match。** canonical assigned name (`encode_assigned_name`) が
+  `pane_name` を担い、live `agent list` row は #13247 decode で ledger row 形へ正規化してから
+  `backend_neutral_resolver.resolve_route_neutral(..., backend=herdr)` で再照合する。herdr locator /
+  pane_id は cache/evidence のみで authority に昇格しない。
+- **lane は決定的に導出、全 lane scan しない。** lane 未指定 send は先に単一 lane を導出してから
+  その slot を照合する。precedence (最優先から): **explicit lane > sender same-lane (peer
+  `claude`/`codex` receiver は sender の lane) > coordinator default (`coordinator` は workspace
+  default lane) > legacy default (sender lane 不明/`default`)** (`derive_target_lane`)。導出 lane の
+  slot が live でなければ `target_unavailable` / `target_ambiguous` / `route_locator_missing` で
+  fail-closed し、`(workspace_id, role)` の全 lane scan に fallback しない。
+- **fail-closed 語彙 = #13302 ledger 語彙。** 新 reason token は増やさない (必要時は再 consultation)。
+- **gateway-route enforcement gate との関係。** cross-lane worker 送信 (governed
+  `implementation_request` `--to claude` を別 lane worker へ) は、lane-in-match により
+  **target 解決の時点で `target_unavailable` に落ち**、gateway-route gate に到達する前に
+  fail-closed する (同一 invariant を上流で enforce)。gate 本体は tmux path 用に byte 不変で残す。
+- **tmux path は byte 不変。** tmux は従来どおり `pane_info` で解決する。`resolve_route_neutral(tmux)`
+  が `pane_info` の target と一致することは characterization test で pin する
+  (`tests/unit/.../test_herdr_route_authority.py::TmuxByteInvarianceCharacterizationTest`)。
 
 ## 4. Discovery-port boundary (core vs provider)
 

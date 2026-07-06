@@ -297,13 +297,15 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertIn("snapshot awaiting_input", out)
         self.assertIn("wait changed", out)
 
-    def test_gateway_gate_blocks_cross_lane_worker_via_env_no_tmux(self) -> None:
-        # Redmine #13261 increment 4: a governed implementation_request `--to claude`
-        # to a worker in a DIFFERENT lane than the env-derived sender must fail closed
-        # on the gateway-route gate — resolved from the env sender lane (lane-1) vs the
-        # target agent's lane (lane-x), with NO tmux call (TMUX_PANE is set, so a
-        # `current_pane_lane_unit()` fallback would spawn `tmux list-panes` and the
-        # fake herdr runner would raise).
+    def test_cross_lane_worker_fails_closed_at_resolution_no_tmux(self) -> None:
+        # Redmine #13305: the route-authority convergence makes the herdr send path
+        # lane-in-match. A governed implementation_request `--to claude` to a worker in
+        # a DIFFERENT lane than the env-derived sender (lane-1) now fails closed at
+        # TARGET RESOLUTION — the derived lane-1 slot is not live and the authority does
+        # NOT scan all lanes to find the lane-x worker — so it never reaches the
+        # gateway-route gate. The same-lane invariant is enforced upstream (the gate
+        # stays byte-intact for tmux). Still no tmux call (TMUX_PANE is set; a
+        # `list-panes` fallback would make the fake herdr runner raise), still no send.
         def rows(ws):
             return [
                 {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wS:pS"},
@@ -315,7 +317,7 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         outcome = _outcome_from(out)
         self.assertIsNotNone(outcome, msg=out)
         self.assertEqual(outcome.get("status"), "blocked")
-        self.assertEqual(outcome.get("reason"), "gateway_route_blocked")
+        self.assertEqual(outcome.get("reason"), "target_unavailable")
         # Fail-closed before any send.
         self.assertFalse(
             [op for op in herdr.sends if op[0] in ("send_text", "send_keys")]

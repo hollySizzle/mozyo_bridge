@@ -39,8 +39,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfigError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_route_authority import (
+    resolve_herdr_route_target,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    resolve_herdr_target,
     resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -85,9 +87,13 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
 
     Resolves the sender identity (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
     ``MOZYO_LANE_ID`` cross-checked against the repo anchor), lists the live herdr
-    inventory, and resolves ``receiver`` to a single live agent scoped to the sender's
-    workspace + provider role (WU1). Returns a ``project_preflight_target``-compatible
-    pane dict whose ``id`` is the live herdr locator.
+    inventory, and resolves ``receiver`` to a single live agent through the #13305
+    backend-neutral route authority — the lane-in-match tuple
+    ``(workspace_id, lane_id, role, pane_name)`` with a deterministically derived lane
+    (:func:`~...application.herdr_route_authority.resolve_herdr_route_target`), not the
+    legacy lane-less ``(workspace_id, role)`` projection. Returns a
+    ``project_preflight_target``-compatible pane dict whose ``id`` is the live herdr
+    locator.
 
     The synthesized record projects as a ``normal_window`` agent (role carried on the
     ``window_name``, not a ``@mozyo_agent_role`` pane option): a herdr agent is not a
@@ -127,13 +133,26 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
             f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
         )
 
-    resolution = resolve_herdr_target(
-        receiver, sender, rows, coordinator_provider=coordinator_provider
+    # Redmine #13305: resolve through the single backend-neutral route authority
+    # (lane-in-match `(workspace_id, lane_id, role, pane_name)`), not the lane-less
+    # `(workspace_id, role)` projection. A lane-unspecified send derives one lane
+    # deterministically (explicit > sender same-lane > coordinator default > legacy
+    # default) and re-resolves that slot; a slot not live fails closed with the
+    # #13302 ledger vocabulary rather than scanning all lanes. `--target-lane`
+    # (absent today) is threaded so a future explicit-lane caller is honoured.
+    explicit_lane = getattr(args, "target_lane", None)
+    resolution = resolve_herdr_route_target(
+        receiver,
+        sender,
+        rows,
+        coordinator_provider=coordinator_provider,
+        explicit_lane=explicit_lane,
     )
     if resolution.is_fail:
         raise HerdrSendEntryError(
             f"herdr target resolution failed for receiver {receiver!r} in workspace "
-            f"{sender.workspace_id!r} (reason={resolution.reason}): {resolution.detail}",
+            f"{sender.workspace_id!r} lane {resolution.lane!r} "
+            f"(reason={resolution.reason}): {resolution.detail}",
             reason=resolution.reason,
         )
     identity = resolution.identity
