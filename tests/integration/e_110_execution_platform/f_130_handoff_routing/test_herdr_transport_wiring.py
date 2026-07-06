@@ -803,5 +803,76 @@ class TmuxBackendUntouchedTest(unittest.TestCase):
             self.assertTrue(herdr_backend_selected(args))
 
 
+class ExplicitPaneTargetRoutesTmuxTest(unittest.TestCase):
+    """Redmine #13320 (a-narrow, j#73114): under ``backend: herdr`` an explicit tmux
+    ``%pane`` target installs NEITHER the herdr binding NOR the herdr turn-start rail —
+    it rides the tmux rail. Both send-path branch points (the decorator's
+    ``resolve_handoff_transport_runtime`` / the older
+    ``resolve_handoff_transport_binding``) must return the tmux-default ``None`` for a
+    ``%pane`` target, and must do so WITHOUT requiring a herdr binary / inventory (the
+    narrowing short-circuits before ``_resolve_herdr_binding``)."""
+
+    def _herdr_repo(self, tmp):
+        repo = Path(tmp)
+        (repo / ".mozyo-bridge").mkdir()
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+        )
+        return repo
+
+    @staticmethod
+    def _args(repo, target):
+        class _Args:
+            pass
+
+        args = _Args()
+        args.repo = str(repo)
+        args.to = "claude"
+        args.target = target
+        return args
+
+    def test_explicit_pane_binding_is_none_no_binary_required(self) -> None:
+        from mozyo_bridge.application.handoff_transport_wiring import (
+            resolve_handoff_transport_binding,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._herdr_repo(tmp)
+            # No MOZYO_HERDR_BINARY in env: an explicit `%pane` must not reach the
+            # herdr binary resolution (would `die`), it returns the tmux default.
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertIsNone(
+                    resolve_handoff_transport_binding(self._args(repo, "%45"))
+                )
+
+    def test_explicit_pane_runtime_is_none_none_no_binary_required(self) -> None:
+        from mozyo_bridge.application.handoff_transport_wiring import (
+            resolve_handoff_transport_runtime,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._herdr_repo(tmp)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    resolve_handoff_transport_runtime(self._args(repo, "%45")),
+                    (None, None),
+                )
+
+    def test_implicit_target_still_takes_herdr_path(self) -> None:
+        # Contrast: a non-`%pane` (implicit `--to claude`) target under herdr config
+        # DOES enter herdr resolution — with no binary configured it fails closed
+        # (`die` -> SystemExit), proving the narrowing is target-kind-specific and not
+        # a blanket tmux downgrade.
+        from mozyo_bridge.application.handoff_transport_wiring import (
+            resolve_handoff_transport_runtime,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._herdr_repo(tmp)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(SystemExit):
+                    resolve_handoff_transport_runtime(self._args(repo, None))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

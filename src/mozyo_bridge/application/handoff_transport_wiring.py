@@ -63,6 +63,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfigError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
+    explicit_tmux_pane_target,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBinding,
     TransportBindingError,
@@ -199,6 +202,14 @@ def resolve_handoff_transport_binding(
         return None
     if config.backend != BACKEND_HERDR:
         return None
+    # Redmine #13320 (a-narrow, j#73114): an explicit tmux `%pane` target routes on
+    # the tmux rail even under `backend: herdr`, so install no herdr binding for it —
+    # the same target-kind narrowing `orchestrate_handoff` applies via
+    # `herdr_effective_backend_selected`. `orchestrate_handoff` then runs the tmux
+    # path (`require_tmux()` / `pane_info()`), which fails closed on an unresolvable
+    # pane exactly as under `backend: tmux` — never a silent herdr fallback.
+    if explicit_tmux_pane_target(args):
+        return None
     return _resolve_herdr_binding(args, config)
 
 
@@ -228,6 +239,14 @@ def resolve_handoff_transport_runtime(
     except RepoLocalConfigError:
         return None, None
     if config.backend != BACKEND_HERDR:
+        return None, None
+    # Redmine #13320 (a-narrow, j#73114): the decorator's branch point. An explicit
+    # tmux `%pane` target must install NEITHER the herdr binding NOR the herdr
+    # turn-start rail — it rides the tmux rail (same predicate `orchestrate_handoff`
+    # reads via `herdr_effective_backend_selected`). Narrowing here and in
+    # `orchestrate_handoff` together keeps the split whole: a `%pane` send neither
+    # gets the herdr shim/rail nor skips `require_tmux()`.
+    if explicit_tmux_pane_target(args):
         return None, None
     binding = _resolve_herdr_binding(args, config)
     # The binding resolution above already died if the binary is unconfigured /

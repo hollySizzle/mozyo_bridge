@@ -27,10 +27,10 @@ from unittest import mock
 # Every config-guarded herdr entry on the send path is pinned (Redmine #13307):
 # #13255 routed the decorator through ``resolve_handoff_transport_runtime`` (its
 # own config read -> ``_resolve_herdr_binding``) and #13261/#13305 added the
-# ``herdr_backend_selected`` guard inside ``orchestrate_handoff`` (herdr-native
-# target resolution). Pinning only the older
-# ``resolve_handoff_transport_binding`` left both armed and every tmux-rail send
-# died fail-closed once the committed config selected herdr again.
+# ``herdr_effective_backend_selected`` guard inside ``orchestrate_handoff``
+# (herdr-native target resolution; #13320 narrowed it by target kind). Pinning only
+# the older ``resolve_handoff_transport_binding`` left both armed and every tmux-rail
+# send died fail-closed once the committed config selected herdr again.
 
 _TMUX_RAIL_TRANSPORT_PATCHES: "list[mock._patch] | None" = None
 
@@ -50,7 +50,7 @@ def setUpModule() -> None:
             return_value=(None, None),
         ),
         mock.patch(
-            "mozyo_bridge.application.commands.herdr_backend_selected",
+            "mozyo_bridge.application.commands.herdr_effective_backend_selected",
             return_value=False,
         ),
     ]

@@ -33,6 +33,9 @@ from typing import Optional
 from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    is_explicit_pane_target,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
     resolve_coordinator_provider,
 )
@@ -80,6 +83,44 @@ def herdr_backend_selected(args: argparse.Namespace) -> bool:
     """
     config = _terminal_transport_config(args)
     return config is not None and config.backend == BACKEND_HERDR
+
+
+def explicit_tmux_pane_target(args: argparse.Namespace) -> bool:
+    """True iff this send names an explicit tmux pane-id (``%N``) target.
+
+    Redmine #13320 (a-narrow, j#73114): the target-kind half of the effective-backend
+    predicate. Lane choreography — ``sublane create --execute`` dispatch,
+    gateway→worker relay, worker/gateway callback — always addresses its peer by an
+    explicit ``--target %NN`` pane, so those legs must ride the tmux runtime rail even
+    when ``terminal_transport.backend: herdr`` is the repo-local default. Role /
+    receiver-name based implicit resolution and herdr locator / assigned-name targets
+    carry no ``%N`` handle and are unaffected. Pure/string-only over ``args.target``.
+    """
+    return is_explicit_pane_target(getattr(args, "target", None))
+
+
+def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
+    """True iff this send should use the herdr backend **for its target kind** (#13320).
+
+    The single effective-backend predicate shared by both send-path branch points —
+    the ``@bind_runtime_transport`` decorator (which installs the herdr binding +
+    turn-start rail) and ``orchestrate_handoff`` (which gates ``require_tmux()`` and
+    target resolution). It is the config-level herdr selection
+    (:func:`herdr_backend_selected`) NARROWED by target kind (auditor answer j#73114,
+    a-narrow): an explicit tmux ``%pane`` target is NOT a herdr send even under
+    ``backend: herdr`` — it routes through the tmux rail.
+
+    Both branch points MUST read this one predicate (or its
+    :func:`explicit_tmux_pane_target` half). A half-applied split — e.g. skipping
+    ``require_tmux()`` for a herdr config while still handing an explicit ``%pane`` to
+    the herdr shim, or installing the herdr rail while ``orchestrate_handoff`` runs the
+    tmux path — would hand a tmux target to the herdr locator resolver or skip tmux
+    preflight. Routing a ``%pane`` to the tmux rail under ``backend: herdr`` is an
+    explicit target-kind route selection, not a silent fallback: an unresolvable
+    ``%pane`` / absent tmux / receiver-binding mismatch still fails closed on the tmux
+    path exactly as it does under ``backend: tmux``.
+    """
+    return herdr_backend_selected(args) and not explicit_tmux_pane_target(args)
 
 
 def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dict:
@@ -188,6 +229,8 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
 
 __all__ = (
     "HerdrSendEntryError",
+    "explicit_tmux_pane_target",
     "herdr_backend_selected",
+    "herdr_effective_backend_selected",
     "resolve_herdr_send_target",
 )

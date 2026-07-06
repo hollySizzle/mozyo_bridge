@@ -231,7 +231,7 @@ active_herdr_turn_start_rail = None
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     HerdrSendEntryError,
-    herdr_backend_selected,
+    herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )
 from mozyo_bridge.scaffold.rules import (
@@ -1660,12 +1660,12 @@ def orchestrate_handoff(
     would let an explicit `%pane` for a foreign Claude pane be typed into under
     a ``to=codex`` marker, defeating the gateway boundary.
     """
-    # Redmine #13261 (increment 2): resolve the backend once, strictly from the
-    # repo-local config, and gate every tmux-only step on it. Under the herdr backend
-    # a pure herdr session has no tmux server, so `require_tmux()` (and the tmux
-    # pane/session gates below) must not run; the target is resolved herdr-natively.
-    # The tmux default keeps `require_tmux()` and the whole tmux path byte-identical.
-    herdr_send = herdr_backend_selected(args)
+    # Redmine #13261 (increment 2): resolve the backend once and gate every tmux-only
+    # step on it. Under herdr a pure session has no tmux server, so `require_tmux()`
+    # (and the tmux gates below) must not run; the target is resolved herdr-natively.
+    # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
+    # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
+    herdr_send = herdr_effective_backend_selected(args)
     if not herdr_send:
         require_tmux()
 

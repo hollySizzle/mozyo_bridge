@@ -33,7 +33,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     HerdrSendEntryError,
+    explicit_tmux_pane_target,
     herdr_backend_selected,
+    herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )
 
@@ -96,6 +98,54 @@ class BackendSelectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(tmp, backend="tmux")
             self.assertFalse(herdr_backend_selected(_args(ctx.repo)))
+
+
+class EffectiveBackendSelectionTest(unittest.TestCase):
+    """Redmine #13320 (a-narrow): the effective-backend predicate narrows the config
+    herdr selection by target kind — an explicit tmux ``%pane`` target is NOT a herdr
+    send even under ``backend: herdr`` (it rides the tmux rail), while role /
+    receiver-name targets stay on the herdr path."""
+
+    @staticmethod
+    def _args(repo, target=None):
+        ns = argparse.Namespace()
+        ns.repo = str(repo)
+        ns.to = "claude"
+        ns.target = target
+        return ns
+
+    def test_explicit_pane_target_is_not_effective_herdr_under_herdr_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, backend="herdr")
+            args = self._args(ctx.repo, target="%45")
+            # config-level selection is still herdr...
+            self.assertTrue(herdr_backend_selected(args))
+            self.assertTrue(explicit_tmux_pane_target(args))
+            # ...but the effective (target-kind-narrowed) predicate routes it to tmux.
+            self.assertFalse(herdr_effective_backend_selected(args))
+
+    def test_implicit_receiver_target_stays_effective_herdr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, backend="herdr")
+            # No explicit target (role-based `--to claude` implicit resolution).
+            args = self._args(ctx.repo, target=None)
+            self.assertFalse(explicit_tmux_pane_target(args))
+            self.assertTrue(herdr_effective_backend_selected(args))
+            # A receiver-label target (not a `%pane`) is also implicit resolution.
+            args_label = self._args(ctx.repo, target="claude")
+            self.assertFalse(explicit_tmux_pane_target(args_label))
+            self.assertTrue(herdr_effective_backend_selected(args_label))
+
+    def test_tmux_config_is_never_effective_herdr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, backend="tmux")
+            # Neither an explicit pane nor an implicit target flips a tmux config.
+            self.assertFalse(
+                herdr_effective_backend_selected(self._args(ctx.repo, target="%45"))
+            )
+            self.assertFalse(
+                herdr_effective_backend_selected(self._args(ctx.repo, target=None))
+            )
 
 
 class ResolveHerdrSendTargetTest(unittest.TestCase):
