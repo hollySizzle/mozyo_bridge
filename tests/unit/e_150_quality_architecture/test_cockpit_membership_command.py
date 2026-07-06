@@ -638,6 +638,36 @@ class CollectHerdrMembershipTest(unittest.TestCase):
         self.assertIn(WARN_HERDR_INVENTORY_UNAVAILABLE, codes)
         self.assertFalse(report.ok)
 
+    def test_herdr_only_environment_is_present_not_nothing_loaded(self) -> None:
+        # No tmux managed windows / geometry, herdr `agent list` returns a Unit:
+        # cockpit_present must be True so the projection does not both list a
+        # `member` herdr row and say "nothing loaded" (review j#72953).
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+            format_membership_text,
+        )
+
+        ops = _FakeMembershipOps(windows=[], geo_panes=None, facts={})
+        report = CockpitMembershipUseCase(
+            ops, _FakeHerdrColumnOps(self._herdr_rows())
+        ).collect("s")
+        self.assertTrue(report.cockpit_present)
+        self.assertEqual(1, len(report.workspaces))
+        self.assertTrue(report.workspaces[0].member)
+        text = format_membership_text(report)
+        self.assertNotIn("nothing loaded", text)
+
+    def test_no_units_on_any_backend_still_says_nothing_loaded(self) -> None:
+        # herdr off + no tmux -> genuinely nothing loaded, byte-invariant.
+        default = CockpitMembershipUseCase(
+            _FakeMembershipOps(windows=[], geo_panes=None, facts={})
+        ).collect("s")
+        off = CockpitMembershipUseCase(
+            _FakeMembershipOps(windows=[], geo_panes=None, facts={}),
+            _FakeHerdrColumnOps(None),
+        ).collect("s")
+        self.assertFalse(default.cockpit_present)
+        self.assertEqual(default.as_dict(), off.as_dict())
+
     def test_live_herdr_ops_off_returns_none(self) -> None:
         # With no herdr backend selected in this repo, the live supply is None
         # (byte-invariant), not an empty list or a raise.
