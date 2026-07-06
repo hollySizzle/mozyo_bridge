@@ -56,15 +56,27 @@ import dataclasses
 import json as _json
 import os
 from pathlib import Path
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     infer_repo_root,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (
+    herdr_inventory,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (
+    PANE_KEY_ID,
+    PANE_KEY_LANE,
+    PANE_KEY_ROLE,
+    PANE_KEY_WORKSPACE,
+)
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+    BACKEND_HERDR,
     BACKEND_TMUX,
+    WARN_HERDR_INVENTORY_UNAVAILABLE,
     CockpitMembershipReport,
     MembershipObservation,
+    MembershipWarning,
     RegistryFacts,
     absent_membership,
     format_membership_text,
@@ -138,6 +150,69 @@ def build_membership_observations(
                     backend=units[key]["backend"],
                 )
             )
+    return observations
+
+
+# --- Pure projection: tag live herdr `agent list` Units as herdr columns. ------
+
+
+def herdr_membership_observations(
+    agent_rows: Any,
+) -> list[MembershipObservation]:
+    """Project a live herdr ``agent list`` snapshot into herdr-tagged Units (#13303).
+
+    This is the supply source #13298 deferred: the cockpit degrade projection can
+    already render a :data:`BACKEND_HERDR` Unit honestly, but nothing fed it live
+    herdr membership. Here each ``agent list`` row is decoded — through the
+    #13297 backend-neutral :func:`herdr_inventory`, the single sanctioned decode
+    path — into its stable ``(workspace_id, lane_id, role)`` slot (its assigned
+    name, never a tmux pane id, is the identity; foreign / non-mzb1 agents are
+    dropped). Rows are grouped into one :class:`MembershipObservation` per
+    ``(workspace_id, lane_id)`` Unit, collapsing the Unit's codex / claude agents,
+    tagged :data:`BACKEND_HERDR` so :func:`build_membership` degrades the tmux-only
+    fields (panes / window / geometry) instead of showing a stale tmux value.
+
+    The transient herdr locator is *not* carried onto the observation's pane
+    fields: it is cache / evidence only (#13297), and the degrade projection
+    replaces those fields with a token regardless, so leaving them empty keeps the
+    locator from ever reading as route authority. ``repo_root`` is left empty (a
+    herdr Unit has no cockpit pane cwd to walk); the registry canonical path fills
+    it in downstream. Full herdr cockpit parity (live layout / focus / adopt) stays
+    deferred — this only makes the herdr membership real instead of empty.
+    """
+    units: dict[tuple[str, str], dict[str, str]] = {}
+    order: list[tuple[str, str]] = []
+    for row in herdr_inventory(agent_rows or []):
+        workspace_id = row.get(PANE_KEY_WORKSPACE) or ""
+        if not workspace_id:
+            continue
+        key = (workspace_id, normalize_lane(row.get(PANE_KEY_LANE)))
+        if key not in units:
+            units[key] = {"codex": "", "claude": ""}
+            order.append(key)
+        role = row.get(PANE_KEY_ROLE)
+        locator = row.get(PANE_KEY_ID) or ""
+        if role == ROLE_CODEX and not units[key]["codex"]:
+            units[key]["codex"] = locator
+        elif role == ROLE_CLAUDE and not units[key]["claude"]:
+            units[key]["claude"] = locator
+    observations: list[MembershipObservation] = []
+    for key in order:
+        observations.append(
+            MembershipObservation(
+                workspace_id=key[0],
+                lane_id=key[1],
+                lane_label="",
+                # Transient herdr locators are evidence, not authority (#13297); the
+                # degrade projection tokenises these fields anyway, so keep them empty.
+                codex_pane="",
+                claude_pane="",
+                window="",
+                window_id="",
+                repo_root="",
+                backend=BACKEND_HERDR,
+            )
+        )
     return observations
 
 
@@ -326,6 +401,82 @@ class LiveCockpitMembershipOps:
         return self._commands()._resolve_workspace_lane(repo_root, workspace_id)
 
 
+# --- Herdr column supply: live `agent list` inventory -> herdr Units (#13303). --
+
+
+@runtime_checkable
+class HerdrColumnOps(Protocol):
+    """Port: the live herdr ``agent list`` inventory the cockpit tags herdr Units from.
+
+    :meth:`read_herdr_agent_rows` returns the raw herdr ``agent list`` rows when the
+    herdr backend is selected, or ``None`` when it is off (the tmux default) — the
+    ``None`` sentinel keeps the tmux projection byte-invariant, distinct from ``[]``
+    (herdr on, zero agents). It may raise a fail-closed transport error on an
+    unreadable snapshot; the use case catches it and degrades to a warning rather
+    than aborting the whole membership view.
+    """
+
+    def read_herdr_agent_rows(self) -> Optional[Sequence[Any]]: ...
+
+
+class NullHerdrColumnOps:
+    """Default :class:`HerdrColumnOps`: herdr backend off, no herdr Units.
+
+    Yields ``None`` so a :class:`CockpitMembershipUseCase` built without an explicit
+    herdr supply projects exactly the tmux membership it always did (byte-invariant).
+    The live CLI handlers inject :class:`LiveHerdrColumnOps` instead.
+    """
+
+    def read_herdr_agent_rows(self) -> Optional[Sequence[Any]]:
+        return None
+
+
+class LiveHerdrColumnOps:
+    """Live :class:`HerdrColumnOps` over the repo-local config + built-in `agent list`.
+
+    Resolves the repo-local ``terminal_transport`` selection for ``repo_root`` and,
+    **only when the herdr backend is explicitly selected**, runs the built-in herdr
+    agent lister (#13261). Default-off and fail-soft on selection: the tmux default
+    backend — and a missing / unreadable / malformed repo-local config, exactly like
+    :func:`herdr_backend_selected` — returns ``None`` (no herdr Units), so the cockpit
+    projection is byte-invariant whenever herdr is not deliberately turned on. Once
+    herdr *is* selected, an unreadable live snapshot is a fail-closed
+    :class:`TerminalTransportError` propagated to the caller (never a silent empty
+    inventory that would read as "no herdr Units").
+
+    ``repo_root`` defaults to the current working directory: ``cockpit`` is
+    session-scoped, and the operator invokes it from a repo whose config declares
+    whether this environment runs herdr. Per-workspace herdr config resolution is a
+    deferred refinement (full herdr parity stays deferred, #13298 / #13263 j#72594).
+    """
+
+    def __init__(self, repo_root: Optional[str] = None) -> None:
+        self._repo_root = repo_root if repo_root is not None else os.getcwd()
+
+    def read_herdr_agent_rows(self) -> Optional[Sequence[Any]]:
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config,
+        )
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+            RepoLocalConfigError,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (
+            resolve_agent_lister,
+        )
+
+        try:
+            config = load_repo_local_config(self._repo_root).terminal_transport
+        except RepoLocalConfigError:
+            # A broken / unreadable config is not a herdr selection (it resolves to
+            # the tmux default), so it never diverts the cockpit onto the herdr path.
+            return None
+        lister = resolve_agent_lister(config)
+        if lister is None:
+            # tmux (default) backend: herdr is off -> no herdr Units.
+            return None
+        return lister.list_agent_rows()
+
+
 @dataclasses.dataclass(frozen=True)
 class CockpitListOutcome:
     """`cockpit list` result: the membership report, always exit ``0``."""
@@ -372,16 +523,55 @@ class CockpitMembershipUseCase:
     a display / liveness projection, never Redmine workflow truth.
     """
 
-    def __init__(self, ops: CockpitMembershipOps) -> None:
+    def __init__(
+        self,
+        ops: CockpitMembershipOps,
+        herdr_ops: Optional[HerdrColumnOps] = None,
+    ) -> None:
         self._ops = ops
+        # Default to the null supply so an existing tmux-only caller is unchanged
+        # (byte-invariant); the live CLI handlers inject LiveHerdrColumnOps.
+        self._herdr_ops: HerdrColumnOps = herdr_ops or NullHerdrColumnOps()
+
+    def _herdr_observations(
+        self,
+    ) -> tuple[list[MembershipObservation], list[MembershipWarning]]:
+        """Read the live herdr inventory and tag its Units (#13303, tolerant).
+
+        Returns the herdr :class:`MembershipObservation` list plus any cockpit-wide
+        warnings. Herdr off (the default) yields ``([], [])`` so the tmux projection
+        is byte-invariant. An unreadable live herdr snapshot degrades to no herdr
+        Units *plus* a :data:`WARN_HERDR_INVENTORY_UNAVAILABLE` advisory — so the
+        operator never mistakes an unreadable snapshot for an empty one — and never
+        aborts the whole membership view.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+            TerminalTransportError,
+        )
+
+        try:
+            rows = self._herdr_ops.read_herdr_agent_rows()
+        except TerminalTransportError as exc:
+            return [], [
+                MembershipWarning(
+                    WARN_HERDR_INVENTORY_UNAVAILABLE,
+                    "herdr backend is selected but its live `agent list` inventory "
+                    f"could not be read ({exc}); herdr Units are omitted from this "
+                    "view. Retry once the herdr server is reachable.",
+                )
+            ]
+        if rows is None:
+            return [], []
+        return herdr_membership_observations(rows), []
 
     def collect(self, session: str) -> CockpitMembershipReport:
         """Project the live cockpit into a membership report (#12341, read-only).
 
         Reads every managed cockpit window (shared ``cockpit`` window + #12330
         Project Group windows), runs the read-only geometry diagnosis for drift
-        findings, resolves each Unit's registry / anchor facts, and hands them all
-        to the pure :func:`project_membership_report`.
+        findings, tags any live herdr Units from the herdr inventory (#13303),
+        resolves each Unit's registry / anchor facts, and hands them all to the pure
+        :func:`project_membership_report`.
         """
         from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_geometry import (
             diagnose_cockpit_geometry,
@@ -398,6 +588,11 @@ class CockpitMembershipUseCase:
                 session, codex_pane, claude_pane
             ),
         )
+        # Live herdr Units come from the herdr `agent list` inventory, not the tmux
+        # managed windows, so they are a separate supply concatenated here (a Unit
+        # runs on one backend, so the two inventories are disjoint by construction).
+        herdr_observations, herdr_warnings = self._herdr_observations()
+        observations = observations + herdr_observations
         cockpit_present = bool(managed) or geometry.cockpit_present
 
         facts: dict[str, object] = {}
@@ -413,6 +608,7 @@ class CockpitMembershipUseCase:
             observations=observations,
             facts_by_workspace=facts,
             geometry=geometry,
+            extra_warnings=herdr_warnings,
         )
 
     def list(self, session: str) -> CockpitListOutcome:
@@ -559,7 +755,9 @@ def _handle_cockpit_list(session: str, *, json_output: bool) -> int:
     state, not an error. Cockpit membership is a display / liveness projection,
     never Redmine workflow truth.
     """
-    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).list(session)
+    outcome = CockpitMembershipUseCase(
+        LiveCockpitMembershipOps(), LiveHerdrColumnOps()
+    ).list(session)
     print(outcome.render(json_output=json_output))
     return outcome.exit_code
 
@@ -581,8 +779,8 @@ def _handle_cockpit_status(
     # The repo argument extraction stays here (argparse-facing); the use case is
     # handed a resolved repo path and owns the identity / projection.
     repo = getattr(args, "repo", None) or getattr(args, "cwd", None) or os.getcwd()
-    outcome = CockpitMembershipUseCase(LiveCockpitMembershipOps()).status(
-        session=session, repo=repo
-    )
+    outcome = CockpitMembershipUseCase(
+        LiveCockpitMembershipOps(), LiveHerdrColumnOps(repo)
+    ).status(session=session, repo=repo)
     print(outcome.render(json_output=json_output))
     return outcome.exit_code

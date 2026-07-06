@@ -28,20 +28,33 @@ from mozyo_bridge.application.cockpit_membership_command import (
     CockpitMembershipOps,
     CockpitMembershipUseCase,
     CockpitStatusOutcome,
+    HerdrColumnOps,
     LiveCockpitMembershipOps,
+    LiveHerdrColumnOps,
     LiveRegistryFactsOps,
     LiveUnitRepoRootOps,
+    NullHerdrColumnOps,
     RegistryFactsOps,
     RegistryFactsUseCase,
     UnitRepoRootOps,
     UnitRepoRootUseCase,
     build_membership_observations,
+    herdr_membership_observations,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+    BACKEND_HERDR,
+    BACKEND_TMUX,
+    WARN_HERDR_INVENTORY_UNAVAILABLE,
     RegistryFacts,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
     LaneIdentity,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    encode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    TerminalTransportError,
 )
 
 
@@ -157,6 +170,68 @@ class BuildMembershipObservationsTest(unittest.TestCase):
     def test_empty_windows_yield_no_observations(self) -> None:
         self.assertEqual([], build_membership_observations(None, "s", lambda c, cl: ""))
         self.assertEqual([], build_membership_observations([], "s", lambda c, cl: ""))
+
+
+# --- Pure herdr-column projection (#13303). ----------------------------------
+
+
+def _herdr_row(workspace_id, role, lane="", locator="w1:p1"):
+    return {"name": encode_assigned_name(workspace_id, role, lane), "pane_id": locator}
+
+
+class HerdrMembershipObservationsTest(unittest.TestCase):
+    def test_groups_codex_and_claude_into_one_herdr_unit(self) -> None:
+        obs = herdr_membership_observations(
+            [
+                _herdr_row("wsA", "codex", "laneX"),
+                _herdr_row("wsA", "claude", "laneX"),
+            ]
+        )
+        self.assertEqual(1, len(obs))
+        self.assertEqual("wsA", obs[0].workspace_id)
+        self.assertEqual("laneX", obs[0].lane_id)
+        self.assertEqual(BACKEND_HERDR, obs[0].backend)
+
+    def test_transient_locator_is_not_carried_onto_pane_fields(self) -> None:
+        # The herdr locator is cache/evidence, never route authority (#13297), and
+        # the degrade projection tokenises the pane fields anyway -> keep them empty.
+        obs = herdr_membership_observations([_herdr_row("wsA", "codex", "laneX")])
+        self.assertEqual("", obs[0].codex_pane)
+        self.assertEqual("", obs[0].claude_pane)
+
+    def test_foreign_non_scheme_agents_are_dropped(self) -> None:
+        obs = herdr_membership_observations(
+            [
+                {"name": "poc_claude", "pane_id": "w9:p9"},  # not a mzb1 scheme name
+                {"name": "", "pane_id": "w9:p8"},
+                _herdr_row("wsA", "codex", "laneX"),
+            ]
+        )
+        self.assertEqual(1, len(obs))
+        self.assertEqual("wsA", obs[0].workspace_id)
+
+    def test_empty_lane_normalizes_to_default(self) -> None:
+        obs = herdr_membership_observations([_herdr_row("wsB", "claude", "")])
+        self.assertEqual("default", obs[0].lane_id)
+
+    def test_distinct_lanes_are_distinct_units(self) -> None:
+        obs = herdr_membership_observations(
+            [
+                _herdr_row("wsA", "codex", "a"),
+                _herdr_row("wsA", "codex", "b"),
+            ]
+        )
+        self.assertEqual({"a", "b"}, {o.lane_id for o in obs})
+
+    def test_unit_with_missing_locator_still_tagged(self) -> None:
+        # A decoded agent with no live locator is still a loaded herdr Unit.
+        obs = herdr_membership_observations([_herdr_row("wsC", "claude", "z", locator="")])
+        self.assertEqual(1, len(obs))
+        self.assertEqual(BACKEND_HERDR, obs[0].backend)
+
+    def test_empty_input_yields_no_observations(self) -> None:
+        self.assertEqual([], herdr_membership_observations(None))
+        self.assertEqual([], herdr_membership_observations([]))
 
 
 # --- Unit repo-root resolver. ------------------------------------------------
@@ -473,6 +548,100 @@ class PortContractTest(unittest.TestCase):
                 report=None, query={}, query_label="x", ok=False
             ).exit_code,
         )
+
+    def test_herdr_column_ops_contract(self) -> None:
+        self.assertIsInstance(NullHerdrColumnOps(), HerdrColumnOps)
+        self.assertIsInstance(LiveHerdrColumnOps(), HerdrColumnOps)
+        self.assertIsInstance(_FakeHerdrColumnOps(None), HerdrColumnOps)
+
+
+# --- Live herdr Units flow into the collect projection (#13303). -------------
+
+
+class _FakeHerdrColumnOps:
+    """A herdr supply that returns canned `agent list` rows, or raises."""
+
+    def __init__(self, rows, *, error=None):
+        self._rows = rows
+        self._error = error
+
+    def read_herdr_agent_rows(self):
+        if self._error is not None:
+            raise self._error
+        return self._rows
+
+
+class CollectHerdrMembershipTest(unittest.TestCase):
+    def _tmux_only_ops(self):
+        # A cockpit with one tmux Unit, so we can assert the tmux rows are untouched.
+        return _FakeMembershipOps(
+            windows=[_cockpit_window()], geo_panes=_geo_panes(),
+            facts={"wsA": _facts()},
+        )
+
+    def _herdr_rows(self):
+        return [
+            {"name": encode_assigned_name("wsH", "codex", "L"), "pane_id": "w1:p1"},
+            {"name": encode_assigned_name("wsH", "claude", "L"), "pane_id": "w1:p2"},
+        ]
+
+    def test_live_herdr_unit_is_tagged_and_degraded(self) -> None:
+        report = CockpitMembershipUseCase(
+            self._tmux_only_ops(), _FakeHerdrColumnOps(self._herdr_rows())
+        ).collect("s")
+        herdr = next(w for w in report.workspaces if w.workspace_id == "wsH")
+        self.assertEqual(BACKEND_HERDR, herdr.backend)
+        self.assertTrue(herdr.member)
+        # tmux-only fields degraded, never a stale tmux pane / geometry.
+        self.assertEqual("backend_unavailable", herdr.geometry_status)
+        self.assertEqual("unsupported", herdr.codex_pane)
+        self.assertFalse(herdr.panes_present)
+        # A loaded herdr Unit is ok (degraded liveness is honest, not a fault).
+        self.assertTrue(herdr.ok)
+
+    def test_herdr_facts_resolved_for_its_workspace(self) -> None:
+        ops = self._tmux_only_ops()
+        CockpitMembershipUseCase(ops, _FakeHerdrColumnOps(self._herdr_rows())).collect("s")
+        self.assertIn("wsH", ops.facts_calls)
+
+    def test_tmux_units_are_byte_invariant_alongside_herdr(self) -> None:
+        # The pre-existing tmux Unit projects exactly as it does without herdr.
+        baseline = CockpitMembershipUseCase(self._tmux_only_ops()).collect("s")
+        with_herdr = CockpitMembershipUseCase(
+            self._tmux_only_ops(), _FakeHerdrColumnOps(self._herdr_rows())
+        ).collect("s")
+        base_tmux = next(w for w in baseline.workspaces if w.workspace_id == "wsA")
+        live_tmux = next(w for w in with_herdr.workspaces if w.workspace_id == "wsA")
+        self.assertEqual(base_tmux.as_dict(), live_tmux.as_dict())
+        self.assertEqual(BACKEND_TMUX, live_tmux.backend)
+
+    def test_herdr_off_is_byte_invariant(self) -> None:
+        # None (herdr backend off) -> identical to the default null supply.
+        default = CockpitMembershipUseCase(self._tmux_only_ops()).collect("s")
+        off = CockpitMembershipUseCase(
+            self._tmux_only_ops(), _FakeHerdrColumnOps(None)
+        ).collect("s")
+        self.assertEqual(default.as_dict(), off.as_dict())
+
+    def test_default_use_case_has_no_herdr_units(self) -> None:
+        report = CockpitMembershipUseCase(self._tmux_only_ops()).collect("s")
+        self.assertTrue(all(w.backend == BACKEND_TMUX for w in report.workspaces))
+
+    def test_unreadable_herdr_snapshot_degrades_to_warning(self) -> None:
+        report = CockpitMembershipUseCase(
+            self._tmux_only_ops(),
+            _FakeHerdrColumnOps(None, error=TerminalTransportError("server down")),
+        ).collect("s")
+        # No herdr Units, but an explicit advisory (never a silent empty inventory).
+        self.assertTrue(all(w.backend == BACKEND_TMUX for w in report.workspaces))
+        codes = {w.code for w in report.warnings}
+        self.assertIn(WARN_HERDR_INVENTORY_UNAVAILABLE, codes)
+        self.assertFalse(report.ok)
+
+    def test_live_herdr_ops_off_returns_none(self) -> None:
+        # With no herdr backend selected in this repo, the live supply is None
+        # (byte-invariant), not an empty list or a raise.
+        self.assertIsNone(LiveHerdrColumnOps().read_herdr_agent_rows())
 
 
 if __name__ == "__main__":

@@ -245,6 +245,40 @@ class MembershipProjectionTest(unittest.TestCase):
         self.assertIn(membership.WARN_ROLE_LESS_PANE, codes)
         self.assertFalse(report.ok)
 
+    def test_extra_warnings_are_appended_report_level(self) -> None:
+        # Application-supplied cockpit-wide advisories (e.g. an unreadable herdr
+        # inventory, #13303) are appended to the geometry warnings.
+        extra = membership.MembershipWarning(
+            membership.WARN_HERDR_INVENTORY_UNAVAILABLE, "herdr snapshot unreadable"
+        )
+        report = membership.project_membership_report(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[_obs()],
+            facts_by_workspace={"wsA": _facts()},
+            geometry=_healthy_geometry(),
+            extra_warnings=[extra],
+        )
+        codes = {w.code for w in report.warnings}
+        self.assertIn(membership.WARN_HERDR_INVENTORY_UNAVAILABLE, codes)
+        self.assertFalse(report.ok)
+
+    def test_extra_warnings_default_empty_is_byte_invariant(self) -> None:
+        # Omitting extra_warnings leaves the report exactly as the geometry-only path.
+        kwargs = dict(
+            session="mozyo-cockpit",
+            cockpit_present=True,
+            observations=[_obs()],
+            facts_by_workspace={"wsA": _facts()},
+            geometry=_healthy_geometry(),
+        )
+        self.assertEqual(
+            membership.project_membership_report(**kwargs).as_dict(),
+            membership.project_membership_report(
+                **kwargs, extra_warnings=[]
+            ).as_dict(),
+        )
+
     def test_absent_membership_says_not_loaded(self) -> None:
         ws = membership.absent_membership(
             session="mozyo-cockpit",
