@@ -84,10 +84,26 @@ TARGET_STALE: str = "route_identity_stale"
 #: pane-name / route-label metadata; a managed pane without it must not fall
 #: back to pane-id authority (Required behavior #5).
 ROUTE_LABEL_MISSING: str = "route_label_missing"
+#: Exactly one live unit matched the stable identity but its row carries no
+#: usable live locator, so addressing it would hand a downstream a blank target
+#: (Redmine #13297). :func:`resolve_route` never emits this on the tmux path — a
+#: ``try_pane_lines`` row always carries a pane id — so tmux behaviour is
+#: unchanged; it is emitted only by the backend-neutral herdr adapter
+#: (:mod:`...domain.backend_neutral_resolver`), where a decoded ``agent list``
+#: row can lack a locator (the herdr analogue of the herdr-identity domain's
+#: ``rebind_missing_locator``). Kept in the shared vocabulary so the shared
+#: :class:`RouteResolution` result type stays coherent across both backends.
+ROUTE_LOCATOR_MISSING: str = "route_locator_missing"
 
 #: Non-OK statuses, for callers that want a single "did not resolve" guard.
 FAIL_CLOSED_STATUSES: frozenset[str] = frozenset(
-    {TARGET_UNAVAILABLE, TARGET_AMBIGUOUS, TARGET_STALE, ROUTE_LABEL_MISSING}
+    {
+        TARGET_UNAVAILABLE,
+        TARGET_AMBIGUOUS,
+        TARGET_STALE,
+        ROUTE_LABEL_MISSING,
+        ROUTE_LOCATOR_MISSING,
+    }
 )
 
 # ---------------------------------------------------------------------------
