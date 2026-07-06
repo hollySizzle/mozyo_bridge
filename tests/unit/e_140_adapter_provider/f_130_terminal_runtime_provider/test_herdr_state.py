@@ -70,9 +70,21 @@ class RecordingRunner:
 BIN = "/opt/herdr/bin/herdr"
 
 
+# The live `agent get` payload shape (herdr 0.7.1, #13307 live smoke): the agent
+# object is nested under an `id`/`result` envelope, never flat at the top level.
+def _live_agent_info(status: str) -> str:
+    return (
+        '{"id": "cli:agent:get", "result": {"agent": {"agent": "claude", '
+        f'"agent_status": "{status}", "cwd": "/repo", "focused": true, '
+        '"name": "mzb1_ws_claude_default", "pane_id": "w1:p1", "revision": 0, '
+        '"tab_id": "w1:t1", "terminal_id": "term_0", "workspace_id": "w1"}, '
+        '"type": "agent_info"}}'
+    )
+
+
 class ReadAgentStateTest(unittest.TestCase):
     def test_argv_and_mapping(self) -> None:
-        runner = RecordingRunner(stdout='{"agent_status": "working"}')
+        runner = RecordingRunner(stdout=_live_agent_info("working"))
         reader = HerdrCliAgentStateReader(BIN, runner=runner)
         result = reader.read_agent_state("poc_claude")
         self.assertTrue(result.ok)
@@ -92,12 +104,40 @@ class ReadAgentStateTest(unittest.TestCase):
         }
         for status, expected in cases.items():
             with self.subTest(status=status):
-                runner = RecordingRunner(stdout=f'{{"agent_status": "{status}"}}')
+                runner = RecordingRunner(stdout=_live_agent_info(status))
                 reader = HerdrCliAgentStateReader(BIN, runner=runner)
                 self.assertEqual(reader.read_agent_state("w1:p1").state, expected)
 
+    def test_flat_status_alias_still_maps(self) -> None:
+        # Pre-envelope flat shape, kept as an alias regression only.
+        runner = RecordingRunner(stdout='{"agent_status": "working"}')
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.read_agent_state("w1:p1")
+        self.assertEqual(result.state, RUNTIME_BUSY)
+        self.assertEqual(result.raw_status, "working")
+
     def test_alternate_status_key(self) -> None:
         runner = RecordingRunner(stdout='{"status": "idle"}')
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        self.assertEqual(reader.read_agent_state("w1:p1").state, RUNTIME_AWAITING_INPUT)
+
+    def test_envelope_without_status_is_observed_unknown(self) -> None:
+        runner = RecordingRunner(
+            stdout='{"id": "cli:agent:get", "result": {"agent": {"name": "poc"}, '
+            '"type": "agent_info"}}'
+        )
+        reader = HerdrCliAgentStateReader(BIN, runner=runner)
+        result = reader.read_agent_state("w1:p1")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.state, RUNTIME_UNKNOWN)
+        self.assertIsNone(result.raw_status)
+
+    def test_top_level_status_wins_over_nested(self) -> None:
+        # Shallowest scope wins: a top-level token is not shadowed by the envelope.
+        runner = RecordingRunner(
+            stdout='{"agent_status": "idle", '
+            '"result": {"agent": {"agent_status": "working"}}}'
+        )
         reader = HerdrCliAgentStateReader(BIN, runner=runner)
         self.assertEqual(reader.read_agent_state("w1:p1").state, RUNTIME_AWAITING_INPUT)
 

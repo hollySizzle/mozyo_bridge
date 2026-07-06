@@ -23,23 +23,44 @@ from unittest import mock
 # per module. Tests that build their own herdr config
 # (``test_herdr_transport_wiring.py``) do NOT import this fixture and continue to
 # run against the real resolver.
+#
+# Every config-guarded herdr entry on the send path is pinned (Redmine #13307):
+# #13255 routed the decorator through ``resolve_handoff_transport_runtime`` (its
+# own config read -> ``_resolve_herdr_binding``) and #13261/#13305 added the
+# ``herdr_backend_selected`` guard inside ``orchestrate_handoff`` (herdr-native
+# target resolution). Pinning only the older
+# ``resolve_handoff_transport_binding`` left both armed and every tmux-rail send
+# died fail-closed once the committed config selected herdr again.
 
-_TMUX_RAIL_TRANSPORT_PATCH: "mock._patch | None" = None
+_TMUX_RAIL_TRANSPORT_PATCHES: "list[mock._patch] | None" = None
 
 
 def setUpModule() -> None:
     """Isolate a tmux-rail test module from the workspace transport backend."""
-    global _TMUX_RAIL_TRANSPORT_PATCH
-    _TMUX_RAIL_TRANSPORT_PATCH = mock.patch(
-        "mozyo_bridge.application.handoff_transport_wiring."
-        "resolve_handoff_transport_binding",
-        return_value=None,
-    )
-    _TMUX_RAIL_TRANSPORT_PATCH.start()
+    global _TMUX_RAIL_TRANSPORT_PATCHES
+    _TMUX_RAIL_TRANSPORT_PATCHES = [
+        mock.patch(
+            "mozyo_bridge.application.handoff_transport_wiring."
+            "resolve_handoff_transport_binding",
+            return_value=None,
+        ),
+        mock.patch(
+            "mozyo_bridge.application.handoff_transport_wiring."
+            "resolve_handoff_transport_runtime",
+            return_value=(None, None),
+        ),
+        mock.patch(
+            "mozyo_bridge.application.commands.herdr_backend_selected",
+            return_value=False,
+        ),
+    ]
+    for patch in _TMUX_RAIL_TRANSPORT_PATCHES:
+        patch.start()
 
 
 def tearDownModule() -> None:
-    global _TMUX_RAIL_TRANSPORT_PATCH
-    if _TMUX_RAIL_TRANSPORT_PATCH is not None:
-        _TMUX_RAIL_TRANSPORT_PATCH.stop()
-        _TMUX_RAIL_TRANSPORT_PATCH = None
+    global _TMUX_RAIL_TRANSPORT_PATCHES
+    if _TMUX_RAIL_TRANSPORT_PATCHES is not None:
+        for patch in reversed(_TMUX_RAIL_TRANSPORT_PATCHES):
+            patch.stop()
+        _TMUX_RAIL_TRANSPORT_PATCHES = None

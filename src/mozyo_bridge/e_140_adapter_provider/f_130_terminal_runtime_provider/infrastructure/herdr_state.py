@@ -83,6 +83,12 @@ _LIST_KEYS = ("agents", "panes", "items")
 # closed), distinct from a recognised-but-empty list.
 _LIST_ENVELOPE_KEYS = ("result", "data")
 
+# An ``agent get`` payload nests the agent object under the same envelope plus an
+# object key (live 0.7.1: ``{"id": ..., "result": {"agent": {"agent_status": ...}}}``);
+# these are the recognised object keys descended into below an envelope before
+# giving up on a status token.
+_GET_OBJECT_KEYS = ("agent", "pane")
+
 
 class HerdrCliAgentStateReader:
     """A herdr agent-state reader over the herdr CLI (``agent get`` / ``agent list``).
@@ -217,15 +223,31 @@ class HerdrCliAgentStateReader:
 def _extract_status(stdout: object) -> Optional[str]:
     """Extract a herdr status token from an ``agent get`` payload, or ``None``.
 
-    Defensive by design (the live JSON schema is confirmed in a later US): a JSON
-    object contributes the first present of a small candidate key set whose value
-    is a string; anything else (non-JSON, a non-object, no candidate key) yields
-    ``None``, which the core maps to ``unknown``. Never raises.
+    Live 0.7.1 nests the agent object under an envelope
+    (``{"id": ..., "result": {"agent": {"agent_status": ...}}}``, #13307 live
+    smoke); flat shapes keep working as aliases. The scan is defensive: the
+    shallowest scope wins — top level first, then each recognised envelope
+    object, then a recognised agent object inside it. Anything else (non-JSON, a
+    non-object, no candidate key at any scope) yields ``None``, which the core
+    maps to ``unknown``. Never raises.
     """
-    payload = _load_json(stdout)
+    return _status_from_container(_load_json(stdout))
+
+
+def _status_from_container(payload: object) -> Optional[str]:
+    """Recursively resolve the status token from a decoded payload, or ``None``."""
     if not isinstance(payload, Mapping):
         return None
-    return _first_str(payload, _STATUS_KEYS)
+    token = _first_str(payload, _STATUS_KEYS)
+    if token is not None:
+        return token
+    for key in (*_LIST_ENVELOPE_KEYS, *_GET_OBJECT_KEYS):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            token = _status_from_container(nested)
+            if token is not None:
+                return token
+    return None
 
 
 def _extract_list_rows(stdout: object) -> Optional[list]:

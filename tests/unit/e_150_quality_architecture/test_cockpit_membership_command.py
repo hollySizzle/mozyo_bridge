@@ -19,6 +19,7 @@ seams stays pinned by the cockpit membership characterization tests
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -669,9 +670,14 @@ class CollectHerdrMembershipTest(unittest.TestCase):
         self.assertEqual(default.as_dict(), off.as_dict())
 
     def test_live_herdr_ops_off_returns_none(self) -> None:
-        # With no herdr backend selected in this repo, the live supply is None
-        # (byte-invariant), not an empty list or a raise.
-        self.assertIsNone(LiveHerdrColumnOps().read_herdr_agent_rows())
+        # A repo whose config selects no herdr backend (here: no config at all)
+        # keeps the live supply None (byte-invariant), not an empty list or a
+        # raise — pinned to a hermetic repo_root so this checkout's committed
+        # backend selection (#13307 herdr re-cutover) cannot leak in.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                LiveHerdrColumnOps(repo_root=tmp).read_herdr_agent_rows()
+            )
 
 
 if __name__ == "__main__":
