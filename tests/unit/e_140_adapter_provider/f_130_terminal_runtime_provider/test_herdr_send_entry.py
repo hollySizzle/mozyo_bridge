@@ -106,11 +106,14 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             return resolve_herdr_send_target(_args(ctx.repo), receiver=receiver)
 
     def test_synthesizes_normal_window_projection(self) -> None:
+        # Redmine #13305: the real send path is now lane-in-match, so the target must
+        # live in the derived lane (a peer `claude` dispatch derives the sender's own
+        # lane, lane-1) — a lane-x claude would fail closed (see the cross-lane test).
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(
                 tmp,
                 rows=lambda ws: [
-                    {"name": encode_assigned_name(ws, "claude", "lane-x"), "pane_id": "wT:pT"}
+                    {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": "wT:pT"}
                 ],
             )
             pane = self._resolve(ctx)
@@ -138,6 +141,9 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             self.assertEqual(c.exception.reason, "missing_sender_env")
 
     def test_no_target_agent_fails_closed(self) -> None:
+        # Redmine #13305: no live claude -> the derived slot is unavailable. The
+        # convergence projects the #13302 ledger vocabulary (`target_unavailable`),
+        # not the legacy lane-less `no_match` token.
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(
                 tmp,
@@ -147,7 +153,23 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             )
             with self.assertRaises(HerdrSendEntryError) as c:
                 self._resolve(ctx, receiver="claude")
-            self.assertEqual(c.exception.reason, "no_match")
+            self.assertEqual(c.exception.reason, "target_unavailable")
+
+    def test_cross_lane_worker_fails_closed_no_all_lane_scan(self) -> None:
+        # Redmine #13305: a claude live only in lane-x, sender in lane-1. The
+        # lane-in-match authority derives lane-1 and fails closed rather than scanning
+        # all lanes to find the lane-x worker (no all-lane `(ws, role)` fallback).
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wS:pS"},
+                    {"name": encode_assigned_name(ws, "claude", "lane-x"), "pane_id": "wT:pT"},
+                ],
+            )
+            with self.assertRaises(HerdrSendEntryError) as c:
+                self._resolve(ctx, receiver="claude")
+            self.assertEqual(c.exception.reason, "target_unavailable")
 
     def test_backend_not_selected_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
