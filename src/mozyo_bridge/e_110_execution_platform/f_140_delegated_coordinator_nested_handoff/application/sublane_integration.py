@@ -87,7 +87,9 @@ class SublaneGitOperations(Protocol):
 
     def worktree_exists(self, branch: str) -> bool: ...
 
-    def create_worktree(self, *, branch: str, worktree_path: str) -> None: ...
+    def create_worktree(
+        self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
+    ) -> None: ...
 
     def worktree_dirty(self) -> bool: ...
 
@@ -264,12 +266,23 @@ class LiveSublaneGitOperations:
         needle = f"branch refs/heads/{branch}"
         return any(line.strip() == needle for line in result.stdout.splitlines())
 
-    def create_worktree(self, *, branch: str, worktree_path: str) -> None:
-        result = self._run("worktree", "add", worktree_path, "-b", branch)
+    def create_worktree(
+        self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
+    ) -> None:
+        # #13293: a supplied ``base_ref`` is appended as the ``<commit-ish>`` positional
+        # so the new branch is cut from that ref instead of the ambient checkout HEAD
+        # (the j#72677 base trap: a stale main checkout would otherwise branch a lane
+        # from an unintended base). ``None`` keeps the historical HEAD-based behavior.
+        args = ["worktree", "add", worktree_path, "-b", branch]
+        base = (base_ref or "").strip()
+        if base:
+            args.append(base)
+        result = self._run(*args)
         if result.returncode != 0:
             raise RuntimeError(
-                f"git worktree add failed for branch {branch!r} at {worktree_path!r}: "
-                f"{result.stderr.strip()}"
+                f"git worktree add failed for branch {branch!r} at {worktree_path!r}"
+                + (f" from base {base!r}" if base else "")
+                + f": {result.stderr.strip()}"
             )
 
     def worktree_dirty(self) -> bool:

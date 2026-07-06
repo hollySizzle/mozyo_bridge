@@ -368,6 +368,17 @@ class PlanCreateTests(unittest.TestCase):
         self.assertIn("implementation_gateway", dispatch.command)
         self.assertIn("lane=issue_12955_x", dispatch.command)
 
+    def test_base_ref_pins_the_planned_worktree_add(self):
+        # #13293: an explicit base ref is reflected as the git <commit-ish> positional
+        # so the plan-only recipe and the --execute actuation cut the same base.
+        plan = plan_sublane_create(
+            _req(base_ref="origin/main"), self._launch(LAUNCH_CREATE_WORKTREE)
+        )
+        self.assertEqual(
+            plan.steps[0].command,
+            "git worktree add /wt/12955 -b issue_12955_x origin/main",
+        )
+
     def test_reuse_worktree_has_no_add_command(self):
         plan = plan_sublane_create(_req(), self._launch(LAUNCH_REUSE_WORKTREE))
         self.assertEqual(plan.status, CREATE_PLANNED)

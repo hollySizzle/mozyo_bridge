@@ -394,6 +394,19 @@ def register_lifecycle(sub) -> None:
     sublane_create.add_argument(
         "--worktree", required=True, help="Worktree path for the lane"
     )
+    # #13293: pin the base the lane worktree is cut from. Default (omit) keeps the
+    # historical `git worktree add <path> -b <branch>` behavior (branch off the main
+    # checkout's current HEAD); supply e.g. `origin/main` or a stacked-lane base commit
+    # so a stale checkout can never silently cut the lane from an unintended base
+    # (the j#72677 base trap). Only affects a create; a reuse/adopt ignores it.
+    sublane_create.add_argument(
+        "--base-ref",
+        dest="base_ref",
+        default=None,
+        help="Explicit git base ref the lane worktree branches from (default: the main "
+        "checkout HEAD, historical behavior). Use origin/main or a stacked-lane base "
+        "commit to avoid cutting the lane from a stale checkout.",
+    )
     sublane_create.add_argument(
         "--journal", default=None, help="Durable-anchor journal id for the dispatch step"
     )
@@ -454,6 +467,21 @@ def register_lifecycle(sub) -> None:
         dest="target_repo",
         default="auto",
         help="Target-repo resolution for the --execute dispatch (default: auto).",
+    )
+    # #13293: bounded pre-dispatch gateway readiness wait. Before the --execute
+    # queue-enter dispatch, poll the freshly-launched gateway TUI until it is booted +
+    # rendered (so the input lands on a live composer, not a still-booting one — the
+    # j#72677 / 5-example dispatch-loss failure mode). Never hard-blocks the queue-enter
+    # rail: an unconfirmed readiness within the window degrades to gateway_ready=false
+    # and dispatches anyway. 0 disables the wait (back-compat immediate dispatch).
+    sublane_create.add_argument(
+        "--gateway-ready-timeout",
+        dest="gateway_ready_timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for the gateway TUI to become ready before the --execute "
+        "dispatch (default: 10.0; 0 disables the wait). Never hard-blocks — an "
+        "unconfirmed readiness dispatches anyway and records gateway_ready=false.",
     )
     _add_dispatch_admission_flags(sublane_create)
     add_repo_option(sublane_create)
