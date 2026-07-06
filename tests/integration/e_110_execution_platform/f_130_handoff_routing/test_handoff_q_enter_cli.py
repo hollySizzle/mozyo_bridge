@@ -166,32 +166,6 @@ class QEnterFrontDoorTest(unittest.TestCase):
         )
         self.assertEqual(("send-keys", "-t", "%2", "Enter"), sent[-1])
 
-    def test_tmux_send_makes_no_herdr_ledger_emission(self) -> None:
-        # Redmine #13300: the herdr delivery-ledger emission is guarded on the herdr
-        # send path; a tmux backend send must never append to the ledger (tmux 経路
-        # 不変). The spy stands in for the send-site helper so no real ledger write
-        # can happen — asserting it is NOT called proves the tmux path stays clean.
-        with patch(
-            "mozyo_bridge.application.commands._record_herdr_send_ledger"
-        ) as ledger_spy:
-            result, sent, stdout, _pane = self._run(
-                [
-                    "handoff", "q-enter",
-                    "--intent", "consultation_callback",
-                    "--to", "codex", "--target", "%2",
-                    "--classification", "no_dispatch",
-                    "--dispatch-decision", "hand_back_to_caller",
-                    "--workflow-next-owner", "caller",
-                    "--callback-reason", "no_dispatch_decided",
-                    "--read-contract", "grandparent_coordinator",
-                    "--mode", "standard",
-                    "--submit-delay", "0",
-                ]
-            )
-        self.assertEqual(0, result)
-        self.assertEqual("sent", self._transport(stdout)["status"])
-        ledger_spy.assert_not_called()
-
     def test_worker_dispatch_without_anchor_fails_closed_without_touching_pane(self) -> None:
         result, sent, stdout, _pane = self._run(
             [

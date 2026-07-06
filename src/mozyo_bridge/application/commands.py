@@ -233,10 +233,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_backend_selected,
     resolve_herdr_send_target,
 )
-# Redmine #13300: live send-site wiring for the #13296 herdr delivery ledger. The
-# best-effort append boundary is a core leaf (stdlib + shared paths only); it never
-# raises into the caller (#13296 j#72893), so a ledger failure cannot fail the send.
-from mozyo_bridge.core.state.herdr_delivery_ledger import record_herdr_delivery
 from mozyo_bridge.scaffold.rules import (
     PORTABLE_HOME_EXPRESSION,
     install_rules,
@@ -1622,29 +1618,6 @@ def _maybe_restore_previous_active(
     )
 
 
-def _record_herdr_send_ledger(outcome: object, *, retry: dict | None = None) -> None:
-    """Emit the #13296 herdr delivery-ledger record at a live herdr send-site (#13300).
-
-    Called AFTER the transport outcome is finalized and emitted, on each of the two
-    herdr send rails of :func:`orchestrate_handoff` — the #13255 event rail (carrying
-    ``turn_start_outcome``) and the #13292 queue-enter rail (carrying
-    ``queue_enter_turn_start_observation``). The ledger derives its ``rail`` /
-    ``backend`` from those telemetry fields, so the caller supplies only the additive
-    ``retry`` telemetry (a numbers+bool dict) when the queue-enter Enter-only retry
-    engaged.
-
-    :func:`record_herdr_delivery` is best-effort by contract (never raises into the
-    caller, #13296 j#72893): a ledger failure MUST NOT fail the send that triggered
-    it, exactly like the delivery-record / telemetry seams. ACK semantics — ``status``
-    / ``reason`` / ``next_action_owner`` — are the rails', stored verbatim; the ledger
-    reinvents no judgement. The caller passes no path-bearing field (redaction is the
-    ledger's, but the whitelist projection also never reads ``execution_root``). Only
-    the herdr send path calls this; the tmux path never reaches it (close condition:
-    tmux 経路不変).
-    """
-    record_herdr_delivery(outcome, retry=retry)
-
-
 @bind_runtime_transport
 def orchestrate_handoff(
     args: argparse.Namespace,
@@ -3003,12 +2976,6 @@ def orchestrate_handoff(
             submit_lines=_submit_lines_for(args, outcome),
             turn_start_lines=turn_start_lines,
         )
-        # Redmine #13300: persist EVERY event-rail send outcome to the #13296 ledger
-        # (both the `sent` turn-started and the non-started/blocked outcomes below),
-        # best-effort — the ledger's job is to durably record what the send observed,
-        # including a delivered-not-started. Placed before the sent/die branch so no
-        # terminal event-rail path escapes the ledger.
-        _record_herdr_send_ledger(outcome)
         if status == "sent":
             _maybe_persist_delivery_record(
                 args,
@@ -3318,15 +3285,6 @@ def orchestrate_handoff(
         activation=target_activation,
         turn_start_lines=turn_start_lines,
     )
-    # Redmine #13300: persist the herdr queue-enter send outcome to the #13296 ledger.
-    # This terminal block is shared with the tmux backend, so the emission is guarded
-    # on `herdr_send` (tmux 経路不変 — the tmux path never appends). The Enter-only
-    # retry telemetry (numbers+bool, redaction-safe) enriches the same entry when the
-    # retry engaged, wiring the ledger's `retry` field on this send path.
-    if herdr_send:
-        _record_herdr_send_ledger(
-            outcome, retry=retry_record.to_dict() if retry_record else None
-        )
     return 0
 
 
