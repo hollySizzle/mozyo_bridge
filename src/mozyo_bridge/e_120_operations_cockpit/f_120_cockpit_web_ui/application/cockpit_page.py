@@ -194,14 +194,34 @@ function unitRow(unit, hidden) {
   row.className = hidden ? 'unit-row hidden-unit' : 'unit-row';
   const lane = document.createElement('span');
   lane.textContent = (unit.lane_label || '-') +
+    (unit.issue ? ' · #' + unit.issue : '') +
     (unit.issue_label ? ' · ' + unit.issue_label : '');
   row.appendChild(lane);
+  // Backend badge (#13356): only a non-tmux backend is named, so tmux rows
+  // render exactly as before.
+  const nonTmux = !!unit.backend && unit.backend !== 'tmux';
+  if (nonTmux) {
+    const backendTag = document.createElement('span');
+    backendTag.className = 'tag';
+    backendTag.textContent = unit.backend;
+    row.appendChild(backendTag);
+  }
   const fresh = KNOWN_FRESHNESS.includes(unit.freshness) ? unit.freshness : 'unknown';
   const state = document.createElement('span');
   state.className = 'fresh-' + fresh;
   state.textContent = (unit.state_label || unit.status || 'unknown') +
     ' / ' + (unit.freshness_label || fresh);
   row.appendChild(state);
+  // Per-role runtime receiver-states (#13356): a live-runtime observation
+  // (herdr agent_status), never Redmine workflow state. runtime-blocked is a
+  // live permission prompt — labelled apart from a Redmine blocked gate.
+  if (unit.runtime_label) {
+    const rt = document.createElement('span');
+    rt.className = unit.runtime_blocked ? 'tag stale' : 'muted';
+    rt.textContent = unit.runtime_label +
+      (unit.runtime_blocked ? ' (runtime-blocked, not Redmine blocked)' : '');
+    row.appendChild(rt);
+  }
   if (hidden) {
     const tag = document.createElement('span');
     tag.className = 'muted';
@@ -210,12 +230,13 @@ function unitRow(unit, hidden) {
   }
   // The Target layer: one action affordance per observed role pane. Disabled
   // when the row is not current (reload_required) — the candidate selector would
-  // fail closed anyway.
+  // fail closed anyway — and on a non-tmux backend (grouped jump/reveal are tmux
+  // pane actions; a herdr row has no pane, so the affordance is honest-disabled).
   for (const role of (unit.roles || [])) {
     for (const [kind, label] of [['jump', 'jump'], ['reveal', 'Finder']]) {
       const button = document.createElement('button');
       button.textContent = role + ':' + label;
-      button.disabled = !!unit.reload_required;
+      button.disabled = !!unit.reload_required || nonTmux;
       button.addEventListener('click', () => actGrouped(kind, unit, role));
       row.appendChild(button);
     }
@@ -252,6 +273,18 @@ function renderGrouped(data) {
     let tagText = g.source;
     if (g.stale) tagText += ' · stale';
     if (g.reload_required) tagText += ' · reload';
+    // herdr runtime roll-up (#13356): live/working/unknown role counts over the
+    // group's herdr rows; a runtime-blocked prompt is counted from the rows'
+    // own row-level flag. Absent on a tmux-only group (unchanged).
+    const s = g.summary || {};
+    if (s.herdr_units) {
+      tagText += ' · herdr ' + (s.herdr_working_roles || 0) + '/' +
+        (s.herdr_live_roles || 0) + ' working';
+      const rtBlocked = (g.units || []).concat(g.hidden_units || [])
+        .filter(u => u.runtime_blocked).length;
+      if (rtBlocked) tagText += ' · ' + rtBlocked + ' runtime-blocked';
+      if (s.herdr_unknown_roles) tagText += ' · ' + s.herdr_unknown_roles + ' unknown';
+    }
     tag.textContent = tagText;
     if (g.stale) tag.classList.add('stale');
     else if (g.reload_required) tag.classList.add('reload');

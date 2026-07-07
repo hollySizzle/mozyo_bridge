@@ -733,14 +733,15 @@ class GroupHeaderSummaryTests(unittest.TestCase):
             g for g in view.as_payload()["groups"]
             if g["group_id"] == "project:alpha"
         )
-        self.assertEqual(
-            set(alpha["summary"].keys()),
-            {"total", "active_lanes", "reload_required", "attention", "needs_attention"},
-        )
-        self.assertEqual(
-            set(view.as_payload()["summary"].keys()),
-            {"total", "active_lanes", "reload_required", "attention", "needs_attention"},
-        )
+        # #13356 adds the herdr runtime-observation roll-up counts — still
+        # projection-only counts over displayed rows, never governance truth.
+        expected = {
+            "total", "active_lanes", "reload_required", "attention",
+            "needs_attention", "herdr_units", "herdr_live_roles",
+            "herdr_working_roles", "herdr_unknown_roles",
+        }
+        self.assertEqual(set(alpha["summary"].keys()), expected)
+        self.assertEqual(set(view.as_payload()["summary"].keys()), expected)
 
     def test_summary_carries_no_governance_or_routing_vocabulary(self) -> None:
         # The summary is a projection: its field names name counts, never a

@@ -259,6 +259,13 @@ Table naming:
 - `managed_events`
 - `inventory_panes`, `inventory_meta`
 - `otel_events`, `otel_meta`
+- `lane_metadata_records` — 最初の **native component** (#13356、j#73386 Q2)。legacy file を持たず
+  `state.sqlite` に直接生まれる lane 表示 metadata (token↔lane_label/issue/branch/worktree join)。
+  owner module は `core/state/lane_metadata.py`、writer は `sublane create` / `sublane retire --execute`
+  の command boundary、recovery policy は `operator_current_state` (token は一方向 path hash であり
+  event から再構成できない。loss は表示の fail-open degrade (`lane_record_missing`) に留まり、復旧は
+  explicit re-declare)。表示 join であり routing authority / liveness / workflow truth に昇格させない。
+  `state_schema_components` へは `migrated_from` NULL で自己登録する (native component の登録形)。
 - future `presentation_*` / `unit_*` tables from `unit-presentation-state-db.md`
 
 Ownership rules:

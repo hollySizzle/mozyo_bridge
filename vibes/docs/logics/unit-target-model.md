@@ -495,6 +495,24 @@ routing / approval / close authority に使わない点は変わらない。
 > 非目標どおり tmux window / iTerm tab を identity authority にせず、public extension API /
 > dynamic plugin loading も開かない。
 
+> 実装メモ (#13356): grouped Unit projection に **backend 軸**を通した (design
+> j#73386 案 A)。`ObservedUnit` / `UnitView` / `UnitDisplayRow` は additive な
+> `backend` (default `tmux`、既存 tmux row は表示互換) を carry し、herdr Unit は
+> live `herdr agent list` の mzb1 decode (#13247) を `cockpit_payload.herdr_observed_units`
+> が同一 read model へ fold する (#13303 membership fold の視覚面拡張。default-off /
+> config fail-soft / unreadable inventory は diagnostic として可視)。herdr Unit の
+> 人間可読 identity (`lane_label` / `issue`) は **lane metadata record**
+> (`managed-state-model.md` の `lane_metadata_records` native component) の display
+> join であり、record 欠落は `wt_<hash>` 生値 + `lane_record_missing` の fail-open
+> degrade。per-role `agent_status` は core receiver-state 語彙 (busy / blocked /
+> awaiting_input / turn_ended / unknown) へ写像した **runtime observation layer**
+> (`role_runtime_states` / row の `runtime_blocked` / summary の herdr counts) として
+> 供給し、Redmine workflow attention / blocked gate へ昇格させない (runtime-blocked
+> は別 label)。herdr 行の観測 envelope は tmux snapshot と独立の live-query
+> (`source="herdr"`) で、非 tmux Unit の `unit_id` は backend-qualified
+> (`unit:host:ws:lane:herdr`) にして hybrid 観測の衝突を防ぐ。routing / approval /
+> close authority への非昇格境界は従来どおり (herdr 行の grouped action は disabled)。
+
 > 実装メモ (#12296): 本 Project Group read model に対する **detail / command preview**
 > projection は `src/mozyo_bridge/application/grouped_detail.py` に実装済み
 > (`build_grouped_unit_detail`)。operator が grouped cockpit で Unit / Target を選んだ

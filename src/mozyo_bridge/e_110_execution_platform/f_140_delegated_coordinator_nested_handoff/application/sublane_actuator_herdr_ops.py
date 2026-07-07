@@ -103,6 +103,7 @@ class HerdrSublaneActuatorOps:
     repo_root: Path
     lane_label: str
     issue: str
+    branch: str = ""
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     providers: tuple[str, ...] = HERDR_LANE_PROVIDERS
@@ -167,6 +168,36 @@ class HerdrSublaneActuatorOps:
             )
         except HerdrSessionStartError as exc:
             raise RuntimeError(f"herdr lane workspace creation failed: {exc}") from exc
+        # Best-effort lane metadata upsert (Redmine #13356 j#73386 Q2): record the
+        # token↔(lane_label / issue / branch / worktree) display join at the create
+        # command boundary, so `sublane list` / dispatch-worker / the cockpit web UI
+        # can resolve the lane's human identity from the wt_<hash> token. A metadata
+        # write failure never breaks the actuation — the projections fail open to
+        # the raw token (`lane_record_missing`).
+        self._record_lane_metadata(worktree_path)
+
+    def _record_lane_metadata(self, worktree_path: str) -> None:
+        """Upsert the lane's display-metadata record (best-effort, never raises)."""
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+
+        try:
+            token = herdr_workspace_segment(Path(worktree_path))
+        except (OSError, ValueError):
+            return
+        if not token:
+            return
+        try:
+            repo_workspace_id = herdr_workspace_segment(self.repo_root)
+        except (OSError, ValueError):
+            repo_workspace_id = ""
+        record_lane_created(
+            lane_workspace_token=token,
+            repo_workspace_id=repo_workspace_id,
+            issue_id=self.issue or "",
+            lane_label=self.lane_label or "",
+            branch=self.branch or "",
+            worktree_path=str(worktree_path),
+        )
 
     def _live_rows(self) -> Sequence[Mapping[str, object]]:
         binary = _resolve_binary_or_die(self.env)

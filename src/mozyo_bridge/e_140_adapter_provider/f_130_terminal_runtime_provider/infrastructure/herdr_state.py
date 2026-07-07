@@ -90,6 +90,22 @@ _LIST_ENVELOPE_KEYS = ("result", "data")
 _GET_OBJECT_KEYS = ("agent", "pane")
 
 
+def agent_row_runtime_state(row: object) -> str:
+    """Map one raw ``agent list`` row's status to a runtime receiver-state (pure).
+
+    The public per-row twin of the :func:`_rows_to_state_pairs` mapping, shared
+    with read models that fold the raw inventory themselves (the cockpit herdr
+    supplier, Redmine #13356): the row's status token is looked up under the same
+    :data:`_STATUS_KEYS` candidates and mapped through the core fail-closed
+    :func:`~mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state.map_agent_status`
+    — a non-mapping row / absent / unrecognised status degrades to ``unknown``.
+    Never raises.
+    """
+    if not isinstance(row, Mapping):
+        return map_agent_status(None)
+    return map_agent_status(_first_str(row, _STATUS_KEYS))
+
+
 class HerdrCliAgentStateReader:
     """A herdr agent-state reader over the herdr CLI (``agent get`` / ``agent list``).
 
@@ -376,5 +392,6 @@ def resolve_agent_state_reader(
 
 __all__ = (
     "HerdrCliAgentStateReader",
+    "agent_row_runtime_state",
     "resolve_agent_state_reader",
 )

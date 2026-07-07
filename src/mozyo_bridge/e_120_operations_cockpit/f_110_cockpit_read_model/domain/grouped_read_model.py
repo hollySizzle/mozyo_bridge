@@ -103,6 +103,22 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     STRENGTH_PROJECTION_ONLY,
     RuntimeObservationSnapshot,
 )
+from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+    BACKEND_HERDR,
+    BACKEND_TMUX,
+)
+
+#: The runtime receiver-state token a herdr ``blocked`` observation maps to
+#: (:mod:`...f_130_terminal_runtime_provider.domain.agent_state` ``RUNTIME_BLOCKED``).
+#: Named here so the display layer can flag a *runtime*-blocked row — a
+#: permission prompt observed on the live runtime — without importing the
+#: transport vocabulary; it is NEVER the Redmine workflow ``blocked`` gate
+#: (Redmine #13356 j#73386 Q3: the two are labelled apart).
+RUNTIME_STATE_BLOCKED: str = "blocked"
+#: The runtime receiver-state for an actively-working role (`herdr working`).
+RUNTIME_STATE_BUSY: str = "busy"
+#: The fail-closed runtime receiver-state (unreadable / unrecognised).
+RUNTIME_STATE_UNKNOWN: str = "unknown"
 
 #: Unit read-model presentation status values. ``observed`` is the ordinary
 #: fresh / readable / placed outcome; the rest are *visible* degraded conditions
@@ -221,10 +237,36 @@ class ObservedUnit:
     active: bool = False
     roles: "tuple[str, ...]" = ()
     observation: RuntimeObservationSnapshot = UNKNOWN_OBSERVATION
+    #: The terminal transport backing this Unit (Redmine #13356). Defaults to
+    #: ``tmux`` so every existing tmux caller / payload is unchanged; a ``herdr``
+    #: Unit is supplied by the live ``agent list`` fold and carries no tmux pane.
+    backend: str = BACKEND_TMUX
+    #: Observed per-role runtime receiver-states, ``(role, state)`` pairs in
+    #: display order (Redmine #13356 j#73386 Q3). A *runtime observation layer*
+    #: only — herdr ``agent_status`` mapped to the core receiver-state vocabulary
+    #: (busy / blocked / awaiting_input / turn_ended / unknown); it is never
+    #: Redmine workflow attention / review / close truth, and never a routing
+    #: input. Empty for a tmux Unit (whose liveness rides the snapshot itself).
+    role_runtime_states: "tuple[tuple[str, str], ...]" = ()
+    #: Human lane identity resolved from the lane metadata record (Redmine
+    #: #13356): the lane label (e.g. ``issue_13356_cockpit_aggregate``) and the
+    #: issue number. Display join facts only, never identity / routing; ``None``
+    #: for a tmux Unit (whose lane identity is its ``lane_id``) and for a herdr
+    #: Unit whose record is missing (the row then degrades to the raw token).
+    lane_label: Optional[str] = None
+    issue: Optional[str] = None
 
     def unit_id(self) -> str:
-        """The portable Unit key (``unit-target-model.md`` UnitRecord shape)."""
-        return f"unit:{self.host_id}:{self.workspace_id}:{self.lane_id}"
+        """The portable Unit key (``unit-target-model.md`` UnitRecord shape).
+
+        A non-tmux Unit appends its backend so a hybrid workspace observed on
+        both transports never collides onto one row id; tmux Unit ids stay
+        byte-identical to the pre-#13356 shape.
+        """
+        base = f"unit:{self.host_id}:{self.workspace_id}:{self.lane_id}"
+        if self.backend != BACKEND_TMUX:
+            return f"{base}:{self.backend}"
+        return base
 
     def launch_context(self) -> LaunchContext:
         """The :class:`LaunchContext` this Unit is placed by (#12263 resolver input)."""
@@ -279,6 +321,14 @@ class UnitView:
     stale_reason: Optional[str] = None
     contradiction: Optional[str] = None
     diagnostic: Optional[str] = None
+    #: Carried verbatim from :class:`ObservedUnit` (Redmine #13356): the backing
+    #: transport, the per-role runtime receiver-states (display observation, not
+    #: workflow truth), and the lane metadata display join (human lane label +
+    #: issue number). All additive with tmux-preserving defaults.
+    backend: str = BACKEND_TMUX
+    role_runtime_states: "tuple[tuple[str, str], ...]" = ()
+    lane_label: Optional[str] = None
+    issue: Optional[str] = None
 
     @property
     def needs_reload(self) -> bool:
@@ -311,6 +361,10 @@ class UnitView:
             "stale_reason": self.stale_reason,
             "contradiction": self.contradiction,
             "diagnostic": self.diagnostic,
+            "backend": self.backend,
+            "runtime_states": dict(self.role_runtime_states),
+            "lane_label": self.lane_label,
+            "issue": self.issue,
         }
 
 
@@ -434,6 +488,10 @@ def _unit_view_from_observed(
         stale_reason=observation.stale_reason,
         contradiction=observation.contradiction,
         diagnostic=placement.diagnostic,
+        backend=observed.backend,
+        role_runtime_states=observed.role_runtime_states,
+        lane_label=observed.lane_label,
+        issue=observed.issue,
     )
 
 
@@ -688,6 +746,11 @@ __all__ = (
     "UNIT_STATUS_UNREADABLE",
     "UNIT_STATUS_CONTRADICTED",
     "UNIT_STATUS_UNKNOWN",
+    "BACKEND_TMUX",
+    "BACKEND_HERDR",
+    "RUNTIME_STATE_BLOCKED",
+    "RUNTIME_STATE_BUSY",
+    "RUNTIME_STATE_UNKNOWN",
     "GROUP_SOURCE_DESIRED",
     "GROUP_SOURCE_DEFAULT",
     "GROUPED_READ_MODEL_DIAGNOSTIC_ONLY_NOTE",

@@ -470,6 +470,38 @@ def _build_create_sql(target_table: str, columns: list[tuple]) -> str:
     return f'CREATE TABLE main."{target_table}" (\n    ' + ",\n    ".join(col_defs) + "\n)"
 
 
+def connect_state_container_rw(path: Path) -> sqlite3.Connection:
+    """Open the single state DB read-write, creating / validating the container.
+
+    The one shared container guard (``PRAGMA user_version`` +
+    ``state_schema_components``) for every writer of ``state.sqlite`` — the
+    legacy-import migrator (:meth:`StateStore.migrate`) and any *native*
+    component writer (a post-consolidation component with no legacy file, e.g.
+    :mod:`mozyo_bridge.core.state.lane_metadata`). Version ``0`` is a fresh file
+    — create ``state_schema_components`` and stamp the container version. A
+    newer, unrecognized container fails closed via :class:`StateStoreError`
+    rather than being rewritten, so a downgraded build never destroys a newer
+    single DB.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA busy_timeout = 2000")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        conn.execute(_STATE_SCHEMA_COMPONENTS_SQL)
+        conn.execute(f"PRAGMA user_version = {STATE_CONTAINER_VERSION}")
+        conn.commit()
+    elif version != STATE_CONTAINER_VERSION:
+        conn.close()
+        raise StateStoreError(
+            f"state store {path} has unsupported container version "
+            f"{version}; this build understands {STATE_CONTAINER_VERSION}. "
+            f"The single DB is left untouched (downgrade-safe); migrate with a "
+            f"newer build or move the file aside deliberately."
+        )
+    return conn
+
+
 class StateStore:
     """Read/write access to the home-scoped single state DB and its migration.
 
@@ -490,29 +522,11 @@ class StateStore:
     def _connect_rw(self) -> sqlite3.Connection:
         """Open a read-write connection, creating / validating the container.
 
-        ``PRAGMA user_version`` is the migration guard, mirroring the sibling
-        stores. Version ``0`` is a fresh file — create ``state_schema_components``
-        and stamp the container version. A newer, unrecognized container fails
-        closed via :class:`StateStoreError` rather than being rewritten, so a
-        downgraded build never destroys a newer single DB.
+        Delegates to the shared :func:`connect_state_container_rw` guard so the
+        migrator and any native component writer agree byte-for-byte on the
+        container layout and the downgrade-safe failure.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA busy_timeout = 2000")
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            conn.execute(_STATE_SCHEMA_COMPONENTS_SQL)
-            conn.execute(f"PRAGMA user_version = {STATE_CONTAINER_VERSION}")
-            conn.commit()
-        elif version != STATE_CONTAINER_VERSION:
-            conn.close()
-            raise StateStoreError(
-                f"state store {self.path} has unsupported container version "
-                f"{version}; this build understands {STATE_CONTAINER_VERSION}. "
-                f"The single DB is left untouched (downgrade-safe); migrate with a "
-                f"newer build or move the file aside deliberately."
-            )
-        return conn
+        return connect_state_container_rw(self.path)
 
     def _connect_ro(self) -> Optional[sqlite3.Connection]:
         """Open a read-only connection if the DB exists; ``None`` when absent.
@@ -980,5 +994,6 @@ __all__ = (
     "CleanupPlan",
     "StateStoreError",
     "state_store_path",
+    "connect_state_container_rw",
     "StateStore",
 )

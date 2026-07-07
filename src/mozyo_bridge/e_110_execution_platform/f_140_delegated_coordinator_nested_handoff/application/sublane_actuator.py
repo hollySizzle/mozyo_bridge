@@ -212,6 +212,7 @@ def _resolve_sublane_ops(
             repo_root=repo_root,
             lane_label=request.lane_label,
             issue=request.issue,
+            branch=request.branch,
             quiet_stdout=quiet_stdout,
         )
     return LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=quiet_stdout)
