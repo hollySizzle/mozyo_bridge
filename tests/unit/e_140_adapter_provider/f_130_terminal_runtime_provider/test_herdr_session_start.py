@@ -43,14 +43,33 @@ class _Herdr:
     (``result.type == "agent_started"``, locator at ``result.agent.pane_id``). There
     is no ``agent rename`` branch — a stray rename call raises (the durable name is
     applied at start).
+
+    ``workspace create`` / ``pane close`` model the Redmine #13330 empty-base-pane
+    reclaim: ``workspace create`` returns a ``workspace_created`` envelope carrying a
+    ``root_pane.pane_id`` (the empty base pane), and ``pane close`` acknowledges the
+    reclaim. ``start_fails`` / ``close_fails`` drive the fail-closed / non-fatal
+    branches. Calls are recorded so tests can assert the exact herdr choreography.
     """
 
-    def __init__(self, *, existing_rows=None, start_locator="w1:pNEW"):
+    def __init__(
+        self,
+        *,
+        existing_rows=None,
+        start_locator="w1:pNEW",
+        created_workspace="wZ",
+        start_fails=False,
+        close_fails=False,
+    ):
         self.existing_rows = existing_rows or []
         self.start_locator = start_locator
+        self.created_workspace = created_workspace
+        self.start_fails = start_fails
+        self.close_fails = close_fails
         self.calls: list = []
         self.launch_envs: list = []
         self.start_argvs: list = []
+        self.workspace_creates: list = []
+        self.pane_closes: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -59,9 +78,40 @@ class _Herdr:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.existing_rows}), stderr=""
             )
+        if rest[:2] == ["workspace", "create"]:
+            self.workspace_creates.append(rest)
+            wid = self.created_workspace
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "id": "cli:workspace:create",
+                        "result": {
+                            "type": "workspace_created",
+                            "workspace": {"workspace_id": wid},
+                            "root_pane": {"pane_id": f"{wid}:p1"},
+                        },
+                    }
+                ),
+                stderr="",
+            )
+        if rest[:2] == ["pane", "close"]:
+            self.pane_closes.append(rest)
+            if self.close_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane close refused"
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+            )
         if rest[:2] == ["agent", "start"]:
             self.launch_envs.append(env)
             self.start_argvs.append(rest)
+            if self.start_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="agent start refused"
+                )
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -220,6 +270,148 @@ class SessionStartTest(unittest.TestCase):
             )
         self.assertEqual(result.slots[0].outcome, SLOT_PLANNED)
         self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        # A dry-run plans nothing to launch, so no workspace is created and no base
+        # pane is reclaimed (Redmine #13330).
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertEqual(result.base_pane_id, "")
+
+    def test_cold_start_creates_workspace_launches_with_flag_and_reclaims(self) -> None:
+        # Redmine #13330: a pure cold start explicitly creates the workspace, launches
+        # every slot into it (`--workspace`), and reclaims ONLY the returned root pane
+        # after all launches succeed.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, anchor, repo = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr
+            )
+        # Exactly one workspace create; each launch carries `--workspace wZ`.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        for argv in herdr.start_argvs:
+            self.assertIn("--workspace", argv)
+            self.assertEqual(argv[argv.index("--workspace") + 1], "wZ")
+        # Exactly the created root pane is closed — never a scanned-for shell.
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
+        self.assertEqual(result.herdr_workspace_id, "wZ")
+        self.assertEqual(result.base_pane_id, "wZ:p1")
+        self.assertTrue(result.base_pane_reclaimed)
+        self.assertEqual(result.base_pane_detail, "")
+        # Ordering: create BEFORE both launches, close AFTER both launches.
+        kinds = [tuple(c[:2]) for c in herdr.calls]
+        create_i = kinds.index(("workspace", "create"))
+        close_i = kinds.index(("pane", "close"))
+        start_is = [i for i, k in enumerate(kinds) if k == ("agent", "start")]
+        self.assertTrue(create_i < min(start_is))
+        self.assertTrue(close_i > max(start_is))
+
+    def test_all_adopt_makes_no_workspace_and_no_close(self) -> None:
+        # Redmine #13330: an all-adopt run launches nothing, so it stays byte-invariant
+        # — no workspace create, no base pane, no reclaim.
+        with tempfile.TemporaryDirectory() as tmp:
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                existing = [
+                    {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": "w7:pC"},
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w7:pX"},
+                ]
+                herdr = _Herdr(existing_rows=existing)
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(result.base_pane_id, "")
+
+    def test_launch_failure_leaves_root_pane_unclosed_and_fails_closed(self) -> None:
+        # Redmine #13330: a launch failure raises BEFORE reclaim — the created root
+        # pane is left as residue (an implementation failure), never closed blindly.
+        herdr = _Herdr(start_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(tmp, providers=["claude", "codex"], herdr=herdr)
+        # The workspace was created (residue) but the base pane was NOT closed.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_root_pane_close_failure_is_non_fatal(self) -> None:
+        # Redmine #13330: a `pane close` failure is cosmetic residue only — the agents
+        # are already live — so it is recorded, not raised.
+        herdr = _Herdr(close_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, anchor, repo = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr
+            )
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
+        self.assertEqual(result.base_pane_id, "wZ:p1")
+        self.assertFalse(result.base_pane_reclaimed)
+        self.assertTrue(result.base_pane_detail)
+        # Slots still launched successfully despite the failed reclaim.
+        self.assertTrue(all(s.outcome == SLOT_LAUNCHED for s in result.slots))
+
+    def test_mixed_adopt_launch_reuses_adopted_workspace_no_base_pane(self) -> None:
+        # Redmine #13330: when one slot adopts a live agent, launches land in that
+        # agent's existing workspace (`--workspace w5`) — no new workspace, no base
+        # pane — instead of creating a fresh one.
+        with tempfile.TemporaryDirectory() as tmp:
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                existing = [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "w5:pOLD"},
+                ]
+                herdr = _Herdr(existing_rows=existing, start_locator="w5:p2")
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["claude", "codex"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertEqual(result.herdr_workspace_id, "w5")
+        self.assertEqual(result.base_pane_id, "")
+        # The launched claude slot carries `--workspace w5` (the adopted workspace).
+        self.assertEqual(len(herdr.start_argvs), 1)
+        launch = herdr.start_argvs[0]
+        self.assertEqual(launch[launch.index("--workspace") + 1], "w5")
+
+    def test_launch_target_from_adopted_conflicting_prefixes_fail_closed(self) -> None:
+        # Redmine #13330 mixed-case gate: adopted agents spanning >1 herdr workspace
+        # fail closed rather than guessing a launch target. (Structurally unreachable
+        # with the 2-provider set, but the guard stays fail-closed if it grows.)
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+            _launch_target_from_adopted,
+        )
+
+        self.assertEqual(_launch_target_from_adopted([]), "")
+        self.assertEqual(_launch_target_from_adopted(["w5:pA", "w5:pB"]), "w5")
+        with self.assertRaises(HerdrSessionStartError):
+            _launch_target_from_adopted(["w5:pA", "w6:pB"])
 
     def test_unknown_provider_fails_closed(self) -> None:
         herdr = _Herdr()

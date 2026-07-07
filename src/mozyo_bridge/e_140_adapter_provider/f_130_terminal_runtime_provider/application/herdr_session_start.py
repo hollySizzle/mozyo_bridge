@@ -22,6 +22,31 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
 Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
 (spec §5 slot-uniqueness) so the same durable name is never minted twice.
 
+Empty base-pane reclaim (Redmine #13330)
+-----------------------------------------
+A herdr workspace is *born with a ``root_pane``* — an empty base shell (measured:
+``workspace create`` returns ``result.root_pane.pane_id`` on a fresh ``pane_count: 1``
+workspace). On a cold start the first ``agent start`` used to auto-create the
+workspace implicitly, leaving that root pane as an unused, agent-less shell beside the
+launched agent panes. To reclaim it deterministically, a pure cold start now:
+
+1. classifies every requested slot (adopt vs launch) *before* launching;
+2. if any slot must launch and none of the adopted agents pin an existing workspace,
+   **explicitly** ``herdr workspace create --no-focus`` and captures the returned
+   ``workspace_id`` + ``root_pane.pane_id``;
+3. launches every slot with ``agent start --workspace <workspace_id>`` (so herdr never
+   auto-creates a second workspace); and
+4. after **every** launch succeeds, ``herdr pane close <root_pane_id>`` — closing only
+   that exact captured handle.
+
+Fail-closed guarantees: only the root pane *this run created* is ever a reclaim target
+(never a scanned-for shell, so a user's own shell can't be mis-closed); a launch
+failure raises before any reclaim (residue left, treated as an implementation
+failure); a ``pane close`` failure is recorded non-fatally (the agents are already
+live and an empty base pane is only cosmetic). All-adopt and launches into an
+already-existing workspace create no new base pane, so they stay byte-invariant. The
+tmux path (:mod:`mozyo_bridge.application.launch_command`) is untouched.
+
 The command is explicit opt-in and is **not** coupled to the ``terminal_transport``
 backend flag: you may prepare herdr identities without selecting the herdr transport,
 and vice versa (documented in ``vibes/docs/specs/herdr-native-identity.md``). In pure
@@ -122,17 +147,42 @@ class SlotResult:
 
 @dataclass
 class SessionStartResult:
-    """The aggregate outcome of a session-start run."""
+    """The aggregate outcome of a session-start run.
+
+    ``workspace_id`` / ``lane_id`` are the *mozyo* identities (registry anchor +
+    requested lane). The base-pane fields (Redmine #13330) record the empty herdr
+    root pane this run created and reclaimed on a pure cold start:
+
+    - ``herdr_workspace_id`` — the herdr *terminal* workspace the launched agents
+      live in (the one this run created, or the single workspace its adopted
+      agents already occupy). Blank when nothing was launched.
+    - ``base_pane_id`` — the ``root_pane.pane_id`` of the workspace this run
+      **created** (blank when no workspace was created: all-adopt, dry-run, or a
+      launch into an already-existing workspace). Only this exact pane is ever a
+      reclaim target — never a scanned-for shell (fail-closed against closing a
+      user's own shell).
+    - ``base_pane_reclaimed`` — True iff that created root pane was closed.
+    - ``base_pane_detail`` — a non-fatal ``pane close`` failure detail, if any
+      (a failed reclaim leaves harmless cosmetic residue, never a hard failure).
+    """
 
     workspace_id: str
     lane_id: str
     slots: list = field(default_factory=list)
+    herdr_workspace_id: str = ""
+    base_pane_id: str = ""
+    base_pane_reclaimed: bool = False
+    base_pane_detail: str = ""
 
     def as_payload(self) -> dict:
         return {
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
             "slots": [slot.as_payload() for slot in self.slots],
+            "herdr_workspace_id": self.herdr_workspace_id,
+            "base_pane_id": self.base_pane_id,
+            "base_pane_reclaimed": self.base_pane_reclaimed,
+            "base_pane_detail": self.base_pane_detail,
         }
 
 
@@ -238,6 +288,149 @@ def _parse_started_locator(stdout: object) -> Optional[str]:
     return locator or None
 
 
+def _workspace_prefix(locator: str) -> str:
+    """The herdr workspace id (``wN``) of a ``wN:pM`` locator (``""`` if unparseable).
+
+    herdr terminal locators are ``<workspace>:<pane>`` (e.g. ``w2:p3``); the part
+    before the first ``:`` is the workspace the pane lives in. Returns ``""`` for a
+    blank / colonless / malformed handle so the caller fails closed rather than
+    guessing a launch target.
+    """
+    loc = _norm(locator)
+    if ":" not in loc:
+        return ""
+    prefix = loc.split(":", 1)[0]
+    return prefix if valid_target(prefix) else ""
+
+
+def _launch_target_from_adopted(adopted_locators: Sequence[str]) -> str:
+    """The single herdr workspace shared by adopted agents (fail-closed on a split).
+
+    When a run launches some slots while others adopt live agents, the launches must
+    land in the workspace those adopted agents already occupy (so no *new* workspace
+    — hence no empty base pane — is created). Returns that single ``wN`` prefix, or
+    ``""`` when nothing was adopted. Raises :class:`HerdrSessionStartError` when the
+    adopted agents span more than one workspace: refusing to guess which one the
+    launches belong to (Redmine #13330 auditor ruling j#73225 mixed-case gate). With
+    the real 2-provider set (claude + codex) a >1 split is structurally unreachable
+    — one adopt + one launch is always a single prefix — but the guard keeps the
+    decision fail-closed if the provider set ever grows.
+    """
+    prefixes = {p for p in (_workspace_prefix(loc) for loc in adopted_locators) if p}
+    if len(prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"adopted agents span multiple herdr workspaces {sorted(prefixes)!r}; "
+            "refuse to guess which one new launches belong to"
+        )
+    return next(iter(prefixes)) if prefixes else ""
+
+
+def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
+    """``(workspace_id, root_pane_id)`` from a herdr ``workspace create`` payload.
+
+    Real herdr shape (coordinator-measured, #13330 probe)::
+
+        {"result": {"type": "workspace_created",
+                    "workspace": {"workspace_id": "w3", ...},
+                    "root_pane": {"pane_id": "w3:p1", ...}, ...}}
+
+    Every fresh workspace is born with exactly this ``root_pane`` — the empty base
+    shell #13330 reclaims. Returns ``None`` (so the caller fails closed and reclaims
+    nothing) when the payload is not JSON, not a ``workspace_created`` envelope, or
+    either id is missing / blank / malformed — never a guessed pane handle.
+    """
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    if _norm(result.get("type")) != "workspace_created":
+        return None
+    workspace = result.get("workspace")
+    root_pane = result.get("root_pane")
+    if not isinstance(workspace, Mapping) or not isinstance(root_pane, Mapping):
+        return None
+    workspace_id = _norm(workspace.get("workspace_id"))
+    root_pane_id = _norm(root_pane.get("pane_id"))
+    if not workspace_id or not valid_target(workspace_id):
+        return None
+    if not root_pane_id or not valid_target(root_pane_id):
+        return None
+    return workspace_id, root_pane_id
+
+
+def _create_workspace(
+    binary: str,
+    repo_root: Path,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+) -> tuple[str, str]:
+    """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
+
+    Making the workspace ourselves (rather than letting the first ``agent start``
+    auto-create it) is what turns the empty base pane into a *known* handle we can
+    reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
+    operator's focus. Fails closed if the response is unparseable.
+    """
+    completed = _invoke(
+        binary,
+        ["workspace", "create", "--cwd", str(repo_root), "--no-focus"],
+        runner,
+        timeout,
+        env=dict(env),
+    )
+    parsed = _parse_workspace_created(completed.stdout)
+    if parsed is None:
+        raise HerdrSessionStartError(
+            "herdr workspace create returned no parseable workspace id / root pane "
+            "(expected result.workspace.workspace_id + result.root_pane.pane_id in a "
+            "workspace_created payload); refuse to guess a pane to reclaim"
+        )
+    return parsed
+
+
+def _close_base_pane(
+    binary: str,
+    pane_id: str,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+) -> tuple[bool, str]:
+    """Reclaim the created base pane; **never hard-fail** (cosmetic residue only).
+
+    Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A failed
+    reclaim only leaves the harmless empty base pane behind — the agent slots are
+    already live — so it is recorded, not raised (Redmine #13330 ruling j#73225).
+    """
+    try:
+        _invoke(binary, ["pane", "close", pane_id], runner, timeout, env=dict(env))
+    except HerdrSessionStartError as exc:
+        return False, _bounded_detail(str(exc)) or "herdr pane close failed"
+    return True, ""
+
+
+@dataclass(frozen=True)
+class _SlotPlan:
+    """A per-provider decision (adopt / launch / dry-run plan) made before any launch.
+
+    Classifying every slot up front lets the run pick a single launch-target
+    workspace (and decide whether to create+reclaim a base pane) before it starts
+    launching, so ``agent start`` can pass an explicit ``--workspace``.
+    """
+
+    provider: str
+    assigned_name: str
+    kind: str  # "adopt" | "launch" | "planned"
+    locator: str = ""  # adopted live locator (kind == "adopt"); else ""
+
+
 def prepare_session(
     *,
     repo_root: Path,
@@ -291,86 +484,134 @@ def prepare_session(
     lane = _norm(lane_id)
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
-    rows = _list_rows(binary, runner or subprocess.run, timeout)
+    runner = runner or subprocess.run
+    rows = _list_rows(binary, runner, timeout)
+
+    # Pass 1 — classify every slot (adopt / launch / dry-run plan) before launching,
+    # failing closed on a duplicate live name. Classifying up front is what lets us
+    # pick ONE launch-target workspace (and decide whether to create+reclaim a base
+    # pane) before the first `agent start`.
+    plans: list = []
     for provider in providers:
         assigned_name = encode_assigned_name(workspace_id, provider, lane)
+        existing = _find_named_agent(rows, assigned_name)
+        if len(existing) > 1:
+            raise HerdrSessionStartError(
+                f"{len(existing)} live agents already carry {assigned_name!r}; herdr "
+                "names must be unique — refuse to launch / rename over a duplicate"
+            )
+        if len(existing) == 1:
+            plans.append(
+                _SlotPlan(provider, assigned_name, "adopt", _agent_locator(existing[0]))
+            )
+        elif dry_run:
+            plans.append(_SlotPlan(provider, assigned_name, "planned"))
+        else:
+            plans.append(_SlotPlan(provider, assigned_name, "launch"))
+
+    # Resolve the launch-target workspace (Redmine #13330). Nothing to launch (all
+    # adopt / dry-run) means no workspace create and no reclaim — byte-invariant.
+    # Launches into an already-adopted workspace reuse it (no new base pane). A pure
+    # cold start (launches, no adopted workspace) creates the workspace explicitly so
+    # its empty root pane is a known handle to reclaim, not one we scan for.
+    launch_plans = [p for p in plans if p.kind == "launch"]
+    target_workspace = ""
+    if launch_plans:
+        target_workspace = _launch_target_from_adopted(
+            [p.locator for p in plans if p.kind == "adopt"]
+        )
+        if not target_workspace:
+            target_workspace, base_pane_id = _create_workspace(
+                binary, repo_root, runner, timeout, env
+            )
+            result.base_pane_id = base_pane_id
+        result.herdr_workspace_id = target_workspace
+
+    # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into
+    # the resolved target workspace). A launch failure raises here, before reclaim.
+    for plan in plans:
         result.slots.append(
-            _prepare_slot(
-                provider=provider,
-                assigned_name=assigned_name,
+            _execute_slot(
+                plan,
                 repo_root=repo_root,
                 workspace_id=workspace_id,
                 lane=result.lane_id,
-                rows=rows,
+                target_workspace=target_workspace,
                 binary=binary,
                 env=env,
-                runner=runner or subprocess.run,
+                runner=runner,
                 timeout=timeout,
-                dry_run=dry_run,
             )
         )
+
+    # Reclaim the empty base pane we created — only after EVERY launch succeeded
+    # (a launch failure raised above, so reaching here means all agents are live and
+    # the workspace is safe to keep with just its agent panes). Close only the exact
+    # root pane id we captured; a close failure is non-fatal cosmetic residue.
+    if result.base_pane_id:
+        reclaimed, detail = _close_base_pane(
+            binary, result.base_pane_id, runner, timeout, env
+        )
+        result.base_pane_reclaimed = reclaimed
+        result.base_pane_detail = detail
     return result
 
 
-def _prepare_slot(
+def _execute_slot(
+    plan: _SlotPlan,
     *,
-    provider: str,
-    assigned_name: str,
     repo_root: Path,
     workspace_id: str,
     lane: str,
-    rows: Sequence[Mapping[str, object]],
+    target_workspace: str,
     binary: str,
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
-    dry_run: bool,
 ) -> SlotResult:
-    existing = _find_named_agent(rows, assigned_name)
-    if len(existing) > 1:
-        raise HerdrSessionStartError(
-            f"{len(existing)} live agents already carry {assigned_name!r}; herdr names "
-            "must be unique — refuse to launch / rename over a duplicate"
-        )
-    if len(existing) == 1:
+    if plan.kind == "adopt":
         return SlotResult(
-            provider=provider,
-            assigned_name=assigned_name,
+            provider=plan.provider,
+            assigned_name=plan.assigned_name,
             outcome=SLOT_ADOPTED,
-            locator=_agent_locator(existing[0]),
+            locator=plan.locator,
             detail="live agent already carries the durable name; adopted",
         )
-    if dry_run:
+    if plan.kind == "planned":
         return SlotResult(
-            provider=provider,
-            assigned_name=assigned_name,
+            provider=plan.provider,
+            assigned_name=plan.assigned_name,
             outcome=SLOT_PLANNED,
             detail="would launch (dry-run)",
         )
     # Launch the agent with the durable name applied at start (herdr 0.7.1 real
-    # syntax: `agent start <NAME> [--cwd] [--env K=V]... [--no-focus] -- <argv>`).
-    # The NAME positional applies directly (probe: result.agent.name == NAME), so no
-    # separate `agent rename` is needed. The self-identity vars ride on repeated
-    # `--env` flags, NOT the client process env — the server-spawned agent does not
-    # inherit the client env (coordinator-measured). `--no-focus` avoids stealing the
-    # operator's focus. The client env is still passed through for PATH etc.
+    # syntax: `agent start <NAME> [--cwd] [--workspace ID] [--env K=V]... [--no-focus]
+    # -- <argv>`). The NAME positional applies directly (probe: result.agent.name ==
+    # NAME), so no separate `agent rename` is needed. `--workspace` pins placement into
+    # the resolved target workspace (Redmine #13330) so herdr never auto-creates a new
+    # workspace — the source of the empty base pane. The self-identity vars ride on
+    # repeated `--env` flags, NOT the client process env — the server-spawned agent
+    # does not inherit the client env (coordinator-measured). `--no-focus` avoids
+    # stealing the operator's focus. The client env is still passed through for PATH etc.
     started = _invoke(
         binary,
         [
             "agent",
             "start",
-            assigned_name,
+            plan.assigned_name,
             "--cwd",
             str(repo_root),
+            "--workspace",
+            target_workspace,
             "--env",
             f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
             "--env",
-            f"{MOZYO_AGENT_ROLE_ENV}={provider}",
+            f"{MOZYO_AGENT_ROLE_ENV}={plan.provider}",
             "--env",
             f"{MOZYO_LANE_ID_ENV}={lane}",
             "--no-focus",
             "--",
-            provider,
+            plan.provider,
         ],
         runner,
         timeout,
@@ -379,13 +620,13 @@ def _prepare_slot(
     locator = _parse_started_locator(started.stdout)
     if not locator or not valid_target(locator):
         raise HerdrSessionStartError(
-            f"herdr agent start for {provider!r} returned no usable live locator "
+            f"herdr agent start for {plan.provider!r} returned no usable live locator "
             "(expected result.agent.pane_id in an agent_started payload); refuse to "
             "return a blank handle"
         )
     return SlotResult(
-        provider=provider,
-        assigned_name=assigned_name,
+        provider=plan.provider,
+        assigned_name=plan.assigned_name,
         outcome=SLOT_LAUNCHED,
         locator=locator,
         detail="launched with the durable name and self-identity env (--env) at start",
@@ -401,6 +642,13 @@ def _render_text(result: SessionStartResult) -> str:
             f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
             + (f" locator={slot.locator}" if slot.locator else "")
         )
+    if result.base_pane_id:
+        state = (
+            "reclaimed"
+            if result.base_pane_reclaimed
+            else f"reclaim-failed ({result.base_pane_detail})"
+        )
+        lines.append(f"base pane {result.base_pane_id}: {state}")
     return "\n".join(lines)
 
 

@@ -166,6 +166,40 @@ herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv
 自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
 live smoke は coordinator の post-review step。
 
+### 空 base pane の回収 (cold start、#13330)
+
+herdr workspace は生成時に必ず `root_pane` (agent 無しの空 base shell) を 1 個持つ (実測:
+`workspace create` 応答 = `result.type == "workspace_created"` に `result.workspace.workspace_id`
++ `result.root_pane.pane_id`、`pane_count: 1`)。cold start で初回 `agent start` を `--workspace`
+無しで呼ぶと herdr が workspace を暗黙生成し、この root pane が使われない残骸として agent pane の横に
+残る (dogfood 発見 #12)。回収は次の決定的手順で行う (auditor ruling #13330 j#73225、対処 (a) 採用):
+
+1. 全 slot を launch 前に分類する (adopt / launch / dry-run plan)。
+2. launch する slot があり、かつ adopted agent が既存 workspace を pin していない (pure cold start) 場合は
+   **明示的に** `herdr workspace create --cwd <repo> --no-focus` を呼び、応答の `workspace_id` と
+   `root_pane.pane_id` を保持する。応答が parse 不能なら fail-closed (推測で pane を閉じない)。
+3. 各 launch slot を `agent start --workspace <workspace_id>` で起動する (herdr が second workspace を
+   暗黙生成しない)。
+4. **全 launch 成功後に限り** `herdr pane close <root_pane_id>` で、この run が生成した root pane
+   **のみ**を閉じる。
+
+fail-closed / safety 不変条件:
+
+- 閉じる対象は **この run が `workspace create` で得た `root_pane.pane_id` 一点のみ**。scan で「空
+  shell らしき pane」を探して閉じることは禁止 (user 自身の shell を誤 close しない構造的保証)。
+- launch 失敗は reclaim より前に raise する (created workspace / root pane は残骸として残し、実装失敗
+  として扱う。blind close しない)。
+- `pane close` 失敗は **non-fatal** (agent slot は既に live で、空 base pane は cosmetic 残骸)。
+  `SessionStartResult.base_pane_detail` に記録し、session-start 全体を hard-fail しない。
+- all-adopt / 既存 workspace への launch は base pane を新規生成しないため byte-invariant。
+- workspace_registry schema は無変更 (§2 invariant 維持)。herdr terminal workspace id は
+  `SessionStartResult.herdr_workspace_id` (created / adopted prefix) として観測用に運ぶだけで、mozyo
+  registry には持ち込まない。mixed adopt+launch では adopted locator の `wN` prefix から launch target を
+  導出し、複数 workspace prefix が混在する場合は fail-closed。
+
+live smoke (cold start bare `mozyo` 後に root pane が残らないこと、adopt 経路が byte-invariant で
+あること) は coordinator の post-review 実機 acceptance で確認する。
+
 ## 6. Close-evidence contract (pure-herdr round trip)
 
 close 判定には次の durable evidence を要求する:
