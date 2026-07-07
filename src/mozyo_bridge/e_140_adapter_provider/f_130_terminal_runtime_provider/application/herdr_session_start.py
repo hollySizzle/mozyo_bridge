@@ -85,11 +85,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.core.state.workspace_registry import (
+    _is_linked_worktree,
+    read_anchor,
+    register_workspace,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
+    derive_lane_workspace_token,
     encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
@@ -184,6 +189,32 @@ class SessionStartResult:
             "base_pane_reclaimed": self.base_pane_reclaimed,
             "base_pane_detail": self.base_pane_detail,
         }
+
+
+def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> str:
+    """The mzb1 ``workspace`` segment for ``repo_root`` (Redmine #13331, design j#73357).
+
+    The single, read-only resolver every herdr identity site shares so mint-time
+    (:func:`prepare_session`) and resolve-time (cross-workspace send, retire, projection,
+    lane read-back) always agree:
+
+    - a **linked git worktree** used as a sublane herdr workspace → the deterministic
+      lane-scoped token (:func:`derive_lane_workspace_token`) from its **canonical** path.
+      The discriminator is git topology (:func:`_is_linked_worktree`), **not** an absent
+      anchor — an unregistered standalone repo also has no anchor. The worktree inherits
+      the main checkout's registry identity (#13152), which is not a distinct per-lane
+      identity, so the registry is left untouched here;
+    - otherwise (**standalone / main checkout**) → the registry / anchor ``workspace_id``,
+      read-only (no registration), byte-for-byte the prior behaviour. ``""`` when the
+      standalone checkout has no resolvable anchor (the caller decides whether that is
+      fatal — :func:`prepare_session` registers + fails closed; the resolve sites treat
+      ``""`` as "not a distinct target workspace").
+    """
+    resolved = Path(repo_root).expanduser().resolve()
+    if _is_linked_worktree(resolved):
+        return derive_lane_workspace_token(str(resolved))
+    anchor = read_anchor(resolved)
+    return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
 
 
 def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
@@ -473,14 +504,24 @@ def prepare_session(
         seen_slots.add(slot)
     binary = _resolve_binary_or_die(env)
 
-    register_workspace(repo_root)
-    anchor = read_anchor(repo_root)
-    workspace_id = anchor.get("workspace_id") if isinstance(anchor, dict) else None
-    workspace_id = _norm(workspace_id)
-    if not workspace_id:
-        raise HerdrSessionStartError(
-            "workspace has no resolvable workspace_id after registration"
-        )
+    # Redmine #13331 (design j#73357, Opt 1): the mzb1 `workspace` segment. A linked git
+    # worktree used as a per-lane herdr workspace inherits the main checkout's registry
+    # identity (#13152) and has no distinct per-lane workspace_id, so it is named by a
+    # deterministic path-derived token (registry untouched). A standalone / main checkout
+    # is registered and named by its registry workspace_id (byte-for-byte the prior path,
+    # incl. the fail-closed-on-empty guard). Both use the single shared resolver so mint
+    # here and resolve at send/retire/projection agree on the same canonical path.
+    resolved_root = Path(repo_root).expanduser().resolve()
+    if _is_linked_worktree(resolved_root):
+        workspace_id = derive_lane_workspace_token(str(resolved_root))
+    else:
+        register_workspace(repo_root)
+        anchor = read_anchor(repo_root)
+        workspace_id = _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
+        if not workspace_id:
+            raise HerdrSessionStartError(
+                "workspace has no resolvable workspace_id after registration"
+            )
     lane = _norm(lane_id)
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
@@ -715,5 +756,6 @@ __all__ = (
     "SessionStartResult",
     "SlotResult",
     "cmd_herdr_session_start",
+    "herdr_workspace_segment",
     "prepare_session",
 )

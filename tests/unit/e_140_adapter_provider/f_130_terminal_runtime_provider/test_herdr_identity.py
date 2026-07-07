@@ -41,9 +41,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REBIND_NOT_FOUND,
     REBIND_OK,
     SCHEME_PREFIX,
+    LANE_WORKSPACE_TOKEN_PREFIX,
     HerdrAgentIdentity,
     HerdrIdentityError,
     decode_assigned_name,
+    derive_lane_workspace_token,
     encode_assigned_name,
     encode_field,
     rebind_by_name,
@@ -342,6 +344,42 @@ class RebindTest(unittest.TestCase):
         agents = [{"name": self.name, "pane_id": "w1:p1"}]
         result = rebind_by_name(self.name, agents)
         self.assertNotIn("w1:p1", result.public_pointer())
+
+
+class LaneWorkspaceTokenTest(unittest.TestCase):
+    """Redmine #13331 (design j#73357): the lane-scoped herdr workspace token for a
+    linked git worktree — deterministic, unique per path, private-path-safe, and a valid
+    mzb1 workspace segment."""
+
+    def test_deterministic_and_prefixed(self) -> None:
+        a = derive_lane_workspace_token("/work/mozyo_bridge_issue_101")
+        b = derive_lane_workspace_token("/work/mozyo_bridge_issue_101")
+        self.assertEqual(a, b)
+        self.assertTrue(a.startswith(LANE_WORKSPACE_TOKEN_PREFIX + "_"))
+
+    def test_distinct_paths_distinct_tokens(self) -> None:
+        self.assertNotEqual(
+            derive_lane_workspace_token("/work/lane_a"),
+            derive_lane_workspace_token("/work/lane_b"),
+        )
+
+    def test_does_not_leak_the_path(self) -> None:
+        # Only a hash — never the (private) absolute path — is emitted.
+        path = "/Users/someone/secret/mozyo_bridge_issue_101"
+        token = derive_lane_workspace_token(path)
+        self.assertNotIn("someone", token)
+        self.assertNotIn("secret", token)
+        self.assertNotIn("/", token)
+
+    def test_round_trips_through_mzb1_encoding(self) -> None:
+        token = derive_lane_workspace_token("/work/mozyo_bridge_issue_101")
+        name = encode_assigned_name(token, "codex", "")
+        decoded = decode_assigned_name(name)
+        self.assertTrue(decoded.ok)
+        self.assertEqual(decoded.identity.workspace_id, token)
+        self.assertEqual(decoded.identity.role, "codex")
+        self.assertEqual(decoded.identity.lane_id, DEFAULT_LANE)
+        self.assertLessEqual(len(name), NAME_MAX_LENGTH)
 
 
 if __name__ == "__main__":  # pragma: no cover

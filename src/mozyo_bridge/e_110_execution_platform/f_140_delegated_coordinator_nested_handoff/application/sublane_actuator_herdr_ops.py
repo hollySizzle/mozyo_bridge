@@ -47,7 +47,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
@@ -61,6 +60,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
     _list_rows,
     _resolve_binary_or_die,
+    herdr_workspace_segment,
     prepare_session,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -204,21 +204,20 @@ class HerdrSublaneActuatorOps:
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         """Resolve the lane from the live herdr inventory for this worktree (fail-safe).
 
-        Reads the worktree's own anchor for its mozyo workspace id, lists the live herdr
-        agents, and folds the default-lane codex / claude managed slots into a
-        :class:`SublaneLaneView`. Returns ``None`` when the worktree has no resolvable
-        workspace yet (a fresh ``git worktree add`` before :meth:`append_lane_column`) or
-        when neither managed slot is live — so the use case treats a not-yet-created lane as
-        absent and proceeds to create it. The view carries the requested ``lane_label`` /
-        ``issue`` (the worktree→workspace mapping is the collision-free lane identity).
+        Resolves the worktree's herdr workspace segment through the shared resolver
+        (:func:`~...herdr_session_start.herdr_workspace_segment` — a lane token for a linked
+        git worktree, #13331 j#73357), lists the live herdr agents, and folds the
+        default-lane codex / claude managed slots into a :class:`SublaneLaneView`. Returns
+        ``None`` when the worktree has no resolvable segment or when neither managed slot is
+        live (a fresh worktree before :meth:`append_lane_column`, whose agents are not yet
+        launched) — so the use case treats a not-yet-created lane as absent and creates it.
+        The view carries the requested ``lane_label`` / ``issue`` (the worktree→workspace
+        mapping is the collision-free lane identity).
         """
         try:
-            anchor = read_anchor(Path(worktree_path))
+            workspace_id = herdr_workspace_segment(Path(worktree_path))
         except (OSError, ValueError):
             return None
-        workspace_id = (
-            _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
-        )
         if not workspace_id:
             return None
         try:

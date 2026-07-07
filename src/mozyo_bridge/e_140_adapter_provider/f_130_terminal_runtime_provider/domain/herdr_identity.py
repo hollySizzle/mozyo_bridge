@@ -99,6 +99,7 @@ Non-goals (unchanged, restated for this seam)
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -156,6 +157,44 @@ _NAME_CHAR_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: Normalized stand-in for an unset ``lane_id`` — the same convention the route
 #: identity ledger uses (an empty lane is the workspace-default lane).
 DEFAULT_LANE: str = "default"
+
+#: Prefix marking a lane-scoped herdr workspace token (Redmine #13331). The mzb1
+#: ``workspace`` segment is normally the registry / anchor workspace_id, but a linked
+#: git worktree used as a sublane herdr workspace inherits the main checkout's registry
+#: identity (#13152) and so has no distinct per-lane workspace_id — for those lanes the
+#: segment is a path-derived token starting with this prefix.
+LANE_WORKSPACE_TOKEN_PREFIX: str = "wt"
+
+#: Hex length of the lane-workspace-token digest (a 64-bit slice of the SHA-256 of the
+#: canonical worktree path — ample to avoid same-host worktree collisions while keeping
+#: the mzb1 name well under :data:`NAME_MAX_LENGTH`).
+_LANE_TOKEN_HEX_LEN: int = 16
+
+
+def derive_lane_workspace_token(canonical_worktree_path: str) -> str:
+    """The deterministic lane-scoped herdr workspace token for a linked git worktree.
+
+    Redmine #13331 (design consultation answer j#73357, Opt 1): a linked git worktree
+    inherits the main checkout's registry identity (#13152, ``workspace_registry``) and
+    therefore has no distinct registry ``workspace_id`` to name its per-lane herdr
+    workspace. The mzb1 ``workspace`` segment for such a lane is instead this token,
+    derived only from the worktree's **canonical** path (the caller must pass a
+    symlink-resolved path so mint-time and resolve-time agree). It is:
+
+    - **deterministic + unique per worktree on a host** — the same worktree always yields
+      the same token, so ``prepare_session`` (mint), the cross-workspace send resolver, and
+      the retire / projection reads all agree;
+    - **private-path-safe** — only the hash is emitted into assigned names / journals /
+      tests, never the absolute path (public/private boundary);
+    - **stable against workflow metadata drift** — branch / lane_label are deliberately
+      excluded (they change on rename / rerun / typo; route identity must not drift).
+
+    The token is drawn from ``[a-z0-9_]`` so :func:`encode_assigned_name` accepts it
+    (a machine-local runtime identity — the herdr workspace / locator is a live-host
+    surface, not a cross-machine authority persisted to Redmine).
+    """
+    digest = hashlib.sha256(canonical_worktree_path.encode("utf-8")).hexdigest()
+    return f"{LANE_WORKSPACE_TOKEN_PREFIX}_{digest[:_LANE_TOKEN_HEX_LEN]}"
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +675,8 @@ __all__ = (
     "AGENT_KEY_NAME",
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
+    "LANE_WORKSPACE_TOKEN_PREFIX",
+    "derive_lane_workspace_token",
     "NAME_MAX_LENGTH",
     "REASON_BAD_ESCAPE",
     "REASON_BAD_PREFIX",

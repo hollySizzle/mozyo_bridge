@@ -72,6 +72,11 @@ class _Ctx:
         self.sender_lane = sender_lane
 
     def run(self, argv, capture_output=None, text=None, timeout=None, **kw):
+        # `herdr_workspace_segment` probes git topology (#13331). These test repos are
+        # plain (non-git) temp dirs, so the probe must read as "not a git checkout" ->
+        # standalone -> registry workspace_id (patch.dict replaces the real subprocess.run).
+        if list(argv[:1]) == ["git"]:
+            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="not a git repo")
         rest = list(argv[1:])
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(

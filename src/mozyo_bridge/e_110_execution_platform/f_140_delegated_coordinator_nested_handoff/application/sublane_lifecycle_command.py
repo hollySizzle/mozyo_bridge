@@ -657,7 +657,6 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
     unresolvable workspace / unavailable inventory yields a result with no close targets
     (recorded), never a crash and never a foreign close.
     """
-    from mozyo_bridge.core.state.workspace_registry import read_anchor
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
         repo_backend_is_herdr,
@@ -669,6 +668,7 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
+        herdr_workspace_segment,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -676,10 +676,13 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
     worktree = getattr(args, "worktree", None)
     if not worktree:
         return HerdrRetireCloseResult(workspace_id="")
-    anchor = read_anchor(Path(worktree))
-    workspace_id = (
-        (anchor.get("workspace_id") or "") if isinstance(anchor, dict) else ""
-    )
+    # Resolve the lane's herdr workspace segment through the shared resolver (a lane token
+    # for a linked git worktree, #13331 j#73357) — the same segment its managed agents were
+    # minted under, so the guarded close targets them.
+    try:
+        workspace_id = herdr_workspace_segment(Path(worktree))
+    except (OSError, ValueError):
+        workspace_id = ""
     if not workspace_id:
         return HerdrRetireCloseResult(workspace_id="")
     try:

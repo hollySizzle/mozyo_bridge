@@ -154,14 +154,16 @@ def herdr_sublane_views(
     herdr inventory is unavailable (a down herdr degrades to "no lanes", never a crash) —
     matching the tmux ``sublane list`` degrade-to-empty contract.
     """
-    from mozyo_bridge.core.state.workspace_registry import (
-        load_workspace_by_id,
-        read_anchor,
+    from mozyo_bridge.core.state.workspace_registry import load_workspace_by_id
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        herdr_workspace_segment,
     )
 
     environ = env if env is not None else os.environ
-    anchor = read_anchor(repo_root)
-    own_ws = _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
+    # The coordinator's OWN workspace segment (a lane token if `sublane list` is somehow run
+    # from a lane worktree, else the main registry id) — excluded from the lane projection
+    # (#13331 j#73357: same shared resolver as the mint / send / retire sites).
+    own_ws = herdr_workspace_segment(repo_root)
     try:
         rows = list_herdr_agent_rows(environ)
     except HerdrSessionStartError:

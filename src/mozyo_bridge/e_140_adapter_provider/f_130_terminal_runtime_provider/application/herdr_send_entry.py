@@ -33,7 +33,6 @@ from typing import Optional
 
 from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
-from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     is_explicit_pane_target,
@@ -47,6 +46,9 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_route_authority import (
     resolve_herdr_cross_workspace_target,
     resolve_herdr_route_target,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+    herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     _norm,
@@ -146,26 +148,25 @@ def herdr_auto_target_repo(args: argparse.Namespace) -> str:
 
 
 def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
-    """The *mozyo* workspace id of an explicit ``--target-repo <path>``, or ``""``.
+    """The herdr workspace *segment* of an explicit ``--target-repo <path>``, or ``""``.
 
     Redmine #13331: option A makes a lane its own herdr workspace, so a
     coordinator→lane-gateway dispatch names the lane worktree with an explicit
-    ``--target-repo <worktree-root>``. That worktree's anchor carries the lane's mozyo
-    workspace id — the exact id embedded in the lane agents' ``mzb1_<ws>_<role>_default``
-    names — so it is the authority for cross-workspace target resolution. Returns ``""``
-    for the ``auto`` sentinel, an unset value, or an unreadable / anchor-less path (so the
-    caller falls back to same-workspace resolution rather than guessing a workspace).
+    ``--target-repo <worktree-root>``. The segment is resolved through the SAME shared
+    resolver :func:`~...herdr_session_start.herdr_workspace_segment` used to mint the lane
+    (design j#73357): a linked git worktree → its path-derived lane token (the exact
+    ``workspace`` segment its ``mzb1_<segment>_<role>_default`` agents carry), a standalone
+    checkout → its registry workspace_id. Returns ``""`` for the ``auto`` sentinel, an
+    unset value, or an unresolvable path (so the caller falls back to same-workspace
+    resolution rather than guessing a workspace).
     """
     raw = getattr(args, "target_repo", None)
     if not raw or raw == AUTO_TARGET_REPO:
         return ""
     try:
-        anchor = read_anchor(Path(raw))
+        return herdr_workspace_segment(Path(raw))
     except (OSError, ValueError):
         return ""
-    if not isinstance(anchor, dict):
-        return ""
-    return _norm(anchor.get("workspace_id"))
 
 
 def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dict:
@@ -194,8 +195,14 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
             reason="backend_not_selected",
         )
     repo_root = repo_root_from_args(args)
-    anchor = read_anchor(repo_root)
-    anchor_ws = anchor.get("workspace_id") if isinstance(anchor, dict) else None
+    # Redmine #13331 (design j#73357): the sender's own workspace segment. For a lane agent
+    # (gateway / worker) the repo root is a linked git worktree with NO registry anchor, so
+    # cross-check the launch-injected `MOZYO_WORKSPACE_ID` against the shared segment
+    # resolver (a path-derived lane token) instead of the absent anchor — otherwise the lane
+    # agent could never resolve its own identity to send (gateway→worker, callbacks). A
+    # standalone / main checkout resolves to its registry workspace_id, byte-for-byte as
+    # before (the env↔anchor mismatch guard is preserved).
+    anchor_ws = herdr_workspace_segment(repo_root) or None
 
     sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
     if not sender_res.ok or sender_res.identity is None:

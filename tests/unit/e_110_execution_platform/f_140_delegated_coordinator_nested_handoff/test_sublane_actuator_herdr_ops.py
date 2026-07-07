@@ -300,6 +300,57 @@ class BackendSelectorTest(unittest.TestCase):
         self.assertIsInstance(ops, LiveSublaneActuatorOps)
 
 
+class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):
+    """Redmine #13331 (design j#73357): the `sublane create --execute` defect scenario —
+    a REAL linked git worktree. append_lane_column (prepare_session) mints the lane agents
+    under the path-derived token, and read_lane resolves them by the SAME token (not the
+    empty / inherited-main registry id that made j#73348 crash). Scratch standalone dirs
+    (the other tests) do not reproduce this."""
+
+    def _git(self, path, *args):
+        subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
+        )
+
+    def test_append_then_read_lane_on_real_worktree_uses_token(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            main.mkdir()
+            self._git(main, "init", "-q")
+            self._git(main, "config", "user.email", "t@t")
+            self._git(main, "config", "user.name", "t")
+            (main / "README.md").write_text("x", encoding="utf-8")
+            self._git(main, "add", "-A")
+            self._git(main, "commit", "-qm", "init")
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13331_x")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = _fake_binary(tmp)
+            ops = HerdrSublaneActuatorOps(
+                repo_root=main,
+                lane_label="issue_13331_x",
+                issue="13331",
+                env={HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)},
+                runner=herdr.run,
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                self.assertIsNone(ops.read_lane(str(wt)))  # fresh worktree, no agents yet
+                ops.append_lane_column(str(wt))
+                view = ops.read_lane(str(wt))
+            token = derive_lane_workspace_token(str(wt.resolve()))
+        self.assertIsNotNone(view)
+        self.assertEqual(view.workspace_id, token)
+        self.assertTrue(view.gateway_pane and view.gateway_pane.startswith("wL:"))
+        self.assertTrue(view.worker_pane and view.worker_pane.startswith("wL:"))
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+
+
 class HerdrUseCaseIntegrationTest(unittest.TestCase):
     """The pure SublaneActuateUseCase choreography over the herdr adapter (--no-dispatch,
     so the create → append → read-back → confirm legs run without driving a live send)."""

@@ -101,6 +101,11 @@ class _FakeHerdr:
 
     def run(self, argv, capture_output=None, text=None, timeout=None, **kw):
         rest = list(argv[1:])
+        # `herdr_workspace_segment` probes git topology (#13331). These repos are plain
+        # (non-git) temp dirs, so the probe must read "not a git checkout" -> standalone ->
+        # registry workspace_id (patch.dict replaced the real subprocess.run).
+        if list(argv[:1]) == ["git"]:
+            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="not a git repo")
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.agent_rows}), stderr=""
