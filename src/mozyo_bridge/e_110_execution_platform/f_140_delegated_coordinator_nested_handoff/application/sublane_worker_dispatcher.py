@@ -37,6 +37,16 @@ contract); the typed :class:`WorkerDispatchOutcome` carries the machine-readable
 payload; and the thin ``cmd_sublane_dispatch_worker`` handler owns stdout and
 the exit code. The default UX is a side-effect-free dry-run preview; ``--execute``
 is the opt-in live drive, exactly like the actuator surface.
+
+Backend selection (Redmine #13357): under ``terminal_transport.backend: herdr``
+(#13331 option A — a lane is its own per-lane herdr workspace) the handler picks
+the herdr adapter
+:class:`~...application.sublane_worker_dispatch_herdr_ops.HerdrWorkerDispatchOps`
+through :func:`_resolve_worker_dispatch_ops` (the same
+:func:`~...application.sublane_herdr_projection.repo_backend_is_herdr` selector
+``sublane create --execute`` uses), so the measured-ACK contract above holds on
+the herdr rail too. Anything else keeps the tmux :class:`LiveWorkerDispatchOps`,
+byte-for-byte.
 """
 
 from __future__ import annotations
@@ -218,38 +228,50 @@ class LiveWorkerDispatchOps:
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
         )
-        from mozyo_bridge.application.cli import build_parser, normalize_paths
+        return _drive_worker_send_argv(argv)
 
-        # Review j#71597: the inner `handoff send` fails closed through
-        # `die()` == `raise SystemExit`, which `except Exception` never
-        # catches, and it emits its own delivery record to stdout. Both must
-        # be contained here so the outer WorkerDispatchOutcome stays the
-        # single fail-closed, machine-readable surface: run the composed
-        # primitive under stdout capture and convert any SystemExit
-        # (including an argparse usage error) to its exit code. The captured
-        # inner record is surfaced to stderr on failure so the blocked send
-        # stays diagnosable without polluting the outer `--json` stdout.
-        inner_out = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(inner_out):
-                args = build_parser().parse_args(argv)
-                args = normalize_paths(args)
-                rc = int(args.func(args) or 0)
-        except SystemExit as exc:
-            # A SystemExit is always the *fail-closed* leg here (`die()` /
-            # argparse usage error); the success leg returns an int. A
-            # non-int / None exit code is never treated as a delivery ACK —
-            # an ambiguous exit must not promote to `worker_dispatched`.
-            code = exc.code
-            rc = code if isinstance(code, int) and code != 0 else 1
-        if rc != 0:
-            captured = inner_out.getvalue().strip()
-            if captured:
-                print(
-                    "worker handoff send (inner delivery record):\n" + captured,
-                    file=sys.stderr,
-                )
-        return rc
+
+def _drive_worker_send_argv(argv: list[str]) -> int:
+    """Run the composed same-lane ``handoff send`` argv, fail-closed (shared).
+
+    Review j#71597: the inner `handoff send` fails closed through
+    `die()` == `raise SystemExit`, which `except Exception` never
+    catches, and it emits its own delivery record to stdout. Both must
+    be contained here so the outer WorkerDispatchOutcome stays the
+    single fail-closed, machine-readable surface: run the composed
+    primitive under stdout capture and convert any SystemExit
+    (including an argparse usage error) to its exit code. The captured
+    inner record is surfaced to stderr on failure so the blocked send
+    stays diagnosable without polluting the outer `--json` stdout.
+
+    Shared by the tmux :class:`LiveWorkerDispatchOps` and the herdr
+    :class:`~...application.sublane_worker_dispatch_herdr_ops.HerdrWorkerDispatchOps`
+    (#13357), so both backends measure the delivery ACK with the identical
+    containment; extracting it changes no tmux behaviour.
+    """
+    from mozyo_bridge.application.cli import build_parser, normalize_paths
+
+    inner_out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(inner_out):
+            args = build_parser().parse_args(argv)
+            args = normalize_paths(args)
+            rc = int(args.func(args) or 0)
+    except SystemExit as exc:
+        # A SystemExit is always the *fail-closed* leg here (`die()` /
+        # argparse usage error); the success leg returns an int. A
+        # non-int / None exit code is never treated as a delivery ACK —
+        # an ambiguous exit must not promote to `worker_dispatched`.
+        code = exc.code
+        rc = code if isinstance(code, int) and code != 0 else 1
+    if rc != 0:
+        captured = inner_out.getvalue().strip()
+        if captured:
+            print(
+                "worker handoff send (inner delivery record):\n" + captured,
+                file=sys.stderr,
+            )
+    return rc
 
 
 def _worker_dispatch_argv(
@@ -682,6 +704,36 @@ def format_worker_dispatch_text(outcome: WorkerDispatchOutcome) -> str:
     return "\n".join(lines)
 
 
+def _resolve_worker_dispatch_ops(
+    *, repo_root: Path, request: WorkerDispatchRequest
+) -> WorkerDispatchOps:
+    """Pick the worker-dispatch ack-drive adapter for the configured terminal backend.
+
+    Redmine #13357 (the worker-dispatch leg of the #13331 option A migration):
+    ``backend: herdr`` → the per-lane-workspace
+    :class:`~...application.sublane_worker_dispatch_herdr_ops.HerdrWorkerDispatchOps`,
+    carrying the requested lane identity so its inventory read-back projects the lane
+    (the same selector shape as ``sublane create``'s ``_resolve_sublane_ops``). Anything
+    else — including an absent / broken repo-local config — keeps the tmux
+    :class:`LiveWorkerDispatchOps`, byte-for-byte (#13320 posture).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        repo_backend_is_herdr,
+    )
+
+    if repo_backend_is_herdr(repo_root):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
+            HerdrWorkerDispatchOps,
+        )
+
+        return HerdrWorkerDispatchOps(
+            repo_root=repo_root,
+            lane_label=request.lane_label,
+            issue=request.issue,
+        )
+    return LiveWorkerDispatchOps(repo_root=repo_root)
+
+
 def cmd_sublane_dispatch_worker(args: argparse.Namespace) -> int:
     """``sublane dispatch-worker`` handler: dry-run preview by default; ``--execute``
     drives the live same-lane worker transfer (``--dry-run`` wins when both are
@@ -711,7 +763,7 @@ def cmd_sublane_dispatch_worker(args: argparse.Namespace) -> int:
     interval = DEFAULT_WORKER_READY_INTERVAL_SECONDS
     ready_probes = 0 if ready_timeout <= 0 else max(1, round(ready_timeout / interval))
     use_case = WorkerDispatchUseCase(
-        LiveWorkerDispatchOps(repo_root=repo_root),
+        _resolve_worker_dispatch_ops(repo_root=repo_root, request=request),
         worker_ready_probes=ready_probes,
         worker_ready_interval_seconds=interval,
     )
