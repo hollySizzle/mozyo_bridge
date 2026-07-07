@@ -90,6 +90,10 @@ from mozyo_bridge.core.state.workspace_registry import (
     read_anchor,
     register_workspace,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+    InvalidPermissionMode,
+    resolve_claude_permission_mode,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
@@ -471,6 +475,7 @@ def prepare_session(
     runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
+    claude_permission_mode_default: Optional[str] = None,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -478,6 +483,13 @@ def prepare_session(
     ``register_workspace`` / ``read_anchor``). Raises :class:`HerdrSessionStartError`
     on any fail-closed condition (unknown provider, unconfigured binary, duplicate
     assigned name, a launch that yields no usable locator).
+
+    ``claude_permission_mode_default`` is the launch-context policy default for the
+    managed Claude permission mode (Redmine #11925 / #13360): sublane lane creation
+    passes ``auto`` so lane workers are reproducibly auto (tmux parity); the
+    session-start / bare ``mozyo`` paths pass ``None`` so the historical bare
+    ``claude`` launch never changes silently. The ``MOZYO_CLAUDE_PERMISSION_MODE``
+    env override rail wins over the default either way (resolved from ``env``).
     """
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
@@ -582,6 +594,7 @@ def prepare_session(
                 env=env,
                 runner=runner,
                 timeout=timeout,
+                claude_permission_mode_default=claude_permission_mode_default,
             )
         )
 
@@ -609,6 +622,7 @@ def _execute_slot(
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
+    claude_permission_mode_default: Optional[str] = None,
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -646,28 +660,48 @@ def _execute_slot(
     # trusted value the same way the identity vars are propagated: as an `--env` flag on
     # the server-spawned agent, from a value the launcher already resolved from ITS trusted
     # env (never widened to a repo-local path).
+    launch_argv = [
+        "agent",
+        "start",
+        plan.assigned_name,
+        "--cwd",
+        str(repo_root),
+        "--workspace",
+        target_workspace,
+        "--env",
+        f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
+        "--env",
+        f"{MOZYO_AGENT_ROLE_ENV}={plan.provider}",
+        "--env",
+        f"{MOZYO_LANE_ID_ENV}={lane}",
+        "--env",
+        f"{HERDR_BINARY_ENV}={binary}",
+        "--no-focus",
+        "--",
+        plan.provider,
+    ]
+    # Reproducible permission mode for managed Claude agents (Redmine #11925 /
+    # #13360): the tmux managed-pane chokepoint has always appended
+    # `--permission-mode <mode>`; without the same suffix here every herdr lane
+    # worker boots prompt-gated and stalls on its first gated command
+    # (coordinator-measured, 2026-07-07: all four wave workers blocked). The pure
+    # policy resolver keeps the precedence identical to tmux (env override >
+    # launch-context default > none) and never renders a flag for Codex. An
+    # invalid mode fails the launch closed instead of silently booting a
+    # default-permission agent the operator did not intend.
+    try:
+        permission_mode = resolve_claude_permission_mode(
+            plan.provider,
+            policy_default=claude_permission_mode_default,
+            env=env,
+        )
+    except InvalidPermissionMode as exc:
+        raise HerdrSessionStartError(str(exc)) from exc
+    if permission_mode:
+        launch_argv.extend(["--permission-mode", permission_mode])
     started = _invoke(
         binary,
-        [
-            "agent",
-            "start",
-            plan.assigned_name,
-            "--cwd",
-            str(repo_root),
-            "--workspace",
-            target_workspace,
-            "--env",
-            f"{MOZYO_WORKSPACE_ID_ENV}={workspace_id}",
-            "--env",
-            f"{MOZYO_AGENT_ROLE_ENV}={plan.provider}",
-            "--env",
-            f"{MOZYO_LANE_ID_ENV}={lane}",
-            "--env",
-            f"{HERDR_BINARY_ENV}={binary}",
-            "--no-focus",
-            "--",
-            plan.provider,
-        ],
+        launch_argv,
         runner,
         timeout,
         env=dict(env),

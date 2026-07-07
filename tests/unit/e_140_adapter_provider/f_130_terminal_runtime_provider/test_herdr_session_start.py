@@ -148,7 +148,17 @@ class _Herdr:
 
 
 class SessionStartTest(unittest.TestCase):
-    def _prepare(self, tmp, *, providers, herdr, lane="lane-1", dry_run=False):
+    def _prepare(
+        self,
+        tmp,
+        *,
+        providers,
+        herdr,
+        lane="lane-1",
+        dry_run=False,
+        extra_env=None,
+        claude_permission_mode_default=None,
+    ):
         repo = Path(tmp) / "repo"
         repo.mkdir()
         home = Path(tmp) / "home"
@@ -157,6 +167,8 @@ class SessionStartTest(unittest.TestCase):
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         env = {HERDR_ENV: str(binpath)}
+        if extra_env:
+            env.update(extra_env)
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
             result = prepare_session(
                 repo_root=repo,
@@ -165,6 +177,7 @@ class SessionStartTest(unittest.TestCase):
                 env=env,
                 runner=herdr.run,
                 dry_run=dry_run,
+                claude_permission_mode_default=claude_permission_mode_default,
             )
             anchor = read_anchor(repo)
         return result, anchor, repo
@@ -227,6 +240,73 @@ class SessionStartTest(unittest.TestCase):
         # repo-local binary — the value is the launcher's trusted resolved binary.
         idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
         self.assertEqual(start[idx - 1], "--env")
+
+    def test_launch_appends_permission_mode_for_claude_with_policy_default(self) -> None:
+        # Redmine #13360: the herdr launch chokepoint mirrors the tmux managed-pane
+        # `--permission-mode` parity (#11925). A lane-creation caller passing the
+        # cockpit/sublane policy default gets a reproducibly-auto Claude worker.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                claude_permission_mode_default="auto",
+            )
+        by_provider = {}
+        for argv in herdr.start_argvs:
+            provider = argv[argv.index("--") + 1]
+            by_provider[provider] = argv
+        claude = by_provider["claude"]
+        idx = claude.index("--permission-mode")
+        self.assertEqual(claude[idx + 1], "auto")
+        # The flag rides AFTER `-- claude` so it reaches the claude CLI, not herdr.
+        self.assertGreater(idx, claude.index("--"))
+        # Codex launches never get the flag (Claude-only policy, #11925 rule 1).
+        self.assertNotIn("--permission-mode", by_provider["codex"])
+
+    def test_launch_without_policy_default_is_flagless(self) -> None:
+        # No default and no env override: the historical bare `-- claude` launch is
+        # byte-invariant (session-start / bare `mozyo` paths pass None, #13360).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(tmp, providers=["claude"], herdr=herdr)
+        start = herdr.start_argvs[0]
+        self.assertNotIn("--permission-mode", start)
+        self.assertEqual(start[-2:], ["--", "claude"])
+
+    def test_launch_env_override_wins_over_policy_default(self) -> None:
+        # MOZYO_CLAUDE_PERMISSION_MODE stays the explicit override rail (#11857):
+        # an operator can force any mode (including turning auto OFF with
+        # `default`) even when the lane chokepoint passes `auto`.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude"],
+                herdr=herdr,
+                extra_env={"MOZYO_CLAUDE_PERMISSION_MODE": "default"},
+                claude_permission_mode_default="auto",
+            )
+        start = herdr.start_argvs[0]
+        idx = start.index("--permission-mode")
+        self.assertEqual(start[idx + 1], "default")
+
+    def test_launch_invalid_env_permission_mode_fails_closed(self) -> None:
+        # A typo must fail the launch loudly (HerdrSessionStartError), never boot a
+        # default-permission agent the operator did not intend (#11857 / #13360).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._prepare(
+                    tmp,
+                    providers=["claude"],
+                    herdr=herdr,
+                    extra_env={"MOZYO_CLAUDE_PERMISSION_MODE": "yolo"},
+                    claude_permission_mode_default="auto",
+                )
+            self.assertIn("permission mode", str(ctx.exception))
+        self.assertFalse(herdr.start_argvs)
 
     def test_existing_name_is_adopted_not_relaunched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

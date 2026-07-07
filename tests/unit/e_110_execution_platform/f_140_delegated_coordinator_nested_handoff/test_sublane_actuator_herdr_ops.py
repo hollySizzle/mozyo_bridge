@@ -47,6 +47,7 @@ class _StatefulHerdr:
     def __init__(self, *, created_workspace="wL"):
         self.created_workspace = created_workspace
         self.agents: list[dict] = []  # {"name", "pane_id"}
+        self.start_argvs: list[list] = []
         self._pane_seq = 1
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
@@ -76,6 +77,7 @@ class _StatefulHerdr:
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
         if rest[:2] == ["agent", "start"]:
+            self.start_argvs.append(rest)
             name = rest[2]
             wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
             self._pane_seq += 1
@@ -145,6 +147,29 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertTrue(view.worker_pane and view.worker_pane.startswith("wL:"))
         self.assertNotEqual(view.gateway_pane, view.worker_pane)
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+
+    def test_append_launches_claude_worker_in_auto_permission_mode(self) -> None:
+        # Redmine #13360: lane creation is a managed-pane chokepoint, so the lane's
+        # Claude worker must launch reproducibly auto (#11925 parity with the tmux
+        # `cockpit append` path) — without it every herdr lane worker stalls on its
+        # first permission prompt (coordinator-measured, 2026-07-07). Codex never
+        # gets the flag.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+        by_provider = {}
+        for argv in herdr.start_argvs:
+            provider = argv[argv.index("--") + 1]
+            by_provider[provider] = argv
+        claude = by_provider["claude"]
+        idx = claude.index("--permission-mode")
+        self.assertEqual(claude[idx + 1], "auto")
+        self.assertGreater(idx, claude.index("--"))
+        self.assertNotIn("--permission-mode", by_provider["codex"])
 
     def test_read_lane_gateway_only(self) -> None:
         herdr = _StatefulHerdr()

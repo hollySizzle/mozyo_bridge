@@ -50,6 +50,9 @@ from typing import Mapping, Optional, Sequence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+    COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     GATEWAY_ROLE,
     WORKER_ROLE,
@@ -155,6 +158,12 @@ class HerdrSublaneActuatorOps:
                 env=self.env,
                 runner=self.runner,
                 timeout=self.timeout,
+                # Lane creation is a managed-pane chokepoint: pass the cockpit /
+                # sublane policy default (#11925) so lane Claude workers launch
+                # reproducibly auto, exactly like the tmux `cockpit append` path
+                # (#13360 — without this every herdr lane worker stalls on its
+                # first permission prompt).
+                claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             )
         except HerdrSessionStartError as exc:
             raise RuntimeError(f"herdr lane workspace creation failed: {exc}") from exc
