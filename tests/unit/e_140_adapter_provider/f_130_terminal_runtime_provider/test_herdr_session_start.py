@@ -206,6 +206,26 @@ class SessionStartTest(unittest.TestCase):
         # `-- <provider>` terminates the argv.
         self.assertEqual(start[-2:], ["--", "claude"])
 
+    def test_launch_injects_herdr_binary_env(self) -> None:
+        # Redmine #13331 j#73312 scope addition #1: the launched agent is itself a
+        # mozyo operator that runs its own `handoff send`, and herdr resolves its
+        # binary only from the trusted env. Injecting the already-resolved binary as
+        # `--env MOZYO_HERDR_BINARY=<binary>` removes the inline
+        # `MOZYO_HERDR_BINARY=$(command -v herdr)` the coordinator had to prepend.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(tmp, providers=["codex"], herdr=herdr)
+            # `_resolve_binary` returns a path-shaped trusted value verbatim (an
+            # existing executable), so the injected value is exactly what `_prepare`
+            # put in the env — no symlink resolution.
+            binpath = str(Path(tmp) / "fake-herdr")
+        start = herdr.start_argvs[0]
+        self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
+        # It rides on an `--env` flag (server-spawned agent path), never widened to a
+        # repo-local binary — the value is the launcher's trusted resolved binary.
+        idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
+        self.assertEqual(start[idx - 1], "--env")
+
     def test_existing_name_is_adopted_not_relaunched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             # Pre-seed the registry so we know the workspace_id, then place a live

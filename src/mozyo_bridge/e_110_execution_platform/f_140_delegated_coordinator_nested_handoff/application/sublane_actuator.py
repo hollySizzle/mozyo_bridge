@@ -185,6 +185,38 @@ def resolve_dispatch_admission_args(
     return fill_inputs, override
 
 
+def _resolve_sublane_ops(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    request: SublaneCreateRequest,
+    quiet_stdout: bool,
+) -> SublaneActuatorOps:
+    """Pick the creation-side actuation adapter for the configured terminal backend.
+
+    ``backend: herdr`` (Redmine #13331) → the per-lane-workspace
+    :class:`~...application.sublane_actuator_herdr_ops.HerdrSublaneActuatorOps`, carrying the
+    requested lane identity so its inventory read-back projects the lane. Anything else →
+    the tmux :class:`LiveSublaneActuatorOps`, unchanged.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        repo_backend_is_herdr,
+    )
+
+    if repo_backend_is_herdr(repo_root):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
+            HerdrSublaneActuatorOps,
+        )
+
+        return HerdrSublaneActuatorOps(
+            repo_root=repo_root,
+            lane_label=request.lane_label,
+            issue=request.issue,
+            quiet_stdout=quiet_stdout,
+        )
+    return LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=quiet_stdout)
+
+
 def cmd_sublane_start(args: argparse.Namespace) -> int:
     """``sublane create`` / ``start`` dispatcher.
 
@@ -234,8 +266,20 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
     ready_probes = (
         0 if ready_timeout <= 0 else max(1, round(ready_timeout / interval))
     )
+    # Redmine #13331 (option A, j#73314): under `terminal_transport.backend: herdr` a lane
+    # is its own herdr workspace (prepare_session on the lane worktree), not a tmux cockpit
+    # column — so pick the herdr actuation adapter. The pure use-case choreography is
+    # unchanged (both adapters satisfy the same SublaneActuatorOps port); the tmux path is
+    # byte-for-byte the #12973 behaviour (a broken / absent config resolves to tmux, exactly
+    # like the send path's `herdr_backend_selected`).
+    ops = _resolve_sublane_ops(
+        args,
+        repo_root=repo_root,
+        request=request,
+        quiet_stdout=json_mode,
+    )
     use_case = SublaneActuateUseCase(
-        LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=json_mode),
+        ops,
         gateway_ready_probes=ready_probes,
         gateway_ready_interval_seconds=interval,
     )

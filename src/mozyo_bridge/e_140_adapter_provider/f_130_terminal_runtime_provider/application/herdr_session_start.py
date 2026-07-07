@@ -593,6 +593,18 @@ def _execute_slot(
     # repeated `--env` flags, NOT the client process env — the server-spawned agent
     # does not inherit the client env (coordinator-measured). `--no-focus` avoids
     # stealing the operator's focus. The client env is still passed through for PATH etc.
+    #
+    # MOZYO_HERDR_BINARY (Redmine #13331 j#73312 scope addition): the launched agent is
+    # itself a mozyo operator (a lane worker / gateway that runs its own `handoff send`),
+    # and every herdr code path resolves the herdr binary ONLY from the trusted
+    # environment (`_resolve_binary_or_die`, `herdr_transport._resolve_binary`) — never a
+    # repo-local binary. The three self-identity vars were the only injected env, so a
+    # launched agent knew *who* it was but not *how* to reach herdr, forcing an inline
+    # `MOZYO_HERDR_BINARY=$(command -v herdr)` before every send (coordinator-measured,
+    # j#73312 finding #1). Injecting the already-resolved binary here propagates the
+    # trusted value the same way the identity vars are propagated: as an `--env` flag on
+    # the server-spawned agent, from a value the launcher already resolved from ITS trusted
+    # env (never widened to a repo-local path).
     started = _invoke(
         binary,
         [
@@ -609,6 +621,8 @@ def _execute_slot(
             f"{MOZYO_AGENT_ROLE_ENV}={plan.provider}",
             "--env",
             f"{MOZYO_LANE_ID_ENV}={lane}",
+            "--env",
+            f"{HERDR_BINARY_ENV}={binary}",
             "--no-focus",
             "--",
             plan.provider,

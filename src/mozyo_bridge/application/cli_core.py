@@ -671,6 +671,17 @@ def register_lifecycle(sub) -> None:
         action="store_true",
         help="The lane / worktree / pane target is positively resolved.",
     )
+    sublane_retire.add_argument(
+        "--execute",
+        dest="execute",
+        action="store_true",
+        help=(
+            "Redmine #13331: under backend: herdr, and only when the preflight permits "
+            "retirement, close the lane workspace's managed gateway/worker agents "
+            "(mzb1 default-lane codex/claude). Never removes a worktree or deletes a "
+            "branch (still runbook); never closes a foreign agent. No-op under tmux."
+        ),
+    )
     add_repo_option(sublane_retire)
     _add_lifecycle_json(sublane_retire)
     sublane_retire.set_defaults(func=cmd_sublane_retire)

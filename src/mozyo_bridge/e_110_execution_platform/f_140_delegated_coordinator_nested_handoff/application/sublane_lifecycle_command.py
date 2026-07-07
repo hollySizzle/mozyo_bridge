@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -517,7 +518,34 @@ def _build_create_request(
 
 
 def cmd_sublane_list(args: argparse.Namespace) -> int:
-    use_case = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=_repo_root(args)))
+    repo_root = _repo_root(args)
+    # Redmine #13331: under backend: herdr a lane is its own herdr workspace, so project
+    # the live herdr inventory into the SAME read model (the tmux path below is untouched —
+    # byte-invariant). A broken / absent config resolves to the tmux path.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        herdr_sublane_views,
+        repo_backend_is_herdr,
+    )
+
+    if repo_backend_is_herdr(repo_root):
+        lanes = herdr_sublane_views(repo_root)
+        lane_filter = (getattr(args, "lane", None) or "").strip()
+        if lane_filter:
+            lanes = tuple(
+                lane
+                for lane in lanes
+                if lane_filter in (lane.lane_id, lane.lane_label)
+                or lane_filter == lane.issue
+            )
+        outcome = SublaneListOutcome(lanes=lanes)
+        if getattr(args, "json", False):
+            print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print("sublane list (backend: herdr)")
+            print(format_list_text(outcome))
+        return 0
+
+    use_case = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=repo_root))
     outcome = use_case.run(
         lane_filter=getattr(args, "lane", None),
         integration_branch=getattr(args, "integration_branch", None),
@@ -563,7 +591,8 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         durable_record_recorded=bool(getattr(args, "durable_record", False)),
         target_identity_known=bool(getattr(args, "target_identity_known", False)),
     )
-    use_case = SublaneRetireUseCase(LiveSublaneLifecycleOps(repo_root=_repo_root(args)))
+    repo_root = _repo_root(args)
+    use_case = SublaneRetireUseCase(LiveSublaneLifecycleOps(repo_root=repo_root))
     outcome = use_case.run(
         issue=getattr(args, "issue", "") or "",
         lane_label=getattr(args, "lane_label", "") or "",
@@ -572,11 +601,82 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         integration_branch=getattr(args, "integration_branch", None),
         assertions=assertions,
     )
+    # Redmine #13331: opt-in herdr guarded close. Only under backend: herdr, only with
+    # --execute, and only when the preflight already permits retirement (may_retire), close
+    # the lane workspace's managed gateway/worker agents. Never removes a worktree / deletes
+    # a branch (still runbook per worktree-lifecycle-boundary.md); never touches a foreign
+    # agent. The default (no --execute) path is byte-for-byte the preflight-only behaviour.
+    close_result = None
+    if getattr(args, "execute", False) and outcome.preflight.may_retire:
+        close_result = _maybe_herdr_retire_close(args, repo_root)
+    payload = outcome.as_payload()
+    if close_result is not None:
+        payload["herdr_retire_close"] = close_result.as_payload()
     if getattr(args, "json", False):
-        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_retire_text(outcome))
+        if close_result is not None:
+            print(_format_herdr_close_text(close_result))
     return 0 if outcome.preflight.may_retire else 1
+
+
+def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
+    """Guarded herdr retire close, or ``None`` when not on the herdr backend (Redmine #13331).
+
+    Resolves the lane workspace from the ``--worktree`` anchor, plans the managed-slot close
+    from the live herdr inventory, and executes it. Fail-safe: a missing ``--worktree`` /
+    unresolvable workspace / unavailable inventory yields a result with no close targets
+    (recorded), never a crash and never a foreign close.
+    """
+    from mozyo_bridge.core.state.workspace_registry import read_anchor
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        list_herdr_agent_rows,
+        repo_backend_is_herdr,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+        HerdrRetireCloseResult,
+        execute_herdr_retire_close,
+        plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        HerdrSessionStartError,
+    )
+
+    if not repo_backend_is_herdr(repo_root):
+        return None
+    worktree = getattr(args, "worktree", None)
+    if not worktree:
+        return HerdrRetireCloseResult(workspace_id="")
+    anchor = read_anchor(Path(worktree))
+    workspace_id = (
+        (anchor.get("workspace_id") or "") if isinstance(anchor, dict) else ""
+    )
+    if not workspace_id:
+        return HerdrRetireCloseResult(workspace_id="")
+    try:
+        rows = list_herdr_agent_rows(os.environ)
+    except HerdrSessionStartError:
+        return HerdrRetireCloseResult(workspace_id=workspace_id)
+    plan = plan_herdr_retire_close(rows, workspace_id=workspace_id)
+    return execute_herdr_retire_close(plan)
+
+
+def _format_herdr_close_text(result) -> str:
+    lines = [f"  herdr retire close: workspace={result.workspace_id or '<unresolved>'}"]
+    if not result.closed and not result.failed:
+        lines.append("    - no managed lane agents to close (already retired / absent)")
+    for role, locator in result.closed:
+        lines.append(f"    - closed {role} {locator}")
+    for role, locator, detail in result.failed:
+        lines.append(f"    ! close failed {role} {locator}: {detail}")
+    if result.foreign_names:
+        lines.append(
+            "    (workspace also has non-managed agents; it will not disappear: "
+            + ", ".join(result.foreign_names)
+            + ")"
+        )
+    return "\n".join(lines)
 
 
 __all__ = (

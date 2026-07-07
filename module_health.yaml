@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3512
+    lines: 3518
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1026,6 +1026,11 @@ allowlist:
       emission helper (which projects the outcome/retry and calls the #13296 never-raises
       ``record_herdr_delivery``) lives in ``application/handoff_delivery_command.py`` next
       to the sibling delivery-record seam, not here — only the two thin call sites remain.
+      Raised 3512 -> 3518 for the #13331 `--target-repo auto` herdr branch in
+      `orchestrate_handoff` (under `backend: herdr`, `auto` resolves to the sender's own
+      repo root instead of the `%pane`-only gate; the resolution itself is the new
+      `herdr_send_entry.herdr_auto_target_repo` helper, not here — only the guarded branch
+      remains). tmux `auto` is byte-invariant (the branch is guarded on `herdr_send`).
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

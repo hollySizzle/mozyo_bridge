@@ -212,7 +212,72 @@ def resolve_herdr_route_target(
     return HerdrRouteAuthorityResolution.from_route_resolution(resolution, derivation)
 
 
+def resolve_herdr_cross_workspace_target(
+    receiver: object,
+    target_workspace_id: str,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    coordinator_provider: Optional[str],
+    target_lane: str = "",
+) -> HerdrRouteAuthorityResolution:
+    """Resolve a herdr send target in a DIFFERENT, explicitly-named workspace (#13331).
+
+    The lane-migration (option A, Redmine #13331 j#73314) makes a lane its own herdr
+    workspace, so the coordinator→lane-gateway and gateway→coordinator legs cross a
+    workspace boundary: the receiver lives in ``target_workspace_id`` (the lane
+    worktree's *mozyo* workspace id, from its anchor), **not** the sender's. The
+    same-workspace :func:`resolve_herdr_route_target` derives the slot from the sender
+    identity, so it structurally cannot reach the other workspace; this variant takes
+    the target workspace explicitly (the "explicit herdr target / route identity record"
+    the design consultation calls for) and resolves the receiver's canonical slot there.
+
+    The slot is ``(target_workspace_id, target_lane, role)`` with ``target_lane``
+    defaulting to the empty/``default`` lane — option A launches the lane workspace's
+    agents as ``mzb1_<lane-ws>_<provider>_default``. Resolution is the SAME single
+    backend-neutral route authority (canonical assigned name is ``pane_name``; the live
+    herdr locator is transient cache, never authority), so cross-workspace and
+    same-workspace share one fail-closed contract and vocabulary. Pure and fail-closed:
+    an empty ``target_workspace_id`` or a role that cannot mint a durable name folds into
+    a ``target_unavailable`` result rather than raising.
+    """
+    role_res = resolve_target_role(receiver, coordinator_provider=coordinator_provider)
+    if not role_res.ok:
+        assert role_res.reason is not None
+        return HerdrRouteAuthorityResolution.role_failure(role_res.reason, role_res.detail)
+    target_role = role_res.role
+
+    lane = _norm(target_lane)
+    # A synthetic derivation record for audit: the lane was chosen explicitly from the
+    # target workspace's default-lane slot, not derived from the sender's lane.
+    derivation = LaneDerivation(lane=lane, basis="cross_workspace_explicit")
+    try:
+        canonical = encode_assigned_name(target_workspace_id, target_role, lane)
+        identity = herdr_route_identity(
+            workspace_id=target_workspace_id,
+            role=target_role,
+            route_id=canonical,
+            lane_id=lane,
+            last_seen_locator="",
+        )
+    except HerdrIdentityError as exc:
+        return HerdrRouteAuthorityResolution(
+            ok=False,
+            status=TARGET_UNAVAILABLE,
+            reason=TARGET_UNAVAILABLE,
+            lane=lane,
+            lane_basis=derivation.basis,
+            detail=(
+                "herdr cross-workspace route identity could not be minted for the slot "
+                f"(target workspace {target_workspace_id!r}): {exc}"
+            ),
+        )
+
+    resolution = resolve_route_neutral(identity, rows, backend=BACKEND_HERDR)
+    return HerdrRouteAuthorityResolution.from_route_resolution(resolution, derivation)
+
+
 __all__ = (
     "HerdrRouteAuthorityResolution",
+    "resolve_herdr_cross_workspace_target",
     "resolve_herdr_route_target",
 )

@@ -229,5 +229,88 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             self.assertEqual(c.exception.reason, "backend_not_selected")
 
 
+class CrossWorkspaceHerdrSendTargetTest(unittest.TestCase):
+    """Redmine #13331: coordinator -> lane gateway crosses a workspace boundary
+    (option A per-lane herdr workspace). An explicit ``--target-repo <lane-worktree>``
+    resolves the receiver in the LANE workspace (the worktree anchor's mozyo
+    workspace id), not the sender's — the sender-scoped route authority cannot reach
+    it. A ``--target-repo`` that resolves to the sender's own workspace (or ``auto`` /
+    unset) stays on the same-workspace path."""
+
+    def _prepare(self, tmp):
+        # Sender = coordinator (codex, default lane) in its own workspace.
+        ctx = _Ctx(tmp, sender_role="codex", sender_lane="default")
+        lane_repo = Path(tmp) / "lane"
+        lane_repo.mkdir()
+        register_workspace(lane_repo, home=ctx.home)
+        lane_ws = read_anchor(lane_repo)["workspace_id"]
+        self.assertNotEqual(lane_ws, ctx.workspace_id)
+        return ctx, lane_repo, lane_ws
+
+    @staticmethod
+    def _args(ctx, target_repo, *, to="codex"):
+        ns = argparse.Namespace()
+        ns.repo = str(ctx.repo)
+        ns.to = to
+        ns.target = None
+        ns.target_repo = str(target_repo)
+        return ns
+
+    def _resolve(self, ctx, args):
+        with patch("subprocess.run", ctx.run), patch.dict(
+            os.environ, ctx.env(), clear=True
+        ):
+            return resolve_herdr_send_target(args, receiver=args.to)
+
+    def test_resolves_lane_gateway_in_target_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lane_repo, lane_ws = self._prepare(tmp)
+            # The lane gateway (codex, default lane) lives in the LANE workspace; a
+            # same-role codex in the SENDER workspace must NOT be chosen.
+            ctx.rows = [
+                {"name": encode_assigned_name(lane_ws, "codex", ""), "pane_id": "wL:p2"},
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "codex", "default"),
+                    "pane_id": "wC:p2",
+                },
+            ]
+            pane = self._resolve(ctx, self._args(ctx, lane_repo, to="codex"))
+        self.assertEqual(pane["id"], "wL:p2")
+        self.assertEqual(pane["workspace_id"], lane_ws)
+        self.assertEqual(pane["lane_id"], "default")
+        # The target record's cwd is the LANE worktree (the --target-repo), so the
+        # downstream target_repo_mismatch gate compares like-for-like rather than
+        # blocking on the coordinator's own root.
+        self.assertEqual(pane["cwd"], str(lane_repo))
+        # The env-derived SENDER fields stay the coordinator's: the gateway-route gate
+        # enforces on the sender's lane, not the target's.
+        self.assertEqual(pane["herdr_sender_workspace_id"], ctx.workspace_id)
+
+    def test_same_workspace_target_repo_uses_sender_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="default")
+            ctx.rows = [
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "claude", "default"),
+                    "pane_id": "wC:p3",
+                }
+            ]
+            # --target-repo names the sender's OWN repo -> not cross-workspace.
+            pane = self._resolve(ctx, self._args(ctx, ctx.repo, to="claude"))
+        self.assertEqual(pane["id"], "wC:p3")
+        self.assertEqual(pane["workspace_id"], ctx.workspace_id)
+
+    def test_cross_workspace_missing_gateway_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lane_repo, lane_ws = self._prepare(tmp)
+            # Lane workspace has a worker but no codex gateway slot.
+            ctx.rows = [
+                {"name": encode_assigned_name(lane_ws, "claude", ""), "pane_id": "wL:p3"}
+            ]
+            with self.assertRaises(HerdrSendEntryError) as c:
+                self._resolve(ctx, self._args(ctx, lane_repo, to="codex"))
+        self.assertEqual(c.exception.reason, "target_unavailable")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

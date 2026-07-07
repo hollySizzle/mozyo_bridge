@@ -231,6 +231,7 @@ active_herdr_turn_start_rail = None
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
     HerdrSendEntryError,
+    herdr_auto_target_repo,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
 )
@@ -2018,7 +2019,12 @@ def orchestrate_handoff(
     # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
     # no reachable marker is rejected here, and `--to claude` cross-session is
     # still blocked downstream regardless).
-    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
+    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO and herdr_send:
+        # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto`
+        # resolves to the sender's own repo root (the same-workspace target's repo). tmux
+        # `auto` is untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
+        args.target_repo = herdr_auto_target_repo(args)
+    elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
         raw_target = getattr(args, "target", None)
         if not is_explicit_pane_target(raw_target):
             _emit_outcome(

@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 from typing import Optional
 
 from mozyo_bridge.application.commands_common import repo_root_from_args
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    AUTO_TARGET_REPO,
     is_explicit_pane_target,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
@@ -43,7 +45,11 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     RepoLocalConfigError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_route_authority import (
+    resolve_herdr_cross_workspace_target,
     resolve_herdr_route_target,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    _norm,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     resolve_sender_identity,
@@ -123,6 +129,45 @@ def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
     return herdr_backend_selected(args) and not explicit_tmux_pane_target(args)
 
 
+def herdr_auto_target_repo(args: argparse.Namespace) -> str:
+    """Resolve ``--target-repo auto`` for a herdr send to the sender's own repo root.
+
+    Redmine #13331 (j#73312 scope addition #2): a herdr send has no tmux ``%pane`` /
+    ``pane_current_path`` to infer a target repo from, so the ``%pane``-only ``auto`` gate is
+    inapplicable — it forced a hand-passed ``--target-repo <root>`` even for a same-workspace
+    herdr send. The herdr target is already workspace-scoped by the resolver (a same-workspace
+    send resolves the receiver in the sender's own workspace; a cross-workspace lane dispatch
+    passes an EXPLICIT ``--target-repo``, never ``auto``), so ``auto`` resolves to the sender's
+    own repo root — the same-workspace target's repo — and flows through the unchanged
+    ``target_repo_mismatch`` gate like a hand-passed root. Kept out of the oversized
+    ``commands.py`` (module-health gate); the command module calls this from its herdr branch.
+    """
+    return str(repo_root_from_args(args))
+
+
+def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
+    """The *mozyo* workspace id of an explicit ``--target-repo <path>``, or ``""``.
+
+    Redmine #13331: option A makes a lane its own herdr workspace, so a
+    coordinator→lane-gateway dispatch names the lane worktree with an explicit
+    ``--target-repo <worktree-root>``. That worktree's anchor carries the lane's mozyo
+    workspace id — the exact id embedded in the lane agents' ``mzb1_<ws>_<role>_default``
+    names — so it is the authority for cross-workspace target resolution. Returns ``""``
+    for the ``auto`` sentinel, an unset value, or an unreadable / anchor-less path (so the
+    caller falls back to same-workspace resolution rather than guessing a workspace).
+    """
+    raw = getattr(args, "target_repo", None)
+    if not raw or raw == AUTO_TARGET_REPO:
+        return ""
+    try:
+        anchor = read_anchor(Path(raw))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(anchor, dict):
+        return ""
+    return _norm(anchor.get("workspace_id"))
+
+
 def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dict:
     """Resolve the herdr-native send target and synthesize its pane record (fail-closed).
 
@@ -174,21 +219,42 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
             f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
         )
 
-    # Redmine #13305: resolve through the single backend-neutral route authority
-    # (lane-in-match `(workspace_id, lane_id, role, pane_name)`), not the lane-less
-    # `(workspace_id, role)` projection. A lane-unspecified send derives one lane
-    # deterministically (explicit > sender same-lane > coordinator default > legacy
-    # default) and re-resolves that slot; a slot not live fails closed with the
-    # #13302 ledger vocabulary rather than scanning all lanes. `--target-lane`
-    # (absent today) is threaded so a future explicit-lane caller is honoured.
-    explicit_lane = getattr(args, "target_lane", None)
-    resolution = resolve_herdr_route_target(
-        receiver,
-        sender,
-        rows,
-        coordinator_provider=coordinator_provider,
-        explicit_lane=explicit_lane,
-    )
+    # Redmine #13331: cross-workspace explicit dispatch. When `--target-repo <path>`
+    # names a worktree whose mozyo workspace id differs from the sender's, the receiver
+    # lives in THAT workspace (a lane's own herdr workspace under option A), which the
+    # sender-scoped route authority below cannot reach. Resolve the receiver's canonical
+    # default-lane slot in the named target workspace instead (still the one
+    # backend-neutral route authority; the live locator stays transient cache). A
+    # `--target-repo` that resolves to the sender's OWN workspace (or `auto` / unset)
+    # falls through to the same-workspace path unchanged, so same-workspace herdr sends
+    # are byte-for-byte as before.
+    target_workspace_id = _explicit_target_workspace_id(args)
+    cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
+    if cross_workspace:
+        explicit_lane = getattr(args, "target_lane", None)
+        resolution = resolve_herdr_cross_workspace_target(
+            receiver,
+            target_workspace_id,
+            rows,
+            coordinator_provider=coordinator_provider,
+            target_lane=_norm(explicit_lane) if explicit_lane else "",
+        )
+    else:
+        # Redmine #13305: resolve through the single backend-neutral route authority
+        # (lane-in-match `(workspace_id, lane_id, role, pane_name)`), not the lane-less
+        # `(workspace_id, role)` projection. A lane-unspecified send derives one lane
+        # deterministically (explicit > sender same-lane > coordinator default > legacy
+        # default) and re-resolves that slot; a slot not live fails closed with the
+        # #13302 ledger vocabulary rather than scanning all lanes. `--target-lane`
+        # (absent today) is threaded so a future explicit-lane caller is honoured.
+        explicit_lane = getattr(args, "target_lane", None)
+        resolution = resolve_herdr_route_target(
+            receiver,
+            sender,
+            rows,
+            coordinator_provider=coordinator_provider,
+            explicit_lane=explicit_lane,
+        )
     if resolution.is_fail:
         raise HerdrSendEntryError(
             f"herdr target resolution failed for receiver {receiver!r} in workspace "
@@ -198,6 +264,15 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         )
     identity = resolution.identity
     assert identity is not None  # success guarantees an identity
+    # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
+    # reads the target pane's own cwd). For a same-workspace send that is the sender's repo;
+    # for a #13331 cross-workspace dispatch it is the named lane worktree (`--target-repo`),
+    # so the downstream `target_repo_mismatch` gate compares like-for-like (observed target
+    # cwd vs the explicit `--target-repo`) instead of blocking on the sender's own root.
+    if cross_workspace:
+        target_cwd = str(Path(getattr(args, "target_repo")).expanduser())
+    else:
+        target_cwd = str(repo_root)
     return {
         "id": resolution.locator,
         # No tmux location: the pure-herdr target is addressed by its live locator and
@@ -213,7 +288,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         "agent_role": "",
         "workspace_id": identity.workspace_id,
         "lane_id": identity.lane_id,
-        "cwd": str(repo_root),
+        "cwd": target_cwd,
         # Diagnostic breadcrumb (not consumed by the pane projection): the durable
         # herdr name this locator was resolved from.
         "herdr_assigned_name": resolution.assigned_name,
