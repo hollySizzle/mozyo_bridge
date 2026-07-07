@@ -5,8 +5,10 @@ answer to "is this workspace loaded in the cockpit, are its Codex/Claude panes
 present, is the geometry healthy?" — the #12339 mis-read this US closes. These
 tests cover the pure projection (`domain.cockpit_membership`) and the read-only
 CLI handlers (`cmd_cockpit` `list` / `status`, plus the `status` membership line).
-Every test stubs tmux + the registry, so it is hermetic (no live tmux, no
-destructive operations).
+Every test stubs tmux + the registry + the live herdr `agent list` supply, so it
+is hermetic (no live tmux, no live herdr inventory, no destructive operations)
+even when `MOZYO_HERDR_BINARY` / a herdr-selected repo config is present
+(Redmine #13359).
 """
 
 from __future__ import annotations
@@ -445,12 +447,18 @@ class CockpitListStatusCliTest(unittest.TestCase):
     @contextlib.contextmanager
     def _patched(self, *, windows, geo_panes, facts, unit_repo_root=""):
         from mozyo_bridge.application import commands
+        from mozyo_bridge.application import cockpit_membership_command
 
         def fake_facts(workspace_id):
             return facts.get(workspace_id) or membership.RegistryFacts.unresolved(
                 workspace_id
             )
 
+        # The live herdr column supply (#13303) bypasses the `commands` seams: it
+        # reads the cwd repo-local config + `MOZYO_HERDR_BINARY`, so on a herdr-
+        # selected workspace the live `agent list` inventory would contaminate
+        # these fixtures (Redmine #13359). Pin it to the herdr-off `None`
+        # sentinel so the tmux projection under test stays hermetic.
         with patch.object(commands, "_read_managed_cockpit_windows",
                           return_value=windows), \
             patch.object(commands, "_read_cockpit_geometry",
@@ -458,7 +466,9 @@ class CockpitListStatusCliTest(unittest.TestCase):
             patch.object(commands, "_resolve_registry_facts",
                          side_effect=fake_facts), \
             patch.object(commands, "_cockpit_unit_repo_root",
-                         return_value=unit_repo_root):
+                         return_value=unit_repo_root), \
+            patch.object(cockpit_membership_command.LiveHerdrColumnOps,
+                         "read_herdr_agent_rows", return_value=None):
             yield commands
 
     def _cockpit_window(self):
