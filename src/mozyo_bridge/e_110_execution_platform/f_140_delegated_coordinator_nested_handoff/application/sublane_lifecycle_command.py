@@ -361,9 +361,21 @@ class SublaneRetireUseCase:
         branch: Optional[str],
         integration_branch: Optional[str],
         assertions: RetireAssertions,
+        worktree_dirty_override: Optional[bool] = None,
     ) -> SublaneRetireOutcome:
         is_git = self.ops.is_git_workspace()
-        worktree_dirty = self.ops.worktree_dirty() if is_git else False
+        # Redmine #13331 review j#73338 (blocking): the retire TARGET is the lane worktree
+        # (`--worktree`), not the repo the command runs in. The injected `ops` is bound to
+        # the command's repo_root, so `ops.worktree_dirty()` inspects the coordinator repo
+        # — a clean coordinator would let a DIRTY lane worktree pass `may_retire` and (under
+        # the #13331 `--execute` guarded close) get its managed agents closed. When the
+        # caller supplies the target worktree's own dirty state, it is authoritative here
+        # (fail-closed: an uninspectable target resolves to dirty upstream). Absent an
+        # override the behaviour is byte-for-byte the prior repo_root-bound probe.
+        if worktree_dirty_override is not None:
+            worktree_dirty = worktree_dirty_override
+        else:
+            worktree_dirty = self.ops.worktree_dirty() if is_git else False
         policy = SublaneIntegrationPolicy(
             manage_worktree=True,
             integration_branch=integration_branch,
@@ -592,14 +604,30 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         target_identity_known=bool(getattr(args, "target_identity_known", False)),
     )
     repo_root = _repo_root(args)
+    # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the
+    # thing being retired), not the repo the command runs in. A clean coordinator repo must
+    # not let a dirty lane worktree pass `may_retire` (and, under `--execute`, close its
+    # managed agents). `LiveSublaneGitOperations.worktree_dirty()` fails closed (an
+    # uninspectable / non-git path reads as dirty), so a missing / bad `--worktree` blocks.
+    worktree = getattr(args, "worktree", None)
+    worktree_dirty_override = None
+    if worktree:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
+            LiveSublaneGitOperations,
+        )
+
+        worktree_dirty_override = LiveSublaneGitOperations(
+            repo_root=Path(worktree)
+        ).worktree_dirty()
     use_case = SublaneRetireUseCase(LiveSublaneLifecycleOps(repo_root=repo_root))
     outcome = use_case.run(
         issue=getattr(args, "issue", "") or "",
         lane_label=getattr(args, "lane_label", "") or "",
-        worktree_path=getattr(args, "worktree", None),
+        worktree_path=worktree,
         branch=getattr(args, "branch", None),
         integration_branch=getattr(args, "integration_branch", None),
         assertions=assertions,
+        worktree_dirty_override=worktree_dirty_override,
     )
     # Redmine #13331: opt-in herdr guarded close. Only under backend: herdr, only with
     # --execute, and only when the preflight already permits retirement (may_retire), close

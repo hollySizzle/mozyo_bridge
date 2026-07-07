@@ -116,5 +116,122 @@ class ExecuteHerdrRetireCloseTest(unittest.TestCase):
         self.assertEqual(result.failed[0][0], "claude")
 
 
+class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
+    """Redmine #13331 review j#73338 (blocking): the retire dirty check must inspect the
+    TARGET lane worktree (`--worktree`), not the repo the command runs in — else a clean
+    coordinator repo lets a dirty lane worktree pass may_retire and (under `--execute`)
+    close its managed agents."""
+
+    def test_use_case_override_blocks_on_dirty_target(self) -> None:
+        # A CLEAN injected ops (dirty=False) must still block when the caller reports the
+        # TARGET worktree dirty via the override.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            RetireAssertions,
+            SublaneRetireUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            INTEGRATION_BLOCKED,
+        )
+
+        class _CleanOps:
+            def is_git_workspace(self):
+                return True
+
+            def worktree_dirty(self):
+                return False  # coordinator repo is clean
+
+        all_true = RetireAssertions(
+            issue_closed=True,
+            owner_approval_present=True,
+            callbacks_drained=True,
+            verification_passed=True,
+            durable_record_recorded=True,
+            target_identity_known=True,
+        )
+        outcome = SublaneRetireUseCase(_CleanOps()).run(
+            issue="13331",
+            lane_label="issue_13331_x",
+            worktree_path="/wt",
+            branch="b",
+            integration_branch=None,
+            assertions=all_true,
+            worktree_dirty_override=True,  # the TARGET lane worktree is dirty
+        )
+        self.assertFalse(outcome.preflight.may_retire)
+        self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
+        self.assertIn("dirty_worktree", outcome.preflight.decision.blocked_reasons)
+
+    def _git(self, path: Path, *args):
+        subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def _init_repo(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        self._git(path, "init", "-q")
+        self._git(path, "config", "user.email", "t@t")
+        self._git(path, "config", "user.name", "t")
+        (path / "README.md").write_text("x", encoding="utf-8")
+        self._git(path, "add", "-A")
+        self._git(path, "commit", "-qm", "init")
+
+    def _retire_args(self, *, repo, worktree, execute):
+        import argparse
+
+        return argparse.Namespace(
+            issue="13331",
+            lane_label="issue_13331_x",
+            worktree=str(worktree),
+            branch="issue_13331_x",
+            integration_branch=None,
+            issue_closed=True,
+            owner_approved=True,
+            callbacks_drained=True,
+            verified=True,
+            durable_record=True,
+            target_identity_known=True,
+            execute=execute,
+            repo=str(repo),
+            json=True,
+        )
+
+    def test_cli_clean_coordinator_dirty_target_blocks(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            cmd_sublane_retire,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            coord = Path(tmp) / "coord"
+            self._init_repo(coord)  # clean coordinator repo
+            lane = Path(tmp) / "lane"
+            self._init_repo(lane)
+            (lane / "uncommitted.txt").write_text("dirty", encoding="utf-8")  # dirty target
+            rc = cmd_sublane_retire(
+                self._retire_args(repo=coord, worktree=lane, execute=True)
+            )
+        # A dirty TARGET worktree blocks retirement even though the coordinator is clean.
+        self.assertEqual(rc, 1)
+
+    def test_cli_clean_target_permits_retire(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            cmd_sublane_retire,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            coord = Path(tmp) / "coord"
+            self._init_repo(coord)
+            lane = Path(tmp) / "lane"
+            self._init_repo(lane)  # clean target worktree
+            # --execute but NOT herdr backend (no config) -> close is a no-op; the override
+            # must not over-block a clean target.
+            rc = cmd_sublane_retire(
+                self._retire_args(repo=coord, worktree=lane, execute=False)
+            )
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
