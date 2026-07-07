@@ -44,6 +44,10 @@ SOURCE_OTEL = "otel"
 SOURCE_SIDECAR = "sidecar"
 SOURCE_MANAGED_EVENT = "managed_event"
 SOURCE_CACHE = "cache"
+# The live herdr ``agent list`` inventory (Redmine #13356): a runtime observation
+# source distinct from tmux capture, so a herdr-backed row's freshness envelope
+# names which runtime it was read from (additive vocabulary evolution).
+SOURCE_HERDR = "herdr"
 SOURCE_OTHER = "other"
 
 # ``method``: how this observation was captured.

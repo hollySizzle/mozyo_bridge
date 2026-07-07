@@ -298,6 +298,231 @@ def observed_units_from_inventory(snapshot, *, observation):
     return units
 
 
+# --- herdr Unit supply for the grouped view (Redmine #13356, design j#73386) ---
+#
+# The tmux inventory can never see a herdr agent, so before #13356 the grouped
+# cockpit view was structurally blind to herdr lanes (#13331 j#73370 audit:
+# cockpit_payload was tmux `take_inventory` only). This supplier folds the live
+# herdr `agent list` inventory into the SAME grouped read model, following the
+# #13303 membership-fold pattern: default-off and fail-soft on selection (the
+# tmux default / a broken config yields no herdr Units, so a tmux-only payload
+# is unchanged), fail-visible on an unreadable snapshot (a diagnostic, never a
+# silent "no herdr Units").
+
+#: Diagnostic prefix for an unreadable live herdr inventory (mirrors the
+#: membership view's ``herdr_inventory_unavailable`` advisory, #13303).
+HERDR_INVENTORY_UNAVAILABLE_DIAGNOSTIC = "herdr_inventory_unavailable"
+
+
+def herdr_observed_units(
+    *,
+    repo_root: Path | None,
+    now,
+    home: Path | None = None,
+) -> "tuple[list, list[str]]":
+    """Fold the live herdr ``agent list`` inventory into grouped ``ObservedUnit``s.
+
+    Returns ``(units, diagnostics)``. Herdr off — the tmux default backend, or a
+    missing / broken repo-local config — yields ``([], [])`` so the tmux-only
+    grouped payload is byte-invariant. An unreadable live snapshot (herdr
+    selected but the inventory could not be read) yields ``([],
+    [herdr_inventory_unavailable: ...])`` so the operator never mistakes an
+    unreadable snapshot for an empty one.
+
+    Each managed ``mzb1`` row decodes to its ``(workspace_id, lane_id, role)``
+    slot (#13247 decode; foreign agents are dropped) and rows aggregate into one
+    Unit per ``(workspace_id, lane_id)`` with ``backend="herdr"``:
+
+    - the Unit's human identity joins from the **lane metadata record**
+      (Redmine #13356 j#73386 Q2: ``lane_label`` / ``issue``; the record is a
+      display join, never routing authority). A lane token with no record
+      degrades fail-open to the raw ``wt_<hash>`` label with a
+      ``lane_record_missing`` diagnostic;
+    - the grouping label (``repo_label``) resolves the workspace to its project:
+      the registry record of the lane record's ``repo_workspace_id`` (a lane) or
+      of the workspace id itself (the main workspace), so all lanes of one repo
+      group with their main workspace — the "全 lane 1 画面同時監視" view;
+    - ``role_runtime_states`` carry the herdr ``agent_status`` mapped to the
+      core runtime receiver-state vocabulary (j#73386 Q3: a runtime observation
+      layer / freshness signal, labelled apart from Redmine workflow state and
+      never promoted to it);
+    - the observation envelope is a **fresh live-query snapshot stamped at
+      read time with ``source="herdr"``** — deliberately distinct from the tmux
+      snapshot's envelope, so a stale tmux cache never stales the herdr rows and
+      vice versa. A duplicate live role in one slot degrades the Unit to a
+      visible contradicted row, mirroring the tmux lane-ambiguity fail-closed.
+    """
+    from datetime import datetime, timezone
+
+    from mozyo_bridge.application.repo_local_config_loader import (
+        load_repo_local_config,
+    )
+    from mozyo_bridge.core.state.lane_metadata import load_lane_records
+    from mozyo_bridge.core.state.workspace_registry import load_workspace_by_id
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.backend_neutral_resolver import (  # noqa: E501
+        herdr_agent_to_pane_row,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.route_identity_ledger import (  # noqa: E501
+        PANE_KEY_LANE,
+        PANE_KEY_ROLE,
+        PANE_KEY_WORKSPACE,
+    )
+    from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
+        BACKEND_HERDR,
+        ObservedUnit,
+    )
+    from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.domain.attention import (
+        ROLE_CLAUDE,
+        ROLE_CODEX,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (  # noqa: E501
+        CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+        DISPLAY_STATE_HEALTHY,
+        DISPLAY_STATE_RELOAD_REQUIRED,
+        FRESHNESS_FRESH,
+        METHOD_LIVE_QUERY,
+        READABILITY_READABLE,
+        SOURCE_HERDR,
+        STRENGTH_STRONG_RUNTIME_SIGNAL,
+        RuntimeObservationSnapshot,
+    )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+        RepoLocalConfigError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
+        TerminalTransportError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
+        resolve_agent_lister,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
+        agent_row_runtime_state,
+    )
+
+    try:
+        config = load_repo_local_config(repo_root).terminal_transport
+    except RepoLocalConfigError:
+        # A broken / unreadable config is not a herdr selection (the tmux
+        # default), exactly like every other herdr selector.
+        return [], []
+    lister = resolve_agent_lister(config)
+    if lister is None:
+        return [], []
+    try:
+        rows = lister.list_agent_rows()
+    except TerminalTransportError as exc:
+        return [], [
+            f"{HERDR_INVENTORY_UNAVAILABLE_DIAGNOSTIC}: herdr backend is "
+            f"selected but its live `agent list` inventory could not be read "
+            f"({exc}); herdr Units are omitted from this view."
+        ]
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    observed_at = now.isoformat(timespec="seconds")
+    live_observation = RuntimeObservationSnapshot(
+        observed_at=observed_at,
+        source=SOURCE_HERDR,
+        method=METHOD_LIVE_QUERY,
+        freshness=FRESHNESS_FRESH,
+        readability=READABILITY_READABLE,
+        strength=STRENGTH_STRONG_RUNTIME_SIGNAL,
+        stale_reason=None,
+        contradiction=None,
+        display_state=DISPLAY_STATE_HEALTHY,
+        source_refs=("herdr:agent_list",),
+    )
+
+    lane_records = load_lane_records()
+    diagnostics: list[str] = []
+    by_unit: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows or []:
+        pane_row = herdr_agent_to_pane_row(row)
+        if pane_row is None:
+            continue
+        workspace_id = pane_row.get(PANE_KEY_WORKSPACE) or ""
+        role = pane_row.get(PANE_KEY_ROLE) or ""
+        if not workspace_id or role not in (ROLE_CODEX, ROLE_CLAUDE):
+            continue
+        lane_id = (pane_row.get(PANE_KEY_LANE) or "").strip() or DEFAULT_LANE
+        key = (workspace_id, lane_id)
+        if key not in by_unit:
+            by_unit[key] = {"role_counts": {}, "runtime": {}}
+            order.append(key)
+        entry = by_unit[key]
+        entry["role_counts"][role] = entry["role_counts"].get(role, 0) + 1
+        entry["runtime"].setdefault(role, agent_row_runtime_state(row))
+
+    units: list = []
+    from dataclasses import replace
+
+    for key in order:
+        workspace_id, lane_id = key
+        entry = by_unit[key]
+        role_counts = entry["role_counts"]
+        roles = tuple(
+            role for role in (ROLE_CODEX, ROLE_CLAUDE) if role in role_counts
+        )
+        record = lane_records.get(workspace_id)
+        lane_label = None
+        issue = None
+        repo_label = None
+        if record is not None and record.lane_label:
+            lane_label = record.lane_label
+            issue = record.issue_id or None
+            anchor_id = record.repo_workspace_id or workspace_id
+        else:
+            anchor_id = workspace_id
+        registry_record = load_workspace_by_id(anchor_id)
+        if registry_record is not None:
+            repo_label = (
+                getattr(registry_record, "project_name", None)
+                or getattr(registry_record, "canonical_session", None)
+                or anchor_id
+            )
+        elif record is not None and record.lane_label:
+            # Lane record present but its main workspace is unregistered: the
+            # lane label is still the best public-safe grouping label.
+            repo_label = record.lane_label
+        else:
+            # No record and no registry entry: fail-open degrade to the raw
+            # token, kept visible (j#73386: lane_record_missing).
+            repo_label = workspace_id
+            diagnostics.append(
+                f"lane_record_missing: herdr workspace {workspace_id} has no "
+                f"lane metadata record; showing the raw token"
+            )
+        ambiguous = any(count > 1 for count in role_counts.values())
+        unit_observation = live_observation
+        if ambiguous:
+            unit_observation = replace(
+                live_observation,
+                contradiction=CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+                display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+            )
+        units.append(
+            ObservedUnit(
+                workspace_id=workspace_id,
+                lane_id=lane_id,
+                host_id=DEFAULT_HOST,
+                repo_label=repo_label,
+                active=True,
+                roles=roles,
+                observation=unit_observation,
+                backend=BACKEND_HERDR,
+                role_runtime_states=tuple(
+                    (role, entry["runtime"][role])
+                    for role in roles
+                    if role in entry["runtime"]
+                ),
+                lane_label=lane_label,
+                issue=issue,
+            )
+        )
+    return units, diagnostics
+
+
 def grouped_units_payload(
     *,
     home: Path | None = None,
@@ -340,7 +565,20 @@ def grouped_units_payload(
     observed_units = observed_units_from_inventory(
         snapshot, observation=observation
     )
-    model = build_grouped_read_model(
-        config, observed_units, observation=observation
+    # Redmine #13356: fold the live herdr Units into the SAME grouped read model
+    # (backend axis). Herdr off / broken config yields no units and no
+    # diagnostics, so the tmux-only payload is unchanged; an unreadable herdr
+    # inventory stays visible as a diagnostic instead of reading as "no lanes".
+    herdr_units, herdr_diagnostics = herdr_observed_units(
+        repo_root=repo_root, now=now, home=home
     )
+    model = build_grouped_read_model(
+        config, list(observed_units) + list(herdr_units), observation=observation
+    )
+    if herdr_diagnostics:
+        from dataclasses import replace
+
+        model = replace(
+            model, diagnostics=model.diagnostics + tuple(herdr_diagnostics)
+        )
     return build_grouped_display_view(model).as_payload()

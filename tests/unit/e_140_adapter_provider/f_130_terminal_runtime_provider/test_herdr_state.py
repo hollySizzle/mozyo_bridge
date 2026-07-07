@@ -41,6 +41,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     HerdrCliAgentStateReader,
+    agent_row_runtime_state,
     resolve_agent_state_reader,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
@@ -427,6 +428,28 @@ class ResolverTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.reason, REASON_BINARY_NOT_FOUND)
             finally:
                 os.environ["PATH"] = prev_path
+
+
+class AgentRowRuntimeStateTest(unittest.TestCase):
+    """The public per-row status mapping shared with read-model folds (#13356)."""
+
+    def test_maps_recognised_statuses(self) -> None:
+        self.assertEqual(
+            agent_row_runtime_state({"agent_status": "working"}), "busy"
+        )
+        self.assertEqual(
+            agent_row_runtime_state({"status": "idle"}), "awaiting_input"
+        )
+        self.assertEqual(agent_row_runtime_state({"state": "done"}), "turn_ended")
+        self.assertEqual(
+            agent_row_runtime_state({"agent_status": "blocked"}), "blocked"
+        )
+
+    def test_fails_closed_to_unknown(self) -> None:
+        self.assertEqual(agent_row_runtime_state({}), "unknown")
+        self.assertEqual(agent_row_runtime_state({"agent_status": "novel"}), "unknown")
+        self.assertEqual(agent_row_runtime_state(None), "unknown")
+        self.assertEqual(agent_row_runtime_state("not a mapping"), "unknown")
 
 
 if __name__ == "__main__":

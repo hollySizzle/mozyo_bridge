@@ -146,6 +146,30 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertNotEqual(view.gateway_pane, view.worker_pane)
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
 
+    def test_append_upserts_lane_metadata_record(self) -> None:
+        # Redmine #13356 j#73386 Q2: the create command boundary records the
+        # token↔(lane_label / issue / branch / worktree) display join.
+        from mozyo_bridge.core.state.lane_metadata import load_lane_records
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            ops.branch = "issue_13331_x"
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                lane_ws = read_anchor(worktree)["workspace_id"]
+                records = load_lane_records(home=home)
+        self.assertIn(lane_ws, records)
+        record = records[lane_ws]
+        self.assertEqual(record.lane_label, "issue_13331_x")
+        self.assertEqual(record.issue_id, "13331")
+        self.assertEqual(record.branch, "issue_13331_x")
+        self.assertEqual(record.worktree_path, str(worktree))
+        self.assertEqual(record.source_backend, "herdr")
+        self.assertEqual(record.status, "active")
+
     def test_read_lane_gateway_only(self) -> None:
         herdr = _StatefulHerdr()
         with tempfile.TemporaryDirectory() as tmp:

@@ -690,7 +690,15 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
     except HerdrSessionStartError:
         return HerdrRetireCloseResult(workspace_id=workspace_id)
     plan = plan_herdr_retire_close(rows, workspace_id=workspace_id)
-    return execute_herdr_retire_close(plan)
+    result = execute_herdr_retire_close(plan)
+    # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
+    # command boundary marks the lane's display-metadata record `retired` (kept as
+    # a tombstone for late label resolution / residue diagnosis, never deleted
+    # here). Never raises; an unrecorded lane simply stays unrecorded.
+    from mozyo_bridge.core.state.lane_metadata import record_lane_retired
+
+    record_lane_retired(workspace_id)
+    return result
 
 
 def _format_herdr_close_text(result) -> str:

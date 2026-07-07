@@ -66,7 +66,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.grouped_read_model import (
+    BACKEND_TMUX,
     GROUP_SOURCE_DESIRED,
+    RUNTIME_STATE_BLOCKED,
+    RUNTIME_STATE_BUSY,
+    RUNTIME_STATE_UNKNOWN,
     UNIT_STATUS_CONTRADICTED,
     GroupedReadModel,
     ProjectGroupView,
@@ -224,6 +228,19 @@ class GroupAttentionSummary:
     active_lanes: int = 0
     reload_required: int = 0
     attention: int = 0
+    #: herdr runtime-observation roll-up (Redmine #13356 j#73386 Q3): counts over
+    #: the ``backend=herdr`` member rows' per-role runtime receiver-states —
+    #: live roles observed, roles actively working (``busy``), and roles whose
+    #: state is unreadable / unrecognised (``unknown``). A live runtime
+    #: permission prompt stays a *row-level* warning
+    #: (:attr:`UnitDisplayRow.runtime_blocked`) — it is deliberately not a
+    #: summary field, so the summary vocabulary never carries a token readable
+    #: as the Redmine workflow gate. Zero on a tmux-only view, so the pre-#13356
+    #: summary is unchanged. Projection facts only, never governance truth.
+    herdr_units: int = 0
+    herdr_live_roles: int = 0
+    herdr_working_roles: int = 0
+    herdr_unknown_roles: int = 0
 
     @property
     def needs_attention(self) -> bool:
@@ -240,6 +257,10 @@ class GroupAttentionSummary:
             "reload_required": self.reload_required,
             "attention": self.attention,
             "needs_attention": self.needs_attention,
+            "herdr_units": self.herdr_units,
+            "herdr_live_roles": self.herdr_live_roles,
+            "herdr_working_roles": self.herdr_working_roles,
+            "herdr_unknown_roles": self.herdr_unknown_roles,
         }
 
 
@@ -253,12 +274,24 @@ def _summarize(rows: "tuple[UnitDisplayRow, ...]") -> GroupAttentionSummary:
     contradiction-class ``status`` (:data:`ATTENTION_CANDIDATE_STATUSES`) — never
     a re-read of governance truth.
     """
+    herdr_rows = tuple(row for row in rows if row.backend != BACKEND_TMUX)
+    herdr_states = tuple(
+        state for row in herdr_rows for _role, state in row.runtime_states
+    )
     return GroupAttentionSummary(
         total=len(rows),
         active_lanes=sum(1 for row in rows if row.active),
         reload_required=sum(1 for row in rows if row.reload_required),
         attention=sum(
             1 for row in rows if row.status in ATTENTION_CANDIDATE_STATUSES
+        ),
+        herdr_units=len(herdr_rows),
+        herdr_live_roles=sum(len(row.roles) for row in herdr_rows),
+        herdr_working_roles=sum(
+            1 for state in herdr_states if state == RUNTIME_STATE_BUSY
+        ),
+        herdr_unknown_roles=sum(
+            1 for state in herdr_states if state == RUNTIME_STATE_UNKNOWN
         ),
     )
 
@@ -313,6 +346,19 @@ class UnitDisplayRow:
     managed: bool
     reload_required: bool
     diagnostic: Optional[str]
+    #: Backend axis + herdr runtime observation (Redmine #13356, additive with
+    #: tmux-preserving defaults). ``runtime_states`` are the per-role runtime
+    #: receiver-states (display observation, never workflow truth);
+    #: ``runtime_label`` is their public-safe human rendering;
+    #: ``runtime_blocked`` flags a live *runtime* permission prompt — labelled
+    #: apart from the Redmine workflow ``blocked`` gate. ``issue`` is the lane
+    #: metadata issue number (display join), distinct from the tmux-era
+    #: ``issue_label`` (the workspace's public display label).
+    backend: str = BACKEND_TMUX
+    runtime_states: "tuple[tuple[str, str], ...]" = ()
+    runtime_label: str = ""
+    runtime_blocked: bool = False
+    issue: Optional[str] = None
 
     def as_payload(self) -> dict:
         return {
@@ -337,6 +383,11 @@ class UnitDisplayRow:
             "managed": self.managed,
             "reload_required": self.reload_required,
             "diagnostic": self.diagnostic,
+            "backend": self.backend,
+            "runtime_states": dict(self.runtime_states),
+            "runtime_label": self.runtime_label,
+            "runtime_blocked": self.runtime_blocked,
+            "issue": self.issue,
         }
 
 
@@ -469,12 +520,19 @@ def _unit_row(
         freshness_label = unit.freshness
         reload_required = unit.needs_reload
     roles = _canonical_roles(unit.roles)
+    runtime_states = unit.role_runtime_states
+    runtime_blocked = any(
+        state == RUNTIME_STATE_BLOCKED for _role, state in runtime_states
+    )
     return UnitDisplayRow(
         unit_id=unit.unit_id,
         workspace_id=unit.workspace_id,
         lane_id=unit.lane_id,
         host_id=unit.host_id,
-        lane_label=unit.lane_id,
+        # The human lane label from the lane metadata display join when present
+        # (a herdr lane, Redmine #13356); a tmux row has none and keeps its
+        # lane_id verbatim (byte-compatible).
+        lane_label=unit.lane_label or unit.lane_id,
         issue_label=unit.label,
         roles=roles,
         role_label=_role_label(roles),
@@ -491,6 +549,13 @@ def _unit_row(
         managed=managed,
         reload_required=reload_required,
         diagnostic=unit.diagnostic,
+        backend=unit.backend,
+        runtime_states=runtime_states,
+        runtime_label=", ".join(
+            f"{role}:{state}" for role, state in runtime_states
+        ),
+        runtime_blocked=runtime_blocked,
+        issue=unit.issue,
     )
 
 
