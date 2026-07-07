@@ -308,6 +308,27 @@ class SessionStartTest(unittest.TestCase):
             self.assertIn("permission mode", str(ctx.exception))
         self.assertFalse(herdr.start_argvs)
 
+    def test_invalid_env_fails_before_any_launch_in_lane_provider_order(self) -> None:
+        # Review j#73404: the lane chokepoint requests (codex, claude) in that
+        # order. Policy validation must fire BEFORE any side effect — a validation
+        # that only ran inside the claude slot's launch left the codex gateway
+        # already started (a partial lane) on an invalid env override. Pin: zero
+        # `agent start` AND zero `workspace create`.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp,
+                    providers=["codex", "claude"],
+                    herdr=herdr,
+                    extra_env={"MOZYO_CLAUDE_PERMISSION_MODE": "yolo"},
+                    claude_permission_mode_default="auto",
+                )
+        self.assertFalse(herdr.start_argvs)
+        self.assertFalse(
+            [c for c in herdr.calls if c[:2] == ["workspace", "create"]]
+        )
+
     def test_existing_name_is_adopted_not_relaunched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             # Pre-seed the registry so we know the workspace_id, then place a live

@@ -514,6 +514,20 @@ def prepare_session(
                 "once — remove the duplicate `--agent` argument"
             )
         seen_slots.add(slot)
+    # Resolve (and validate) the Claude permission policy BEFORE any side effect
+    # (review j#73404): the lane chokepoint requests (codex, claude), so a
+    # validation that only fires inside the claude slot's launch would leave the
+    # codex gateway already started — a partial lane — when the env override is
+    # invalid. Resolving once up front fails closed with zero workspace create /
+    # agent start, and `_execute_slot` receives the resolved mode verbatim.
+    claude_permission_mode: Optional[str] = None
+    if "claude" in providers:
+        try:
+            claude_permission_mode = resolve_claude_permission_mode(
+                "claude", policy_default=claude_permission_mode_default, env=env
+            )
+        except InvalidPermissionMode as exc:
+            raise HerdrSessionStartError(str(exc)) from exc
     binary = _resolve_binary_or_die(env)
 
     # Redmine #13331 (design j#73357, Opt 1): the mzb1 `workspace` segment. A linked git
@@ -594,7 +608,7 @@ def prepare_session(
                 env=env,
                 runner=runner,
                 timeout=timeout,
-                claude_permission_mode_default=claude_permission_mode_default,
+                claude_permission_mode=claude_permission_mode,
             )
         )
 
@@ -622,7 +636,7 @@ def _execute_slot(
     env: Mapping[str, str],
     runner: Runner,
     timeout: float,
-    claude_permission_mode_default: Optional[str] = None,
+    claude_permission_mode: Optional[str] = None,
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -684,21 +698,12 @@ def _execute_slot(
     # #13360): the tmux managed-pane chokepoint has always appended
     # `--permission-mode <mode>`; without the same suffix here every herdr lane
     # worker boots prompt-gated and stalls on its first gated command
-    # (coordinator-measured, 2026-07-07: all four wave workers blocked). The pure
-    # policy resolver keeps the precedence identical to tmux (env override >
-    # launch-context default > none) and never renders a flag for Codex. An
-    # invalid mode fails the launch closed instead of silently booting a
-    # default-permission agent the operator did not intend.
-    try:
-        permission_mode = resolve_claude_permission_mode(
-            plan.provider,
-            policy_default=claude_permission_mode_default,
-            env=env,
-        )
-    except InvalidPermissionMode as exc:
-        raise HerdrSessionStartError(str(exc)) from exc
-    if permission_mode:
-        launch_argv.extend(["--permission-mode", permission_mode])
+    # (coordinator-measured, 2026-07-07: all four wave workers blocked). The mode
+    # arrives pre-resolved (and pre-validated) from `prepare_session` — resolving
+    # here, mid-launch-sequence, is exactly what left a partial lane on an invalid
+    # env override (review j#73404). Codex never gets the flag.
+    if plan.provider == "claude" and claude_permission_mode:
+        launch_argv.extend(["--permission-mode", claude_permission_mode])
     started = _invoke(
         binary,
         launch_argv,
