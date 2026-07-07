@@ -21,6 +21,13 @@ is. The semantics are the runtime observation snapshot contract codified in
 The probes are read-only and best-effort. The tmux probe re-reads live tmux
 runtime (degrading to the inventory cache when tmux is unavailable); the
 otel/cache probe reads the local OTel event store file with no network call.
+The herdr probe (#13355) re-reads the live herdr ``agent list`` inventory; it
+joins ``--source all`` only when the repo-local config selects the herdr
+backend (so ``backend: tmux`` output is byte-invariant) and fails closed to
+``unknown`` when the backend is unselected or the inventory is unreadable.
+herdr today exposes only snapshot reads (``agent list`` / ``agent get``) — a
+push-based herdr *event* feed for the timeline is deferred until an upstream
+event-subscription API exists.
 """
 
 from __future__ import annotations
@@ -34,8 +41,9 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
 
 SOURCE_TMUX = "tmux"
 SOURCE_OTEL = "otel"
+SOURCE_HERDR = "herdr"
 SOURCE_ALL = "all"
-SOURCE_CHOICES = (SOURCE_TMUX, SOURCE_OTEL, SOURCE_ALL)
+SOURCE_CHOICES = (SOURCE_TMUX, SOURCE_OTEL, SOURCE_HERDR, SOURCE_ALL)
 
 DEFAULT_MAX_AGE_SECONDS = 30.0
 DEFAULT_EXPIRED_AFTER_SECONDS = 300.0
@@ -229,6 +237,99 @@ def _capture_otel(
     )
 
 
+def _herdr_snapshot(
+    *,
+    inventory,
+    now: datetime,
+    now_iso: str,
+    max_age_seconds: float,
+    expired_after_seconds: float,
+) -> ro.RuntimeObservationSnapshot:
+    """Map a herdr inventory read into a runtime observation snapshot (#13355).
+
+    A readable live ``agent list`` is a strong runtime signal observed *now*
+    (there is no herdr cache layer to degrade to). Fail-closed: a repo that does
+    not select the herdr backend has nothing to observe, and an unreadable
+    inventory (server down / binary unconfigured) is unreadable — both derive
+    ``unknown`` / ``reload_required``, never ``healthy``.
+    """
+    if not inventory.backend_selected:
+        return ro.make_snapshot(
+            source=ro.SOURCE_HERDR,
+            method=ro.METHOD_LIVE_QUERY,
+            observed_at=None,
+            readability=ro.READABILITY_UNREADABLE,
+            strength=ro.STRENGTH_PROJECTION_ONLY,
+            now=now,
+            max_age_seconds=max_age_seconds,
+            expired_after_seconds=expired_after_seconds,
+            source_refs=("herdr:agent-list",),
+            notes=(
+                "herdr backend is not selected by the repo-local config; "
+                "nothing to observe",
+            ),
+        )
+    if not inventory.ok:
+        return ro.make_snapshot(
+            source=ro.SOURCE_HERDR,
+            method=ro.METHOD_LIVE_QUERY,
+            observed_at=None,
+            readability=ro.READABILITY_UNREADABLE,
+            strength=ro.STRENGTH_PROJECTION_ONLY,
+            now=now,
+            max_age_seconds=max_age_seconds,
+            expired_after_seconds=expired_after_seconds,
+            source_refs=("herdr:agent-list",),
+            notes=(
+                f"herdr inventory unreadable ({inventory.reason or '-'}): "
+                f"{inventory.detail or '-'}",
+            ),
+        )
+    managed = inventory.managed_agents
+    return ro.make_snapshot(
+        source=ro.SOURCE_HERDR,
+        method=ro.METHOD_LIVE_QUERY,
+        observed_at=now_iso,
+        readability=ro.READABILITY_READABLE,
+        strength=ro.STRENGTH_STRONG_RUNTIME_SIGNAL,
+        now=now,
+        max_age_seconds=max_age_seconds,
+        expired_after_seconds=expired_after_seconds,
+        source_refs=(f"herdr:agent-list@{now_iso}",),
+        notes=(
+            f"live herdr inventory: {len(managed)} managed agent(s) observed "
+            f"(workspace {inventory.workspace_segment or '-'})",
+        ),
+    )
+
+
+def _herdr_selected(args: argparse.Namespace) -> bool:
+    """Cheap backend-selection check gating the `--source all` herdr capture."""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
+        herdr_backend_selected_for,
+    )
+    from mozyo_bridge.shared.paths import resolve_repo_root
+
+    return herdr_backend_selected_for(resolve_repo_root(getattr(args, "repo", None)))
+
+
+def _capture_herdr(
+    *, repo, now: datetime, now_iso: str, max_age: float, expired_after: float
+) -> ro.RuntimeObservationSnapshot:
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
+        read_herdr_inventory,
+    )
+    from mozyo_bridge.shared.paths import resolve_repo_root
+
+    return _herdr_snapshot(
+        inventory=read_herdr_inventory(resolve_repo_root(repo)),
+        now=now,
+        now_iso=now_iso,
+        max_age_seconds=max_age,
+        expired_after_seconds=expired_after,
+    )
+
+
 def _render(snapshots, *, as_json: bool, now_iso: str) -> None:
     if as_json:
         import json as _json
@@ -306,6 +407,21 @@ def cmd_observe_reload(args: argparse.Namespace) -> int:
                 db=db,
                 home=home,
                 now=now,
+                max_age=max_age,
+                expired_after=expired_after,
+            )
+        )
+    # herdr inventory snapshot (#13355). Under `all` it is captured only when
+    # the repo-local config selects the herdr backend, so the `backend: tmux`
+    # `observe reload` output stays byte-for-byte unchanged; an explicit
+    # `--source herdr` always renders (fail-closed when not selected /
+    # unreadable, so the exit code is non-zero rather than silently empty).
+    if source == SOURCE_HERDR or (source == SOURCE_ALL and _herdr_selected(args)):
+        snapshots.append(
+            _capture_herdr(
+                repo=getattr(args, "repo", None),
+                now=now,
+                now_iso=now_iso,
                 max_age=max_age,
                 expired_after=expired_after,
             )

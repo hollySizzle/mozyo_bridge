@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 # ``source``: which responsibility layer the observation came from.
 SOURCE_REDMINE = "redmine"
 SOURCE_TMUX = "tmux"
+SOURCE_HERDR = "herdr"  # herdr terminal-runtime inventory (`agent list`), #13355
 SOURCE_OTEL = "otel"
 SOURCE_SIDECAR = "sidecar"
 SOURCE_MANAGED_EVENT = "managed_event"

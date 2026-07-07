@@ -306,8 +306,14 @@ class DoctorLaunchPolicySectionTest(unittest.TestCase):
         from mozyo_bridge.application.doctor import run_doctor
 
         args = argparse.Namespace(repo=str(ROOT), home=None)
+        # The target is this checkout, whose repo-local config may select the
+        # herdr backend: stub the #13355 herdr section so this test never
+        # performs a live `herdr agent list` read (hermeticity, #13359 lesson).
         with patch.dict(
             "os.environ", {CLAUDE_PERMISSION_MODE_ENV: "default"}, clear=False
+        ), patch(
+            "mozyo_bridge.application.doctor.doctor_herdr_section",
+            return_value=None,
         ):
             result = run_doctor(args)
         self.assertIn("claude_launch_policy", result["sections"])

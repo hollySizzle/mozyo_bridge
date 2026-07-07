@@ -94,7 +94,6 @@ from mozyo_bridge.application.commands_agents import (
     cmd_list,
 )
 from mozyo_bridge.application.agent_discovery_port import LiveAgentDiscovery
-from mozyo_bridge.application.status_session_port import LiveStatusSession
 from mozyo_bridge.application.status_session_helper import (
     LegacyBasenameNoticeUseCase,
     LiveStatusSessionHelperReads,
@@ -103,10 +102,8 @@ from mozyo_bridge.application.status_session_helper import (
     cwd_is_under_repo,
 )
 from mozyo_bridge.application.commands_status import (
-    LiveStatusCockpitMembership,
-    LiveStatusDoctorContinuation,
-    StatusCommandHandler,
     StatusCommandRequest,
+    live_status_handler,
 )
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.commands_workspace import (
     cmd_workspace_inspect,
@@ -1487,17 +1484,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     require_tmux()
     # OOP-first command boundary (Redmine #12831, atop #12830 / #12825 / #12785):
     # the handler composes the session-read use case (StatusSessionPort), the
-    # cockpit-membership projection (StatusCockpitMembershipPort), and the
-    # doctor-tail continuation (StatusDoctorContinuation) — all in
-    # commands_status.py. This thin adapter prints the rendered StatusReport, then
-    # defers the exit code to the continuation. #12831 isolated the
-    # `cmd_doctor(args)` tail behind that typed port + StatusContinuationResult VO
-    # (live adapter routes to cmd_doctor at call time; broad doctor body = #12638).
-    handler = StatusCommandHandler(
-        sessions=LiveStatusSession(),
-        membership=LiveStatusCockpitMembership(args),
-        continuation=LiveStatusDoctorContinuation(args),
-    )
+    # cockpit-membership projection (StatusCockpitMembershipPort), the
+    # doctor-tail continuation (StatusDoctorContinuation), and the #13355 herdr
+    # backend port — all constructed by `live_status_handler` in
+    # commands_status.py so this adapter stays a fixed-size composition root.
+    # It prints the rendered StatusReport, then defers the exit code to the
+    # doctor-tail continuation (live adapter routes to cmd_doctor at call time).
+    handler = live_status_handler(args)
     report = handler.handle(StatusCommandRequest(session=resolve_status_session(args)))
     print(report.report_text, end="")
     return handler.continue_with_doctor().exit_code

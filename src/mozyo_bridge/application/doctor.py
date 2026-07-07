@@ -72,6 +72,10 @@ from mozyo_bridge.application.doctor_otel import (
     LiveOtelDoctorReads,
     OtelSectionUseCase,
 )
+from mozyo_bridge.application.doctor_herdr import (
+    HerdrSectionUseCase,
+    LiveHerdrDoctorReads,
+)
 # ``pane_lines`` and ``run_tmux`` are resolved through this module at call time
 # by the section adapters (the existing ``doctor.pane_lines`` / ``doctor.run_tmux``
 # / ``doctor.subprocess`` section integration tests patch these names):
@@ -541,6 +545,27 @@ def doctor_otel_section(args: argparse.Namespace) -> dict[str, Any]:
     / legacy section dict assembly in the pure ``evaluate_otel_section`` policy.
     """
     return OtelSectionUseCase(LiveOtelDoctorReads(args)).execute()
+
+
+def doctor_herdr_section(args: argparse.Namespace) -> dict[str, Any] | None:
+    """herdr backend probe: server reachability / managed slots / identity (#13355).
+
+    Read-only and **conditional**: returns ``None`` when the target repo's
+    config does not select the herdr terminal backend, so the ``backend: tmux``
+    doctor output carries no ``herdr`` section at all (byte-invariance). Under
+    the herdr backend it reports the live ``agent list`` inventory — a down or
+    misconfigured herdr server is a fail-closed ``error`` section — the mzb1
+    decode of every managed slot, and this repo's workspace-segment resolution
+    health.
+
+    Thin handler over
+    :class:`~mozyo_bridge.application.doctor_herdr.HerdrSectionUseCase`: the
+    external read (config selection, workspace segment, live inventory) lives in
+    :class:`LiveHerdrDoctorReads` via the shared ``herdr_observability`` read
+    model, and the verdict / section dict assembly in the pure
+    ``evaluate_herdr_section`` policy.
+    """
+    return HerdrSectionUseCase(LiveHerdrDoctorReads(args)).execute()
 
 
 def doctor_delivery_env_section(args: argparse.Namespace) -> dict[str, Any]:

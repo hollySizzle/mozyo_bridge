@@ -281,12 +281,16 @@ def register(sub) -> None:
     )
     observe_reload.add_argument(
         "--source",
-        choices=["tmux", "otel", "all"],
+        choices=["tmux", "otel", "herdr", "all"],
         default="all",
         help=(
             "Which observation source to reload: `tmux` (live runtime "
             "liveness, degrading to the inventory cache), `otel` (the "
-            "best-effort OTel event store cache), or `all` (default)."
+            "best-effort OTel event store cache), `herdr` (the live herdr "
+            "agent-list inventory; fail-closed when the herdr backend is not "
+            "selected or the server is unreachable), or `all` (default; "
+            "includes herdr only when the repo-local config selects the "
+            "herdr backend)."
         ),
     )
     observe_reload.add_argument(
