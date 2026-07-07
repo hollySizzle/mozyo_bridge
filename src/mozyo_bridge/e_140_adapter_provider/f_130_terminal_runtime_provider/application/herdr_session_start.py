@@ -624,6 +624,21 @@ def _execute_slot(
             "(expected result.agent.pane_id in an agent_started payload); refuse to "
             "return a blank handle"
         )
+    # Verify the launch actually landed in the requested workspace (Redmine #13330
+    # review j#73231). Passing `--workspace` is what keeps herdr from auto-creating a
+    # second workspace (with its own empty base pane); if the returned locator is in a
+    # DIFFERENT workspace (herdr ignored the flag / spec drift), trusting it would let
+    # us close our created root pane while an auto-created base pane survives elsewhere,
+    # unseen — exactly the failure this US must prevent. Fail closed instead (before
+    # any reclaim), so the mislocated launch is surfaced rather than papered over.
+    landed = _workspace_prefix(locator)
+    if landed != target_workspace:
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} landed in workspace "
+            f"{landed or '<none>'!r} but --workspace {target_workspace!r} was requested; "
+            "refuse to trust a mislocated launch (herdr may have auto-created another "
+            "workspace with its own base pane)"
+        )
     return SlotResult(
         provider=plan.provider,
         assigned_name=plan.assigned_name,

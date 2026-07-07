@@ -55,12 +55,15 @@ class _Herdr:
         self,
         *,
         existing_rows=None,
-        start_locator="w1:pNEW",
+        start_locator=None,
         created_workspace="wZ",
         start_fails=False,
         close_fails=False,
     ):
         self.existing_rows = existing_rows or []
+        # By default the launched agent lands in the workspace it was told to via
+        # `--workspace` (the realistic herdr behaviour). An explicit `start_locator`
+        # overrides that — used to force a mislocated launch (#13330 review j#73231).
         self.start_locator = start_locator
         self.created_workspace = created_workspace
         self.start_fails = start_fails
@@ -112,6 +115,14 @@ class _Herdr:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="agent start refused"
                 )
+            if self.start_locator is not None:
+                pane_id = self.start_locator
+            elif "--workspace" in rest:
+                # Land in the requested workspace with a distinct pane per launch.
+                wid = rest[rest.index("--workspace") + 1]
+                pane_id = f"{wid}:p{len(self.start_argvs) + 1}"
+            else:
+                pane_id = "w1:pNEW"
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -121,7 +132,7 @@ class _Herdr:
                         "result": {
                             "agent": {
                                 "name": rest[2],
-                                "pane_id": self.start_locator,
+                                "pane_id": pane_id,
                                 "agent_status": "unknown",
                             },
                             "argv": rest,
@@ -296,6 +307,10 @@ class SessionStartTest(unittest.TestCase):
         self.assertEqual(result.base_pane_id, "wZ:p1")
         self.assertTrue(result.base_pane_reclaimed)
         self.assertEqual(result.base_pane_detail, "")
+        # Every launched agent actually landed inside the created workspace (#13330
+        # review j#73231) — not a herdr-auto-created sibling.
+        for slot in result.slots:
+            self.assertTrue(slot.locator.startswith("wZ:"))
         # Ordering: create BEFORE both launches, close AFTER both launches.
         kinds = [tuple(c[:2]) for c in herdr.calls]
         create_i = kinds.index(("workspace", "create"))
@@ -345,6 +360,18 @@ class SessionStartTest(unittest.TestCase):
             with self.assertRaises(HerdrSessionStartError):
                 self._prepare(tmp, providers=["claude", "codex"], herdr=herdr)
         # The workspace was created (residue) but the base pane was NOT closed.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_mislocated_launch_fails_closed_and_leaves_base_pane(self) -> None:
+        # Redmine #13330 review j#73231: if `agent start` lands in a DIFFERENT
+        # workspace than `--workspace` requested (herdr ignored the flag / spec
+        # drift), fail closed — never trust it, and never close the created root pane
+        # (an auto-created base pane may survive in the other workspace).
+        herdr = _Herdr(created_workspace="wZ", start_locator="w9:pBAD")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(tmp, providers=["claude", "codex"], herdr=herdr)
         self.assertEqual(len(herdr.workspace_creates), 1)
         self.assertEqual(herdr.pane_closes, [])
 

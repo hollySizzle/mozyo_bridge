@@ -187,6 +187,11 @@ fail-closed / safety 不変条件:
 
 - 閉じる対象は **この run が `workspace create` で得た `root_pane.pane_id` 一点のみ**。scan で「空
   shell らしき pane」を探して閉じることは禁止 (user 自身の shell を誤 close しない構造的保証)。
+- **launched locator は target workspace 内であることを fail-closed 検証する** (#13330 review j#73231)。
+  `agent start --workspace <id>` の返す `result.agent.pane_id` の workspace prefix が要求 workspace と
+  一致しない場合 (herdr が flag を無視 / 仕様差分で別 workspace に auto-create した場合) は
+  `HerdrSessionStartError` で raise する。検証は reclaim step より前で発火するため、mislocated launch
+  時は created root pane を close せず、別 workspace 側の残存 base pane を見逃さない。
 - launch 失敗は reclaim より前に raise する (created workspace / root pane は残骸として残し、実装失敗
   として扱う。blind close しない)。
 - `pane close` 失敗は **non-fatal** (agent slot は既に live で、空 base pane は cosmetic 残骸)。
