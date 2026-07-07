@@ -356,6 +356,45 @@ def format_doctor_text(result: dict[str, Any]) -> str:
             f"  MOZYO_REDMINE_API_KEY: set={delivery_env.get('api_key_set', False)}"
         )
 
+    # herdr backend probe (Redmine #13355). The section is present only when the
+    # target repo selects the herdr terminal backend, so `backend: tmux` output
+    # stays byte-for-byte unchanged.
+    herdr = sections.get("herdr") or {}
+    if herdr:
+        counts = herdr.get("counts") or {}
+        lines.append(
+            f"herdr: {herdr.get('status', 'unknown')} "
+            f"workspace={herdr.get('workspace_segment') or '-'} "
+            f"agents={counts.get('managed', 0)} managed"
+            f"/{counts.get('unmanaged', 0)} unmanaged"
+        )
+        server = herdr.get("server") or {}
+        if server.get("reachable"):
+            lines.append("  server: reachable (agent list ok)")
+        else:
+            lines.append(
+                f"  server: UNREACHABLE ({server.get('reason') or '-'}) "
+                f"{server.get('detail') or ''}".rstrip()
+            )
+        for agent in herdr.get("agents", []):
+            if agent.get("managed"):
+                lines.append(
+                    f"  {agent.get('name', '-')}: state={agent.get('runtime_state', '-')} "
+                    f"raw={agent.get('raw_status') or '-'} "
+                    f"slot={agent.get('workspace_id', '-')}/{agent.get('lane_id', '-')}"
+                    f"/{agent.get('role', '-')} locator={agent.get('locator') or '-'}"
+                )
+            else:
+                lines.append(
+                    f"  {agent.get('name') or '<unnamed>'}: unmanaged "
+                    f"({agent.get('decode_reason') or '-'}) "
+                    f"state={agent.get('runtime_state', '-')}"
+                )
+        for note in herdr.get("notes", []):
+            lines.append(f"  note: {note}")
+        for action in herdr.get("next_action", []):
+            lines.append(f"  -> {action}")
+
     lines.append("")
     lines.append("result: " + ("ok" if result["ok"] else "needs attention"))
     return "\n".join(lines)

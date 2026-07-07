@@ -123,7 +123,7 @@ class LiveDoctorSections:
         tmux_section["artifact"] = _doctor.doctor_tmux_ui_artifact_info(
             _doctor.doctor_target(args)
         )
-        return {
+        sections = {
             "cli": _doctor.doctor_cli_section(_doctor.doctor_target(args)),
             "rules": _doctor.doctor_rules_section(_doctor.doctor_home(args)),
             "codex_skill": _doctor.doctor_codex_skill_section(),
@@ -137,6 +137,14 @@ class LiveDoctorSections:
             "otel": _doctor.doctor_otel_section(args),
             "delivery_env": _doctor.doctor_delivery_env_section(args),
         }
+        # The herdr backend probe is conditional (#13355): the collector returns
+        # None when the target repo does not select the herdr terminal backend,
+        # and the section key is then absent entirely — so `backend: tmux`
+        # doctor output (text and --json) stays byte-for-byte unchanged.
+        herdr_section = _doctor.doctor_herdr_section(args)
+        if herdr_section is not None:
+            sections["herdr"] = herdr_section
+        return sections
 
 
 class RunDoctorUseCase:
