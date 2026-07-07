@@ -154,7 +154,11 @@ class ProjectHerdrSublanesTest(unittest.TestCase):
 
 
 class HerdrLaneViewForWorktreeTest(unittest.TestCase):
-    """The dispatch-side single-lane read-back (Redmine #13356, j#73400 fix)."""
+    """The lane-record-joined single-lane read-back (Redmine #13356).
+
+    Not wired into dispatch-worker here — the herdr dispatch drive is #13357's
+    surface; this pins the seam it can adopt for a recorded identity check.
+    """
 
     _MODULE = (
         "mozyo_bridge.e_110_execution_platform."

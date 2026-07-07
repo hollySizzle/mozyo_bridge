@@ -221,16 +221,21 @@ def herdr_lane_view_for_worktree(
 ) -> Optional[SublaneLaneView]:
     """Resolve ONE lane worktree's live herdr lane view (fail-safe to ``None``).
 
-    The dispatch-side twin of :func:`herdr_sublane_views` (Redmine #13356): where the
-    list fold enumerates every lane workspace, this resolves the single lane anchored on
-    ``worktree_path`` — the ``sublane dispatch-worker`` ``read_lane`` read-back that was
-    structurally impossible before the lane metadata record existed (j#73400:
-    ``lane_not_resolved``). The lane's human identity (``lane_label`` / ``issue`` /
-    ``branch``) joins from the lane metadata record written at ``sublane create``; the
-    record is a display join, never routing authority — the gateway / worker locators
-    still come only from the live ``agent list`` inventory. Returns ``None`` when the
-    worktree has no resolvable segment, the inventory is unavailable, or neither managed
-    slot is live — the caller fails closed exactly as on the tmux path.
+    The single-lane twin of :func:`herdr_sublane_views` (Redmine #13356): where the
+    list fold enumerates every lane workspace, this resolves the lane anchored on
+    ``worktree_path``, with its human identity (``lane_label`` / ``issue`` /
+    ``branch``) joined from the lane metadata record written at ``sublane create`` —
+    unlike the #13331 actuator read-back, which only echoes the *requested* identity.
+    The record is a display join, never routing authority — the gateway / worker
+    locators still come only from the live ``agent list`` inventory. Returns ``None``
+    when the worktree has no resolvable segment, the inventory is unavailable, or
+    neither managed slot is live.
+
+    Deliberately **not wired into ``sublane dispatch-worker`` here**: the herdr
+    dispatch drive (lane read-back + measured-ACK forward) is Redmine #13357's
+    surface (``sublane_worker_dispatch_herdr_ops``, developed in a sibling lane);
+    this helper is the lane-record-joined read-back that surface can adopt when it
+    wants a recorded (not merely echoed) identity check.
     """
     from mozyo_bridge.core.state.lane_metadata import load_lane_records
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501

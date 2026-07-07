@@ -379,14 +379,33 @@ def inspect_single_db(home: Path, reads: StateStoreReads) -> dict[str, Any]:
 
     entry["components"] = components
     present = {c["component"] for c in components}
+    migrated_legacy = present & _SINGLE_DB_EXPECTED_COMPONENTS
     missing = sorted(_SINGLE_DB_EXPECTED_COMPONENTS - present)
-    if missing:
+    if missing and (migrated_legacy or not present):
+        # A migration RAN and stopped short (some legacy components imported,
+        # some not), or the container exists with an EMPTY metadata table (a
+        # write that died before recording anything, #12273 j#61689) — the true
+        # partial-migration hazards the doc forbids treating as complete
+        # (managed-state-model.md ### legacy import).
         entry["status"] = "warning"
         entry["readability"] = "partial"
         entry["next_action"] = "migrate_dry_run"
         entry["notes"].append(
             "partial migration: state_schema_components carries "
             f"{sorted(present) or 'no'} component(s); not yet migrated: {missing}"
+        )
+    elif missing:
+        # Native components only (Redmine #13356: a post-consolidation component
+        # such as `lane_metadata` creates the container without any legacy
+        # import). No migration has run and the legacy files remain the source
+        # of their state — exactly the healthy pre-migration posture, not a
+        # partial import; migrating stays an operator option, not a warning.
+        entry["status"] = "ok"
+        entry["next_action"] = "inspect"
+        entry["notes"].append(
+            "single DB carries native component(s) only "
+            f"({sorted(present) or 'none'}); no legacy migration has run — "
+            f"legacy files remain the source for: {missing}"
         )
     else:
         entry["status"] = "ok"

@@ -304,6 +304,71 @@ class InspectSingleDbTest(unittest.TestCase):
         self.assertEqual(entry["next_action"], "migrate_dry_run")
         self.assertEqual(entry["components"], [])
 
+    def test_native_components_only_is_ok_not_partial(self) -> None:
+        # Redmine #13356: a native component (lane_metadata) creates the
+        # container without any legacy import. No migration has run and the
+        # legacy files remain the source of their state — the healthy
+        # pre-migration posture, so the doctor must not flag it as a partial
+        # migration (which would flip doctor health to warning on every host
+        # the moment the first lane record is written).
+        name = self._path_name()
+        reads = FakeStateStoreReads(
+            existing={name},
+            probes={
+                name: _probe(
+                    user_version=STATE_STORE_SINGLE_DB_CONTAINER_VERSION,
+                    tables=["state_schema_components", "lane_metadata_records"],
+                )
+            },
+            schema_components={
+                name: [
+                    {
+                        "component": "lane_metadata",
+                        "schema_version": 1,
+                        "recovery_policy": "operator_current_state",
+                        "migrated_from": None,
+                    }
+                ]
+            },
+        )
+        entry = inspect_single_db(HOME, reads)
+        self.assertEqual(entry["status"], "ok")
+        self.assertEqual(entry["next_action"], "inspect")
+        self.assertIn("native component", entry["notes"][0])
+
+    def test_partial_legacy_migration_with_native_row_still_warns(self) -> None:
+        # One legacy component imported, others not: the true partial-migration
+        # hazard stays a warning even when a native component row coexists.
+        name = self._path_name()
+        reads = FakeStateStoreReads(
+            existing={name},
+            probes={
+                name: _probe(
+                    user_version=STATE_STORE_SINGLE_DB_CONTAINER_VERSION,
+                    tables=["state_schema_components"],
+                )
+            },
+            schema_components={
+                name: [
+                    {
+                        "component": "registry",
+                        "schema_version": 1,
+                        "recovery_policy": "authoritative_identity",
+                        "migrated_from": "registry.sqlite",
+                    },
+                    {
+                        "component": "lane_metadata",
+                        "schema_version": 1,
+                        "recovery_policy": "operator_current_state",
+                        "migrated_from": None,
+                    },
+                ]
+            },
+        )
+        entry = inspect_single_db(HOME, reads)
+        self.assertEqual(entry["status"], "warning")
+        self.assertEqual(entry["next_action"], "migrate_dry_run")
+
 
 class SectionRollUpTest(unittest.TestCase):
     def test_missing_ranks_as_ok(self) -> None:

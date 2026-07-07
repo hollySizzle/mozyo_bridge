@@ -55,12 +55,11 @@ import argparse
 import contextlib
 import io
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
     LiveSublaneActuatorOps,
@@ -181,18 +180,6 @@ class LiveWorkerDispatchOps:
         return LiveSublaneActuatorOps(repo_root=self.repo_root)
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
-        # Redmine #13356: under `terminal_transport.backend: herdr` the lane is its
-        # own herdr workspace, so the tmux pane-inventory read-back can never
-        # resolve it (j#73400 `lane_not_resolved`). Resolve it from the live herdr
-        # inventory + the lane metadata record instead; the tmux path is untouched
-        # (a broken / absent config resolves to tmux, like every herdr selector).
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            herdr_lane_view_for_worktree,
-            repo_backend_is_herdr,
-        )
-
-        if repo_backend_is_herdr(self.repo_root):
-            return herdr_lane_view_for_worktree(worktree_path)
         return self._actuator_ops().read_lane(worktree_path)
 
     def probe_worker_ready(self, worker_pane: str) -> bool:
@@ -211,34 +198,6 @@ class LiveWorkerDispatchOps:
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (  # noqa: E501
             capture_pane,
         )
-
-        # Redmine #13356: a herdr worker is not a tmux pane — readiness is "the
-        # locator is live in the inventory now" (the same reduced contract as the
-        # actuator's herdr probe_gateway_ready; the herdr send rail self-heals).
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            repo_backend_is_herdr,
-        )
-
-        if repo_backend_is_herdr(self.repo_root):
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-                list_herdr_agent_rows,
-            )
-            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-                _agent_locator,
-                _norm,
-            )
-
-            want = _norm(worker_pane)
-            if not want:
-                return False
-            try:
-                rows = list_herdr_agent_rows(os.environ)
-            except Exception:  # noqa: BLE001 — a probe never fails the drive.
-                return False
-            return any(
-                isinstance(row, Mapping) and _agent_locator(row) == want
-                for row in rows
-            )
 
         try:
             info = pane_info(worker_pane)
