@@ -294,8 +294,25 @@ class HerdrObservedUnitsSupplierTest(unittest.TestCase):
         )
         self.assertEqual(len(units), 1)
         self.assertEqual(units[0].repo_label, "wt_orphan")
-        self.assertIsNone(units[0].lane_label)
+        # j#73386 Q2 / j#73436 finding 1: the raw token IS the degraded lane
+        # label, so the display row never collapses it to the lane id.
+        self.assertEqual(units[0].lane_label, "wt_orphan")
         self.assertTrue(any("lane_record_missing" in d for d in diagnostics))
+
+    def test_missing_lane_record_display_row_shows_raw_token(self) -> None:
+        # Regression for j#73436 finding 1: pin the degrade all the way to the
+        # rendered display row — its lane_label must be the raw wt_<hash>
+        # token, never the lane id (`default`).
+        units, _diagnostics = self._run(
+            lister=_FakeLister(rows=[_agent_row("wt_orphan", "codex", "wX:p2", "idle")]),
+            lane_records={},
+            registry={},
+        )
+        view = build_grouped_display_view(build_grouped_read_model(None, units))
+        row = view.all_units()[0]
+        self.assertEqual(row.lane_label, "wt_orphan")
+        self.assertEqual(row.backend, BACKEND_HERDR)
+        self.assertIsNone(row.issue)
 
     def test_duplicate_role_degrades_to_contradiction(self) -> None:
         units, _diagnostics = self._run(

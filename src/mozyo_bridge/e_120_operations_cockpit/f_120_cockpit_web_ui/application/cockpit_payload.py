@@ -487,8 +487,13 @@ def herdr_observed_units(
             repo_label = record.lane_label
         else:
             # No record and no registry entry: fail-open degrade to the raw
-            # token, kept visible (j#73386: lane_record_missing).
+            # token, kept visible (j#73386: lane_record_missing). The token is
+            # ALSO the row's lane label (j#73386 Q2: `lane_label=wt_<hash>`) —
+            # without it the display row would fall back to the lane id
+            # (`default`) and the raw token would vanish from the lane column
+            # (j#73436 finding 1).
             repo_label = workspace_id
+            lane_label = workspace_id
             diagnostics.append(
                 f"lane_record_missing: herdr workspace {workspace_id} has no "
                 f"lane metadata record; showing the raw token"
