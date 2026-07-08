@@ -42,6 +42,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_EXECUTED,
     STEP_READY,
     STEP_SKIPPED,
+    ActuationStep,
+    SublaneActuationOutcome,
     render_actuation_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
@@ -884,6 +886,44 @@ class JsonEnvelopeContractTests(unittest.TestCase):
         rc, out, err = self._drive_with_quiet(quiet=False)
         self.assertEqual(rc, 0)
         self.assertIn("INNER-DELIVERY-PROGRESS", out)
+
+
+class ActuateTextPathRedactionTests(unittest.TestCase):
+    """Redmine #13368: ``format_actuate_text`` carries no host-local absolute path."""
+
+    _WT = "/workspace/parent/mozyo_bridge_issue_13368_record_path_redaction"
+    _LABEL = "mozyo_bridge_issue_13368_record_path_redaction"
+
+    def test_actuate_text_redacts_worktree_line_and_step_command(self):
+        outcome = SublaneActuationOutcome(
+            status=ACTUATE_EXECUTED,
+            execute=True,
+            reason="ok",
+            issue="13368",
+            lane_label="issue_13368_record_path_redaction",
+            branch="issue_13368_record_path_redaction",
+            worktree_path=self._WT,
+            launch_action="create_worktree",
+            gateway_pane="%1",
+            worker_pane="%2",
+            steps=(
+                ActuationStep(
+                    order=1,
+                    title="create worktree",
+                    status=STEP_EXECUTED,
+                    detail="created",
+                    command=f"git worktree add {self._WT} -b issue_13368_record_path_redaction",
+                ),
+            ),
+        )
+        text = format_actuate_text(outcome)
+        # Neither the durable-record `- worktree:` line nor the `$ git worktree add`
+        # command preview carries the absolute path.
+        self.assertNotIn(self._WT, text)
+        self.assertIn(f"- worktree: {self._LABEL}", text)
+        self.assertIn(f"git worktree add {self._LABEL}", text)
+        # The machine payload keeps the absolute path (local surface).
+        self.assertEqual(outcome.as_payload()["worktree_path"], self._WT)
 
 
 if __name__ == "__main__":

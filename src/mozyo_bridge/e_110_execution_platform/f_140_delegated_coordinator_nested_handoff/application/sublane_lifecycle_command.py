@@ -61,8 +61,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
     SublaneRetirePreflight,
     plan_sublane_create,
+    portable_worktree_label,
     preflight_sublane_retire,
     project_sublanes,
+    redact_worktree_paths,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
     normalize_work_unit_granularity,
@@ -422,7 +424,10 @@ def format_list_text(outcome: SublaneListOutcome) -> str:
         )
         lines.append(
             f"    gateway={lane.gateway_pane or '-'} worker={lane.worker_pane or '-'}"
-            f" worktree={lane.repo_root or '-'}"
+            # #13368: `sublane list` rows are pasted into durable records; show the
+            # portable lane worktree sibling basename, not the host-local absolute path
+            # (the absolute repo_root stays in the `--json` payload / local state).
+            f" worktree={portable_worktree_label(lane.repo_root)}"
         )
         # Host window identity (#13086): one address when the lane is intact, the
         # full split list when its panes span windows (no guessing a host).
@@ -436,7 +441,9 @@ def format_list_text(outcome: SublaneListOutcome) -> str:
     return "\n".join(lines)
 
 
-def format_create_text(outcome: SublaneCreateOutcome) -> str:
+def format_create_text(
+    outcome: SublaneCreateOutcome, worktree_path: Optional[str] = None
+) -> str:
     plan = outcome.plan
     lines = [f"sublane create: {plan.status}", f"  reason: {plan.reason}"]
     if plan.launch_action:
@@ -450,10 +457,15 @@ def format_create_text(outcome: SublaneCreateOutcome) -> str:
         lines.append(f"    {step.order}. {step.title}: {step.detail}")
         if step.command:
             lines.append(f"       $ {step.command}")
-    return "\n".join(lines)
+    # #13368: the plan text is pasteable; redact the host-local absolute worktree path
+    # from the replayable `git worktree add` / `cockpit append --repo` command lines to
+    # its portable sibling basename (the exact command stays in the `--json` payload).
+    return redact_worktree_paths("\n".join(lines), worktree_path)
 
 
-def format_retire_text(outcome: SublaneRetireOutcome) -> str:
+def format_retire_text(
+    outcome: SublaneRetireOutcome, worktree_path: Optional[str] = None
+) -> str:
     pre = outcome.preflight
     decision = pre.decision
     lines = [
@@ -472,7 +484,10 @@ def format_retire_text(outcome: SublaneRetireOutcome) -> str:
     lines.append("  durable journal:")
     for jline in pre.journal.splitlines():
         lines.append(f"    {jline}")
-    return "\n".join(lines)
+    # #13368: the retire runbook is pasteable; redact the host-local absolute worktree
+    # path from the replayable `git worktree remove` command to its portable sibling
+    # basename (the exact command stays in the `--json` payload for local replay).
+    return redact_worktree_paths("\n".join(lines), worktree_path)
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +605,7 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        print(format_create_text(outcome))
+        print(format_create_text(outcome, worktree_path=request.worktree_path))
     return 1 if outcome.plan.status == CREATE_BLOCKED else 0
 
 
@@ -643,7 +658,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        print(format_retire_text(outcome))
+        print(format_retire_text(outcome, worktree_path=worktree))
         if close_result is not None:
             print(_format_herdr_close_text(close_result))
     return 0 if outcome.preflight.may_retire else 1

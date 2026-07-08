@@ -62,6 +62,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneCreateRequest,
     SublaneLaneView,
     parse_issue_from_lane_label,
+    portable_worktree_label,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
     DEFAULT_GATEWAY_READY_INTERVAL_SECONDS,
@@ -452,8 +453,12 @@ class SublaneActuateUseCase:
                     order=1,
                     title="create worktree",
                     status=STEP_EXECUTED,
-                    detail=f"created worktree {request.worktree_path} on branch "
-                    f"{request.branch}"
+                    # #13368: prose detail is pasteable; name the portable sibling
+                    # basename, not the host-local absolute path (the replayable
+                    # `git worktree add` command below keeps the absolute path for
+                    # local replay, redacted only in the human-readable text render).
+                    detail=f"created worktree {portable_worktree_label(request.worktree_path)} "
+                    f"on branch {request.branch}"
                     + (
                         f" from base {request.base_ref}"
                         if (request.base_ref or "").strip()
@@ -648,7 +653,9 @@ class SublaneActuateUseCase:
                 order=3,
                 title="confirm lane stamps",
                 status=STEP_EXECUTED,
-                detail=f"lane visible: repo_root={lane.repo_root} "
+                # #13368: redact the pasteable prose detail to the portable sibling
+                # basename (the absolute repo root remains in the structured payload).
+                detail=f"lane visible: repo_root={portable_worktree_label(lane.repo_root)} "
                 f"gateway={gateway_pane} worker={worker_pane} state={lane.state}",
                 command=None,
             )

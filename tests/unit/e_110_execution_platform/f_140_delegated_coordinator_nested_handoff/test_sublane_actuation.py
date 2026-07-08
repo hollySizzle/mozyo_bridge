@@ -129,5 +129,25 @@ class JournalRenderTests(unittest.TestCase):
         self.assertIn("coordinator callback", text)
 
 
+class TestActuationJournalPathRedaction(unittest.TestCase):
+    """Redmine #13368: the pasteable durable record carries no host-local abs path."""
+
+    # Synthetic host-local worktree path (never a real home path; feedback:
+    # no_homepath_or_secret_shaped_literals_in_tracked_files).
+    _WT = "/workspace/parent/mozyo_bridge_issue_13368_record_path_redaction"
+    _LABEL = "mozyo_bridge_issue_13368_record_path_redaction"
+
+    def test_journal_worktree_line_is_sibling_basename_not_abs(self):
+        text = render_actuation_journal(_outcome(worktree_path=self._WT))
+        self.assertNotIn(self._WT, text)
+        self.assertIn(f"- worktree: {self._LABEL}", text)
+
+    def test_json_payload_retains_absolute_worktree_path(self):
+        # The machine field stays local/absolute (design decision, mirrors #12098
+        # ExecutionRoot.workdir); only the pasteable text redacts.
+        payload = _outcome(worktree_path=self._WT).as_payload()
+        self.assertEqual(payload["worktree_path"], self._WT)
+
+
 if __name__ == "__main__":
     unittest.main()

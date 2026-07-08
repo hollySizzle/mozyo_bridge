@@ -84,6 +84,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneLaneView,
+    redact_worktree_paths,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (
     REASON_LANE_NOT_RESOLVED,
@@ -701,7 +702,11 @@ def format_worker_dispatch_text(outcome: WorkerDispatchOutcome) -> str:
     lines.append("  durable record:")
     for jline in render_worker_dispatch_journal(outcome).splitlines():
         lines.append(f"    {jline}")
-    return "\n".join(lines)
+    # #13368: keep the pasteable text free of the host-local absolute worktree path
+    # (the machine `worktree_path` stays in the `--json` payload). The same-lane send
+    # command uses `--target-repo auto`, so this is defence-in-depth against a future
+    # command shape carrying the path.
+    return redact_worktree_paths("\n".join(lines), outcome.worktree_path)
 
 
 def _resolve_worker_dispatch_ops(

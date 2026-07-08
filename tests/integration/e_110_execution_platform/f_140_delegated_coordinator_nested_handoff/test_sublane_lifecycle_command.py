@@ -24,8 +24,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RetireAssertions,
     SublaneCreateUseCase,
     SublaneLifecycleOps,
+    SublaneListOutcome,
     SublaneListUseCase,
     SublaneRetireUseCase,
+    format_create_text,
+    format_list_text,
+    format_retire_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     INTEGRATION_BLOCKED,
@@ -34,8 +38,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
     CREATE_PLANNED,
+    SUBLANE_STATE_ACTIVE,
     SublaneCreateRequest,
+    SublaneLaneView,
 )
+
+# Redmine #13368: synthetic host-local worktree path (never a real home path).
+_WT = "/workspace/parent/mozyo_bridge_issue_13368_record_path_redaction"
+_WT_LABEL = "mozyo_bridge_issue_13368_record_path_redaction"
 
 
 class FakeOps:
@@ -240,6 +250,69 @@ class RetireUseCaseTests(unittest.TestCase):
             branch="b", integration_branch=None, assertions=RetireAssertions(),
         )
         self.assertFalse(outcome.preflight.may_retire)
+
+
+class RecordPathRedactionTests(unittest.TestCase):
+    """Redmine #13368: command-layer pasteable text carries no host-local abs path.
+
+    Every ``format_*_text`` a coordinator pastes into a Redmine journal redacts the
+    absolute worktree path to its portable sibling basename; the machine ``--json``
+    payload (``as_payload``) keeps the absolute path for local use.
+    """
+
+    def _all_true(self):
+        return RetireAssertions(
+            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            verification_passed=True, durable_record_recorded=True,
+            target_identity_known=True,
+        )
+
+    def test_list_text_shows_basename_json_keeps_abs(self):
+        lane = SublaneLaneView(
+            workspace_id="ws", lane_id="lane-1",
+            lane_label="issue_13368_record_path_redaction", issue="13368",
+            branch="issue_13368_record_path_redaction", repo_root=_WT,
+            gateway_pane="%1", worker_pane="%2", state=SUBLANE_STATE_ACTIVE,
+        )
+        outcome = SublaneListOutcome(lanes=(lane,))
+        text = format_list_text(outcome)
+        self.assertNotIn(_WT, text)
+        self.assertIn(f"worktree={_WT_LABEL}", text)
+        # Machine payload retains the absolute repo root.
+        self.assertEqual(outcome.as_payload()["sublanes"][0]["repo_root"], _WT)
+
+    def test_create_plan_text_redacts_git_worktree_add_command(self):
+        outcome = SublaneCreateUseCase(FakeOps(git=True)).run(
+            SublaneCreateRequest(
+                issue="13368",
+                lane_label="issue_13368_record_path_redaction",
+                branch="issue_13368_record_path_redaction",
+                worktree_path=_WT,
+            )
+        )
+        text = format_create_text(outcome, worktree_path=_WT)
+        self.assertNotIn(_WT, text)
+        self.assertIn(_WT_LABEL, text)
+        # The plan JSON keeps the exact replayable command with the absolute path.
+        commands = [s["command"] for s in outcome.as_payload()["steps"] if s["command"]]
+        self.assertTrue(any(_WT in c for c in commands))
+
+    def test_retire_runbook_text_redacts_but_json_keeps_abs(self):
+        outcome = SublaneRetireUseCase(FakeOps(git=True, dirty=False)).run(
+            issue="13368", lane_label="issue_13368_record_path_redaction",
+            worktree_path=_WT, branch="issue_13368_record_path_redaction",
+            integration_branch=None, assertions=self._all_true(),
+        )
+        text = format_retire_text(outcome, worktree_path=_WT)
+        self.assertNotIn(_WT, text)
+        self.assertIn(f"git worktree remove {_WT_LABEL}", text)
+        # The runbook JSON keeps the exact replayable command with the absolute path.
+        commands = [
+            s["command"]
+            for s in outcome.as_payload()["runbook"]
+            if s["command"]
+        ]
+        self.assertTrue(any(_WT in c for c in commands))
 
 
 if __name__ == "__main__":
