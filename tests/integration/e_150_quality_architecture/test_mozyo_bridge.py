@@ -202,6 +202,50 @@ class PathResolutionTest(unittest.TestCase):
 
             self.assertEqual(workspace.resolve(), find_repo_root(nested))
 
+    def test_find_repo_root_uses_config_only_adoption_marker(self) -> None:
+        # A non-Git project adopted by hand-writing `.mozyo-bridge/config.yaml`
+        # alone (no scaffold manifest / anchor) is a first-class root: the walk
+        # from a child cwd must stop at the adopted root, not fall through to
+        # the child / an incidental ancestor (Redmine #13379 review j#73711).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "proj"
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            (root / ".mozyo-bridge").mkdir()
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\n", encoding="utf-8"
+            )
+
+            resolved = find_repo_root(nested)
+            self.assertEqual(root.resolve(), resolved)
+
+            from mozyo_bridge.shared.paths import workspace_adoption_marker
+
+            self.assertEqual(
+                ".mozyo-bridge/config.yaml", workspace_adoption_marker(resolved)
+            )
+
+    def test_config_only_root_selects_herdr_backend_from_child_cwd(self) -> None:
+        # The same walk feeds the repo-local config load at the entrypoint: a
+        # config-only adopted root must have its `terminal_transport.backend:
+        # herdr` selection read from a child cwd (Redmine #13379 j#73711).
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "proj"
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            (root / ".mozyo-bridge").mkdir()
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n",
+                encoding="utf-8",
+            )
+
+            config = load_repo_local_config(None, start=nested)
+            self.assertTrue(config.terminal_transport.herdr_enabled)
+
     def test_resolve_repo_root_prefers_explicit_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(Path(tmp).resolve(), resolve_repo_root(tmp))

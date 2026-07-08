@@ -45,11 +45,18 @@ WORKSPACE_MARKERS = (
     ".mozyo-bridge/workspace-anchor.json",
     ".mozyo-bridge/workspace.json",
 )
+# The repo-local config is equally an adoption-time root marker (Redmine
+# #13379 review j#73711): a non-Git project adopted by hand-writing
+# `.mozyo-bridge/config.yaml` alone (no scaffold manifest, no registry
+# anchor) must resolve its root from a child cwd exactly like a scaffolded
+# workspace — otherwise the bare-`mozyo` adoption gate refuses an adopted
+# project and the repo-local backend selection never reads its config.
+REPO_LOCAL_CONFIG_MARKER = ".mozyo-bridge/config.yaml"
 # Markers that establish a repo / workspace root for identity inference. The
 # walk returns the deepest ancestor bearing ANY marker, so adding workspace
 # markers can only stop the walk earlier (at a more specific root) — it never
 # overrides a deeper git / pyproject root.
-REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS
+REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS + (REPO_LOCAL_CONFIG_MARKER,)
 # Markers that establish mozyo ADOPTION of an already-resolved root (Redmine
 # #13379). Identity inference (which ancestor is the root) and adoption (did
 # this project opt into mozyo) are different questions: bare `mozyo` in an
@@ -60,7 +67,7 @@ REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS
 # anchors (`scaffold apply` manifest, `workspace register`). A bare
 # `.mozyo-bridge/` directory is deliberately NOT a marker — repo-local stores
 # (state.sqlite, ledgers) may create it as a side effect without adoption.
-ADOPTION_MARKERS = (".mozyo-bridge/config.yaml",) + WORKSPACE_MARKERS
+ADOPTION_MARKERS = (REPO_LOCAL_CONFIG_MARKER,) + WORKSPACE_MARKERS
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mozyo-bridge"
 
 
