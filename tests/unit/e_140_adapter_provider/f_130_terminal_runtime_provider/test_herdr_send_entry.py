@@ -317,5 +317,108 @@ class CrossWorkspaceHerdrSendTargetTest(unittest.TestCase):
         self.assertEqual(c.exception.reason, "target_unavailable")
 
 
+class SharedWorkspaceExplicitLaneDispatchTest(unittest.TestCase):
+    """Redmine #13377 (review j#73640 finding 1): coordinator -> lane gateway under
+    the shared project workspace model is a SAME-workspace, explicit-lane send whose
+    ``--target-repo <lane worktree>`` is the repo/cwd gate (j#73613). The synthesized
+    target ``cwd`` must be the lane worktree — the resolved lane slot's launch cwd
+    (``prepare_session --cwd``) — not the sender's repo root; otherwise the downstream
+    ``target_repo_mismatch`` gate compares ``expected`` = lane worktree against
+    ``observed`` = main repo and structurally blocks the dispatch. An implicit send
+    (no ``--target-lane``) keeps the sender-root cwd, so the repo gate's conservatism
+    for implicit sends is unchanged."""
+
+    @staticmethod
+    def _args(ctx, *, target_repo=None, target_lane=None, to="codex"):
+        ns = argparse.Namespace()
+        ns.repo = str(ctx.repo)
+        ns.to = to
+        ns.target = None
+        if target_repo is not None:
+            ns.target_repo = str(target_repo)
+        ns.target_lane = target_lane
+        return ns
+
+    def _resolve(self, ctx, args):
+        with patch("subprocess.run", ctx.run), patch.dict(
+            os.environ, ctx.env(), clear=True
+        ):
+            return resolve_herdr_send_target(args, receiver=args.to)
+
+    @staticmethod
+    def _lane_worktree(tmp, ctx) -> Path:
+        # A stand-in lane worktree that inherits the PROJECT identity: it carries the
+        # sender repo's own anchor (the plain-dir harness cannot probe the real git
+        # worktree topology, so the inheritance is materialized as the shared anchor).
+        lane = Path(tmp) / "lane-wt"
+        (lane / ".mozyo-bridge").mkdir(parents=True)
+        anchor = ctx.repo / ".mozyo-bridge" / "workspace-anchor.json"
+        (lane / ".mozyo-bridge" / "workspace-anchor.json").write_text(
+            anchor.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        return lane
+
+    def test_explicit_lane_dispatch_synthesizes_lane_worktree_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="default")
+            lane_wt = self._lane_worktree(tmp, ctx)
+            lane_label = "issue_13377_x"
+            ctx.rows = [
+                # The lane gateway slot of the SAME project workspace...
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "codex", lane_label),
+                    "pane_id": "w2:p4",
+                },
+                # ...never the coordinator's own default-lane codex.
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "codex", "default"),
+                    "pane_id": "w2:p2",
+                },
+            ]
+            pane = self._resolve(
+                ctx,
+                self._args(ctx, target_repo=lane_wt, target_lane=lane_label, to="codex"),
+            )
+        self.assertEqual(pane["id"], "w2:p4")
+        self.assertEqual(pane["workspace_id"], ctx.workspace_id)
+        self.assertEqual(pane["lane_id"], lane_label)
+        # j#73640 regression: the target record's cwd is the LANE worktree (the
+        # explicit --target-repo), so the downstream target_repo_mismatch gate
+        # compares like-for-like instead of blocking on the sender's own root.
+        self.assertEqual(pane["cwd"], str(lane_wt))
+        self.assertNotEqual(pane["cwd"], str(ctx.repo))
+
+    def test_implicit_send_keeps_sender_root_cwd(self) -> None:
+        # No --target-lane: the derived same-lane send keeps cwd = the sender's repo
+        # root (the repo gate's conservative default is unchanged by #13377).
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="lane-1")
+            ctx.rows = [
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "claude", "lane-1"),
+                    "pane_id": "wT:pT",
+                }
+            ]
+            pane = self._resolve(ctx, self._args(ctx, to="claude"))
+        self.assertEqual(pane["cwd"], str(Path(ctx.repo).resolve()))
+
+    def test_explicit_lane_without_target_repo_keeps_sender_root_cwd(self) -> None:
+        # --target-lane alone (no explicit repo gate requested): nothing to compare
+        # like-for-like against, so cwd stays the sender root.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="default")
+            ctx.rows = [
+                {
+                    "name": encode_assigned_name(ctx.workspace_id, "codex", "issue_1_x"),
+                    "pane_id": "w2:p4",
+                }
+            ]
+            pane = self._resolve(
+                ctx, self._args(ctx, target_lane="issue_1_x", to="codex")
+            )
+        self.assertEqual(pane["id"], "w2:p4")
+        self.assertEqual(pane["cwd"], str(Path(ctx.repo).resolve()))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

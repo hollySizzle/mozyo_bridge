@@ -270,8 +270,8 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     # same-workspace path unchanged.
     target_workspace_id = _explicit_target_workspace_id(args)
     cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
+    explicit_lane = getattr(args, "target_lane", None)
     if cross_workspace:
-        explicit_lane = getattr(args, "target_lane", None)
         resolution = resolve_herdr_cross_workspace_target(
             receiver,
             target_workspace_id,
@@ -288,7 +288,6 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         # #13302 ledger vocabulary rather than scanning all lanes. `--target-lane`
         # (Redmine #13377) is the explicit-lane field a coordinator→lane-gateway
         # dispatch passes under the shared project workspace model.
-        explicit_lane = getattr(args, "target_lane", None)
         resolution = resolve_herdr_route_target(
             receiver,
             sender,
@@ -306,12 +305,23 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     identity = resolution.identity
     assert identity is not None  # success guarantees an identity
     # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
-    # reads the target pane's own cwd). For a same-workspace send that is the sender's repo;
-    # for a #13331 cross-workspace dispatch it is the named lane worktree (`--target-repo`),
-    # so the downstream `target_repo_mismatch` gate compares like-for-like (observed target
-    # cwd vs the explicit `--target-repo`) instead of blocking on the sender's own root.
-    if cross_workspace:
-        target_cwd = str(Path(getattr(args, "target_repo")).expanduser())
+    # reads the target pane's own cwd). Three shapes (#13331 / #13377 j#73640 finding 1):
+    #
+    # - a #13331 cross-workspace dispatch names the target repo explicitly, so `cwd` is
+    #   the expanded `--target-repo` and the downstream `target_repo_mismatch` gate
+    #   compares like-for-like (observed target cwd vs the explicit `--target-repo`);
+    # - a #13377 shared-model explicit-lane dispatch (`--target-lane` + an explicit
+    #   non-auto `--target-repo <lane worktree>`) resolves in the sender's OWN workspace,
+    #   but the resolved lane slot's launch cwd IS the lane worktree (`prepare_session
+    #   --cwd`), not the sender's repo — synthesizing the sender root here made the repo
+    #   gate structurally fail (`expected` = lane worktree vs `observed` = main repo).
+    #   The explicit pair rides the same like-for-like precedent as cross-workspace;
+    # - every other same-workspace send (no explicit lane) keeps `cwd` = the sender's
+    #   repo root, so the repo gate's conservatism for implicit sends is unchanged.
+    raw_target_repo = getattr(args, "target_repo", None)
+    explicit_target_repo = bool(raw_target_repo) and raw_target_repo != AUTO_TARGET_REPO
+    if cross_workspace or (explicit_target_repo and _norm(explicit_lane)):
+        target_cwd = str(Path(raw_target_repo).expanduser())
     else:
         target_cwd = str(repo_root)
     return {
