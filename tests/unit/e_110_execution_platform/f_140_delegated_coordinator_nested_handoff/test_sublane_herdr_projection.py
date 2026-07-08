@@ -487,6 +487,109 @@ class HerdrStaleHintsTest(unittest.TestCase):
         )
 
 
+class RepoScopeWorkspaceIdTest(unittest.TestCase):
+    """The record-scoping key resolves the MAIN workspace identity (j#73469).
+
+    A linked-worktree caller must scope by its INHERITED main workspace id (what
+    ``sublane create`` stamped into the records), never by its own per-lane
+    ``wt_<hash>`` segment.
+    """
+
+    _REGISTRY = "mozyo_bridge.core.state.workspace_registry"
+    _SESSION_START = (
+        "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+        "application.herdr_session_start"
+    )
+
+    def test_linked_worktree_resolves_main_identity(self) -> None:
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            repo_scope_workspace_id,
+        )
+
+        main_root = Path("/work/main_checkout")
+        with mock.patch(
+            f"{self._REGISTRY}._main_worktree_root", return_value=main_root
+        ), mock.patch(
+            f"{self._SESSION_START}.herdr_workspace_segment",
+            side_effect=lambda p: "wsMain" if p == main_root else "wt_lane",
+        ):
+            self.assertEqual(repo_scope_workspace_id(Path("/work/lane")), "wsMain")
+
+    def test_main_checkout_resolves_itself(self) -> None:
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            repo_scope_workspace_id,
+        )
+
+        with mock.patch(
+            f"{self._REGISTRY}._main_worktree_root", return_value=None
+        ), mock.patch(
+            f"{self._SESSION_START}.herdr_workspace_segment",
+            return_value="wsMain",
+        ):
+            self.assertEqual(
+                repo_scope_workspace_id(Path("/work/main_checkout")), "wsMain"
+            )
+
+
+class HerdrSublaneViewsLinkedWorktreeTest(unittest.TestCase):
+    """Regression (j#73469 finding 1): a linked-worktree caller still scopes
+    the CURRENT repo's records into the vanished / duplicate diagnosis."""
+
+    _MODULE = (
+        "mozyo_bridge.e_110_execution_platform."
+        "f_140_delegated_coordinator_nested_handoff.application."
+        "sublane_herdr_projection"
+    )
+    _REGISTRY = "mozyo_bridge.core.state.workspace_registry"
+    _SESSION_START = (
+        "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+        "application.herdr_session_start"
+    )
+
+    def test_linked_worktree_caller_still_emits_current_repo_vanished_row(
+        self,
+    ) -> None:
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            herdr_sublane_views,
+        )
+
+        lane_path = Path("/work/lane_worktree").expanduser().resolve()
+        main_root = Path("/work/main_checkout")
+        gone = LaneMetadataRecord(
+            lane_workspace_token="wt_gone",
+            # Stamped at create time with the MAIN checkout's identity.
+            repo_workspace_id="wsMain",
+            issue_id="303",
+            lane_label="issue_303_gone",
+        )
+
+        def _segment(path):
+            # The caller's own segment is a per-lane token; only the main
+            # checkout resolves to the registry/anchor workspace id.
+            return "wsMain" if path == main_root else "wt_caller_lane"
+
+        with mock.patch(
+            f"{self._SESSION_START}.herdr_workspace_segment", side_effect=_segment
+        ), mock.patch(
+            f"{self._REGISTRY}._main_worktree_root", return_value=main_root
+        ), mock.patch(
+            f"{self._MODULE}.list_herdr_agent_rows", return_value=[]
+        ), mock.patch(
+            "mozyo_bridge.core.state.lane_metadata.load_lane_records",
+            return_value={"wt_gone": gone},
+        ):
+            views = herdr_sublane_views(lane_path)
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].workspace_id, "wt_gone")
+        self.assertEqual(views[0].stale_hints, (LANE_WORKSPACE_MISSING_HINT,))
+
+
 class ProbeWorktreeResolvedTest(unittest.TestCase):
     """The live git-checkout probe's unknown / gone boundary (pure input shapes)."""
 

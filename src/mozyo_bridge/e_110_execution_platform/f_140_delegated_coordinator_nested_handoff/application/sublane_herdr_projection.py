@@ -117,6 +117,35 @@ def list_herdr_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping[str, objec
     return _list_rows(binary, subprocess.run, 30.0)
 
 
+def repo_scope_workspace_id(repo_root: Path) -> str:
+    """The caller repo's MAIN workspace identity — the record-scoping key (j#73469).
+
+    ``sublane create`` stamps each lane record's ``repo_workspace_id`` with the
+    creating repo root's segment — the coordinator's **main checkout**, so the
+    registry / anchor workspace id. A linked worktree *inherits* that identity
+    (#13152) rather than owning one, and its own mzb1 segment is a per-lane
+    ``wt_<hash>`` token no record ever carries — so the scope key must resolve
+    through the main worktree: the same ``_main_worktree_root`` probe the #13152
+    registry inheritance uses, then the same shared segment resolver the create
+    site stamped with. A main / standalone checkout resolves as itself
+    (byte-for-byte the create-site value). ``""`` on any failure — the vanished /
+    duplicate diagnosis then stays quiet rather than guessing (fail-safe).
+    """
+    from mozyo_bridge.core.state.workspace_registry import _main_worktree_root
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        herdr_workspace_segment,
+    )
+
+    try:
+        resolved = Path(repo_root).expanduser().resolve()
+        main_root = _main_worktree_root(resolved)
+        return herdr_workspace_segment(
+            main_root if main_root is not None else resolved
+        )
+    except (OSError, ValueError):
+        return ""
+
+
 def probe_worktree_resolved(path: str) -> Optional[bool]:
     """Read-only probe: does ``path`` still resolve to a live git checkout?
 
@@ -408,18 +437,19 @@ def herdr_sublane_views(
     # slot) and the worktree probe supplies the ``worktree_unresolved`` material.
     lane_records = load_lane_records()
 
-    # own_ws doubles as the repo scope key (j#73459 finding 1): `sublane create`
-    # stamps each record's `repo_workspace_id` through the SAME shared resolver
-    # over the creating repo root, so only this repo's records feed the vanished /
-    # duplicate diagnosis. (Run from a lane worktree the segment is a wt_<hash>
-    # token no record carries — the diagnosis then stays quiet, fail-safe.)
+    # Repo scope key (j#73459 finding 1, corrected per j#73469 finding 1): the
+    # caller's MAIN workspace identity — inherited through the main worktree for
+    # a linked-worktree caller — so `sublane list` run from a lane worktree
+    # repo-local CLI still scopes this repo's records into the vanished /
+    # duplicate diagnosis. NOT own_ws: that is the mzb1 segment (a per-lane
+    # token for a linked worktree) and only correct as the live-row exclusion.
     return project_herdr_sublanes(
         rows,
         exclude_workspace_id=own_ws,
         resolve_repo_root=_resolve,
         lane_records=lane_records,
         worktree_resolved=probe_worktree_resolved,
-        repo_workspace_id=own_ws,
+        repo_workspace_id=repo_scope_workspace_id(repo_root),
     )
 
 
@@ -517,4 +547,5 @@ __all__ = (
     "probe_worktree_resolved",
     "project_herdr_sublanes",
     "repo_backend_is_herdr",
+    "repo_scope_workspace_id",
 )
