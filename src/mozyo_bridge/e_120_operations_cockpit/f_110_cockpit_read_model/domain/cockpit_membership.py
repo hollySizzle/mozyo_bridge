@@ -90,6 +90,12 @@ WARN_TMUX_FIELDS_DEGRADED = "tmux_fields_degraded"
 # Units", so the operator never mistakes an unreadable herdr snapshot for an empty
 # one (#13303; mirrors the fail-closed herdr lister contract).
 WARN_HERDR_INVENTORY_UNAVAILABLE = "herdr_inventory_unavailable"
+# Per-row advisory (#13367): a herdr lane Unit had no lane metadata record, so its
+# human identity (lane_label / issue) could not be joined and the row fell open to
+# the raw ``wt_<hash>`` workspace token as its lane label. Mirrors the sublane-list
+# ``lane_record_missing`` hint (#13356 j#73386) — advisory display material only,
+# never a routing / liveness fact.
+WARN_HERDR_LANE_RECORD_MISSING = "lane_record_missing"
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,15 @@ class MembershipObservation:
     defaults to :data:`BACKEND_TMUX` so every existing tmux caller is unchanged;
     a :data:`BACKEND_HERDR` observation makes :func:`build_membership` degrade the
     tmux-only fields (panes / window / geometry) honestly.
+
+    ``issue`` / ``lane_record_missing`` are the herdr lane-record display join
+    (#13367): the application layer LEFT JOINs the #13356 lane metadata record onto
+    each herdr Unit, filling ``lane_label`` / ``issue`` with the recorded human
+    identity. When no record resolves, the caller sets ``lane_label`` to the raw
+    ``wt_<hash>`` token and ``lane_record_missing=True`` so
+    :func:`build_membership` emits the fail-open :data:`WARN_HERDR_LANE_RECORD_MISSING`
+    advisory. Both default to the tmux-neutral values so a tmux observation is
+    unchanged.
     """
 
     workspace_id: str
@@ -157,6 +172,8 @@ class MembershipObservation:
     window_id: str
     repo_root: str = ""
     backend: str = BACKEND_TMUX
+    issue: str = ""
+    lane_record_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,6 +197,10 @@ class WorkspaceMembership:
     warnings: tuple[MembershipWarning, ...] = ()
     registry_canonical_path: str = ""
     backend: str = BACKEND_TMUX
+    #: The herdr lane's recorded issue id (#13367 lane-record join). Empty for a
+    #: tmux Unit and only serialised for a non-tmux row (see :meth:`as_dict`), so
+    #: the tmux membership JSON stays byte-invariant.
+    issue: str = ""
 
     @property
     def panes_present(self) -> bool:
@@ -213,7 +234,7 @@ class WorkspaceMembership:
         return self.member and self.geometry_status in (GEOM_OK, GEOM_UNKNOWN)
 
     def as_dict(self) -> dict:
-        return {
+        payload = {
             "workspace_id": self.workspace_id,
             "label": self.label,
             "repo_root": self.repo_root,
@@ -234,6 +255,13 @@ class WorkspaceMembership:
             "ok": self.ok,
             "warnings": [w.as_dict() for w in self.warnings],
         }
+        # The lane-record issue join is a herdr-only field (#13367): serialise it
+        # only for a non-tmux row so the tmux membership JSON stays byte-invariant
+        # (the acceptance's "tmux 表示 byte-compatible"). A herdr row always carries
+        # the key — the recorded issue, or ``""`` on the fail-open degrade.
+        if self.backend != BACKEND_TMUX:
+            payload["issue"] = self.issue
+        return payload
 
 
 @dataclass(frozen=True)
@@ -347,6 +375,20 @@ def _degraded_membership(
             "geometry) are degraded and do not reflect tmux liveness.",
         )
     ]
+    # Fail-open lane-record degrade (#13367): the lane token had no metadata record,
+    # so ``lane_label`` is the raw ``wt_<hash>`` token and ``issue`` is unknown. Say
+    # so, mirroring the sublane-list ``lane_record_missing`` hint, rather than
+    # silently showing an unjoined row.
+    if observation.lane_record_missing:
+        warnings.append(
+            MembershipWarning(
+                WARN_HERDR_LANE_RECORD_MISSING,
+                "herdr lane has no lane metadata record; its human identity "
+                "(lane_label / issue) is unresolved and the row shows the raw "
+                "workspace token. Re-declare it with `sublane create` from the "
+                "lane worktree.",
+            )
+        )
     warnings.extend(_registry_warnings(facts))
     repo_root = observation.repo_root or facts.repo_root
     return WorkspaceMembership(
@@ -367,6 +409,7 @@ def _degraded_membership(
         warnings=tuple(warnings),
         registry_canonical_path=facts.repo_root,
         backend=backend,
+        issue=observation.issue,
     )
 
 
@@ -451,6 +494,10 @@ def build_membership(
         anchor_present=facts.anchor_present,
         warnings=tuple(warnings),
         registry_canonical_path=facts.repo_root,
+        # Empty for a tmux Unit — the herdr lane-record join only fills it for a
+        # BACKEND_HERDR observation, and ``as_dict`` omits the key for tmux, so the
+        # tmux membership JSON is byte-invariant (#13367).
+        issue=observation.issue,
     )
 
 
@@ -466,6 +513,7 @@ def absent_membership(
     anchor_present: bool,
     registry_canonical_path: str = "",
     backend: str = BACKEND_TMUX,
+    issue: str = "",
 ) -> WorkspaceMembership:
     """A :class:`WorkspaceMembership` for a workspace NOT loaded in the cockpit (pure).
 
@@ -510,6 +558,7 @@ def absent_membership(
         warnings=tuple(warnings),
         registry_canonical_path=registry_canonical_path,
         backend=backend,
+        issue=issue,
     )
 
 
@@ -620,6 +669,14 @@ def format_membership_text(
                     f"  backend: {ws.backend} (tmux-only fields degraded — "
                     "not tmux liveness)"
                 )
+                # Surface the lane-record display join (#13367): the WORKSPACE
+                # column above is the raw workspace token for a herdr lane, so name
+                # the recorded human lane label / issue here. On the fail-open
+                # degrade ``lane_label`` is the raw token and ``issue`` is blank; the
+                # ``lane_record_missing`` warning below already explains that.
+                if ws.lane_label:
+                    issue_suffix = f" (issue {ws.issue})" if ws.issue else ""
+                    lines.append(f"  lane: {ws.lane_label}{issue_suffix}")
             if ws.repo_root:
                 lines.append(f"  repo: {ws.repo_root}")
             if (

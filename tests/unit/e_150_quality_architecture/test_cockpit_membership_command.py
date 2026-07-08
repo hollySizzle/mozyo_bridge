@@ -42,10 +42,12 @@ from mozyo_bridge.application.cockpit_membership_command import (
     build_membership_observations,
     herdr_membership_observations,
 )
+from mozyo_bridge.core.state.lane_metadata import LaneMetadataRecord
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
     BACKEND_HERDR,
     BACKEND_TMUX,
     WARN_HERDR_INVENTORY_UNAVAILABLE,
+    WARN_HERDR_LANE_RECORD_MISSING,
     RegistryFacts,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.cockpit_layout import (
@@ -233,6 +235,50 @@ class HerdrMembershipObservationsTest(unittest.TestCase):
     def test_empty_input_yields_no_observations(self) -> None:
         self.assertEqual([], herdr_membership_observations(None))
         self.assertEqual([], herdr_membership_observations([]))
+
+    # -- lane-record display join (#13367). ----------------------------------
+
+    def test_lane_record_join_fills_label_and_issue(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_abc",
+            issue_id="13367",
+            lane_label="issue_13367_cockpit_herdr_polish",
+        )
+        obs = herdr_membership_observations(
+            [_herdr_row("wt_abc", "codex", "default")],
+            resolve_lane_record={"wt_abc": record}.get,
+        )
+        self.assertEqual("issue_13367_cockpit_herdr_polish", obs[0].lane_label)
+        self.assertEqual("13367", obs[0].issue)
+        self.assertFalse(obs[0].lane_record_missing)
+
+    def test_lane_record_issue_falls_back_to_label_parse(self) -> None:
+        # A record with no explicit issue_id but a parseable label still resolves.
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_abc",
+            lane_label="issue_13367_polish",
+        )
+        obs = herdr_membership_observations(
+            [_herdr_row("wt_abc", "codex", "default")],
+            resolve_lane_record={"wt_abc": record}.get,
+        )
+        self.assertEqual("13367", obs[0].issue)
+
+    def test_missing_record_degrades_to_token_and_flags(self) -> None:
+        obs = herdr_membership_observations(
+            [_herdr_row("wt_orphan", "codex", "default")],
+            resolve_lane_record={}.get,
+        )
+        # Fail-open: the raw workspace token is the lane label, issue unknown, and
+        # the missing-record flag is set so the projection emits the advisory.
+        self.assertEqual("wt_orphan", obs[0].lane_label)
+        self.assertEqual("", obs[0].issue)
+        self.assertTrue(obs[0].lane_record_missing)
+
+    def test_no_resolver_takes_the_fail_open_path(self) -> None:
+        obs = herdr_membership_observations([_herdr_row("wt_x", "codex", "default")])
+        self.assertEqual("wt_x", obs[0].lane_label)
+        self.assertTrue(obs[0].lane_record_missing)
 
 
 # --- Unit repo-root resolver. ------------------------------------------------
@@ -836,6 +882,88 @@ class CollectHerdrMembershipTest(unittest.TestCase):
             self.assertIsNone(
                 LiveHerdrColumnOps(repo_root=tmp).read_herdr_agent_rows()
             )
+
+
+# --- Live herdr lane-record display join through the use case (#13367). -------
+
+
+class CollectHerdrLaneRecordJoinTest(unittest.TestCase):
+    """The lane metadata store LEFT JOINs onto the live herdr rows in `collect`.
+
+    Patches ``load_lane_records`` (the store read ``_herdr_observations`` performs)
+    so the join is exercised end to end: the herdr row's JSON carries the recorded
+    ``lane_label`` / ``issue``; a missing record fails open to the raw token + the
+    ``lane_record_missing`` advisory; and the tmux row's JSON stays byte-invariant.
+    """
+
+    _LOAD = "mozyo_bridge.core.state.lane_metadata.load_lane_records"
+
+    def _ops(self):
+        return _FakeMembershipOps(
+            windows=[_cockpit_window()], geo_panes=_geo_panes(),
+            facts={"wsA": _facts()},
+        )
+
+    def _herdr_rows(self):
+        return [
+            {"name": encode_assigned_name("wt_abc", "codex", "default"),
+             "pane_id": "w1:p1"},
+            {"name": encode_assigned_name("wt_abc", "claude", "default"),
+             "pane_id": "w1:p2"},
+        ]
+
+    def _collect(self, records):
+        with unittest.mock.patch(self._LOAD, return_value=records):
+            return CockpitMembershipUseCase(
+                self._ops(), _FakeHerdrColumnOps(self._herdr_rows())
+            ).collect("s")
+
+    def _herdr_row(self, report):
+        return next(w for w in report.workspaces if w.workspace_id == "wt_abc")
+
+    def test_json_carries_recorded_lane_label_and_issue(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_abc",
+            issue_id="13367",
+            lane_label="issue_13367_cockpit_herdr_polish",
+        )
+        report = self._collect({"wt_abc": record})
+        row = self._herdr_row(report).as_dict()
+        self.assertEqual("issue_13367_cockpit_herdr_polish", row["lane_label"])
+        self.assertEqual("13367", row["issue"])
+        # No fail-open advisory when the record joined cleanly.
+        codes = {w["code"] for w in row["warnings"]}
+        self.assertNotIn(WARN_HERDR_LANE_RECORD_MISSING, codes)
+
+    def test_text_shows_lane_label_and_issue(self) -> None:
+        from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.cockpit_membership import (
+            format_membership_text,
+        )
+
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_abc",
+            issue_id="13367",
+            lane_label="issue_13367_cockpit_herdr_polish",
+        )
+        text = format_membership_text(self._collect({"wt_abc": record}))
+        self.assertIn("lane: issue_13367_cockpit_herdr_polish (issue 13367)", text)
+
+    def test_missing_record_degrades_to_token_with_warning(self) -> None:
+        report = self._collect({})
+        row = self._herdr_row(report)
+        self.assertEqual("wt_abc", row.lane_label)  # raw token, fail-open
+        payload = row.as_dict()
+        self.assertEqual("", payload["issue"])
+        codes = {w["code"] for w in payload["warnings"]}
+        self.assertIn(WARN_HERDR_LANE_RECORD_MISSING, codes)
+
+    def test_tmux_row_json_omits_issue_key_byte_invariant(self) -> None:
+        # The `issue` field is a herdr-only key: a tmux row's JSON must not carry it
+        # (the acceptance's "tmux 表示 byte-compatible").
+        report = self._collect({})
+        tmux_row = next(w for w in report.workspaces if w.workspace_id == "wsA")
+        self.assertNotIn("issue", tmux_row.as_dict())
+        self.assertEqual(BACKEND_TMUX, tmux_row.backend)
 
 
 if __name__ == "__main__":
