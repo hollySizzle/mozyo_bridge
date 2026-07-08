@@ -158,6 +158,8 @@ def build_membership_observations(
 
 def herdr_membership_observations(
     agent_rows: Any,
+    *,
+    resolve_lane_record: Optional[Callable[[str], Optional[Any]]] = None,
 ) -> list[MembershipObservation]:
     """Project a live herdr ``agent list`` snapshot into herdr-tagged Units (#13303).
 
@@ -177,9 +179,22 @@ def herdr_membership_observations(
     replaces those fields with a token regardless, so leaving them empty keeps the
     locator from ever reading as route authority. ``repo_root`` is left empty (a
     herdr Unit has no cockpit pane cwd to walk); the registry canonical path fills
-    it in downstream. Full herdr cockpit parity (live layout / focus / adopt) stays
-    deferred — this only makes the herdr membership real instead of empty.
+    it in downstream.
+
+    Lane-record display join (#13367): ``resolve_lane_record(workspace_id)`` — the
+    host-local #13356 lane metadata record keyed on the lane workspace token — fills
+    the Unit's human ``lane_label`` / ``issue`` (mirroring ``sublane list`` and the
+    web UI). It is a **display join, never routing authority**. When no record
+    resolves the Unit fails open: ``lane_label`` degrades to the raw ``wt_<hash>``
+    token, ``issue`` is unknown, and ``lane_record_missing`` is set so
+    :func:`build_membership` emits the :data:`WARN_HERDR_LANE_RECORD_MISSING`
+    advisory. When no resolver is supplied every Unit takes that fail-open path
+    (byte-for-byte the pre-#13367 empty-label projection plus the advisory).
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+        parse_issue_from_lane_label,
+    )
+
     units: dict[tuple[str, str], dict[str, str]] = {}
     order: list[tuple[str, str]] = []
     for row in herdr_inventory(agent_rows or []):
@@ -198,11 +213,30 @@ def herdr_membership_observations(
             units[key]["claude"] = locator
     observations: list[MembershipObservation] = []
     for key in order:
+        workspace_id = key[0]
+        record = (
+            resolve_lane_record(workspace_id)
+            if resolve_lane_record is not None
+            else None
+        )
+        if record is not None and getattr(record, "lane_label", ""):
+            lane_label = getattr(record, "lane_label")
+            issue = getattr(record, "issue_id", "") or (
+                parse_issue_from_lane_label(lane_label) or ""
+            )
+            lane_record_missing = False
+        else:
+            # Fail-open degrade (#13367 / #13356 j#73386): show the raw workspace
+            # token as the lane label and flag the missing record so the projection
+            # emits the advisory rather than silently rendering an unjoined row.
+            lane_label = workspace_id
+            issue = parse_issue_from_lane_label(workspace_id) or ""
+            lane_record_missing = True
         observations.append(
             MembershipObservation(
-                workspace_id=key[0],
+                workspace_id=workspace_id,
                 lane_id=key[1],
-                lane_label="",
+                lane_label=lane_label,
                 # Transient herdr locators are evidence, not authority (#13297); the
                 # degrade projection tokenises these fields anyway, so keep them empty.
                 codex_pane="",
@@ -211,6 +245,8 @@ def herdr_membership_observations(
                 window_id="",
                 repo_root="",
                 backend=BACKEND_HERDR,
+                issue=issue,
+                lane_record_missing=lane_record_missing,
             )
         )
     return observations
@@ -569,7 +605,20 @@ class CockpitMembershipUseCase:
             ]
         if rows is None:
             return [], []
-        return herdr_membership_observations(rows), []
+        # Fail-open lane-record display join (#13367): load the host-local #13356
+        # lane metadata store so each herdr Unit's row shows its recorded human
+        # lane_label / issue. ``load_lane_records`` never raises (empty mapping on
+        # any read failure), so a missing / unreadable store degrades every herdr
+        # row to the raw token + advisory rather than aborting the view.
+        from mozyo_bridge.core.state.lane_metadata import load_lane_records
+
+        lane_records = load_lane_records()
+        return (
+            herdr_membership_observations(
+                rows, resolve_lane_record=lane_records.get
+            ),
+            [],
+        )
 
     def collect(self, session: str) -> CockpitMembershipReport:
         """Project the live cockpit into a membership report (#12341, read-only).

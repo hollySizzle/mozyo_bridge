@@ -29,6 +29,21 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.group
 from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application.cockpit_payload import (  # noqa: E402,E501
     HERDR_INVENTORY_UNAVAILABLE_DIAGNOSTIC,
     herdr_observed_units,
+    reconcile_whole_view_observation,
+)
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.runtime_observation import (  # noqa: E402,E501
+    CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+    DISPLAY_STATE_HEALTHY,
+    DISPLAY_STATE_RELOAD_REQUIRED,
+    FRESHNESS_FRESH,
+    FRESHNESS_STALE,
+    METHOD_LIVE_QUERY,
+    READABILITY_READABLE,
+    SOURCE_HERDR,
+    SOURCE_TMUX,
+    STALE_REASON_SOURCE_UNREADABLE,
+    STRENGTH_STRONG_RUNTIME_SIGNAL,
+    RuntimeObservationSnapshot,
 )
 from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.domain.grouped_display import (  # noqa: E402,E501
     build_grouped_display_view,
@@ -327,6 +342,220 @@ class HerdrObservedUnitsSupplierTest(unittest.TestCase):
         )
         self.assertEqual(len(units), 1)
         self.assertIsNotNone(units[0].observation.contradiction)
+
+
+def _tmux_stale_envelope() -> RuntimeObservationSnapshot:
+    return RuntimeObservationSnapshot(
+        observed_at="2026-07-08T00:00:00+00:00",
+        source=SOURCE_TMUX,
+        method=METHOD_LIVE_QUERY,
+        freshness=FRESHNESS_STALE,
+        readability=READABILITY_READABLE,
+        strength=STRENGTH_STRONG_RUNTIME_SIGNAL,
+        stale_reason=STALE_REASON_SOURCE_UNREADABLE,
+        contradiction=None,
+        display_state=DISPLAY_STATE_RELOAD_REQUIRED,
+    )
+
+
+def _herdr_fresh_envelope() -> RuntimeObservationSnapshot:
+    return RuntimeObservationSnapshot(
+        observed_at="2026-07-08T01:00:00+00:00",
+        source=SOURCE_HERDR,
+        method=METHOD_LIVE_QUERY,
+        freshness=FRESHNESS_FRESH,
+        readability=READABILITY_READABLE,
+        strength=STRENGTH_STRONG_RUNTIME_SIGNAL,
+        stale_reason=None,
+        contradiction=None,
+        display_state=DISPLAY_STATE_HEALTHY,
+    )
+
+
+class ReconcileWholeViewObservationTest(unittest.TestCase):
+    """The #13367 whole-view freshness reconciliation (pure)."""
+
+    def _herdr_unit(self, observation):
+        return ObservedUnit(
+            workspace_id="wt_abc",
+            repo_label="alpha",
+            active=True,
+            roles=("codex",),
+            backend=BACKEND_HERDR,
+            observation=observation,
+            lane_label="issue_1_x",
+            issue="1",
+        )
+
+    def test_no_herdr_units_keeps_tmux_envelope(self) -> None:
+        tmux = _tmux_stale_envelope()
+        got = reconcile_whole_view_observation(
+            tmux_observation=tmux, tmux_unit_count=2, herdr_units=[]
+        )
+        self.assertIs(got, tmux)
+
+    def test_herdr_only_uses_fresh_herdr_envelope_not_stale_tmux(self) -> None:
+        # The misleading case: stale tmux snapshot, a herdr-only display of fresh
+        # live-queried lanes. The whole-view must read the herdr envelope.
+        herdr = _herdr_fresh_envelope()
+        got = reconcile_whole_view_observation(
+            tmux_observation=_tmux_stale_envelope(),
+            tmux_unit_count=0,
+            herdr_units=[self._herdr_unit(herdr)],
+        )
+        self.assertEqual(SOURCE_HERDR, got.source)
+        self.assertEqual(FRESHNESS_FRESH, got.freshness)
+        self.assertFalse(got.needs_reload)
+
+    def test_herdr_only_worst_wins_surfaces_degraded_unit(self) -> None:
+        # An ambiguous / contradicted herdr Unit makes the whole herdr view read as
+        # needing reload — never healthier than its rows.
+        degraded = _herdr_fresh_envelope()
+        degraded = RuntimeObservationSnapshot(
+            **{
+                **degraded.as_payload(),
+                "contradiction": CONTRADICTION_LIVE_RUNTIME_CONFLICT,
+                "display_state": DISPLAY_STATE_RELOAD_REQUIRED,
+                "source_refs": (),
+                "notes": (),
+            }
+        )
+        got = reconcile_whole_view_observation(
+            tmux_observation=_tmux_stale_envelope(),
+            tmux_unit_count=0,
+            herdr_units=[
+                self._herdr_unit(_herdr_fresh_envelope()),
+                self._herdr_unit(degraded),
+            ],
+        )
+        self.assertTrue(got.needs_reload)
+
+    def test_both_present_keeps_tmux_envelope(self) -> None:
+        # When tmux rows ARE shown, their staleness legitimately applies to the
+        # whole view; each herdr row keeps its own fresh per-row envelope.
+        tmux = _tmux_stale_envelope()
+        got = reconcile_whole_view_observation(
+            tmux_observation=tmux,
+            tmux_unit_count=1,
+            herdr_units=[self._herdr_unit(_herdr_fresh_envelope())],
+        )
+        self.assertIs(got, tmux)
+
+
+class GroupedPayloadWholeViewFreshnessTest(unittest.TestCase):
+    """End-to-end #13367: the served grouped payload's whole-view freshness line.
+
+    A herdr-only display over a stale / empty tmux inventory must NOT read as stale:
+    the freshly-queried herdr rows would otherwise be tarred by the tmux snapshot's
+    staleness. Drives ``grouped_units_payload`` with the tmux inventory and the herdr
+    supply both mocked.
+    """
+
+    _PAYLOAD = (
+        "mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui."
+        "application.cockpit_payload"
+    )
+
+    def _fake_snapshot(self, *, records, stale):
+        from mozyo_bridge.session_inventory import InventorySnapshot
+
+        return InventorySnapshot(
+            records=tuple(records),
+            collected_at=None,
+            source="cache" if stale else "runtime",
+            stale=stale,
+            inventory_path=Path("/tmp/inv.sqlite"),
+        )
+
+    def _run(self, *, tmux_snapshot, herdr_rows):
+        from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import (  # noqa: E501
+            cockpit_payload,
+        )
+        from mozyo_bridge.e_120_operations_cockpit.f_140_presentation_grouping_layout.domain.presentation_grouping import (  # noqa: E501
+            PresentationGroupingConfig,
+        )
+
+        class _Config:
+            presentation = type(
+                "_P", (), {"grouping": PresentationGroupingConfig.default()}
+            )()
+            terminal_transport = object()
+
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_abc",
+            repo_workspace_id="wsMain",
+            issue_id="13367",
+            lane_label="issue_13367_cockpit_herdr_polish",
+        )
+        with mock.patch.object(
+            cockpit_payload, "take_inventory", return_value=tmux_snapshot
+        ), mock.patch(
+            "mozyo_bridge.application.repo_local_config_loader.load_repo_local_config",
+            return_value=_Config(),
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "infrastructure.herdr_discovery.resolve_agent_lister",
+            return_value=_FakeLister(rows=herdr_rows),
+        ), mock.patch(
+            "mozyo_bridge.core.state.lane_metadata.load_lane_records",
+            return_value={"wt_abc": record},
+        ), mock.patch(
+            "mozyo_bridge.core.state.workspace_registry.load_workspace_by_id",
+            side_effect={"wsMain": _FakeRegistryRecord("mozyo_bridge")}.get,
+        ):
+            return cockpit_payload.grouped_units_payload(now=_NOW)
+
+    def test_herdr_only_over_stale_tmux_reads_fresh(self) -> None:
+        payload = self._run(
+            tmux_snapshot=self._fake_snapshot(records=[], stale=True),
+            herdr_rows=[
+                _agent_row("wt_abc", "codex", "wD:p2", "idle"),
+                _agent_row("wt_abc", "claude", "wD:p3", "working"),
+            ],
+        )
+        # The whole-view freshness line reflects the live herdr query, not the
+        # stale tmux snapshot: fresh, not reload_required.
+        self.assertEqual(FRESHNESS_FRESH, payload["freshness"])
+        self.assertFalse(payload["reload_required"])
+        # The herdr lane row still shows its recorded identity.
+        rows = [u for g in payload["groups"] for u in g["units"]]
+        self.assertTrue(
+            any(u["lane_label"] == "issue_13367_cockpit_herdr_polish" for u in rows)
+        )
+
+    def test_tmux_present_stale_keeps_reload_required(self) -> None:
+        # A genuine tmux Unit that IS stale keeps the whole view reload_required —
+        # its staleness legitimately applies (byte-invariant behaviour retained).
+        tmux_record = _record_inventory()
+        payload = self._run(
+            tmux_snapshot=self._fake_snapshot(records=[tmux_record], stale=True),
+            herdr_rows=[_agent_row("wt_abc", "codex", "wD:p2", "idle")],
+        )
+        self.assertTrue(payload["reload_required"])
+
+
+def _record_inventory():
+    from mozyo_bridge.session_inventory import InventoryRecord, WorkspaceIdentity
+
+    return InventoryRecord(
+        pane_id="%1",
+        session="mozyo-demo",
+        window_index="1",
+        window_name="codex",
+        pane_index="0",
+        pane_active=True,
+        process="codex",
+        cwd="/tmp",
+        repo_root="/tmp",
+        agent_kind="codex",
+        lane_id="default",
+        workspace=WorkspaceIdentity(
+            workspace_id="wsTmux",
+            canonical_session="mozyo-demo",
+            project_name="mozyo_bridge",
+            source="test",
+        ),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

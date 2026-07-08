@@ -528,6 +528,54 @@ def herdr_observed_units(
     return units, diagnostics
 
 
+def reconcile_whole_view_observation(
+    *,
+    tmux_observation,
+    tmux_unit_count: int,
+    herdr_units: "list",
+):
+    """Pick the whole-projection freshness envelope that matches the shown rows (#13367).
+
+    The grouped read model's whole-view freshness line is driven by ONE
+    observation envelope. Before #13367 it was always the tmux inventory snapshot's
+    envelope (``snapshot_from_inventory``). That reads a **herdr-only** display as
+    stale / reload_required whenever the tmux inventory is unreadable or empty —
+    the tmux snapshot describes nothing that is shown, yet its staleness tars the
+    live-queried herdr rows (#13367 scope: "現状 tmux snapshot 由来").
+
+    The reconciliation is deliberately minimal and fail-safe:
+
+    - **No herdr units** → return ``tmux_observation`` unchanged, so a tmux-only
+      (or herdr-off) payload is byte-invariant.
+    - **Herdr units present but no tmux units** (a herdr-only display) → return the
+      herdr rows' own live-query envelope, worst-wins across them: the fresh
+      live-query snapshot unless a Unit degraded (an ambiguous / contradicted Unit
+      makes the whole herdr view read as needing reload, never healthy). The tmux
+      snapshot is not consulted — nothing tmux is shown.
+    - **Both present** → keep ``tmux_observation``: when tmux rows ARE shown their
+      staleness legitimately applies to the whole view, and each herdr row still
+      carries its own fresh per-row envelope (so a consumer reading per-row
+      freshness, or the ``needs_attention`` roll-up, is never misled about the
+      herdr rows). Worst-wins here is already the tmux envelope, since a herdr
+      live query is at least as fresh.
+
+    Pure: reads only the passed envelopes / counts, mutates nothing.
+    """
+    if not herdr_units:
+        return tmux_observation
+    if tmux_unit_count:
+        return tmux_observation
+    # Herdr-only display: worst-wins across the herdr Units' envelopes. They share
+    # one live-query envelope stamped at read time; an ambiguous Unit's is degraded
+    # (contradiction / reload_required), so surface a degraded one when present so
+    # the whole view never reads healthier than its rows.
+    envelopes = [unit.observation for unit in herdr_units]
+    for envelope in envelopes:
+        if envelope.needs_reload:
+            return envelope
+    return envelopes[0]
+
+
 def grouped_units_payload(
     *,
     home: Path | None = None,
@@ -577,8 +625,21 @@ def grouped_units_payload(
     herdr_units, herdr_diagnostics = herdr_observed_units(
         repo_root=repo_root, now=now, home=home
     )
+    # Redmine #13367: the whole-view freshness line must match the rows actually
+    # shown. A herdr-only display (no tmux Units) reconciles to the herdr rows'
+    # live-query envelope instead of the tmux snapshot's — otherwise a stale /
+    # empty tmux inventory would read the freshly-queried herdr rows as stale. A
+    # tmux-only or mixed display keeps the tmux envelope (byte-invariant), and each
+    # herdr row keeps its own per-row envelope regardless.
+    whole_view_observation = reconcile_whole_view_observation(
+        tmux_observation=observation,
+        tmux_unit_count=len(observed_units),
+        herdr_units=herdr_units,
+    )
     model = build_grouped_read_model(
-        config, list(observed_units) + list(herdr_units), observation=observation
+        config,
+        list(observed_units) + list(herdr_units),
+        observation=whole_view_observation,
     )
     if herdr_diagnostics:
         from dataclasses import replace
