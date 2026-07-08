@@ -47,6 +47,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
+    GATEWAY_READY_CAPTURE_LINES,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
@@ -76,6 +79,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
+    HerdrCliTransport,
     Runner,
 )
 
@@ -199,6 +203,23 @@ class HerdrSublaneActuatorOps:
             worktree_path=str(worktree_path),
         )
 
+    def heal_lane_column(self, worktree_path: str) -> None:
+        """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
+
+        A lane gateway can die between its launch and the first dispatch for reasons
+        entirely outside mozyo (measured: a host-level ``npm install -g @openai/codex``
+        cleanly exits every idle, pre-session codex TUI — #13378 j#73606). The heal is
+        simply :meth:`append_lane_column` again: :func:`prepare_session` is
+        adopt-or-launch idempotent per slot, so the surviving slot is *adopted* (its
+        locator pins the launch-target workspace, exactly the runbook relaunch standard
+        "両 agent 指定") and only the dead slot is relaunched. Any
+        :class:`HerdrSessionStartError` propagates as ``RuntimeError`` so the use case
+        stays fail-closed. Exposed as an *optional* port capability (the use case
+        discovers it via ``getattr``): the tmux adapter deliberately does not provide it
+        — a repeated tmux ``cockpit append`` would append a duplicate column, not adopt.
+        """
+        self.append_lane_column(worktree_path)
+
     def _live_rows(self) -> Sequence[Mapping[str, object]]:
         binary = _resolve_binary_or_die(self.env)
         runner = self.runner
@@ -286,13 +307,17 @@ class HerdrSublaneActuatorOps:
         )
 
     def probe_gateway_ready(self, gateway_pane: str) -> bool:
-        """Non-fatal live-presence check of the gateway agent (#13293 parity).
+        """Non-fatal boot-readiness check of the gateway agent (#13293 parity).
 
-        The tmux probe waits for a Codex TUI to boot + render before a queue-enter
-        dispatch; on herdr the agent is server-spawned and the send rail self-heals
-        (turn-start observation + Enter-resend, #13322), so readiness is simply "the
-        gateway locator is live in the inventory now." Any read failure returns ``False``
-        (never fatal) — the caller polls this on a bounded window.
+        Redmine #13378: readiness is "the gateway locator is live in the inventory
+        AND its pane has rendered content" (``agent read`` returns non-blank text) —
+        the same booted-and-rendered gate the tmux probe applies. The prior
+        liveness-only probe returned ``True`` the instant ``agent start`` completed,
+        so the in-create dispatch fired into a still-booting codex TUI and vanished
+        (the measured reason the #13366 runbook fell back to a two-step
+        ``--no-dispatch`` flow). Any read failure returns ``False`` (never fatal) —
+        the caller polls this on a bounded window and the queue-enter rail's
+        turn-start observation + Enter-resend (#13322) stays the landing net.
         """
         want = _norm(gateway_pane)
         if not want:
@@ -301,10 +326,24 @@ class HerdrSublaneActuatorOps:
             rows = self._live_rows()
         except Exception:  # noqa: BLE001 — a probe never fails the actuation.
             return False
-        for row in rows:
-            if isinstance(row, Mapping) and _agent_locator(row) == want:
-                return True
-        return False
+        if not any(
+            isinstance(row, Mapping) and _agent_locator(row) == want for row in rows
+        ):
+            return False
+        try:
+            binary = _resolve_binary_or_die(self.env)
+            runner = self.runner
+            if runner is None:
+                import subprocess
+
+                runner = subprocess.run
+            transport = HerdrCliTransport(binary, runner=runner, timeout=self.timeout)
+            read = transport.read_pane(want, lines=GATEWAY_READY_CAPTURE_LINES)
+        except Exception:  # noqa: BLE001 — a probe never fails the actuation.
+            return False
+        if not read.ok:
+            return False
+        return bool((read.content or "").strip())
 
     # -- governed dispatch (cross-workspace herdr send) -----------------------------
 

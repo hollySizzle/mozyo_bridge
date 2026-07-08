@@ -49,12 +49,29 @@ class _StatefulHerdr:
         self.agents: list[dict] = []  # {"name", "pane_id"}
         self.start_argvs: list[list] = []
         self._pane_seq = 1
+        # #13378: rendered pane text served by `agent read`; set to "" to simulate a
+        # live-but-still-booting TUI (blank render).
+        self.read_text = "codex composer rendered"
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
         if rest == ["agent", "list"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"agents": self.agents}), stderr=""
+            )
+        if rest[:2] == ["agent", "read"]:
+            pane = rest[2]
+            if not any(a["pane_id"] == pane for a in self.agents):
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="agent_not_found"
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {"result": {"read": {"text": self.read_text, "truncated": False}}}
+                ),
+                stderr="",
             )
         if rest[:2] == ["workspace", "create"]:
             wid = self.created_workspace
@@ -244,6 +261,50 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 self.assertTrue(ops.probe_gateway_ready(view.gateway_pane))
                 self.assertFalse(ops.probe_gateway_ready("wL:p999"))
                 self.assertFalse(ops.probe_gateway_ready(""))
+
+    def test_probe_gateway_ready_requires_rendered_content(self) -> None:
+        # Redmine #13378: a live-but-blank pane (TUI still booting) is NOT ready —
+        # the liveness-only probe fired the in-create dispatch into a still-booting
+        # composer (the measured #13366 空振り). Rendered content flips it ready.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                view = ops.read_lane(str(worktree))
+                herdr.read_text = "   \n  "
+                self.assertFalse(ops.probe_gateway_ready(view.gateway_pane))
+                herdr.read_text = "▌ composer"
+                self.assertTrue(ops.probe_gateway_ready(view.gateway_pane))
+
+    def test_heal_lane_column_relaunches_only_the_missing_slot(self) -> None:
+        # Redmine #13378: the self-heal is append_lane_column again — prepare_session
+        # is adopt-or-launch idempotent, so the surviving worker is adopted (workspace
+        # pin) and only the vanished gateway slot is relaunched into the SAME workspace.
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(str(worktree))
+                launches_before = len(herdr.start_argvs)
+                # The gateway codex slot vanishes (host-level kill, not a pane close).
+                herdr.agents = [a for a in herdr.agents if "_codex_" not in a["name"]]
+                ops.heal_lane_column(str(worktree))
+                view = ops.read_lane(str(worktree))
+        self.assertEqual(len(herdr.start_argvs), launches_before + 1)
+        relaunch = herdr.start_argvs[-1]
+        self.assertEqual(relaunch[relaunch.index("--") + 1], "codex")
+        # The relaunch is pinned into the surviving worker's workspace (adopt pin),
+        # so no second workspace (and no new base pane) is created.
+        self.assertEqual(relaunch[relaunch.index("--workspace") + 1], "wL")
+        self.assertIsNotNone(view)
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+        self.assertTrue(view.gateway_pane.startswith("wL:"))
+        self.assertTrue(view.worker_pane.startswith("wL:"))
 
     def test_append_failure_raises_runtime_error(self) -> None:
         herdr = _StatefulHerdr()

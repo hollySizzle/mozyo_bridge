@@ -19,12 +19,22 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 ## lane 作成 (標準形)
 
 1. dispatch decision journal を issue に記録 (durable anchor)。
-2. `sublane create --issue <id> --lane-label issue_<id>_<slug> --branch issue_<id>_<slug> --worktree <sibling path> --base-ref origin/main --journal <jid> --upstream-coordinator <coordinator herdr pane> --execute --no-dispatch --json`
-   - **`--no-dispatch` が標準**: create 内蔵 dispatch は gateway TUI の boot に間に合わず空振りする (実測)。
-3. boot 待ち (約 10 秒) 後、**明示送達**:
+2. 単発 create+dispatch (#13378 以降の標準):
+   `sublane create --issue <id> --lane-label issue_<id>_<slug> --branch issue_<id>_<slug> --worktree <sibling path> --base-ref origin/main --journal <jid> --upstream-coordinator <coordinator herdr pane> --execute --json`
+   - 旧標準の `--no-dispatch` 二段運用は「create 内蔵 dispatch が gateway TUI の boot に間に合わず空振りする」実測が理由だった。#13378 で herdr の gateway readiness probe が liveness のみ → **live かつ rendered** (`agent read` で描画内容あり) に強化され、dispatch は boot 完了を bounded wait (`--gateway-ready-timeout`、既定 10 秒) してから送られる。
+   - **self-heal**: dispatch が失敗し read-back で gateway slot の消滅を確認した場合に限り、lane column を 1 回だけ自動 relaunch (生存 slot は adopt pin、消滅 slot のみ再 launch — relaunch 標準と同一機構) して dispatch を再試行する。再失敗は fail-closed (`blocked`) で手動介入へ。
+   - outcome の `reason` に `self-healed` が含まれる場合、記録すべき gateway pane id は relaunch 後のもの。
+3. 着弾確認: `dispatch_result=gateway_notified` + delivery record の marker observed / turn-start。marker 未観測なら `herdr agent read <pane>` で実測してから再送判断。以降の worker 駆動は gateway の `sublane dispatch-worker` (#13357)。
+4. fallback (旧二段運用): `--no-dispatch` で create し、boot 待ち後に明示送達も引き続き可:
    `handoff send --to codex --source redmine --issue <id> --journal <jid> --kind implementation_request --target <gateway pane> --target-repo <lane worktree 絶対 path> --role-profile implementation_gateway --profile-field lane=<label> --profile-field upstream_coordinator=<coordinator pane>`
    - cross-workspace 送達のため `--target-repo` は **explicit** (auto は sender repo に解決される)。
-4. 着弾確認: delivery record の `sent` + marker observed + turn-start。marker 未観測なら `herdr agent read <pane>` で実測してから再送判断。
+   - この経路では gateway 消滅時の自動復旧は働かない。送達失敗時は下記 relaunch 標準で復旧する。
+
+## 初回 gateway pane 消滅の原因と運用注意 (#13378)
+
+- 原因 (host log 実測、#13378 j#73606): lane 作成〜初回送達の間に host で agent CLI の global update (実例: `npm install --global @openai/codex`) が走ると、**idle かつ session 未確立** の codex TUI が exit 0 で自己終了し pane ごと消える。mozyo の launch 経路 (env / permission mode / adopt pin / root pane reclaim) の欠陥ではない。busy / session 確立後の agent は同じ update を生き延びる。
+- 運用注意: **wave 進行中 (lane 作成〜初回送達の window) に agent CLI (codex / claude) の global update を実行しない**。update は wave 間の quiescent 時に行う。
+- 復旧: 標準形の create+dispatch は self-heal で自動復旧する。self-heal 外 (稼働中 lane の途中死・fallback 経路) は下記 relaunch 標準で手動復旧する。
 
 ## gateway → worker の駆動 (実測 ACK)
 

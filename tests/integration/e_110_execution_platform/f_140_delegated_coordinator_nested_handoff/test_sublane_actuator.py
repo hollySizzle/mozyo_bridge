@@ -442,6 +442,146 @@ class LaneIdentityValidationTests(unittest.TestCase):
         self.assertTrue(outcome.adopted)
 
 
+class HealCapableFakeOps(FakeActuatorOps):
+    """The #13378 optional ``heal_lane_column`` capability on the scriptable fake.
+
+    ``dispatch_rcs`` scripts one exit code per dispatch attempt (front to back, last
+    value sticky) so a first-fails / retry-succeeds sequence is expressible.
+    """
+
+    def __init__(self, *, heal_error=None, dispatch_rcs=(0,), **kw):
+        super().__init__(**kw)
+        self._heal_error = heal_error
+        self._dispatch_rcs = list(dispatch_rcs)
+
+    def heal_lane_column(self, worktree_path):
+        self.calls.append(("heal_lane_column", worktree_path))
+        if self._heal_error is not None:
+            raise self._heal_error
+
+    def dispatch_implementation_request(self, **kwargs):
+        self.calls.append(("dispatch", kwargs))
+        if self._dispatch_error is not None:
+            raise self._dispatch_error
+        if len(self._dispatch_rcs) > 1:
+            return self._dispatch_rcs.pop(0)
+        return self._dispatch_rcs[0] if self._dispatch_rcs else 0
+
+
+class DispatchSelfHealTests(unittest.TestCase):
+    """Redmine #13378: one bounded self-heal + dispatch retry for a vanished gateway.
+
+    The measured vanish mode (an idle pre-session gateway killed by a host-level
+    agent-CLI update between launch and first dispatch) surfaces as a failed dispatch
+    whose gateway slot is gone on read-back. With the optional ``heal_lane_column``
+    capability the use case relaunches once and retries once — every other failure
+    stays the plain pre-#13378 fail-closed block.
+    """
+
+    def _healable(self, **kw):
+        defaults = dict(
+            git=True,
+            # read#1 pre-append -> absent; read#2 post-append -> live lane;
+            # read#3 heal-applicability -> gateway slot vanished;
+            # read#4 post-heal -> relaunched gateway %130.
+            lanes=[None, _lane(), _lane(gateway=None), _lane(gateway="%130")],
+            dispatch_rcs=(1, 0),
+        )
+        defaults.update(kw)
+        return HealCapableFakeOps(**defaults)
+
+    def test_vanished_gateway_heals_and_retries_once(self):
+        ops = self._healable()
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_GATEWAY_NOTIFIED)
+        # The outcome carries the RELAUNCHED gateway locator, not the vanished one.
+        self.assertEqual(outcome.gateway_pane, "%130")
+        self.assertEqual(outcome.dispatch_target, "%130")
+        self.assertIn("self-healed", outcome.reason)
+        names = ops._names()
+        self.assertEqual(names.count("heal_lane_column"), 1)
+        self.assertEqual(names.count("dispatch"), 2)
+        titles = [s.title for s in outcome.steps]
+        self.assertIn("relaunch lane column (self-heal)", titles)
+        self.assertIn("confirm gateway readiness (post-heal)", titles)
+        self.assertIn("dispatch implementation_request (retry)", titles)
+        dispatches = [c for c in ops.calls if isinstance(c, tuple) and c[0] == "dispatch"]
+        self.assertEqual(dispatches[-1][1]["gateway_pane"], "%130")
+
+    def test_gateway_still_resolvable_blocks_without_heal(self):
+        # The dispatch failed but the gateway is still live on read-back: not the
+        # vanish mode, so no relaunch — the plain fail-closed block, byte-for-byte.
+        ops = self._healable(lanes=[None, _lane(), _lane()], dispatch_rcs=(1,))
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        names = ops._names()
+        self.assertNotIn("heal_lane_column", names)
+        self.assertEqual(names.count("dispatch"), 1)
+
+    def test_no_heal_capability_never_reprobes_the_lane(self):
+        # The base port (tmux adapter shape) has no heal capability: the failed
+        # dispatch must not even re-read the lane — pre-#13378 behaviour.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()], dispatch_rc=1)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        self.assertEqual(ops._names().count("read_lane"), 2)
+
+    def test_heal_failure_blocks(self):
+        ops = self._healable(
+            heal_error=RuntimeError("herdr down"),
+            lanes=[None, _lane(), _lane(gateway=None)],
+            dispatch_rcs=(1,),
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        self.assertIn(REASON_PANE_CREATE_FAILED, outcome.blocked_reasons)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+
+    def test_healed_lane_missing_panes_blocks(self):
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None), None], dispatch_rcs=(1,)
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        self.assertIn(REASON_PANE_CREATE_FAILED, outcome.blocked_reasons)
+        self.assertEqual(ops._names().count("heal_lane_column"), 1)
+
+    def test_healed_lane_identity_mismatch_blocks(self):
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None), _wrong_lane()],
+            dispatch_rcs=(1,),
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LANE_MISMATCH, outcome.blocked_reasons)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        # never dispatched to the mismatched healed lane
+        self.assertEqual(ops._names().count("dispatch"), 1)
+
+    def test_retry_failure_blocks_without_second_heal(self):
+        ops = self._healable(dispatch_rcs=(1, 1))
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_HANDOFF_FAILED, outcome.blocked_reasons)
+        self.assertIn("no second heal", outcome.reason)
+        names = ops._names()
+        self.assertEqual(names.count("heal_lane_column"), 1)
+        self.assertEqual(names.count("dispatch"), 2)
+
+    def test_no_dispatch_never_heals(self):
+        # --no-dispatch performs no dispatch, so the heal never arms.
+        ops = self._healable(lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True, dispatch=False)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+        self.assertNotIn("heal_lane_column", ops._names())
+
+
 class RenderTests(unittest.TestCase):
     def test_text_render_marks_blocked(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()], dispatch_rc=1)

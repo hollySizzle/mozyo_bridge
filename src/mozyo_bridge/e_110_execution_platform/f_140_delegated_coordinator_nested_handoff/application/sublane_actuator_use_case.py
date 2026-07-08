@@ -749,6 +749,25 @@ class SublaneActuateUseCase:
         else:
             dispatch_detail = f"handoff send to gateway {gateway_pane} exit={rc}"
         if rc != 0:
+            # Redmine #13378: a failed dispatch whose gateway slot is GONE on
+            # read-back is the measured vanish mode (an idle pre-session gateway
+            # killed by a host-level agent-CLI update) — self-heal once and retry,
+            # when the ops adapter offers the capability. Any other failure keeps
+            # the plain fail-closed block below, byte-for-byte.
+            healed_outcome = self._heal_and_retry_dispatch(
+                request,
+                launch,
+                steps=steps,
+                failed_dispatch_detail=dispatch_detail,
+                dispatch=dispatch,
+                target_repo=target_repo,
+                adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+                gateway_ready=gateway_ready,
+            )
+            if healed_outcome is not None:
+                return healed_outcome
             steps.append(
                 ActuationStep(
                     order=5,
@@ -804,6 +823,47 @@ class SublaneActuateUseCase:
             gateway_ready=gateway_ready,
         )
 
+    def _heal_and_retry_dispatch(
+        self,
+        request: SublaneCreateRequest,
+        launch: WorktreeLaunchDecision,
+        *,
+        steps: list,
+        failed_dispatch_detail: str,
+        dispatch: bool,
+        target_repo: str,
+        adopted: bool,
+        fill_decision: Optional[str],
+        fill_override_reason: Optional[str],
+        gateway_ready: Optional[bool],
+    ) -> Optional[SublaneActuationOutcome]:
+        """One bounded self-heal + dispatch retry for a vanished gateway (#13378).
+
+        Thin delegator to :func:`~.sublane_actuator_heal.heal_and_retry_dispatch`
+        (carved into its own module for the module-health ceiling — the recovery
+        contract lives there). Returns ``None`` when the heal is not applicable
+        (no ops capability, or the gateway is still resolvable), leaving ``steps``
+        untouched so the caller's plain fail-closed block is byte-for-byte the
+        pre-#13378 behaviour; otherwise a terminal executed / blocked outcome.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_heal import (  # noqa: E501
+            heal_and_retry_dispatch,
+        )
+
+        return heal_and_retry_dispatch(
+            self,
+            request,
+            launch,
+            steps=steps,
+            failed_dispatch_detail=failed_dispatch_detail,
+            dispatch=dispatch,
+            target_repo=target_repo,
+            adopted=adopted,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+            gateway_ready=gateway_ready,
+        )
+
     def _executed(
         self,
         request: SublaneCreateRequest,
@@ -818,6 +878,7 @@ class SublaneActuateUseCase:
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
         gateway_ready: Optional[bool] = None,
+        healed: bool = False,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_EXECUTED,
@@ -826,6 +887,7 @@ class SublaneActuateUseCase:
             + ("adopted existing lane" if adopted else "created lane")
             + f"; launch action {launch.action!r}"
             + self._dispatch_reason_suffix(dispatch_result)
+            + self._heal_reason_suffix(healed)
             + self._gateway_ready_reason_suffix(dispatch_result, gateway_ready)
             + self._fill_override_reason_suffix(fill_override_reason),
             issue=request.issue,
@@ -860,6 +922,22 @@ class SublaneActuateUseCase:
         if dispatch_result == DISPATCH_SKIPPED:
             return " — dispatch skipped (--no-dispatch)"
         return ""
+
+    @staticmethod
+    def _heal_reason_suffix(healed: bool) -> str:
+        """Spell out that the lane was self-healed before this dispatch (pure, #13378).
+
+        A healed outcome means the originally-launched gateway vanished before the
+        first delivery (a host-level event killed the idle agent) and the lane column
+        was relaunched in-flow; the coordinator record must say so — the gateway
+        locator in this outcome is the *relaunched* pane, not the created one.
+        """
+        if not healed:
+            return ""
+        return (
+            " — gateway vanished before the first dispatch; lane column self-healed "
+            "(relaunched) and the dispatch was retried (#13378)"
+        )
 
     @staticmethod
     def _gateway_ready_reason_suffix(

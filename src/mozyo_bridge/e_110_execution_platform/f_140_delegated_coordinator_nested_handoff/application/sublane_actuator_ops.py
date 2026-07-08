@@ -71,6 +71,17 @@ class SublaneActuatorOps(Protocol):
     ``dispatch_implementation_request`` routes the governed handoff to the gateway pane and
     returns its exit code. There is intentionally no remove / kill / delete / merge method —
     the destructive half is gated and coordinator-owned.
+
+    Optional capability (Redmine #13378): an adapter MAY additionally provide
+    ``heal_lane_column(worktree_path) -> None`` — a *creation-side* relaunch of the lane's
+    missing managed slot(s) the use case invokes at most once when a dispatch fails and the
+    gateway slot is gone on read-back (the measured vanish mode: an idle pre-session gateway
+    agent killed by a host-level event such as an agent-CLI update). It is discovered via
+    ``getattr`` and deliberately NOT part of this protocol, so existing adapters and test
+    fakes stay conformant; the herdr adapter provides it (its session preparation is
+    adopt-or-launch idempotent), the tmux adapter deliberately does not (a repeated
+    ``cockpit append`` would duplicate the column, not adopt it). Still additive-only —
+    a heal launches panes, it never closes one.
     """
 
     def is_git_workspace(self) -> bool: ...
