@@ -739,6 +739,92 @@ class StatusDualPresenceTest(unittest.TestCase):
         self.assertIn("not loaded", outcome.render(json_output=False).lower())
 
 
+# --- `cockpit status` from a herdr LANE worktree matches its segment (#13367). --
+
+
+class StatusHerdrLaneWorktreeTest(unittest.TestCase):
+    """A ``cockpit status`` run from a linked herdr lane worktree must return the
+    lane's live herdr row (auditor j#73521 finding 1). The worktree inherits the
+    main workspace id + a ``lane-<hash>`` lane id (#13152), but its live herdr row is
+    keyed on the worktree's ``wt_<hash>`` segment, so the tmux-identity match alone
+    would fall through to an absent tmux row. The query resolves the herdr segment
+    (patched here, since the real resolver reads git topology) and matches on it.
+    """
+
+    _SEGMENT = "wt_b7bd4eee36773bd9"
+    _QSEG = "mozyo_bridge.application.cockpit_membership_command._herdr_query_segment"
+    _LOAD = "mozyo_bridge.core.state.lane_metadata.load_lane_records"
+
+    def _ops(self):
+        # The linked worktree's *inherited* identity: main workspace id + lane-<hash>
+        # — deliberately NOT the herdr segment, so only the segment match can find
+        # the herdr row.
+        canon = SimpleNamespace(name="mozyo_bridge", workspace_id="wsMain")
+        lane = LaneIdentity("lane-9fd3face7947", "issue_13367_cockpit_herdr_polish")
+        return _FakeMembershipOps(
+            windows=[], geo_panes=None, facts={"wsMain": _facts()},
+            canon=canon, lane=lane,
+        )
+
+    def _herdr_rows(self):
+        return [
+            {"name": encode_assigned_name(self._SEGMENT, "codex", "default"),
+             "pane_id": "wG:p4"},
+            {"name": encode_assigned_name(self._SEGMENT, "claude", "default"),
+             "pane_id": "wG:p3"},
+        ]
+
+    def _status(self, records):
+        with unittest.mock.patch(self._QSEG, return_value=self._SEGMENT), \
+                unittest.mock.patch(self._LOAD, return_value=records):
+            return CockpitMembershipUseCase(
+                self._ops(), _FakeHerdrColumnOps(self._herdr_rows())
+            ).status(session="s", repo="/repo/mozyo_bridge_issue_13367")
+
+    def test_status_returns_the_live_herdr_lane_row(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token=self._SEGMENT,
+            issue_id="13367",
+            lane_label="issue_13367_cockpit_herdr_polish",
+        )
+        outcome = self._status({self._SEGMENT: record})
+        payload = json.loads(outcome.render(json_output=True))
+        # The herdr lane row is found (not an absent tmux row), with its record join.
+        self.assertEqual(1, payload["workspace_count"])
+        row = payload["workspaces"][0]
+        self.assertEqual(BACKEND_HERDR, row["backend"])
+        self.assertEqual(self._SEGMENT, row["workspace_id"])
+        self.assertEqual("issue_13367_cockpit_herdr_polish", row["lane_label"])
+        self.assertEqual("13367", row["issue"])
+        self.assertTrue(row["member"])
+        self.assertTrue(payload["query"]["member"])
+        self.assertEqual(0, outcome.exit_code)
+
+    def test_status_missing_record_still_finds_row_with_token(self) -> None:
+        # Even with no lane record the segment match finds the row (fail-open token).
+        outcome = self._status({})
+        payload = json.loads(outcome.render(json_output=True))
+        row = payload["workspaces"][0]
+        self.assertEqual(BACKEND_HERDR, row["backend"])
+        self.assertEqual(self._SEGMENT, row["lane_label"])  # raw token
+        codes = {w["code"] for w in row["warnings"]}
+        self.assertIn(WARN_HERDR_LANE_RECORD_MISSING, codes)
+
+    def test_no_herdr_segment_keeps_absent_tmux_row_byte_invariant(self) -> None:
+        # When the segment resolver yields "" (a non-herdr / unresolvable query) the
+        # herdr match is disabled and the query falls through to the absent tmux row.
+        with unittest.mock.patch(self._QSEG, return_value=""), \
+                unittest.mock.patch(self._LOAD, return_value={}):
+            outcome = CockpitMembershipUseCase(
+                self._ops(), _FakeHerdrColumnOps(self._herdr_rows())
+            ).status(session="s", repo="/repo/x")
+        payload = json.loads(outcome.render(json_output=True))
+        self.assertEqual(1, payload["workspace_count"])
+        self.assertEqual(BACKEND_TMUX, payload["workspaces"][0]["backend"])
+        self.assertFalse(payload["workspaces"][0]["member"])
+        self.assertEqual(1, outcome.exit_code)
+
+
 # --- Port contracts: the fake and live adapters satisfy the protocols. -------
 
 
