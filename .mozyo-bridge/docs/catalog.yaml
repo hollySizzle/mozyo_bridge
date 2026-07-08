@@ -117,6 +117,17 @@ documents:
       - spec-herdr-native-identity
       - logic-coordinator-sublane-development-flow
 
+  - id: task-external-project-herdr-adoption
+    type: task
+    status: active
+    canonical_path: vibes/docs/tasks/external-project-herdr-adoption.md
+    purpose: 外部 project への herdr backend 導入の replay 手順 (Redmine #13379)。scaffold apply / rules install / config backend 宣言 / 起動確認と、未採用 directory での bare `mozyo` fail-closed gate、初回導入 smoke checklist。installed CLI のみで完結する。
+    audit_role: external_project_herdr_adoption_task
+    related_document_refs:
+      - task-herdr-lane-operations
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+
   - id: spec-project-map
     type: spec
     status: active

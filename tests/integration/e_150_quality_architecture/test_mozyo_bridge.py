@@ -206,6 +206,36 @@ class PathResolutionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(Path(tmp).resolve(), resolve_repo_root(tmp))
 
+    def test_workspace_adoption_marker_names_the_explicit_adoption_file(self) -> None:
+        # Adoption (Redmine #13379) is a property of the resolved root itself:
+        # only files written by an explicit adoption action count, and a bare
+        # `.mozyo-bridge/` directory (tooling side effect) is NOT adoption.
+        from mozyo_bridge.shared.paths import workspace_adoption_marker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(workspace_adoption_marker(root))
+            (root / ".mozyo-bridge").mkdir()
+            self.assertIsNone(workspace_adoption_marker(root))
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "", encoding="utf-8"
+            )
+            self.assertEqual(
+                ".mozyo-bridge/config.yaml", workspace_adoption_marker(root)
+            )
+
+    def test_workspace_adoption_marker_accepts_workspace_anchors(self) -> None:
+        from mozyo_bridge.shared.paths import workspace_adoption_marker
+
+        for anchor in ("scaffold.json", "workspace-anchor.json", "workspace.json"):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".mozyo-bridge").mkdir()
+                (root / ".mozyo-bridge" / anchor).write_text("{}", encoding="utf-8")
+                self.assertEqual(
+                    f".mozyo-bridge/{anchor}", workspace_adoption_marker(root)
+                )
+
     def test_default_paths_are_relative_to_resolved_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1474,10 +1504,21 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(2, find_agent.call_count)
         self.assertEqual([], created)
 
+    @staticmethod
+    def _adopt(repo: Path) -> None:
+        """Mark a temp repo as mozyo-adopted (scaffold manifest, #13379).
+
+        Bare `mozyo` fails closed on an unadopted root, so the launch-flow
+        tests below adopt their temp repos first.
+        """
+        (repo / ".mozyo-bridge").mkdir(exist_ok=True)
+        (repo / ".mozyo-bridge" / "scaffold.json").write_text("{}", encoding="utf-8")
+
     def test_cmd_mozyo_attaches_after_ensuring_repo_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1519,6 +1560,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1547,6 +1589,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1598,6 +1641,7 @@ class CommandTest(unittest.TestCase):
         self.addCleanup(tmp_ctx.__exit__, None, None, None)
         repo = (Path(tmp) / "my-project").resolve()
         repo.mkdir()
+        self._adopt(repo)
         ns = dict(
             repo=str(repo),
             session=None,
@@ -1675,6 +1719,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1715,6 +1760,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1749,6 +1795,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1781,6 +1828,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1821,6 +1869,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session=None,
@@ -1849,6 +1898,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             other = (Path(tmp) / "other-project").resolve()
             other.mkdir()
             args = argparse.Namespace(
@@ -1891,6 +1941,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session="explicit-session",
@@ -1925,6 +1976,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "my-project").resolve()
             repo.mkdir()
+            self._adopt(repo)
             custom_conf = (Path(tmp) / "custom.tmux.conf").resolve()
             custom_conf.write_text("")
             args = argparse.Namespace(

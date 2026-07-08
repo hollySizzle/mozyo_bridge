@@ -65,6 +65,7 @@ class _FakeLaunchOps:
         self,
         *,
         repo_root: Path = Path("/repo"),
+        adoption_marker: str | None = ".mozyo-bridge/config.yaml",
         canonical: str = "mozyo-repo",
         session_exists: bool = False,
         cwd_mismatch: list[str] | None = None,
@@ -77,6 +78,7 @@ class _FakeLaunchOps:
         execute_raises: BaseException | None = None,
     ) -> None:
         self._repo_root = repo_root
+        self._adoption_marker = adoption_marker
         self._canonical = canonical
         self._session_exists = session_exists
         self._cwd_mismatch = cwd_mismatch or []
@@ -99,6 +101,10 @@ class _FakeLaunchOps:
 
     def repo_root(self, args: argparse.Namespace) -> Path:
         return self._repo_root
+
+    def adoption_marker(self, repo_root: Path) -> str | None:
+        self.calls.append(("adoption_marker", repo_root))
+        return self._adoption_marker
 
     def canonical_session_name(self, repo_root: Path) -> str:
         return self._canonical
@@ -248,7 +254,83 @@ class PureHelpersTest(unittest.TestCase):
         self.assertTrue(payload["control_mode"])
 
 
+class AdoptionRefusalTest(unittest.TestCase):
+    """The pure #13379 gate policy (wording + precedence), home injectable."""
+
+    def test_home_refusal_wins_even_with_marker(self) -> None:
+        from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
+
+        home = Path("/home/someone")
+        refusal = adoption_refusal(
+            home, ".mozyo-bridge/scaffold.json", home=home
+        )
+        self.assertIn("home directory", refusal)
+
+    def test_unadopted_names_root_and_scaffold_guidance(self) -> None:
+        from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
+
+        refusal = adoption_refusal(
+            Path("/somewhere"), None, home=Path("/home/someone")
+        )
+        self.assertIn("/somewhere", refusal)
+        self.assertIn("mozyo-bridge scaffold apply", refusal)
+
+    def test_adopted_non_home_root_proceeds(self) -> None:
+        from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
+
+        self.assertIsNone(
+            adoption_refusal(
+                Path("/somewhere"),
+                ".mozyo-bridge/config.yaml",
+                home=Path("/home/someone"),
+            )
+        )
+
+
 class MozyoLaunchUseCaseTest(unittest.TestCase):
+    def test_unadopted_root_refuses_before_any_session_side_effect(self) -> None:
+        # Redmine #13379: bare `mozyo` in an unadopted directory must fail
+        # closed with the resolved root + scaffold guidance, and must not
+        # touch sessions/windows (the observed trap started two real agents
+        # in the home directory the root silently resolved up to).
+        ops = _FakeLaunchOps(repo_root=Path("/unadopted"), adoption_marker=None)
+        outcome = MozyoLaunchUseCase(ops).run(_mozyo_args())
+        self.assertIsNotNone(outcome.error_message)
+        self.assertIn("/unadopted", outcome.error_message)
+        self.assertIn("not an adopted mozyo workspace", outcome.error_message)
+        self.assertIn("mozyo-bridge scaffold apply", outcome.error_message)
+        self.assertIsNone(ops.setup_args)  # ensure_windows never ran
+        self.assertNotIn(
+            ("session_exists", "mozyo-repo"), ops.calls
+        )  # refused before session probes
+
+    def test_home_root_refuses_even_with_adoption_marker(self) -> None:
+        # A stray home-level manifest (a forgotten `scaffold apply` run from
+        # home — observed live on the trap host) must not re-open the trap:
+        # bare `mozyo` never targets the home directory.
+        ops = _FakeLaunchOps(
+            repo_root=Path.home(), adoption_marker=".mozyo-bridge/scaffold.json"
+        )
+        outcome = MozyoLaunchUseCase(ops).run(_mozyo_args())
+        self.assertIsNotNone(outcome.error_message)
+        self.assertIn("home directory", outcome.error_message)
+        self.assertIsNone(ops.setup_args)
+
+    def test_explicit_session_does_not_bypass_adoption_gate(self) -> None:
+        # The trap is about the directory, not the session name: naming a
+        # session must not launch agents in an unadopted root.
+        ops = _FakeLaunchOps(adoption_marker=None)
+        outcome = MozyoLaunchUseCase(ops).run(_mozyo_args(session="custom"))
+        self.assertIn("not an adopted mozyo workspace", outcome.error_message)
+
+    def test_adopted_root_launches_unchanged(self) -> None:
+        # Any explicit adoption marker (scaffold manifest here) passes the
+        # gate; the flow below stays byte-identical to the pre-gate path.
+        ops = _FakeLaunchOps(adoption_marker=".mozyo-bridge/scaffold.json")
+        outcome = MozyoLaunchUseCase(ops).run(_mozyo_args())
+        self.assertIsNone(outcome.error_message)
+        self.assertIsNotNone(outcome.pre_attach_text)
+
     def test_underivable_name_refuses(self) -> None:
         ops = _FakeLaunchOps(canonical="")
         outcome = MozyoLaunchUseCase(ops).run(_mozyo_args())

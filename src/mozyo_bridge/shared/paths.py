@@ -50,6 +50,17 @@ WORKSPACE_MARKERS = (
 # markers can only stop the walk earlier (at a more specific root) — it never
 # overrides a deeper git / pyproject root.
 REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS
+# Markers that establish mozyo ADOPTION of an already-resolved root (Redmine
+# #13379). Identity inference (which ancestor is the root) and adoption (did
+# this project opt into mozyo) are different questions: bare `mozyo` in an
+# unadopted directory used to walk up to an incidental marker — the home
+# directory's `.tmux.conf` in the observed trap — and silently start two real
+# agents there. Only files written by an explicit adoption action count: the
+# repo-local config (`scaffold apply` / hand-written) and the workspace
+# anchors (`scaffold apply` manifest, `workspace register`). A bare
+# `.mozyo-bridge/` directory is deliberately NOT a marker — repo-local stores
+# (state.sqlite, ledgers) may create it as a side effect without adoption.
+ADOPTION_MARKERS = (".mozyo-bridge/config.yaml",) + WORKSPACE_MARKERS
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mozyo-bridge"
 
 
@@ -103,6 +114,21 @@ def find_repo_root(start: Path | None = None) -> Path:
         if any((path / marker).exists() for marker in REPO_ROOT_MARKERS):
             return path
     return current
+
+
+def workspace_adoption_marker(root: str | Path) -> str | None:
+    """The adoption marker ``root`` carries, or ``None`` for an unadopted root.
+
+    Checks :data:`ADOPTION_MARKERS` directly under the already-resolved
+    ``root`` — no ancestor walk; adoption is a property of the resolved root
+    itself, not of whatever ancestor made it resolvable. Returns the matching
+    marker's repo-relative path so refusal text can name the evidence.
+    """
+    base = Path(root).expanduser()
+    for marker in ADOPTION_MARKERS:
+        if (base / marker).exists():
+            return marker
+    return None
 
 
 def resolve_repo_root(repo: str | Path | None = None, start: Path | None = None) -> Path:

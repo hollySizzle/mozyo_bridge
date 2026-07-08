@@ -97,11 +97,15 @@ _RECOVERY_INVARIANTS: tuple[str, ...] = (
 )
 
 # Re-used recovery fragment for the stale-CLI sub-case of a delivery failure.
+# The repo-local re-send is a dogfooding fallback that only exists inside a
+# mozyo-bridge checkout; an adopting project runs the installed CLI alone
+# (Redmine #13379), so the hint names the update path first.
 _STALE_CLI_HINT = (
     "if the lane reached a routing / preflight step then went silent, suspect a "
-    "stale installed CLI; re-send from the repo-local CLI "
-    "(`PYTHONPATH=src python3 -m mozyo_bridge ...`) before concluding the lane "
-    "is idle"
+    "stale installed CLI; update the installed CLI (during a quiescent window — "
+    "never while lanes are live) or, inside a mozyo-bridge checkout, re-send "
+    "from the repo-local CLI (`PYTHONPATH=src python3 -m mozyo_bridge ...`) "
+    "before concluding the lane is idle"
 )
 
 

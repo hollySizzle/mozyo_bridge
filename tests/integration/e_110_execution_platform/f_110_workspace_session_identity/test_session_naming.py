@@ -333,12 +333,25 @@ class SessionNamingTest(unittest.TestCase):
     # Bare `mozyo` / status unification (Redmine #10796 follow-up #52324)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _adopt(repo: Path) -> None:
+        """Mark a temp repo as mozyo-adopted (scaffold manifest, #13379).
+
+        Bare `mozyo` fails closed on an unadopted root, so the launch-flow
+        tests below adopt their temp repos first.
+        """
+        (repo / ".mozyo-bridge").mkdir(exist_ok=True)
+        (repo / ".mozyo-bridge" / "scaffold.json").write_text(
+            "{}", encoding="utf-8"
+        )
+
     def _run_bare_mozyo_capture_session(self, repo: Path) -> str:
         """Run bare `mozyo --no-attach` with tmux mocked; return the session.
 
         Captures the session name handed to `ensure_repo_session_windows` so
         the test asserts the derivation without touching a real tmux server.
         """
+        self._adopt(repo)
         args = argparse.Namespace(
             repo=str(repo),
             session=None,
@@ -397,6 +410,7 @@ class SessionNamingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = (Path(tmp) / "2026PBL_ローカル").resolve()
             repo.mkdir()
+            self._adopt(repo)
             args = argparse.Namespace(
                 repo=str(repo),
                 session="explicit-name",

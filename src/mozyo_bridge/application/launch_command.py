@@ -68,6 +68,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     InvalidClaudeModel,
     claude_model_flag,
 )
+from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
 
 
 # --- Pure policy: attach form, window parsing, payload / text rendering. -------
@@ -223,6 +224,8 @@ class LaunchOps(Protocol):
 
     def repo_root(self, args: argparse.Namespace) -> Path: ...
 
+    def adoption_marker(self, repo_root: Path) -> str | None: ...
+
     def canonical_session_name(self, repo_root: Path) -> str: ...
 
     def session_exists(self, session: str) -> bool: ...
@@ -275,6 +278,11 @@ class LiveLaunchOps:
 
     def repo_root(self, args: argparse.Namespace) -> Path:
         return self._commands().repo_root_from_args(args)
+
+    def adoption_marker(self, repo_root: Path) -> str | None:
+        from mozyo_bridge.shared.paths import workspace_adoption_marker
+
+        return workspace_adoption_marker(repo_root)
 
     def canonical_session_name(self, repo_root: Path) -> str:
         return self._commands().resolve_canonical_session(repo_root).name
@@ -377,10 +385,10 @@ class LayoutLaunchOutcome:
 class MozyoLaunchUseCase:
     """Bare ``mozyo`` launch over the :class:`LaunchOps` port.
 
-    Mirrors the legacy ``cmd_mozyo`` body exactly: resolve the repo root and
-    session name (failing closed on an underivable name or a cwd-mismatched
-    existing session), compute the legacy notice, ensure the repo session
-    windows, then decide JSON vs text vs attach. The ``os.execvp`` attach and the
+    Mirrors the legacy ``cmd_mozyo`` body: resolve the repo root and session
+    name (failing closed on an unadopted root (Redmine #13379), an underivable
+    name, or a cwd-mismatched existing session), compute the legacy notice,
+    ensure the repo session windows, then decide JSON vs text vs attach. The ``os.execvp`` attach and the
     stdout stay in the thin handler that renders the returned outcome.
     """
 
@@ -390,6 +398,12 @@ class MozyoLaunchUseCase:
         ops = self.ops
         ops.require_tmux()
         repo_root = ops.repo_root(args)
+        # Adoption gate (Redmine #13379): fail closed BEFORE any session/window
+        # side effect when the resolved root is unadopted or the home
+        # directory. Policy + wording live in `launch_adoption_gate`.
+        refusal = adoption_refusal(repo_root, ops.adoption_marker(repo_root))
+        if refusal is not None:
+            return MozyoLaunchOutcome(error_message=refusal)
         derived = ops.canonical_session_name(repo_root)
         if not derived:
             return MozyoLaunchOutcome(

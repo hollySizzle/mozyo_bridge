@@ -532,7 +532,11 @@ def ensure_repo_session_windows(args: argparse.Namespace) -> list[str]:
 def cmd_mozyo(args: argparse.Namespace) -> int:
     """Bare ``mozyo`` entrypoint: repo-aware session with one window per agent.
 
-    Resolves the repo root, resolves the session name via
+    Resolves the repo root — failing closed when that root carries no mozyo
+    adoption marker (``.mozyo-bridge/config.yaml`` / scaffold manifest /
+    workspace anchor, Redmine #13379), so an unadopted directory can no longer
+    silently resolve up to an incidental ancestor (the home directory in the
+    observed trap) and start real agents there — resolves the session name via
     :func:`resolve_canonical_session` (the registered canonical session name
     from the home registry / workspace anchor when this workspace was
     registered with ``mozyo-bridge workspace register`` (Redmine #11429);
