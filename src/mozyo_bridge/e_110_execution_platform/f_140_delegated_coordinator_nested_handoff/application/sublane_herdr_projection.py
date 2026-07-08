@@ -16,16 +16,27 @@ Two backend-selection notes keep the tmux path byte-invariant:
   fold);
 * the sender's OWN workspace is excluded: the coordinator / main workspace also carries a
   codex (auditor) + claude (coordinator) default-lane pair, which is not a sublane.
+
+Stale / retire hints (Redmine #13358): the fold also supplies the herdr analogue of the
+#13086 tmux advisory diagnosis material into the same ``stale_hints`` field — a lost
+gateway / worker slot, a live-but-vanished lane workspace (an active lane metadata record
+with no live managed slot), duplicate lanes carrying one issue id, and a recorded worktree
+that no longer resolves to a live git checkout. Exactly like the tmux hints they are
+retire *decision material* for a human / coordinator: advisory display output only, never
+an auto-retire trigger, and routing / callback target resolution never reads them.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     GATEWAY_ROLE,
+    STALE_HINT_DUPLICATE_ISSUE_LANE,
+    STALE_HINT_WORKTREE_UNRESOLVED,
     WORKER_ROLE,
     SublaneLaneView,
     _lane_state,
@@ -68,11 +79,34 @@ def repo_backend_is_herdr(repo_root: Path) -> bool:
     return config is not None and config.backend == BACKEND_HERDR
 
 
+# ---------------------------------------------------------------------------
+# herdr stale / retire hints (#13358): the herdr lane analogue of the #13086
+# tmux ``STALE_HINT_*`` vocabulary. Each token names one observed inconsistency
+# between the lane's durable identity and the live herdr inventory. Advisory
+# retire decision material only — never an auto-retire trigger, never a routing
+# input, and unknown never fabricates a hint. Where a tmux token's meaning
+# carries over unchanged (``duplicate_issue_lane:<peer>``,
+# ``worktree_unresolved``) the shared domain token is reused; the herdr-only
+# conditions get their own tokens below.
+# ---------------------------------------------------------------------------
+
 #: Machine-readable ``stale_hints`` token: the live lane workspace has no lane
 #: metadata record, so its human identity (lane_label / issue / branch /
 #: worktree) could not be resolved and the row degrades to the raw token
 #: (Redmine #13356 j#73386 fail-open degrade). Advisory display material only.
 LANE_RECORD_MISSING_HINT = "lane_record_missing"
+
+#: The lane workspace has no live ``codex`` gateway slot (dispatch / callback
+#: rail lost) — the herdr analogue of the tmux ``gateway_pane_missing``.
+GATEWAY_SLOT_MISSING_HINT = "gateway_slot_missing"
+#: The lane workspace has no live ``claude`` worker slot (implementer lost /
+#: never adopted) — the herdr analogue of the tmux ``worker_pane_missing``.
+WORKER_SLOT_MISSING_HINT = "worker_slot_missing"
+#: An ACTIVE lane metadata record's workspace has NO live managed slot at all:
+#: the lane vanished (herdr down-scoped / agents closed outside retire) while
+#: the durable display record still says active. Rendered as a detached row so
+#: the loss stays visible instead of silently dropping out of ``sublane list``.
+LANE_WORKSPACE_MISSING_HINT = "lane_workspace_missing"
 
 
 def list_herdr_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping[str, object]]:
@@ -83,12 +117,54 @@ def list_herdr_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping[str, objec
     return _list_rows(binary, subprocess.run, 30.0)
 
 
+def probe_worktree_resolved(path: str) -> Optional[bool]:
+    """Read-only probe: does ``path`` still resolve to a live git checkout?
+
+    The herdr twin of the tmux ``branch_for`` unresolved-worktree probe (#13086):
+    ``False`` means the recorded worktree is gone / not a git checkout (removed,
+    moved, or never created) — stale retire material. ``None`` is *unknown* (empty
+    path, git binary unavailable), and unknown never fabricates a hint.
+    """
+    import subprocess
+
+    if not path:
+        return None
+    if not Path(path).is_dir():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    return result.returncode == 0
+
+
+@dataclass(frozen=True)
+class _LaneEntry:
+    """One pre-hint lane row of the fold (internal assembly record)."""
+
+    workspace_id: str
+    gateway: Optional[str]
+    worker: Optional[str]
+    lane_label: str
+    issue: Optional[str]
+    branch: Optional[str]
+    repo_root: Optional[str]
+    identity_hints: tuple[str, ...]
+    workspace_missing: bool
+
+
 def project_herdr_sublanes(
     rows: Sequence[Mapping[str, object]],
     *,
     exclude_workspace_id: str,
     resolve_repo_root: Callable[[str], Optional[str]],
     resolve_lane_record: Optional[Callable[[str], Optional[object]]] = None,
+    lane_records: Optional[Mapping[str, object]] = None,
+    worktree_resolved: Optional[Callable[[str], Optional[bool]]] = None,
 ) -> tuple[SublaneLaneView, ...]:
     """Fold the live herdr inventory into one :class:`SublaneLaneView` per lane workspace.
 
@@ -108,10 +184,29 @@ def project_herdr_sublanes(
     registry-id workspace, never for a ``wt_<hash>`` lane token) and finally to the raw
     workspace id as the label (never guessed), with the
     :data:`LANE_RECORD_MISSING_HINT` stale hint so the degrade stays visible.
+    ``lane_records`` (the full token-keyed record mapping) doubles as the record join
+    source when ``resolve_lane_record`` is not supplied.
 
-    Pure over the injected rows + resolvers (no subprocess / config read); deterministic
-    first-seen ordering.
+    Stale / retire hints (Redmine #13358), all advisory-only:
+
+    - a lane with only one live managed slot carries :data:`GATEWAY_SLOT_MISSING_HINT` /
+      :data:`WORKER_SLOT_MISSING_HINT` for the lost slot;
+    - an ACTIVE record in ``lane_records`` whose workspace has NO live managed slot is
+      emitted as an extra detached row (appended after the live lanes, token-sorted)
+      carrying :data:`LANE_WORKSPACE_MISSING_HINT` — a vanished lane stays visible
+      instead of silently dropping out (retired tombstones and the excluded workspace
+      never produce such a row);
+    - every emitted lane (live or vanished) resolving to the same issue id names each
+      peer as ``duplicate_issue_lane:<peer label or token>`` (the shared #13086 token);
+    - a lane whose resolved worktree path ``worktree_resolved`` reports as ``False`` (no
+      longer a live git checkout) carries ``worktree_unresolved``; ``None`` / no probe is
+      *unknown*, and unknown never fabricates a hint.
+
+    Pure over the injected rows + resolvers (no subprocess / config read); live lanes keep
+    deterministic first-seen ordering.
     """
+    if resolve_lane_record is None and lane_records is not None:
+        resolve_lane_record = lane_records.get
     slots: dict[str, dict[str, str]] = {}
     order: list[str] = []
     exclude = _norm(exclude_workspace_id)
@@ -137,7 +232,7 @@ def project_herdr_sublanes(
             order.append(ws)
         slots[ws].setdefault(identity.role, locator)
 
-    views: list[SublaneLaneView] = []
+    entries: list[_LaneEntry] = []
     for ws in order:
         gateway = slots[ws].get(GATEWAY_ROLE)
         worker = slots[ws].get(WORKER_ROLE)
@@ -149,25 +244,98 @@ def project_herdr_sublanes(
             )
             branch = getattr(record, "branch", "") or None
             repo_root = getattr(record, "worktree_path", "") or resolve_repo_root(ws)
-            hints: tuple[str, ...] = ()
+            identity_hints: tuple[str, ...] = ()
         else:
             repo_root = resolve_repo_root(ws)
             lane_label = Path(repo_root).name if repo_root else ws
             issue = parse_issue_from_lane_label(lane_label)
             branch = None
-            hints = () if repo_root else (LANE_RECORD_MISSING_HINT,)
-        views.append(
-            SublaneLaneView(
+            identity_hints = () if repo_root else (LANE_RECORD_MISSING_HINT,)
+        entries.append(
+            _LaneEntry(
                 workspace_id=ws,
-                lane_id=DEFAULT_LANE,
+                gateway=gateway,
+                worker=worker,
                 lane_label=lane_label,
                 issue=issue or None,
                 branch=branch,
                 repo_root=repo_root,
-                gateway_pane=gateway,
-                worker_pane=worker,
-                state=_lane_state(gateway, worker),
-                stale_hints=hints,
+                identity_hints=identity_hints,
+                workspace_missing=False,
+            )
+        )
+
+    # Vanished lane workspaces (#13358): an ACTIVE lane record with no live managed
+    # slot. Only records can reveal these — the live fold above never sees them.
+    if lane_records:
+        live = {_norm(ws) for ws in order}
+        for token in sorted(lane_records):
+            record = lane_records[token]
+            if getattr(record, "retired", False):
+                continue
+            if _norm(token) in live or _norm(token) == exclude:
+                continue
+            lane_label = getattr(record, "lane_label", "") or token
+            issue = getattr(record, "issue_id", "") or parse_issue_from_lane_label(
+                lane_label
+            )
+            entries.append(
+                _LaneEntry(
+                    workspace_id=token,
+                    gateway=None,
+                    worker=None,
+                    lane_label=lane_label,
+                    issue=issue or None,
+                    branch=getattr(record, "branch", "") or None,
+                    repo_root=getattr(record, "worktree_path", "") or None,
+                    identity_hints=(),
+                    workspace_missing=True,
+                )
+            )
+
+    # Duplicate-issue detection needs the whole emitted lane set (live + vanished),
+    # so every duplicate lane can name its peers (mirrors the tmux fold).
+    lanes_by_issue: dict[str, list[int]] = {}
+    for idx, entry in enumerate(entries):
+        if entry.issue:
+            lanes_by_issue.setdefault(entry.issue, []).append(idx)
+
+    views: list[SublaneLaneView] = []
+    for idx, entry in enumerate(entries):
+        hints: list[str] = []
+        if entry.workspace_missing:
+            hints.append(LANE_WORKSPACE_MISSING_HINT)
+        else:
+            if not entry.gateway:
+                hints.append(GATEWAY_SLOT_MISSING_HINT)
+            if not entry.worker:
+                hints.append(WORKER_SLOT_MISSING_HINT)
+        for peer_idx in lanes_by_issue.get(entry.issue or "", ()):
+            if peer_idx == idx:
+                continue
+            peer = entries[peer_idx]
+            hints.append(
+                f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:{peer.lane_label or peer.workspace_id}"
+            )
+        if (
+            entry.repo_root
+            and worktree_resolved is not None
+            and worktree_resolved(entry.repo_root) is False
+        ):
+            hints.append(STALE_HINT_WORKTREE_UNRESOLVED)
+        hints.extend(entry.identity_hints)
+        views.append(
+            SublaneLaneView(
+                workspace_id=entry.workspace_id,
+                lane_id=DEFAULT_LANE,
+                lane_label=entry.lane_label,
+                issue=entry.issue,
+                branch=entry.branch,
+                repo_root=entry.repo_root,
+                gateway_pane=entry.gateway,
+                worker_pane=entry.worker,
+                state=_lane_state(entry.gateway, entry.worker),
+                stale_hints=tuple(hints),
             )
         )
     return tuple(views)
@@ -205,14 +373,17 @@ def herdr_sublane_views(
 
     # Fail-open display join (#13356 j#73386): tombstones stay resolvable so a
     # retired-but-still-live lane keeps its label; a missing / unreadable store
-    # yields no records and the fold degrades to the raw token.
+    # yields no records and the fold degrades to the raw token. The full mapping
+    # also feeds the #13358 vanished-workspace detection (active record, no live
+    # slot) and the worktree probe supplies the ``worktree_unresolved`` material.
     lane_records = load_lane_records()
 
     return project_herdr_sublanes(
         rows,
         exclude_workspace_id=own_ws,
         resolve_repo_root=_resolve,
-        resolve_lane_record=lane_records.get,
+        lane_records=lane_records,
+        worktree_resolved=probe_worktree_resolved,
     )
 
 
@@ -300,10 +471,14 @@ def herdr_lane_view_for_worktree(
 
 
 __all__ = (
+    "GATEWAY_SLOT_MISSING_HINT",
     "LANE_RECORD_MISSING_HINT",
+    "LANE_WORKSPACE_MISSING_HINT",
+    "WORKER_SLOT_MISSING_HINT",
     "herdr_lane_view_for_worktree",
     "herdr_sublane_views",
     "list_herdr_agent_rows",
+    "probe_worktree_resolved",
     "project_herdr_sublanes",
     "repo_backend_is_herdr",
 )

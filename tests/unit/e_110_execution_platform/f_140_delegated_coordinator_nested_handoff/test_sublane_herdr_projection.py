@@ -15,12 +15,22 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+    GATEWAY_SLOT_MISSING_HINT,
     LANE_RECORD_MISSING_HINT,
+    LANE_WORKSPACE_MISSING_HINT,
+    WORKER_SLOT_MISSING_HINT,
+    probe_worktree_resolved,
     project_herdr_sublanes,
 )
-from mozyo_bridge.core.state.lane_metadata import LaneMetadataRecord
+from mozyo_bridge.core.state.lane_metadata import (
+    LANE_STATUS_RETIRED,
+    LaneMetadataRecord,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+    STALE_HINT_DUPLICATE_ISSUE_LANE,
+    STALE_HINT_WORKTREE_UNRESOLVED,
     SUBLANE_STATE_ACTIVE,
+    SUBLANE_STATE_DETACHED,
     SUBLANE_STATE_GATEWAY_ONLY,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -151,6 +161,261 @@ class ProjectHerdrSublanesTest(unittest.TestCase):
             resolve_lane_record={"wt_x": record}.get,
         )
         self.assertEqual(views[0].issue, "777")
+
+
+class HerdrStaleHintsTest(unittest.TestCase):
+    """The #13358 herdr stale / retire hint supply (advisory-only display material)."""
+
+    def test_lost_worker_slot_raises_worker_slot_missing(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_a",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+        )
+        views = project_herdr_sublanes(
+            [_row("wt_a", "codex", "", "wL1:p2")],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_a": record},
+        )
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].state, SUBLANE_STATE_GATEWAY_ONLY)
+        self.assertEqual(views[0].stale_hints, (WORKER_SLOT_MISSING_HINT,))
+
+    def test_lost_gateway_slot_raises_gateway_slot_missing(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_a",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+        )
+        views = project_herdr_sublanes(
+            [_row("wt_a", "claude", "", "wL1:p3")],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_a": record},
+        )
+        self.assertEqual(views[0].stale_hints, (GATEWAY_SLOT_MISSING_HINT,))
+
+    def test_intact_lane_has_no_slot_hints(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_a",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+        )
+        views = project_herdr_sublanes(
+            [
+                _row("wt_a", "codex", "", "wL1:p2"),
+                _row("wt_a", "claude", "", "wL1:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_a": record},
+        )
+        self.assertEqual(views[0].stale_hints, ())
+
+    def test_active_record_without_live_slot_is_vanished_workspace_row(self) -> None:
+        gone = LaneMetadataRecord(
+            lane_workspace_token="wt_gone",
+            issue_id="303",
+            lane_label="issue_303_gone",
+            branch="issue_303_gone",
+            worktree_path="/work/mozyo_bridge_issue_303_gone",
+        )
+        live = LaneMetadataRecord(
+            lane_workspace_token="wt_live",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+        )
+        views = project_herdr_sublanes(
+            [
+                _row("wt_live", "codex", "", "wL1:p2"),
+                _row("wt_live", "claude", "", "wL1:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_live": live, "wt_gone": gone},
+        )
+        # The vanished lane is appended after the live lanes as a detached row —
+        # visible instead of silently dropping out of `sublane list`.
+        self.assertEqual([v.workspace_id for v in views], ["wt_live", "wt_gone"])
+        vanished = views[1]
+        self.assertEqual(vanished.lane_label, "issue_303_gone")
+        self.assertEqual(vanished.issue, "303")
+        self.assertEqual(vanished.state, SUBLANE_STATE_DETACHED)
+        self.assertIsNone(vanished.gateway_pane)
+        self.assertIsNone(vanished.worker_pane)
+        self.assertEqual(vanished.stale_hints, (LANE_WORKSPACE_MISSING_HINT,))
+        self.assertEqual(views[0].stale_hints, ())
+
+    def test_retired_tombstone_never_becomes_vanished_row(self) -> None:
+        tombstone = LaneMetadataRecord(
+            lane_workspace_token="wt_retired",
+            issue_id="404",
+            lane_label="issue_404_done",
+            status=LANE_STATUS_RETIRED,
+            retired_at="2026-07-08T00:00:00+00:00",
+        )
+        views = project_herdr_sublanes(
+            [],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_retired": tombstone},
+        )
+        self.assertEqual(views, ())
+
+    def test_own_workspace_record_never_becomes_vanished_row(self) -> None:
+        own = LaneMetadataRecord(
+            lane_workspace_token="wsMain",
+            lane_label="main",
+        )
+        views = project_herdr_sublanes(
+            [],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wsMain": own},
+        )
+        self.assertEqual(views, ())
+
+    def test_duplicate_issue_lanes_name_each_peer(self) -> None:
+        records = {
+            "wt_a": LaneMetadataRecord(
+                lane_workspace_token="wt_a",
+                issue_id="500",
+                lane_label="issue_500_first",
+            ),
+            "wt_b": LaneMetadataRecord(
+                lane_workspace_token="wt_b",
+                issue_id="500",
+                lane_label="issue_500_second",
+            ),
+        }
+        views = project_herdr_sublanes(
+            [
+                _row("wt_a", "codex", "", "wL1:p2"),
+                _row("wt_a", "claude", "", "wL1:p3"),
+                _row("wt_b", "codex", "", "wL2:p2"),
+                _row("wt_b", "claude", "", "wL2:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records=records,
+        )
+        self.assertEqual(
+            views[0].stale_hints,
+            (f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_500_second",),
+        )
+        self.assertEqual(
+            views[1].stale_hints,
+            (f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_500_first",),
+        )
+
+    def test_vanished_record_duplicates_against_live_relaunch(self) -> None:
+        # The #13360 lost-workspace relaunch shape: the issue's original lane
+        # workspace vanished (record still active) and a relaunched live lane
+        # carries the same issue — both rows flag each other.
+        records = {
+            "wt_old": LaneMetadataRecord(
+                lane_workspace_token="wt_old",
+                issue_id="600",
+                lane_label="issue_600_lost",
+            ),
+            "wt_new": LaneMetadataRecord(
+                lane_workspace_token="wt_new",
+                issue_id="600",
+                lane_label="issue_600_relaunch",
+            ),
+        }
+        views = project_herdr_sublanes(
+            [
+                _row("wt_new", "codex", "", "wL1:p2"),
+                _row("wt_new", "claude", "", "wL1:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records=records,
+        )
+        self.assertEqual([v.workspace_id for v in views], ["wt_new", "wt_old"])
+        self.assertEqual(
+            views[0].stale_hints,
+            (f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_600_lost",),
+        )
+        self.assertEqual(
+            views[1].stale_hints,
+            (
+                LANE_WORKSPACE_MISSING_HINT,
+                f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_600_relaunch",
+            ),
+        )
+
+    def test_unresolved_worktree_probe_raises_hint(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_a",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+            worktree_path="/work/removed_checkout",
+        )
+        views = project_herdr_sublanes(
+            [
+                _row("wt_a", "codex", "", "wL1:p2"),
+                _row("wt_a", "claude", "", "wL1:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_a": record},
+            worktree_resolved=lambda path: False,
+        )
+        self.assertEqual(views[0].stale_hints, (STALE_HINT_WORKTREE_UNRESOLVED,))
+
+    def test_unknown_worktree_probe_never_fabricates_hint(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token="wt_a",
+            issue_id="101",
+            lane_label="issue_101_alpha",
+            worktree_path="/work/somewhere",
+        )
+        for probe in (lambda path: None, lambda path: True):
+            views = project_herdr_sublanes(
+                [
+                    _row("wt_a", "codex", "", "wL1:p2"),
+                    _row("wt_a", "claude", "", "wL1:p3"),
+                ],
+                exclude_workspace_id="wsMain",
+                resolve_repo_root=lambda ws: None,
+                lane_records={"wt_a": record},
+                worktree_resolved=probe,
+            )
+            self.assertEqual(views[0].stale_hints, ())
+
+    def test_lane_without_worktree_path_never_probes(self) -> None:
+        probed: list[str] = []
+
+        def probe(path: str) -> bool:
+            probed.append(path)
+            return False
+
+        views = project_herdr_sublanes(
+            [_row("wt_orphan", "codex", "", "wX:p2")],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            resolve_lane_record=lambda ws: None,
+            worktree_resolved=probe,
+        )
+        self.assertEqual(probed, [])
+        # The record-missing degrade keeps its identity hint alongside the slot hint.
+        self.assertEqual(
+            views[0].stale_hints,
+            (WORKER_SLOT_MISSING_HINT, LANE_RECORD_MISSING_HINT),
+        )
+
+
+class ProbeWorktreeResolvedTest(unittest.TestCase):
+    """The live git-checkout probe's unknown / gone boundary (pure input shapes)."""
+
+    def test_empty_path_is_unknown(self) -> None:
+        self.assertIsNone(probe_worktree_resolved(""))
+
+    def test_missing_directory_is_unresolved(self) -> None:
+        self.assertIs(probe_worktree_resolved("/nonexistent/path/for/13358"), False)
 
 
 class HerdrLaneViewForWorktreeTest(unittest.TestCase):
