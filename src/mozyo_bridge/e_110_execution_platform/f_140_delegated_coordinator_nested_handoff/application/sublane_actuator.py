@@ -82,6 +82,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneCreateRequest,
+    redact_worktree_paths,
 )
 
 
@@ -133,7 +134,11 @@ def format_actuate_text(outcome: SublaneActuationOutcome) -> str:
     lines.append("  durable record:")
     for jline in render_actuation_journal(outcome).splitlines():
         lines.append(f"    {jline}")
-    return "\n".join(lines)
+    # #13368: the full text output is pasteable; redact the host-local absolute
+    # worktree path (e.g. inside the replayable `git worktree add` / `cockpit append
+    # --repo` command lines) to its portable sibling basename. The exact command with
+    # the absolute path is still available in the `--json` payload for local replay.
+    return redact_worktree_paths("\n".join(lines), outcome.worktree_path)
 
 
 # ---------------------------------------------------------------------------

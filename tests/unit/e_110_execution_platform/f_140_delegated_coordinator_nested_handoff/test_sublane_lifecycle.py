@@ -50,9 +50,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneCreateRequest,
     parse_issue_from_lane_label,
     plan_sublane_create,
+    portable_worktree_label,
     preflight_sublane_retire,
     project_sublanes,
+    redact_worktree_paths,
 )
+
+# Redmine #13368: synthetic host-local absolute worktree path. Uses a `/workspace`
+# prefix (never a real home path) per the tracked-file no-home-literal convention
+# (feedback: `no_homepath_or_secret_shaped_literals_in_tracked_files`).
+_FAKE_WT = "/workspace/parent/mozyo_bridge_issue_13368_record_path_redaction"
+_FAKE_WT_LABEL = "mozyo_bridge_issue_13368_record_path_redaction"
 
 
 def _row(**kw):
@@ -490,6 +498,56 @@ class PreflightRetireTests(unittest.TestCase):
         titles = [s.title for s in pre.runbook]
         self.assertNotIn("remove worktree", titles)
         self.assertNotIn("delete local branch", titles)
+
+
+class TestRecordPathRedaction(unittest.TestCase):
+    """Redmine #13368: pasteable records carry no host-local absolute worktree path.
+
+    The lane ``worktree_path`` is private state (``lane_metadata.py`` /
+    ``vibes/docs/rules/public-private-boundary.md``); the portable sibling basename
+    is what human-readable records surface, while the absolute path stays only in the
+    structured JSON / local state (mirroring #12098 ``ExecutionRoot``).
+    """
+
+    def test_portable_worktree_label_is_sibling_basename(self):
+        self.assertEqual(portable_worktree_label(_FAKE_WT), _FAKE_WT_LABEL)
+
+    def test_portable_worktree_label_empty_is_dash(self):
+        self.assertEqual(portable_worktree_label(""), "-")
+        self.assertEqual(portable_worktree_label(None), "-")
+
+    def test_portable_worktree_label_carries_no_home_prefix(self):
+        label = portable_worktree_label(_FAKE_WT)
+        self.assertNotIn("/", label)
+        self.assertNotIn(_FAKE_WT, label)
+
+    def test_redact_worktree_paths_replaces_exact_abs_with_basename(self):
+        text = f"$ git worktree add {_FAKE_WT} -b issue_13368_record_path_redaction"
+        redacted = redact_worktree_paths(text, _FAKE_WT)
+        self.assertNotIn(_FAKE_WT, redacted)
+        self.assertIn(_FAKE_WT_LABEL, redacted)
+
+    def test_redact_worktree_paths_noop_on_empty_or_absent(self):
+        text = "no path here"
+        self.assertEqual(redact_worktree_paths(text, ""), text)
+        self.assertEqual(redact_worktree_paths(text, None), text)
+        # A path not present in the text is left untouched (exact-match only).
+        self.assertEqual(redact_worktree_paths(text, "/other/lane"), text)
+
+    def test_retire_runbook_command_keeps_abs_but_text_render_redacts(self):
+        # The runbook VO / JSON retains the exact replayable `git worktree remove`
+        # command (local machine surface); the pasteable *text* redaction happens in
+        # the command-layer `format_retire_text` (integration test). Here we pin that
+        # the domain runbook still emits the absolute path for local replay.
+        pre = preflight_sublane_retire(
+            RetireDecision(state=RETIRE_OK),
+            issue="13368",
+            lane_label="issue_13368_record_path_redaction",
+            worktree_path=_FAKE_WT,
+            branch="issue_13368_record_path_redaction",
+        )
+        remove = next(s for s in pre.runbook if s.title == "remove worktree")
+        self.assertIn(_FAKE_WT, remove.command)
 
 
 if __name__ == "__main__":

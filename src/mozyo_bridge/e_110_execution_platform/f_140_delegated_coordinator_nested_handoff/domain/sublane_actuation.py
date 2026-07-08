@@ -46,6 +46,9 @@ from typing import Optional, Tuple
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
     REASON_FILL_STOP,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    portable_worktree_label,
+)
 
 # ---------------------------------------------------------------------------
 # Per-step execution status (literal; machine-readable regardless of UI language).
@@ -320,7 +323,10 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         f"- adopted: {str(outcome.adopted).lower()}",
         f"- launch_action: {outcome.launch_action or '-'}",
         f"- branch: {outcome.branch or '-'}",
-        f"- worktree: {outcome.worktree_path or '-'}",
+        # #13368: the durable record is pasted into a Redmine journal; render the
+        # portable lane worktree sibling basename, never the host-local absolute path
+        # (the absolute path stays in `as_payload()["worktree_path"]`, a local surface).
+        f"- worktree: {portable_worktree_label(outcome.worktree_path)}",
         f"- gateway_pane: {outcome.gateway_pane or '-'}",
         f"- worker_pane: {outcome.worker_pane or '-'}",
         f"- dispatch_target: {outcome.dispatch_target or '-'}",

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Collection, Iterable, Mapping, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -104,6 +105,58 @@ def parse_issue_from_lane_label(lane_label: str) -> Optional[str]:
     """
     match = _ISSUE_LABEL_RE.search(lane_label or "")
     return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Record-path redaction (Redmine #13368; privacy系統対処).
+#
+# A lane ``worktree_path`` is a host-local absolute path and is **private state**:
+# ``src/mozyo_bridge/core/state/lane_metadata.py`` marks it "local/private state
+# only; do not copy to a Redmine journal / pasteable durable record", and
+# ``vibes/docs/rules/public-private-boundary.md`` forbids personal home / private
+# project absolute paths in a public record. j#73454 (#13358 review finding 2) was
+# exactly such a leak: a gateway dispatch outcome carried the absolute worktree
+# path into the Redmine journal. These helpers make every *pasteable human-readable*
+# record redact the absolute path to its portable **sibling basename** — the lane
+# worktree directory name (e.g. ``mozyo_bridge_issue_13368_record_path_redaction``),
+# which carries no home prefix and still identifies the lane. The absolute path
+# stays only in the structured JSON outcome / local state, mirroring the #12098
+# ``ExecutionRoot`` doctrine (``workdir`` absolute in the machine surface, portable
+# pointer in the pasteable text).
+# ---------------------------------------------------------------------------
+
+
+def portable_worktree_label(worktree_path: Optional[str]) -> str:
+    """Pasteable-safe label for a lane worktree: its sibling basename (pure, #13368).
+
+    Returns the worktree directory basename (no personal home / private-project
+    absolute prefix), so it is safe to render into a Redmine journal / pasteable
+    durable record. Empty input renders as ``-`` (matching the existing ``or '-'``
+    field convention in the record renderers).
+    """
+    text = (worktree_path or "").strip()
+    if not text:
+        return "-"
+    return PurePath(text).name or text
+
+
+def redact_worktree_paths(text: str, *worktree_paths: Optional[str]) -> str:
+    """Redact known host-local worktree absolute paths in composed record text (pure).
+
+    Replaces each supplied absolute worktree path with its portable sibling basename
+    (:func:`portable_worktree_label`) wherever it appears in ``text`` — e.g. inside a
+    replayable ``git worktree add <abs>`` / ``cockpit append --repo <abs>`` command
+    line — so a pasteable text record carries no private path while the exact command
+    (with the absolute path) is still preserved in the structured JSON outcome
+    (#13368). Replacement is by the exact known string, never by guessing a home
+    prefix, so it cannot mangle unrelated text.
+    """
+    out = text
+    for raw in worktree_paths:
+        candidate = (raw or "").strip()
+        if candidate:
+            out = out.replace(candidate, PurePath(candidate).name or candidate)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +857,8 @@ __all__ = (
     "DEFAULT_LANE",
     "MAIN_LANE_LABEL",
     "parse_issue_from_lane_label",
+    "portable_worktree_label",
+    "redact_worktree_paths",
     "SUBLANE_STATE_ACTIVE",
     "SUBLANE_STATE_GATEWAY_ONLY",
     "SUBLANE_STATE_WORKER_ONLY",

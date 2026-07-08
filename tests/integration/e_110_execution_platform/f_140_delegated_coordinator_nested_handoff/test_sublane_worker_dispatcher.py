@@ -56,6 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_LANE_PANE_MISSING,
     REASON_WORKER_DISPATCH_FAILED,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    WorkerDispatchOutcome,
     WorkerDispatchRequest,
 )
 
@@ -539,6 +540,37 @@ class RenderAndCliTests(unittest.TestCase):
         )
         self.assertEqual(args.worker_ready_timeout, 0.0)
         self.assertTrue(args.allow_direct_worker)
+
+
+class WorkerDispatchTextPathRedactionTests(unittest.TestCase):
+    """Redmine #13368: ``format_worker_dispatch_text`` leaks no host-local abs path.
+
+    The same-lane send uses ``--target-repo auto`` so the command carries no path;
+    this pins that even with an absolute ``worktree_path`` on the outcome, the
+    pasteable text stays path-free (defence-in-depth) while the machine payload
+    keeps the absolute path.
+    """
+
+    _WT = "/workspace/parent/mozyo_bridge_issue_13368_record_path_redaction"
+
+    def test_worker_dispatch_text_has_no_abs_worktree_path(self):
+        outcome = WorkerDispatchOutcome(
+            status=ACTUATE_EXECUTED,
+            execute=True,
+            reason="delivery-acked",
+            issue="13368",
+            lane_label="issue_13368_record_path_redaction",
+            worktree_path=self._WT,
+            gateway_pane="%1",
+            worker_pane="%2",
+            dispatch_target="%2",
+            dispatch_result=DISPATCH_WORKER_DISPATCHED,
+            durable_anchor="73502",
+            command="mozyo-bridge handoff send --to claude --target-repo auto",
+        )
+        text = format_worker_dispatch_text(outcome)
+        self.assertNotIn(self._WT, text)
+        self.assertEqual(outcome.as_payload()["worktree_path"], self._WT)
 
 
 if __name__ == "__main__":
