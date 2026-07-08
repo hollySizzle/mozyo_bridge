@@ -593,6 +593,7 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             "### 応答言語ポリシー",
             "### Review Finding Verdict Obligation (迎合禁止)",
             "### 根拠出所分類",
+            "### 回答前 Doc 解決 (Answer-Time Resolution)",
         ):
             self.assertIn(
                 section,
@@ -630,6 +631,7 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             "narrative-issue-labeling",
             "response-language",
             "no-sycophancy-evidence-provenance",
+            "answer-time-doc-resolution",
         }
     )
 
