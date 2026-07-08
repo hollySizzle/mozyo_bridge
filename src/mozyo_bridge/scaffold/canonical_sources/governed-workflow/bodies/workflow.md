@@ -688,6 +688,27 @@ mozyo-bridge docs audit-impact --all-changed --check-generated
 
 これらは catalog が埋まっていれば即座に機能する。catalog が空でも tool 自体は valid catalog skeleton を accept するため、operator は段階的に埋められる。`--check-file-coverage` も {{COVERAGE_LAYER_LABEL}} の有無に関わらず安全に実行できる。
 
+### 回答前 Doc 解決 (Answer-Time Resolution)
+
+<!-- mozyo-bridge:activation:always id=answer-time-doc-resolution digest="設計・仕様・現状挙動を回答・断定する前に、質問ドメインの cataloged docs を catalog (`.mozyo-bridge/docs/catalog.yaml` / `docs resolve`) で解決して読む。memory / 直近 journal は pointer であり verdict ではない。正本: central preset `### 回答前 Doc 解決 (Answer-Time Resolution)`。" -->
+
+上の使用契約は変更対象 path 起点 (実装前 / review 前 / guardrail 変更前) の義務である。それに加え、**owner / user への回答・断定・裁定**も doc 解決の対象とする。直近の裁定や agent の記憶が committed spec と乖離している場合、回答時に正本を読み直さない限り乖離は回答として再生産されるためである。
+
+```yaml
+回答前doc解決:
+  対象: 設計・仕様・現状挙動・規約についての回答 / 断定 / 裁定 (実装作業の有無と無関係)
+  義務:
+    - 質問ドメイン (表示 / routing / identity / workflow 等) に対応する cataloged docs を
+      catalog (`.mozyo-bridge/docs/catalog.yaml`) / `mozyo-bridge docs resolve` 経由で解決し、
+      本文を読んでから答える
+    - agent memory・直近 journal・直近裁定は pointer / 手がかりとして扱い、verdict にしない。
+      committed spec と矛盾する可能性を照合してから断定する
+    - 解決不能 (catalog 不在 / ドメイン対応 doc 不明) の場合は、読んだふりをせず
+      「正本未照合のまま回答している」ことを回答内に明示する
+  禁止:
+    - memory / 直近 journal のみを根拠に「設計どおり」「仕様どおり」と断定すること
+```
+
 ## LLM Rule Authoring
 
 target repo に新規 rule / gate / workflow / skill 入口を足すときは、scaffold-shipped `.mozyo-bridge/rules/llm_rule_authoring.md` を正本に従う:
