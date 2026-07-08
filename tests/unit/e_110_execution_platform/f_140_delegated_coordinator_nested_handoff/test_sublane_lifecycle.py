@@ -527,6 +527,28 @@ class TestRecordPathRedaction(unittest.TestCase):
         self.assertNotIn(_FAKE_WT, redacted)
         self.assertIn(_FAKE_WT_LABEL, redacted)
 
+    def test_portable_worktree_label_handles_windows_path(self):
+        # Redmine #13368 review j#73538 finding 1: a Windows-shaped host-local path
+        # must basename even on POSIX (PurePosixPath would leave `\` un-split).
+        win = r"C:\Users\someuser\mozyo_bridge_issue_13368_record_path_redaction"
+        self.assertEqual(portable_worktree_label(win), _FAKE_WT_LABEL)
+        # Forward-slash + drive letter, and a plain Windows path, both basename.
+        self.assertEqual(
+            portable_worktree_label(
+                "C:/Users/someuser/mozyo_bridge_issue_13368_record_path_redaction"
+            ),
+            _FAKE_WT_LABEL,
+        )
+        self.assertEqual(portable_worktree_label(r"D:\a\b\lane"), "lane")
+
+    def test_redact_worktree_paths_redacts_windows_path(self):
+        win = r"C:\Users\someuser\mozyo_bridge_issue_13368_record_path_redaction"
+        text = f"$ git worktree add {win} -b issue_13368_record_path_redaction"
+        redacted = redact_worktree_paths(text, win)
+        self.assertNotIn(win, redacted)
+        self.assertNotIn(r"C:\Users", redacted)
+        self.assertIn(_FAKE_WT_LABEL, redacted)
+
     def test_redact_worktree_paths_noop_on_empty_or_absent(self):
         text = "no path here"
         self.assertEqual(redact_worktree_paths(text, ""), text)

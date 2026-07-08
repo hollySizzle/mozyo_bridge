@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import PurePath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Collection, Iterable, Mapping, Optional, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -125,19 +125,41 @@ def parse_issue_from_lane_label(lane_label: str) -> Optional[str]:
 # pointer in the pasteable text).
 # ---------------------------------------------------------------------------
 
+#: A leading Windows drive designator (``C:`` / ``d:``). Its presence — like a
+#: backslash separator — marks a Windows-shaped path whose basename POSIX flavor
+#: cannot extract (Redmine #13368 review j#73538 finding 1).
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _portable_basename(text: str) -> str:
+    """Final path component of ``text`` for either a POSIX or a Windows path (pure).
+
+    Redmine #13368 review j#73538 (finding 1): a lane ``worktree_path`` may be a
+    Windows-shaped host-local path (``C:\\Users\\<user>\\lane``). ``PurePosixPath``
+    does not treat ``\\`` as a separator, so its ``.name`` returns the whole string
+    and the private prefix survives redaction. Detect a Windows shape (a backslash
+    separator or a leading drive designator) and use the Windows flavor for it;
+    otherwise the POSIX flavor. Falls back to the raw string when no component can
+    be derived (e.g. a bare drive), never an empty result.
+    """
+    if "\\" in text or _WINDOWS_DRIVE_RE.match(text):
+        return PureWindowsPath(text).name or text
+    return PurePosixPath(text).name or text
+
 
 def portable_worktree_label(worktree_path: Optional[str]) -> str:
     """Pasteable-safe label for a lane worktree: its sibling basename (pure, #13368).
 
     Returns the worktree directory basename (no personal home / private-project
     absolute prefix), so it is safe to render into a Redmine journal / pasteable
-    durable record. Empty input renders as ``-`` (matching the existing ``or '-'``
-    field convention in the record renderers).
+    durable record. Handles both POSIX and Windows-shaped paths (:func:`_portable_basename`).
+    Empty input renders as ``-`` (matching the existing ``or '-'`` field convention
+    in the record renderers).
     """
     text = (worktree_path or "").strip()
     if not text:
         return "-"
-    return PurePath(text).name or text
+    return _portable_basename(text)
 
 
 def redact_worktree_paths(text: str, *worktree_paths: Optional[str]) -> str:
@@ -155,7 +177,7 @@ def redact_worktree_paths(text: str, *worktree_paths: Optional[str]) -> str:
     for raw in worktree_paths:
         candidate = (raw or "").strip()
         if candidate:
-            out = out.replace(candidate, PurePath(candidate).name or candidate)
+            out = out.replace(candidate, _portable_basename(candidate))
     return out
 
 
