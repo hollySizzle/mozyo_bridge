@@ -1,18 +1,19 @@
-"""Lane metadata record — token↔human-label display join (Redmine #13356).
+"""Lane metadata record — lane↔human-label display join (Redmine #13356 / #13377).
 
-Under the herdr backend a sublane is its own herdr workspace whose mzb1
-``workspace`` segment is a deterministic path-hash token (``wt_<hash>``,
-Redmine #13331 j#73357). The token is deliberately **not** registry-resolvable
-(the registry's ``canonical_path`` invariant stays untouched), so every display
-surface that only had the token — ``sublane list``, ``sublane dispatch-worker``
-lane resolution, the cockpit web UI — showed ``wt_<hash>`` with no lane label /
-issue (#13331 j#73363 residual; the #13356 design answer j#73386 Q2 fixes the
-join here).
+Under the herdr backend a sublane is a ``(repo_workspace_id, lane_id)`` slot
+inside the shared **project** herdr workspace (Redmine #13377 Opt3, design
+j#73613): its slots are ``mzb1_<project-ws>_<role>_<lane>``. A *legacy*
+pre-#13377 lane (#13331 j#73357) was instead its own herdr workspace keyed on
+the deterministic path-hash token (``wt_<hash>``). Either way the live
+inventory carries only machine identity, so every display surface —
+``sublane list``, ``sublane dispatch-worker`` lane resolution, the cockpit web
+UI — needs this record to show the lane's label / issue (#13331 j#73363
+residual; the #13356 design answer j#73386 Q2 fixes the join here).
 
 This module is that join: a **host-local display-metadata record** keyed on the
-lane workspace token, carrying the human lane identity (``lane_label`` /
-``issue_id`` / ``branch`` / ``worktree_path``) a projection LEFT JOINs onto the
-live herdr inventory. It is:
+per-worktree path token, carrying the human lane identity (``lane_label`` /
+``issue_id`` / ``branch`` / ``worktree_path``) and — since v2 (#13377) — the
+``lane_id`` a projection joins a live ``(workspace_id, lane_id)`` unit on. It is:
 
 - **display metadata, never routing authority** (j#73386): the token→label join
   names a row for a human; route resolution stays with the live ``agent list``
@@ -68,7 +69,11 @@ from mozyo_bridge.core.state.state_store import (
 
 #: The ``state_schema_components`` identity of this native component.
 LANE_METADATA_COMPONENT = "lane_metadata"
-LANE_METADATA_SCHEMA_VERSION = 1
+#: v2 (Redmine #13377): adds ``lane_id`` — under the shared project workspace
+#: model a lane is a ``(repo_workspace_id, lane_id)`` slot of the project
+#: workspace, so readers join on that unit; ``lane_workspace_token`` stays the
+#: stable per-worktree primary key (and the legacy pre-#13377 workspace segment).
+LANE_METADATA_SCHEMA_VERSION = 2
 
 #: Recovery policy (managed-state-model.md ``### recovery policy vocabulary``):
 #: a desired current state that cannot be rebuilt from events (the token is a
@@ -96,13 +101,15 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    retired_at TEXT
+    retired_at TEXT,
+    lane_id TEXT
 )
 """
 
 _COLUMNS = (
     "lane_workspace_token, repo_workspace_id, issue_id, lane_label, branch, "
-    "worktree_path, source_backend, status, created_at, updated_at, retired_at"
+    "worktree_path, source_backend, status, created_at, updated_at, retired_at, "
+    "lane_id"
 )
 
 
@@ -119,11 +126,16 @@ def _utc_now() -> str:
 class LaneMetadataRecord:
     """One lane workspace's display-metadata record (display join, not authority).
 
-    ``lane_workspace_token`` is the primary join key — the mzb1 ``workspace``
-    segment (``wt_<hash>`` for a linked-worktree lane). ``repo_workspace_id`` is
-    the main checkout's registry workspace id when resolvable (lets a display
-    group the lane under its project). ``worktree_path`` is host-local private
-    state; never copy it into a durable Redmine record.
+    ``lane_workspace_token`` is the stable per-worktree primary key (the
+    ``wt_<hash>`` path token — the mzb1 ``workspace`` segment of a *legacy*
+    pre-#13377 per-lane workspace, and purely a metadata key for a shared-model
+    lane). ``repo_workspace_id`` is the main checkout's registry workspace id.
+    ``lane_id`` (Redmine #13377, shared project workspace model) is the mzb1
+    ``lane`` segment the lane's slots carry — readers join a live
+    ``(workspace_id, lane_id)`` unit on ``(repo_workspace_id, lane_id)``; an
+    empty ``lane_id`` marks a legacy record whose live rows are keyed on the
+    token itself (default lane of a ``wt_<hash>`` workspace). ``worktree_path``
+    is host-local private state; never copy it into a durable Redmine record.
     """
 
     lane_workspace_token: str
@@ -137,6 +149,7 @@ class LaneMetadataRecord:
     created_at: str = ""
     updated_at: str = ""
     retired_at: Optional[str] = None
+    lane_id: str = ""
 
     @property
     def retired(self) -> bool:
@@ -155,6 +168,7 @@ class LaneMetadataRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "retired_at": self.retired_at,
+            "lane_id": self.lane_id,
         }
 
 
@@ -175,7 +189,19 @@ class LaneMetadataStore:
     def _connect_rw(self) -> sqlite3.Connection:
         conn = connect_state_container_rw(self.path)
         conn.execute(_TABLE_SQL)
+        # In-place v1 -> v2 migration (Redmine #13377): an existing table created
+        # before the ``lane_id`` column gains it additively (legacy rows read as
+        # ``lane_id=""`` — the legacy marker). CREATE TABLE IF NOT EXISTS never
+        # alters an existing table, so this is the single write-path migration.
+        if "lane_id" not in self._table_columns(conn):
+            conn.execute(f"ALTER TABLE {_TABLE} ADD COLUMN lane_id TEXT")
         return conn
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection) -> frozenset[str]:
+        return frozenset(
+            row[1] for row in conn.execute(f"PRAGMA table_info({_TABLE})")
+        )
 
     def _record_component(self, conn: sqlite3.Connection, now: str) -> None:
         """Register this native component in ``state_schema_components``.
@@ -219,7 +245,7 @@ class LaneMetadataStore:
             with conn:
                 conn.execute(
                     f"INSERT INTO {_TABLE} ({_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * 11)}) "
+                    f"VALUES ({', '.join('?' * 12)}) "
                     "ON CONFLICT(lane_workspace_token) DO UPDATE SET "
                     "repo_workspace_id = excluded.repo_workspace_id, "
                     "issue_id = excluded.issue_id, "
@@ -229,7 +255,8 @@ class LaneMetadataStore:
                     "source_backend = excluded.source_backend, "
                     "status = excluded.status, "
                     "updated_at = excluded.updated_at, "
-                    "retired_at = excluded.retired_at",
+                    "retired_at = excluded.retired_at, "
+                    "lane_id = excluded.lane_id",
                     (
                         stamped.lane_workspace_token,
                         stamped.repo_workspace_id,
@@ -242,6 +269,7 @@ class LaneMetadataStore:
                         stamped.created_at,
                         stamped.updated_at,
                         stamped.retired_at,
+                        stamped.lane_id,
                     ),
                 )
                 self._record_component(conn, now)
@@ -282,8 +310,15 @@ class LaneMetadataStore:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 if version != STATE_CONTAINER_VERSION:
                     return []
+                # A v1 table (no write since the #13377 lane_id migration) is
+                # still fully readable: select the legacy shape and default the
+                # missing column, so a read-only consumer never loses the
+                # display join just because no write has migrated the schema.
+                columns = _COLUMNS
+                if "lane_id" not in self._table_columns(conn):
+                    columns = _COLUMNS.rsplit(", lane_id", 1)[0] + ", '' AS lane_id"
                 return conn.execute(
-                    f"SELECT {_COLUMNS} FROM {_TABLE} ORDER BY lane_workspace_token"
+                    f"SELECT {columns} FROM {_TABLE} ORDER BY lane_workspace_token"
                 ).fetchall()
             finally:
                 conn.close()
@@ -313,6 +348,7 @@ class LaneMetadataStore:
                 created_at=row[8] or "",
                 updated_at=row[9] or "",
                 retired_at=row[10],
+                lane_id=row[11] or "",
             )
             if not include_retired and record.retired:
                 continue
@@ -332,6 +368,7 @@ def record_lane_created(
     branch: str = "",
     worktree_path: str = "",
     source_backend: str = "herdr",
+    lane_id: str = "",
     home: Path | None = None,
 ) -> Optional[LaneMetadataRecord]:
     """Best-effort upsert at the ``sublane create`` command boundary.
@@ -353,6 +390,7 @@ def record_lane_created(
                 source_backend=source_backend,
                 status=LANE_STATUS_ACTIVE,
                 retired_at=None,
+                lane_id=lane_id,
             )
         )
     except (StateStoreError, sqlite3.DatabaseError, OSError, ValueError):
@@ -383,6 +421,26 @@ def load_lane_records(
         return {}
 
 
+def lane_records_by_unit(
+    records: dict[str, LaneMetadataRecord],
+) -> dict[tuple[str, str], LaneMetadataRecord]:
+    """Index token-keyed records by their live lane unit ``(repo_workspace_id, lane_id)``.
+
+    Shared project workspace model (Redmine #13377): a lane's live rows carry
+    ``(workspace_id=<project>, lane_id=<lane>)``, so display joins key on that
+    unit. Only records that carry BOTH fields participate (a legacy record —
+    empty ``lane_id`` — joins by its token instead; an unattributed record never
+    fabricates a unit key). Pure over the supplied mapping.
+    """
+    by_unit: dict[tuple[str, str], LaneMetadataRecord] = {}
+    for record in records.values():
+        ws = (record.repo_workspace_id or "").strip()
+        lane = (record.lane_id or "").strip()
+        if ws and lane:
+            by_unit.setdefault((ws, lane), record)
+    return by_unit
+
+
 __all__ = (
     "LANE_METADATA_COMPONENT",
     "LANE_METADATA_SCHEMA_VERSION",
@@ -392,6 +450,7 @@ __all__ = (
     "LaneMetadataRecord",
     "LaneMetadataStore",
     "lane_metadata_path",
+    "lane_records_by_unit",
     "load_lane_records",
     "record_lane_created",
     "record_lane_retired",

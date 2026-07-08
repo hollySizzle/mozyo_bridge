@@ -744,20 +744,22 @@ class StatusDualPresenceTest(unittest.TestCase):
 
 class StatusHerdrLaneWorktreeTest(unittest.TestCase):
     """A ``cockpit status`` run from a linked herdr lane worktree must return the
-    lane's live herdr row (auditor j#73521 finding 1). The worktree inherits the
-    main workspace id + a ``lane-<hash>`` lane id (#13152), but its live herdr row is
-    keyed on the worktree's ``wt_<hash>`` segment, so the tmux-identity match alone
-    would fall through to an absent tmux row. The query resolves the herdr segment
-    (patched here, since the real resolver reads git topology) and matches on it.
+    lane's live herdr row (auditor j#73521 finding 1, re-keyed by #13377). The
+    worktree inherits the main workspace id + a ``lane-<hash>`` tmux lane id
+    (#13152), but its live herdr row is keyed on its lane unit — the shared
+    project workspace + recorded lane id (#13377), or the legacy ``wt_<hash>``
+    twin for a pre-#13377 lane — so the tmux-identity match alone would fall
+    through to an absent tmux row. The query resolves the unit (patched here,
+    since the real resolver reads git topology) and matches on it.
     """
 
     _SEGMENT = "wt_b7bd4eee36773bd9"
-    _QSEG = "mozyo_bridge.application.cockpit_membership_command._herdr_query_segment"
+    _QUNIT = "mozyo_bridge.application.cockpit_membership_command._herdr_query_unit"
     _LOAD = "mozyo_bridge.core.state.lane_metadata.load_lane_records"
 
     def _ops(self):
         # The linked worktree's *inherited* identity: main workspace id + lane-<hash>
-        # — deliberately NOT the herdr segment, so only the segment match can find
+        # — deliberately NOT the herdr unit, so only the unit match can find
         # the herdr row.
         canon = SimpleNamespace(name="mozyo_bridge", workspace_id="wsMain")
         lane = LaneIdentity("lane-9fd3face7947", "issue_13367_cockpit_herdr_polish")
@@ -774,11 +776,13 @@ class StatusHerdrLaneWorktreeTest(unittest.TestCase):
              "pane_id": "wG:p3"},
         ]
 
-    def _status(self, records):
-        with unittest.mock.patch(self._QSEG, return_value=self._SEGMENT), \
+    def _status(self, records, *, unit=None, rows=None):
+        query_unit = unit if unit is not None else ("wsMain", "", self._SEGMENT)
+        with unittest.mock.patch(self._QUNIT, return_value=query_unit), \
                 unittest.mock.patch(self._LOAD, return_value=records):
             return CockpitMembershipUseCase(
-                self._ops(), _FakeHerdrColumnOps(self._herdr_rows())
+                self._ops(),
+                _FakeHerdrColumnOps(rows if rows is not None else self._herdr_rows()),
             ).status(session="s", repo="/repo/mozyo_bridge_issue_13367")
 
     def test_status_returns_the_live_herdr_lane_row(self) -> None:
@@ -801,7 +805,7 @@ class StatusHerdrLaneWorktreeTest(unittest.TestCase):
         self.assertEqual(0, outcome.exit_code)
 
     def test_status_missing_record_still_finds_row_with_token(self) -> None:
-        # Even with no lane record the segment match finds the row (fail-open token).
+        # Even with no lane record the legacy-token match finds the row (fail-open).
         outcome = self._status({})
         payload = json.loads(outcome.render(json_output=True))
         row = payload["workspaces"][0]
@@ -810,10 +814,35 @@ class StatusHerdrLaneWorktreeTest(unittest.TestCase):
         codes = {w["code"] for w in row["warnings"]}
         self.assertIn(WARN_HERDR_LANE_RECORD_MISSING, codes)
 
+    def test_status_matches_shared_model_lane_unit(self) -> None:
+        # #13377: a shared-model lane's live row is (project workspace, lane id).
+        rows = [
+            {"name": encode_assigned_name("wsMain", "codex", "issue_13377_x"),
+             "pane_id": "w2:p4"},
+            {"name": encode_assigned_name("wsMain", "claude", "issue_13377_x"),
+             "pane_id": "w2:p5"},
+            # The coordinator pair must NOT match a lane-worktree query.
+            {"name": encode_assigned_name("wsMain", "codex", "default"),
+             "pane_id": "w2:p3"},
+        ]
+        outcome = self._status(
+            {},
+            unit=("wsMain", "issue_13377_x", self._SEGMENT),
+            rows=rows,
+        )
+        payload = json.loads(outcome.render(json_output=True))
+        herdr_rows = [
+            w for w in payload["workspaces"] if w["backend"] == BACKEND_HERDR
+        ]
+        self.assertEqual(1, len(herdr_rows))
+        self.assertEqual("wsMain", herdr_rows[0]["workspace_id"])
+        self.assertEqual("issue_13377_x", herdr_rows[0]["lane_id"])
+
     def test_no_herdr_segment_keeps_absent_tmux_row_byte_invariant(self) -> None:
-        # When the segment resolver yields "" (a non-herdr / unresolvable query) the
-        # herdr match is disabled and the query falls through to the absent tmux row.
-        with unittest.mock.patch(self._QSEG, return_value=""), \
+        # When the unit resolver yields empties (a non-herdr / unresolvable query)
+        # the herdr match is disabled and the query falls through to the absent
+        # tmux row.
+        with unittest.mock.patch(self._QUNIT, return_value=("", "", "")), \
                 unittest.mock.patch(self._LOAD, return_value={}):
             outcome = CockpitMembershipUseCase(
                 self._ops(), _FakeHerdrColumnOps(self._herdr_rows())

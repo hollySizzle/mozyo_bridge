@@ -659,11 +659,13 @@ class SessionStartCliTest(unittest.TestCase):
 
 
 class LinkedWorktreeIdentityTest(unittest.TestCase):
-    """Redmine #13331 (design j#73357): on a REAL linked git worktree, the lane's mzb1
-    `workspace` segment is the path-derived token — not the inherited main registry id
-    (#13152) — so `prepare_session` no longer crashes and mint agrees with the shared
-    resolver. Scratch standalone repos do NOT reproduce this (they mint a distinct
-    registry id), which is exactly why the earlier fake-dir coverage missed j#73348."""
+    """Redmine #13377 (design j#73613, shared project workspace): on a REAL linked git
+    worktree, the lane's mzb1 `workspace` segment is the MAIN checkout's registry
+    identity (#13152 inheritance) and the lane segment is the discriminant — the slots
+    are `mzb1_<project-ws>_<role>_<lane_label>` and they join the project's live herdr
+    workspace instead of creating a per-lane one (the #13331 `wt_<hash>` per-lane
+    workspace is legacy). Real git worktrees are used (scratch standalone repos hide
+    the inheritance, the j#73348 lesson)."""
 
     def _git(self, path, *args):
         subprocess.run(
@@ -679,40 +681,147 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self._git(path, "add", "-A")
         self._git(path, "commit", "-qm", "init")
 
-    def test_prepare_session_on_linked_worktree_uses_derived_token(self) -> None:
-        herdr = _Herdr()
+    def _binpath(self, tmp: Path) -> Path:
+        binpath = tmp / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        return binpath
+
+    def test_prepare_session_on_linked_worktree_uses_project_workspace(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
         with tempfile.TemporaryDirectory() as tmp:
             main = Path(tmp) / "main"
-            self._init_repo(main)  # a registered main is NOT required for the token
+            self._init_repo(main)
             wt = Path(tmp) / "lane"
-            self._git(main, "worktree", "add", str(wt), "-b", "issue_13331_x")
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13377_x")
             home = Path(tmp) / "home"
             home.mkdir()
-            binpath = Path(tmp) / "fake-herdr"
-            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
-            # The herdr subprocess calls ride the injected fake runner; `_is_linked_worktree`
-            # uses the REAL git against the REAL worktree (subprocess.run is NOT patched).
+            binpath = self._binpath(Path(tmp))
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                # The project's coordinator pair is live in herdr workspace w7: the
+                # lane launch must JOIN it (no `workspace create`, no per-lane ws).
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(main_ws, "codex", ""),
+                            "pane_id": "w7:p2",
+                        }
+                    ],
+                    start_locator="w7:p9",
+                )
                 result = prepare_session(
                     repo_root=wt,
                     providers=["codex", "claude"],
+                    lane_id="issue_13377_x",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+                # The shared resolver agrees with what was minted (mint == resolve):
+                # the lane worktree resolves to the MAIN registry identity.
+                segment = herdr_workspace_segment(wt)
+            token = derive_lane_workspace_token(str(wt.resolve()))
+        self.assertEqual(result.workspace_id, main_ws)
+        self.assertEqual(segment, main_ws)
+        self.assertNotEqual(result.workspace_id, token)  # wt_<hash> is legacy-only
+        names = {s.provider: s.assigned_name for s in result.slots}
+        self.assertEqual(
+            names["codex"], encode_assigned_name(main_ws, "codex", "issue_13377_x")
+        )
+        self.assertEqual(
+            names["claude"], encode_assigned_name(main_ws, "claude", "issue_13377_x")
+        )
+        # Joined the live project workspace: no workspace create, launches pinned to w7.
+        self.assertEqual(herdr.workspace_creates, [])
+        for argv in herdr.start_argvs:
+            self.assertIn("--workspace", argv)
+            self.assertEqual(argv[argv.index("--workspace") + 1], "w7")
+
+    def test_prepare_session_linked_worktree_unregistered_main_fails_closed(self) -> None:
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)  # NOT registered
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13377_y")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=wt,
+                        providers=["codex"],
+                        lane_id="issue_13377_y",
+                        env={HERDR_ENV: str(binpath)},
+                        runner=herdr.run,
+                    )
+        self.assertIn("main checkout has no registered workspace identity", str(ctx.exception))
+
+    def test_prepare_session_linked_worktree_without_lane_fails_closed(self) -> None:
+        """No --lane and no lane metadata record: refuse to mint the project's
+        DEFAULT slots (the coordinator pair) from a lane checkout."""
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13377_z")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=wt,
+                        providers=["codex", "claude"],
+                        lane_id="",
+                        env={HERDR_ENV: str(binpath)},
+                        runner=herdr.run,
+                    )
+        self.assertIn("requires an explicit lane id", str(ctx.exception))
+
+    def test_prepare_session_linked_worktree_recovers_lane_from_metadata(self) -> None:
+        """A relaunch without --lane recovers the recorded lane id (never default)."""
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13377_w")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                record_lane_created(
+                    lane_workspace_token=derive_lane_workspace_token(str(wt.resolve())),
+                    repo_workspace_id=main_ws,
+                    lane_label="issue_13377_w",
+                    lane_id="issue_13377_w",
+                    worktree_path=str(wt),
+                )
+                herdr = _Herdr()
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex"],
                     lane_id="",
                     env={HERDR_ENV: str(binpath)},
                     runner=herdr.run,
                 )
-                # The shared resolver agrees with what was minted (mint == resolve).
-                segment = herdr_workspace_segment(wt)
-            token = derive_lane_workspace_token(str(wt.resolve()))
-        self.assertEqual(result.workspace_id, token)
-        self.assertEqual(segment, token)
+        self.assertEqual(result.lane_id, "issue_13377_w")
         names = {s.provider: s.assigned_name for s in result.slots}
-        self.assertEqual(names["codex"], encode_assigned_name(token, "codex", ""))
-        self.assertEqual(names["claude"], encode_assigned_name(token, "claude", ""))
-        # The token is not the main checkout's registry identity (isolation restored).
-        main_anchor = read_anchor(main)
-        if isinstance(main_anchor, dict) and main_anchor.get("workspace_id"):
-            self.assertNotEqual(token, main_anchor["workspace_id"])
+        self.assertEqual(
+            names["codex"], encode_assigned_name(main_ws, "codex", "issue_13377_w")
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

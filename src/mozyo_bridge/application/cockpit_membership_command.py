@@ -558,27 +558,47 @@ class CockpitStatusOutcome:
         return format_membership_text(self.report, query_label=self.query_label)
 
 
-def _herdr_query_segment(repo_root: str) -> str:
-    """The herdr workspace segment for the queried repo (fail-safe to ``""``).
+def _herdr_query_unit(repo_root: str) -> tuple[str, str, str]:
+    """The herdr unit for the queried repo: ``(workspace_id, lane_id, legacy_token)``.
 
-    A herdr sublane is its own herdr workspace (option A) whose live membership row
-    is keyed on the worktree's ``wt_<hash>`` segment — NOT the tmux / registry
-    identity ``resolve_canonical_session`` returns (a linked worktree inherits the
-    main checkout's workspace id, #13152; its own lane id is ``lane-<hash>``). So a
-    ``cockpit status`` from a herdr lane worktree must resolve this segment to match
-    its live herdr row, which the tmux-identity match never can (auditor j#73521
-    finding 1). Uses the same shared resolver ``sublane create`` stamped the row
-    with, so the two always agree. Any failure — a non-herdr / unresolvable path —
-    degrades to ``""`` (no herdr match), so a tmux-only query is unaffected.
+    Shared project workspace model (Redmine #13377): a herdr sublane's live row is
+    keyed on ``(project workspace segment, lane_id)`` — NOT the tmux / registry lane
+    identity ``resolve_workspace_lane`` returns (``lane-<hash>``), and no longer a
+    per-lane ``wt_<hash>`` workspace. So a ``cockpit status`` from a herdr lane
+    worktree resolves its project segment (the shared resolver) plus its recorded
+    lane id (the lane metadata record keyed on the worktree's stable path token),
+    while a main / standalone checkout resolves to its own segment's default lane
+    (its coordinator pair — never every lane of the workspace). ``legacy_token``
+    carries the worktree's ``wt_<hash>`` twin so a pre-#13377 lane's live row still
+    matches (auditor j#73521 finding 1 posture preserved). Any failure degrades to
+    empties (no herdr match), so a tmux-only query is unaffected.
     """
+    from mozyo_bridge.core.state.workspace_registry import _is_linked_worktree
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         herdr_workspace_segment,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        DEFAULT_LANE,
+        derive_lane_workspace_token,
+    )
 
     try:
-        return herdr_workspace_segment(Path(repo_root))
+        resolved = Path(repo_root).expanduser().resolve()
+        segment = herdr_workspace_segment(resolved)
+        if not _is_linked_worktree(resolved):
+            return segment, DEFAULT_LANE, ""
+        legacy_token = derive_lane_workspace_token(str(resolved))
+        from mozyo_bridge.core.state.lane_metadata import load_lane_records
+
+        record = load_lane_records().get(legacy_token)
+        lane = ""
+        if record is not None:
+            lane = (getattr(record, "lane_id", "") or "").strip() or (
+                getattr(record, "lane_label", "") or ""
+            ).strip()
+        return segment, lane, legacy_token
     except (OSError, ValueError):
-        return ""
+        return "", "", ""
 
 
 class CockpitMembershipUseCase:
@@ -732,14 +752,17 @@ class CockpitMembershipUseCase:
         )
         target_lane = normalize_lane(lane.lane_id)
         facts = self._ops.resolve_registry_facts(workspace_id)
-        # A herdr sublane's live row is keyed on the worktree's herdr segment
-        # (wt_<hash>), not the tmux/registry identity resolved above (a linked
-        # worktree inherits the main workspace id + carries a lane-<hash> lane id,
-        # #13152). Resolve that segment so a `cockpit status` from a herdr lane
-        # worktree matches its own live herdr row instead of falling through to an
-        # absent tmux row (auditor j#73521 finding 1). Empty (a tmux-only / non-herdr
-        # / unresolvable query) disables the herdr match, so tmux output is unchanged.
-        herdr_segment = _herdr_query_segment(repo_root)
+        # A herdr sublane's live row is keyed on its lane unit — the shared project
+        # workspace segment + recorded lane id (#13377), or the legacy per-lane
+        # wt_<hash> workspace for a pre-#13377 lane — not the tmux/registry lane
+        # identity resolved above (a linked worktree inherits the main workspace id
+        # + carries a lane-<hash> tmux lane id, #13152). Resolve that unit so a
+        # `cockpit status` from a herdr lane worktree matches its own live herdr row
+        # (auditor j#73521 finding 1) and a main-checkout query matches only its
+        # default-lane coordinator row, never every lane of the shared workspace.
+        # Empties (a tmux-only / non-herdr / unresolvable query) disable the herdr
+        # match, so tmux output is unchanged.
+        herdr_segment, herdr_lane, herdr_legacy_token = _herdr_query_unit(repo_root)
 
         report = self.collect(session)
         # Dual-backend transition (#13317, auditor j#73083 decision (a)): the same
@@ -762,8 +785,15 @@ class CockpitMembershipUseCase:
             )
             or (
                 herdr_segment
+                and herdr_lane
                 and w.backend != BACKEND_TMUX
                 and w.workspace_id == herdr_segment
+                and normalize_lane(w.lane_id) == normalize_lane(herdr_lane)
+            )
+            or (
+                herdr_legacy_token
+                and w.backend != BACKEND_TMUX
+                and w.workspace_id == herdr_legacy_token
             )
         )
         if not matches:

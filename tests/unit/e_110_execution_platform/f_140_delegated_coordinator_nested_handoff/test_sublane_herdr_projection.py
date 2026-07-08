@@ -1,8 +1,10 @@
-"""herdr `sublane list` projection tests (Redmine #13331 option A).
+"""herdr `sublane list` projection tests (Redmine #13377 shared project workspace).
 
-Pins the pure fold: one :class:`SublaneLaneView` per lane workspace, the sender's own
-workspace excluded, foreign / non-default-lane rows dropped, repo-root / lane-label /
-issue recovered from the injected registry resolver.
+Pins the pure fold: one :class:`SublaneLaneView` per lane unit ``(workspace_id,
+lane_id)`` — non-default lanes are sublanes, a registry workspace's default-lane
+coordinator pair never is, and a legacy pre-#13331 per-lane ``wt_...`` workspace's
+default-lane pair stays visible as the compatibility read. Identity joins from the
+lane metadata records; hints are advisory-only.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
     GATEWAY_SLOT_MISSING_HINT,
     LANE_RECORD_MISSING_HINT,
-    LANE_WORKSPACE_MISSING_HINT,
+    LANE_SLOTS_MISSING_HINT,
     WORKER_SLOT_MISSING_HINT,
     probe_worktree_resolved,
     project_herdr_sublanes,
@@ -43,56 +45,90 @@ def _row(ws, role, lane, locator):
 
 
 class ProjectHerdrSublanesTest(unittest.TestCase):
-    def test_folds_lane_workspaces_excludes_own_and_foreign(self) -> None:
-        roots = {
-            "wsA": "/work/mozyo_bridge_issue_101_alpha",
-            "wsB": "/work/mozyo_bridge_issue_202_beta",
+    def test_folds_lane_units_excludes_coordinator_pairs(self) -> None:
+        records = {
+            "wt_aaaa": LaneMetadataRecord(
+                lane_workspace_token="wt_aaaa",
+                repo_workspace_id="wsMain",
+                issue_id="101",
+                lane_label="issue_101_alpha",
+                worktree_path="/work/mozyo_bridge_issue_101_alpha",
+                lane_id="issue_101_alpha",
+            ),
+            "wt_bbbb": LaneMetadataRecord(
+                lane_workspace_token="wt_bbbb",
+                repo_workspace_id="wsMain",
+                issue_id="202",
+                lane_label="issue_202_beta",
+                worktree_path="/work/mozyo_bridge_issue_202_beta",
+                lane_id="issue_202_beta",
+            ),
         }
         rows = [
-            _row("wsA", "codex", "", "wL1:p2"),
-            _row("wsA", "claude", "", "wL1:p3"),
-            _row("wsB", "codex", "", "wL2:p2"),
-            _row("wsB", "claude", "", "wL2:p3"),
-            # the coordinator's own workspace (excluded) — also a codex+claude pair
+            # shared project workspace lane units (#13377): sublanes
+            _row("wsMain", "codex", "issue_101_alpha", "w2:p4"),
+            _row("wsMain", "claude", "issue_101_alpha", "w2:p5"),
+            _row("wsMain", "codex", "issue_202_beta", "w2:p6"),
+            _row("wsMain", "claude", "issue_202_beta", "w2:p7"),
+            # the project's default-lane coordinator pair — never a sublane
             _row("wsMain", "codex", "", "w2:p3"),
             _row("wsMain", "claude", "", "w2:p2"),
-            # a foreign non-mzb1 agent, and a non-default lane slot — both dropped
+            # a FOREIGN project's coordinator pair — also never a sublane
+            _row("wsOther", "codex", "", "w9:p2"),
+            _row("wsOther", "claude", "", "w9:p3"),
+            # a foreign non-mzb1 agent — dropped
             {"name": "someones-shell", "pane_id": "wZ:p1"},
-            _row("wsA", "codex", "lane-x", "wL1:p9"),
         ]
         views = project_herdr_sublanes(
             rows,
             exclude_workspace_id="wsMain",
-            resolve_repo_root=lambda ws: roots.get(ws),
+            resolve_repo_root=lambda ws: None,
+            lane_records=records,
+            repo_workspace_id="wsMain",
         )
-        self.assertEqual([v.workspace_id for v in views], ["wsA", "wsB"])
+        self.assertEqual(
+            [(v.workspace_id, v.lane_id) for v in views],
+            [("wsMain", "issue_101_alpha"), ("wsMain", "issue_202_beta")],
+        )
         a, b = views
-        self.assertEqual(a.lane_label, "mozyo_bridge_issue_101_alpha")
+        self.assertEqual(a.lane_label, "issue_101_alpha")
         self.assertEqual(a.issue, "101")
         self.assertEqual(a.repo_root, "/work/mozyo_bridge_issue_101_alpha")
-        self.assertEqual(a.gateway_pane, "wL1:p2")
-        self.assertEqual(a.worker_pane, "wL1:p3")
-        self.assertEqual(a.lane_id, "default")
+        self.assertEqual(a.gateway_pane, "w2:p4")
+        self.assertEqual(a.worker_pane, "w2:p5")
         self.assertEqual(a.state, SUBLANE_STATE_ACTIVE)
         self.assertEqual(b.issue, "202")
 
-    def test_gateway_only_workspace_is_degraded_lane(self) -> None:
-        rows = [_row("wsA", "codex", "", "wL1:p2")]
+    def test_legacy_lane_workspace_stays_visible(self) -> None:
+        # A pre-#13377 lane: its own wt_ workspace, default-lane pair (compat read).
+        rows = [
+            _row("wt_1234", "codex", "", "wL1:p2"),
+            _row("wt_1234", "claude", "", "wL1:p3"),
+        ]
         views = project_herdr_sublanes(
             rows, exclude_workspace_id="wsMain", resolve_repo_root=lambda ws: None
         )
+        self.assertEqual([(v.workspace_id, v.lane_id) for v in views], [("wt_1234", "default")])
+
+    def test_recordless_lane_unit_falls_back_to_lane_id_label(self) -> None:
+        views = project_herdr_sublanes(
+            [_row("wsMain", "codex", "issue_303_gamma", "w2:p8")],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+        )
         self.assertEqual(len(views), 1)
-        self.assertEqual(views[0].gateway_pane, "wL1:p2")
+        self.assertEqual(views[0].gateway_pane, "w2:p8")
         self.assertIsNone(views[0].worker_pane)
         self.assertEqual(views[0].state, SUBLANE_STATE_GATEWAY_ONLY)
-        # Unresolvable workspace falls back to the workspace id as the label (never guessed).
-        self.assertEqual(views[0].lane_label, "wsA")
-        self.assertIsNone(views[0].issue)
+        # The lane segment is the requested lane label at create — the honest fallback.
+        self.assertEqual(views[0].lane_label, "issue_303_gamma")
+        self.assertEqual(views[0].issue, "303")
+        self.assertIn(LANE_RECORD_MISSING_HINT, views[0].stale_hints)
 
     def test_row_without_locator_is_dropped(self) -> None:
         rows = [
-            {"name": encode_assigned_name("wsA", "codex", ""), "pane_id": ""},
-            _row("wsA", "claude", "", "wL1:p3"),
+            {"name": encode_assigned_name("wsMain", "codex", "issue_1_x"), "pane_id": ""},
+            _row("wsMain", "claude", "issue_1_x", "wL1:p3"),
         ]
         views = project_herdr_sublanes(
             rows, exclude_workspace_id="", resolve_repo_root=lambda ws: None
@@ -247,7 +283,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
         self.assertEqual(vanished.state, SUBLANE_STATE_DETACHED)
         self.assertIsNone(vanished.gateway_pane)
         self.assertIsNone(vanished.worker_pane)
-        self.assertEqual(vanished.stale_hints, (LANE_WORKSPACE_MISSING_HINT,))
+        self.assertEqual(vanished.stale_hints, (LANE_SLOTS_MISSING_HINT,))
         self.assertEqual(views[0].stale_hints, ())
 
     def test_retired_tombstone_never_becomes_vanished_row(self) -> None:
@@ -421,7 +457,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
         self.assertEqual(
             views[1].stale_hints,
             (
-                LANE_WORKSPACE_MISSING_HINT,
+                LANE_SLOTS_MISSING_HINT,
                 f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:issue_600_relaunch",
             ),
         )
@@ -587,7 +623,7 @@ class HerdrSublaneViewsLinkedWorktreeTest(unittest.TestCase):
             views = herdr_sublane_views(lane_path)
         self.assertEqual(len(views), 1)
         self.assertEqual(views[0].workspace_id, "wt_gone")
-        self.assertEqual(views[0].stale_hints, (LANE_WORKSPACE_MISSING_HINT,))
+        self.assertEqual(views[0].stale_hints, (LANE_SLOTS_MISSING_HINT,))
 
 
 class ProbeWorktreeResolvedTest(unittest.TestCase):
@@ -601,7 +637,7 @@ class ProbeWorktreeResolvedTest(unittest.TestCase):
 
 
 class HerdrLaneViewForWorktreeTest(unittest.TestCase):
-    """The lane-record-joined single-lane read-back (Redmine #13356).
+    """The lane-record-joined single-lane read-back (Redmine #13356 / #13377).
 
     Not wired into dispatch-worker here — the herdr dispatch drive is #13357's
     surface; this pins the seam it can adopt for a recorded identity check.
@@ -612,6 +648,19 @@ class HerdrLaneViewForWorktreeTest(unittest.TestCase):
         "f_140_delegated_coordinator_nested_handoff.application."
         "sublane_herdr_projection"
     )
+
+    #: The lane worktree path every test resolves; its stable metadata / legacy key.
+    _WORKTREE = "/work/lane"
+
+    @property
+    def _token(self) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        return derive_lane_workspace_token(
+            str(Path(self._WORKTREE).expanduser().resolve())
+        )
 
     def _resolve(self, *, segment, rows, records):
         from unittest import mock
@@ -630,43 +679,71 @@ class HerdrLaneViewForWorktreeTest(unittest.TestCase):
             "mozyo_bridge.core.state.lane_metadata.load_lane_records",
             return_value=records,
         ):
-            return herdr_lane_view_for_worktree("/work/lane")
+            return herdr_lane_view_for_worktree(self._WORKTREE)
 
-    def test_resolves_lane_with_metadata_join(self) -> None:
+    def test_resolves_shared_model_lane_unit_with_metadata_join(self) -> None:
         record = LaneMetadataRecord(
-            lane_workspace_token="wt_abc",
+            lane_workspace_token=self._token,
+            repo_workspace_id="wsMain",
+            issue_id="13377",
+            lane_label="issue_13377_shared",
+            branch="issue_13377_shared",
+            lane_id="issue_13377_shared",
+        )
+        view = self._resolve(
+            segment="wsMain",
+            rows=[
+                _row("wsMain", "codex", "issue_13377_shared", "w2:p4"),
+                _row("wsMain", "claude", "issue_13377_shared", "w2:p5"),
+            ],
+            records={self._token: record},
+        )
+        self.assertIsNotNone(view)
+        self.assertEqual(view.workspace_id, "wsMain")
+        self.assertEqual(view.lane_id, "issue_13377_shared")
+        self.assertEqual(view.lane_label, "issue_13377_shared")
+        self.assertEqual(view.issue, "13377")
+        self.assertEqual(view.gateway_pane, "w2:p4")
+        self.assertEqual(view.worker_pane, "w2:p5")
+        self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+        self.assertEqual(view.stale_hints, ())
+
+    def test_resolves_legacy_lane_via_token(self) -> None:
+        record = LaneMetadataRecord(
+            lane_workspace_token=self._token,
             issue_id="13356",
             lane_label="issue_13356_cockpit_aggregate",
             branch="issue_13356_cockpit_aggregate",
         )
         view = self._resolve(
-            segment="wt_abc",
+            segment="wsMain",
             rows=[
-                _row("wt_abc", "codex", "", "wD:p2"),
-                _row("wt_abc", "claude", "", "wD:p3"),
+                _row(self._token, "codex", "", "wD:p2"),
+                _row(self._token, "claude", "", "wD:p3"),
             ],
-            records={"wt_abc": record},
+            records={self._token: record},
         )
         self.assertIsNotNone(view)
+        self.assertEqual(view.workspace_id, self._token)
+        self.assertEqual(view.lane_id, "default")
         self.assertEqual(view.lane_label, "issue_13356_cockpit_aggregate")
         self.assertEqual(view.issue, "13356")
-        self.assertEqual(view.gateway_pane, "wD:p2")
-        self.assertEqual(view.worker_pane, "wD:p3")
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
         self.assertEqual(view.stale_hints, ())
 
-    def test_missing_record_falls_back_to_worktree_basename(self) -> None:
+    def test_missing_record_falls_back_to_legacy_unit_and_basename(self) -> None:
         view = self._resolve(
-            segment="wt_abc",
-            rows=[_row("wt_abc", "claude", "", "wD:p3")],
+            segment="wsMain",
+            rows=[_row(self._token, "claude", "", "wD:p3")],
             records={},
         )
         self.assertIsNotNone(view)
+        self.assertEqual(view.workspace_id, self._token)
         self.assertEqual(view.lane_label, "lane")
         self.assertIn(LANE_RECORD_MISSING_HINT, view.stale_hints)
 
     def test_no_live_slot_resolves_none(self) -> None:
-        view = self._resolve(segment="wt_abc", rows=[], records={})
+        view = self._resolve(segment="wsMain", rows=[], records={})
         self.assertIsNone(view)
 
     def test_unresolvable_segment_resolves_none(self) -> None:

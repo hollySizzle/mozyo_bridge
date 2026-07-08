@@ -665,12 +665,15 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
 
 
 def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
-    """Guarded herdr retire close, or ``None`` when not on the herdr backend (Redmine #13331).
+    """Guarded herdr retire close, or ``None`` when not on the herdr backend (Redmine #13377).
 
-    Resolves the lane workspace from the ``--worktree`` anchor, plans the managed-slot close
-    from the live herdr inventory, and executes it. Fail-safe: a missing ``--worktree`` /
-    unresolvable workspace / unavailable inventory yields a result with no close targets
-    (recorded), never a crash and never a foreign close.
+    Resolves the lane's unit from the ``--worktree`` anchor — the shared project
+    workspace segment + the requested ``--lane-label`` (design j#73613), plus the legacy
+    pre-#13377 per-lane ``wt_<hash>`` twin — plans the managed-slot close from the live
+    herdr inventory, and executes it. The close never touches the project workspace, the
+    default-lane coordinator pair, or another lane's slots. Fail-safe: a missing
+    ``--worktree`` / unresolvable unit / unavailable inventory yields a result with no
+    close targets (recorded), never a crash and never a foreign close.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         list_herdr_agent_rows,
@@ -685,39 +688,55 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         HerdrSessionStartError,
         herdr_workspace_segment,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        derive_lane_workspace_token,
+    )
 
     if not repo_backend_is_herdr(repo_root):
         return None
     worktree = getattr(args, "worktree", None)
+    lane_label = (getattr(args, "lane_label", "") or "").strip()
     if not worktree:
-        return HerdrRetireCloseResult(workspace_id="")
-    # Resolve the lane's herdr workspace segment through the shared resolver (a lane token
-    # for a linked git worktree, #13331 j#73357) — the same segment its managed agents were
-    # minted under, so the guarded close targets them.
+        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
+    # Resolve the lane's unit through the shared resolver: the worktree inherits the
+    # project workspace identity (#13377), and its stable path token names the legacy
+    # pre-#13377 per-lane workspace (compatibility close) plus the metadata tombstone key.
     try:
-        workspace_id = herdr_workspace_segment(Path(worktree))
+        resolved_worktree = Path(worktree).expanduser().resolve()
+        workspace_id = herdr_workspace_segment(resolved_worktree)
     except (OSError, ValueError):
-        workspace_id = ""
-    if not workspace_id:
-        return HerdrRetireCloseResult(workspace_id="")
+        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
+    legacy_token = derive_lane_workspace_token(str(resolved_worktree))
+    if not workspace_id and not legacy_token:
+        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
     try:
         rows = list_herdr_agent_rows(os.environ)
     except HerdrSessionStartError:
-        return HerdrRetireCloseResult(workspace_id=workspace_id)
-    plan = plan_herdr_retire_close(rows, workspace_id=workspace_id)
+        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
+    plan = plan_herdr_retire_close(
+        rows,
+        workspace_id=workspace_id,
+        lane_id=lane_label,
+        legacy_workspace_id=legacy_token,
+    )
     result = execute_herdr_retire_close(plan)
     # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
     # command boundary marks the lane's display-metadata record `retired` (kept as
     # a tombstone for late label resolution / residue diagnosis, never deleted
-    # here). Never raises; an unrecorded lane simply stays unrecorded.
+    # here). The record key is the worktree's stable path token — the same key both
+    # the legacy and the #13377 shared-model create sites upsert on. Never raises;
+    # an unrecorded lane simply stays unrecorded.
     from mozyo_bridge.core.state.lane_metadata import record_lane_retired
 
-    record_lane_retired(workspace_id)
+    record_lane_retired(legacy_token)
     return result
 
 
 def _format_herdr_close_text(result) -> str:
-    lines = [f"  herdr retire close: workspace={result.workspace_id or '<unresolved>'}"]
+    unit = result.workspace_id or "<unresolved>"
+    if getattr(result, "lane_id", ""):
+        unit = f"{unit} lane={result.lane_id}"
+    lines = [f"  herdr retire close: workspace={unit}"]
     if not result.closed and not result.failed:
         lines.append("    - no managed lane agents to close (already retired / absent)")
     for role, locator in result.closed:
@@ -726,7 +745,7 @@ def _format_herdr_close_text(result) -> str:
         lines.append(f"    ! close failed {role} {locator}: {detail}")
     if result.foreign_names:
         lines.append(
-            "    (workspace also has non-managed agents; it will not disappear: "
+            "    (lane unit also has non-managed agents, recorded and never closed: "
             + ", ".join(result.foreign_names)
             + ")"
         )

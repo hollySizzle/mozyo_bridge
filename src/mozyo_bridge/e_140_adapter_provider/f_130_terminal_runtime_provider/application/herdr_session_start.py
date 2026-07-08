@@ -87,6 +87,7 @@ from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.workspace_registry import (
     _is_linked_worktree,
+    _main_worktree_root,
     read_anchor,
     register_workspace,
 )
@@ -98,6 +99,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
+    decode_assigned_name,
     derive_lane_workspace_token,
     encode_assigned_name,
 )
@@ -196,27 +198,35 @@ class SessionStartResult:
 
 
 def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> str:
-    """The mzb1 ``workspace`` segment for ``repo_root`` (Redmine #13331, design j#73357).
+    """The mzb1 ``workspace`` segment for ``repo_root`` (Redmine #13377, design j#73613).
 
     The single, read-only resolver every herdr identity site shares so mint-time
-    (:func:`prepare_session`) and resolve-time (cross-workspace send, retire, projection,
-    lane read-back) always agree:
+    (:func:`prepare_session`) and resolve-time (send, retire, projection, lane
+    read-back) always agree:
 
-    - a **linked git worktree** used as a sublane herdr workspace → the deterministic
-      lane-scoped token (:func:`derive_lane_workspace_token`) from its **canonical** path.
-      The discriminator is git topology (:func:`_is_linked_worktree`), **not** an absent
-      anchor — an unregistered standalone repo also has no anchor. The worktree inherits
-      the main checkout's registry identity (#13152), which is not a distinct per-lane
-      identity, so the registry is left untouched here;
-    - otherwise (**standalone / main checkout**) → the registry / anchor ``workspace_id``,
-      read-only (no registration), byte-for-byte the prior behaviour. ``""`` when the
-      standalone checkout has no resolvable anchor (the caller decides whether that is
-      fatal — :func:`prepare_session` registers + fails closed; the resolve sites treat
-      ``""`` as "not a distinct target workspace").
+    - a **linked git worktree** (a sublane lane checkout) → the **main checkout's**
+      registry / anchor ``workspace_id`` (#13152 identity inheritance). Under the
+      shared project workspace model (#13377 Opt3, superseding the per-lane
+      ``wt_<hash>`` workspace of #13331 j#73357) a lane's agents live in the
+      project workspace as ``mzb1_<project-ws>_<role>_<lane>`` slots, so the
+      ``workspace`` segment is the project identity and the *lane* segment is the
+      discriminant. The legacy per-lane token (:func:`derive_lane_workspace_token`)
+      is no longer minted for new slots; it survives only as the compatibility key
+      for pre-#13377 rows (legacy resolve / retire) and as the lane metadata
+      record's stable per-worktree join key;
+    - otherwise (**standalone / main checkout**) → the registry / anchor
+      ``workspace_id``, read-only (no registration), byte-for-byte the prior
+      behaviour. ``""`` when no anchor resolves (the caller decides whether that is
+      fatal — :func:`prepare_session` fails closed; the resolve sites treat ``""``
+      as "not a resolvable workspace").
     """
     resolved = Path(repo_root).expanduser().resolve()
     if _is_linked_worktree(resolved):
-        return derive_lane_workspace_token(str(resolved))
+        main_root = _main_worktree_root(resolved)
+        if main_root is None:
+            return ""
+        anchor = read_anchor(main_root)
+        return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
     anchor = read_anchor(resolved)
     return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
 
@@ -358,6 +368,69 @@ def _launch_target_from_adopted(adopted_locators: Sequence[str]) -> str:
             "refuse to guess which one new launches belong to"
         )
     return next(iter(prefixes)) if prefixes else ""
+
+
+def _launch_target_for_workspace(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    adopted_locators: Sequence[str],
+) -> str:
+    """The single herdr workspace the mozyo workspace's agents occupy (fail-closed).
+
+    Shared project workspace model (Redmine #13377, design j#73613): every slot of
+    one mozyo workspace — the coordinator's default lane AND every sublane's lane
+    slots — shares ONE herdr terminal workspace, so a lane launch must join the
+    workspace the project's live agents already occupy rather than creating a new
+    one (workspace count must not scale with lane count). The join key is the live
+    inventory: any row whose ``mzb1`` name decodes to ``workspace_id`` (any lane)
+    pins the launch target, exactly like an adopted slot does. Returns ``""`` when
+    nothing pins one (a pure cold start — the caller then creates the workspace
+    explicitly). Raises when the pins span more than one herdr workspace: refusing
+    to guess which one new launches belong to (the same fail-closed posture as the
+    adopted-slot gate, extended workspace-wide).
+    """
+    locators = list(adopted_locators)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if decode.identity.workspace_id != workspace_id:
+            continue
+        locator = _agent_locator(row)
+        if locator:
+            locators.append(locator)
+    prefixes = {p for p in (_workspace_prefix(loc) for loc in locators) if p}
+    if len(prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"live agents of mozyo workspace {workspace_id!r} span multiple herdr "
+            f"workspaces {sorted(prefixes)!r}; refuse to guess which one new "
+            "launches belong to"
+        )
+    return next(iter(prefixes)) if prefixes else ""
+
+
+def _lane_id_from_metadata(resolved_root: Path) -> str:
+    """The recorded lane id for a lane worktree (``""`` when unrecorded).
+
+    Shared project workspace model (Redmine #13377): a lane worktree's slots are
+    ``mzb1_<project-ws>_<role>_<lane>``, so a relaunch from the worktree must
+    recover the SAME lane segment ``sublane create`` launched with. The lane
+    metadata record — keyed on the worktree's stable per-path token — carries it
+    (``lane_id``, falling back to ``lane_label`` for a record written before the
+    column existed). Read-only and fail-open to ``""`` (the caller fails closed:
+    a lane slot is never minted with a guessed lane).
+    """
+    from mozyo_bridge.core.state.lane_metadata import load_lane_records
+
+    token = derive_lane_workspace_token(str(resolved_root))
+    record = load_lane_records().get(token)
+    if record is None:
+        return ""
+    return _norm(getattr(record, "lane_id", "")) or _norm(
+        getattr(record, "lane_label", "")
+    )
 
 
 def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
@@ -530,16 +603,37 @@ def prepare_session(
             raise HerdrSessionStartError(str(exc)) from exc
     binary = _resolve_binary_or_die(env)
 
-    # Redmine #13331 (design j#73357, Opt 1): the mzb1 `workspace` segment. A linked git
-    # worktree used as a per-lane herdr workspace inherits the main checkout's registry
-    # identity (#13152) and has no distinct per-lane workspace_id, so it is named by a
-    # deterministic path-derived token (registry untouched). A standalone / main checkout
-    # is registered and named by its registry workspace_id (byte-for-byte the prior path,
-    # incl. the fail-closed-on-empty guard). Both use the single shared resolver so mint
-    # here and resolve at send/retire/projection agree on the same canonical path.
+    # Redmine #13377 (design j#73613, Opt3 — shared project workspace): the mzb1
+    # `workspace` segment. A linked git worktree (a sublane lane checkout) inherits the
+    # main checkout's registry identity (#13152), and its slots are launched INTO the
+    # project workspace as `mzb1_<project-ws>_<role>_<lane>` — the lane segment, not a
+    # per-lane workspace, is the discriminant (supersedes the #13331 j#73357 `wt_<hash>`
+    # per-lane workspace; that token survives only as the legacy/compat + metadata key).
+    # A standalone / main checkout is registered and named by its registry workspace_id
+    # (byte-for-byte the prior path, incl. the fail-closed-on-empty guard). Both use the
+    # single shared resolver so mint here and resolve at send/retire/projection agree.
     resolved_root = Path(repo_root).expanduser().resolve()
+    lane = _norm(lane_id)
     if _is_linked_worktree(resolved_root):
-        workspace_id = derive_lane_workspace_token(str(resolved_root))
+        workspace_id = herdr_workspace_segment(resolved_root)
+        if not workspace_id:
+            raise HerdrSessionStartError(
+                "linked worktree's main checkout has no registered workspace "
+                "identity to inherit; run `mozyo-bridge workspace register` from "
+                "the main checkout first (Redmine #13152 / #13377)"
+            )
+        if not lane:
+            # A lane worktree's slots carry a non-default lane segment. Recover the
+            # recorded lane rather than minting the project workspace's DEFAULT
+            # slots (those are the coordinator pair) from a lane checkout.
+            lane = _lane_id_from_metadata(resolved_root)
+            if not lane:
+                raise HerdrSessionStartError(
+                    "a linked worktree lane requires an explicit lane id (its slots "
+                    "are `mzb1_<project-ws>_<role>_<lane>`); pass --lane or create "
+                    "the lane via `sublane create` so its lane metadata record "
+                    "carries the lane id (Redmine #13377)"
+                )
     else:
         register_workspace(repo_root)
         anchor = read_anchor(repo_root)
@@ -548,7 +642,6 @@ def prepare_session(
             raise HerdrSessionStartError(
                 "workspace has no resolvable workspace_id after registration"
             )
-    lane = _norm(lane_id)
 
     result = SessionStartResult(workspace_id=workspace_id, lane_id=lane or "default")
     runner = runner or subprocess.run
@@ -576,16 +669,19 @@ def prepare_session(
         else:
             plans.append(_SlotPlan(provider, assigned_name, "launch"))
 
-    # Resolve the launch-target workspace (Redmine #13330). Nothing to launch (all
-    # adopt / dry-run) means no workspace create and no reclaim — byte-invariant.
-    # Launches into an already-adopted workspace reuse it (no new base pane). A pure
-    # cold start (launches, no adopted workspace) creates the workspace explicitly so
-    # its empty root pane is a known handle to reclaim, not one we scan for.
+    # Resolve the launch-target workspace (Redmine #13330 / #13377). Nothing to launch
+    # (all adopt / dry-run) means no workspace create and no reclaim — byte-invariant.
+    # Launches join the herdr workspace the mozyo workspace's live agents already
+    # occupy — an adopted slot, the coordinator pair, or another lane's slots all pin
+    # it (shared project workspace: a lane launch must NOT create a per-lane
+    # workspace). A pure cold start (launches, nothing live for this workspace)
+    # creates the workspace explicitly so its empty root pane is a known handle to
+    # reclaim, not one we scan for.
     launch_plans = [p for p in plans if p.kind == "launch"]
     target_workspace = ""
     if launch_plans:
-        target_workspace = _launch_target_from_adopted(
-            [p.locator for p in plans if p.kind == "adopt"]
+        target_workspace = _launch_target_for_workspace(
+            rows, workspace_id, [p.locator for p in plans if p.kind == "adopt"]
         )
         if not target_workspace:
             target_workspace, base_pane_id = _create_workspace(

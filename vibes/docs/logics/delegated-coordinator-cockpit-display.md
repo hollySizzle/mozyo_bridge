@@ -108,6 +108,16 @@ window を増やさない。
 可視鑑賞ではなく routing / lifecycle / read-model の一貫性である。lane ごとの
 window 分裂は、stale lane を window 数から推測するという運用負荷を生んだ。
 
+**herdr backend での `shared` の実体 (Redmine #13377 / design j#73613)**: tmux の
+「単一 sublane host window」に対応する herdr 語彙は **project workspace 1 個** で
+ある。sublane は per-lane herdr workspace (#13331 の暫定形、legacy) ではなく、
+project workspace 内の lane slot (`mzb1_<project-ws>_<role>_<lane>`) として同居
+し、herdr workspace 数は lane 数に比例しない (owner 裁定: #13377 description /
+#13081)。tmux 側の `(workspace_id, lane_id)` unit 概念がそのまま herdr の route /
+projection identity になるため、`shared` 既定は herdr では表示 policy であると同時
+に配置の実装既定でもある。`separate` opt-in は tmux window 配置の knob であり、
+herdr 側に per-lane workspace を復活させる knob ではない。
+
 `separate` は **opt-in** として保持する (#12467 表示 + #13015 launcher actuation)。
 delegated coordinator は callback drain / audit 待ちで `callback_due` /
 `review_waiting` を抱えやすく、孫 worker は `implementing` であることが多い。両者を

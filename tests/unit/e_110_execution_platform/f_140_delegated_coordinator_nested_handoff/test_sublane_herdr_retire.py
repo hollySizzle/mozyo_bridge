@@ -1,7 +1,9 @@
-"""herdr sublane retire guarded-close tests (Redmine #13331 option A, j#73314).
+"""herdr sublane retire guarded-close tests (Redmine #13377 shared project workspace).
 
-Pins the fail-closed plan (only managed default-lane codex/claude slots are close targets;
-a foreign agent is never a target) and the non-fatal executor over a fake herdr.
+Pins the fail-closed plan (only the lane unit's managed codex/claude slots are close
+targets — never the project workspace's default-lane coordinator pair, another lane, or
+a foreign agent; a legacy pre-#13377 ``wt_...`` workspace's default-lane pair closes via
+the compatibility twin) and the non-fatal executor over a fake herdr.
 """
 
 from __future__ import annotations
@@ -33,23 +35,74 @@ def _row(ws, role, lane, locator):
 
 
 class PlanHerdrRetireCloseTest(unittest.TestCase):
-    def test_plans_managed_slots_only(self) -> None:
+    def test_plans_lane_unit_managed_slots_only(self) -> None:
         rows = [
-            _row("wsL", "codex", "", "wL:p2"),
-            _row("wsL", "claude", "", "wL:p3"),
+            # the target lane unit's slots (#13377 shared model) -> close targets
+            _row("wsMain", "codex", "issue_101_alpha", "w2:p4"),
+            _row("wsMain", "claude", "issue_101_alpha", "w2:p5"),
+            # the project's default-lane coordinator pair -> NEVER closed
+            _row("wsMain", "codex", "", "w2:p3"),
+            _row("wsMain", "claude", "", "w2:p2"),
+            # another lane of the same workspace -> ignored
+            _row("wsMain", "codex", "issue_202_beta", "w2:p6"),
             # other workspace -> ignored
             _row("wsOther", "codex", "", "wO:p2"),
             # foreign non-mzb1 -> ignored
             {"name": "someones-shell", "pane_id": "wZ:p1"},
-            # managed-scheme but non-default lane in THIS workspace -> recorded, not closed
-            _row("wsL", "codex", "lane-x", "wL:p9"),
+            # managed-scheme but non-gateway/worker role INSIDE the unit -> recorded
+            _row("wsMain", "helper", "issue_101_alpha", "w2:p9"),
         ]
-        plan = plan_herdr_retire_close(rows, workspace_id="wsL")
+        plan = plan_herdr_retire_close(
+            rows, workspace_id="wsMain", lane_id="issue_101_alpha"
+        )
+        self.assertEqual(
+            sorted(plan.close_targets),
+            sorted([("codex", "w2:p4"), ("claude", "w2:p5")]),
+        )
+        self.assertTrue(plan.has_targets)
+        self.assertEqual(plan.lane_id, "issue_101_alpha")
+        self.assertEqual(len(plan.foreign_names), 1)  # the in-unit helper
+
+    def test_default_lane_of_project_workspace_is_never_a_target(self) -> None:
+        rows = [
+            _row("wsMain", "codex", "", "w2:p3"),
+            _row("wsMain", "claude", "", "w2:p2"),
+        ]
+        # No lane / an explicit default lane both refuse the coordinator pair.
+        for lane in ("", "default"):
+            plan = plan_herdr_retire_close(rows, workspace_id="wsMain", lane_id=lane)
+            self.assertFalse(plan.has_targets)
+            self.assertEqual(plan.foreign_names, ())
+
+    def test_legacy_workspace_token_closes_default_pair(self) -> None:
+        rows = [
+            _row("wt_1234", "codex", "", "wL:p2"),
+            _row("wt_1234", "claude", "", "wL:p3"),
+            _row("wt_1234", "codex", "lane-x", "wL:p9"),  # recorded, not closed
+        ]
+        # Pre-#13377 caller shape: the legacy token passed as the workspace id.
+        plan = plan_herdr_retire_close(rows, workspace_id="wt_1234")
         self.assertEqual(
             sorted(plan.close_targets), sorted([("codex", "wL:p2"), ("claude", "wL:p3")])
         )
-        self.assertTrue(plan.has_targets)
-        self.assertEqual(len(plan.foreign_names), 1)  # the lane-x codex
+        self.assertEqual(len(plan.foreign_names), 1)
+
+    def test_legacy_twin_closes_alongside_shared_unit(self) -> None:
+        rows = [
+            _row("wsMain", "codex", "issue_101_alpha", "w2:p4"),
+            _row("wt_1234", "codex", "", "wL:p2"),
+            _row("wt_1234", "claude", "", "wL:p3"),
+        ]
+        plan = plan_herdr_retire_close(
+            rows,
+            workspace_id="wsMain",
+            lane_id="issue_101_alpha",
+            legacy_workspace_id="wt_1234",
+        )
+        self.assertEqual(
+            sorted(plan.close_targets),
+            sorted([("codex", "w2:p4"), ("codex", "wL:p2"), ("claude", "wL:p3")]),
+        )
 
     def test_empty_workspace_id_matches_nothing(self) -> None:
         rows = [_row("wsL", "codex", "", "wL:p2")]
@@ -57,8 +110,15 @@ class PlanHerdrRetireCloseTest(unittest.TestCase):
         self.assertFalse(plan.has_targets)
 
     def test_row_without_locator_not_a_target(self) -> None:
-        rows = [{"name": encode_assigned_name("wsL", "codex", ""), "pane_id": ""}]
-        plan = plan_herdr_retire_close(rows, workspace_id="wsL")
+        rows = [
+            {
+                "name": encode_assigned_name("wsMain", "codex", "issue_101_alpha"),
+                "pane_id": "",
+            }
+        ]
+        plan = plan_herdr_retire_close(
+            rows, workspace_id="wsMain", lane_id="issue_101_alpha"
+        )
         self.assertFalse(plan.has_targets)
 
 
@@ -91,8 +151,12 @@ class ExecuteHerdrRetireCloseTest(unittest.TestCase):
         herdr = _CloseHerdr()
         with tempfile.TemporaryDirectory() as tmp:
             plan = plan_herdr_retire_close(
-                [_row("wsL", "codex", "", "wL:p2"), _row("wsL", "claude", "", "wL:p3")],
-                workspace_id="wsL",
+                [
+                    _row("wsMain", "codex", "issue_101_alpha", "wL:p2"),
+                    _row("wsMain", "claude", "issue_101_alpha", "wL:p3"),
+                ],
+                workspace_id="wsMain",
+                lane_id="issue_101_alpha",
             )
             result = execute_herdr_retire_close(
                 plan, env=self._env(tmp), runner=herdr.run
@@ -100,13 +164,18 @@ class ExecuteHerdrRetireCloseTest(unittest.TestCase):
         self.assertEqual(sorted(herdr.closed), ["wL:p2", "wL:p3"])
         self.assertEqual(len(result.closed), 2)
         self.assertEqual(len(result.failed), 0)
+        self.assertEqual(result.lane_id, "issue_101_alpha")
 
     def test_close_failure_is_non_fatal(self) -> None:
         herdr = _CloseHerdr(fail_locators={"wL:p3"})
         with tempfile.TemporaryDirectory() as tmp:
             plan = plan_herdr_retire_close(
-                [_row("wsL", "codex", "", "wL:p2"), _row("wsL", "claude", "", "wL:p3")],
-                workspace_id="wsL",
+                [
+                    _row("wsMain", "codex", "issue_101_alpha", "wL:p2"),
+                    _row("wsMain", "claude", "issue_101_alpha", "wL:p3"),
+                ],
+                workspace_id="wsMain",
+                lane_id="issue_101_alpha",
             )
             result = execute_herdr_retire_close(
                 plan, env=self._env(tmp), runner=herdr.run

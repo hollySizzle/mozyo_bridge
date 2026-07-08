@@ -169,6 +169,86 @@ class LaneMetadataStoreTest(unittest.TestCase):
         )
         self.assertEqual(record.as_payload()["worktree_path"], "/work/lane")
 
+    # -- v2 lane_id (Redmine #13377 shared project workspace model) -------------
+
+    def test_lane_id_round_trips_and_indexes_by_unit(self) -> None:
+        from mozyo_bridge.core.state.lane_metadata import lane_records_by_unit
+
+        self._store().upsert(
+            LaneMetadataRecord(
+                lane_workspace_token="wt_abc",
+                repo_workspace_id="wsMain",
+                lane_label="issue_13377_shared",
+                lane_id="issue_13377_shared",
+            )
+        )
+        records = self._store().load_all()
+        self.assertEqual(records["wt_abc"].lane_id, "issue_13377_shared")
+        by_unit = lane_records_by_unit(records)
+        self.assertIn(("wsMain", "issue_13377_shared"), by_unit)
+        # A legacy record (no lane_id) never fabricates a unit key.
+        self._store().upsert(
+            LaneMetadataRecord(
+                lane_workspace_token="wt_legacy", repo_workspace_id="wsMain"
+            )
+        )
+        by_unit = lane_records_by_unit(self._store().load_all())
+        self.assertEqual(
+            sorted(by_unit), [("wsMain", "issue_13377_shared")]
+        )
+
+    def _create_v1_table(self) -> Path:
+        """A pre-#13377 container whose lane table lacks the ``lane_id`` column."""
+        db = lane_metadata_path(self.home)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(f"PRAGMA user_version = {STATE_CONTAINER_VERSION}")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state_schema_components ("
+                    "component TEXT PRIMARY KEY, schema_version INTEGER, owner TEXT, "
+                    "recovery_policy TEXT, migrated_from TEXT, updated_at TEXT)"
+                )
+                conn.execute(
+                    "CREATE TABLE lane_metadata_records ("
+                    "lane_workspace_token TEXT PRIMARY KEY, repo_workspace_id TEXT, "
+                    "issue_id TEXT, lane_label TEXT, branch TEXT, worktree_path TEXT, "
+                    "source_backend TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL, retired_at TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO lane_metadata_records VALUES "
+                    "('wt_old', 'wsMain', '13331', 'issue_13331_x', 'issue_13331_x', "
+                    "'/work/lane', 'herdr', 'active', 't', 't', NULL)"
+                )
+        finally:
+            conn.close()
+        return db
+
+    def test_v1_table_is_readable_without_migration(self) -> None:
+        # A read-only consumer (no write since the upgrade) still resolves legacy
+        # records — lane_id defaults to "" (the legacy marker), nothing is lost.
+        self._create_v1_table()
+        records = self._store().load_all()
+        self.assertIn("wt_old", records)
+        self.assertEqual(records["wt_old"].lane_id, "")
+        self.assertEqual(records["wt_old"].lane_label, "issue_13331_x")
+
+    def test_write_migrates_v1_table_in_place(self) -> None:
+        self._create_v1_table()
+        self._store().upsert(
+            LaneMetadataRecord(
+                lane_workspace_token="wt_new",
+                repo_workspace_id="wsMain",
+                lane_id="issue_13377_shared",
+            )
+        )
+        records = self._store().load_all()
+        # The legacy row survives the additive ALTER; the new row carries lane_id.
+        self.assertEqual(records["wt_old"].lane_id, "")
+        self.assertEqual(records["wt_new"].lane_id, "issue_13377_shared")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -1,14 +1,17 @@
-"""herdr-backend creation-side actuation IO for ``sublane start --execute`` (Redmine #13331).
+"""herdr-backend creation-side actuation IO for ``sublane start --execute`` (Redmine #13377).
 
 The tmux :class:`~...application.sublane_actuator_ops.LiveSublaneActuatorOps` stands a lane
 up as a *cockpit column* (two tmux panes) in the shared tmux server, so a lane is a
-``(workspace_id, lane_id)`` slice of one workspace. Redmine #13331 (design consultation
-answer j#73314, **option A**) migrates the lane onto herdr as its own **per-lane herdr
-workspace**: the lane worktree is a fresh workspace whose two managed agents are launched
-as ``mzb1_<lane-ws>_codex_default`` / ``mzb1_<lane-ws>_claude_default`` by the #13330
+``(workspace_id, lane_id)`` slice of one workspace. Redmine #13377 (design consultation
+answer j#73613, **Opt3 — shared project workspace**) gives herdr the same shape: the lane
+worktree stays a linked git worktree, but its two managed agents are launched INTO the
+project's single herdr workspace as ``mzb1_<project-ws>_codex_<lane>`` /
+``mzb1_<project-ws>_claude_<lane>`` by the #13330
 :func:`~...terminal_runtime_provider.application.herdr_session_start.prepare_session`
-(explicit ``workspace create`` + ``agent start --workspace`` + root-pane reclaim), so the
-hybrid (herdr coordinator, tmux lanes) is dissolved.
+(join-or-create workspace + ``agent start --workspace --cwd <lane-worktree>`` + root-pane
+reclaim), so the herdr workspace count does not scale with the lane count. This supersedes
+the #13331 j#73314 per-lane ``wt_<hash>`` workspace (option A), which survives read-side
+as legacy compatibility only.
 
 :class:`HerdrSublaneActuatorOps` implements the SAME
 :class:`~...application.sublane_actuator_ops.SublaneActuatorOps` port the tmux adapter
@@ -18,19 +21,24 @@ choreography is unchanged — only the side effects differ:
 * ``create_worktree`` — the identical additive #12604 git op (worktree add is backend-agnostic
   and already inside ``worktree-lifecycle-boundary.md``);
 * ``append_lane_column`` — instead of a cockpit append, :func:`prepare_session` on the lane
-  worktree, creating the lane's own herdr workspace with a codex gateway + claude worker;
+  worktree with ``lane_id=lane_label``, launching the codex gateway + claude worker as lane
+  slots of the shared project workspace;
 * ``read_lane`` — resolves the lane from the **live herdr inventory** (``agent list``
-  ``mzb1`` decode, #13247) filtered to the worktree's own mozyo workspace, not a tmux pane
-  snapshot. The lane identity is the worktree→workspace mapping (collision-free: one
-  worktree is one workspace), so it carries the request's ``lane_label`` / ``issue``;
-* ``probe_gateway_ready`` — a non-fatal live-presence check of the gateway agent (the herdr
-  send rail's turn-start observation + Enter-resend self-healing, #13322, is the landing
-  net, so readiness is just "is the agent live");
+  ``mzb1`` decode, #13247) filtered to the lane's unit ``(project workspace, lane_label)``,
+  not a tmux pane snapshot; a pre-#13377 lane still resolves through its legacy
+  ``wt_<hash>`` default-lane slots (compatibility read, so a live legacy lane is never
+  double-created);
+* ``probe_gateway_ready`` — a non-fatal boot-readiness check of the gateway agent: live in
+  the inventory AND rendered (``agent read`` returns non-blank text, #13378 — the same
+  booted-and-rendered gate as the tmux probe; the send rail's turn-start observation +
+  Enter-resend, #13322, stays the landing net);
 * ``dispatch_implementation_request`` — the governed ``handoff send`` to the gateway. The
-  gateway lives in the LANE workspace, so the coordinator→gateway leg crosses a workspace
-  boundary: the dispatch names the lane worktree with an explicit ``--target-repo`` (the
-  #13331 cross-workspace route authority resolves the receiver there) and a non-``%pane``
-  herdr target so the send rides the herdr rail (#13320 effective-backend predicate).
+  gateway is a lane slot of the SAME project workspace, so the coordinator→gateway leg is
+  a same-workspace, **explicit-lane** send: the dispatch passes ``--target-lane
+  <lane_label>`` (the j#73613 explicit lane field — never an all-lane scan) plus
+  ``--target-repo <lane-worktree>`` as the repo/cwd gate (a gate, not a workspace
+  selector) and a non-``%pane`` herdr target so the send rides the herdr rail (#13320
+  effective-backend predicate).
 
 Boundary (identical to the tmux adapter): creation-side / additive only — there is no
 remove / kill / delete / merge method here; the destructive retire half stays gated
@@ -76,6 +84,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    derive_lane_workspace_token,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
@@ -89,15 +98,14 @@ HERDR_LANE_PROVIDERS: tuple[str, ...] = (GATEWAY_ROLE, WORKER_ROLE)
 
 @dataclass
 class HerdrSublaneActuatorOps:
-    """Live herdr adapter composing the per-lane-workspace primitives for a lane.
+    """Live herdr adapter composing the shared-project-workspace primitives for a lane.
 
     ``repo_root`` is the *coordinator's* checkout (the actuation is driven from the
-    coordinator). ``lane_label`` / ``issue`` are the requested lane identity, echoed into
-    the :class:`SublaneLaneView` on read-back: under option A the lane identity is the
-    worktree→workspace mapping (each lane worktree is a distinct mozyo workspace, so there
-    is no repo-root / basename collision to disambiguate — the ``read_lane`` anchor lookup
-    is already the collision-free target), so the view carries the requested label with the
-    live gateway / worker locators the inventory decode recovers.
+    coordinator). ``lane_label`` / ``issue`` are the requested lane identity: under the
+    #13377 shared model ``lane_label`` IS the mzb1 lane segment, so the lane unit
+    ``(project workspace, lane_label)`` is the collision-free target the ``read_lane``
+    inventory decode resolves, and the view carries the requested label with the live
+    gateway / worker locators.
 
     ``env`` / ``runner`` are injected so tests drive a fake herdr; the binary is resolved
     from ``env`` (trusted-environment only). ``quiet_stdout`` mirrors the tmux adapter:
@@ -146,20 +154,22 @@ class HerdrSublaneActuatorOps:
         return argv
 
     def append_lane_column(self, worktree_path: str) -> None:
-        """Stand the lane's own herdr workspace up: launch the gateway + worker slots.
+        """Stand the lane's slots up inside the shared project herdr workspace.
 
-        Delegates to the #13330 :func:`prepare_session` on the LANE worktree (its own repo
-        root → its own mozyo workspace + herdr workspace), launching
-        ``mzb1_<lane-ws>_<provider>_default`` for each provider and reclaiming the cold-start
-        empty base pane. :class:`HerdrSessionStartError` (unconfigured binary, a launch that
-        lands in the wrong workspace, an unusable locator) propagates so the use case fails
-        closed exactly as it does on a cockpit-append failure.
+        Delegates to the #13330 :func:`prepare_session` on the LANE worktree with
+        ``lane_id=lane_label`` (Redmine #13377 Opt3): the worktree inherits the main
+        checkout's workspace identity, so the slots launch as
+        ``mzb1_<project-ws>_<provider>_<lane_label>`` INTO the herdr workspace the
+        project's live agents already occupy (join-or-create — a lane never creates a
+        per-lane workspace). :class:`HerdrSessionStartError` (unconfigured binary, a
+        launch that lands in the wrong workspace, an unusable locator) propagates so the
+        use case fails closed exactly as it does on a cockpit-append failure.
         """
         try:
             prepare_session(
                 repo_root=Path(worktree_path),
                 providers=list(self.providers),
-                lane_id="",
+                lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
                 timeout=self.timeout,
@@ -171,13 +181,14 @@ class HerdrSublaneActuatorOps:
                 claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             )
         except HerdrSessionStartError as exc:
-            raise RuntimeError(f"herdr lane workspace creation failed: {exc}") from exc
-        # Best-effort lane metadata upsert (Redmine #13356 j#73386 Q2): record the
-        # token↔(lane_label / issue / branch / worktree) display join at the create
-        # command boundary, so `sublane list` / dispatch-worker / the cockpit web UI
-        # can resolve the lane's human identity from the wt_<hash> token. A metadata
-        # write failure never breaks the actuation — the projections fail open to
-        # the raw token (`lane_record_missing`).
+            raise RuntimeError(f"herdr lane slot creation failed: {exc}") from exc
+        # Best-effort lane metadata upsert (Redmine #13356 j#73386 Q2 / #13377): record
+        # the (lane unit)↔(lane_label / issue / branch / worktree) display join at the
+        # create command boundary, so `sublane list` / dispatch-worker / the cockpit web
+        # UI can resolve the lane's human identity. The record key stays the worktree's
+        # stable path token; `repo_workspace_id` + `lane_id` carry the live unit the
+        # shared-model projections join on. A metadata write failure never breaks the
+        # actuation — the projections fail open (`lane_record_missing`).
         self._record_lane_metadata(worktree_path)
 
     def _record_lane_metadata(self, worktree_path: str) -> None:
@@ -185,11 +196,12 @@ class HerdrSublaneActuatorOps:
         from mozyo_bridge.core.state.lane_metadata import record_lane_created
 
         try:
-            token = herdr_workspace_segment(Path(worktree_path))
-        except (OSError, ValueError):
+            resolved = Path(worktree_path).expanduser().resolve()
+        except OSError:
             return
-        if not token:
-            return
+        # The stable per-worktree metadata key (also the legacy pre-#13377 workspace
+        # segment) — NOT the mzb1 workspace segment, which is the project identity now.
+        token = derive_lane_workspace_token(str(resolved))
         try:
             repo_workspace_id = herdr_workspace_segment(self.repo_root)
         except (OSError, ValueError):
@@ -201,6 +213,7 @@ class HerdrSublaneActuatorOps:
             lane_label=self.lane_label or "",
             branch=self.branch or "",
             worktree_path=str(worktree_path),
+            lane_id=self.lane_label or "",
         )
 
     def heal_lane_column(self, worktree_path: str) -> None:
@@ -210,9 +223,12 @@ class HerdrSublaneActuatorOps:
         entirely outside mozyo (measured: a host-level ``npm install -g @openai/codex``
         cleanly exits every idle, pre-session codex TUI — #13378 j#73606). The heal is
         simply :meth:`append_lane_column` again: :func:`prepare_session` is
-        adopt-or-launch idempotent per slot, so the surviving slot is *adopted* (its
-        locator pins the launch-target workspace, exactly the runbook relaunch standard
-        "両 agent 指定") and only the dead slot is relaunched. Any
+        adopt-or-launch idempotent per slot, so the surviving slot is *adopted* and
+        only the dead slot is relaunched. Under the #13377 shared project workspace
+        model the relaunch target is the PROJECT workspace via the workspace-wide
+        live-agent join — the surviving slot pins it, and even a lane whose BOTH
+        slots died still heals into the workspace the project's other agents occupy
+        (j#73619 alignment: a heal never resurrects a per-lane workspace). Any
         :class:`HerdrSessionStartError` propagates as ``RuntimeError`` so the use case
         stays fail-closed. Exposed as an *optional* port capability (the use case
         discovers it via ``getattr``): the tmux adapter deliberately does not provide it
@@ -230,16 +246,20 @@ class HerdrSublaneActuatorOps:
         return _list_rows(binary, runner, self.timeout)
 
     def _lane_slots(
-        self, workspace_id: str, rows: Sequence[Mapping[str, object]]
+        self,
+        workspace_id: str,
+        lane_id: str,
+        rows: Sequence[Mapping[str, object]],
     ) -> dict[str, str]:
-        """Map ``{role: locator}`` for this workspace's default-lane managed slots.
+        """Map ``{role: locator}`` for the lane unit's managed slots.
 
         Decodes each ``agent list`` row's ``mzb1`` name (#13247); a row is a managed lane
-        slot iff it decodes to ``(workspace_id, default lane, role)``. Undecodable / foreign
+        slot iff it decodes to ``(workspace_id, lane_id, role)``. Undecodable / foreign
         rows are skipped. A row that decodes to a managed slot but carries no live locator is
         skipped (a blank target is never a resolved pane), so the use case reads it as a
         missing pane and fails closed rather than adopting a locator-less lane.
         """
+        want_lane = _norm_lane(lane_id)
         slots: dict[str, str] = {}
         for row in rows:
             if not isinstance(row, Mapping):
@@ -250,7 +270,7 @@ class HerdrSublaneActuatorOps:
             identity = decode.identity
             if identity.workspace_id != workspace_id:
                 continue
-            if _norm_lane(identity.lane_id) != DEFAULT_LANE:
+            if _norm_lane(identity.lane_id) != want_lane:
                 continue
             if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
                 continue
@@ -265,21 +285,20 @@ class HerdrSublaneActuatorOps:
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         """Resolve the lane from the live herdr inventory for this worktree (fail-safe).
 
-        Resolves the worktree's herdr workspace segment through the shared resolver
-        (:func:`~...herdr_session_start.herdr_workspace_segment` — a lane token for a linked
-        git worktree, #13331 j#73357), lists the live herdr agents, and folds the
-        default-lane codex / claude managed slots into a :class:`SublaneLaneView`. Returns
-        ``None`` when the worktree has no resolvable segment or when neither managed slot is
-        live (a fresh worktree before :meth:`append_lane_column`, whose agents are not yet
-        launched) — so the use case treats a not-yet-created lane as absent and creates it.
-        The view carries the requested ``lane_label`` / ``issue`` (the worktree→workspace
-        mapping is the collision-free lane identity).
+        Shared project workspace model (Redmine #13377): the lane unit is
+        ``(project workspace segment, lane_label)`` — the worktree resolves to the main
+        checkout's workspace identity through the shared resolver and the requested
+        ``lane_label`` is the lane discriminant. A pre-#13377 lane whose agents still
+        carry the legacy per-lane ``wt_<hash>`` default-lane names resolves through the
+        compatibility read (so a live legacy lane is adopted, never double-created).
+        Returns ``None`` when no segment resolves or neither managed slot is live (a
+        fresh worktree before :meth:`append_lane_column`) — the use case then treats the
+        lane as absent and creates it.
         """
         try:
-            workspace_id = herdr_workspace_segment(Path(worktree_path))
+            resolved = Path(worktree_path).expanduser().resolve()
+            workspace_id = herdr_workspace_segment(resolved)
         except (OSError, ValueError):
-            return None
-        if not workspace_id:
             return None
         try:
             rows = self._live_rows()
@@ -289,14 +308,24 @@ class HerdrSublaneActuatorOps:
             # rather than fabricating a partial view — a genuinely down herdr also fails
             # closed on the append step, so this never adopts a lane it cannot see.
             return None
-        slots = self._lane_slots(workspace_id, rows)
+        lane_id = _norm_lane(self.lane_label)
+        slots: dict[str, str] = {}
+        if workspace_id:
+            slots = self._lane_slots(workspace_id, lane_id, rows)
+        if not slots:
+            # Legacy compatibility (pre-#13377): the lane's agents live in their own
+            # `wt_<hash>` workspace under the default lane.
+            legacy_ws = derive_lane_workspace_token(str(resolved))
+            legacy_slots = self._lane_slots(legacy_ws, DEFAULT_LANE, rows)
+            if legacy_slots:
+                workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, legacy_slots
         gateway = slots.get(GATEWAY_ROLE)
         worker = slots.get(WORKER_ROLE)
         if not gateway and not worker:
             return None
         return SublaneLaneView(
             workspace_id=workspace_id,
-            lane_id=DEFAULT_LANE,
+            lane_id=lane_id,
             lane_label=self.lane_label,
             issue=self.issue or None,
             branch=None,
@@ -359,12 +388,15 @@ class HerdrSublaneActuatorOps:
     ) -> list[str]:
         """The governed ``handoff send`` argv for the coordinator→lane-gateway leg.
 
-        The gateway lives in the LANE workspace, so ``--target-repo <lane-worktree>`` names
-        it: the #13331 cross-workspace route authority resolves the codex gateway there. The
-        ``--target`` is the gateway's live herdr locator — a non-``%pane`` value, so the
-        send rides the herdr rail (#13320 effective-backend predicate) rather than the tmux
-        rail. Same governed shape as the tmux dispatch (queue-enter, implementation_gateway
-        role profile, lane / upstream_coordinator profile fields).
+        The gateway is a lane slot of the SAME project workspace (Redmine #13377), so the
+        dispatch is an explicit-lane, same-workspace herdr send: ``--target-lane
+        <lane_label>`` names the slot (j#73613 — an explicit lane field, never an all-lane
+        scan) and ``--target-repo <lane-worktree>`` stays the repo/cwd gate (a gate, not a
+        workspace selector). The ``--target`` is the gateway's live herdr locator — a
+        non-``%pane`` value, so the send rides the herdr rail (#13320 effective-backend
+        predicate) rather than the tmux rail. Same governed shape as the tmux dispatch
+        (queue-enter, implementation_gateway role profile, lane / upstream_coordinator
+        profile fields).
         """
         argv = [
             "handoff",
@@ -383,6 +415,8 @@ class HerdrSublaneActuatorOps:
             gateway_pane,
             "--target-repo",
             target_repo,
+            "--target-lane",
+            lane_label,
             "--mode",
             "queue-enter",
             "--role-profile",

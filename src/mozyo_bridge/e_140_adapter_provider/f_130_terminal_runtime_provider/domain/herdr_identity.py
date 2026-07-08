@@ -197,6 +197,25 @@ def derive_lane_workspace_token(canonical_worktree_path: str) -> str:
     return f"{LANE_WORKSPACE_TOKEN_PREFIX}_{digest[:_LANE_TOKEN_HEX_LEN]}"
 
 
+_LANE_TOKEN_RE = re.compile(rf"^{LANE_WORKSPACE_TOKEN_PREFIX}_[A-Za-z0-9_]+$")
+
+
+def is_lane_workspace_token(value: object) -> bool:
+    """True iff ``value`` is a legacy per-lane workspace token (``wt_<hash>``).
+
+    Redmine #13377 (shared project workspace model): new lane slots carry the
+    project workspace segment + a lane segment, so the ``wt_...`` form only
+    identifies a *legacy* pre-#13377 per-lane workspace. Read-side folds use this
+    to keep the compatibility view of such rows (a legacy default-lane pair IS a
+    sublane) apart from a project workspace's default-lane coordinator pair
+    (never a sublane). Prefix-shape match: canonical tokens are
+    ``wt_<16 hex>`` (:func:`derive_lane_workspace_token`), and a registry
+    workspace id (``uuid4().hex`` — no underscore) can never collide with the
+    ``wt_`` prefix.
+    """
+    return isinstance(value, str) and bool(_LANE_TOKEN_RE.match(value.strip()))
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed decode reason vocabulary (core-owned, closed set).
 # ---------------------------------------------------------------------------
@@ -677,6 +696,7 @@ __all__ = (
     "DEFAULT_LANE",
     "LANE_WORKSPACE_TOKEN_PREFIX",
     "derive_lane_workspace_token",
+    "is_lane_workspace_token",
     "NAME_MAX_LENGTH",
     "REASON_BAD_ESCAPE",
     "REASON_BAD_PREFIX",

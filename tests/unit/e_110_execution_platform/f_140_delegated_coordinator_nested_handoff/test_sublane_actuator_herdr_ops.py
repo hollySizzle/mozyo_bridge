@@ -1,10 +1,11 @@
-"""herdr sublane actuation adapter tests (Redmine #13331, option A per-lane workspace).
+"""herdr sublane actuation adapter tests (Redmine #13377 shared project workspace).
 
 Drives :class:`HerdrSublaneActuatorOps` through a stateful fake herdr CLI (0.7.1 shape)
-and a real (temp) workspace registry — no live herdr, no tmux. Covers the per-lane
-workspace stand-up (``append_lane_column`` = ``prepare_session``), the live-inventory
-read-back (``read_lane`` mzb1 decode), the presence-based gateway readiness probe, the
-cross-workspace dispatch argv, and the backend selector.
+and a real (temp) workspace registry — no live herdr, no tmux. Covers the lane-slot
+stand-up inside the shared project workspace (``append_lane_column`` =
+``prepare_session`` with ``lane_id=lane_label``), the live-inventory read-back
+(``read_lane`` mzb1 unit decode), the presence-based gateway readiness probe, the
+explicit-lane dispatch argv, and the backend selector.
 """
 
 from __future__ import annotations
@@ -154,8 +155,8 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 lane_ws = read_anchor(worktree)["workspace_id"]
         self.assertIsNotNone(view)
         self.assertEqual(view.workspace_id, lane_ws)
-        self.assertEqual(view.lane_id, "default")
-        # The requested lane identity is echoed (worktree->workspace is the identity).
+        # The lane label IS the mzb1 lane segment (#13377 shared model).
+        self.assertEqual(view.lane_id, "issue_13331_x")
         self.assertEqual(view.lane_label, "issue_13331_x")
         self.assertEqual(view.issue, "13331")
         self.assertEqual(view.repo_root, str(worktree))
@@ -189,9 +190,13 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertNotIn("--permission-mode", by_provider["codex"])
 
     def test_append_upserts_lane_metadata_record(self) -> None:
-        # Redmine #13356 j#73386 Q2: the create command boundary records the
-        # token↔(lane_label / issue / branch / worktree) display join.
+        # Redmine #13356 j#73386 Q2 / #13377: the create command boundary records the
+        # display join keyed on the worktree's stable path token, carrying the lane
+        # unit fields (`repo_workspace_id`, `lane_id`) the shared-model reads join on.
         from mozyo_bridge.core.state.lane_metadata import load_lane_records
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
 
         herdr = _StatefulHerdr()
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,11 +206,12 @@ class HerdrSublaneOpsTest(unittest.TestCase):
             worktree.mkdir()
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 ops.append_lane_column(str(worktree))
-                lane_ws = read_anchor(worktree)["workspace_id"]
                 records = load_lane_records(home=home)
-        self.assertIn(lane_ws, records)
-        record = records[lane_ws]
+            token = derive_lane_workspace_token(str(worktree.resolve()))
+        self.assertIn(token, records)
+        record = records[token]
         self.assertEqual(record.lane_label, "issue_13331_x")
+        self.assertEqual(record.lane_id, "issue_13331_x")
         self.assertEqual(record.issue_id, "13331")
         self.assertEqual(record.branch, "issue_13331_x")
         self.assertEqual(record.worktree_path, str(worktree))
@@ -338,8 +344,10 @@ class HerdrSublaneOpsTest(unittest.TestCase):
             target_repo="/path/to/lane-wt",
         )
         self.assertEqual(argv[:2], ["handoff", "send"])
-        # cross-workspace: the lane worktree is named explicitly (its anchor workspace is
-        # where the #13331 route authority resolves the gateway).
+        # #13377: the lane slot is named EXPLICITLY (--target-lane); --target-repo stays
+        # the repo/cwd gate, never the workspace selector (j#73613).
+        self.assertIn("--target-lane", argv)
+        self.assertEqual(argv[argv.index("--target-lane") + 1], "issue_13331_x")
         self.assertIn("--target-repo", argv)
         self.assertEqual(argv[argv.index("--target-repo") + 1], "/path/to/lane-wt")
         # the herdr locator target is NOT a %pane -> rides the herdr rail (#13320).
@@ -411,34 +419,41 @@ class BackendSelectorTest(unittest.TestCase):
 
 
 class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):
-    """Redmine #13331 (design j#73357): the `sublane create --execute` defect scenario —
-    a REAL linked git worktree. append_lane_column (prepare_session) mints the lane agents
-    under the path-derived token, and read_lane resolves them by the SAME token (not the
-    empty / inherited-main registry id that made j#73348 crash). Scratch standalone dirs
-    (the other tests) do not reproduce this."""
+    """Redmine #13377 (design j#73613): the `sublane create --execute` shape on a REAL
+    linked git worktree. append_lane_column (prepare_session with lane_id=lane_label)
+    mints the lane agents as slots of the MAIN checkout's project workspace, and
+    read_lane resolves them by the same `(project workspace, lane_label)` unit. A live
+    legacy lane (pre-#13377 `wt_<hash>` default-lane pair) is still adopted through the
+    compatibility read instead of being double-created. Scratch standalone dirs (the
+    other tests) do not reproduce the inheritance."""
 
     def _git(self, path, *args):
         subprocess.run(
             ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
         )
 
-    def test_append_then_read_lane_on_real_worktree_uses_token(self) -> None:
+    def _repo_pair(self, tmp):
+        main = Path(tmp) / "main"
+        main.mkdir()
+        self._git(main, "init", "-q")
+        self._git(main, "config", "user.email", "t@t")
+        self._git(main, "config", "user.name", "t")
+        (main / "README.md").write_text("x", encoding="utf-8")
+        self._git(main, "add", "-A")
+        self._git(main, "commit", "-qm", "init")
+        wt = Path(tmp) / "lane"
+        self._git(main, "worktree", "add", str(wt), "-b", "issue_13331_x")
+        return main, wt
+
+    def test_append_then_read_lane_on_real_worktree_uses_project_unit(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_lane_workspace_token,
         )
 
         herdr = _StatefulHerdr()
         with tempfile.TemporaryDirectory() as tmp:
-            main = Path(tmp) / "main"
-            main.mkdir()
-            self._git(main, "init", "-q")
-            self._git(main, "config", "user.email", "t@t")
-            self._git(main, "config", "user.name", "t")
-            (main / "README.md").write_text("x", encoding="utf-8")
-            self._git(main, "add", "-A")
-            self._git(main, "commit", "-qm", "init")
-            wt = Path(tmp) / "lane"
-            self._git(main, "worktree", "add", str(wt), "-b", "issue_13331_x")
+            main, wt = self._repo_pair(tmp)
             home = Path(tmp) / "home"
             home.mkdir()
             binpath = _fake_binary(tmp)
@@ -450,15 +465,54 @@ class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):
                 runner=herdr.run,
             )
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
                 self.assertIsNone(ops.read_lane(str(wt)))  # fresh worktree, no agents yet
                 ops.append_lane_column(str(wt))
                 view = ops.read_lane(str(wt))
             token = derive_lane_workspace_token(str(wt.resolve()))
         self.assertIsNotNone(view)
-        self.assertEqual(view.workspace_id, token)
+        self.assertEqual(view.workspace_id, main_ws)
+        self.assertNotEqual(view.workspace_id, token)  # wt_<hash> is legacy-only
+        self.assertEqual(view.lane_id, "issue_13331_x")
         self.assertTrue(view.gateway_pane and view.gateway_pane.startswith("wL:"))
         self.assertTrue(view.worker_pane and view.worker_pane.startswith("wL:"))
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+
+    def test_read_lane_adopts_live_legacy_lane(self) -> None:
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+            encode_assigned_name,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            main, wt = self._repo_pair(tmp)
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = _fake_binary(tmp)
+            token = derive_lane_workspace_token(str(wt.resolve()))
+            # A pre-#13377 lane pair is still live in its own wt_ workspace.
+            herdr.agents = [
+                {"name": encode_assigned_name(token, "codex", ""), "pane_id": "wO:p2"},
+                {"name": encode_assigned_name(token, "claude", ""), "pane_id": "wO:p3"},
+            ]
+            ops = HerdrSublaneActuatorOps(
+                repo_root=main,
+                lane_label="issue_13331_x",
+                issue="13331",
+                env={HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)},
+                runner=herdr.run,
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                view = ops.read_lane(str(wt))
+        self.assertIsNotNone(view)
+        self.assertEqual(view.workspace_id, token)
+        self.assertEqual(view.lane_id, "default")
+        self.assertEqual(view.gateway_pane, "wO:p2")
+        self.assertEqual(view.worker_pane, "wO:p3")
 
 
 class HerdrUseCaseIntegrationTest(unittest.TestCase):

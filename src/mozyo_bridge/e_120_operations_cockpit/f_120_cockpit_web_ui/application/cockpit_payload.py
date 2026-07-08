@@ -434,6 +434,13 @@ def herdr_observed_units(
     )
 
     lane_records = load_lane_records()
+    # Shared project workspace model (Redmine #13377): a lane's live rows carry
+    # `(workspace_id=<project>, lane_id=<lane>)`, so its record joins on that unit;
+    # a legacy pre-#13377 lane still joins on its `wt_<hash>` token (the row's
+    # workspace segment).
+    from mozyo_bridge.core.state.lane_metadata import lane_records_by_unit
+
+    records_by_unit = lane_records_by_unit(lane_records)
     diagnostics: list[str] = []
     by_unit: dict[tuple[str, str], dict] = {}
     order: list[tuple[str, str]] = []
@@ -464,7 +471,11 @@ def herdr_observed_units(
         roles = tuple(
             role for role in (ROLE_CODEX, ROLE_CLAUDE) if role in role_counts
         )
-        record = lane_records.get(workspace_id)
+        # Record join: a shared-model unit (non-default lane) keys on
+        # (workspace_id, lane_id); a legacy per-lane workspace keys on its token.
+        record = records_by_unit.get((workspace_id, lane_id))
+        if record is None:
+            record = lane_records.get(workspace_id)
         lane_label = None
         issue = None
         repo_label = None

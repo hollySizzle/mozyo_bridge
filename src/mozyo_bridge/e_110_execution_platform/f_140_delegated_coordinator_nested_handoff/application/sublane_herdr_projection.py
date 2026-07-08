@@ -1,29 +1,34 @@
-"""herdr sublane read-model projection + backend selection (Redmine #13331).
+"""herdr sublane read-model projection + backend selection (Redmine #13331 / #13377).
 
-Under ``terminal_transport.backend: herdr`` a lane is its own herdr workspace (option A,
-j#73314): its two managed agents are ``mzb1_<lane-ws>_codex_default`` /
-``mzb1_<lane-ws>_claude_default``. This module folds the live ``herdr agent list``
-inventory into the SAME :class:`SublaneLaneView` read model ``sublane list`` renders for
-tmux — one row per lane workspace — so the coordinator can see herdr lanes the same way
-(#13303 cockpit_present fold lesson: a new backend's rows join the existing read model).
+Under ``terminal_transport.backend: herdr`` a lane is a **lane slot unit of the shared
+project workspace** (Redmine #13377 Opt3, design j#73613): its two managed agents are
+``mzb1_<project-ws>_codex_<lane>`` / ``mzb1_<project-ws>_claude_<lane>``. This module
+folds the live ``herdr agent list`` inventory into the SAME :class:`SublaneLaneView`
+read model ``sublane list`` renders for tmux — one row per ``(workspace_id, lane_id)``
+unit — so the coordinator can see herdr lanes the same way (#13303 cockpit_present fold
+lesson: a new backend's rows join the existing read model). The fold rule:
+
+* a **non-default lane** unit is a sublane (any workspace — host-global enumeration);
+* a **default-lane** unit is a coordinator pair (the project's codex auditor + claude
+  coordinator) and is never a sublane row — EXCEPT a legacy pre-#13377 per-lane
+  workspace (a ``wt_<hash>`` token, #13331 j#73314 option A), whose default-lane pair
+  IS a lane and stays visible as a compatibility read until it retires.
 
 Two backend-selection notes keep the tmux path byte-invariant:
 
-* the projection is a **separate** code path chosen by :func:`repo_backend_is_herdr`; the
-  tmux ``project_sublanes`` fold and its ``SublaneLaneView`` payload are untouched, so
-  ``backend: tmux`` output does not change (a lane is default-lane within its own herdr
-  workspace, which the tmux fold would *exclude* — the two "lane" notions do not share a
-  fold);
-* the sender's OWN workspace is excluded: the coordinator / main workspace also carries a
-  codex (auditor) + claude (coordinator) default-lane pair, which is not a sublane.
+* the projection is a **separate** code path chosen by :func:`repo_backend_is_herdr`;
+  the tmux ``project_sublanes`` fold and its ``SublaneLaneView`` payload are untouched,
+  so ``backend: tmux`` output does not change;
+* the excluded workspace (the caller's own) only suppresses its legacy live rows — the
+  default-lane coordinator pair is already excluded structurally by the fold rule.
 
 Stale / retire hints (Redmine #13358): the fold also supplies the herdr analogue of the
 #13086 tmux advisory diagnosis material into the same ``stale_hints`` field — a lost
-gateway / worker slot, a live-but-vanished lane workspace (an active lane metadata record
-with no live managed slot), duplicate lanes carrying one issue id, and a recorded worktree
-that no longer resolves to a live git checkout. Exactly like the tmux hints they are
-retire *decision material* for a human / coordinator: advisory display output only, never
-an auto-retire trigger, and routing / callback target resolution never reads them.
+gateway / worker slot, a live-but-vanished lane (an active lane metadata record with no
+live managed slot), duplicate lanes carrying one issue id, and a recorded worktree that
+no longer resolves to a live git checkout. Exactly like the tmux hints they are retire
+*decision material* for a human / coordinator: advisory display output only, never an
+auto-retire trigger, and routing / callback target resolution never reads them.
 """
 
 from __future__ import annotations
@@ -54,6 +59,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    derive_lane_workspace_token,
+    is_lane_workspace_token,
 )
 
 
@@ -96,17 +103,20 @@ def repo_backend_is_herdr(repo_root: Path) -> bool:
 #: (Redmine #13356 j#73386 fail-open degrade). Advisory display material only.
 LANE_RECORD_MISSING_HINT = "lane_record_missing"
 
-#: The lane workspace has no live ``codex`` gateway slot (dispatch / callback
+#: The lane unit has no live ``codex`` gateway slot (dispatch / callback
 #: rail lost) — the herdr analogue of the tmux ``gateway_pane_missing``.
 GATEWAY_SLOT_MISSING_HINT = "gateway_slot_missing"
-#: The lane workspace has no live ``claude`` worker slot (implementer lost /
+#: The lane unit has no live ``claude`` worker slot (implementer lost /
 #: never adopted) — the herdr analogue of the tmux ``worker_pane_missing``.
 WORKER_SLOT_MISSING_HINT = "worker_slot_missing"
-#: An ACTIVE lane metadata record's workspace has NO live managed slot at all:
-#: the lane vanished (herdr down-scoped / agents closed outside retire) while
-#: the durable display record still says active. Rendered as a detached row so
-#: the loss stays visible instead of silently dropping out of ``sublane list``.
-LANE_WORKSPACE_MISSING_HINT = "lane_workspace_missing"
+#: An ACTIVE lane metadata record's lane unit has NO live managed slot at all:
+#: the lane vanished (agents closed outside retire) while the durable display
+#: record still says active. Rendered as a detached row so the loss stays
+#: visible instead of silently dropping out of ``sublane list``. Renamed from
+#: the pre-#13377 ``lane_workspace_missing``: under the shared project workspace
+#: model (design j#73613) a vanished lane no longer implies a missing herdr
+#: workspace — only its ``(workspace_id, lane_id)`` slots are gone.
+LANE_SLOTS_MISSING_HINT = "lane_slots_missing"
 
 
 def list_herdr_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping[str, object]]:
@@ -176,6 +186,7 @@ class _LaneEntry:
     """One pre-hint lane row of the fold (internal assembly record)."""
 
     workspace_id: str
+    lane_id: str
     gateway: Optional[str]
     worker: Optional[str]
     lane_label: str
@@ -183,7 +194,7 @@ class _LaneEntry:
     branch: Optional[str]
     repo_root: Optional[str]
     identity_hints: tuple[str, ...]
-    workspace_missing: bool
+    slots_missing: bool
     #: The lane's record attributes it to the CALLER's repo (j#73459 finding 1):
     #: only repo-scoped entries participate in duplicate-issue grouping, so a
     #: same-issue lane of a *different* repo never fabricates a duplicate hint.
@@ -200,36 +211,43 @@ def project_herdr_sublanes(
     worktree_resolved: Optional[Callable[[str], Optional[bool]]] = None,
     repo_workspace_id: str = "",
 ) -> tuple[SublaneLaneView, ...]:
-    """Fold the live herdr inventory into one :class:`SublaneLaneView` per lane workspace.
+    """Fold the live herdr inventory into one :class:`SublaneLaneView` per lane unit.
 
-    Decodes each ``agent list`` row's ``mzb1`` name (#13247); a row is a managed lane slot
-    iff it decodes to ``(workspace_id != exclude_workspace_id, default lane, codex|claude)``
-    and carries a live locator. Rows are grouped by workspace; each workspace with at least
-    one managed slot becomes a lane row (a gateway-only / worker-only workspace is a
-    degraded lane, surfaced with its state). Foreign (non-mzb1) rows and the excluded
-    workspace are dropped.
+    Decodes each ``agent list`` row's ``mzb1`` name (#13247); a row is a managed lane
+    slot iff it decodes to a ``codex`` / ``claude`` role with a live locator in a lane
+    unit ``(workspace_id, lane_id)`` that is a sublane (Redmine #13377, design j#73613):
 
-    Lane identity resolution (Redmine #13356 j#73386): ``resolve_lane_record(workspace_id)``
-    — the host-local lane metadata record written at ``sublane create`` — is the primary
-    source of the lane's human identity (``lane_label`` / ``issue`` / ``branch`` /
-    worktree ``repo_root``); it is a **display join, never routing authority**. When no
-    record exists the fold falls back to ``resolve_repo_root(workspace_id)`` (the mozyo
-    registry's canonical path — its basename is the lane label; only resolvable for a
-    registry-id workspace, never for a ``wt_<hash>`` lane token) and finally to the raw
-    workspace id as the label (never guessed), with the
+    - a **non-default lane** of any workspace (the shared-project-workspace lane slots);
+    - a **default-lane** unit ONLY when its workspace is a legacy pre-#13377 per-lane
+      token (``wt_<hash>``, :func:`is_lane_workspace_token`) — the compatibility read. A
+      default-lane pair of a registry workspace is a coordinator pair (the caller's own
+      or another project's), never a sublane row. ``exclude_workspace_id`` additionally
+      suppresses legacy live rows of the caller's own segment.
+
+    Rows are grouped by unit; each unit with at least one managed slot becomes a lane row
+    (a gateway-only / worker-only unit is a degraded lane, surfaced with its state).
+    Foreign (non-mzb1) rows are dropped.
+
+    Lane identity resolution (Redmine #13356 j#73386 / #13377): the host-local lane
+    metadata record written at ``sublane create`` is the primary source of the lane's
+    human identity (``lane_label`` / ``issue`` / ``branch`` / worktree ``repo_root``) —
+    a **display join, never routing authority**. A shared-model unit joins on
+    ``(repo_workspace_id, lane_id)`` (via ``lane_records``); a legacy unit joins on its
+    token (``resolve_lane_record`` / ``lane_records[token]``). When no record exists a
+    legacy unit falls back to ``resolve_repo_root(workspace_id)`` (registry canonical
+    path basename) and finally the raw token; a shared-model unit falls back to its lane
+    id (the lane segment IS the requested lane label at create). Fallbacks carry the
     :data:`LANE_RECORD_MISSING_HINT` stale hint so the degrade stays visible.
-    ``lane_records`` (the full token-keyed record mapping) doubles as the record join
-    source when ``resolve_lane_record`` is not supplied.
 
     Stale / retire hints (Redmine #13358), all advisory-only:
 
     - a lane with only one live managed slot carries :data:`GATEWAY_SLOT_MISSING_HINT` /
       :data:`WORKER_SLOT_MISSING_HINT` for the lost slot;
-    - an ACTIVE record in ``lane_records`` whose workspace has NO live managed slot is
+    - an ACTIVE record in ``lane_records`` whose lane unit has NO live managed slot is
       emitted as an extra detached row (appended after the live lanes, token-sorted)
-      carrying :data:`LANE_WORKSPACE_MISSING_HINT` — a vanished lane stays visible
-      instead of silently dropping out (retired tombstones and the excluded workspace
-      never produce such a row);
+      carrying :data:`LANE_SLOTS_MISSING_HINT` — a vanished lane stays visible instead
+      of silently dropping out (retired tombstones and the excluded workspace never
+      produce such a row);
     - every emitted lane (live or vanished) resolving to the same issue id names each
       peer as ``duplicate_issue_lane:<peer label or token>`` (the shared #13086 token);
     - a lane whose resolved worktree path ``worktree_resolved`` reports as ``False`` (no
@@ -249,8 +267,15 @@ def project_herdr_sublanes(
     """
     if resolve_lane_record is None and lane_records is not None:
         resolve_lane_record = lane_records.get
-    slots: dict[str, dict[str, str]] = {}
-    order: list[str] = []
+    records_by_unit: dict[tuple[str, str], object] = {}
+    if lane_records:
+        for record in lane_records.values():
+            rec_ws = _norm(getattr(record, "repo_workspace_id", ""))
+            rec_lane = _norm(getattr(record, "lane_id", ""))
+            if rec_ws and rec_lane:
+                records_by_unit.setdefault((rec_ws, rec_lane), record)
+    slots: dict[tuple[str, str], dict[str, str]] = {}
+    order: list[tuple[str, str]] = []
     exclude = _norm(exclude_workspace_id)
     repo_scope = _norm(repo_workspace_id)
 
@@ -267,43 +292,64 @@ def project_herdr_sublanes(
         if not decode.ok or decode.identity is None:
             continue
         identity = decode.identity
-        if _norm_lane(identity.lane_id) != DEFAULT_LANE:
-            continue
         if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
             continue
         ws = identity.workspace_id
-        if not ws or ws == exclude:
+        lane = _norm_lane(identity.lane_id)
+        if not ws:
             continue
+        if lane == DEFAULT_LANE:
+            # A default-lane pair is a coordinator pair unless the workspace is a
+            # legacy pre-#13377 per-lane token (compatibility read).
+            if not is_lane_workspace_token(ws) or ws == exclude:
+                continue
         locator = _agent_locator(row)
         if not locator:
             continue
-        if ws not in slots:
-            slots[ws] = {}
-            order.append(ws)
-        slots[ws].setdefault(identity.role, locator)
+        unit = (ws, lane)
+        if unit not in slots:
+            slots[unit] = {}
+            order.append(unit)
+        slots[unit].setdefault(identity.role, locator)
 
     entries: list[_LaneEntry] = []
-    for ws in order:
-        gateway = slots[ws].get(GATEWAY_ROLE)
-        worker = slots[ws].get(WORKER_ROLE)
-        record = resolve_lane_record(ws) if resolve_lane_record is not None else None
+    for unit in order:
+        ws, lane = unit
+        gateway = slots[unit].get(GATEWAY_ROLE)
+        worker = slots[unit].get(WORKER_ROLE)
+        legacy_unit = lane == DEFAULT_LANE
+        if legacy_unit:
+            record = resolve_lane_record(ws) if resolve_lane_record is not None else None
+        else:
+            record = records_by_unit.get(unit)
         if record is not None and getattr(record, "lane_label", ""):
             lane_label = getattr(record, "lane_label")
             issue = getattr(record, "issue_id", "") or parse_issue_from_lane_label(
                 lane_label
             )
             branch = getattr(record, "branch", "") or None
-            repo_root = getattr(record, "worktree_path", "") or resolve_repo_root(ws)
+            repo_root = getattr(record, "worktree_path", "") or (
+                resolve_repo_root(ws) if legacy_unit else None
+            )
             identity_hints: tuple[str, ...] = ()
-        else:
+        elif legacy_unit:
             repo_root = resolve_repo_root(ws)
             lane_label = Path(repo_root).name if repo_root else ws
             issue = parse_issue_from_lane_label(lane_label)
             branch = None
             identity_hints = () if repo_root else (LANE_RECORD_MISSING_HINT,)
+        else:
+            # A record-less shared-model unit: the lane segment is the requested
+            # lane label at create, so it stays the honest display fallback.
+            repo_root = None
+            lane_label = lane
+            issue = parse_issue_from_lane_label(lane_label)
+            branch = None
+            identity_hints = (LANE_RECORD_MISSING_HINT,)
         entries.append(
             _LaneEntry(
                 workspace_id=ws,
+                lane_id=lane,
                 gateway=gateway,
                 worker=worker,
                 lane_label=lane_label,
@@ -311,23 +357,34 @@ def project_herdr_sublanes(
                 branch=branch,
                 repo_root=repo_root,
                 identity_hints=identity_hints,
-                workspace_missing=False,
+                slots_missing=False,
                 repo_scoped=_record_repo_scoped(record),
             )
         )
 
-    # Vanished lane workspaces (#13358): an ACTIVE lane record with no live managed
-    # slot. Only records can reveal these — the live fold above never sees them.
+    # Vanished lanes (#13358): an ACTIVE lane record with no live managed slot in its
+    # lane unit. Only records can reveal these — the live fold above never sees them.
     # Repo-scoped (j#73459 finding 1): a foreign repo's record never becomes a row here.
     if lane_records:
-        live = {_norm(ws) for ws in order}
+        live_units = {(_norm(ws), _norm_lane(lane)) for ws, lane in order}
         for token in sorted(lane_records):
             record = lane_records[token]
             if getattr(record, "retired", False):
                 continue
             if not _record_repo_scoped(record):
                 continue
-            if _norm(token) in live or _norm(token) == exclude:
+            rec_lane = _norm(getattr(record, "lane_id", ""))
+            if rec_lane:
+                # Shared-model record: its live unit is (repo_workspace_id, lane_id).
+                unit_ws = _norm(getattr(record, "repo_workspace_id", ""))
+                unit_lane = rec_lane
+            else:
+                # Legacy record: its live unit is the token's default-lane pair.
+                unit_ws = _norm(token)
+                unit_lane = DEFAULT_LANE
+                if unit_ws == exclude:
+                    continue
+            if (unit_ws, unit_lane) in live_units:
                 continue
             lane_label = getattr(record, "lane_label", "") or token
             issue = getattr(record, "issue_id", "") or parse_issue_from_lane_label(
@@ -335,7 +392,8 @@ def project_herdr_sublanes(
             )
             entries.append(
                 _LaneEntry(
-                    workspace_id=token,
+                    workspace_id=unit_ws or token,
+                    lane_id=unit_lane,
                     gateway=None,
                     worker=None,
                     lane_label=lane_label,
@@ -343,7 +401,7 @@ def project_herdr_sublanes(
                     branch=getattr(record, "branch", "") or None,
                     repo_root=getattr(record, "worktree_path", "") or None,
                     identity_hints=(),
-                    workspace_missing=True,
+                    slots_missing=True,
                     repo_scoped=True,
                 )
             )
@@ -361,8 +419,8 @@ def project_herdr_sublanes(
     views: list[SublaneLaneView] = []
     for idx, entry in enumerate(entries):
         hints: list[str] = []
-        if entry.workspace_missing:
-            hints.append(LANE_WORKSPACE_MISSING_HINT)
+        if entry.slots_missing:
+            hints.append(LANE_SLOTS_MISSING_HINT)
         else:
             if not entry.gateway:
                 hints.append(GATEWAY_SLOT_MISSING_HINT)
@@ -386,7 +444,7 @@ def project_herdr_sublanes(
         views.append(
             SublaneLaneView(
                 workspace_id=entry.workspace_id,
-                lane_id=DEFAULT_LANE,
+                lane_id=entry.lane_id,
                 lane_label=entry.lane_label,
                 issue=entry.issue,
                 branch=entry.branch,
@@ -417,9 +475,10 @@ def herdr_sublane_views(
     )
 
     environ = env if env is not None else os.environ
-    # The coordinator's OWN workspace segment (a lane token if `sublane list` is somehow run
-    # from a lane worktree, else the main registry id) — excluded from the lane projection
-    # (#13331 j#73357: same shared resolver as the mint / send / retire sites).
+    # The caller's OWN workspace segment (the project / main registry id under the #13377
+    # shared model — same shared resolver as the mint / send / retire sites). The fold
+    # already excludes every registry workspace's default-lane coordinator pair
+    # structurally; this value additionally suppresses the caller's own legacy live rows.
     own_ws = herdr_workspace_segment(repo_root)
     try:
         rows = list_herdr_agent_rows(environ)
@@ -481,37 +540,61 @@ def herdr_lane_view_for_worktree(
 
     environ = env if env is not None else os.environ
     try:
-        workspace_id = herdr_workspace_segment(Path(worktree_path))
+        resolved = Path(worktree_path).expanduser().resolve()
+        project_ws = herdr_workspace_segment(resolved)
     except (OSError, ValueError):
         return None
-    if not workspace_id:
-        return None
+    legacy_ws = derive_lane_workspace_token(str(resolved))
+    record = load_lane_records().get(legacy_ws)
     try:
         rows = list_herdr_agent_rows(environ)
     except HerdrSessionStartError:
         return None
+
+    def _unit_slots(want_ws: str, want_lane: str) -> dict[str, str]:
+        unit_slots: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+            if not decode.ok or decode.identity is None:
+                continue
+            identity = decode.identity
+            if identity.workspace_id != want_ws:
+                continue
+            if _norm_lane(identity.lane_id) != want_lane:
+                continue
+            if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
+                continue
+            locator = _agent_locator(row)
+            if locator:
+                unit_slots.setdefault(identity.role, locator)
+        return unit_slots
+
+    # Shared project workspace model (#13377): the lane unit is (project workspace,
+    # recorded lane id). Without a record the shared-model lane id is unknowable from
+    # the path alone, so only the legacy unit below can still resolve (fail-safe).
+    workspace_id = ""
+    lane_id = ""
     slots: dict[str, str] = {}
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decode.ok or decode.identity is None:
-            continue
-        identity = decode.identity
-        if identity.workspace_id != workspace_id:
-            continue
-        if _norm_lane(identity.lane_id) != DEFAULT_LANE:
-            continue
-        if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
-            continue
-        locator = _agent_locator(row)
-        if locator:
-            slots.setdefault(identity.role, locator)
+    record_lane = ""
+    if record is not None:
+        record_lane = _norm(getattr(record, "lane_id", "")) or _norm(
+            getattr(record, "lane_label", "")
+        )
+    if project_ws and record_lane:
+        candidate = _unit_slots(project_ws, _norm_lane(record_lane))
+        if candidate:
+            workspace_id, lane_id, slots = project_ws, _norm_lane(record_lane), candidate
+    if not slots:
+        # Legacy compatibility (pre-#13377): the lane's own `wt_<hash>` workspace.
+        candidate = _unit_slots(legacy_ws, DEFAULT_LANE)
+        if candidate:
+            workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, candidate
     gateway = slots.get(GATEWAY_ROLE)
     worker = slots.get(WORKER_ROLE)
     if not gateway and not worker:
         return None
-    record = load_lane_records().get(workspace_id)
     if record is not None and record.lane_label:
         lane_label = record.lane_label
         issue = record.issue_id or parse_issue_from_lane_label(lane_label)
@@ -524,7 +607,7 @@ def herdr_lane_view_for_worktree(
         hints = (LANE_RECORD_MISSING_HINT,)
     return SublaneLaneView(
         workspace_id=workspace_id,
-        lane_id=DEFAULT_LANE,
+        lane_id=lane_id,
         lane_label=lane_label,
         issue=issue or None,
         branch=branch,
@@ -539,7 +622,7 @@ def herdr_lane_view_for_worktree(
 __all__ = (
     "GATEWAY_SLOT_MISSING_HINT",
     "LANE_RECORD_MISSING_HINT",
-    "LANE_WORKSPACE_MISSING_HINT",
+    "LANE_SLOTS_MISSING_HINT",
     "WORKER_SLOT_MISSING_HINT",
     "herdr_lane_view_for_worktree",
     "herdr_sublane_views",

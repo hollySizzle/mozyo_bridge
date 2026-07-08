@@ -54,6 +54,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    MOZYO_WORKSPACE_ID_ENV,
     resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -147,18 +148,41 @@ def herdr_auto_target_repo(args: argparse.Namespace) -> str:
     return str(repo_root_from_args(args))
 
 
+def _legacy_lane_token(repo_root: Path) -> str:
+    """The pre-#13377 per-lane workspace token for a linked-worktree repo, or ``""``.
+
+    Deterministically re-derived from the worktree's canonical path — the exact value a
+    #13331-model launch injected as ``MOZYO_WORKSPACE_ID`` — so the legacy attestation
+    compat in :func:`resolve_herdr_send_target` matches only the token this checkout
+    could legitimately carry. ``""`` for a main / standalone checkout (no legacy form).
+    """
+    from mozyo_bridge.core.state.workspace_registry import _is_linked_worktree
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        derive_lane_workspace_token,
+    )
+
+    try:
+        resolved = Path(repo_root).expanduser().resolve()
+        if not _is_linked_worktree(resolved):
+            return ""
+        return derive_lane_workspace_token(str(resolved))
+    except (OSError, ValueError):
+        return ""
+
+
 def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
     """The herdr workspace *segment* of an explicit ``--target-repo <path>``, or ``""``.
 
-    Redmine #13331: option A makes a lane its own herdr workspace, so a
-    coordinator→lane-gateway dispatch names the lane worktree with an explicit
-    ``--target-repo <worktree-root>``. The segment is resolved through the SAME shared
-    resolver :func:`~...herdr_session_start.herdr_workspace_segment` used to mint the lane
-    (design j#73357): a linked git worktree → its path-derived lane token (the exact
-    ``workspace`` segment its ``mzb1_<segment>_<role>_default`` agents carry), a standalone
-    checkout → its registry workspace_id. Returns ``""`` for the ``auto`` sentinel, an
-    unset value, or an unresolvable path (so the caller falls back to same-workspace
-    resolution rather than guessing a workspace).
+    Redmine #13377 (shared project workspace): a lane worktree's segment resolves to the
+    MAIN checkout's workspace identity through the SAME shared resolver
+    :func:`~...herdr_session_start.herdr_workspace_segment` used to mint the lane slots
+    — so a coordinator→lane-gateway ``--target-repo <lane-worktree>`` resolves to the
+    sender's OWN workspace and the dispatch flows through the same-workspace,
+    explicit-lane path (``--target-repo`` is a repo/cwd gate, not a workspace selector;
+    j#73613). A genuinely different repo (cross-project send) still resolves to a
+    distinct workspace and takes the cross-workspace branch. Returns ``""`` for the
+    ``auto`` sentinel, an unset value, or an unresolvable path (so the caller falls back
+    to same-workspace resolution rather than guessing a workspace).
     """
     raw = getattr(args, "target_repo", None)
     if not raw or raw == AUTO_TARGET_REPO:
@@ -195,14 +219,23 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
             reason="backend_not_selected",
         )
     repo_root = repo_root_from_args(args)
-    # Redmine #13331 (design j#73357): the sender's own workspace segment. For a lane agent
-    # (gateway / worker) the repo root is a linked git worktree with NO registry anchor, so
-    # cross-check the launch-injected `MOZYO_WORKSPACE_ID` against the shared segment
-    # resolver (a path-derived lane token) instead of the absent anchor — otherwise the lane
-    # agent could never resolve its own identity to send (gateway→worker, callbacks). A
-    # standalone / main checkout resolves to its registry workspace_id, byte-for-byte as
-    # before (the env↔anchor mismatch guard is preserved).
+    # Redmine #13377 (design j#73613): the sender's own workspace segment. A lane agent
+    # (gateway / worker) runs in a linked git worktree, whose segment now resolves to the
+    # MAIN checkout's workspace identity (shared project workspace) — matching the
+    # `MOZYO_WORKSPACE_ID=<project-ws>` its launch injected. A standalone / main checkout
+    # resolves to its registry workspace_id, byte-for-byte as before (the env↔anchor
+    # mismatch guard is preserved).
     anchor_ws = herdr_workspace_segment(repo_root) or None
+    # Legacy lane attestation compatibility (pre-#13377 lanes still live during the
+    # transition): a #13331-model lane agent was launched with
+    # `MOZYO_WORKSPACE_ID=wt_<hash>` (its own per-lane workspace). Accept exactly the
+    # worktree's deterministically re-derived token — never an arbitrary env value — so
+    # a live legacy lane keeps sending (gateway→worker, callbacks) until it retires.
+    env_ws = _norm(os.environ.get(MOZYO_WORKSPACE_ID_ENV))
+    if env_ws and env_ws != (anchor_ws or ""):
+        legacy_token = _legacy_lane_token(repo_root)
+        if legacy_token and env_ws == legacy_token:
+            anchor_ws = legacy_token
 
     sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
     if not sender_res.ok or sender_res.identity is None:
@@ -226,15 +259,15 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
             f"herdr inventory unavailable: {exc}", reason=getattr(exc, "reason", None)
         )
 
-    # Redmine #13331: cross-workspace explicit dispatch. When `--target-repo <path>`
-    # names a worktree whose mozyo workspace id differs from the sender's, the receiver
-    # lives in THAT workspace (a lane's own herdr workspace under option A), which the
-    # sender-scoped route authority below cannot reach. Resolve the receiver's canonical
-    # default-lane slot in the named target workspace instead (still the one
-    # backend-neutral route authority; the live locator stays transient cache). A
-    # `--target-repo` that resolves to the sender's OWN workspace (or `auto` / unset)
-    # falls through to the same-workspace path unchanged, so same-workspace herdr sends
-    # are byte-for-byte as before.
+    # Cross-workspace explicit dispatch (#13331, re-scoped by #13377): under the shared
+    # project workspace model a lane worktree resolves to the sender's OWN workspace, so
+    # a coordinator→lane-gateway dispatch flows through the same-workspace path below
+    # with an explicit `--target-lane` (j#73613). This branch now fires only when
+    # `--target-repo <path>` names a genuinely different repo (a cross-project send):
+    # the receiver's slot is resolved in THAT workspace (still the one backend-neutral
+    # route authority; the live locator stays transient cache). A `--target-repo` that
+    # resolves to the sender's own workspace (or `auto` / unset) falls through to the
+    # same-workspace path unchanged.
     target_workspace_id = _explicit_target_workspace_id(args)
     cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
     if cross_workspace:
@@ -253,7 +286,8 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         # deterministically (explicit > sender same-lane > coordinator default > legacy
         # default) and re-resolves that slot; a slot not live fails closed with the
         # #13302 ledger vocabulary rather than scanning all lanes. `--target-lane`
-        # (absent today) is threaded so a future explicit-lane caller is honoured.
+        # (Redmine #13377) is the explicit-lane field a coordinator→lane-gateway
+        # dispatch passes under the shared project workspace model.
         explicit_lane = getattr(args, "target_lane", None)
         resolution = resolve_herdr_route_target(
             receiver,
