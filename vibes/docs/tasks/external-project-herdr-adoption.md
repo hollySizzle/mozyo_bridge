@@ -19,6 +19,7 @@ mozyo_bridge 以外の project に herdr backend の運用 (coordinator/auditor 
 
    - `<preset>` は project の ticket システムに合わせる (`redmine` / `redmine-governed` / `asana` / `none` 等。一覧は `mozyo-bridge scaffold apply --help`)。
    - 生成される `.mozyo-bridge/scaffold.json` が **mozyo 採用 marker** になる。未採用 directory での bare `mozyo` は fail-closed する (#13379。下記「未採用 directory の挙動」)。
+   - **非 Git directory も Git repository と同格に採用できる** (#13379 j#73703 owner_intent / #11301)。Git 化は前提でない: scaffold marker がそのまま workspace identity root になり (`.git` 不在でも repo 解決が home へ leak しない)、以降の手順は Git / 非 Git で同一。非 Git workspace の lane 運用差分は `vibes/docs/logics/sublane-lifecycle-map.md` を読む (非 Git × herdr の検証は別 US)。
 
 2. **rules install** — preset rules store を配置する:
 
@@ -55,6 +56,7 @@ mozyo_bridge 以外の project に herdr backend の運用 (coordinator/auditor 
 - bare `mozyo` は、解決された repo root に採用 marker (`.mozyo-bridge/config.yaml` / `scaffold.json` / `workspace-anchor.json` / `workspace.json`) が無い場合、**agent session を一切起動せず** scaffold 導線を案内して停止する (exit 2)。導入前の directory で誤って叩いても実 agent は起動しない。
 - **home directory は marker が有っても常に拒否**する。未採用 dir からの repo 解決は home の偶発 marker (`~/.tmux.conf` 等) まで遡りやすく、home 直下への迷子 session 生成 (#13379 j#73667 の観測) を構造的に塞ぐため。
 - 採用 marker は明示的な採用操作 (`scaffold apply` / `workspace register` / config 作成) でのみ生まれる。`.mozyo-bridge/` directory の存在だけでは採用と見なさない (tooling の副生成があり得るため)。
+- 判定は **採用 marker の有無のみ** で行い、**Git repository であるかどうかを条件にしない** (#13379 j#73703 owner_intent)。非 Git の採用済み directory は従来どおり完全に動作する。
 - 明示 subcommand (`mozyo-bridge herdr session-start` / `mozyo layout apply cockpit` 等) はこの gate の対象外。
 
 ## 初回導入 smoke checklist (対象 project での実測)
