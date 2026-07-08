@@ -558,6 +558,29 @@ class CockpitStatusOutcome:
         return format_membership_text(self.report, query_label=self.query_label)
 
 
+def _herdr_query_segment(repo_root: str) -> str:
+    """The herdr workspace segment for the queried repo (fail-safe to ``""``).
+
+    A herdr sublane is its own herdr workspace (option A) whose live membership row
+    is keyed on the worktree's ``wt_<hash>`` segment — NOT the tmux / registry
+    identity ``resolve_canonical_session`` returns (a linked worktree inherits the
+    main checkout's workspace id, #13152; its own lane id is ``lane-<hash>``). So a
+    ``cockpit status`` from a herdr lane worktree must resolve this segment to match
+    its live herdr row, which the tmux-identity match never can (auditor j#73521
+    finding 1). Uses the same shared resolver ``sublane create`` stamped the row
+    with, so the two always agree. Any failure — a non-herdr / unresolvable path —
+    degrades to ``""`` (no herdr match), so a tmux-only query is unaffected.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        herdr_workspace_segment,
+    )
+
+    try:
+        return herdr_workspace_segment(Path(repo_root))
+    except (OSError, ValueError):
+        return ""
+
+
 class CockpitMembershipUseCase:
     """Project the live cockpit into the membership report / list / status views.
 
@@ -709,22 +732,39 @@ class CockpitMembershipUseCase:
         )
         target_lane = normalize_lane(lane.lane_id)
         facts = self._ops.resolve_registry_facts(workspace_id)
+        # A herdr sublane's live row is keyed on the worktree's herdr segment
+        # (wt_<hash>), not the tmux/registry identity resolved above (a linked
+        # worktree inherits the main workspace id + carries a lane-<hash> lane id,
+        # #13152). Resolve that segment so a `cockpit status` from a herdr lane
+        # worktree matches its own live herdr row instead of falling through to an
+        # absent tmux row (auditor j#73521 finding 1). Empty (a tmux-only / non-herdr
+        # / unresolvable query) disables the herdr match, so tmux output is unchanged.
+        herdr_segment = _herdr_query_segment(repo_root)
 
         report = self.collect(session)
         # Dual-backend transition (#13317, auditor j#73083 decision (a)): the same
-        # (workspace_id, lane_id) slot can carry BOTH a tmux rollback-lever Unit and
-        # a live herdr Unit. Keep *every* matching row rather than the historical
-        # first-match, so a live herdr agent is never hidden behind a tmux row and
-        # `status` agrees with `cockpit list` (which already shows both). Each row's
-        # repo root is pinned to the queried checkout so a worktree / lane query
-        # echoes the path the operator asked about, never the registry canonical
-        # main checkout (review j#62643). A tmux-only / herdr-only slot still yields
-        # exactly one row, so that output stays byte-invariant.
+        # slot can carry BOTH a tmux rollback-lever Unit and a live herdr Unit. Keep
+        # *every* matching row rather than the historical first-match, so a live
+        # herdr agent is never hidden behind a tmux row and `status` agrees with
+        # `cockpit list` (which already shows both). A row matches when it is either
+        # the queried tmux identity ((workspace_id, lane_id)) OR the queried herdr
+        # segment (a non-tmux row whose workspace_id is the worktree's herdr token,
+        # #13367). Each row's repo root is pinned to the queried checkout so a
+        # worktree / lane query echoes the path the operator asked about, never the
+        # registry canonical main checkout (review j#62643). A tmux-only / herdr-only
+        # slot still yields exactly one row, so that output stays byte-invariant.
         matches = tuple(
             dataclasses.replace(w, repo_root=queried_root)
             for w in report.workspaces
-            if w.workspace_id == workspace_id
-            and normalize_lane(w.lane_id) == target_lane
+            if (
+                w.workspace_id == workspace_id
+                and normalize_lane(w.lane_id) == target_lane
+            )
+            or (
+                herdr_segment
+                and w.backend != BACKEND_TMUX
+                and w.workspace_id == herdr_segment
+            )
         )
         if not matches:
             label = facts.label if facts.registry_present else canon.name
