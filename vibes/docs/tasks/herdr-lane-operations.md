@@ -14,7 +14,8 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
   - `python3 -c 'import sys; sys.argv=["mozyo-bridge", ...]; from mozyo_bridge.application.cli import main; main()'` の直呼び形式も同等に有効 (旧手順互換)。
 
 - `MOZYO_HERDR_BINARY`: launch 注入済み agent (lane worker / gateway) は不要。手動起動の coordinator 等で未設定なら `MOZYO_HERDR_BINARY=$(command -v herdr)` を inline 付与。
-- lane の identity (**#13377 shared project workspace model**): sublane は **project workspace 1 個の中の lane slot** (`mzb1_<project-ws>_<role>_<lane_label>`)。workspace 数は lane 数に比例しない。linked worktree は main checkout の registry identity を継承する (#13152)。`sublane create` 時の record (component `lane_metadata`) が `(repo_workspace_id, lane_id)` unit と label/issue の display join を担う。
+- lane の identity (**#13377 shared project workspace model**): sublane の slot は `mzb1_<project-ws>_<role>_<lane_label>` で、mzb1 の workspace segment は project identity のまま。linked worktree は main checkout の registry identity を継承する (#13152)。`sublane create` 時の record (component `lane_metadata`) が `(repo_workspace_id, lane_id)` unit と label/issue の display join を担う。
+- lane の**配置** (**#13380 dedicated sublane host workspace**): lane slot は coordinator pair の project workspace ではなく、**専用 sublane host workspace** に着地する。herdr workspace 数は「project 1 + sublane host 1」の定数 (lane 数に比例しない)。host は最初の lane 作成時に on demand で mint され (operator 可読 label `<main-checkout名>_sublanes`、cosmetic のみ)、lane ゼロで herdr が自動 close する (残骸 husk は生じない)。#13380 以前に作成された coordinator workspace 同居 lane は heal では同居のまま (pair 不分裂優先)、retire で自然 drain する。
 - **legacy lane (pre-#13377)**: 旧 model の lane は独自 herdr workspace (`wt_<hash>` segment, default lane) を持つ。読み (list / status / dispatch-worker) と retire は互換対応済み。新規 create は常に shared model。legacy lane への coordinator dispatch は互換対象外 — 生かしたまま運用せず、順次 retire する。
 
 ## lane 作成 (標準形)
@@ -22,9 +23,9 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 1. dispatch decision journal を issue に記録 (durable anchor)。
 2. 単発 create+dispatch (#13378 以降の標準):
    `sublane create --issue <id> --lane-label issue_<id>_<slug> --branch issue_<id>_<slug> --worktree <sibling path> --base-ref origin/main --journal <jid> --upstream-coordinator <coordinator herdr pane> --execute --json`
-   - gateway/worker は project workspace 内に lane slot (`--target-lane` = lane label) として起動する (#13377: per-lane workspace は作られない)。内蔵 dispatch も `--target-lane <label>` の explicit-lane 送達。
+   - gateway/worker は専用 sublane host workspace 内に lane slot (`--target-lane` = lane label) として起動する (#13380。#13377: per-lane workspace は作られない)。内蔵 dispatch も `--target-lane <label>` の explicit-lane 送達 (routing は mzb1 identity 基準で、herdr 配置に依存しない)。
    - 旧標準の `--no-dispatch` 二段運用は「create 内蔵 dispatch が gateway TUI の boot に間に合わず空振りする」実測が理由だった。#13378 で herdr の gateway readiness probe が liveness のみ → **live かつ rendered** (`agent read` で描画内容あり) に強化され、dispatch は boot 完了を bounded wait (`--gateway-ready-timeout`、既定 10 秒) してから送られる。
-   - **self-heal**: dispatch が失敗し read-back で gateway slot の消滅を確認した場合に限り、lane column を 1 回だけ自動 relaunch (`append_lane_column` 再実行 = adopt-or-launch。#13377 では launch 先は project workspace への workspace-wide join なので、生存 slot が無くても project の live agents が pin になる) して dispatch を再試行する。再失敗は fail-closed (`blocked`) で手動介入へ。
+   - **self-heal**: dispatch が失敗し read-back で gateway slot の消滅を確認した場合に限り、lane column を 1 回だけ自動 relaunch (`append_lane_column` 再実行 = adopt-or-launch。#13380 lane-aware join: 生存 slot が pin (pair 不分裂)、両 slot 消滅でも他 lane slots の host に join するか host を再 mint する) して dispatch を再試行する。再失敗は fail-closed (`blocked`) で手動介入へ。
    - outcome の `reason` に `self-healed` が含まれる場合、記録すべき gateway pane id は relaunch 後のもの。
 3. 着弾確認: `dispatch_result=gateway_notified` + delivery record の marker observed / turn-start。marker 未観測なら `herdr agent read <pane>` で実測してから再送判断。以降の worker 駆動は gateway の `sublane dispatch-worker` (#13357)。
 4. fallback (旧二段運用): `--no-dispatch` で create し、boot 待ち後に明示送達も引き続き可:
@@ -46,14 +47,14 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 ## worker の relaunch (stall / 再起動時)
 
 - `herdr session-start --agent codex --agent claude --repo <lane worktree>` — lane segment は lane metadata record から自動復元される (record が無い場合は `--lane <label>` を明示。無指定 + record 無しは fail-closed)。
-- launch 先 workspace は **同 project workspace の live agents に join** する (#13377: adopt slot / coordinator pair / 他 lane slot のいずれでも pin になる)。旧「claude 単独指定は新 workspace に迷子」(#13360 j#73407) は workspace-wide join で構造的に解消したが、両 agent 指定の運用は維持してよい。
+- launch 先 workspace は **lane-aware join** (#13380): 自 lane の生存 slot / adopted slot が最優先で pin (pair 不分裂)、無ければ他 lane slots の sublane host に join (coordinator workspace は除外)、それも無ければ host を再 mint する。旧「claude 単独指定は新 workspace に迷子」(#13360 j#73407) は live-agent join で構造的に解消したが、両 agent 指定の運用は維持してよい。
 - relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧 pane は先に `herdr pane close`。
 - relaunch 後、gateway に worker route の再駆動を指示 (worker の pane id は変わるが解決は assigned name 経由で自動追従)。
 
 ## lane retire (guarded close)
 
 1. lane worktree の dirty を確認・復元: `git -C <worktree> checkout -- .claude/settings.local.json` (agent harness が触る唯一の常連 dirt)。**dirty のままだと retire は `dirty_worktree` で fail-closed する** (正常動作、#13331 j#73339 guard)。
-2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --owner-approved --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13377: project workspace・coordinator pair・他 lane は閉じない。workspace 自動消滅は retire の前提・完了条件ではない)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
+2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --owner-approved --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. worktree / local branch の除去は **統合後** (`git worktree remove` + `git branch -d|-D`)。remote branch は削除しない。
 
 ## 統合 (integration disposition)

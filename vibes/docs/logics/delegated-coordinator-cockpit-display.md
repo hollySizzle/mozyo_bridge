@@ -108,15 +108,24 @@ window を増やさない。
 可視鑑賞ではなく routing / lifecycle / read-model の一貫性である。lane ごとの
 window 分裂は、stale lane を window 数から推測するという運用負荷を生んだ。
 
-**herdr backend での `shared` の実体 (Redmine #13377 / design j#73613)**: tmux の
-「単一 sublane host window」に対応する herdr 語彙は **project workspace 1 個** で
-ある。sublane は per-lane herdr workspace (#13331 の暫定形、legacy) ではなく、
-project workspace 内の lane slot (`mzb1_<project-ws>_<role>_<lane>`) として同居
-し、herdr workspace 数は lane 数に比例しない (owner 裁定: #13377 description /
-#13081)。tmux 側の `(workspace_id, lane_id)` unit 概念がそのまま herdr の route /
-projection identity になるため、`shared` 既定は herdr では表示 policy であると同時
-に配置の実装既定でもある。`separate` opt-in は tmux window 配置の knob であり、
-herdr 側に per-lane workspace を復活させる knob ではない。
+**herdr backend での `shared` の実体 (Redmine #13377 / design j#73613 → #13380)**:
+tmux の「単一 sublane host window」に対応する herdr 語彙は **専用 sublane host
+workspace 1 個** である (#13380、#12391 `shared` の厳密解釈 + owner intent #13377
+j#73654「サブレーン専用ウィンドウ / 親・子・孫 3 ウィンドウ」)。sublane は per-lane
+herdr workspace (#13331 の暫定形、legacy) ではなく、また coordinator pair の project
+workspace への同居 (#13377 統合直後の暫定配置) でもなく、coordinator とは別の単一
+host workspace 内の lane slot (`mzb1_<project-ws>_<role>_<lane>` — identity は
+project workspace segment のまま、#13377 model 不変) として着地し、herdr workspace
+数は「project 1 + sublane host 1」の定数 (lane 数に比例しない。owner 裁定: #13377
+description / #13081)。host は最初の lane 作成時に on demand で mint され (operator
+可読 label 付き、label は join key ではない)、lane ゼロで herdr が自動 close する
+(実測、#13380)。tmux 側の `(workspace_id, lane_id)` unit 概念がそのまま herdr の
+route / projection identity になるため、`shared` 既定は herdr では表示 policy で
+あると同時に配置の実装既定でもある。`separate` opt-in は tmux window 配置の knob
+であり、herdr 側に per-lane workspace を復活させる knob ではない。lane tab 細分化
+(host workspace 内で lane ごとに herdr tab を割る表示、`herdr tab create` +
+`agent start --tab --split`) は #13380 spike で実現可能と実測済みだが、採否は
+display knob (#12391 範疇) として未裁定。
 
 `separate` は **opt-in** として保持する (#12467 表示 + #13015 launcher actuation)。
 delegated coordinator は callback drain / audit 待ちで `callback_due` /

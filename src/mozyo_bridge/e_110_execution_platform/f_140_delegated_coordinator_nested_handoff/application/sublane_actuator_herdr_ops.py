@@ -3,15 +3,17 @@
 The tmux :class:`~...application.sublane_actuator_ops.LiveSublaneActuatorOps` stands a lane
 up as a *cockpit column* (two tmux panes) in the shared tmux server, so a lane is a
 ``(workspace_id, lane_id)`` slice of one workspace. Redmine #13377 (design consultation
-answer j#73613, **Opt3 — shared project workspace**) gives herdr the same shape: the lane
-worktree stays a linked git worktree, but its two managed agents are launched INTO the
-project's single herdr workspace as ``mzb1_<project-ws>_codex_<lane>`` /
-``mzb1_<project-ws>_claude_<lane>`` by the #13330
+answer j#73613, **Opt3 — shared project workspace**) gives herdr the same identity shape:
+the lane worktree stays a linked git worktree and its two managed agents are launched as
+``mzb1_<project-ws>_codex_<lane>`` / ``mzb1_<project-ws>_claude_<lane>`` by the #13330
 :func:`~...terminal_runtime_provider.application.herdr_session_start.prepare_session`
 (join-or-create workspace + ``agent start --workspace --cwd <lane-worktree>`` + root-pane
-reclaim), so the herdr workspace count does not scale with the lane count. This supersedes
-the #13331 j#73314 per-lane ``wt_<hash>`` workspace (option A), which survives read-side
-as legacy compatibility only.
+reclaim). Placement refined by Redmine #13380 (dedicated sublane host workspace): lane
+slots land in a single sublane host workspace separate from the coordinator pair's
+project workspace, so the herdr workspace count is a constant "project 1 + host 1" —
+still never scaling with the lane count. This supersedes the #13331 j#73314 per-lane
+``wt_<hash>`` workspace (option A), which survives read-side as legacy compatibility
+only.
 
 :class:`HerdrSublaneActuatorOps` implements the SAME
 :class:`~...application.sublane_actuator_ops.SublaneActuatorOps` port the tmux adapter
@@ -22,7 +24,7 @@ choreography is unchanged — only the side effects differ:
   and already inside ``worktree-lifecycle-boundary.md``);
 * ``append_lane_column`` — instead of a cockpit append, :func:`prepare_session` on the lane
   worktree with ``lane_id=lane_label``, launching the codex gateway + claude worker as lane
-  slots of the shared project workspace;
+  slots of the project identity, placed in the dedicated sublane host workspace (#13380);
 * ``read_lane`` — resolves the lane from the **live herdr inventory** (``agent list``
   ``mzb1`` decode, #13247) filtered to the lane's unit ``(project workspace, lane_label)``,
   not a tmux pane snapshot; a pre-#13377 lane still resolves through its legacy
@@ -33,8 +35,10 @@ choreography is unchanged — only the side effects differ:
   booted-and-rendered gate as the tmux probe; the send rail's turn-start observation +
   Enter-resend, #13322, stays the landing net);
 * ``dispatch_implementation_request`` — the governed ``handoff send`` to the gateway. The
-  gateway is a lane slot of the SAME project workspace, so the coordinator→gateway leg is
-  a same-workspace, **explicit-lane** send: the dispatch passes ``--target-lane
+  gateway is a lane slot of the SAME *mozyo* workspace identity (its herdr placement —
+  the sublane host workspace, #13380 — is irrelevant to routing, which matches on the
+  mzb1 decode), so the coordinator→gateway leg is an **explicit-lane** send: the
+  dispatch passes ``--target-lane
   <lane_label>`` (the j#73613 explicit lane field — never an all-lane scan) plus
   ``--target-repo <lane-worktree>`` as the repo/cwd gate (a gate, not a workspace
   selector) and a non-``%pane`` herdr target so the send rides the herdr rail (#13320
@@ -154,16 +158,19 @@ class HerdrSublaneActuatorOps:
         return argv
 
     def append_lane_column(self, worktree_path: str) -> None:
-        """Stand the lane's slots up inside the shared project herdr workspace.
+        """Stand the lane's slots up inside the dedicated sublane host workspace.
 
         Delegates to the #13330 :func:`prepare_session` on the LANE worktree with
         ``lane_id=lane_label`` (Redmine #13377 Opt3): the worktree inherits the main
         checkout's workspace identity, so the slots launch as
-        ``mzb1_<project-ws>_<provider>_<lane_label>`` INTO the herdr workspace the
-        project's live agents already occupy (join-or-create — a lane never creates a
-        per-lane workspace). :class:`HerdrSessionStartError` (unconfigured binary, a
-        launch that lands in the wrong workspace, an unusable locator) propagates so the
-        use case fails closed exactly as it does on a cockpit-append failure.
+        ``mzb1_<project-ws>_<provider>_<lane_label>`` INTO the sublane host workspace
+        (Redmine #13380 lane-aware join: the lane's own live slots pin the target
+        first, then the host the other lane slots occupy — never the coordinator
+        pair's project workspace — and a labelled host is minted on demand; a lane
+        never creates a per-lane workspace). :class:`HerdrSessionStartError`
+        (unconfigured binary, a launch that lands in the wrong workspace, an unusable
+        locator) propagates so the use case fails closed exactly as it does on a
+        cockpit-append failure.
         """
         try:
             prepare_session(
@@ -224,11 +231,12 @@ class HerdrSublaneActuatorOps:
         cleanly exits every idle, pre-session codex TUI — #13378 j#73606). The heal is
         simply :meth:`append_lane_column` again: :func:`prepare_session` is
         adopt-or-launch idempotent per slot, so the surviving slot is *adopted* and
-        only the dead slot is relaunched. Under the #13377 shared project workspace
-        model the relaunch target is the PROJECT workspace via the workspace-wide
-        live-agent join — the surviving slot pins it, and even a lane whose BOTH
-        slots died still heals into the workspace the project's other agents occupy
-        (j#73619 alignment: a heal never resurrects a per-lane workspace). Any
+        only the dead slot is relaunched. Under the #13380 lane-aware join the
+        surviving slot pins the relaunch target (a heal never splits the pair —
+        even a legacy lane still cohabiting the coordinator's workspace heals in
+        place), and a lane whose BOTH slots died heals into the sublane host the
+        other lane slots occupy, or re-mints it (j#73619 alignment: a heal never
+        resurrects a per-lane workspace). Any
         :class:`HerdrSessionStartError` propagates as ``RuntimeError`` so the use case
         stays fail-closed. Exposed as an *optional* port capability (the use case
         discovers it via ``getattr``): the tmux adapter deliberately does not provide it

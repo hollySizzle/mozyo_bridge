@@ -47,6 +47,19 @@ live and an empty base pane is only cosmetic). All-adopt and launches into an
 already-existing workspace create no new base pane, so they stay byte-invariant. The
 tmux path (:mod:`mozyo_bridge.application.launch_command`) is untouched.
 
+Placement: dedicated sublane host workspace (Redmine #13380)
+------------------------------------------------------------
+The mzb1 identity model is #13377's (design j#73613): a lane's slots are
+``mzb1_<project-ws>_<role>_<lane>`` and the workspace segment stays the project
+identity. The herdr *placement* however splits (#13380, owner intent #13377
+j#73654 "サブレーン専用ウィンドウ"): the default lane (coordinator pair) lives in
+the project workspace while every lane slot lands in a single dedicated sublane
+host workspace — a constant "project 1 + host 1", never scaling with lanes. The
+join rule lives in :func:`_launch_target_for_lane`; the host is minted on demand
+with an operator-readable label (:func:`_host_workspace_label`, cosmetic only)
+and needs no retire-side disposal: herdr auto-closes a workspace with its last
+pane (live-measured), so a lane-zero host vanishes by itself.
+
 The command is explicit opt-in and is **not** coupled to the ``terminal_transport``
 backend flag: you may prepare herdr identities without selecting the herdr transport,
 and vice versa (documented in ``vibes/docs/specs/herdr-native-identity.md``). In pure
@@ -97,6 +110,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
+    DEFAULT_LANE,
     _agent_locator,
     _norm,
     decode_assigned_name,
@@ -348,48 +362,48 @@ def _workspace_prefix(locator: str) -> str:
     return prefix if valid_target(prefix) else ""
 
 
-def _launch_target_from_adopted(adopted_locators: Sequence[str]) -> str:
-    """The single herdr workspace shared by adopted agents (fail-closed on a split).
-
-    When a run launches some slots while others adopt live agents, the launches must
-    land in the workspace those adopted agents already occupy (so no *new* workspace
-    — hence no empty base pane — is created). Returns that single ``wN`` prefix, or
-    ``""`` when nothing was adopted. Raises :class:`HerdrSessionStartError` when the
-    adopted agents span more than one workspace: refusing to guess which one the
-    launches belong to (Redmine #13330 auditor ruling j#73225 mixed-case gate). With
-    the real 2-provider set (claude + codex) a >1 split is structurally unreachable
-    — one adopt + one launch is always a single prefix — but the guard keeps the
-    decision fail-closed if the provider set ever grows.
-    """
-    prefixes = {p for p in (_workspace_prefix(loc) for loc in adopted_locators) if p}
-    if len(prefixes) > 1:
-        raise HerdrSessionStartError(
-            f"adopted agents span multiple herdr workspaces {sorted(prefixes)!r}; "
-            "refuse to guess which one new launches belong to"
-        )
-    return next(iter(prefixes)) if prefixes else ""
-
-
-def _launch_target_for_workspace(
+def _launch_target_for_lane(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
+    lane_id: str,
     adopted_locators: Sequence[str],
 ) -> str:
-    """The single herdr workspace the mozyo workspace's agents occupy (fail-closed).
+    """The herdr workspace this lane's launches must join (``""`` -> create one).
 
-    Shared project workspace model (Redmine #13377, design j#73613): every slot of
-    one mozyo workspace — the coordinator's default lane AND every sublane's lane
-    slots — shares ONE herdr terminal workspace, so a lane launch must join the
-    workspace the project's live agents already occupy rather than creating a new
-    one (workspace count must not scale with lane count). The join key is the live
-    inventory: any row whose ``mzb1`` name decodes to ``workspace_id`` (any lane)
-    pins the launch target, exactly like an adopted slot does. Returns ``""`` when
-    nothing pins one (a pure cold start — the caller then creates the workspace
-    explicitly). Raises when the pins span more than one herdr workspace: refusing
-    to guess which one new launches belong to (the same fail-closed posture as the
-    adopted-slot gate, extended workspace-wide).
+    Dedicated sublane host workspace model (Redmine #13380, refining the #13377
+    shared project workspace): one mozyo workspace occupies exactly TWO herdr
+    terminal workspaces — the project workspace hosting the coordinator pair
+    (default lane) and a single **sublane host workspace** hosting every lane
+    slot — so the workspace count stays a constant "project 1 + host 1", still
+    never scaling with the lane count. The identity model is unchanged (the mzb1
+    ``workspace`` segment stays the project identity, j#73613); only the herdr
+    placement splits. The target is picked from the live inventory, in order:
+
+    1. the lane's OWN live slots (plus this run's adopted slots — always
+       same-lane) pin the target. A heal never splits a gateway/worker pair
+       across workspaces, even for a lane still cohabiting the coordinator's
+       workspace (pre-#13380 placement, which drains via retire).
+    2. a non-default lane with no own pins joins the workspace the OTHER live
+       lane slots occupy, EXCLUDING any workspace the live default-lane
+       (coordinator) slots occupy. The exclusion is what lands a new lane in
+       the dedicated host instead of the coordinator's window while legacy
+       cohabiting lanes are still alive.
+    3. nothing pins one -> ``""``: the caller creates the workspace explicitly
+       (the project workspace for the default lane, the labelled sublane host
+       for a lane slot). A lane-zero host cannot linger to be rejoined — herdr
+       auto-closes a workspace with its last pane (live-measured, #13380) — so
+       the next lane simply re-mints it on demand.
+
+    The default lane only ever joins its own pins (rule 1): the coordinator
+    pair never lands in the sublane host, mirroring the separation.
+
+    Raises when any pin set spans more than one herdr workspace: refusing to
+    guess which one the launches belong to (the #13330 fail-closed posture).
     """
-    locators = list(adopted_locators)
+    lane = _norm(lane_id) or DEFAULT_LANE
+    own = [loc for loc in adopted_locators if loc]
+    sibling_lanes: list = []
+    coordinator: list = []
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -399,16 +413,57 @@ def _launch_target_for_workspace(
         if decode.identity.workspace_id != workspace_id:
             continue
         locator = _agent_locator(row)
-        if locator:
-            locators.append(locator)
-    prefixes = {p for p in (_workspace_prefix(loc) for loc in locators) if p}
-    if len(prefixes) > 1:
+        if not locator:
+            continue
+        row_lane = decode.identity.lane_id or DEFAULT_LANE
+        if row_lane == lane:
+            own.append(locator)
+        elif row_lane == DEFAULT_LANE:
+            coordinator.append(locator)
+        else:
+            sibling_lanes.append(locator)
+    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
+    if len(own_prefixes) > 1:
         raise HerdrSessionStartError(
-            f"live agents of mozyo workspace {workspace_id!r} span multiple herdr "
-            f"workspaces {sorted(prefixes)!r}; refuse to guess which one new "
-            "launches belong to"
+            f"live slots of lane {lane!r} span multiple herdr workspaces "
+            f"{sorted(own_prefixes)!r}; refuse to guess which one new launches "
+            "belong to"
         )
-    return next(iter(prefixes)) if prefixes else ""
+    if own_prefixes:
+        return next(iter(own_prefixes))
+    if lane == DEFAULT_LANE:
+        return ""
+    coordinator_prefixes = {
+        p for p in (_workspace_prefix(loc) for loc in coordinator) if p
+    }
+    host_prefixes = {
+        p for p in (_workspace_prefix(loc) for loc in sibling_lanes) if p
+    } - coordinator_prefixes
+    if len(host_prefixes) > 1:
+        raise HerdrSessionStartError(
+            f"lane slots of mozyo workspace {workspace_id!r} span multiple herdr "
+            f"workspaces {sorted(host_prefixes)!r} outside the coordinator's; "
+            "refuse to guess which one is the sublane host"
+        )
+    return next(iter(host_prefixes)) if host_prefixes else ""
+
+
+def _host_workspace_label(repo_root: Path) -> str:
+    """Operator-readable label for a minted sublane host workspace (cosmetic only).
+
+    Derived from the MAIN checkout's directory name — the project surface the
+    operator recognises — not the lane worktree's (whose basename carries the
+    lane). Purely observability: every join decision keys on the live mzb1
+    inventory, never on this label (a herdr label is neither unique nor durable
+    identity, and a lane-zero host auto-closes anyway).
+    """
+    try:
+        resolved = Path(repo_root).expanduser().resolve()
+    except OSError:
+        return "sublanes"
+    main_root = _main_worktree_root(resolved)
+    base = (main_root or resolved).name
+    return f"{base}_sublanes" if base else "sublanes"
 
 
 def _lane_id_from_metadata(resolved_root: Path) -> str:
@@ -479,17 +534,24 @@ def _create_workspace(
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
+    label: str = "",
 ) -> tuple[str, str]:
     """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
 
     Making the workspace ourselves (rather than letting the first ``agent start``
     auto-create it) is what turns the empty base pane into a *known* handle we can
     reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
-    operator's focus. Fails closed if the response is unparseable.
+    operator's focus. ``label`` (Redmine #13380) names a minted sublane host
+    workspace for the operator — cosmetic only, never a join key. Fails closed if
+    the response is unparseable.
     """
+    argv = ["workspace", "create", "--cwd", str(repo_root)]
+    if label:
+        argv.extend(["--label", label])
+    argv.append("--no-focus")
     completed = _invoke(
         binary,
-        ["workspace", "create", "--cwd", str(repo_root), "--no-focus"],
+        argv,
         runner,
         timeout,
         env=dict(env),
@@ -669,23 +731,37 @@ def prepare_session(
         else:
             plans.append(_SlotPlan(provider, assigned_name, "launch"))
 
-    # Resolve the launch-target workspace (Redmine #13330 / #13377). Nothing to launch
-    # (all adopt / dry-run) means no workspace create and no reclaim — byte-invariant.
-    # Launches join the herdr workspace the mozyo workspace's live agents already
-    # occupy — an adopted slot, the coordinator pair, or another lane's slots all pin
-    # it (shared project workspace: a lane launch must NOT create a per-lane
-    # workspace). A pure cold start (launches, nothing live for this workspace)
-    # creates the workspace explicitly so its empty root pane is a known handle to
-    # reclaim, not one we scan for.
+    # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
+    # to launch (all adopt / dry-run) means no workspace create and no reclaim —
+    # byte-invariant. Placement is lane-aware (#13380 dedicated sublane host): a
+    # lane's own live/adopted slots pin the target first (a heal never splits a
+    # pair); otherwise a lane slot joins the sublane host workspace the other lane
+    # slots occupy (never the coordinator's), and the default lane joins only its
+    # own pins — one mozyo workspace thus occupies a constant "project 1 + host 1"
+    # herdr workspaces. When nothing pins a target the workspace is created
+    # explicitly (labelled for a lane slot) so its empty root pane is a known
+    # handle to reclaim, not one we scan for.
     launch_plans = [p for p in plans if p.kind == "launch"]
     target_workspace = ""
     if launch_plans:
-        target_workspace = _launch_target_for_workspace(
-            rows, workspace_id, [p.locator for p in plans if p.kind == "adopt"]
+        target_workspace = _launch_target_for_lane(
+            rows,
+            workspace_id,
+            result.lane_id,
+            [p.locator for p in plans if p.kind == "adopt"],
         )
         if not target_workspace:
             target_workspace, base_pane_id = _create_workspace(
-                binary, repo_root, runner, timeout, env
+                binary,
+                repo_root,
+                runner,
+                timeout,
+                env,
+                label=(
+                    _host_workspace_label(resolved_root)
+                    if result.lane_id != DEFAULT_LANE
+                    else ""
+                ),
             )
             result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace

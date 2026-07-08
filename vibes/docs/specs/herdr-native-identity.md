@@ -19,11 +19,15 @@ sender env** に置き換える。
     **linked git worktree (sublane lane checkout) も main checkout の registry identity を
     継承した同じ project workspace_id を使う (Redmine #13377 / design j#73613, shared
     project workspace model)。** lane の識別は `workspace` segment ではなく `lane` segment
-    が担い、lane の slot は project workspace 1 個の中に
-    `mzb1_<project-ws>_<role>_<lane_label>` として同居する (workspace 数は lane 数に比例
-    しない)。判別は git topology (`_is_linked_worktree`) + `_main_worktree_root` 経由の
-    main anchor 読みで行う (#13152 継承)。registry schema は無変更。mint (§5) と全 resolve
-    側 (send / retire / projection) は単一 resolver `herdr_workspace_segment` を共有する。
+    が担い、lane の slot は `mzb1_<project-ws>_<role>_<lane_label>` として project identity
+    を保つ。herdr 上の**配置**は Redmine #13380 (dedicated sublane host workspace) で分離:
+    coordinator pair (default lane) は project workspace に、全 lane slot は単一の **sublane
+    host workspace** に着地し、herdr workspace 数は「project 1 + host 1」の定数 (lane 数に
+    比例しない)。identity model はこの配置分離で変わらない (mzb1 名は workspace segment に
+    project identity を持ち続ける)。判別は git topology (`_is_linked_worktree`) +
+    `_main_worktree_root` 経由の main anchor 読みで行う (#13152 継承)。registry schema は
+    無変更。mint (§5) と全 resolve 側 (send / retire / projection) は単一 resolver
+    `herdr_workspace_segment` を共有する。
     - **legacy (correction history): #13331 j#73357 の per-lane workspace token
       (`derive_lane_workspace_token`, `wt_<hash>`)。** 2026-07-07〜08 の移行期に linked
       worktree lane を独自 herdr workspace として立て、その canonical path hash を
@@ -158,9 +162,16 @@ flow:
    (main 未登録なら fail-closed)。lane segment は明示 `--lane` か、`sublane create` が書いた lane
    metadata record の `lane_id` から復元し、どちらも無ければ fail-closed する (lane worktree から
    project workspace の default slot — coordinator pair — を誤 mint しない)。launch 先 herdr
-   workspace は同 mozyo workspace の live agents (adopt slot / coordinator pair / 他 lane slot) が
-   占める workspace に join し、無ければ workspace create する (per-lane workspace は作らない)。同
-   resolver を send / retire / projection の resolve 側でも使い、mint と resolve を一致させる。
+   workspace は lane-aware join (`_launch_target_for_lane`, Redmine #13380) で決める: (1) 自
+   lane の live slots + 同 run adopted slots が pin する workspace (heal で pair を分裂させない)、
+   (2) 非 default lane は、他 lane slots が占める workspace から live default-lane slots
+   (coordinator pair) の workspace を除外した残り = **sublane host workspace**、(3) どちらも
+   無ければ workspace create する (lane slot は operator 可読 `--label` 付き、cosmetic のみ —
+   join key は常に live mzb1 inventory)。default lane は自 pin のみ join し host へは決して
+   join しない。各段で pin が複数 workspace に split したら fail-closed。lane ゼロの host は
+   herdr が最終 pane close で自動 close する (実測、#13380) ため残骸 husk は構造的に生じず、
+   次の lane が on demand で再 mint する (per-lane workspace は作らない)。同 resolver を
+   send / retire / projection の resolve 側でも使い、mint と resolve を一致させる。
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
 4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
    launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /

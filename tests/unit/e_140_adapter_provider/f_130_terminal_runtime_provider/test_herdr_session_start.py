@@ -550,18 +550,75 @@ class SessionStartTest(unittest.TestCase):
         launch = herdr.start_argvs[0]
         self.assertEqual(launch[launch.index("--workspace") + 1], "w5")
 
-    def test_launch_target_from_adopted_conflicting_prefixes_fail_closed(self) -> None:
-        # Redmine #13330 mixed-case gate: adopted agents spanning >1 herdr workspace
-        # fail closed rather than guessing a launch target. (Structurally unreachable
-        # with the 2-provider set, but the guard stays fail-closed if it grows.)
+    def test_launch_target_for_lane_placement_rules(self) -> None:
+        # Redmine #13380 dedicated sublane host workspace: own pins first, then the
+        # sibling-lane host EXCLUDING the coordinator's workspace, else create ("").
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
-            _launch_target_from_adopted,
+            _launch_target_for_lane,
         )
 
-        self.assertEqual(_launch_target_from_adopted([]), "")
-        self.assertEqual(_launch_target_from_adopted(["w5:pA", "w5:pB"]), "w5")
+        ws = "wsA"
+
+        def row(role, lane, pane):
+            return {"name": encode_assigned_name(ws, role, lane), "pane_id": pane}
+
+        coord = [row("codex", "", "w2:p1"), row("claude", "", "w2:p2")]
+        cohabiting = coord + [row("codex", "lane-a", "w2:p5")]
+        # 1. own slots pin first — a heal keeps a pair together even inside the
+        #    coordinator's workspace (pre-#13380 cohabitation drains via retire).
+        self.assertEqual(_launch_target_for_lane(cohabiting, ws, "lane-a", []), "w2")
+        # 2. a NEW lane sees only cohabiting/legacy lane pins: the coordinator's
+        #    workspace is excluded, so it mints the host ("").
+        self.assertEqual(_launch_target_for_lane(cohabiting, ws, "lane-b", []), "")
+        # 3. sibling lane slots outside the coordinator's workspace pin the host.
+        with_host = coord + [row("codex", "lane-a", "w8:p1")]
+        self.assertEqual(_launch_target_for_lane(with_host, ws, "lane-b", []), "w8")
+        # 4. the default lane joins only its own pins — never the sublane host.
+        self.assertEqual(_launch_target_for_lane(coord, ws, "", []), "w2")
+        self.assertEqual(
+            _launch_target_for_lane([row("codex", "lane-a", "w8:p1")], ws, "", []), ""
+        )
+        # 5. rows of ANOTHER mozyo workspace never pin anything.
+        foreign = [{"name": encode_assigned_name("wsB", "codex", "lane-a"), "pane_id": "w9:p1"}]
+        self.assertEqual(_launch_target_for_lane(foreign, ws, "lane-b", []), "")
+        # 6. fail-closed: lane pins outside the coordinator's span two workspaces.
+        split_host = coord + [
+            row("codex", "lane-a", "w8:p1"),
+            row("codex", "lane-c", "w9:p1"),
+        ]
         with self.assertRaises(HerdrSessionStartError):
-            _launch_target_from_adopted(["w5:pA", "w6:pB"])
+            _launch_target_for_lane(split_host, ws, "lane-b", [])
+        # 7. fail-closed: a lane's OWN slots span two workspaces — including via
+        #    this run's adopted locators (the #13330 j#73225 mixed-case gate,
+        #    subsumed from the retired `_launch_target_from_adopted`).
+        split_own = [row("codex", "lane-a", "w8:p1"), row("claude", "lane-a", "w9:p1")]
+        with self.assertRaises(HerdrSessionStartError):
+            _launch_target_for_lane(split_own, ws, "lane-a", [])
+        with self.assertRaises(HerdrSessionStartError):
+            _launch_target_for_lane([], ws, "lane-a", ["w5:pA", "w6:pB"])
+
+    def test_lane_cold_start_creates_labelled_host_workspace(self) -> None:
+        # Redmine #13380: a lane-slot mint labels the host workspace after the main
+        # checkout (cosmetic, operator-readable — never a join key).
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, anchor, repo = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr
+            )
+        create = herdr.workspace_creates[0]
+        self.assertIn("--label", create)
+        self.assertEqual(create[create.index("--label") + 1], f"{repo.name}_sublanes")
+
+    def test_default_lane_cold_start_creates_unlabelled_project_workspace(self) -> None:
+        # The coordinator pair's project workspace keeps the pre-#13380 argv (no
+        # label) — the default-lane path stays byte-invariant.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, anchor, repo = self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, lane=""
+            )
+        create = herdr.workspace_creates[0]
+        self.assertNotIn("--label", create)
 
     def test_unknown_provider_fails_closed(self) -> None:
         herdr = _Herdr()
@@ -662,10 +719,12 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
     """Redmine #13377 (design j#73613, shared project workspace): on a REAL linked git
     worktree, the lane's mzb1 `workspace` segment is the MAIN checkout's registry
     identity (#13152 inheritance) and the lane segment is the discriminant — the slots
-    are `mzb1_<project-ws>_<role>_<lane_label>` and they join the project's live herdr
-    workspace instead of creating a per-lane one (the #13331 `wt_<hash>` per-lane
-    workspace is legacy). Real git worktrees are used (scratch standalone repos hide
-    the inheritance, the j#73348 lesson)."""
+    are `mzb1_<project-ws>_<role>_<lane_label>` (the #13331 `wt_<hash>` per-lane
+    workspace is legacy). Placement refined by #13380 (dedicated sublane host
+    workspace): lane slots land in a single sublane host workspace separate from the
+    coordinator pair's project workspace — never joining the coordinator's, never one
+    per lane. Real git worktrees are used (scratch standalone repos hide the
+    inheritance, the j#73348 lesson)."""
 
     def _git(self, path, *args):
         subprocess.run(
@@ -702,7 +761,9 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                 register_workspace(main)
                 main_ws = read_anchor(main)["workspace_id"]
                 # The project's coordinator pair is live in herdr workspace w7: the
-                # lane launch must JOIN it (no `workspace create`, no per-lane ws).
+                # lane launch must NOT join it (Redmine #13380 dedicated sublane
+                # host) — with no live lane slots it mints the labelled host
+                # workspace instead.
                 herdr = _Herdr(
                     existing_rows=[
                         {
@@ -710,7 +771,7 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                             "pane_id": "w7:p2",
                         }
                     ],
-                    start_locator="w7:p9",
+                    created_workspace="wH",
                 )
                 result = prepare_session(
                     repo_root=wt,
@@ -733,11 +794,62 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(
             names["claude"], encode_assigned_name(main_ws, "claude", "issue_13377_x")
         )
-        # Joined the live project workspace: no workspace create, launches pinned to w7.
-        self.assertEqual(herdr.workspace_creates, [])
+        # Minted the dedicated sublane host (labelled after the MAIN checkout) and
+        # pinned every launch into it — never the coordinator's w7.
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        create = herdr.workspace_creates[0]
+        self.assertIn("--label", create)
+        self.assertEqual(create[create.index("--label") + 1], "main_sublanes")
         for argv in herdr.start_argvs:
             self.assertIn("--workspace", argv)
-            self.assertEqual(argv[argv.index("--workspace") + 1], "w7")
+            self.assertEqual(argv[argv.index("--workspace") + 1], "wH")
+        self.assertEqual(result.herdr_workspace_id, "wH")
+        # The host's empty root pane was reclaimed (#13330 choreography reused).
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "wH:p1"]])
+
+    def test_prepare_session_linked_worktree_joins_live_host_workspace(self) -> None:
+        """A second lane joins the sublane host the first lane's slots occupy —
+        no new workspace, and never the coordinator's (Redmine #13380)."""
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            self._init_repo(main)
+            wt = Path(tmp) / "lane"
+            self._git(main, "worktree", "add", str(wt), "-b", "issue_13380_b")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = self._binpath(Path(tmp))
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                register_workspace(main)
+                main_ws = read_anchor(main)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(main_ws, "codex", ""),
+                            "pane_id": "w7:p2",
+                        },
+                        {
+                            "name": encode_assigned_name(
+                                main_ws, "codex", "issue_13380_a"
+                            ),
+                            "pane_id": "w8:p3",
+                        },
+                    ],
+                )
+                result = prepare_session(
+                    repo_root=wt,
+                    providers=["codex", "claude"],
+                    lane_id="issue_13380_b",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertEqual(result.herdr_workspace_id, "w8")
+        for argv in herdr.start_argvs:
+            self.assertIn("--workspace", argv)
+            self.assertEqual(argv[argv.index("--workspace") + 1], "w8")
 
     def test_prepare_session_linked_worktree_unregistered_main_fails_closed(self) -> None:
         herdr = _Herdr()

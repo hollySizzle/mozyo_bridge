@@ -6,10 +6,12 @@ The tmux ``sublane retire`` is preflight / runbook only — the destructive half
 answer) authorizes ONE narrow herdr actuation for retire: closing the lane's own
 **managed** agents. Under the #13377 shared project workspace model (design j#73613)
 those are the lane unit's slots — ``mzb1_<project-ws>_codex_<lane>`` /
-``mzb1_<project-ws>_claude_<lane>`` — and retire **never closes the project workspace**:
-the same workspace keeps hosting the default-lane coordinator pair and every other lane,
-so a "workspace disappears on last pane close" assumption no longer holds and is not
-part of the retire contract. A *legacy* pre-#13377 lane (its own ``wt_<hash>`` workspace,
+``mzb1_<project-ws>_claude_<lane>`` — and retire **never closes a workspace itself**:
+the coordinator pair's project workspace is untouched, and the dedicated sublane host
+workspace the lane slots live in (#13380) keeps hosting every other lane. When the LAST
+lane's slots close, herdr auto-closing the now-empty host (live-measured, #13380) is an
+incidental herdr behaviour — harmless, not a retire postcondition; the next lane re-mints
+the host on demand. A *legacy* pre-#13377 lane (its own ``wt_<hash>`` workspace,
 default-lane slots) still closes through the compatibility plan, where the old
 last-pane-close workspace vanish remains an incidental herdr behaviour, not a
 postcondition. Either way the authorization covers **only** the lane's managed gateway /
