@@ -90,6 +90,8 @@ escalation trigger 一覧 (実装者 Claude がユーザー窓口 Codex へ esca
 - Codex は handoff 前に、選定理由、対象 issue、既存 worktree 差分の扱い、Codex の後続 audit 役割を Redmine に記録する。
 - Codex が誤って通常開発 task を直接実装した場合、その実行は task の正規完了に数えない。確認 task 中であれば自律フロー反映確認の成功条件にも数えない。
 - 上記の誤実装が発生した場合、対象 issue を未完了に戻し、誤実装の事実、影響範囲、後続対応(採用・破棄・再実装)の判断を Redmine に correction として記録したうえで、Claude 実装から Codex audit までの flow をやり直す。この correction flow は、検証対象の確認 issue に限らず、すべての通常開発 issue に適用する。
+- `owner_close_approval` journal の記録は coordinator role が行う (standing delegation を含む)。lane gateway が発動条件充足を確認した場合は、close 条件充足の callback を coordinator へ返し、記録自体は coordinator が行う。lane gateway が standing_delegation を直接起票した既往は、条件充足時に限り coordinator の ratification journal で追認できるが、標準経路にしない (owner_intent anchor: #13358 j#73485 運用注記)。
+- herdr backend での lane 実運用手順 (作成 / dispatch / relaunch / retire / 統合 / live smoke) の正本は `vibes/docs/tasks/herdr-lane-operations.md`。本 doc は手順を複製しない。
 
 ## Architecture Boundary For Modularization
 

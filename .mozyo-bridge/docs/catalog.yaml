@@ -106,6 +106,17 @@ documents:
       - skill-workflow-reference
       - logic-skill-distribution
 
+  - id: task-herdr-lane-operations
+    type: task
+    status: active
+    canonical_path: vibes/docs/tasks/herdr-lane-operations.md
+    purpose: herdr backend での sublane 実運用手順書 (lane 作成 / dispatch / relaunch / retire / 統合 / live smoke)。#13331〜#13360 の live 実測で確立した運用の replay 用正本。
+    audit_role: herdr_lane_operations_task
+    related_document_refs:
+      - rule-project-agent-workflow
+      - spec-herdr-native-identity
+      - logic-coordinator-sublane-development-flow
+
   - id: spec-project-map
     type: spec
     status: active
