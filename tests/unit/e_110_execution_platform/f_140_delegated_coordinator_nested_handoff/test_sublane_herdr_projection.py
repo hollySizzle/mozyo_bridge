@@ -216,6 +216,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
     def test_active_record_without_live_slot_is_vanished_workspace_row(self) -> None:
         gone = LaneMetadataRecord(
             lane_workspace_token="wt_gone",
+            repo_workspace_id="wsMain",
             issue_id="303",
             lane_label="issue_303_gone",
             branch="issue_303_gone",
@@ -223,6 +224,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
         )
         live = LaneMetadataRecord(
             lane_workspace_token="wt_live",
+            repo_workspace_id="wsMain",
             issue_id="101",
             lane_label="issue_101_alpha",
         )
@@ -234,6 +236,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
             exclude_workspace_id="wsMain",
             resolve_repo_root=lambda ws: None,
             lane_records={"wt_live": live, "wt_gone": gone},
+            repo_workspace_id="wsMain",
         )
         # The vanished lane is appended after the live lanes as a detached row —
         # visible instead of silently dropping out of `sublane list`.
@@ -250,6 +253,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
     def test_retired_tombstone_never_becomes_vanished_row(self) -> None:
         tombstone = LaneMetadataRecord(
             lane_workspace_token="wt_retired",
+            repo_workspace_id="wsMain",
             issue_id="404",
             lane_label="issue_404_done",
             status=LANE_STATUS_RETIRED,
@@ -260,12 +264,14 @@ class HerdrStaleHintsTest(unittest.TestCase):
             exclude_workspace_id="wsMain",
             resolve_repo_root=lambda ws: None,
             lane_records={"wt_retired": tombstone},
+            repo_workspace_id="wsMain",
         )
         self.assertEqual(views, ())
 
     def test_own_workspace_record_never_becomes_vanished_row(self) -> None:
         own = LaneMetadataRecord(
             lane_workspace_token="wsMain",
+            repo_workspace_id="wsMain",
             lane_label="main",
         )
         views = project_herdr_sublanes(
@@ -273,18 +279,87 @@ class HerdrStaleHintsTest(unittest.TestCase):
             exclude_workspace_id="wsMain",
             resolve_repo_root=lambda ws: None,
             lane_records={"wsMain": own},
+            repo_workspace_id="wsMain",
         )
         self.assertEqual(views, ())
+
+    # -- repo scope (j#73459 finding 1): the record store is host-global ---------
+
+    def test_foreign_repo_record_never_becomes_vanished_row(self) -> None:
+        foreign = LaneMetadataRecord(
+            lane_workspace_token="wt_other",
+            repo_workspace_id="other_repo",
+            issue_id="900",
+            lane_label="issue_900_foreign",
+        )
+        views = project_herdr_sublanes(
+            [],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_other": foreign},
+            repo_workspace_id="wsMain",
+        )
+        self.assertEqual(views, ())
+
+    def test_unscoped_caller_never_emits_vanished_rows(self) -> None:
+        # No caller repo scope (empty) — even a record with an EMPTY
+        # repo_workspace_id never matches: empty never fabricates attribution.
+        unattributed = LaneMetadataRecord(
+            lane_workspace_token="wt_gone",
+            repo_workspace_id="",
+            issue_id="303",
+            lane_label="issue_303_gone",
+        )
+        views = project_herdr_sublanes(
+            [],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_gone": unattributed},
+        )
+        self.assertEqual(views, ())
+
+    def test_foreign_repo_lane_never_raises_duplicate_hint(self) -> None:
+        # A live lane of ANOTHER repo carrying the same issue id must neither
+        # raise nor receive duplicate_issue_lane against this repo's lane.
+        records = {
+            "wt_mine": LaneMetadataRecord(
+                lane_workspace_token="wt_mine",
+                repo_workspace_id="wsMain",
+                issue_id="500",
+                lane_label="issue_500_mine",
+            ),
+            "wt_theirs": LaneMetadataRecord(
+                lane_workspace_token="wt_theirs",
+                repo_workspace_id="other_repo",
+                issue_id="500",
+                lane_label="issue_500_theirs",
+            ),
+        }
+        views = project_herdr_sublanes(
+            [
+                _row("wt_mine", "codex", "", "wL1:p2"),
+                _row("wt_mine", "claude", "", "wL1:p3"),
+                _row("wt_theirs", "codex", "", "wL2:p2"),
+                _row("wt_theirs", "claude", "", "wL2:p3"),
+            ],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            lane_records=records,
+            repo_workspace_id="wsMain",
+        )
+        self.assertEqual([v.stale_hints for v in views], [(), ()])
 
     def test_duplicate_issue_lanes_name_each_peer(self) -> None:
         records = {
             "wt_a": LaneMetadataRecord(
                 lane_workspace_token="wt_a",
+                repo_workspace_id="wsMain",
                 issue_id="500",
                 lane_label="issue_500_first",
             ),
             "wt_b": LaneMetadataRecord(
                 lane_workspace_token="wt_b",
+                repo_workspace_id="wsMain",
                 issue_id="500",
                 lane_label="issue_500_second",
             ),
@@ -299,6 +374,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
             exclude_workspace_id="wsMain",
             resolve_repo_root=lambda ws: None,
             lane_records=records,
+            repo_workspace_id="wsMain",
         )
         self.assertEqual(
             views[0].stale_hints,
@@ -316,11 +392,13 @@ class HerdrStaleHintsTest(unittest.TestCase):
         records = {
             "wt_old": LaneMetadataRecord(
                 lane_workspace_token="wt_old",
+                repo_workspace_id="wsMain",
                 issue_id="600",
                 lane_label="issue_600_lost",
             ),
             "wt_new": LaneMetadataRecord(
                 lane_workspace_token="wt_new",
+                repo_workspace_id="wsMain",
                 issue_id="600",
                 lane_label="issue_600_relaunch",
             ),
@@ -333,6 +411,7 @@ class HerdrStaleHintsTest(unittest.TestCase):
             exclude_workspace_id="wsMain",
             resolve_repo_root=lambda ws: None,
             lane_records=records,
+            repo_workspace_id="wsMain",
         )
         self.assertEqual([v.workspace_id for v in views], ["wt_new", "wt_old"])
         self.assertEqual(

@@ -155,6 +155,10 @@ class _LaneEntry:
     repo_root: Optional[str]
     identity_hints: tuple[str, ...]
     workspace_missing: bool
+    #: The lane's record attributes it to the CALLER's repo (j#73459 finding 1):
+    #: only repo-scoped entries participate in duplicate-issue grouping, so a
+    #: same-issue lane of a *different* repo never fabricates a duplicate hint.
+    repo_scoped: bool
 
 
 def project_herdr_sublanes(
@@ -165,6 +169,7 @@ def project_herdr_sublanes(
     resolve_lane_record: Optional[Callable[[str], Optional[object]]] = None,
     lane_records: Optional[Mapping[str, object]] = None,
     worktree_resolved: Optional[Callable[[str], Optional[bool]]] = None,
+    repo_workspace_id: str = "",
 ) -> tuple[SublaneLaneView, ...]:
     """Fold the live herdr inventory into one :class:`SublaneLaneView` per lane workspace.
 
@@ -202,6 +207,14 @@ def project_herdr_sublanes(
       longer a live git checkout) carries ``worktree_unresolved``; ``None`` / no probe is
       *unknown*, and unknown never fabricates a hint.
 
+    Repo scope (j#73459 finding 1): the lane metadata store is host-global, so vanished
+    rows and duplicate-issue grouping consider ONLY records whose ``repo_workspace_id``
+    equals the caller's ``repo_workspace_id`` (the workspace segment ``sublane create``
+    stamped, resolved by the same shared resolver). An empty caller / record value never
+    matches — a foreign repo's lost lane never leaks a detached row or a duplicate hint
+    into this repo's list (fail-safe: unattributable lanes just carry no such hint).
+    The LIVE row enumeration itself stays host-global per the #13331 contract.
+
     Pure over the injected rows + resolvers (no subprocess / config read); live lanes keep
     deterministic first-seen ordering.
     """
@@ -210,6 +223,14 @@ def project_herdr_sublanes(
     slots: dict[str, dict[str, str]] = {}
     order: list[str] = []
     exclude = _norm(exclude_workspace_id)
+    repo_scope = _norm(repo_workspace_id)
+
+    def _record_repo_scoped(record: object) -> bool:
+        """True iff ``record`` attributes its lane to the caller's repo (never on empty)."""
+        if not repo_scope or record is None:
+            return False
+        return _norm(getattr(record, "repo_workspace_id", "")) == repo_scope
+
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -262,16 +283,20 @@ def project_herdr_sublanes(
                 repo_root=repo_root,
                 identity_hints=identity_hints,
                 workspace_missing=False,
+                repo_scoped=_record_repo_scoped(record),
             )
         )
 
     # Vanished lane workspaces (#13358): an ACTIVE lane record with no live managed
     # slot. Only records can reveal these — the live fold above never sees them.
+    # Repo-scoped (j#73459 finding 1): a foreign repo's record never becomes a row here.
     if lane_records:
         live = {_norm(ws) for ws in order}
         for token in sorted(lane_records):
             record = lane_records[token]
             if getattr(record, "retired", False):
+                continue
+            if not _record_repo_scoped(record):
                 continue
             if _norm(token) in live or _norm(token) == exclude:
                 continue
@@ -290,14 +315,18 @@ def project_herdr_sublanes(
                     repo_root=getattr(record, "worktree_path", "") or None,
                     identity_hints=(),
                     workspace_missing=True,
+                    repo_scoped=True,
                 )
             )
 
     # Duplicate-issue detection needs the whole emitted lane set (live + vanished),
-    # so every duplicate lane can name its peers (mirrors the tmux fold).
+    # so every duplicate lane can name its peers (mirrors the tmux fold). Only
+    # repo-scoped entries participate (j#73459 finding 1): a lane whose record
+    # attributes it to another repo — or whose repo attribution is unknown — never
+    # raises or receives a duplicate hint (unknown never fabricates a hint).
     lanes_by_issue: dict[str, list[int]] = {}
     for idx, entry in enumerate(entries):
-        if entry.issue:
+        if entry.issue and entry.repo_scoped:
             lanes_by_issue.setdefault(entry.issue, []).append(idx)
 
     views: list[SublaneLaneView] = []
@@ -310,13 +339,14 @@ def project_herdr_sublanes(
                 hints.append(GATEWAY_SLOT_MISSING_HINT)
             if not entry.worker:
                 hints.append(WORKER_SLOT_MISSING_HINT)
-        for peer_idx in lanes_by_issue.get(entry.issue or "", ()):
-            if peer_idx == idx:
-                continue
-            peer = entries[peer_idx]
-            hints.append(
-                f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:{peer.lane_label or peer.workspace_id}"
-            )
+        if entry.repo_scoped:
+            for peer_idx in lanes_by_issue.get(entry.issue or "", ()):
+                if peer_idx == idx:
+                    continue
+                peer = entries[peer_idx]
+                hints.append(
+                    f"{STALE_HINT_DUPLICATE_ISSUE_LANE}:{peer.lane_label or peer.workspace_id}"
+                )
         if (
             entry.repo_root
             and worktree_resolved is not None
@@ -378,12 +408,18 @@ def herdr_sublane_views(
     # slot) and the worktree probe supplies the ``worktree_unresolved`` material.
     lane_records = load_lane_records()
 
+    # own_ws doubles as the repo scope key (j#73459 finding 1): `sublane create`
+    # stamps each record's `repo_workspace_id` through the SAME shared resolver
+    # over the creating repo root, so only this repo's records feed the vanished /
+    # duplicate diagnosis. (Run from a lane worktree the segment is a wt_<hash>
+    # token no record carries — the diagnosis then stays quiet, fail-safe.)
     return project_herdr_sublanes(
         rows,
         exclude_workspace_id=own_ws,
         resolve_repo_root=_resolve,
         lane_records=lane_records,
         worktree_resolved=probe_worktree_resolved,
+        repo_workspace_id=own_ws,
     )
 
 
