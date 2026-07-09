@@ -55,6 +55,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     MOZYO_WORKSPACE_ID_ENV,
+    REASON_MISSING_SENDER_ENV,
     resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -239,9 +240,30 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
 
     sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
     if not sender_res.ok or sender_res.identity is None:
+        # Redmine #13397 finding 2 (design consultation answer j#73755, Option B):
+        # a herdr send needs an attested launch-time lane-sender identity
+        # (`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`), which an
+        # env-less operator terminal does not carry. That terminal is NOT a sanctioned
+        # lane-dispatch origin (admitting it would bypass the workspace/lane scope +
+        # coordinator-binding attestation this rail exists to enforce). The historical
+        # message read as a tmux-era `target_unavailable`; name the herdr-native cause
+        # and point to the one sanctioned route so an operator is not left guessing.
+        route_hint = (
+            " Dispatch lanes through the coordinator agent (coordinator -> "
+            "target-lane Codex gateway -> same-lane Claude worker), or run this send "
+            "from an attested lane agent pane. An env-less operator shell is not a "
+            "lane-dispatch origin; see vibes/docs/specs/herdr-native-identity.md."
+        )
+        if sender_res.reason == REASON_MISSING_SENDER_ENV:
+            raise HerdrSendEntryError(
+                "herdr backend selected but this shell carries no attested lane-sender "
+                f"identity ({MOZYO_WORKSPACE_ID_ENV} / MOZYO_AGENT_ROLE unset): "
+                f"{sender_res.detail}." + route_hint,
+                reason=sender_res.reason,
+            )
         raise HerdrSendEntryError(
             "herdr backend selected but the sender identity is not attested "
-            f"(reason={sender_res.reason}): {sender_res.detail}",
+            f"(reason={sender_res.reason}): {sender_res.detail}." + route_hint,
             reason=sender_res.reason,
         )
     sender = sender_res.identity

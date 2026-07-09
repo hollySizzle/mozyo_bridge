@@ -194,6 +194,14 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             with self.assertRaises(HerdrSendEntryError) as c:
                 self._resolve(ctx, with_sender=False)
             self.assertEqual(c.exception.reason, "missing_sender_env")
+            # Redmine #13397 finding 2 (Option B, j#73755): the message is herdr-native
+            # and names the sanctioned lane-dispatch route instead of the tmux-era
+            # `target_unavailable` wording — an env-less operator shell is refused, not
+            # admitted as a dispatch origin.
+            msg = str(c.exception)
+            self.assertIn("attested lane-sender identity", msg)
+            self.assertIn("coordinator agent", msg)
+            self.assertIn("not a lane-dispatch origin", msg)
 
     def test_no_target_agent_fails_closed(self) -> None:
         # Redmine #13305: no live claude -> the derived slot is unavailable. The

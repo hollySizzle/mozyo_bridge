@@ -65,6 +65,17 @@ resolver はこれを fail-closed に読む。
 - **sender env は target authority ではない。** sender env は (a) coordinator pseudo-target の
   provider 解決の workspace scope、(b) lane context の 2 用途に限る。target の identity は必ず
   live inventory + assigned-name decode で決める (§3)。
+- **env なし operator shell は lane-dispatch origin ではない (#13397 finding 2、design consultation
+  answer j#73755 = Option B)。** MOZYO_* env を持たない素の operator terminal から
+  `handoff send --target-lane` / explicit `--target` を撃つと `resolve_sender_identity` が
+  `missing_sender_env` で fail-closed し、send は拒否される。これは意図された境界であり、operator
+  shell を新 dispatch origin として admit すると workspace/lane scope + coordinator-binding の
+  attestation を迂回する別 route authority を増やすため採らない。正規の lane-dispatch route は
+  **coordinator agent → target-lane Codex gateway → same-lane Claude worker** (skill
+  `references/workflow.md` `## 同一レーン Claude dispatch` / `## Sublane の coordinator callback`)。
+  error 文言はこの herdr-native な原因と正規 route を明示する (tmux 世代の `target_unavailable`
+  文言に留めない)。operator が lane を直接叩く必要がある debug 時は attested lane agent pane から
+  実行する。
 
 ## 3. Target-resolution semantics
 
