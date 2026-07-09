@@ -142,6 +142,15 @@ class HerdrWorkerDispatchOps:
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            # Redmine #13397: pin the inner send's effective-backend resolution to the
+            # SAME repo the outer `sublane dispatch-worker` selected herdr on
+            # (`self.repo_root` — the value `repo_backend_is_herdr` returned True for),
+            # not the driving process's cwd. Without this, an external adopted project
+            # (whose `backend: herdr` selection lives only at the adopted root, not a
+            # committed config every checkout carries) re-derives `backend: tmux` from a
+            # divergent cwd and validates the herdr worker locator (`worker_pane`, a
+            # non-`%pane` handle) as an invalid tmux target — the #13379 j#73722 blocker.
+            repo_root=str(self.repo_root),
         )
         return _worker_dispatcher._drive_worker_send_argv(argv)
 

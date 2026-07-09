@@ -201,12 +201,14 @@ herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv
 - 出力は stdout 上の単一 JSON object。rebind/read 用 transient locator は
   `result.type == "agent_started"` envelope 下の `result.agent.pane_id`
   (`_parse_started_locator`、type 不一致 / pane_id 欠落は fail-closed)。
-- **managed Claude の permission-mode parity (#13360)**: `-- <argv...>` の claude 起動列には
+- **managed Claude の permission-mode parity (#13360 / #13397)**: `-- <argv...>` の claude 起動列には
   #11925 policy (env `MOZYO_CLAUDE_PERMISSION_MODE` override > launch-context default > なし) で
   解決した `--permission-mode <mode>` を付与する。sublane lane 作成 chokepoint は default `auto` を
-  渡し (tmux `cockpit append` parity、lane worker の prompt stall 防止)、session-start / bare `mozyo`
-  経路は default なし (歴史的 bare `claude` 起動を暗黙変更しない。env override は常に有効)。codex には
-  付与しない。invalid mode は launch を fail-closed。
+  渡し (tmux `cockpit append` parity、lane worker の prompt stall 防止)、bare `mozyo` の coordinator
+  pair launch (`herdr_launch_command`、default no-lane session の claude + codex) も同じ default `auto`
+  を渡す (#13397 finding 3 — 外部 project で coordinator Claude が manual mode 起動し headless 運用不能
+  だった非対称を lane worker parity で解消。env override は常に有効)。default `None` を渡す caller は
+  歴史的 flagless bare `claude` 起動のまま。codex には付与しない。invalid mode は launch を fail-closed。
 
 自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
 live smoke は coordinator の post-review step。

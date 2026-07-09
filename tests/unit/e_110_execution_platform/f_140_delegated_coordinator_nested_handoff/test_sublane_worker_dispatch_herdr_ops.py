@@ -187,7 +187,12 @@ class DispatchContainmentTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(len(seen), 1)
         argv = seen[0]
-        self.assertEqual(argv[:2], ["handoff", "send"])
+        # Redmine #13397: the inner send pins the top-level `--repo` to the ops'
+        # own repo_root (the outer-resolved herdr root) so its effective-backend
+        # resolution matches the outer selection instead of the driving cwd. The
+        # `--repo` flag MUST precede the `handoff` subcommand.
+        self.assertEqual(argv[:2], ["--repo", "/wt/13357"])
+        self.assertEqual(argv[2:4], ["handoff", "send"])
         self.assertEqual(argv[argv.index("--to") + 1], "claude")
         self.assertEqual(argv[argv.index("--kind") + 1], "implementation_request")
         # The herdr locator target is NOT a %pane -> rides the herdr rail (#13320),
@@ -310,6 +315,86 @@ class HerdrUseCaseDriveTests(unittest.TestCase):
         self.assertEqual(outcome.dispatch_result, WORKER_DISPATCH_DELIVERY_FAILED)
         self.assertFalse(outcome.worker_dispatch_confirmed)
         self.assertIn("gateway_notified", outcome.reason)
+
+
+class InnerSendBackendPinTests(unittest.TestCase):
+    """Redmine #13397: the composed inner send resolves the herdr backend from the
+    outer-selected repo, not the driving process's cwd.
+
+    The #13379 j#73722 blocker: an external adopted project carries its
+    ``backend: herdr`` selection only at the adopted root (not a committed config
+    every checkout inherits, as ``mozyo_bridge`` does), so a worker-dispatch drive
+    whose cwd resolved elsewhere re-derived ``backend: tmux`` on the inner
+    ``handoff send`` and validated the herdr worker locator as an invalid tmux
+    target. The fix pins the top-level ``--repo`` to the ops' own ``repo_root``. This
+    exercises the *real* send-path backend predicate against the composed argv from a
+    deliberately divergent cwd — hermetic (no live herdr, no tmux).
+    """
+
+    @staticmethod
+    def _herdr_external_project(tmp: str) -> Path:
+        ext = Path(tmp) / "external_project"
+        (ext / ".mozyo-bridge").mkdir(parents=True)
+        (ext / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+        )
+        return ext
+
+    def _effective_backend_from_argv(self, argv: list) -> bool:
+        from mozyo_bridge.application.cli import build_parser, normalize_paths
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+            herdr_effective_backend_selected,
+        )
+
+        ns = normalize_paths(build_parser().parse_args(argv))
+        return herdr_effective_backend_selected(ns)
+
+    def test_pinned_repo_resolves_herdr_from_a_divergent_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ext = self._herdr_external_project(tmp)
+            # A divergent cwd that resolves to its OWN (non-herdr) repo root.
+            other = Path(tmp) / "other_cwd"
+            (other / ".git").mkdir(parents=True)
+
+            seen: list[list] = []
+
+            class FakeParser:
+                def parse_args(self, argv):
+                    seen.append(list(argv))
+                    return Namespace(func=lambda a: 0)
+
+            ops = HerdrWorkerDispatchOps(
+                repo_root=ext, lane_label=LANE_LABEL, issue=ISSUE
+            )
+            out, err = io.StringIO(), io.StringIO()
+            with patch(
+                "mozyo_bridge.application.cli.build_parser", return_value=FakeParser()
+            ), patch(
+                "mozyo_bridge.application.cli.normalize_paths", side_effect=lambda a: a
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                ops.dispatch_to_worker(
+                    issue=ISSUE,
+                    journal="73729",
+                    worker_pane="wS:p3",
+                    lane_label=LANE_LABEL,
+                    gateway_callback_target="wS:p2",
+                    target_repo="auto",
+                )
+            argv = seen[0]
+            # The pinned --repo is the ops' repo_root (the outer-selected herdr root).
+            self.assertEqual(argv[:2], ["--repo", str(ext)])
+
+            # The REAL send-path predicate resolves herdr from that argv even while
+            # cwd is the non-herdr `other` dir (would be False without the pin).
+            old = os.getcwd()
+            try:
+                os.chdir(other)
+                self.assertTrue(self._effective_backend_from_argv(argv))
+                # Guard the harness: the same argv WITHOUT the pin re-derives tmux
+                # from this cwd, proving the pin (not the cwd) carries the selection.
+                self.assertFalse(self._effective_backend_from_argv(argv[2:]))
+            finally:
+                os.chdir(old)
 
 
 if __name__ == "__main__":  # pragma: no cover
