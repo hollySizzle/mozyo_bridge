@@ -159,8 +159,11 @@ fake ドリフト = false confidence を防ぐ **contract テスト** (小さな
     実機 window)。これを acceptance protocol に組み込む (`logic-acceptance-rerun-protocol`
     への追記 pointer)。
   - **herdr version pin と結合**: `herdr --version` を記録し、version が上がったら contract
-    テストを必ず再実行する gate。version 文字列単独を evidence にせず feature probe と
-    併用 (runtime fingerprint 規律、`external-project-herdr-adoption.md` 既述)。
+    テストを必ず再実行する gate (過去 green を流用しない、auditor j#73769 裁定 3)。version
+    文字列単独を evidence にせず feature probe と shape 比較を併用 (runtime fingerprint 規律、
+    `external-project-herdr-adoption.md` 既述)。
+  - **acceptance journal 必須記録** (US B deliverable): `MOZYO_HERDR_BINARY` availability /
+    `herdr --version` / feature probe・shape 比較結果 / contract test command / pass-fail。
   - contract テストが赤 = fake が実仕様から乖離した signal。scenario の green は
     contract green を前提としてのみ意味を持つ (green の依存順序を doc で固定)。
 
@@ -291,17 +294,22 @@ auditor と粒度合意してから起票する。
 | US | 粒度 | deliverable | 依存 |
 |---|---|---|---|
 | **A: 共有 fake herdr (stateful)** | `tests/support/herdr_fake.py` の in-memory state machine (§1.1 A〜F)、未知 argv は fail-closed、時間なし | fake + fake 自身の unit テスト (fake の state 遷移を直接検証) | なし (先行) |
-| **B: fake→実バイナリ contract テスト** | §2.2。`@skipUnless(MOZYO_HERDR_BINARY)`、shape 比較、acceptance protocol 追記、version-pin gate | contract テスト + `logic-acceptance-rerun-protocol` への cadence 追記 | A |
+| **B: fake→実バイナリ contract テスト** | §2.2。`@skipUnless(MOZYO_HERDR_BINARY)`、shape 比較、version-pin gate。**contract テストは US B の必須 deliverable** (auditor j#73769 裁定 3) | contract テスト + `logic-acceptance-rerun-protocol` への cadence 追記 + **acceptance journal 記録項目** (`MOZYO_HERDR_BINARY` availability / `herdr --version` / feature probe・shape 比較結果 / contract test command / pass-fail) | A |
 | **C: scenario harness + routing grid** | §3。`tests/scenarios/test_herdr_lane_choreography.py` (仮)、parametrization grid (backend × topology × root-inference)、各 hop の routing assert | harness + **finding 1 再現 scenario (§4.1, red→#13397 で green)** | A |
 | **D: 今日バグ回帰の grid 組込み** | §4.2/4.3 を C の grid のセルとして追加 | 回帰 scenario 群 | C |
-| **E: 既存 inline fake の収斂移行** | 57 分散 stub を A の共有 fake へ段階移行。byte-invariant を保ちつつ重複削減。module-health / baseline 規律遵守 | 移行 PR 群 (機械的、粒度小) | A, C |
+| **E: 既存 inline fake の収斂移行** | 57 分散 stub を A の共有 fake へ段階移行。**1 module / small batch 単位で既存 assertion・expected behavior を変えず** byte-invariant を保つ (auditor j#73769 裁定 2)。module-health / baseline 規律遵守 | 移行 PR 群 (機械的、粒度小) | A, C |
 
-- **順序**: A → (B, C 並行) → D → E。C の finding 1 scenario は #13397 と情報共有し、
-  #13397 の fix を acceptance にできる (段階指示 4)。
-- **A/C を最小 MVP に**: 最初は finding 1 の 1 セルが red→green するところまでを A+C の
-  acceptance にし、grid 全 topology は D で広げる (大投資を段階化)。
-- **E は独立に価値**: 共有 fake 収斂は drift 源 (§1.2) を構造的に減らすので、A 完了後に
-  背景で進められる。ただし byte-invariant 移行なので focused + full suite 規律必須。
+- **順序** (auditor j#73769 裁定 2): **A(stateful fake) → C(finding 1 scenario) を先に通す**。
+  B は A 後に C と並行、D は C 後、**E は MVP blocker にせず D 以降または並行の小粒度移行**。
+  C の finding 1 scenario は #13397 と情報共有し、#13397 の fix を acceptance にできる (段階指示 4)。
+- **A/C を最小 MVP に** (auditor j#73769 裁定 4): 最初は finding 1 の 1 セル
+  (`herdr × 外部 project(config-only) × child cwd`) が red→green するところまでを A+C の
+  acceptance にする。**MVP acceptance は predicate-level assert (`herdr_effective_backend_selected`)
+  と end-to-end worker-dispatch composition assert の両方**を置き、red/green の説明を #13397 fix
+  (nested send の `--repo` pin) と接続する。grid 全 topology は D で広げる (大投資を段階化)。
+- **E は独立に価値だが MVP を止めない**: 共有 fake 収斂は drift 源 (§1.2) を構造的に減らすので、
+  A 完了後に背景で進められる。byte-invariant 移行なので focused + 必要に応じて full
+  `python -m unittest discover -s tests -v` 規律必須。
 
 ---
 
@@ -326,6 +334,22 @@ auditor と粒度合意してから起票する。
    pin gate の実装場所 (`acceptance-rerun-protocol` 追記で十分か)。
 4. **grid の初期網羅範囲**: MVP を finding 1 の 1 セルに絞る案で妥当か、最初から全 topology を
    要求するか。
+
+## 8. Design consultation 裁定 (auditor = codex, #13398 j#73769)
+
+**approve with conditions** (実装 US 起票へ進めてよい)。§7 の 4 事項への裁定を本 doc に折り込む:
+
+1. **fake boundary**: 最外 subprocess `Runner` 境界を **主境界に採用**。欠陥の実経路
+   (`repo_root_from_args`→config→`herdr_effective_backend_selected`→rail) を再 bypass しない
+   ため。内側 port fake は補助 unit test では可だが、scenario harness の acceptance は実
+   composition seam を通すこと (§3.4 / §5-C に反映)。
+2. **US E 収斂**: 必要だが **MVP blocker にしない**。A→C を先に通し E は D 以降/並行の小粒度移行
+   (1 module / small batch、既存 assertion・behavior 不変)。§5 順序に反映。
+3. **contract cadence**: post-review 実機 acceptance に組込み、**US B の必須 deliverable**。
+   acceptance journal に binary availability / version / probe・shape 結果 / command / pass-fail
+   を残す。version-pin gate は過去 green を流用せず再取得 (§2.2 / §5-B に反映)。
+4. **grid MVP**: finding 1 の 1 セルに絞る案で妥当。MVP は predicate-level と e2e composition の
+   **両 assert**を置き #13397 fix と接続 (§5 MVP に反映)。#13377 j#73640 / #13379 j#73711 は US D。
 
 ## 参照
 
