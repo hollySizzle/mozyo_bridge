@@ -44,15 +44,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
+    decide_create_launch,
+    default_nongit_worktree_request,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
-    LaunchPreflight,
     RetirePreflight,
     SublaneIntegrationPolicy,
     decide_retire_integration,
-    decide_worktree_launch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
@@ -90,6 +92,15 @@ class SublaneLifecycleOps(Protocol):
     probe cannot answer — unknown never fabricates a hint). There is intentionally no
     create / remove / merge / pane-kill method — the actuating half of the lifecycle
     is gated (worktree-lifecycle-boundary.md).
+
+    Optional capability (Redmine #13432, mirroring the #13392 actuator port): an adapter
+    MAY additionally provide ``canonical_workspace_root() -> str`` — the workspace root the
+    command runs in. :class:`SublaneCreateUseCase` reads it (via ``getattr`` through the
+    shared :func:`resolve_lane_runtime_root`) to default a non-git lane's omitted
+    ``--worktree`` to the workspace root (the lane runtime root a directory-scaffold lane
+    collapses to). Discovered via ``getattr`` and deliberately NOT part of this protocol so
+    existing adapters / test fakes that only drive the Git path stay conformant (they fall
+    back to leaving the omitted worktree blank, which a non-git plan does not require).
     """
 
     def pane_rows(self) -> list[dict[str, str]]: ...
@@ -115,6 +126,12 @@ class LiveSublaneLifecycleOps:
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
+
+    def canonical_workspace_root(self) -> str:
+        # #13432 (mirrors the #13392 actuator adapter): the workspace root the command runs
+        # in — the lane runtime root of a non-git (skip_no_git) lane, which has no worktree
+        # and runs here, so an omitted `--worktree` defaults to it.
+        return str(self.repo_root)
 
     def pane_rows(self) -> list[dict[str, str]]:
         # Imported lazily so the pure use cases / tests never require the tmux
@@ -316,29 +333,16 @@ class SublaneCreateUseCase:
     policy: SublaneIntegrationPolicy = SublaneIntegrationPolicy.default()
 
     def run(self, request: SublaneCreateRequest) -> SublaneCreateOutcome:
-        # A missing identity field short-circuits before any git probe (fail-closed).
-        if request.missing_fields():
-            plan = plan_sublane_create(
-                request,
-                decide_worktree_launch(
-                    self.policy, LaunchPreflight(is_git_workspace=False)
-                ),
-            )
-            return SublaneCreateOutcome(plan=plan)
+        # #13432: in a non-git (directory-scaffold) workspace the lane has no worktree
+        # (LAUNCH_SKIP_NO_GIT) — `--branch` / `--worktree` are optional there — and an
+        # omitted `--worktree` defaults to the workspace root (the #13392 論点1 lane runtime
+        # root), so the plan / dispatch carry the root the lane actually runs in. A Git
+        # workspace keeps the full identity requirement, so a missing field still fails
+        # closed in plan_sublane_create (byte-invariant contract). The shared
+        # decide_create_launch re-probes git for the launch action.
         is_git = self.ops.is_git_workspace()
-        identity_known = bool(request.branch) and bool(request.worktree_path)
-        worktree_exists = (
-            self.ops.worktree_exists(request.branch)
-            if is_git and identity_known
-            else False
-        )
-        preflight = LaunchPreflight(
-            is_git_workspace=is_git,
-            worktree_exists=worktree_exists,
-            branch_resolved=bool(request.branch),
-            target_identity_known=identity_known,
-        )
-        decision = decide_worktree_launch(self.policy, preflight)
+        request = default_nongit_worktree_request(self.ops, request, is_git)
+        decision = decide_create_launch(self.ops, request, self.policy)
         return SublaneCreateOutcome(plan=plan_sublane_create(request, decision))
 
 

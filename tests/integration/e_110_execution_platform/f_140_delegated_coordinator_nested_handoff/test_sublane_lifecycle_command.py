@@ -60,6 +60,7 @@ class FakeOps:
         dirty=False,
         branches=None,
         integrated=None,
+        workspace_root=None,
     ):
         self._rows = rows or []
         self._git = git
@@ -68,8 +69,14 @@ class FakeOps:
         self._branches = branches or {}
         # (branch, integration_branch) -> Optional[bool] ancestry answers (#13086).
         self._integrated = integrated or {}
+        # #13432 optional capability: the workspace root a non-git omitted --worktree
+        # defaults to. When None the fake omits the capability entirely (older-adapter
+        # parity — the getattr discovery falls back to leaving the worktree blank).
+        self._workspace_root = workspace_root
         self.branch_calls = []
         self.integrated_calls = []
+        if workspace_root is not None:
+            self.canonical_workspace_root = lambda: workspace_root
 
     def pane_rows(self):
         return list(self._rows)
@@ -212,10 +219,32 @@ class CreateUseCaseTests(unittest.TestCase):
         self.assertEqual(outcome.plan.launch_action, "skip_no_git")
         self.assertEqual(outcome.plan.status, CREATE_PLANNED)
 
-    def test_missing_field_short_circuits_before_probe(self):
+    def test_git_missing_field_fails_closed(self):
+        # #13432: a Git workspace keeps the full identity requirement, so a missing
+        # worktree still fails closed (the probe order changed, the contract did not).
         ops = FakeOps(git=True)
         outcome = SublaneCreateUseCase(ops).run(_req(worktree_path=""))
         self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:worktree_path", outcome.plan.blocked_reasons)
+
+    def test_non_git_omitted_branch_and_worktree_plans(self):
+        # #13432: --branch/--worktree are optional in a non-git workspace; the plan still
+        # resolves (skip_no_git) with the lane / dispatch steps present.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        outcome = SublaneCreateUseCase(ops).run(_req(branch="", worktree_path=""))
+        self.assertEqual(outcome.plan.status, CREATE_PLANNED)
+        self.assertEqual(outcome.plan.launch_action, "skip_no_git")
+        self.assertEqual(len(outcome.plan.steps), 4)
+
+    def test_non_git_missing_lane_identity_still_fails_closed(self):
+        # #13432: only the Git worktree identity relaxes; issue / lane_label are required
+        # in every workspace.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        outcome = SublaneCreateUseCase(ops).run(
+            _req(lane_label="", branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:lane_label", outcome.plan.blocked_reasons)
 
 
 class RetireUseCaseTests(unittest.TestCase):

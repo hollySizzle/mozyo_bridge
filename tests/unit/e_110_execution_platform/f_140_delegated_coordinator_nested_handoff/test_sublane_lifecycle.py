@@ -362,6 +362,31 @@ def _req(**kw):
     return SublaneCreateRequest(**base)
 
 
+class MissingFieldsTests(unittest.TestCase):
+    """#13432: the is_git-conditional identity requirement on the request."""
+
+    def test_git_requires_all_four(self):
+        # Default (is_git=True) keeps the historical full requirement byte-invariant.
+        self.assertEqual(_req().missing_fields(), ())
+        self.assertEqual(
+            _req(branch="", worktree_path="").missing_fields(),
+            ("branch", "worktree_path"),
+        )
+
+    def test_non_git_makes_branch_and_worktree_optional(self):
+        self.assertEqual(
+            _req(branch="", worktree_path="").missing_fields(is_git=False), ()
+        )
+
+    def test_non_git_still_requires_issue_and_lane_label(self):
+        self.assertEqual(
+            _req(issue="", lane_label="", branch="", worktree_path="").missing_fields(
+                is_git=False
+            ),
+            ("issue", "lane_label"),
+        )
+
+
 class PlanCreateTests(unittest.TestCase):
     def _launch(self, action):
         return WorktreeLaunchDecision(action=action, reason="r")
@@ -406,6 +431,36 @@ class PlanCreateTests(unittest.TestCase):
         self.assertEqual(plan.status, CREATE_BLOCKED)
         self.assertEqual(plan.steps, ())
         self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
+
+    def test_non_git_optional_branch_and_worktree_plans(self):
+        # #13432: on the non-git (LAUNCH_SKIP_NO_GIT) path --branch/--worktree are optional,
+        # so a request with both blank still plans the lane / dispatch steps.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""), self._launch(LAUNCH_SKIP_NO_GIT)
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+        self.assertEqual(plan.steps[0].title, "skip worktree")
+        self.assertEqual(len(plan.steps), 4)
+
+    def test_non_git_still_requires_lane_identity(self):
+        # #13432: only the Git worktree identity relaxes; issue / lane_label always required.
+        plan = plan_sublane_create(
+            _req(issue="", branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_NO_GIT),
+        )
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:issue", plan.blocked_reasons)
+
+    def test_non_git_relaxation_does_not_leak_to_git_reuse_or_create(self):
+        # #13432 byte-invariance: a blank worktree on any Git launch action still fails
+        # closed (only LAUNCH_SKIP_NO_GIT relaxes the requirement).
+        for action in (LAUNCH_CREATE_WORKTREE, LAUNCH_REUSE_WORKTREE):
+            plan = plan_sublane_create(
+                _req(branch="", worktree_path=""), self._launch(action)
+            )
+            self.assertEqual(plan.status, CREATE_BLOCKED)
+            self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
+            self.assertIn("missing_field:branch", plan.blocked_reasons)
 
     def test_blocked_launch_fails_closed(self):
         plan = plan_sublane_create(_req(), self._launch(LAUNCH_BLOCKED))

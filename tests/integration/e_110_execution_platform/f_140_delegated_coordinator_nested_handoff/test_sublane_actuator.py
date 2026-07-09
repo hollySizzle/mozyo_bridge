@@ -224,12 +224,47 @@ class DryRunTests(unittest.TestCase):
 
 
 class MissingIdentityTests(unittest.TestCase):
-    def test_missing_field_blocks_before_probe(self):
+    def test_git_missing_field_fails_closed(self):
+        # #13432: a blank field triggers one git probe (to decide non-git optionality);
+        # in a Git workspace the identity requirement is unchanged, so a missing worktree
+        # still fails closed with `missing_field:worktree_path`. Only the read probe ran —
+        # no worktree/pane/dispatch mutation.
         ops = FakeActuatorOps(git=True)
         outcome = SublaneActuateUseCase(ops).run(_req(worktree_path=""), execute=True)
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
-        self.assertEqual(ops.calls, [])  # short-circuit before any probe
+        self.assertIn("missing_field:worktree_path", outcome.blocked_reasons)
+        self.assertEqual(ops.calls, ["is_git"])  # probe only; no mutation
+
+    def test_non_git_omitted_branch_and_worktree_actuates(self):
+        # #13432: in a non-git workspace --branch/--worktree are optional; the lane has no
+        # worktree (skip_no_git) and the omitted --worktree defaults to the workspace root,
+        # so the create actuates end-to-end without operator-supplied worktree identity.
+        ops = FakeActuatorOps(
+            git=False, workspace_root="/ws", lanes=[None, _lane(repo_root="/ws")]
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.launch_action, "skip_no_git")
+        # the omitted worktree collapsed to the workspace root for append + dispatch.
+        self.assertEqual(outcome.worktree_path, "/ws")
+        append_paths = [c[1] for c in ops.calls if c[0] == "append_lane_column"]
+        self.assertEqual(append_paths, ["/ws"])
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["target_repo"], "/ws")
+
+    def test_non_git_still_requires_issue_and_lane_label(self):
+        # #13432: only the Git worktree identity relaxes in a non-git workspace; the lane
+        # identity (issue / lane_label) is required in every workspace.
+        ops = FakeActuatorOps(git=False, workspace_root="/ws")
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(issue="", branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
+        self.assertIn("missing_field:issue", outcome.blocked_reasons)
 
     def test_anchor_required_when_execute_dispatch_without_journal(self):
         outcome = SublaneActuateUseCase(FakeActuatorOps()).run(

@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
+    LAUNCH_SKIP_NO_GIT,
     RetireDecision,
     WorktreeLaunchDecision,
     render_integration_decision_journal,
@@ -589,17 +590,29 @@ class SublaneCreateRequest:
             explicit_decision_anchor=self.work_unit_decision_anchor,
         )
 
-    def missing_fields(self) -> Tuple[str, ...]:
-        """The required identity fields left blank (fail-closed trigger)."""
+    def missing_fields(self, *, is_git: bool = True) -> Tuple[str, ...]:
+        """The required identity fields left blank (fail-closed trigger).
+
+        ``issue`` / ``lane_label`` are the lane identity and are required in every
+        workspace. ``branch`` / ``worktree_path`` are the Git worktree identity: they
+        are required only in a Git workspace (``is_git=True``, the default that keeps
+        every existing caller byte-invariant). In a non-Git directory scaffold
+        (``is_git=False``, #13432) the lane has no worktree — it runs in the workspace
+        root itself (#13392 論点1) — so ``--branch`` / ``--worktree`` are optional and
+        are not fail-closed triggers. The caller supplies ``is_git`` from the runtime
+        git probe (the CLI resolves it before validating; the pure
+        :func:`plan_sublane_create` derives it from the launch decision).
+        """
         missing = []
         if not (self.issue or "").strip():
             missing.append("issue")
         if not (self.lane_label or "").strip():
             missing.append("lane_label")
-        if not (self.branch or "").strip():
-            missing.append("branch")
-        if not (self.worktree_path or "").strip():
-            missing.append("worktree_path")
+        if is_git:
+            if not (self.branch or "").strip():
+                missing.append("branch")
+            if not (self.worktree_path or "").strip():
+                missing.append("worktree_path")
         return tuple(missing)
 
 
@@ -670,8 +683,15 @@ def plan_sublane_create(
        a no-op reuse note rather than a ``git worktree add``.
 
     The steps are a *plan*: this function actuates nothing.
+
+    #13432: the launch decision carries the git-ness of the workspace. A
+    :data:`LAUNCH_SKIP_NO_GIT` action is the non-Git directory-scaffold path, where the
+    lane has no worktree — so ``--branch`` / ``--worktree`` are optional there and the
+    ``missing_field`` check relaxes accordingly. Every other action (Git create / reuse /
+    disabled / blocked) keeps the full Git identity requirement byte-invariant.
     """
-    missing = request.missing_fields()
+    non_git = launch.action == LAUNCH_SKIP_NO_GIT
+    missing = request.missing_fields(is_git=not non_git)
     if missing:
         return SublaneCreatePlan(
             status=CREATE_BLOCKED,
