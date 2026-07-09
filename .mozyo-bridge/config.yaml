@@ -10,9 +10,14 @@ presentation:
           repo_label: mozyo-giken-3800-mozyo-bridge
         group_id: project:mozyo_bridge
 agent_launch:
-  sublane_claude_model: claude-opus-4-8
+  launch_argv:
+    claude:
+      sublane: ["--model", "claude-opus-4-8"]
+    codex:
+      default: ["--config", "model_reasoning_effort=xhigh"]
+      sublane: ["--config", "model_reasoning_effort=high"]
 provider_binding:
   bindings:
-    coordinator: claude
+    coordinator: codex
 terminal_transport:
   backend: herdr
