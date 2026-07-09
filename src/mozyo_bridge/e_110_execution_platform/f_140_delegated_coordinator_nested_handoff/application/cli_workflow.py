@@ -54,6 +54,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_fill_decision,
     register_fill_decision,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_glance import (
+    cmd_workflow_glance,
+    register_glance,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_dispatch_plan import (
     cmd_workflow_dispatch_plan,
     register_dispatch_plan,
@@ -395,9 +399,13 @@ def register(sub) -> None:
     (Redmine #12672) ingests structured Redmine journal markers (deduped by the
     ``redmine:<issue>:<journal>`` anchor) into that same store and reports the resulting
     pending action, recording a fail-closed ``failed`` state for a missing / ambiguous route
-    rather than sending. The fill-decision / admission / runtime / resume / watch subcommands
-    are registered from their sibling modules so this file stays focused on the step state
-    machine.
+    rather than sending. ``workflow glance`` (Redmine #13435) is the read-only companion that
+    projects every active lane/US into one view — workflow_state (folded from the durable
+    Redmine record) + next_action + next_owner + delivery_anomaly — so a coordinator can spot
+    a "looks stopped but is really delivery-stuck" lane without hand-correlating status + each
+    journal + a herdr pane read; it mutates nothing. The fill-decision / admission / runtime /
+    resume / watch / glance subcommands are registered from their sibling modules so this file
+    stays focused on the step state machine.
     """
     workflow = sub.add_parser(
         "workflow",
@@ -423,6 +431,7 @@ def register(sub) -> None:
     register_runtime(workflow_sub)
     register_resume(workflow_sub)
     register_watch(workflow_sub)
+    register_glance(workflow_sub)
 
     step = workflow_sub.add_parser(
         "step",
@@ -506,5 +515,6 @@ __all__ = (
     "cmd_workflow_runtime",
     "cmd_workflow_resume",
     "cmd_workflow_watch",
+    "cmd_workflow_glance",
     "register",
 )
