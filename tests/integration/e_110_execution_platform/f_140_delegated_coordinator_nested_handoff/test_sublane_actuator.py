@@ -760,6 +760,47 @@ class LiveAppendLaneArgvTest(unittest.TestCase):
                 resolve_append_lane_argv(planned, config_root=bare),
             )
 
+    def test_new_launch_argv_claude_sublane_relays_same_byte_shape(self):
+        # Redmine #13425 Q6: the tmux relay reads through the single-source resolver, so
+        # the new `launch_argv.claude.sublane: ["--model", X]` produces the SAME
+        # `--claude-model X` byte shape as the old `sublane_claude_model` key.
+        wt, argv = self._argv_for(
+            "agent_launch:\n"
+            "  launch_argv:\n"
+            '    claude:\n      sublane: ["--model", "claude-opus-4-8"]\n'
+        )
+        self.assertEqual(
+            argv,
+            [
+                "cockpit", "append", "--repo", wt, "--no-attach",
+                "--claude-model", "claude-opus-4-8",
+            ],
+        )
+
+    def test_codex_only_new_config_does_not_affect_claude_relay(self):
+        # A codex-only sublane config leaves the tmux claude relay historical (the tmux
+        # `--claude-model` transport is claude-only; codex effort is a herdr surface).
+        wt, argv = self._argv_for(
+            "agent_launch:\n"
+            "  launch_argv:\n"
+            '    codex:\n      sublane: ["--config", "model_reasoning_effort=high"]\n'
+        )
+        self.assertEqual(argv, ["cockpit", "append", "--repo", wt, "--no-attach"])
+
+    def test_richer_claude_sublane_argv_fails_closed_on_tmux_transport(self):
+        # A claude sublane argv the single-token `--claude-model` CLI cannot carry fails
+        # closed rather than silently dropping tokens (#13425 tmux-transport limitation).
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+            RepoLocalConfigError,
+        )
+
+        with self.assertRaises(RepoLocalConfigError):
+            self._argv_for(
+                "agent_launch:\n"
+                "  launch_argv:\n"
+                '    claude:\n      sublane: ["--model", "x-1", "--verbose"]\n'
+            )
+
     def test_live_drive_and_preview_share_one_resolver(self):
         # #13155 REV2 (c): the live drive (`append_lane_column`) and the dry-run
         # preview source (`append_lane_argv`) resolve the SAME argv from the SAME

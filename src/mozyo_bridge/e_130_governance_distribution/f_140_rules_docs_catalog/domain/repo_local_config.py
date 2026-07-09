@@ -81,6 +81,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RoleProviderBindingConfig,
     RoleProviderBindingConfigError,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.agent_launch_argv import (
+    AgentLaunchArgvError,
+    parse_launch_argv_record,
+    validate_launch_argv,
+)
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import CliCompositionConfig
 from mozyo_bridge.e_140_adapter_provider.f_140_presentation_provider.domain.presentation_adapter import (
     PRESENTATION_SURFACES,
@@ -143,7 +148,15 @@ DEFAULT_MERGE_ON_RETIRE: bool = True
 #: managed-pane launch chokepoint. It carries *launch-model intent only* — never a shell
 #: string, and never any routing / owner-approval / close / send authority — and an unset
 #: value is byte-for-byte the historical launch command.
-AGENT_LAUNCH_KEYS: frozenset[str] = frozenset({"version", "sublane_claude_model"})
+AGENT_LAUNCH_KEYS: frozenset[str] = frozenset(
+    {"version", "sublane_claude_model", "launch_argv"}
+)
+
+# The provider / lane-class vocabulary, reserved managed-flag set, and launch_argv
+# validators (Redmine #13425) live in the self-contained sibling
+# :mod:`...domain.agent_launch_argv` (imported below) so this governance-config module
+# stays within the module-health budget and the launch-argv rules are one cohesive unit,
+# mirroring :mod:`...domain.role_provider_binding_config`.
 
 #: The permitted shape of a launch model token (Redmine #13155). A single opaque token —
 #: a leading alphanumeric then alphanumerics / ``.`` / ``_`` / ``-`` — so a config value
@@ -583,39 +596,53 @@ class SublaneIntegrationConfig:
 
 @dataclass(frozen=True)
 class AgentLaunchConfig:
-    """The per-role / lane managed-pane launch model knob (Redmine #13155).
+    """The provider-agnostic per-agent x lane-class launch-argv override (#13155/#13425).
 
     This is the typed *field contract* for the ``agent_launch`` block of
-    ``.mozyo-bridge/config.yaml``. It lets a repo pin which Claude *model* the
-    sublane managed-pane launch chokepoint requests, without touching the launch
-    command's byte shape when unset.
+    ``.mozyo-bridge/config.yaml``. It lets a repo pin the extra launch argv (model,
+    reasoning-effort flag, …) each managed agent is started with, keyed by
+    ``provider x lane_class``, without touching the launch command's byte shape when
+    unset. mozyo does **not** hardcode any provider's flag spec — it appends the
+    operator's tokens verbatim after ``-- {provider}`` (Redmine #13425).
 
-    One value field:
+    Value fields:
 
-    - :attr:`sublane_claude_model` — a single opaque model *token* (e.g.
-      ``claude-opus-4-8``) appended as ``--model <token>`` to a managed Claude
-      pane's launch command at the sublane append chokepoint. ``None`` (the
-      default) appends nothing, so the launch command is byte-for-byte the
-      historical one. The value is **not** an opaque shell string: it must match
-      :data:`_MODEL_TOKEN_RE` (a leading alphanumeric then alphanumerics / ``.`` /
-      ``_`` / ``-``), so a space, empty string, flag, path, or shell
-      metacharacter fails closed with :class:`RepoLocalConfigError` rather than
-      reaching a launch command.
+    - :attr:`launch_argv` — the generalized override: a frozen, sorted tuple of
+      ``(provider, lane_class, tokens)`` triples parsed from the
+      ``launch_argv: {provider: {lane_class: [tokens]}}`` mapping. ``provider`` is a
+      :data:`LAUNCH_ARGV_PROVIDERS` launch label (never an executable / argv[0], which
+      stays mozyo-controlled — #13245 posture); ``lane_class`` is ``default`` (the main
+      coordinator / auditor pair) or ``sublane`` (a lane worker / gateway); each token is
+      validated by :func:`_validate_launch_argv_token`. The keying axis is
+      ``provider x lane_class``, deliberately NOT the ``provider_binding`` workflow-role
+      axis (design consultation answer j#73949 Q1).
+    - :attr:`sublane_claude_model` — the #13155 predecessor: a single Claude model *token*
+      (e.g. ``claude-opus-4-8``) matching :data:`_MODEL_TOKEN_RE`. It is **folded** into the
+      generalized mechanism: :meth:`resolve_launch_argv` treats it as the
+      ``claude x sublane`` argv ``["--model", <token>]`` (answer j#73949 Q5). Kept as a
+      distinct field for byte-for-byte backward compatibility.
 
-    Boundary, kept enforced in code (this is *launch-model intent*, not authority):
+    Boundary, kept enforced in code (this is *launch intent*, not authority):
 
-    - **Config-only, never a shell string.** The single value is a validated
-      model token; it can never carry a command, flag list, redirect, or path.
-    - **Claude-only, non-retroactive.** The token only affects a managed Claude
-      pane mozyo *launches* (the sublane append path); a Codex pane and any
-      already-running pane are untouched — the same posture as the reproducible
-      permission-mode policy (#11925).
-    - **Behavior-preserving default.** No key ⇒ ``None`` ⇒ no ``--model`` flag,
-      so a repo with no ``agent_launch`` block launches exactly as before.
+    - **Config-only, never an executable.** Tokens are argv *elements* appended after the
+      mozyo-controlled provider command; config can never select argv[0] / the executable
+      (#13245). A path in a flag *value* is allowed; the shell-string launch surface
+      ``shlex.quote``s every token.
+    - **No mozyo-managed flag override.** A token that re-specifies a
+      :data:`RESERVED_MANAGED_FLAGS` flag (currently Claude ``--permission-mode``) fails
+      closed — the managed posture (#13360) is authoritative (answer j#73949 Q4).
+    - **Old / new conflict fails closed.** Setting both ``sublane_claude_model`` and an
+      explicit ``launch_argv.claude.sublane`` is a fail-closed conflict — the operator's
+      intended source is ambiguous (answer j#73949 Q5).
+    - **Non-retroactive.** The tokens only affect a managed pane mozyo *launches*; an
+      already-running pane is untouched (same posture as the #11925 permission policy).
+    - **Behavior-preserving default.** No block ⇒ empty ⇒ no extra argv, so a repo with no
+      ``agent_launch`` block launches exactly as before.
     """
 
     version: int = REPO_LOCAL_CONFIG_VERSION
     sublane_claude_model: Optional[str] = None
+    launch_argv: "tuple[tuple[str, str, tuple[str, ...]], ...]" = ()
 
     def __post_init__(self) -> None:
         model = self.sublane_claude_model
@@ -628,10 +655,44 @@ class AgentLaunchConfig:
                 "shell metacharacters), or omitted for the historical launch command; "
                 f"got {model!r}"
             )
+        # Validate the generalized launch_argv (covers direct construction too — existing
+        # tests build AgentLaunchConfig(...) directly, and from_record re-uses this path).
+        # The sibling raises AgentLaunchArgvError; re-raise as RepoLocalConfigError so the
+        # public config-failure boundary is uniform (the role_provider_binding pattern).
+        try:
+            validate_launch_argv(
+                self.launch_argv,
+                sublane_claude_model_set=model is not None,
+                source="agent launch config",
+            )
+        except AgentLaunchArgvError as exc:
+            raise RepoLocalConfigError(str(exc)) from exc
+
+    def resolve_launch_argv(self, provider: str, lane_class: str) -> "list[str]":
+        """The extra launch argv tokens for ``(provider, lane_class)`` (the single source).
+
+        Both launch backends resolve through this method (Redmine #13425 answer j#73949
+        Q6): herdr extends its ``agent start ... -- {provider}`` argv list with the
+        returned tokens verbatim; the tmux shell-string surface ``shlex.quote``s them. An
+        explicit :attr:`launch_argv` entry wins; otherwise the #13155
+        :attr:`sublane_claude_model` is folded in for the ``claude x sublane`` slot only
+        (the conflict guard in :meth:`__post_init__` means at most one source is set).
+        Returns a fresh list (``[]`` when nothing is configured — byte-for-byte historical).
+        """
+        for entry_provider, entry_lane_class, tokens in self.launch_argv:
+            if entry_provider == provider and entry_lane_class == lane_class:
+                return list(tokens)
+        if (
+            provider == "claude"
+            and lane_class == "sublane"
+            and self.sublane_claude_model is not None
+        ):
+            return ["--model", self.sublane_claude_model]
+        return []
 
     @classmethod
     def default(cls) -> "AgentLaunchConfig":
-        """The behavior-preserving default: no launch-model override."""
+        """The behavior-preserving default: no launch-argv override."""
         return cls()
 
     @classmethod
@@ -642,8 +703,10 @@ class AgentLaunchConfig:
 
         ``None`` or an empty mapping yields the behavior-preserving default. A
         non-mapping record, a boundary-crossing / unknown key, an unsupported
-        version, or a ``sublane_claude_model`` that is neither ``None`` nor a
-        valid single model token fails closed with :class:`RepoLocalConfigError`.
+        version, a ``sublane_claude_model`` that is neither ``None`` nor a valid
+        single model token, or a ``launch_argv`` that violates the provider /
+        lane_class / token / reserved-flag / old-new-conflict rules fails closed
+        with :class:`RepoLocalConfigError`.
         """
         if record is None:
             return cls.default()
@@ -656,9 +719,16 @@ class AgentLaunchConfig:
             record, allowed=AGENT_LAUNCH_KEYS, source="agent launch config"
         )
         version = _checked_version(record, source="agent launch config")
+        try:
+            launch_argv = parse_launch_argv_record(
+                record.get("launch_argv"), source="agent launch config"
+            )
+        except AgentLaunchArgvError as exc:
+            raise RepoLocalConfigError(str(exc)) from exc
         return cls(
             version=version,
             sublane_claude_model=record.get("sublane_claude_model"),
+            launch_argv=launch_argv,
         )
 
 

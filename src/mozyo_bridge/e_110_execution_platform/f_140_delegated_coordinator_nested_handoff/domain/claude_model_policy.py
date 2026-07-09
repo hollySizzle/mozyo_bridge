@@ -35,6 +35,7 @@ time — defense in depth).
 from __future__ import annotations
 
 import re
+import shlex
 
 #: The permitted shape of a launch model token (Redmine #13155). See the module
 #: docstring: a single opaque token, never a shell string. Kept byte-identical to
@@ -69,4 +70,9 @@ def claude_model_flag(agent: str, model: str | None) -> str:
             f"token matching {MODEL_TOKEN_PATTERN} (no spaces, empty value, or "
             "shell metacharacters)"
         )
-    return f" --model {model}"
+    # `shlex.quote` on the shell-string launch surface (Redmine #13425 answer j#73949
+    # Q2): the launch chokepoint concatenates this suffix into a shell command, so every
+    # value that reaches it must be shell-safe. A `_MODEL_TOKEN_RE`-validated token has no
+    # shell metacharacters, so quoting is a byte-for-byte no-op here (the token passes the
+    # regex above); it is defense-in-depth keeping the shell surface safe by construction.
+    return f" --model {shlex.quote(model)}"

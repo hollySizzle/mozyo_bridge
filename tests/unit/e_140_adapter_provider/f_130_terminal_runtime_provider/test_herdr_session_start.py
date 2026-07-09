@@ -158,6 +158,7 @@ class SessionStartTest(unittest.TestCase):
         dry_run=False,
         extra_env=None,
         claude_permission_mode_default=None,
+        agent_launch=None,
     ):
         repo = Path(tmp) / "repo"
         repo.mkdir()
@@ -178,6 +179,7 @@ class SessionStartTest(unittest.TestCase):
                 runner=herdr.run,
                 dry_run=dry_run,
                 claude_permission_mode_default=claude_permission_mode_default,
+                agent_launch=agent_launch,
             )
             anchor = read_anchor(repo)
         return result, anchor, repo
@@ -264,6 +266,93 @@ class SessionStartTest(unittest.TestCase):
         self.assertGreater(idx, claude.index("--"))
         # Codex launches never get the flag (Claude-only policy, #11925 rule 1).
         self.assertNotIn("--permission-mode", by_provider["codex"])
+
+    def test_launch_argv_config_appended_for_sublane_after_permission_mode(self) -> None:
+        # Redmine #13425: the config's `launch_argv.{provider}.sublane` tokens reach the
+        # herdr launch argv (the #13155 regression fix on the herdr chokepoint). Claude's
+        # `--model` is rendered AFTER the managed `--permission-mode` (answer j#73949 Q4);
+        # codex gets its own sublane tokens.
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+            AgentLaunchConfig,
+        )
+
+        cfg = AgentLaunchConfig.from_record(
+            {
+                "launch_argv": {
+                    "codex": {"sublane": ["--config", "model_reasoning_effort=high"]},
+                    "claude": {"sublane": ["--model", "claude-opus-4-8"]},
+                }
+            }
+        )
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["claude", "codex"],
+                herdr=herdr,
+                lane="issue_x",  # non-default lane -> sublane lane_class
+                claude_permission_mode_default="auto",
+                agent_launch=cfg,
+            )
+        by_provider = {}
+        for argv in herdr.start_argvs:
+            provider = argv[argv.index("--") + 1]
+            by_provider[provider] = argv
+        claude = by_provider["claude"]
+        # `-- claude --permission-mode auto --model claude-opus-4-8` (Q4 order).
+        self.assertEqual(
+            claude[claude.index("--"):],
+            ["--", "claude", "--permission-mode", "auto", "--model", "claude-opus-4-8"],
+        )
+        codex = by_provider["codex"]
+        self.assertEqual(
+            codex[codex.index("--"):],
+            ["--", "codex", "--config", "model_reasoning_effort=high"],
+        )
+
+    def test_launch_argv_config_uses_default_lane_class_for_no_lane(self) -> None:
+        # The coordinator pair (no-lane session) is the `default` lane_class, so only the
+        # `launch_argv.{provider}.default` tokens apply; the sublane tokens do NOT leak in.
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+            AgentLaunchConfig,
+        )
+
+        cfg = AgentLaunchConfig.from_record(
+            {
+                "launch_argv": {
+                    "codex": {
+                        "default": ["--config", "model_reasoning_effort=xhigh"],
+                        "sublane": ["--config", "model_reasoning_effort=high"],
+                    }
+                }
+            }
+        )
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp,
+                providers=["codex"],
+                herdr=herdr,
+                lane="",  # no lane -> default lane_class
+                agent_launch=cfg,
+            )
+        codex = herdr.start_argvs[0]
+        self.assertEqual(
+            codex[codex.index("--"):],
+            ["--", "codex", "--config", "model_reasoning_effort=xhigh"],
+        )
+
+    def test_launch_argv_none_config_is_byte_invariant(self) -> None:
+        # No config (agent_launch=None) appends nothing — byte-for-byte the pre-#13425
+        # launch, so an unconfigured launch site is unaffected.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._prepare(
+                tmp, providers=["claude", "codex"], herdr=herdr, agent_launch=None
+            )
+        for argv in herdr.start_argvs:
+            provider = argv[argv.index("--") + 1]
+            self.assertEqual(argv[-2:], ["--", provider])
 
     def test_launch_without_policy_default_is_flagless(self) -> None:
         # No default and no env override: the historical bare `-- claude` launch is
