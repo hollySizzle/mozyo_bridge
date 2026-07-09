@@ -96,7 +96,12 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
+
+if TYPE_CHECKING:
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+        AgentLaunchConfig,
+    )
 
 from mozyo_bridge.core.state.workspace_registry import (
     _is_linked_worktree,
@@ -611,6 +616,7 @@ def prepare_session(
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
+    agent_launch: "Optional[AgentLaunchConfig]" = None,
 ) -> SessionStartResult:
     """Mint (or adopt) durable herdr identities for ``providers`` (fail-closed).
 
@@ -618,6 +624,16 @@ def prepare_session(
     ``register_workspace`` / ``read_anchor``). Raises :class:`HerdrSessionStartError`
     on any fail-closed condition (unknown provider, unconfigured binary, duplicate
     assigned name, a launch that yields no usable locator).
+
+    ``agent_launch`` (Redmine #13425) is the repo-local launch-argv override the launch
+    site resolved from ``.mozyo-bridge/config.yaml``. When provided, each launched slot's
+    ``-- {provider}`` argv is extended with
+    ``agent_launch.resolve_launch_argv(provider, lane_class)`` — the config's per-agent x
+    lane-class tokens (model, reasoning-effort flag, …) appended verbatim (mozyo hardcodes
+    no provider flag spec). ``lane_class`` is derived from the resolved lane: ``default``
+    for the coordinator pair (no-lane session), ``sublane`` for a lane worker / gateway.
+    ``None`` (the default) appends nothing — byte-for-byte the pre-#13425 launch, so the
+    ``sublane_claude_model`` regression fix is opt-in on the launch site passing a config.
 
     ``claude_permission_mode_default`` is the launch-context policy default for the
     managed Claude permission mode (Redmine #11925 / #13360 / #13397): sublane lane
@@ -769,9 +785,20 @@ def prepare_session(
             result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
 
+    # Config-driven launch argv (Redmine #13425): the lane_class is `default` for the
+    # coordinator pair (no-lane session) and `sublane` for a lane worker / gateway. The
+    # per-slot argv comes from the single-source resolver; `None` config yields `[]`
+    # everywhere, so an unconfigured launch is byte-for-byte the pre-#13425 command.
+    lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
+
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into
     # the resolved target workspace). A launch failure raises here, before reclaim.
     for plan in plans:
+        launch_argv_extra = (
+            agent_launch.resolve_launch_argv(plan.provider, lane_class)
+            if agent_launch is not None
+            else []
+        )
         result.slots.append(
             _execute_slot(
                 plan,
@@ -784,6 +811,7 @@ def prepare_session(
                 runner=runner,
                 timeout=timeout,
                 claude_permission_mode=claude_permission_mode,
+                launch_argv_extra=launch_argv_extra,
             )
         )
 
@@ -812,6 +840,7 @@ def _execute_slot(
     runner: Runner,
     timeout: float,
     claude_permission_mode: Optional[str] = None,
+    launch_argv_extra: Sequence[str] = (),
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -879,6 +908,14 @@ def _execute_slot(
     # env override (review j#73404). Codex never gets the flag.
     if plan.provider == "claude" and claude_permission_mode:
         launch_argv.extend(["--permission-mode", claude_permission_mode])
+    # Config-driven launch argv (Redmine #13425): appended AFTER the mozyo-managed
+    # `--permission-mode` flag (answer j#73949 Q4 render order) so the managed posture
+    # keeps its position; the config schema fail-closes on a token that re-specifies a
+    # managed flag, so a config value can never override it. herdr passes each token as a
+    # distinct `agent start ... -- {provider}` argv element (no shell), so the tokens are
+    # extended verbatim — no quoting needed on this list surface.
+    if launch_argv_extra:
+        launch_argv.extend(launch_argv_extra)
     started = _invoke(
         binary,
         launch_argv,
@@ -940,10 +977,22 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
     """CLI entry: prepare durable herdr identities for the workspace's agents."""
     from mozyo_bridge.application.commands_common import repo_root_from_args
 
+    from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+        RepoLocalConfigError,
+    )
+
     repo_root = repo_root_from_args(args)
     agents = getattr(args, "agent", None) or [PROVIDER_CLAUDE, PROVIDER_CODEX]
     lane_id = getattr(args, "lane", None) or ""
     dry_run = bool(getattr(args, "dry_run", False))
+    # Config-driven launch argv (Redmine #13425): resolved from the repo the command runs
+    # in. lane_class is derived inside `prepare_session` from the resolved lane.
+    try:
+        agent_launch = load_repo_local_config(repo_root).agent_launch
+    except RepoLocalConfigError as exc:
+        die(f"herdr session-start failed: invalid agent_launch config: {exc}")
+        raise AssertionError("unreachable")
     try:
         result = prepare_session(
             repo_root=repo_root,
@@ -951,6 +1000,7 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             lane_id=lane_id,
             env=os.environ,
             dry_run=dry_run,
+            agent_launch=agent_launch,
         )
     except HerdrSessionStartError as exc:
         die(f"herdr session-start failed: {exc}")

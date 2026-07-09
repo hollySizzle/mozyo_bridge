@@ -230,12 +230,22 @@ class LiveHerdrLaunchOps:
         # permission posture the lane worker already has. The `MOZYO_CLAUDE_PERMISSION_MODE`
         # env override still wins for an operator who wants a different mode, and Codex
         # is untouched (the policy is claude-only).
+        # Config-driven launch argv (Redmine #13425): the bare `mozyo` coordinator pair is
+        # the `default` lane_class, so the config's `launch_argv.{provider}.default` tokens
+        # (e.g. claude `--model`, codex `--config model_reasoning_effort=xhigh`) are
+        # appended at the launch chokepoint. Unconfigured repos are byte-for-byte unchanged.
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config,
+        )
+
+        agent_launch = load_repo_local_config(repo_root).agent_launch
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
             env=self._env,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+            agent_launch=agent_launch,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

@@ -732,6 +732,144 @@ class AgentLaunchConfigTest(unittest.TestCase):
             AgentLaunchConfig.from_record({"version": 2})
 
 
+class LaunchArgvConfigTest(unittest.TestCase):
+    """The provider-agnostic ``agent_launch.launch_argv`` override (Redmine #13425)."""
+
+    def test_default_resolves_to_empty_everywhere(self) -> None:
+        cfg = AgentLaunchConfig.default()
+        for provider in ("claude", "codex"):
+            for lane_class in ("default", "sublane"):
+                self.assertEqual(cfg.resolve_launch_argv(provider, lane_class), [])
+
+    def test_new_schema_parse_and_resolve(self) -> None:
+        cfg = AgentLaunchConfig.from_record(
+            {
+                "launch_argv": {
+                    "codex": {
+                        "default": ["--config", "model_reasoning_effort=xhigh"],
+                        "sublane": ["--config", "model_reasoning_effort=high"],
+                    },
+                    "claude": {"sublane": ["--model", "claude-opus-4-8"]},
+                }
+            }
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("codex", "default"),
+            ["--config", "model_reasoning_effort=xhigh"],
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("codex", "sublane"),
+            ["--config", "model_reasoning_effort=high"],
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("claude", "sublane"),
+            ["--model", "claude-opus-4-8"],
+        )
+        # An unset slot is empty (claude default was not configured).
+        self.assertEqual(cfg.resolve_launch_argv("claude", "default"), [])
+
+    def test_resolve_returns_fresh_list(self) -> None:
+        cfg = AgentLaunchConfig.from_record(
+            {"launch_argv": {"codex": {"default": ["--x"]}}}
+        )
+        first = cfg.resolve_launch_argv("codex", "default")
+        first.append("--mutated")
+        self.assertEqual(cfg.resolve_launch_argv("codex", "default"), ["--x"])
+
+    def test_old_key_folds_to_claude_sublane(self) -> None:
+        cfg = AgentLaunchConfig.from_record(
+            {"sublane_claude_model": "claude-opus-4-8"}
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("claude", "sublane"),
+            ["--model", "claude-opus-4-8"],
+        )
+        # The fold is sublane-only; default Claude and any Codex slot stay empty.
+        self.assertEqual(cfg.resolve_launch_argv("claude", "default"), [])
+        self.assertEqual(cfg.resolve_launch_argv("codex", "sublane"), [])
+
+    def test_old_and_other_new_slots_coexist(self) -> None:
+        cfg = AgentLaunchConfig.from_record(
+            {
+                "sublane_claude_model": "claude-opus-4-8",
+                "launch_argv": {"codex": {"default": ["--config", "e=xhigh"]}},
+            }
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("claude", "sublane"),
+            ["--model", "claude-opus-4-8"],
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("codex", "default"), ["--config", "e=xhigh"]
+        )
+
+    def test_old_and_new_same_slot_conflict_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record(
+                {
+                    "sublane_claude_model": "claude-opus-4-8",
+                    "launch_argv": {"claude": {"sublane": ["--model", "sonnet"]}},
+                }
+            )
+
+    def test_reserved_managed_flag_fails_closed(self) -> None:
+        for bad in (["--permission-mode", "plan"], ["--permission-mode=plan"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    AgentLaunchConfig.from_record(
+                        {"launch_argv": {"claude": {"default": bad}}}
+                    )
+
+    def test_unknown_provider_or_lane_class_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record(
+                {"launch_argv": {"grok": {"default": ["--x"]}}}
+            )
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record(
+                {"launch_argv": {"claude": {"main": ["--x"]}}}
+            )
+
+    def test_bad_tokens_fail_closed(self) -> None:
+        bad_argvs = (
+            [""],  # empty token
+            ["a\nb"],  # newline
+            ["a\tb"],  # tab / control char
+            [5],  # non-string
+            "--model",  # bare string, not a list
+        )
+        for bad in bad_argvs:
+            with self.subTest(bad=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    AgentLaunchConfig.from_record(
+                        {"launch_argv": {"claude": {"default": bad}}}
+                    )
+
+    def test_non_mapping_launch_argv_fails_closed(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig.from_record({"launch_argv": ["--x"]})
+
+    def test_path_like_flag_value_allowed(self) -> None:
+        # A path in a flag *value* is legitimate (#13425 Q3); only the executable /
+        # argv[0] stays mozyo-controlled, and this is a value, not argv[0].
+        cfg = AgentLaunchConfig.from_record(
+            {"launch_argv": {"claude": {"default": ["--add-dir", "/some/path"]}}}
+        )
+        self.assertEqual(
+            cfg.resolve_launch_argv("claude", "default"), ["--add-dir", "/some/path"]
+        )
+
+    def test_direct_construction_validates_launch_argv(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            AgentLaunchConfig(launch_argv=(("claude", "default", ("a\nb",)),))
+
+    def test_config_stays_hashable(self) -> None:
+        cfg = AgentLaunchConfig.from_record(
+            {"launch_argv": {"codex": {"default": ["--config", "e=xhigh"]}}}
+        )
+        self.assertIsInstance(hash(cfg), int)
+
+
 class ProviderBindingConfigTest(unittest.TestCase):
     """The role -> provider binding override sub-record (Redmine #13157)."""
 

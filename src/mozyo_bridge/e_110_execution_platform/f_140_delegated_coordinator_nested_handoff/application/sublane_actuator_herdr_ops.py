@@ -172,6 +172,19 @@ class HerdrSublaneActuatorOps:
         locator) propagates so the use case fails closed exactly as it does on a
         cockpit-append failure.
         """
+        # Config-driven launch argv (Redmine #13425): the lane's slots are the `sublane`
+        # lane_class, so the config's `launch_argv.{provider}.sublane` tokens (the folded
+        # `sublane_claude_model` claude `--model`, codex sublane reasoning-effort flag, …)
+        # are appended at the launch chokepoint — the herdr-side fix for the #13155
+        # regression. The config is read from the SOURCE checkout (`self.repo_root`, the
+        # coordinator's), never `worktree_path`: the committed config is identical after
+        # creation and this keeps one config source (the same rule the tmux
+        # `resolve_append_lane_argv` follows). An unconfigured repo appends nothing.
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config,
+        )
+
+        agent_launch = load_repo_local_config(self.repo_root).agent_launch
         try:
             prepare_session(
                 repo_root=Path(worktree_path),
@@ -186,6 +199,7 @@ class HerdrSublaneActuatorOps:
                 # (#13360 — without this every herdr lane worker stalls on its
                 # first permission prompt).
                 claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+                agent_launch=agent_launch,
             )
         except HerdrSessionStartError as exc:
             raise RuntimeError(f"herdr lane slot creation failed: {exc}") from exc
