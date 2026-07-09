@@ -53,6 +53,31 @@ class SelectedTarget:
     selection: TargetSelection
 
 
+def _herdr_backend_selection_hint(repo_root: Optional[str]) -> str:
+    """A ``herdr backend active`` guidance clause for a failed semantic selection (#13446).
+
+    ``handoff send --select`` / ``message --select-role`` narrow over the tmux discovery
+    pool; under ``terminal_transport.backend: herdr`` that pool is empty (no tmux panes),
+    so the pure selector fails closed with a tmux-shaped ``no_candidate:repo`` — the exact
+    #13435 j#74176 -> j#74177 recurrence where the coordinator reached for tmux selection
+    while the herdr workspace's agents were live. When the resolved repo selects the herdr
+    backend, prepend the shared ``herdr backend active`` marker + standard-dispatch hint so
+    the operator is pointed at ``sublane create --execute`` / ``--target-lane`` instead of
+    left with a tmux diagnostic. Returns ``""`` (no change) under the tmux backend or when
+    no repo identity is resolvable, keeping the tmux-backend message byte-identical.
+    """
+    if not repo_root:
+        return ""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        herdr_backend_active,
+        herdr_backend_guidance,
+    )
+
+    if not herdr_backend_active(Path(repo_root)):
+        return ""
+    return herdr_backend_guidance() + " "
+
+
 def discover_all_candidates() -> list[TargetCandidate]:
     """Discover every classified target candidate (no role/session pre-filter).
 
@@ -147,7 +172,8 @@ def select_semantic_target(
         die(
             "semantic target selection failed "
             f"({selection.reason}); no message was sent. "
-            "Resolve the candidates above (or use an explicit `%pane` as a "
+            + _herdr_backend_selection_hint(sender_repo_root or expected_repo)
+            + "Resolve the candidates above (or use an explicit `%pane` as a "
             "debug escape hatch)."
         )
         raise AssertionError("unreachable")

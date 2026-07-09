@@ -438,6 +438,32 @@ def _scan_progress_note(event) -> None:
         )
 
 
+def _emit_herdr_backend_note(args: argparse.Namespace) -> None:
+    """Print a ``herdr backend active`` demotion note for ``agents targets`` (Redmine #13446).
+
+    ``agents targets`` lists the tmux discovery pool; under ``terminal_transport.backend:
+    herdr`` that pool is empty and the surface reads as a dead tmux-era listing — the same
+    harness gap (#13435 j#74176 -> j#74177) where an agent reaches for tmux selection while
+    the herdr workspace's agents are live. Emit a stderr note that names this a tmux-era
+    primitive/debug surface and points at the standard ``sublane create --execute`` dispatch,
+    but do not fail: the command stays a read-only listing. Guarded by
+    :func:`herdr_backend_active`, so the tmux-backend stdout / stderr stays byte-identical.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        herdr_backend_active,
+        herdr_backend_guidance,
+    )
+
+    try:
+        repo_root = repo_root_from_args(args)
+    except (OSError, ValueError):
+        return
+    if not herdr_backend_active(repo_root):
+        return
+    print(f"note: {herdr_backend_guidance()}", file=sys.stderr)
+
+
 def cmd_agents_targets(args: argparse.Namespace) -> int:
     """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
 
@@ -468,6 +494,8 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     identity hints only.
     """
     require_tmux()
+    # herdr-backend demotion note (#13446): read-only, stderr-only, tmux byte-invariant.
+    _emit_herdr_backend_note(args)
 
     # Silent-hang fix (#12985): the per-root bounded project-scope scan behind
     # discovery can walk a large root for 30s+. Install the stderr note listener

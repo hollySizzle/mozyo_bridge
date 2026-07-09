@@ -152,6 +152,11 @@ REASON_CALLBACK_NOT_APPLICABLE = "callback_not_applicable"
 REASON_SELF_LANE_UNRESOLVED = "self_lane_unresolved"
 REASON_LANE_ROLE_UNRESOLVED = "lane_role_unresolved"
 REASON_UNSAFE_PROVIDER_BINDING = "unsafe_provider_binding"
+# Redmine #13446: the herdr-backend counterpart of ``self_lane_unresolved``. Emitted by the
+# CLI preflight (not this pure machine) when ``terminal_transport.backend: herdr`` is active,
+# so ``workflow step`` fails closed with a herdr-specific reason + ``sublane`` next_action
+# instead of dying on the tmux ``%pane`` self-lane resolution the herdr session cannot serve.
+REASON_HERDR_SELF_LANE_UNRESOLVED = "herdr_self_lane_unresolved"
 
 
 # ---------------------------------------------------------------------------
