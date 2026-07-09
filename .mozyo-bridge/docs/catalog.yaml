@@ -1222,6 +1222,24 @@ documents:
       - spec-project-map
       - skill-workflow-reference
 
+  - id: logic-herdr-scenario-test-foundation
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-scenario-test-foundation.md
+    purpose: "高忠実度 herdr fake + 古典派 scenario テスト基盤の設計正本 (Redmine #13398、親 #12531 120_シナリオ・受入テスト基盤)。既存 fake が backend-routing seam を素通りするため決定論的 backend バグ (dispatch/callback/retire/launch の tmux↔herdr 分岐) が review 前に落ちない問題に対し、(a) 単一 stateful fake herdr の契約面と実バイナリ照合 contract テストの cadence、(b) create→dispatch→ACK→callback→retire を fake 相手に流し各 hop で routing を assert する scenario harness (tmux/herdr × git/非git/外部 project × root-inference で parametrize)、(c) 実装 US 分割案、(d) #13397 finding 1 等の回帰 scenario 写像 を設計する。"
+    audit_role: herdr_scenario_test_foundation_logic
+    related_document_refs:
+      - logic-tests-placement-discovery-policy
+      - spec-herdr-native-identity
+      - logic-coordinator-sublane-development-flow
+      - logic-sublane-lifecycle-map
+      - logic-acceptance-rerun-protocol
+      - logic-tmux-send-safety-contract
+      - spec-route-identity-ledger
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: logic-autonomous-ticket-entrypoint
     type: logic
     status: active
