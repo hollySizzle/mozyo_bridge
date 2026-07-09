@@ -689,6 +689,7 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         herdr_workspace_segment,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        derive_directory_lane_token,
         derive_lane_workspace_token,
     )
 
@@ -706,7 +707,22 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
         workspace_id = herdr_workspace_segment(resolved_worktree)
     except (OSError, ValueError):
         return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
-    legacy_token = derive_lane_workspace_token(str(resolved_worktree))
+    # #13392: a non-git (directory scaffold) lane runs in the workspace root itself — the
+    # ``--worktree`` anchor collapses to the workspace root (== ``repo_root``), exactly as
+    # the create site collapsed it. Such a lane has no ``wt_<hash>`` per-lane workspace
+    # twin, and its metadata record is keyed on the lane-scoped ``dl_`` token (matching the
+    # non-git create site). A Git lane's distinct worktree keeps the path-derived ``wt_``
+    # token both as the legacy twin and as the tombstone key.
+    try:
+        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
+    except OSError:
+        collapsed_to_root = False
+    if collapsed_to_root:
+        legacy_token = ""
+        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
+    else:
+        legacy_token = derive_lane_workspace_token(str(resolved_worktree))
+        metadata_token = legacy_token
     if not workspace_id and not legacy_token:
         return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
     try:
@@ -723,12 +739,12 @@ def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
     # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
     # command boundary marks the lane's display-metadata record `retired` (kept as
     # a tombstone for late label resolution / residue diagnosis, never deleted
-    # here). The record key is the worktree's stable path token — the same key both
-    # the legacy and the #13377 shared-model create sites upsert on. Never raises;
-    # an unrecorded lane simply stays unrecorded.
+    # here). The record key is the same key the matching create site upsert on
+    # (the ``wt_`` path token for a Git lane, the ``dl_`` lane-scoped token for a
+    # non-git one). Never raises; an unrecorded lane simply stays unrecorded.
     from mozyo_bridge.core.state.lane_metadata import record_lane_retired
 
-    record_lane_retired(legacy_token)
+    record_lane_retired(metadata_token)
     return result
 
 

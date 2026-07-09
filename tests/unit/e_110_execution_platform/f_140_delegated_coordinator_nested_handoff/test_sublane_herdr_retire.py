@@ -9,6 +9,7 @@ the compatibility twin) and the non-fatal executor over a fake herdr.
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -300,6 +301,105 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
                 self._retire_args(repo=coord, worktree=lane, execute=False)
             )
         self.assertEqual(rc, 0)
+
+
+class NonGitRetireCloseTest(unittest.TestCase):
+    """Redmine #13392 (required test 4): a non-git lane's retire close.
+
+    The lane runs in the workspace root itself (``--worktree`` collapses to the workspace
+    root == ``repo_root``). Retire must close ONLY the lane's ``(project_ws, lane_label)``
+    managed slots — never the coordinator's default-lane pair — and tombstone the
+    lane-scoped ``dl_`` metadata record the non-git create site wrote (never a phantom
+    ``wt_`` token, which would miss the record).
+    """
+
+    def test_non_git_retire_closes_only_lane_slots_and_tombstones_dl_record(self) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.lane_metadata import (
+            load_lane_records,
+            record_lane_created,
+        )
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_directory_lane_token,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as proj,
+            sublane_herdr_retire as retire_mod,
+            sublane_lifecycle_command as lc,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireCloseResult,
+        )
+
+        lane_label = "issue_13392_ng"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            root = Path(tmp) / "nongit_ws"  # a NON-git workspace root (no `git init`)
+            root.mkdir()
+            (root / ".mozyo-bridge").mkdir()
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "terminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                project_ws = register_workspace(root, home=home).record.workspace_id
+                # The non-git create site wrote a lane-scoped `dl_` metadata record.
+                dl_token = derive_directory_lane_token(str(root.resolve()), lane_label)
+                record_lane_created(
+                    lane_workspace_token=dl_token,
+                    repo_workspace_id=project_ws,
+                    issue_id="13392",
+                    lane_label=lane_label,
+                    branch=lane_label,
+                    worktree_path=str(root),
+                    lane_id=lane_label,
+                    home=home,
+                )
+                # Live inventory: the coordinator's default-lane pair AND the lane's slots,
+                # all in the shared project workspace.
+                rows = [
+                    _row(project_ws, "codex", "", "w2:p3"),  # coordinator gateway
+                    _row(project_ws, "claude", "", "w2:p2"),  # coordinator worker
+                    _row(project_ws, "codex", lane_label, "w2:p8"),  # lane gateway
+                    _row(project_ws, "claude", lane_label, "w2:p9"),  # lane worker
+                ]
+                captured: dict = {}
+
+                def _fake_execute(plan, **kw):
+                    captured["plan"] = plan
+                    return HerdrRetireCloseResult(
+                        workspace_id=plan.workspace_id,
+                        lane_id=plan.lane_id,
+                        closed=plan.close_targets,
+                        foreign_names=plan.foreign_names,
+                    )
+
+                args = argparse.Namespace(worktree=str(root), lane_label=lane_label)
+                with patch.object(
+                    proj, "list_herdr_agent_rows", return_value=rows
+                ), patch.object(
+                    retire_mod, "execute_herdr_retire_close", side_effect=_fake_execute
+                ):
+                    result = lc._maybe_herdr_retire_close(args, root)
+                records = load_lane_records(home=home)
+
+        plan = captured["plan"]
+        # Only the lane's two slots close — the coordinator default-lane pair is NEVER a target.
+        self.assertEqual(
+            sorted(plan.close_targets),
+            sorted([("codex", "w2:p8"), ("claude", "w2:p9")]),
+        )
+        self.assertNotIn(("codex", "w2:p3"), plan.close_targets)
+        self.assertNotIn(("claude", "w2:p2"), plan.close_targets)
+        self.assertEqual(plan.lane_id, lane_label)
+        self.assertEqual(plan.workspace_id, project_ws)
+        self.assertEqual(result.lane_id, lane_label)
+        # The lane-scoped `dl_` record was tombstoned (the retire found it by the same key).
+        self.assertIn(dl_token, records)
+        self.assertTrue(records[dl_token].retired)
 
 
 if __name__ == "__main__":  # pragma: no cover

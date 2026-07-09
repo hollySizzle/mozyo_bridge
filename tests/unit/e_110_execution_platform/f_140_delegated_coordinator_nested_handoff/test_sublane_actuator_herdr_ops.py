@@ -218,6 +218,83 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertEqual(record.source_backend, "herdr")
         self.assertEqual(record.status, "active")
 
+    def test_non_git_lane_launches_as_project_lane_unit_not_default(self) -> None:
+        # Redmine #13392 (required test 2): a non-git lane's runtime root IS the workspace
+        # root (the use case collapses skip_no_git to repo_root). Its slots must stand up
+        # as a ``(project workspace, lane_label)`` unit — a NON-default lane distinct from
+        # the coordinator's default-lane pair — so the #13380 dedicated-host placement
+        # (``_launch_target_for_lane`` excludes the coordinator's default workspace for a
+        # non-default lane) applies exactly as it does for a git lane. Here the append
+        # target == the workspace root, the collapsed non-git shape.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            DEFAULT_LANE,
+            decode_assigned_name,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)  # repo_root = coord (a non-git dir)
+            root = str(ops.repo_root)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.append_lane_column(root)
+                view = ops.read_lane(root)
+                project_ws = read_anchor(ops.repo_root)["workspace_id"]
+        self.assertIsNotNone(view)
+        # The lane is a (project workspace, lane_label) unit — project identity (shared
+        # with the coordinator pair), lane segment the label, NEVER the default lane.
+        self.assertEqual(view.workspace_id, project_ws)
+        self.assertEqual(view.lane_id, "issue_13331_x")
+        self.assertNotEqual(view.lane_id, DEFAULT_LANE)
+        # Every launched managed slot decodes to that same lane unit (not default-lane).
+        self.assertTrue(herdr.agents)
+        for agent in herdr.agents:
+            decode = decode_assigned_name(agent["name"])
+            self.assertTrue(decode.ok and decode.identity is not None)
+            self.assertEqual(decode.identity.workspace_id, project_ws)
+            self.assertEqual(decode.identity.lane_id, "issue_13331_x")
+            self.assertNotEqual(decode.identity.lane_id, DEFAULT_LANE)
+
+    def test_two_non_git_lanes_on_one_root_keep_distinct_metadata(self) -> None:
+        # Redmine #13392 (required test 3): two lanes on ONE non-git workspace root must
+        # not collide in the token-keyed lane_metadata store — the path-only ``wt_`` token
+        # is identical for both (same root), so without the ``dl_`` (root, lane_id) key the
+        # second create would overwrite the first record. Both records must survive and the
+        # ``(repo_workspace_id, lane_id)`` unit join must distinguish them.
+        from mozyo_bridge.core.state.lane_metadata import (
+            lane_records_by_unit,
+            load_lane_records,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops_a, home = self._ops(
+                tmp, herdr, lane_label="issue_13392_a", issue="13392"
+            )
+            root = str(ops_a.repo_root)  # the shared non-git workspace root
+            ops_b = HerdrSublaneActuatorOps(
+                repo_root=ops_a.repo_root,
+                lane_label="issue_13392_b",
+                issue="13392",
+                env=ops_a.env,
+                runner=herdr.run,
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops_a.append_lane_column(root)
+                ops_b.append_lane_column(root)
+                records = load_lane_records(home=home)
+                project_ws = read_anchor(ops_a.repo_root)["workspace_id"]
+        # Two distinct records survive — the second lane never overwrote the first.
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            sorted(r.lane_label for r in records.values()),
+            ["issue_13392_a", "issue_13392_b"],
+        )
+        self.assertTrue(all(tok.startswith("dl_") for tok in records))
+        # The unit join keys both lanes on the shared project workspace, distinctly.
+        by_unit = lane_records_by_unit(records)
+        self.assertIn((project_ws, "issue_13392_a"), by_unit)
+        self.assertIn((project_ws, "issue_13392_b"), by_unit)
+
     def test_read_lane_gateway_only(self) -> None:
         herdr = _StatefulHerdr()
         with tempfile.TemporaryDirectory() as tmp:

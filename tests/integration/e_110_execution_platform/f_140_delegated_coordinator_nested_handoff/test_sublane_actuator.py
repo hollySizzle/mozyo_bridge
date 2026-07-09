@@ -81,8 +81,12 @@ class FakeActuatorOps:
         dispatch_error=None,
         append_argv=None,
         gateway_ready=True,
+        workspace_root="/ws",
     ):
         self._git = git
+        # #13392: the optional canonical-workspace-root capability the use case reads to
+        # collapse a non-git (skip_no_git) lane's runtime root off the phantom worktree.
+        self._workspace_root = workspace_root
         self._we = worktree_exists
         self._create_error = create_error
         self._append_error = append_error
@@ -101,6 +105,9 @@ class FakeActuatorOps:
             else [gateway_ready]
         )
         self.calls = []
+
+    def canonical_workspace_root(self):
+        return self._workspace_root
 
     def is_git_workspace(self):
         self.calls.append("is_git")
@@ -319,6 +326,51 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertEqual(outcome.launch_action, "skip_no_git")
         self.assertNotIn("create_worktree", ops._names())
         self.assertIn("append_lane_column", ops._names())
+
+    def test_non_git_collapses_lane_runtime_root_to_workspace_root(self):
+        # Redmine #13392 (required test 1): a non-git lane has no worktree, so the
+        # cockpit append / read-back / dispatch target-repo MUST collapse to the
+        # workspace root (the phantom `--worktree` path carries no herdr identity
+        # segment and would fail the mint). The seam is exercised for real here (not a
+        # stub that ignores the path) — the #13398-class blind spot the create-side
+        # regression hid behind was a fake that never inspected the append path.
+        ops = FakeActuatorOps(
+            git=False,
+            workspace_root="/ws",
+            lanes=[None, _lane(repo_root="/ws")],
+        )
+        # The request still carries a git-idiomatic sibling worktree path (every runbook
+        # example) — the collapse must ignore it for a non-git lane.
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(worktree_path="/somewhere/lane-wt"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.launch_action, "skip_no_git")
+        # append + both read-backs ran against the workspace root, never the phantom path.
+        append_paths = [c[1] for c in ops.calls if c[0] == "append_lane_column"]
+        read_paths = [c[1] for c in ops.calls if c[0] == "read_lane"]
+        self.assertEqual(append_paths, ["/ws"])
+        self.assertTrue(read_paths and all(p == "/ws" for p in read_paths))
+        self.assertNotIn("/somewhere/lane-wt", append_paths + read_paths)
+        # the dispatch repo/cwd gate collapses to the workspace root too.
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["target_repo"], "/ws")
+
+    def test_git_lane_keeps_worktree_path_as_runtime_root(self):
+        # Redmine #13392 (required test 5, byte-invariance guard): a Git worktree lane
+        # keeps its distinct worktree path as the runtime root — the collapse is
+        # non-git-only and never rewrites a Git lane's append / read / dispatch path.
+        ops = FakeActuatorOps(
+            git=True, workspace_root="/ws", lanes=[None, _lane()]
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(worktree_path="/wt/12973"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        append_paths = [c[1] for c in ops.calls if c[0] == "append_lane_column"]
+        self.assertEqual(append_paths, ["/wt/12973"])
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["target_repo"], "auto")
 
     def test_no_dispatch_stops_after_panes(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])

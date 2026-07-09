@@ -72,6 +72,14 @@ class SublaneActuatorOps(Protocol):
     returns its exit code. There is intentionally no remove / kill / delete / merge method —
     the destructive half is gated and coordinator-owned.
 
+    Optional capability (Redmine #13392): an adapter MAY additionally provide
+    ``canonical_workspace_root() -> str`` — the registered workspace root the actuation is
+    driven from. The use case reads it (via ``getattr``) to resolve the *lane runtime root*
+    of a non-git (``LAUNCH_SKIP_NO_GIT``) lane, which has no worktree and so runs in the
+    workspace root itself rather than the phantom ``--worktree`` path. Discovered via
+    ``getattr`` and deliberately NOT part of this protocol so existing adapters / test fakes
+    that only ever drive the Git path stay conformant (they fall back to the worktree path).
+
     Optional capability (Redmine #13378): an adapter MAY additionally provide
     ``heal_lane_column(worktree_path) -> None`` — a *creation-side* relaunch of the lane's
     missing managed slot(s) the use case invokes at most once when a dispatch fails and the
@@ -146,6 +154,11 @@ class LiveSublaneActuatorOps:
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
+
+    def canonical_workspace_root(self) -> str:
+        # #13392: the workspace root the actuation is driven from — the lane runtime root
+        # of a non-git (skip_no_git) lane, which has no worktree and runs here.
+        return str(self.repo_root)
 
     def is_git_workspace(self) -> bool:
         return self._git().is_git_workspace()
@@ -281,6 +294,28 @@ class LiveSublaneActuatorOps:
         return self._drive_cli(argv)
 
 
+def resolve_lane_runtime_root(
+    ops: object, worktree_path: str, *, skip_no_git: bool
+) -> str:
+    """The filesystem / cwd / target-repo root the lane actually runs in (Redmine #13392).
+
+    A non-git sublane skips ``git worktree add`` (``LAUNCH_SKIP_NO_GIT``) — the requested
+    ``--worktree`` path is never created and carries no herdr identity segment, so the lane
+    runs in the **workspace root** itself (the tmux-era directory-scaffold-lane semantics).
+    When the launch skipped the worktree for that reason AND the ops adapter exposes the
+    optional ``canonical_workspace_root()`` capability, this returns that root; every other
+    case (a Git worktree lane, or an adapter without the capability) returns the requested
+    ``worktree_path`` unchanged, so the Git path stays byte-for-byte the prior behaviour.
+    """
+    if skip_no_git:
+        getter = getattr(ops, "canonical_workspace_root", None)
+        if callable(getter):
+            root = (getter() or "").strip()
+            if root:
+                return root
+    return worktree_path or ""
+
+
 def _normalize_path(path: str) -> str:
     try:
         return str(Path(path).expanduser().resolve())
@@ -294,4 +329,5 @@ __all__ = (
     "GATEWAY_READY_CAPTURE_LINES",
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
+    "resolve_lane_runtime_root",
 )

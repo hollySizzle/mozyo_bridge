@@ -74,6 +74,18 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 - 実 store / 実 workspace を汚さない工夫: 使い捨て stub slot (sleep process + `--no-focus`) や scratch `MOZYO_BRIDGE_HOME` を使い、smoke 後に必ず回収 (#13358 j#73456/j#73472 の実例)。
 - 破壊系 (server 停止等) は並列 lane を巻き込むため、同一 fail path の代替実測 (例: `MOZYO_HERDR_BINARY=/usr/bin/false`) で置換可 (#13355 実例)。
 
+## 非 Git workspace の lane (directory scaffold, #13392)
+
+herdr backend は非 Git workspace (registry 採用済みの scratch / sync フォルダ等、git repo でない workspace root) の lane も動かせる。tmux 時代の directory-scaffold-lane 対応を herdr で復元したもの (設計正本: `vibes/docs/logics/sublane-lifecycle-map.md` の Git/非Git 差分、裁定 #13392 j#74067)。
+
+- **runtime cwd = workspace root**: 非 Git lane は worktree を持たない (`git worktree add` は skip)。lane の cwd / `cockpit append --repo` / dispatch の `--target-repo` gate はすべて **workspace root 自身** に collapse する。lane agent は workspace root で走る。
+- **明示形 (当面)**: `sublane create` は現状 `--branch` / `--worktree` を必須とするため、非 Git では **`--worktree <workspace root 絶対 path>`** を明示指定する (sibling worktree path を渡すと phantom path になり identity 解決に失敗する。code は skip_no_git 時に workspace root へ collapse するが、明示形が意図を最も明確にする)。`--branch` は使われないため任意の値でよい。contract の optionality 改善は follow-up #13432。
+- **placement**: 非 Git lane も #13380 の dedicated sublane host workspace に着地する。lane の identity は `(project workspace_id, lane_label)` unit であり、`lane_id != default` なので coordinator の default-lane pair とは別 slot。host 分離は「distinct repo-root がある時だけ」ではなく `(workspace_id, lane_id)` + lane-aware placement で成立する (非 Git は repo-root を共有しても lane 分化する)。
+- **並列 lane**: 同一非 Git workspace root 上で複数 lane を並走できる。lane_metadata は lane ごとに lane-scoped key (`dl_<hash(root, lane_id)>`) で記録され上書きしない (Git lane の `wt_<hash(worktree path)>` とは別体系)。
+- **retire**: `sublane retire --worktree <workspace root>` で対象 `(workspace_id, lane_id)` の managed slot のみ close する。coordinator の default-lane pair は close しない。**branch / merge / worktree cleanup は非 Git では対象外** (worktree が無いため `git worktree remove` / branch 削除 / retire-time merge は発生しない。成果の取り込みは別経路)。
+- **注意**: 非 Git の並列 lane は conversation / runtime lane の分離であって filesystem isolation ではない (branch / worktree による隔離は存在しない)。Google Drive / sync フォルダでは owner 方針どおり auto git-init はしない。
+- 記録衛生は Git lane と同じ: workspace root の host-local 絶対 path を Redmine journal に書かない (workspace label / lane label で参照)。
+
 ## 記録の衛生
 
 - journal / commit message に host-local 絶対 path を書かない (worktree は sibling 名または lane label で参照)。`lane_metadata` の `worktree_path` は host-local private (正本: `vibes/docs/rules/public-private-boundary.md`)。
