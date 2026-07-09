@@ -32,6 +32,7 @@ from mozyo_bridge.application.herdr_launch_command import (
     deliver_herdr_launch_outcome,
     herdr_attach_argv,
     herdr_attach_command_line,
+    render_herdr_session_block,
     session_ready,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
@@ -193,6 +194,18 @@ class HerdrLaunchPolicyTests(unittest.TestCase):
         self.assertEqual(payload["attach"], "/usr/local/bin/herdr")
         self.assertEqual(payload["session_start"]["workspace_id"], "ws1")
         self.assertEqual(len(payload["session_start"]["slots"]), 2)
+        # Redmine #13446: the JSON confirms the workspace/agents AND names the standard
+        # next action (sublane dispatch), not just the tmux-era attach.
+        self.assertIn("sublane create --execute", payload["next_action"])
+
+    def test_session_block_names_standard_next_action(self) -> None:
+        block = render_herdr_session_block(_ready_result(), "/usr/local/bin/herdr")
+        # Existing lines preserved (agents/workspace confirmed + attach hint).
+        self.assertIn("herdr session-start", block)
+        self.assertIn("attach: /usr/local/bin/herdr", block)
+        # Redmine #13446: the summary also points at the standard lane-dispatch surface.
+        self.assertIn("next: ", block)
+        self.assertIn("sublane create --execute", block)
 
 
 # --- use case decision --------------------------------------------------------

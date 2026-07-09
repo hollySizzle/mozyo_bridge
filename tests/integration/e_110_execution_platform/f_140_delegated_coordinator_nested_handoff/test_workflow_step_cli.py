@@ -97,6 +97,8 @@ _ABSENT_STORE = (None, "store_absent")
 def _run(args, candidates, *, self_pane="%self"):
     out = io.StringIO()
     with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
         cli_workflow, "current_pane", lambda: self_pane
     ), patch.object(
         cli_workflow, "_discover_candidates", return_value=candidates
@@ -173,6 +175,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
@@ -199,6 +203,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
     def test_execute_json_is_single_envelope(self):
         gateway = _cand("%gw", project_scope=PROJECT)
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
@@ -273,6 +279,8 @@ class ExecuteWorkerDispatchTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[child, worker]
@@ -320,6 +328,8 @@ class ExecuteCallbackTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[gateway, grandparent]

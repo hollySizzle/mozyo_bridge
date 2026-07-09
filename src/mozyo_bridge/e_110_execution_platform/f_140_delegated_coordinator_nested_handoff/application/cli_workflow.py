@@ -75,12 +75,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_watch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+    EXECUTION_BLOCKED,
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
+    OWNER_OPERATOR,
     PRIMITIVE_CHILD_INTAKE,
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
+    PRIMITIVE_NONE,
     PRIMITIVE_TICKETLESS_CALLBACK,
+    REASON_HERDR_SELF_LANE_UNRESOLVED,
+    STATE_LANE_UNRESOLVED,
     PendingCallback,
     WorkflowAnchor,
     WorkflowStepOutcome,
@@ -298,6 +303,54 @@ def _execute_primitive(
     return int(rc or 0), buf.getvalue()
 
 
+def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | None:
+    """Herdr-backend preflight for ``workflow step`` (Redmine #13446), or ``None`` under tmux.
+
+    ``workflow step`` resolves the current lane from ``current_pane()`` — the tmux
+    ``TMUX_PANE`` ``%pane`` — matched against the tmux discovery inventory. Under
+    ``terminal_transport.backend: herdr`` there is no ``TMUX_PANE`` (or the pane is not in
+    the tmux inventory), so the standard entrypoint dies on ``TMUX_PANE is not set`` or folds
+    to a tmux-shaped ``self_lane_unresolved`` — the #13435 j#74176 -> j#74177 recurrence.
+
+    When the repo selects the herdr backend, this preflight looks at the herdr-native
+    lane-identity env (``HERDR_PANE_ID`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
+    ``MOZYO_LANE_ID``) *first* and returns a fail-closed :class:`WorkflowStepOutcome` whose
+    ``reason`` is the herdr-specific :data:`REASON_HERDR_SELF_LANE_UNRESOLVED`, whose
+    ``next_action`` points at the standard ``sublane create/start --execute`` dispatch, and
+    whose ``detail`` records exactly which herdr env keys were observed — never a bare tmux
+    ``%pane`` diagnostic. Returns ``None`` under the tmux backend so the tmux path (and its
+    byte-identical output) is unchanged.
+
+    This is a preflight guard, not herdr-native ``workflow step`` routing: resolving the
+    step natively from the herdr inventory is out of this MVP's scope (Codex triage j#74179);
+    the guard replaces a tmux-shaped dead end with an actionable herdr-native fail-closed
+    outcome.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        HERDR_STANDARD_DISPATCH_HINT,
+        herdr_backend_active,
+        herdr_lane_env_detail,
+    )
+
+    repo_root = repo_root_from_args(args)
+    if not herdr_backend_active(repo_root):
+        return None
+    return WorkflowStepOutcome(
+        state=STATE_LANE_UNRESOLVED,
+        next_action=(
+            "herdr backend active: workflow step's tmux %pane self-lane resolution does "
+            "not apply in a herdr session. " + HERDR_STANDARD_DISPATCH_HINT
+        ),
+        execution=EXECUTION_BLOCKED,
+        reason=REASON_HERDR_SELF_LANE_UNRESOLVED,
+        next_owner=OWNER_OPERATOR,
+        primitive=PRIMITIVE_NONE,
+        repo_root=str(repo_root),
+        detail=herdr_lane_env_detail(),
+    )
+
+
 def cmd_workflow_step(args: argparse.Namespace) -> int:
     """Resolve and advance one safe workflow step (Redmine #12755 standard entrypoint).
 
@@ -313,10 +366,23 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     Returns 0 for a forward step (executed / ready / dry_run / no_op) and 1 for a
     fail-closed blocked outcome.
     """
+    as_json = getattr(args, "as_json", False)
+
+    # Herdr-backend preflight (Redmine #13446): before touching the tmux rail, fail closed
+    # with a herdr-specific reason + `sublane` next_action instead of dying on the tmux
+    # `%pane` self-lane resolution a herdr session cannot serve. No-op under `backend: tmux`,
+    # so the tmux path below (and its output) is byte-identical.
+    herdr_pre = _herdr_step_preflight(args)
+    if herdr_pre is not None:
+        if as_json:
+            print(_json.dumps(herdr_pre.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            _print_outcome_text(herdr_pre)
+        return 0 if herdr_pre.ok else 1
+
     require_tmux()
     self_pane = current_pane()
     session = getattr(args, "session", None)
-    as_json = getattr(args, "as_json", False)
     dry_run = getattr(args, "dry_run", False)
 
     live = resolve_workflow_step(

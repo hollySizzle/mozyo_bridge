@@ -130,6 +130,10 @@ def build_herdr_json_payload(
     full session-start outcome (workspace / lane / per-slot names + locators).
     """
 
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        HERDR_STANDARD_DISPATCH_HINT,
+    )
+
     return {
         "backend": BACKEND_HERDR,
         "ready": session_ready(result),
@@ -137,6 +141,11 @@ def build_herdr_json_payload(
         "attach": attach_command,
         "attached": False,
         "no_attach": True,
+        # Redmine #13446: the standard next-action pointer, so `mozyo --json` confirms the
+        # herdr workspace/agents AND names the safe lane-dispatch surface (`sublane create
+        # --execute`) rather than leaving the tmux-era selection primitives as the apparent
+        # entrypoint.
+        "next_action": HERDR_STANDARD_DISPATCH_HINT,
     }
 
 
@@ -150,6 +159,10 @@ def render_herdr_session_block(
     so ``--no-attach`` prints exactly what the operator needs to attach later.
     """
 
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        HERDR_STANDARD_DISPATCH_HINT,
+    )
+
     lines = [
         f"herdr session-start: workspace={result.workspace_id} lane={result.lane_id}"
     ]
@@ -159,6 +172,10 @@ def render_herdr_session_block(
             line += f" locator={slot.locator}"
         lines.append(line)
     lines.append(f"attach: {attach_command}")
+    # Redmine #13446: name the standard lane-dispatch next action so the confirmed herdr
+    # workspace/agents summary also tells the operator the safe next step (not the tmux-era
+    # selection primitives).
+    lines.append(f"next: {HERDR_STANDARD_DISPATCH_HINT}")
     return "\n".join(lines)
 
 

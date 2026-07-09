@@ -2,6 +2,19 @@
 
 herdr backend (`terminal_transport.backend: herdr`) での sublane 運用の標準手順。2026-07-07〜08 の herdr 移行波 (#13331 / #13355〜#13360) の live 実測で確立した運用を replay 可能な形で固定する。設計正本は `vibes/docs/specs/herdr-native-identity.md`、role/gate の正本は central preset と `vibes/docs/rules/agent-workflow.md`。本書は手順のみを扱い、規約本文を複製しない。
 
+## 標準入口 vs primitive/debug 面 (#13446)
+
+backend=herdr の workspace では、旧 tmux-era の semantic selection / pane 選択入口を **通常入口として選ばない**。これらは tmux server と tmux pane inventory を前提にしており、herdr session (tmux pane を持たない agent) では live agent が存在しても `no_candidate:repo` / `self_lane_unresolved` に落ちる (再発事例 #13435 j#74176 -> j#74177: repo config=herdr・`herdr agent list` に Codex/Claude が居るのに、coordinator が `agents targets` / `handoff send --select` を先に叩いて tmux 選択側で `no_candidate:repo`)。
+
+- **lane 実装 dispatch の標準形**: `sublane create --execute` / `sublane start --execute` (coordinator 経由。詳細は下記「lane 作成 (標準形)」)。
+- **primitive / debug / compat 面** (標準入口ではない): `handoff send` / `handoff send --select` / 明示 `%pane` target / `agents targets` / `message --select-role` / `workflow step` の tmux `%pane` self-lane 解決。これらは低レベル primitive・互換・debug 用途に限る。
+- **preflight guard**: backend=herdr を検出した標準入口は、旧 tmux selection へ silent に落ちず `herdr backend active` を明示して上記標準形へ誘導する (fail-closed / guidance)。
+  - `mozyo` (bare, herdr): session-start で workspace / 両 agent slot の存在を確認し、summary に `next:` (標準 dispatch) を出す。`--json` は `next_action` を持つ。
+  - `workflow step`: backend=herdr では tmux `%pane` に触れる前に fail-closed し、reason=`herdr_self_lane_unresolved`・herdr-native lane env (`HERDR_PANE_ID` / `MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`) の観測 detail・`sublane` next_action を返す。
+  - `handoff send --select` / `message --select-role`: selection fail 時、message に `herdr backend active` と `sublane create --execute` / `--target-lane` 代替を出す。
+  - `agents targets`: backend=herdr で tmux-era primitive/debug 面である旨を stderr note で明示 (listing 自体は read-only で維持)。
+- tmux backend の workspace では上記 guard は一切発火せず、出力は byte-invariant。
+
 ## 前提
 
 - 実行 CLI: **installed CLI (pipx の `mozyo-bridge` / `mozyo`) が標準** (#13167 で herdr lane 世代へ追いつき済み、#13379 で installed CLI のみでの lane 運用完結を確認)。installed CLI が最新 origin/main と版ズレしている間に限り、fallback として **repo-local CLI** を使う。fallback の標準形は package 直の module 実行 (`src/mozyo_bridge/__main__.py` 経由):

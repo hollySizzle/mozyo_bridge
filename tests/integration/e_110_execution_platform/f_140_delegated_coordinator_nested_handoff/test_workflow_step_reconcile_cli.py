@@ -89,6 +89,8 @@ def _run_step(args, candidates, *, self_pane="%self"):
     """Run `cmd_workflow_step` with a real store read (only tmux/discovery patched)."""
     out = io.StringIO()
     with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
         cli_workflow, "current_pane", lambda: self_pane
     ), patch.object(
         cli_workflow, "_discover_candidates", return_value=candidates
