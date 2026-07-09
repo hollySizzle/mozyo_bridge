@@ -53,6 +53,7 @@ def heal_and_retry_dispatch(
     failed_dispatch_detail: str,
     dispatch: bool,
     target_repo: str,
+    lane_runtime_root: str,
     adopted: bool,
     fill_decision: Optional[str],
     fill_override_reason: Optional[str],
@@ -64,11 +65,14 @@ def heal_and_retry_dispatch(
     gateway is still resolvable — the failure is not the vanish mode), leaving
     ``steps`` untouched so the caller's plain fail-closed block is unchanged. Once
     applicable it always returns a terminal outcome (executed or blocked).
+
+    ``lane_runtime_root`` (#13392) is the root the read-back / relaunch drive against —
+    the Git worktree, or a non-git lane's workspace root (never the phantom path).
     """
     heal = getattr(use_case.ops, "heal_lane_column", None)
     if not callable(heal):
         return None
-    lane_after = use_case.ops.read_lane(request.worktree_path)
+    lane_after = use_case.ops.read_lane(lane_runtime_root)
     if lane_after is not None and lane_after.gateway_pane:
         # The gateway is still resolvable: the dispatch failed for some other
         # reason (route / anchor / rail), which a relaunch cannot fix.
@@ -85,7 +89,7 @@ def heal_and_retry_dispatch(
         )
     )
     try:
-        heal(request.worktree_path)
+        heal(lane_runtime_root)
     except Exception as exc:  # noqa: BLE001 — fail-closed on any heal failure.
         steps.append(
             ActuationStep(
@@ -110,7 +114,7 @@ def heal_and_retry_dispatch(
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
         )
-    healed_lane = use_case.ops.read_lane(request.worktree_path)
+    healed_lane = use_case.ops.read_lane(lane_runtime_root)
     if not (healed_lane and healed_lane.gateway_pane and healed_lane.worker_pane):
         steps.append(
             ActuationStep(

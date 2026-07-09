@@ -216,6 +216,35 @@ def is_lane_workspace_token(value: object) -> bool:
     return isinstance(value, str) and bool(_LANE_TOKEN_RE.match(value.strip()))
 
 
+#: Prefix marking a *directory-scaffold* (non-git) lane's metadata key (Redmine #13392).
+#: A non-git lane has no worktree — its runtime root IS the shared workspace root, so the
+#: ``wt_<hash-of-path>`` token collides across every lane on that root. The lane-metadata
+#: display join therefore keys such a lane on ``(workspace root, lane_id)`` under this
+#: distinct prefix. It is a metadata key only — NOT a workspace segment (a non-git lane's
+#: live slots carry the shared ``(project workspace_id, lane_id)`` unit, resolved by unit,
+#: never a per-lane workspace), so :func:`is_lane_workspace_token` deliberately does not
+#: match it (a ``dl_`` token is never mistaken for a legacy ``wt_`` per-lane workspace).
+DIRECTORY_LANE_TOKEN_PREFIX: str = "dl"
+
+
+def derive_directory_lane_token(canonical_workspace_root: str, lane_id: str) -> str:
+    """The deterministic lane-metadata key for a non-git (directory scaffold) lane (#13392).
+
+    A non-git sublane skips the ``git worktree add`` stage (``LAUNCH_SKIP_NO_GIT``) and
+    runs in the shared workspace root itself, so :func:`derive_lane_workspace_token`
+    (path-only) yields the SAME token for every lane on that root and the token-keyed
+    :mod:`...core.state.lane_metadata` store would overwrite one lane's record with the
+    next. This helper scopes the key by ``(canonical workspace root, lane_id)`` instead —
+    the lane discriminant is the ``lane_id`` (the mzb1 lane segment), exactly the unit the
+    live inventory carries — so two lanes on one non-git root keep distinct records. Same
+    invariants as the ``wt_`` token: deterministic, private-path-safe (only the hash is
+    emitted), and drawn from ``[a-z0-9_]`` so :func:`encode_assigned_name` would accept it.
+    """
+    basis = f"{canonical_workspace_root}\x00{lane_id}"
+    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()
+    return f"{DIRECTORY_LANE_TOKEN_PREFIX}_{digest[:_LANE_TOKEN_HEX_LEN]}"
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed decode reason vocabulary (core-owned, closed set).
 # ---------------------------------------------------------------------------
@@ -695,7 +724,9 @@ __all__ = (
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
     "LANE_WORKSPACE_TOKEN_PREFIX",
+    "DIRECTORY_LANE_TOKEN_PREFIX",
     "derive_lane_workspace_token",
+    "derive_directory_lane_token",
     "is_lane_workspace_token",
     "NAME_MAX_LENGTH",
     "REASON_BAD_ESCAPE",

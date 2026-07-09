@@ -88,6 +88,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    derive_directory_lane_token,
     derive_lane_workspace_token,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
@@ -130,6 +131,11 @@ class HerdrSublaneActuatorOps:
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
+
+    def canonical_workspace_root(self) -> str:
+        # #13392: the coordinator's workspace root — the lane runtime root of a non-git
+        # (skip_no_git) lane, which has no worktree and runs in the workspace root itself.
+        return str(self.repo_root)
 
     def is_git_workspace(self) -> bool:
         return self._git().is_git_workspace()
@@ -208,7 +214,21 @@ class HerdrSublaneActuatorOps:
             return
         # The stable per-worktree metadata key (also the legacy pre-#13377 workspace
         # segment) — NOT the mzb1 workspace segment, which is the project identity now.
-        token = derive_lane_workspace_token(str(resolved))
+        # #13392: a non-git (directory scaffold) lane has no worktree — the use case
+        # collapses its runtime root to the shared workspace root (``== self.repo_root``),
+        # so the path-only ``wt_`` token would collide across every lane on that root and
+        # one lane's record would overwrite the next. Detect that collapse (runtime root IS
+        # the workspace root) and scope the key by ``(workspace root, lane_id)`` instead so
+        # two lanes on one non-git root keep distinct records (live unit stays
+        # ``(project ws, lane_id)``). A Git lane's distinct worktree keeps the ``wt_`` token.
+        try:
+            is_workspace_root = resolved == self.repo_root.expanduser().resolve()
+        except OSError:
+            is_workspace_root = False
+        if is_workspace_root:
+            token = derive_directory_lane_token(str(resolved), self.lane_label or "")
+        else:
+            token = derive_lane_workspace_token(str(resolved))
         try:
             repo_workspace_id = herdr_workspace_segment(self.repo_root)
         except (OSError, ValueError):

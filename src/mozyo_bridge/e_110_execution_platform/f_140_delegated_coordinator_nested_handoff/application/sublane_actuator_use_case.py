@@ -53,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
+    LAUNCH_SKIP_NO_GIT,
     LaunchPreflight,
     SublaneIntegrationPolicy,
     WorktreeLaunchDecision,
@@ -68,6 +69,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DEFAULT_GATEWAY_READY_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_READY_PROBES,
     SublaneActuatorOps,
+    resolve_lane_runtime_root,
 )
 
 
@@ -338,6 +340,7 @@ class SublaneActuateUseCase:
             if launch.action == LAUNCH_CREATE_WORKTREE
             else None
         )
+        lane_runtime_root = resolve_lane_runtime_root(self.ops, request.worktree_path or "", skip_no_git=launch.action == LAUNCH_SKIP_NO_GIT)  # noqa: E501
         steps = [
             ActuationStep(
                 order=1,
@@ -353,7 +356,7 @@ class SublaneActuateUseCase:
                 detail="append (or adopt) a cockpit-visible gateway + worker column and "
                 "bind the lane / role / workspace / repo-root stamps",
                 # #13155: render the SAME argv the live append drives (incl. --claude-model).
-                command="mozyo-bridge " + " ".join(self.ops.append_lane_argv(request.worktree_path)),  # noqa: E501
+                command="mozyo-bridge " + " ".join(self.ops.append_lane_argv(lane_runtime_root)),  # noqa: E501
             ),
             ActuationStep(
                 order=3,
@@ -418,6 +421,11 @@ class SublaneActuateUseCase:
         fill_override_reason: Optional[str] = None,
     ) -> SublaneActuationOutcome:
         steps: list[ActuationStep] = []
+        # #13392: the lane runtime root — worktree (Git) or workspace root (non-git); the
+        # dispatch repo/cwd gate collapses to it too (a non-git lane's agent cwd IS it).
+        lane_runtime_root = resolve_lane_runtime_root(self.ops, request.worktree_path or "", skip_no_git=launch.action == LAUNCH_SKIP_NO_GIT)  # noqa: E501
+        if launch.action == LAUNCH_SKIP_NO_GIT:
+            target_repo = lane_runtime_root
 
         # Step 1 — worktree (create / reuse / skip).
         if launch.action == LAUNCH_CREATE_WORKTREE:
@@ -495,7 +503,7 @@ class SublaneActuateUseCase:
         # ambiguous target and fails closed here. Never adopt / append onto — nor later
         # dispatch to — a lane whose lane_label / issue does not match the request, which
         # would misdeliver the implementation_request to the wrong gateway (Review j#70250).
-        existing = self.ops.read_lane(request.worktree_path)
+        existing = self.ops.read_lane(lane_runtime_root)
         if existing is not None and not self._identity_matches(existing, request):
             steps.append(
                 ActuationStep(
@@ -538,7 +546,7 @@ class SublaneActuateUseCase:
             )
         else:
             try:
-                self.ops.append_lane_column(request.worktree_path)
+                self.ops.append_lane_column(lane_runtime_root)
             except Exception as exc:  # noqa: BLE001 — fail-closed on any append failure.
                 steps.append(
                     ActuationStep(
@@ -559,7 +567,7 @@ class SublaneActuateUseCase:
                     fill_decision=fill_decision,
                     fill_override_reason=fill_override_reason,
                 )
-            lane = self.ops.read_lane(request.worktree_path)
+            lane = self.ops.read_lane(lane_runtime_root)
             if not (lane and lane.gateway_pane and lane.worker_pane):
                 steps.append(
                     ActuationStep(
@@ -761,6 +769,7 @@ class SublaneActuateUseCase:
                 failed_dispatch_detail=dispatch_detail,
                 dispatch=dispatch,
                 target_repo=target_repo,
+                lane_runtime_root=lane_runtime_root,
                 adopted=adopted,
                 fill_decision=fill_decision,
                 fill_override_reason=fill_override_reason,
@@ -832,6 +841,7 @@ class SublaneActuateUseCase:
         failed_dispatch_detail: str,
         dispatch: bool,
         target_repo: str,
+        lane_runtime_root: str,
         adopted: bool,
         fill_decision: Optional[str],
         fill_override_reason: Optional[str],
@@ -858,6 +868,7 @@ class SublaneActuateUseCase:
             failed_dispatch_detail=failed_dispatch_detail,
             dispatch=dispatch,
             target_repo=target_repo,
+            lane_runtime_root=lane_runtime_root,
             adopted=adopted,
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
