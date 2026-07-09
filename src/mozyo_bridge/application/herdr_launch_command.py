@@ -62,6 +62,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SessionStartResult,
     prepare_session,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+    COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     PROVIDER_CLAUDE,
     PROVIDER_CODEX,
@@ -216,11 +219,23 @@ class LiveHerdrLaunchOps:
     def prepare(self, repo_root: Path) -> SessionStartResult:
         # Prepare both provider slots in the default (no-lane) session, reusing the
         # existing idempotent adopt/launch + self-identity `--env` injection.
+        #
+        # Redmine #13397 (finding 3): this is the bare `mozyo` COORDINATOR pair launch
+        # (claude + codex, default no-lane session). #13360 gave the herdr LANE worker
+        # `--permission-mode` parity with the tmux managed pane but deliberately left
+        # bare `mozyo` flagless — which leaves an external-project coordinator's Claude
+        # booting prompt-gated (manual mode) and unusable headless, the asymmetry the
+        # #13379 j#73721 finding 3 recorded. Passing the same cockpit/sublane policy
+        # default (`auto`) gives the coordinator Claude the identical reproducible
+        # permission posture the lane worker already has. The `MOZYO_CLAUDE_PERMISSION_MODE`
+        # env override still wins for an operator who wants a different mode, and Codex
+        # is untouched (the policy is claude-only).
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
             env=self._env,
+            claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

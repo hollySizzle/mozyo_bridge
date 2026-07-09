@@ -284,6 +284,7 @@ def _worker_dispatch_argv(
     gateway_callback_target: Optional[str],
     target_repo: str,
     allow_direct_worker: bool = False,
+    repo_root: Optional[str] = None,
 ) -> list[str]:
     """The same-lane worker forward as the gateway would type it (pure).
 
@@ -299,8 +300,28 @@ def _worker_dispatch_argv(
     recorded distinctly as a ``gateway_route_exception`` instead of failing closed.
     The same-lane gateway drive leaves it off (default), so the #12988 contract is
     byte-for-byte back-compatible.
+
+    ``repo_root`` (Redmine #13397) pins the top-level ``--repo`` so the inner
+    ``handoff send`` resolves its *effective backend* from the SAME repo the outer
+    ``sublane dispatch-worker`` already selected — not from the driving process's
+    cwd. Under ``terminal_transport.backend: herdr`` the send-path backend predicate
+    (``herdr_effective_backend_selected`` → ``load_repo_local_config(repo_root_from_args(args))``)
+    reads the config at ``repo_root_from_args``, which defaults to a marker walk from
+    cwd. In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
+    every checkout / lane worktree carries it and cwd resolution happens to agree; in
+    an **external** adopted project the herdr selection lives only at the adopted root,
+    so a drive whose cwd resolves elsewhere re-derived ``backend: tmux`` and validated
+    the herdr worker locator (``wS:p3``) as an invalid tmux target, failing closed with
+    ``target_unavailable`` (#13379 j#73722). Pinning ``--repo`` to the outer-resolved
+    root makes the inner backend match the outer selection. ``None`` (the tmux
+    :class:`LiveWorkerDispatchOps` default) omits the flag, so the tmux argv stays
+    byte-for-byte the pre-#13397 shape.
     """
-    argv = [
+    argv: list[str] = []
+    if repo_root:
+        # Top-level flag: it MUST precede the ``handoff`` subcommand.
+        argv += ["--repo", repo_root]
+    argv += [
         "handoff",
         "send",
         "--to",

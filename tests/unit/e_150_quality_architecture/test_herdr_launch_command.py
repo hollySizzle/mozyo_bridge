@@ -402,5 +402,47 @@ class BareMozyoBackendRoutingTests(unittest.TestCase):
         self.assertTrue(herdr)
 
 
+class CoordinatorPermissionParityTests(unittest.TestCase):
+    """Redmine #13397 finding 3: the bare ``mozyo`` coordinator-pair launch resolves
+    the Claude ``--permission-mode`` from the SAME cockpit/sublane policy default
+    (``auto``) the #13360 lane worker uses, so the coordinator Claude is headless-
+    capable instead of booting prompt-gated (manual) in an external project.
+
+    Exercises the *live* :class:`LiveHerdrLaunchOps.prepare` — where the policy
+    default is set — with ``prepare_session`` patched, so no live herdr binary runs.
+    """
+
+    def _captured_prepare_kwargs(self) -> dict:
+        from unittest.mock import patch
+
+        from mozyo_bridge.application import herdr_launch_command as mod
+
+        seen: dict = {}
+
+        def _fake_prepare_session(**kwargs):
+            seen.update(kwargs)
+            return _ready_result()
+
+        ops = mod.LiveHerdrLaunchOps(env={"MOZYO_HERDR_BINARY": "/usr/bin/true"})
+        with patch.object(mod, "prepare_session", _fake_prepare_session):
+            ops.prepare(Path("/repo"))
+        return seen
+
+    def test_prepare_passes_auto_permission_default(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (  # noqa: E501
+            COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+        )
+
+        seen = self._captured_prepare_kwargs()
+        self.assertEqual(
+            seen.get("claude_permission_mode_default"),
+            COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
+        )
+        self.assertEqual(COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT, "auto")
+        # The coordinator pair is still claude + codex in the default (no-lane) session.
+        self.assertEqual(list(seen.get("providers")), ["claude", "codex"])
+        self.assertEqual(seen.get("lane_id"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

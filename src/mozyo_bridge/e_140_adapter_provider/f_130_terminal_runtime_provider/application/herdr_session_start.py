@@ -620,10 +620,13 @@ def prepare_session(
     assigned name, a launch that yields no usable locator).
 
     ``claude_permission_mode_default`` is the launch-context policy default for the
-    managed Claude permission mode (Redmine #11925 / #13360): sublane lane creation
-    passes ``auto`` so lane workers are reproducibly auto (tmux parity); the
-    session-start / bare ``mozyo`` paths pass ``None`` so the historical bare
-    ``claude`` launch never changes silently. The ``MOZYO_CLAUDE_PERMISSION_MODE``
+    managed Claude permission mode (Redmine #11925 / #13360 / #13397): sublane lane
+    creation passes ``auto`` so lane workers are reproducibly auto (tmux parity), and
+    the bare ``mozyo`` coordinator-pair launch (``herdr_launch_command``) also passes
+    ``auto`` so the coordinator Claude has the same headless-capable posture as its lane
+    workers (Redmine #13397 finding 3 — the pre-#13397 flagless coordinator booted
+    prompt-gated in an external project). A caller that passes ``None`` still gets the
+    historical flagless bare ``claude`` launch. The ``MOZYO_CLAUDE_PERMISSION_MODE``
     env override rail wins over the default either way (resolved from ``env``).
     """
     for provider in providers:
