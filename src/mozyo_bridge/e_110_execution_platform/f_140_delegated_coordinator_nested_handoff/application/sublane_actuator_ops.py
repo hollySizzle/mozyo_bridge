@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
@@ -32,7 +32,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
+    LaunchPreflight,
+    SublaneIntegrationPolicy,
+    WorktreeLaunchDecision,
+    decide_worktree_launch,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    SublaneCreateRequest,
     SublaneLaneView,
     project_sublanes,
 )
@@ -316,6 +323,70 @@ def resolve_lane_runtime_root(
     return worktree_path or ""
 
 
+def default_nongit_worktree_request(
+    ops: object, request: SublaneCreateRequest, is_git: bool
+) -> SublaneCreateRequest:
+    """Default a non-git lane's omitted ``--worktree`` to the workspace root (Redmine #13432).
+
+    In a non-git (directory-scaffold) workspace the lane has no worktree — it runs in the
+    workspace root itself (#13392 論点1) — so an omitted ``--worktree`` collapses to the lane
+    runtime root. Returns ``request`` unchanged for a Git workspace, when a worktree is
+    already supplied, or when the ops adapter exposes no resolvable workspace root (the
+    non-git plan does not require the field either way).
+    """
+    if is_git or (request.worktree_path or "").strip():
+        return request
+    root = resolve_lane_runtime_root(ops, "", skip_no_git=True)
+    if not root:
+        return request
+    return replace(request, worktree_path=root)
+
+
+def decide_create_launch(
+    ops: object, request: SublaneCreateRequest, policy: SublaneIntegrationPolicy
+) -> WorktreeLaunchDecision:
+    """The #12604 worktree launch decision for a create request over the ops git probes.
+
+    Shared by the plan-only (:class:`SublaneCreateUseCase`) and actuator
+    (:class:`SublaneActuateUseCase`) create paths: probe git, resolve the identity /
+    worktree-exists preflight facts, and ask the pure :func:`decide_worktree_launch`. A
+    non-git workspace resolves to ``LAUNCH_SKIP_NO_GIT`` before the identity gate, so a
+    #13432 non-git lane (optional ``--branch`` / ``--worktree``) is never blocked here.
+    """
+    is_git = ops.is_git_workspace()
+    identity_known = bool(request.branch) and bool(request.worktree_path)
+    worktree_exists = (
+        ops.worktree_exists(request.branch) if is_git and identity_known else False
+    )
+    preflight = LaunchPreflight(
+        is_git_workspace=is_git,
+        worktree_exists=worktree_exists,
+        branch_resolved=bool(request.branch),
+        target_identity_known=identity_known,
+    )
+    return decide_worktree_launch(policy, preflight)
+
+
+def resolve_create_identity(
+    ops: object, request: SublaneCreateRequest
+) -> tuple[SublaneCreateRequest, tuple[str, ...]]:
+    """Resolve the create-request identity + its fail-closed ``missing_fields`` (Redmine #13432).
+
+    The shared #13432 identity contract for both the plan-only and the actuator create use
+    cases: a blank field under the Git-strict contract triggers one git probe; in a non-git
+    workspace ``--branch`` / ``--worktree`` are optional and the omitted ``--worktree``
+    defaults to the workspace root. A fully-supplied request never probes (so a later gate —
+    work-unit / anchor — still short-circuits before any probe). Returns the (possibly
+    worktree-defaulted) request and the remaining required-field gap.
+    """
+    missing = request.missing_fields()
+    if not missing:
+        return request, missing
+    is_git = ops.is_git_workspace()
+    request = default_nongit_worktree_request(ops, request, is_git)
+    return request, request.missing_fields(is_git=is_git)
+
+
 def _normalize_path(path: str) -> str:
     try:
         return str(Path(path).expanduser().resolve())
@@ -330,4 +401,7 @@ __all__ = (
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
     "resolve_lane_runtime_root",
+    "decide_create_launch",
+    "default_nongit_worktree_request",
+    "resolve_create_identity",
 )

@@ -388,11 +388,24 @@ def register_lifecycle(sub) -> None:
         required=True,
         help="Lane label (e.g. issue_<id>_<slug>)",
     )
+    # #13432: `--branch` / `--worktree` are the Git worktree identity. They are required in
+    # a Git workspace (a missing field fails closed in the create/actuate use case with a
+    # `missing_field:*` diagnostic), but OPTIONAL in a non-Git directory-scaffold workspace,
+    # where the lane has no worktree and runs in the workspace root itself (#13392 論点1).
+    # argparse cannot condition `required` on the runtime git probe, so the requirement is
+    # enforced downstream (post-probe) instead of at parse time; omit them for a non-Git
+    # lane and `--worktree` defaults to the workspace root.
     sublane_create.add_argument(
-        "--branch", required=True, help="Branch name for the lane worktree"
+        "--branch",
+        default="",
+        help="Branch name for the lane worktree (required in a Git workspace; optional "
+        "for a non-Git directory-scaffold lane, which has no worktree)",
     )
     sublane_create.add_argument(
-        "--worktree", required=True, help="Worktree path for the lane"
+        "--worktree",
+        default="",
+        help="Worktree path for the lane (required in a Git workspace; optional for a "
+        "non-Git lane, where it defaults to the workspace root — the lane runtime root)",
     )
     # #13293: pin the base the lane worktree is cut from. Default (omit) keeps the
     # historical `git worktree add <path> -b <branch>` behavior (branch off the main

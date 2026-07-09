@@ -54,10 +54,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
     LAUNCH_SKIP_NO_GIT,
-    LaunchPreflight,
     SublaneIntegrationPolicy,
     WorktreeLaunchDecision,
-    decide_worktree_launch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneCreateRequest,
@@ -69,6 +67,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DEFAULT_GATEWAY_READY_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_READY_PROBES,
     SublaneActuatorOps,
+    decide_create_launch,
+    resolve_create_identity,
     resolve_lane_runtime_root,
 )
 
@@ -149,24 +149,6 @@ class SublaneActuateUseCase:
             return False
         return True
 
-    def _decide_launch(
-        self, request: SublaneCreateRequest
-    ) -> WorktreeLaunchDecision:
-        is_git = self.ops.is_git_workspace()
-        identity_known = bool(request.branch) and bool(request.worktree_path)
-        worktree_exists = (
-            self.ops.worktree_exists(request.branch)
-            if is_git and identity_known
-            else False
-        )
-        preflight = LaunchPreflight(
-            is_git_workspace=is_git,
-            worktree_exists=worktree_exists,
-            branch_resolved=bool(request.branch),
-            target_identity_known=identity_known,
-        )
-        return decide_worktree_launch(self.policy, preflight)
-
     def run(
         self,
         request: SublaneCreateRequest,
@@ -177,8 +159,9 @@ class SublaneActuateUseCase:
         fill_inputs: Optional[FillDecisionInputs] = None,
         override_fill_stop: Optional[str] = None,
     ) -> SublaneActuationOutcome:
-        # 1. Fail closed on missing identity before any probe.
-        missing = request.missing_fields()
+        # 1. Fail closed on missing identity (#13432: a non-git workspace relaxes
+        # --branch/--worktree and defaults the omitted worktree to the workspace root).
+        request, missing = resolve_create_identity(self.ops, request)
         if missing:
             return self._blocked(
                 request,
@@ -245,7 +228,7 @@ class SublaneActuateUseCase:
         # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
         # identity field present (step 1 passed) the pure decision does not currently
         # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
-        launch = self._decide_launch(request)
+        launch = decide_create_launch(self.ops, request, self.policy)
         if launch.action == LAUNCH_BLOCKED:
             return self._blocked(
                 request,
