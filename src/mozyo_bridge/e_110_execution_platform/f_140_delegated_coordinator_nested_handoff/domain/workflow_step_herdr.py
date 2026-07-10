@@ -54,11 +54,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
-    EXECUTION_READY,
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
-    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
     STATE_GRANDCHILD_REDMINE_WORK,
@@ -365,26 +363,27 @@ def resolve_herdr_workflow_step(
         return _anchor_blocked(lane, STATE_CHILD_WORKER_DISPATCH, anchor_status, OWNER_CHILD)
 
     if worker_liveness == WORKER_LIVE:
-        # Increment 2 (coordinator disposition j#74855): the one-step worker dispatch. With a
-        # verified source-of-truth anchor + a single live same-lane worker (the stable target) +
-        # an attested identity, this is an **executable** forward leg — the gateway lane's
-        # `workflow step` drives `sublane dispatch-worker --execute` once (the CLI layer runs the
-        # primitive through the shared dry-run / reconcile / fail-closed pipeline). No destructive
-        # drain/retire; ACK is not completion.
+        # Increment 2 (coordinator disposition j#74855) authorizes a one-step worker dispatch,
+        # but the dispatch-vs-monitor decision must come from the verified Redmine gate + the
+        # worker runtime state + a duplicate fence — NOT from mere worker liveness (independent
+        # review j#74912 / audit j#74909). Pending the coordinator's confirmation of the exact
+        # dispatch-authorizing gate/state, runtime authority, and idempotency source (design
+        # consultation), this leg is **monitor / no_op** — it never auto-dispatches. Explicit
+        # dispatch stays the existing `sublane dispatch-worker --execute` primitive.
         return WorkflowStepOutcome(
             state=STATE_CHILD_WORKER_DISPATCH,
             next_action=(
-                "dispatch the single live same-lane worker for the verified Redmine anchor "
-                f"({anchor_pointer}) with `sublane dispatch-worker --execute` (one step). The "
-                "delivery ACK is not completion — the worker advances the implementation and "
-                "records implementation_done on the durable record."
+                "this sublane gateway has a verified Redmine anchor "
+                f"({anchor_pointer}) and a single live same-lane worker. Monitor the durable "
+                "record; dispatch (or re-dispatch) the worker with `sublane dispatch-worker "
+                "--execute` only when the Redmine gate + worker runtime state warrant it. The "
+                "one-step auto-dispatch gate is pending coordinator confirmation."
             ),
-            execution=EXECUTION_READY,
+            execution=EXECUTION_NO_OP,
             reason=REASON_HERDR_WORKER_DISPATCH_READY,
-            next_owner=OWNER_GRANDCHILD,
-            primitive=PRIMITIVE_HERDR_DISPATCH_WORKER,
+            next_owner=OWNER_CHILD,
+            primitive=PRIMITIVE_NONE,
             durable_anchor=anchor_pointer or "none",
-            lane_label=lane_label,
             detail=lane.detail,
             **base,
         )

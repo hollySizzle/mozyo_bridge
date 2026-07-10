@@ -23,11 +23,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
-    EXECUTION_READY,
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
-    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
     STATE_GRANDCHILD_REDMINE_WORK,
@@ -162,25 +160,18 @@ class ResolveGatewayLaneTest(unittest.TestCase):
             anchor_pointer=VERIFIED_PTR,
         )
 
-    def test_verified_anchor_single_live_worker_is_executable_dispatch(self):
-        # Increment 2 (j#74855): a verified anchor + a single live worker is an executable
-        # one-step dispatch (not a no_op) driving `sublane dispatch-worker --execute`.
+    def test_verified_anchor_single_live_worker_is_monitor_no_op(self):
+        # Increment 2 auto-dispatch gate is pending coordinator confirmation (independent review
+        # j#74912): a verified anchor + a single live worker MONITORS (no_op), never auto-dispatches
+        # on liveness alone. The dispatch-vs-monitor decision needs the Redmine gate + runtime state.
         out = self._run(WORKER_LIVE)
         self.assertEqual(out.state, STATE_CHILD_WORKER_DISPATCH)
-        self.assertEqual(out.execution, EXECUTION_READY)
+        self.assertEqual(out.execution, EXECUTION_NO_OP)
         self.assertEqual(out.reason, REASON_HERDR_WORKER_DISPATCH_READY)
-        self.assertEqual(out.primitive, PRIMITIVE_HERDR_DISPATCH_WORKER)
-        self.assertTrue(out.executable)
+        self.assertEqual(out.primitive, PRIMITIVE_NONE)
+        self.assertFalse(out.executable)
         self.assertEqual(out.durable_anchor, VERIFIED_PTR)
-        self.assertEqual(out.next_owner, OWNER_GRANDCHILD)
         self.assertIn("sublane dispatch-worker", out.next_action)
-
-    def test_dispatch_carries_lane_label(self):
-        out = resolve_herdr_workflow_step(
-            self._lane(), worker_liveness=WORKER_LIVE, anchor_status=ANCHOR_VERIFIED,
-            anchor_pointer=VERIFIED_PTR, lane_label="issue_13489_x",
-        )
-        self.assertEqual(out.lane_label, "issue_13489_x")
 
     def test_duplicate_worker_is_ambiguous_fail_closed(self):
         out = self._run(WORKER_AMBIGUOUS)
@@ -206,36 +197,27 @@ class ResolveGatewayLaneTest(unittest.TestCase):
 
 
 class ExecutabilityInvariantTest(unittest.TestCase):
-    def test_only_the_gateway_dispatch_leg_is_executable(self):
-        # Increment 2: the gateway one-step dispatch is the ONLY executable herdr leg; the
-        # worker no_op and every fail-closed leg stay resolution-only (primitive=none).
-        non_executable = [
+    def test_no_herdr_resolver_leg_is_executable_pending_dispatch_gate(self):
+        # The auto-dispatch gate is pending coordinator confirmation, so no herdr resolver leg
+        # is executable yet (every leg is resolution-only / primitive=none, including the
+        # gateway monitor). The dispatch execution wiring is exercised separately by the CLI
+        # tests via a directly-constructed dispatch outcome.
+        legs = [
             resolve_herdr_workflow_step(
                 classify_herdr_workflow_lane(provider="claude", lane_id="l", repo_root="/w"),
-                anchor_status=ANCHOR_VERIFIED,
-                anchor_pointer=VERIFIED_PTR,
+                anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR,
+            ),
+            resolve_herdr_workflow_step(
+                classify_herdr_workflow_lane(provider="codex", lane_id="l", repo_root="/w"),
+                worker_liveness=WORKER_LIVE, anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR,
             ),
             resolve_herdr_workflow_step(
                 classify_herdr_workflow_lane(provider="codex", lane_id="default", repo_root="/w")
             ),
-            resolve_herdr_workflow_step(
-                classify_herdr_workflow_lane(provider="codex", lane_id="l", repo_root="/w"),
-                worker_liveness=WORKER_ABSENT,
-                anchor_status=ANCHOR_VERIFIED,
-                anchor_pointer=VERIFIED_PTR,
-            ),
         ]
-        for out in non_executable:
+        for out in legs:
             self.assertEqual(out.primitive, PRIMITIVE_NONE)
             self.assertFalse(out.executable)
-
-    def test_gateway_dispatch_is_the_executable_leg(self):
-        out = resolve_herdr_workflow_step(
-            classify_herdr_workflow_lane(provider="codex", lane_id="l", repo_root="/w"),
-            worker_liveness=WORKER_LIVE, anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR,
-        )
-        self.assertTrue(out.executable)
-        self.assertEqual(out.primitive, PRIMITIVE_HERDR_DISPATCH_WORKER)
 
 
 if __name__ == "__main__":  # pragma: no cover
