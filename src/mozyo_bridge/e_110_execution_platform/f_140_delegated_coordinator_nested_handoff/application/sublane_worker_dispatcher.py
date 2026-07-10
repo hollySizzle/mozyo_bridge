@@ -388,7 +388,22 @@ def _replayable_command(
     gateway_callback_target: Optional[str],
     target_repo: str,
     allow_direct_worker: bool = False,
+    target_lane: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> str:
+    """The replayable retry command surfaced on the outcome / durable journal.
+
+    Redmine #13485 review F1: the outcome's ``command`` is documented as a *replayable
+    retry command* (:func:`render_worker_dispatch_journal`), so on the herdr rail it MUST
+    carry the same stable-lane authority the actual dispatch pins — ``--target-lane`` (the
+    lane the ``read_lane`` decode confirmed) and the #13397 ``--repo`` backend pin — or
+    replaying the printed command would drop back to the sender-lane re-derivation this US
+    fixes (a cross-lane replay would false-positive ACK on the wrong lane again). The pins
+    ride the same ``target_lane`` / ``repo_root`` params ``_worker_dispatch_argv`` uses, so
+    the printed command is byte-identical to the argv the herdr adapter actually drove. The
+    tmux path passes neither (both ``None``), so its command stays byte-for-byte the prior
+    shape.
+    """
     return "mozyo-bridge " + " ".join(
         _worker_dispatch_argv(
             issue=issue,
@@ -398,6 +413,8 @@ def _replayable_command(
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            target_lane=target_lane,
+            repo_root=repo_root,
         )
     )
 
@@ -448,6 +465,19 @@ class WorkerDispatchUseCase:
             if attempt + 1 < probes:
                 self.sleep(self.worker_ready_interval_seconds)
         return False
+
+    def _command_pins(self) -> dict:
+        """Backend-specific replay-authority pins for the durable / dry-run command.
+
+        Redmine #13485 review F1: the outcome ``command`` is a replayable retry command,
+        so the herdr adapter supplies the ``--target-lane`` / ``--repo`` authority its
+        actual dispatch pins (:meth:`HerdrWorkerDispatchOps.command_authority_pins`) and
+        the command reproduces the true argv. An optional port capability read through
+        ``getattr`` — the tmux :class:`LiveWorkerDispatchOps` does not define it, so its
+        command stays byte-for-byte the pre-#13485 shape (no pins).
+        """
+        getter = getattr(self.ops, "command_authority_pins", None)
+        return getter() if callable(getter) else {}
 
     def run(
         self,
@@ -565,6 +595,7 @@ class WorkerDispatchUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
+        pins = self._command_pins()
         command = _replayable_command(
             issue=request.issue,
             journal=request.journal,
@@ -573,6 +604,8 @@ class WorkerDispatchUseCase:
             gateway_callback_target=lane.gateway_pane,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            target_lane=pins.get("target_lane"),
+            repo_root=pins.get("repo_root"),
         )
 
         # 6. Dry-run: preview the resolved transfer; perform nothing.
@@ -710,6 +743,11 @@ class WorkerDispatchUseCase:
                 lane_label=request.lane_label,
                 gateway_callback_target=gateway_pane,
                 target_repo=target_repo,
+                **{
+                    k: v
+                    for k, v in self._command_pins().items()
+                    if k in ("target_lane", "repo_root")
+                },
             ),
             blocked_reasons=reasons,
             fill_decision=fill_decision,

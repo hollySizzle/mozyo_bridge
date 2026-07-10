@@ -98,6 +98,20 @@ class HerdrWorkerDispatchOps:
             timeout=self.timeout,
         )
 
+    def command_authority_pins(self) -> dict:
+        """The stable-lane authority pins the replayable outcome command must carry (#13485).
+
+        Redmine #13485 review F1: the outcome / dry-run ``command`` is a *replayable retry
+        command*, and on the herdr rail the actual dispatch pins ``--target-lane`` (the
+        lane the ``read_lane`` decode confirmed) and the #13397 ``--repo`` backend root.
+        The use case reads these through ``getattr`` (an optional port capability the tmux
+        :class:`LiveWorkerDispatchOps` does not provide) and threads them into
+        :func:`_replayable_command`, so the printed / journaled command is byte-identical to
+        the argv this adapter actually drove — a safe replay that re-resolves the SAME
+        stable slot, never the sender-derived lane. The tmux command carries no pins.
+        """
+        return {"target_lane": self.lane_label, "repo_root": str(self.repo_root)}
+
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         """The #13331 live-inventory lane read-back (worktree → workspace → slots)."""
         return self._actuator_ops().read_lane(worktree_path)

@@ -190,6 +190,31 @@ class _DivergentSenderWorld:
                 rc = _drive_worker_send_argv(argv)
         return rc, out.getvalue(), err.getvalue()
 
+    def drive_pinned_replay_argv(self):
+        """Re-drive the exact pinned argv the herdr outcome `command` now prints (F1).
+
+        Redmine #13485 review F1: the durable outcome `command` carries `--target-lane`
+        + `--repo`, so replaying it must land on the stable worker even from the divergent
+        sender lane — the whole point of making the command a safe replay. This builds that
+        identical argv and drives the real send composition.
+        """
+        argv = _worker_dispatch_argv(
+            issue="13485",
+            journal="74651",
+            worker_pane=self.worker_locator,
+            lane_label=LANE,
+            gateway_callback_target=self.gateway_locator,
+            target_repo=str(self.project_root),
+            repo_root=str(self.project_root),
+            target_lane=LANE,
+            allow_direct_worker=True,
+        )
+        with self._driving_context():
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = _drive_worker_send_argv(argv)
+        return rc, argv, out.getvalue(), err.getvalue()
+
     def dispatch_via_production_ops(self, *, worker_pane: str = None):
         """The fix, as production wires it: ``HerdrWorkerDispatchOps`` pins the lane.
 
@@ -274,6 +299,24 @@ class StableWorkerTargetScenario(unittest.TestCase):
             self.world.injections_to(self.world.default_locator),
             [],
             msg="the pinned dispatch must not touch the default-lane claude",
+        )
+
+    def test_pinned_replay_command_lands_on_stable_worker(self) -> None:
+        # Review F1: the durable outcome `command` (now lane+repo pinned) is a SAFE replay
+        # — re-driving that exact argv from the divergent (default-lane) sender lands on the
+        # stable lane worker, not the default-lane peer. This is the regression the review
+        # requires: replaying the printed command never regresses to the wrong-lane ACK.
+        rc, argv, out, err = self.world.drive_pinned_replay_argv()
+        self.assertIn("--target-lane", argv)
+        self.assertEqual(rc, 0, msg=f"pinned replay must be green\nout={out}\nerr={err}")
+        self.assertTrue(
+            self.world.injections_to(self.world.worker_locator),
+            msg=f"replayed command must reach the stable worker; calls={self.world.fake.calls}",
+        )
+        self.assertEqual(
+            self.world.injections_to(self.world.default_locator),
+            [],
+            msg="replayed command must not touch the default-lane claude",
         )
 
     def test_pinned_dispatch_fails_closed_when_lane_worker_absent(self) -> None:
