@@ -46,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECONCILE_STORE_ABSENT,
     RECONCILE_STORE_ALIGNED,
     RECONCILE_STORE_GATES_LIVE,
+    RECONCILE_STORE_ISSUE_MISMATCH,
     RECONCILE_STORE_NO_PENDING,
     RECONCILE_STORE_UNAVAILABLE,
     STORE_ABSENT,
@@ -100,6 +101,50 @@ def _na(action, *, owner_role="coordinator", risk=RISK_LOW, confirm=False, block
         reason="test",
         provider="codex",
     )
+
+
+class IssueCorrelationTest(unittest.TestCase):
+    """Issue-correlation of the store action with a herdr live-verified anchor (Redmine #13489 F3c)."""
+
+    def test_matching_issue_reconciles_normally(self):
+        rec = reconcile_step_with_store(
+            _live_blocked(), _na("perform_review"),
+            store_status=STORE_PRESENT, live_anchor_issue="13291",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ALIGNED)
+
+    def test_mismatched_issue_is_rejected_not_aligned(self):
+        rec = reconcile_step_with_store(
+            _live_blocked(), _na("perform_review"),
+            store_status=STORE_PRESENT, live_anchor_issue="99999",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ISSUE_MISMATCH)
+        self.assertIs(rec.outcome, rec.live_outcome)  # live outcome unchanged
+
+    def test_mismatched_gating_action_does_not_gate_a_ready_leg(self):
+        rec = reconcile_step_with_store(
+            _live_ready(), _na("integrate", confirm=True),
+            store_status=STORE_PRESENT, live_anchor_issue="99999",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ISSUE_MISMATCH)
+        self.assertEqual(rec.outcome.execution, "ready")  # NOT downgraded to blocked
+
+    def test_none_anchor_issue_is_byte_invariant_tmux(self):
+        # The tmux path passes None -> no correlation constraint -> prior behaviour (gates).
+        rec = reconcile_step_with_store(
+            _live_ready(), _na("integrate", confirm=True),
+            store_status=STORE_PRESENT, live_anchor_issue=None,
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_GATES_LIVE)
+
+    def test_anchor_field_issue_match(self):
+        import dataclasses
+
+        na = dataclasses.replace(_na("perform_review"), target_issue="")  # anchor "13291:72672"
+        rec = reconcile_step_with_store(
+            _live_blocked(), na, store_status=STORE_PRESENT, live_anchor_issue="13291",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ALIGNED)
 
 
 class PredicateTest(unittest.TestCase):

@@ -96,6 +96,9 @@ ANCHOR_RETIRED = "retired"
 #: The candidate issue could not be verified against the source-of-truth Redmine gate (the
 #: live journal read was unconfigured / failed / found no structured gate marker, R1/F3a).
 ANCHOR_UNVERIFIED = "unverified"
+#: A caller-supplied advisory store asserts a *different* (issue, journal, gate) for this same
+#: lane than the source-of-truth Redmine verification produced (drift / forgery, F3c).
+ANCHOR_STORE_MISMATCH = "store_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +121,8 @@ REASON_HERDR_ANCHOR_UNRESOLVED = "herdr_anchor_unresolved"
 REASON_HERDR_ANCHOR_AMBIGUOUS = "herdr_anchor_ambiguous"
 #: The candidate issue could not be verified against the source-of-truth Redmine gate (F3a).
 REASON_HERDR_ANCHOR_UNVERIFIED = "herdr_anchor_unverified"
+#: A caller-supplied advisory store contradicts the source-of-truth anchor for this lane (F3c).
+REASON_HERDR_ANCHOR_STORE_MISMATCH = "herdr_anchor_store_mismatch"
 #: A default-lane Codex/Claude pair carries no step-time durable role authority (j#74748 F1).
 REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED = "ambiguous_default_coordinator_role"
 #: The current herdr lane's provider is not a known runtime provider (claude / codex).
@@ -135,6 +140,7 @@ HERDR_STEP_REASONS = frozenset(
         REASON_HERDR_ANCHOR_UNRESOLVED,
         REASON_HERDR_ANCHOR_AMBIGUOUS,
         REASON_HERDR_ANCHOR_UNVERIFIED,
+        REASON_HERDR_ANCHOR_STORE_MISMATCH,
         REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
         REASON_HERDR_LANE_ROLE_UNRESOLVED,
         REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
@@ -256,6 +262,7 @@ def _anchor_blocked(
     reason = {
         ANCHOR_AMBIGUOUS: REASON_HERDR_ANCHOR_AMBIGUOUS,
         ANCHOR_UNVERIFIED: REASON_HERDR_ANCHOR_UNVERIFIED,
+        ANCHOR_STORE_MISMATCH: REASON_HERDR_ANCHOR_STORE_MISMATCH,
     }.get(anchor_status or "", REASON_HERDR_ANCHOR_UNRESOLVED)
     detail = {
         ANCHOR_AMBIGUOUS: (
@@ -265,6 +272,10 @@ def _anchor_blocked(
         ANCHOR_UNVERIFIED: (
             "the candidate issue could not be verified against the source-of-truth Redmine "
             "gate (live journal read unconfigured / failed / no structured gate marker)"
+        ),
+        ANCHOR_STORE_MISMATCH: (
+            "a caller-supplied advisory store asserts a different anchor for this lane than "
+            "the source-of-truth Redmine verification; fail closed rather than trust the store"
         ),
         ANCHOR_RETIRED: "the lane's only candidate record is retired (tombstone / stale)",
         ANCHOR_MISSING: "no candidate record joins this lane to a Redmine issue",
@@ -414,6 +425,7 @@ __all__ = (
     "ANCHOR_AMBIGUOUS",
     "ANCHOR_RETIRED",
     "ANCHOR_UNVERIFIED",
+    "ANCHOR_STORE_MISMATCH",
     "REASON_HERDR_WORKER_STEP_READY",
     "REASON_HERDR_WORKER_DISPATCH_READY",
     "REASON_HERDR_WORKER_SLOT_MISSING",
@@ -422,6 +434,7 @@ __all__ = (
     "REASON_HERDR_ANCHOR_UNRESOLVED",
     "REASON_HERDR_ANCHOR_AMBIGUOUS",
     "REASON_HERDR_ANCHOR_UNVERIFIED",
+    "REASON_HERDR_ANCHOR_STORE_MISMATCH",
     "REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED",
     "REASON_HERDR_LANE_ROLE_UNRESOLVED",
     "REASON_HERDR_SENDER_IDENTITY_UNRESOLVED",

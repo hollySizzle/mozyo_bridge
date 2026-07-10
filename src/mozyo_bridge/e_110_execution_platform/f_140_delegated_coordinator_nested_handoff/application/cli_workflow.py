@@ -186,6 +186,24 @@ def _pending_callback_from_args(args: argparse.Namespace) -> PendingCallback | N
     return PendingCallback(classification=classification)
 
 
+def _anchor_issue_of(durable_anchor: str) -> str | None:
+    """The Redmine issue id from a ``redmine:issue=<id>:journal=<id>`` pointer, or ``None``.
+
+    Used to issue-correlate the store reconcile with a herdr live outcome's verified anchor
+    (Redmine #13489 F3c). ``"none"`` / an empty / a non-Redmine pointer yields ``None`` (no
+    correlation constraint), so a herdr lane with no verified anchor reconciles unchanged.
+    """
+    s = (durable_anchor or "").strip()
+    if not s or s == "none" or not s.startswith("redmine:"):
+        return None
+    for field in s.split(":"):
+        field = field.strip()
+        if field.startswith("issue="):
+            issue = field[len("issue="):].strip()
+            return issue or None
+    return None
+
+
 def _print_outcome_text(outcome: WorkflowStepOutcome) -> None:
     print(f"state: {outcome.state}")
     print(f"execution: {outcome.execution}")
@@ -376,6 +394,10 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     herdr_live = _herdr_step_preflight(args)
     if herdr_live is not None:
         live = herdr_live
+        # The herdr live anchor was verified against source-of-truth Redmine; issue-correlate the
+        # store reconcile against it so a caller-supplied store's cross-issue pending action is not
+        # surfaced onto this lane (Redmine #13489 F3c). The tmux path passes None (byte-invariant).
+        live_anchor_issue = _anchor_issue_of(live.durable_anchor)
     else:
         require_tmux()
         self_pane = current_pane()
@@ -386,6 +408,7 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
             pending_callback=_pending_callback_from_args(args),
             session=session,
         )
+        live_anchor_issue = None
 
     # Reconcile the live routing outcome with the persisted runtime store's pending
     # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades
@@ -394,7 +417,9 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     # Fold the store with the SAME repo-local binding resume uses, resolved from the
     # current self lane's repo root (review j#72693), so the reconcile input matches resume.
     store_action, store_status = _load_store_action(args, repo_root=live.repo_root)
-    reconciled = reconcile_step_with_store(live, store_action, store_status=store_status)
+    reconciled = reconcile_step_with_store(
+        live, store_action, store_status=store_status, live_anchor_issue=live_anchor_issue
+    )
     outcome = reconciled.outcome
 
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work

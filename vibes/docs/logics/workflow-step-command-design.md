@@ -248,6 +248,13 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   を verify する。credential 未設定 / transport 失敗 / issue-journal 不在 / gate marker 無し / issue
   不一致は **fail-closed** (`herdr_anchor_unverified`、credential/URL は出力しない)。未検証 anchor で
   ready を返さない。新 credential/network 実装は既存 port を再利用し重複させない。
+- **store↔Redmine issue-correlation (j#74810 F3c)。** caller-supplied advisory store が同 lane に
+  異なる `(issue, journal, gate)` を主張する場合は fail-closed (`herdr_anchor_store_mismatch`、store の
+  canonical `redmine:<issue>:<journal>` event を advisory cross-check として抽出)。さらに共通
+  `reconcile_step_with_store` は herdr の live-verified anchor issue (`live_anchor_issue`) と store の
+  overall pending action の `target_issue`/anchor を相関し、不一致 action は `store_aligned`/gate せず
+  fixed disposition `store_issue_mismatch` で不採用 (audit 反映、live outcome 不変)。tmux は
+  `live_anchor_issue=None` で byte 不変。
 - **same-lane worker liveness は cardinality (j#74749 F2 / j#74750)。** gateway は同一
   `(workspace, lane, claude)` の 0 / 1 / 2+ を保持し、2+ = ambiguous / locator 欠落 = fail-closed
   とし、重複 identity を silent target にしない。

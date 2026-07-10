@@ -219,6 +219,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
     ANCHOR_AMBIGUOUS,
     ANCHOR_RETIRED,
+    ANCHOR_STORE_MISMATCH,
     ANCHOR_UNVERIFIED,
 )
 
@@ -282,32 +283,35 @@ class CandidateIssueTest(unittest.TestCase):
 
 
 class VerifyLaneGateLiveTest(unittest.TestCase):
-    """The source-of-truth Redmine gate verification (F3a)."""
+    """The source-of-truth Redmine gate verification (F3a) — returns (journal, gate)."""
 
     def _run(self, source):
         with patch.object(adapter, "_redmine_journal_source_for", return_value=source):
             return adapter._verify_lane_gate_live(argparse.Namespace(), "13489")
 
     def test_gate_marker_journal_is_verified(self):
-        journal = self._run(_snapshot_source([{"id": 74766, "notes": _GATE_NOTE}]))
+        journal, gate = self._run(_snapshot_source([{"id": 74766, "notes": _GATE_NOTE}]))
         self.assertEqual(journal, "74766")
+        self.assertTrue(gate)  # the runtime gate (review) accompanies the verified journal
 
     def test_note_without_gate_marker_is_unverified(self):
-        journal = self._run(_snapshot_source([{"id": 74766, "notes": "plain note, no marker"}]))
-        self.assertEqual(journal, "")
+        self.assertEqual(
+            self._run(_snapshot_source([{"id": 74766, "notes": "plain note, no marker"}])),
+            ("", ""),
+        )
 
     def test_unconfigured_credentials_fail_closed(self):
         with patch.object(
             adapter, "_redmine_journal_source_for", side_effect=LiveRedmineJournalError("unconfigured")
         ):
-            self.assertEqual(adapter._verify_lane_gate_live(argparse.Namespace(), "13489"), "")
+            self.assertEqual(adapter._verify_lane_gate_live(argparse.Namespace(), "13489"), ("", ""))
 
     def test_transport_error_fails_closed(self):
         class _BoomSource:
             def read_entries(self, issue):
                 raise LiveRedmineJournalError("transport down")
 
-        self.assertEqual(self._run(_BoomSource()), "")
+        self.assertEqual(self._run(_BoomSource()), ("", ""))
 
     def test_marker_for_a_different_issue_is_rejected(self):
         # A gate marker whose entry issue != the candidate issue must not verify (issue match).
@@ -315,31 +319,45 @@ class VerifyLaneGateLiveTest(unittest.TestCase):
             def read_entries(self, issue):
                 return [RedmineJournalEntry(issue_id="99999", journal_id="74766", notes=_GATE_NOTE)]
 
-        self.assertEqual(self._run(_MismatchSource()), "")
+        self.assertEqual(self._run(_MismatchSource()), ("", ""))
 
     def test_latest_gate_marker_wins(self):
-        journal = self._run(
-            _snapshot_source(
-                [
-                    {"id": 100, "notes": _GATE_NOTE},
-                    {"id": 200, "notes": _GATE_NOTE},
-                ]
-            )
+        journal, _ = self._run(
+            _snapshot_source([{"id": 100, "notes": _GATE_NOTE}, {"id": 200, "notes": _GATE_NOTE}])
         )
         self.assertEqual(journal, "200")
 
 
-class ResolveLaneAnchorTest(unittest.TestCase):
-    """Compose candidate + live-Redmine verification (F3)."""
+class CanonicalEventJournalTest(unittest.TestCase):
+    """The canonical `redmine:<issue>:<journal>` event-id validation (F3a)."""
 
-    def _run(self, candidate, journal):
+    def test_canonical_redmine_prefixed(self):
+        self.assertEqual(adapter._canonical_event_journal("redmine:13489:74766", "13489"), "74766")
+
+    def test_canonical_bare(self):
+        self.assertEqual(adapter._canonical_event_journal("13489:74766", "13489"), "74766")
+
+    def test_issue_mismatch_rejected(self):
+        self.assertEqual(adapter._canonical_event_journal("redmine:99999:74766", "13489"), "")
+
+    def test_non_canonical_rejected(self):
+        self.assertEqual(adapter._canonical_event_journal("opaque:74766", "13489"), "")
+        self.assertEqual(adapter._canonical_event_journal("13489:74766:extra", "13489"), "")
+
+
+class ResolveLaneAnchorTest(unittest.TestCase):
+    """Compose candidate + live-Redmine verification + advisory store cross-check (F3 / F3c)."""
+
+    def _run(self, candidate, verified, store_anchor=None):
         with patch.object(adapter, "_candidate_issue", return_value=candidate), patch.object(
-            adapter, "_verify_lane_gate_live", return_value=journal
-        ):
-            return adapter._resolve_lane_anchor(argparse.Namespace(), Path("/repo"), "issue_1")
+            adapter, "_verify_lane_gate_live", return_value=verified
+        ), patch.object(adapter, "_store_lane_anchor", return_value=store_anchor):
+            return adapter._resolve_lane_anchor(
+                argparse.Namespace(), WS, Path("/repo"), "issue_1"
+            )
 
     def test_candidate_plus_verified_gate_is_verified(self):
-        status, ptr = self._run(("13489", ""), "74766")
+        status, ptr = self._run(("13489", ""), ("74766", "review"))
         self.assertEqual(status, ANCHOR_VERIFIED)
         self.assertEqual(ptr, VERIFIED_PTR)  # issue + journal from source-of-truth Redmine
 
@@ -348,20 +366,100 @@ class ResolveLaneAnchorTest(unittest.TestCase):
 
         def _verify(_a, _i):
             called["hit"] = True
-            return "74766"
+            return "74766", "review"
 
         with patch.object(adapter, "_candidate_issue", return_value=("", ANCHOR_AMBIGUOUS)), \
              patch.object(adapter, "_verify_lane_gate_live", side_effect=_verify):
-            status, _ = adapter._resolve_lane_anchor(argparse.Namespace(), Path("/repo"), "issue_1")
+            status, _ = adapter._resolve_lane_anchor(
+                argparse.Namespace(), WS, Path("/repo"), "issue_1"
+            )
         self.assertEqual(status, ANCHOR_AMBIGUOUS)
         self.assertNotIn("hit", called)  # no live read when the candidate already fails closed
 
     def test_candidate_but_unverified_gate_fails_closed(self):
-        # THE core F3 regression: a lane-metadata candidate alone (no verified Redmine gate)
-        # is NOT proof -> fail closed, never a fabricated ready.
-        status, ptr = self._run(("13489", ""), "")
+        # A lane-metadata candidate alone (no verified Redmine gate) is NOT proof -> fail closed.
+        status, ptr = self._run(("13489", ""), ("", ""))
         self.assertEqual(status, ANCHOR_UNVERIFIED)
         self.assertEqual(ptr, "")
+
+    def test_store_agreeing_is_verified(self):
+        status, _ = self._run(
+            ("13489", ""), ("74766", "review"), store_anchor=("13489", "74766", "review")
+        )
+        self.assertEqual(status, ANCHOR_VERIFIED)
+
+    def test_store_absent_is_verified(self):
+        status, _ = self._run(("13489", ""), ("74766", "review"), store_anchor=None)
+        self.assertEqual(status, ANCHOR_VERIFIED)
+
+    def test_store_issue_mismatch_fails_closed(self):
+        status, _ = self._run(
+            ("13489", ""), ("74766", "review"), store_anchor=("99999", "", "")
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+    def test_store_journal_mismatch_fails_closed(self):
+        status, _ = self._run(
+            ("13489", ""), ("74766", "review"), store_anchor=("13489", "99999", "review")
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+
+class StoreLaneAnchorTest(unittest.TestCase):
+    """The advisory store's per-lane (issue, journal, gate) extraction (F3c)."""
+
+    def _run(self, *, store):
+        with patch.object(adapter, "_load_workflow_store", return_value=store):
+            return adapter._store_lane_anchor(argparse.Namespace(store_path=None), WS, "issue_1")
+
+    def _route(self, issue="13489"):
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRouteRow
+
+        return WorkflowRouteRow(
+            route_id="r", issue=issue, workspace_id=WS, lane_id="issue_1", role="codex",
+            pane_name="p", last_seen_pane_id="", observed_at="t",
+        )
+
+    def _event(self, event_id, issue="13489", gate="review"):
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowEventRow
+
+        return WorkflowEventRow(
+            event_id=event_id, issue=issue, gate=gate, review_conclusion="",
+            callback_state="", commit_bearing=False, integration_recorded=False,
+            issue_open=True, blocker_recorded=False,
+        )
+
+    def _store(self, routes=(), events=(), exists=True):
+        return types.SimpleNamespace(
+            path=types.SimpleNamespace(exists=lambda: exists),
+            read_route_identities=lambda: tuple(routes),
+            read_events=lambda: tuple(events),
+        )
+
+    def test_absent_store_contributes_nothing(self):
+        self.assertIsNone(self._run(store=self._store(exists=False)))
+        self.assertIsNone(self._run(store=None))
+
+    def test_no_route_for_lane_contributes_nothing(self):
+        self.assertIsNone(self._run(store=self._store(routes=[self._route(issue="")])))
+
+    def test_single_route_plus_canonical_event(self):
+        anchor = self._run(
+            store=self._store(routes=[self._route()], events=[self._event("redmine:13489:74766")])
+        )
+        self.assertEqual(anchor, ("13489", "74766", "review"))
+
+    def test_two_distinct_route_issues_is_ambiguous_sentinel(self):
+        anchor = self._run(
+            store=self._store(routes=[self._route("13489"), self._route("13490")])
+        )
+        self.assertEqual(anchor[0], "<ambiguous>")
+
+    def test_route_without_canonical_event_has_empty_journal(self):
+        anchor = self._run(
+            store=self._store(routes=[self._route()], events=[self._event("opaque:74766")])
+        )
+        self.assertEqual(anchor, ("13489", "", ""))
 
 
 if __name__ == "__main__":  # pragma: no cover

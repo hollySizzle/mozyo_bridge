@@ -87,6 +87,12 @@ RECONCILE_STORE_UNAVAILABLE = "store_unavailable"
 RECONCILE_STORE_NO_PENDING = "store_no_pending_action"
 RECONCILE_STORE_ALIGNED = "store_aligned"
 RECONCILE_STORE_GATES_LIVE = "store_gates_live"
+# The store's pending action belongs to a different Redmine issue than the live-verified
+# anchor of this lane, so it is **not adopted** onto this lane's step (Redmine #13489 F3c):
+# a caller-supplied store must not surface a cross-issue action on a lane whose anchor was
+# verified against source-of-truth Redmine. Only emitted when a ``live_anchor_issue`` is
+# supplied (the herdr path); the tmux path passes ``None`` and is byte-invariant.
+RECONCILE_STORE_ISSUE_MISMATCH = "store_issue_mismatch"
 
 # The reconcile-only reason token stamped on a gated live leg (the live step's own
 # ``reason`` vocabulary is fixed; this marks a forward leg held by the store gate).
@@ -94,9 +100,11 @@ REASON_STORE_PENDING_ACTION_GATES = "store_pending_action_gates"
 
 # The dispositions that *reflect* a pending store action in the reported output. The
 # degrade / no-op dispositions do not, so a lane with no pending store action keeps the
-# exact prior ``workflow step`` output (Redmine #13291 backward-compat acceptance).
+# exact prior ``workflow step`` output (Redmine #13291 backward-compat acceptance). The
+# issue-mismatch disposition reflects the *rejected* action (auditable, never silently
+# dropped) while leaving the live outcome unchanged.
 _REFLECTING_DISPOSITIONS = frozenset(
-    {RECONCILE_STORE_ALIGNED, RECONCILE_STORE_GATES_LIVE}
+    {RECONCILE_STORE_ALIGNED, RECONCILE_STORE_GATES_LIVE, RECONCILE_STORE_ISSUE_MISMATCH}
 )
 
 # Store overall-actions that are positive-occupancy no-ops: nothing is pending, so the
@@ -109,6 +117,31 @@ _NON_PENDING_ACTIONS = frozenset(
 def store_action_is_pending(action: WorkflowNextAction) -> bool:
     """True when the store's overall action is something to act on (not a no-op/hold/await)."""
     return action.action not in _NON_PENDING_ACTIONS
+
+
+def _action_matches_issue(action: WorkflowNextAction, issue: str) -> bool:
+    """True when the store action is about ``issue`` (its ``target_issue`` or anchor issue).
+
+    Used to issue-correlate a pending store action with the lane's live-verified anchor
+    (Redmine #13489 F3c). An action with no ``target_issue`` and no anchor issue cannot be
+    correlated, so it does **not** match — a caller-supplied store never surfaces an
+    uncorrelated action onto a source-of-truth-verified lane.
+    """
+    want = (issue or "").strip()
+    if not want:
+        return False
+    if (action.target_issue or "").strip() == want:
+        return True
+    # ``anchor`` is a durable Redmine pointer (``issue:journal`` / ``redmine:issue=…:journal=…``);
+    # the issue is the first numeric-ish segment after any ``redmine:``/``issue=`` prefix.
+    anchor = (action.anchor or "").strip()
+    if not anchor:
+        return False
+    tail = anchor.split(":", 1)[1] if anchor.startswith("redmine:") else anchor
+    first = tail.split(":", 1)[0].strip()
+    if first.startswith("issue="):
+        first = first[len("issue="):].strip()
+    return first == want
 
 
 def store_action_is_gating(action: WorkflowNextAction) -> bool:
@@ -228,20 +261,28 @@ def reconcile_step_with_store(
     store_action: Optional[WorkflowNextAction],
     *,
     store_status: str,
+    live_anchor_issue: Optional[str] = None,
 ) -> ReconciledStep:
-    """Compose the live step outcome with the store's pending action (pure, #13291).
+    """Compose the live step outcome with the store's pending action (pure, #13291 / #13489).
 
     ``store_status`` is one of :data:`STORE_PRESENT` / :data:`STORE_ABSENT` /
     :data:`STORE_UNAVAILABLE` (the CLI reads the store fail-open and classifies it).
     ``store_action`` is the store's overall pending action when present, else ``None``.
+    ``live_anchor_issue`` is the Redmine issue the live outcome's anchor was **verified**
+    against (the herdr path passes it; the tmux path passes ``None`` and is byte-invariant).
 
     Ordering (fixed vocabulary, fail-toward-safe):
 
     1. absent / unavailable store -> degrade to the live outcome unchanged;
     2. present but non-pending action -> live unchanged (nothing to reflect);
-    3. pending, gating action + a live forward (``ready``) leg -> gate the live leg
+    3. **issue-correlation (Redmine #13489 F3c):** when a ``live_anchor_issue`` is supplied and
+       the pending action belongs to a *different* Redmine issue, the caller-supplied store must
+       not surface a cross-issue action onto this source-of-truth-verified lane — it is **not
+       adopted** (:data:`RECONCILE_STORE_ISSUE_MISMATCH`), the rejected action reflected for
+       audit while the live outcome is unchanged;
+    4. pending, gating action + a live forward (``ready``) leg -> gate the live leg
        (fail-closed ``blocked``): the store gate wins over the forward step;
-    4. otherwise (pending non-gating, or the live leg is already not a forward step) ->
+    5. otherwise (pending non-gating, or the live leg is already not a forward step) ->
        surface the store action alongside the unchanged live outcome (aligned).
     """
     if store_status == STORE_ABSENT:
@@ -251,6 +292,12 @@ def reconcile_step_with_store(
 
     if not store_action_is_pending(store_action):
         return ReconciledStep(live, live, RECONCILE_STORE_NO_PENDING, store_action)
+
+    anchor_issue = (live_anchor_issue or "").strip()
+    if anchor_issue and not _action_matches_issue(store_action, anchor_issue):
+        # A caller-supplied store action for a different issue is not this lane's action;
+        # reject it rather than reflect / gate it onto the verified-anchor lane.
+        return ReconciledStep(live, live, RECONCILE_STORE_ISSUE_MISMATCH, store_action)
 
     if store_action_is_gating(store_action) and live.execution == EXECUTION_READY:
         gated = _gate_live(live, store_action)
@@ -270,6 +317,7 @@ __all__ = (
     "RECONCILE_STORE_NO_PENDING",
     "RECONCILE_STORE_ALIGNED",
     "RECONCILE_STORE_GATES_LIVE",
+    "RECONCILE_STORE_ISSUE_MISMATCH",
     "REASON_STORE_PENDING_ACTION_GATES",
     "store_action_is_pending",
     "store_action_is_gating",

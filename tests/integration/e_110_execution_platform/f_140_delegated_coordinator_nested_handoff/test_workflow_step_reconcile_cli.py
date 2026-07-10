@@ -294,6 +294,29 @@ class HerdrCommonReconcileTest(_StoreCase):
             payload["store_pending_action"]["action"], "aggregate_owner_approval"
         )
 
+    def test_store_action_for_a_different_issue_is_not_adopted(self):
+        # F3c: the herdr live anchor was verified against source-of-truth Redmine (issue 13489);
+        # a caller-supplied store's pending action for a DIFFERENT issue (13291) must not be
+        # surfaced as `store_aligned` — it is rejected as `store_issue_mismatch`, live unchanged.
+        self._persist(
+            "13291:review_request,id=13291:72672,commit=1",
+            routes=("route_id=r,issue=13291,ws=w,role=codex,pane_name=gw,pane_id=%17",),
+        )
+        live = WorkflowStepOutcome(
+            state="grandchild_redmine_work",
+            next_action="read the verified anchor and implement",
+            execution=EXECUTION_NO_OP,
+            reason="herdr_worker_step_ready",
+            next_owner="grandchild",
+            primitive=PRIMITIVE_NONE,
+            durable_anchor="redmine:issue=13489:journal=74766",  # verified issue != store's 13291
+        )
+        rc, text = self._run_herdr(live, _args(self.store_path))
+        payload = json.loads(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["reason"], "herdr_worker_step_ready")  # live unchanged
+        self.assertEqual(payload["reconcile_disposition"], "store_issue_mismatch")
+
     def test_herdr_outcome_surfaces_a_non_gating_pending_action(self):
         # A non-gating pending action (review_request + codex route -> perform_review) is
         # surfaced alongside the unchanged herdr live outcome in the SAME envelope (aligned).
