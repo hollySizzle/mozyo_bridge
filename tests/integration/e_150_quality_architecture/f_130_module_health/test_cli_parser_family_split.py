@@ -175,7 +175,7 @@ class MovedCommandFuncBindingTest(unittest.TestCase):
     def test_session_bindings(self) -> None:
         self.assertEqual(_bound_func_name(self.parser, ["session", "name"]), "cmd_session_name")
         self.assertEqual(
-            _bound_func_name(self.parser, ["session", "boundary-prompt", "--issue", "1", "--journal", "2"]),
+            _bound_func_name(self.parser, ["session", "boundary-prompt", "--issue", "1", "--journal", "2", "--issue-subject", "s", "--issue-role", "r"]),
             "cmd_session_boundary_prompt",
         )
 
