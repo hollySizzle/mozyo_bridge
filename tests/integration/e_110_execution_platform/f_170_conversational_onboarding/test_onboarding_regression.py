@@ -1,23 +1,18 @@
-"""Onboarding regression guards (Redmine #13498 / #13503).
+"""Onboarding regression guards (Redmine #13498 / #13503 / #13501).
 
 - the #13379 home refusal policy is unchanged (bare `mozyo` still refuses home);
-- a broken existing config is a preflight hard block (fail-closed);
-- the bare-`mozyo` reroute hook never intercepts a fully adopted or an
-  unadopted root (only adoption_in_progress), so the adopted launch path and the
-  existing adoption gate are untouched.
+- a broken / unverifiable receipt and an unreadable config are preflight blocks;
+- the bare-`mozyo` entry hook is NOT wired by this US (#13497 scope, review F5).
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 
+from mozyo_bridge.application import cli as cli_module
 from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
-from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.commands_onboarding import (
-    maybe_resume_bare_mozyo,
-)
 from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.inspect_usecase import (
     inspect_onboarding,
 )
@@ -25,11 +20,11 @@ from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domai
     STATE_BLOCKED,
 )
 
+_SECRET = "regression-gate-secret"
+
 
 class HomeRefusalUnchangedTests(unittest.TestCase):
     def test_launch_adoption_gate_still_refuses_home(self) -> None:
-        # #13379 policy is untouched by the onboarding work: home is refused even
-        # with a marker.
         home = Path("/home/someone")
         self.assertIsNotNone(adoption_refusal(home, ".mozyo-bridge/config.yaml", home=home))
         self.assertIsNotNone(adoption_refusal(home, None, home=home))
@@ -38,11 +33,25 @@ class HomeRefusalUnchangedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             home.mkdir()
-            preflight = inspect_onboarding(home, home=home, sync_roots=()).preflight
+            preflight = inspect_onboarding(
+                home, home=home, sync_roots=(), gate_secret=_SECRET
+            ).preflight
             self.assertEqual(preflight.state, STATE_BLOCKED)
 
 
-class BrokenConfigFailClosedTests(unittest.TestCase):
+class BrokenConfigAndReceiptFailClosedTests(unittest.TestCase):
+    def _local_probe(self):
+        from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domain.path_safety import (
+            MOUNT_LOCAL,
+            MountFacts,
+        )
+
+        class _Local:
+            def classify_mount(self, path):
+                return MountFacts(state=MOUNT_LOCAL)
+
+        return _Local()
+
     def test_broken_config_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "proj"
@@ -51,38 +60,39 @@ class BrokenConfigFailClosedTests(unittest.TestCase):
                 "not: : valid: [\n", encoding="utf-8"
             )
             preflight = inspect_onboarding(
-                root, home=Path(tmp) / "home", sync_roots=()
+                root, home=Path(tmp) / "home", sync_roots=(),
+                mount_probe=self._local_probe(), gate_secret=_SECRET,
+            ).preflight
+            self.assertEqual(preflight.state, STATE_BLOCKED)
+
+    def test_unverifiable_receipt_is_blocked(self) -> None:
+        # A hand-forged onboarding receipt with no valid signature blocks the root.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "proj"
+            (root / ".mozyo-bridge").mkdir(parents=True)
+            (root / ".mozyo-bridge" / "onboarding-receipt.json").write_text(
+                '{"version":1,"root_fingerprint":"x","plan_id":"y",'
+                '"scaffold_preset":"none","rules_store":"central",'
+                '"state":"adoption_in_progress","step_status":{},'
+                '"failed_step":null,"failed_reason":null}',
+                encoding="utf-8",
+            )
+            preflight = inspect_onboarding(
+                root, home=Path(tmp) / "home", sync_roots=(),
+                mount_probe=self._local_probe(), gate_secret=_SECRET,
             ).preflight
             self.assertEqual(preflight.state, STATE_BLOCKED)
 
 
-class BareMozyoRerouteScopeTests(unittest.TestCase):
-    def _hook_returns_none_in(self, root: Path) -> None:
-        cwd = os.getcwd()
-        try:
-            os.chdir(root)
-            import argparse
+class BareEntryScopeTests(unittest.TestCase):
+    def test_bare_mozyo_does_not_wire_onboarding(self) -> None:
+        # The bare entry hook belongs to #13497; the #13501 CLI must not import a
+        # bare-launch onboarding hook into the launch path (review F5).
+        import inspect as _inspect
 
-            self.assertIsNone(maybe_resume_bare_mozyo(argparse.Namespace(json=False)))
-        finally:
-            os.chdir(cwd)
-
-    def test_reroute_ignores_unadopted_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "proj"
-            root.mkdir()
-            self._hook_returns_none_in(root)
-
-    def test_reroute_ignores_adopted_root(self) -> None:
-        # A hand-adopted (config marker, no in-progress receipt) root must not be
-        # intercepted — the adopted launch path stays intact.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "proj"
-            (root / ".mozyo-bridge").mkdir(parents=True)
-            (root / ".mozyo-bridge" / "config.yaml").write_text(
-                "terminal_transport:\n  backend: herdr\n", encoding="utf-8"
-            )
-            self._hook_returns_none_in(root)
+        source = _inspect.getsource(cli_module.main)
+        self.assertNotIn("maybe_resume_bare_mozyo", source)
+        self.assertNotIn("f_170_conversational_onboarding", source)
 
 
 if __name__ == "__main__":

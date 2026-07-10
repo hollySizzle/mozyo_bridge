@@ -378,18 +378,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _exit_on_repo_local_config_error(exc)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
-        # An in-progress onboarding at the cwd reroutes bare `mozyo` to resume
-        # instead of a normal launch (Redmine #13498): the adoption is not yet
-        # complete, so treating it as a normal launch would skip the remaining
-        # deterministic steps. The hook returns None (proceed to launch) for a
-        # fully adopted / unadopted root, so the adopted-launch path is unchanged.
-        from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.commands_onboarding import (
-            maybe_resume_bare_mozyo,
-        )
-
-        resumed = maybe_resume_bare_mozyo(args)
-        if resumed is not None:
-            return resumed
         # Backend-aware bare `mozyo` (Redmine #13324): only the resolved repo's
         # `terminal_transport.backend` chooses the entrypoint. `herdr` runs the
         # single-command herdr session-start + UI attach; `tmux` / unset / absent

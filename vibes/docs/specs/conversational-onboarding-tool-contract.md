@@ -95,7 +95,11 @@ tools:
     mutation: none
     result: {plan_id, root_fingerprint, ordered_steps, warnings, requires_confirmation}
   onboarding.apply:
-    input: {plan_id, human_confirmed: true}
+    # apply が plan record を運ぶ場合、closed schema / unknown-key を reject し、
+    # human-visible field 全て (canonical root / fingerprint / intent / gate receipt /
+    # preset / store / exact ordered steps + summaries / warnings / requires_confirmation /
+    # plan_id HMAC) を fresh 再構築 canonical plan と厳密一致させる。一致しなければ plan_unauthorized。
+    input: {plan_record (plan_id + closed intent + gate receipt + display fields), human_confirmed: true}
     mutation: bounded
     result: {state, applied_steps, no_op_steps, failed_step, next_action}
   onboarding.resume:
@@ -105,27 +109,39 @@ tools:
 ```
 
 `onboarding.plan` は `onboarding.inspect` を決定論的に再実行してpreflight factsを得る。model
-由来の path / risk / adoption / binary fact は入力として受け付けない。`plan_id` は canonical
-root、root fingerprint、再取得したpreflight facts、intent、existing file hashes、binary realpath、
-必要なhuman gate receiptから生成する。`apply` は全 fact を再検査し、driftしたplanを実行しない。
+由来の path / risk / adoption / binary fact は入力として受け付けない。`plan_id` は trusted secret
+鍵の HMAC authority token であり、canonical root、root fingerprint、再取得したpreflight facts
+(state 含む)、intent の全 closed field、existing file hashes、binary realpath、必要なhuman gate
+receipt、exact ordered steps / preset / store を束縛する。caller が再計算できる非鍵 hash は
+authority にしない。`apply` は fresh 再 inspect した facts と closed intent から canonical plan を
+再構築し、supplied plan record の human-visible field 全てが再構築 plan と厳密一致し `plan_id` HMAC
+が一致する時のみ実行する。forged / recomputed / drifted / wrong-secret / unknown-key / display 不一致は
+`plan_unauthorized` とする。trusted secret 未設定・空・空白のみは fail-closed。
 
-ordered steps:
+ordered steps (実行順は機械的依存で確定する: `scaffold apply` は installed preset を要求するため
+`rules install` を先に実行する):
 
-1. onboarding receipt を atomic write し `adoption_in_progress` を記録する。
-2. `scaffold apply <preset> --target <root> --backup` を既存 use case 経由で実行する。
-3. `.mozyo-bridge/config.yaml` を typed write-once tool で作る。
-4. 選択した store に `rules install` を実行する。
+1. onboarding receipt を atomic write し `adoption_in_progress` を記録する。receipt は trusted
+   secret 鍵の HMAC で署名し、read 時に検証する (署名不一致・未署名は broken → blocked)。
+2. 選択した store に `rules install` を実行する。
+3. `scaffold apply <preset> --target <root> --backup` を既存 use case 経由で実行する。
+4. `.mozyo-bridge/config.yaml` を typed write-once tool で作る。
 5. `workspace register` を実行する。
 6. `scaffold status`、config reload、workspace inspect、herdr preflight を検証する。
-7. receipt を `complete` に更新し、`mozyo --json` 相当を実行する。
+7. receipt を `complete` に更新する (`complete` は全 step settled のみ)。
 
-config write は `{version: 1, terminal_transport: {backend: herdr}}` の typed record を atomic
-create する。file 不在は create、typed-equivalent は no-op、その他の既存 config は上書きせず
-`existing_config_requires_separate_merge` で停止する。LLM に YAML を生成・merge させない。
+backend launch は本 US の step ではない。bare `mozyo` entry / launch は #13497 (conversation
+provider / bare entry hook) が所有し、本 tool は launch を実行・主張しない。
 
-各 step は idempotent で、失敗時も完了 step と原因を credential-free receipt に残す。bare
-`mozyo` は `adoption_in_progress` を通常 launch と解釈せず `onboarding.resume` へ戻す。自動 rollback
-で user file を消さない。backup と resume を標準 recovery にする。
+config write は `{version: 1, terminal_transport: {backend: herdr}}` の typed record を排他 create
+(temp + `os.link`) で確定する。file 不在は create、typed-equivalent は no-op、その他の既存 config は
+上書きせず `existing_config_requires_separate_merge` で停止する。check-then-replace の TOCTOU 窓を
+持たず、race で負けた場合は existing を再読して no-op / fail-closed に確定する。LLM に YAML を生成・
+merge させない。
+
+各 step は idempotent で、失敗時も完了 step と原因を credential-free receipt に残す。`onboarding.resume`
+は 1 call = 1 pending idempotent step を実行する。自動 rollback で user file を消さない。backup と
+resume を標準 recovery にする。
 
 同一 root のapply/resumeはroot-scoped OS lockを取得した一つのrunnerだけが実行する。lockを
 取れないrunnerはmodelを起動せず `onboarding_locked` と既存runnerを待つnext actionを返す。
@@ -172,7 +188,7 @@ if (failed?) then (yes)
   :record credential-free receipt and next action;
   stop
 endif
-:verify and launch herdr slots;
+:verify and mark receipt complete (backend launch is #13497, not this tool);
 stop
 @enduml
 ```

@@ -39,8 +39,17 @@ from mozyo_bridge.scaffold.rules import (
 from mozyo_bridge.shared.paths import REPO_LOCAL_CONFIG_MARKER
 
 from ..domain.path_safety import ONBOARDING_RECEIPT_MARKER
-from ..domain.plan import OnboardingPlan, compute_root_fingerprint
-from ..domain.preflight import STATE_BLOCKED
+from ..domain.plan import (
+    OnboardingPlan,
+    PlanError,
+    rebuild_and_verify_plan,
+    require_gate_secret,
+)
+from ..domain.preflight import (
+    STATE_ADOPTED,
+    STATE_ADOPTION_IN_PROGRESS,
+    STATE_BLOCKED,
+)
 from ..domain.receipt import (
     ORDERED_STEPS,
     RECEIPT_STATE_COMPLETE,
@@ -120,6 +129,7 @@ class _StepContext:
     rules_store: str
     home: Path | None
     env: Mapping[str, str] | None
+    secret: str
 
 
 @dataclass(frozen=True)
@@ -132,14 +142,14 @@ def _receipt_path(root: Path) -> Path:
     return root / _RECEIPT_RELPATH
 
 
-def _write_receipt(root: Path, receipt: OnboardingReceipt) -> None:
+def _write_receipt(root: Path, receipt: OnboardingReceipt, secret: str) -> None:
     path = _receipt_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(serialize_receipt(receipt))
+            handle.write(serialize_receipt(receipt, secret=secret))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
@@ -253,6 +263,8 @@ def _step_verify(ctx: _StepContext) -> _StepOutcome:
 
 
 def _step_finalize(ctx: _StepContext) -> _StepOutcome:
+    # Mark the receipt complete only. Launching the backend is the bare-entry
+    # concern owned by #13497 — this step never performs or claims a launch.
     return _StepOutcome(STEP_STATUS_DONE)
 
 
@@ -267,13 +279,25 @@ _EXECUTORS: dict[str, Callable[[_StepContext], _StepOutcome]] = {
 }
 
 
-def _run_steps(root: Path, receipt: OnboardingReceipt, ctx: _StepContext) -> ApplyResult:
-    """Run pending steps sequentially; persist the receipt after each; stop on failure."""
+def _run_steps(
+    root: Path, receipt: OnboardingReceipt, ctx: _StepContext, *, max_steps: int | None
+) -> ApplyResult:
+    """Run pending steps, persisting a signed receipt after each; stop on failure.
+
+    ``max_steps`` bounds how many pending steps run in this call: ``apply`` runs
+    the whole bounded sequence (``None``), ``resume`` runs exactly one pending
+    step (``1``) per the spec's one-call-one-mutation contract (Redmine #13501
+    review F4).
+    """
     applied: list[str] = []
     no_ops: list[str] = []
+    ran = 0
     for step in ORDERED_STEPS:
         if receipt.is_settled(step):
             continue
+        if max_steps is not None and ran >= max_steps:
+            break
+        ran += 1
         executor = _EXECUTORS[step]
         try:
             outcome = executor(ctx)
@@ -283,7 +307,7 @@ def _run_steps(root: Path, receipt: OnboardingReceipt, ctx: _StepContext) -> App
             outcome = _StepOutcome(STEP_STATUS_FAILED, reason=f"{type(exc).__name__}: {exc}")
 
         receipt = receipt.with_step(step, outcome.status, reason=outcome.reason)
-        _write_receipt(root, receipt)
+        _write_receipt(root, receipt, ctx.secret)
 
         if outcome.status == STEP_STATUS_FAILED:
             return ApplyResult(
@@ -302,30 +326,48 @@ def _run_steps(root: Path, receipt: OnboardingReceipt, ctx: _StepContext) -> App
         else:
             applied.append(step)
 
+    pending = receipt.next_pending_step()
+    if pending is not None:
+        # More steps remain (a bounded resume advanced one step).
+        return ApplyResult(
+            state=receipt.state,
+            applied_steps=tuple(applied),
+            no_op_steps=tuple(no_ops),
+            next_action=(
+                f"run `mozyo-bridge onboarding resume` to perform the next step "
+                f"({pending})"
+            ),
+        )
+
     receipt = receipt.completed()
-    _write_receipt(root, receipt)
+    _write_receipt(root, receipt, ctx.secret)
     return ApplyResult(
         state=RECEIPT_STATE_COMPLETE,
         applied_steps=tuple(applied),
         no_op_steps=tuple(no_ops),
-        next_action="adoption complete; `mozyo` now launches the herdr backend",
+        next_action="adoption receipt marked complete",
     )
 
 
 def apply_plan(
-    plan: OnboardingPlan,
+    plan,
     *,
     human_confirmed: bool,
+    gate_secret: str,
     home: Path | None = None,
     sync_roots=None,
     env: Mapping[str, str] | None = None,
+    mount_probe=None,
 ) -> ApplyResult:
-    """Apply a confirmed, drift-bound plan under the root lock.
+    """Apply a human-confirmed plan under the root lock — fresh adoption only.
 
-    Fails closed with :class:`ApplyError` on: an unconfirmed plan, a now-blocked
-    root, a canonical-root mismatch, drift (fresh fingerprint != plan
-    fingerprint) on a fresh apply, a different in-progress adoption, or an
-    unavailable root lock.
+    ``plan`` is a plan record (or an :class:`OnboardingPlan`, converted to its
+    record). Authority is re-derived, not trusted: the root is re-inspected and
+    the record must equal the canonical plan rebuilt from fresh facts + closed
+    intent (:func:`rebuild_and_verify_plan`); this subsumes drift, tamper, and
+    forgery into one ``plan_unauthorized`` check. An in-progress adoption is
+    routed to ``resume``; an already-adopted root is refused. The programmatic
+    path enforces the same boundary as the CLI (Redmine #13501 review F2).
     """
     if not human_confirmed:
         raise ApplyError(
@@ -333,84 +375,106 @@ def apply_plan(
             "apply requires human_confirmed=true (the human must confirm the "
             "visible mutation plan)",
         )
+    try:
+        secret = require_gate_secret(gate_secret)
+    except PlanError as exc:
+        raise ApplyError(exc.code, exc.message) from exc
 
-    root = Path(plan.canonical_root)
-    inspection = inspect_onboarding(root, home=home, sync_roots=sync_roots, env=env)
-    if inspection.preflight.state == STATE_BLOCKED:
+    record = plan.as_record() if isinstance(plan, OnboardingPlan) else plan
+    if not isinstance(record, Mapping):
+        raise ApplyError(
+            "malformed_plan", "plan must be a plan record or an OnboardingPlan"
+        )
+    canonical_root = record.get("canonical_root")
+    if not isinstance(canonical_root, str) or not canonical_root:
+        raise ApplyError("malformed_plan", "plan record is missing canonical_root")
+    root = Path(canonical_root)
+
+    inspection = inspect_onboarding(
+        root, home=home, sync_roots=sync_roots, env=env,
+        mount_probe=mount_probe, gate_secret=secret,
+    )
+    state = inspection.preflight.state
+    if state == STATE_BLOCKED:
         raise ApplyError(
             "blocked",
             "root is now a hard block: "
             + "; ".join(inspection.preflight.hard_block_reasons),
         )
-    if str(inspection.facts.canonical_root) != plan.canonical_root:
+    if state == STATE_ADOPTION_IN_PROGRESS:
         raise ApplyError(
-            "root_mismatch",
-            f"plan root {plan.canonical_root} no longer resolves to the same "
-            f"canonical root ({inspection.facts.canonical_root})",
+            "adoption_in_progress",
+            "an onboarding adoption is already in progress at this root",
+            next_action="run `mozyo-bridge onboarding resume`",
         )
+    if state == STATE_ADOPTED:
+        raise ApplyError("already_adopted", "root is already an adopted workspace")
 
-    existing = inspection.receipt
-    if existing is not None:
-        if existing.plan_id != plan.plan_id:
-            raise ApplyError(
-                "different_plan_in_progress",
-                "a different onboarding plan is already in progress at this root; "
-                "resume or clear it before applying a new plan",
-            )
-        # Same plan already recorded — this is effectively a resume. Do not
-        # re-check drift (our own committed steps have changed the tree).
-        receipt = existing
-    else:
-        # Fresh apply: verify no drift since the plan was built.
-        fresh_fingerprint = compute_root_fingerprint(inspection.facts)
-        if fresh_fingerprint != plan.root_fingerprint:
-            raise ApplyError(
-                "plan_drift",
-                "the tree changed since the plan was built (fingerprint drift); "
-                "re-run `onboarding plan` and confirm a fresh plan",
-            )
-        receipt = OnboardingReceipt(
-            root_fingerprint=plan.root_fingerprint,
-            plan_id=plan.plan_id,
-            scaffold_preset=plan.scaffold_preset,
-            rules_store=plan.rules_store,
-        ).with_step(STEP_ONBOARDING_RECEIPT, STEP_STATUS_DONE)
+    try:
+        authoritative = rebuild_and_verify_plan(record, inspection.facts, gate_secret=secret)
+    except PlanError as exc:
+        raise ApplyError(exc.code, exc.message) from exc
 
+    receipt = OnboardingReceipt(
+        root_fingerprint=authoritative.root_fingerprint,
+        plan_id=authoritative.plan_id,
+        scaffold_preset=authoritative.scaffold_preset,
+        rules_store=authoritative.rules_store,
+    ).with_step(STEP_ONBOARDING_RECEIPT, STEP_STATUS_DONE)
+
+    run_root = Path(authoritative.canonical_root)
     ctx = _StepContext(
-        root=root,
-        scaffold_preset=plan.scaffold_preset,
-        rules_store=plan.rules_store,
+        root=run_root,
+        scaffold_preset=authoritative.scaffold_preset,
+        rules_store=authoritative.rules_store,
         home=home,
         env=env,
+        secret=secret,
     )
-    with _root_lock(root) as acquired:
+    with _root_lock(run_root) as acquired:
         if not acquired:
             raise ApplyError(
                 "onboarding_locked",
                 "another runner holds the onboarding lock for this root",
                 next_action="wait for the other runner, then re-run apply/resume",
             )
-        # Persist the fresh receipt before running steps so a crash right after
-        # lock acquisition still leaves a resumable adoption_in_progress marker.
-        if existing is None:
-            _write_receipt(root, receipt)
-        return _run_steps(root, receipt, ctx)
+        # Persist the fresh signed receipt before running steps so a crash right
+        # after lock acquisition still leaves a resumable adoption_in_progress.
+        _write_receipt(run_root, receipt, secret)
+        return _run_steps(run_root, receipt, ctx, max_steps=None)
 
 
 def resume_onboarding(
     root: Path | str,
     *,
+    gate_secret: str,
     home: Path | None = None,
     sync_roots=None,
     env: Mapping[str, str] | None = None,
+    mount_probe=None,
 ) -> ApplyResult:
-    """Resume an in-progress adoption from its receipt (input: the current root).
+    """Resume an in-progress adoption from its receipt — one pending step per call.
 
-    Reads the receipt for the plan parameters and remaining steps and continues
-    under the root lock. Does not re-check plan-fingerprint drift — the committed
-    steps have legitimately changed the tree; the receipt is the resume anchor.
+    The receipt (validated + signature-verified in inspect) is the resume
+    authority. Per the spec's one-call-one-mutation contract, this performs
+    exactly one pending idempotent step and returns a ``next_action`` to run
+    resume again while steps remain (Redmine #13501 review F4).
     """
-    inspection = inspect_onboarding(root, home=home, sync_roots=sync_roots, env=env)
+    try:
+        secret = require_gate_secret(gate_secret)
+    except PlanError as exc:
+        raise ApplyError(exc.code, exc.message) from exc
+
+    inspection = inspect_onboarding(
+        root, home=home, sync_roots=sync_roots, env=env,
+        mount_probe=mount_probe, gate_secret=secret,
+    )
+    if inspection.preflight.state == STATE_BLOCKED:
+        raise ApplyError(
+            "blocked",
+            "root is a hard block: "
+            + "; ".join(inspection.preflight.hard_block_reasons),
+        )
     receipt = inspection.receipt
     if receipt is None:
         raise ApplyError(
@@ -429,6 +493,7 @@ def resume_onboarding(
         rules_store=receipt.rules_store,
         home=home,
         env=env,
+        secret=secret,
     )
     with _root_lock(resolved_root) as acquired:
         if not acquired:
@@ -437,4 +502,4 @@ def resume_onboarding(
                 "another runner holds the onboarding lock for this root",
                 next_action="wait for the other runner, then re-run resume",
             )
-        return _run_steps(resolved_root, receipt, ctx)
+        return _run_steps(resolved_root, receipt, ctx, max_steps=1)

@@ -66,13 +66,23 @@ def _sha256_file(path: Path) -> str | None:
         return None
 
 
-def _read_receipt(root: Path) -> tuple[str, OnboardingReceipt | None]:
-    """Return ``(receipt_state, receipt)`` for the on-disk onboarding receipt."""
+def _read_receipt(
+    root: Path, secret: str | None
+) -> tuple[str, OnboardingReceipt | None]:
+    """Return ``(receipt_state, receipt)`` for the on-disk onboarding receipt.
+
+    A present receipt is verified against the trusted ``secret`` (signature +
+    coherence). A missing secret, an unreadable file, or a failed validation all
+    classify as ``broken`` — the preflight then blocks the root (a forged /
+    unverifiable receipt is never trusted as resume authority; Redmine #13501 F3).
+    """
     receipt_path = root / ONBOARDING_RECEIPT_MARKER
     if not receipt_path.exists():
         return RECEIPT_STATE_NONE, None
+    if not isinstance(secret, str) or not secret.strip():
+        return RECEIPT_STATE_BROKEN, None
     try:
-        receipt = parse_receipt(receipt_path.read_text(encoding="utf-8"))
+        receipt = parse_receipt(receipt_path.read_text(encoding="utf-8"), secret=secret)
     except (OSError, ReceiptError):
         return RECEIPT_STATE_BROKEN, None
     return receipt.state, receipt
@@ -96,6 +106,7 @@ def inspect_onboarding(
     sync_roots: Sequence[Path] | None = None,
     env: Mapping[str, str] | None = None,
     mount_probe: MountProbe | None = None,
+    gate_secret: str | None = None,
 ) -> InspectResult:
     """Deterministically inspect ``raw_root`` into preflight + drift facts.
 
@@ -103,7 +114,9 @@ def inspect_onboarding(
     live :class:`LiveMountProbe`): the classifier fails closed to ``ambiguous``
     without positive mount evidence (Redmine #13508 F3), so public onboarding
     inspect never succeeds without a mount adapter. Tests inject a fake probe for
-    determinism.
+    determinism. ``gate_secret`` (the trusted onboarding secret) is required to
+    verify a present onboarding receipt's signature; without it a present receipt
+    is treated as broken (blocked).
     """
     home = Path(home) if home is not None else Path.home()
     if mount_probe is None:
@@ -122,7 +135,7 @@ def inspect_onboarding(
         return InspectResult(preflight=preflight, facts=facts, receipt=None)
 
     root = safety.root
-    receipt_state, receipt = _read_receipt(root)
+    receipt_state, receipt = _read_receipt(root, gate_secret)
     config_readable = _config_readable(root)
     preflight = assemble_preflight(
         safety, herdr, receipt_state=receipt_state, config_readable=config_readable

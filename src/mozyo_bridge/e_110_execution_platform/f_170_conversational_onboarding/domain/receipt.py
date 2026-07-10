@@ -13,6 +13,8 @@ the pure model + (de)serialization; file IO lives in the application layer.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -85,6 +87,15 @@ _STEP_STATUSES: frozenset[str] = frozenset(
 # Statuses that count as "this step no longer needs to run" for resume.
 _SETTLED_STATUSES: frozenset[str] = frozenset({STEP_STATUS_DONE, STEP_STATUS_NO_OP})
 
+# Closed vocabularies the receipt's plan parameters must belong to (Redmine
+# #13501 review F3). Kept as a literal set here to avoid a circular import with
+# ``plan`` (which imports this module); it mirrors the values of
+# ``plan.PRESET_INTENT_TO_SCAFFOLD`` and ``intent.INTENT_RULES_STORES``.
+_VALID_SCAFFOLD_PRESETS: frozenset[str] = frozenset(
+    {"none", "asana", "redmine", "redmine-governed", "redmine-rails", "redmine-rails-governed"}
+)
+_VALID_RULES_STORES: frozenset[str] = frozenset({"central", "repo_local"})
+
 
 class ReceiptError(ValueError):
     """A receipt on disk is unreadable or does not match the closed schema."""
@@ -153,8 +164,20 @@ class OnboardingReceipt:
             version=self.version,
         )
 
+    def all_settled(self) -> bool:
+        return all(self.is_settled(step) for step in ORDERED_STEPS)
+
     def completed(self) -> "OnboardingReceipt":
-        """Return a copy marked ``complete`` (all steps settled precondition)."""
+        """Return a copy marked ``complete`` — every step must be settled first.
+
+        Enforcing the precondition (Redmine #13501 review F3) makes ``complete``
+        mean exactly "all ordered steps done/no-op"; a receipt can never claim
+        completion with pending or failed steps.
+        """
+        if not self.all_settled():
+            raise ReceiptError(
+                "cannot mark onboarding receipt complete: not all steps are settled"
+            )
         return OnboardingReceipt(
             root_fingerprint=self.root_fingerprint,
             plan_id=self.plan_id,
@@ -168,9 +191,8 @@ class OnboardingReceipt:
         )
 
 
-def serialize_receipt(receipt: OnboardingReceipt) -> str:
-    """Serialize to canonical, deterministic JSON (sorted keys), no secrets."""
-    record = {
+def _receipt_body(receipt: OnboardingReceipt) -> dict[str, object]:
+    return {
         "version": receipt.version,
         "root_fingerprint": receipt.root_fingerprint,
         "plan_id": receipt.plan_id,
@@ -181,16 +203,42 @@ def serialize_receipt(receipt: OnboardingReceipt) -> str:
         "failed_step": receipt.failed_step,
         "failed_reason": receipt.failed_reason,
     }
+
+
+def _receipt_signature(body: Mapping[str, object], secret: str) -> str:
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def serialize_receipt(receipt: OnboardingReceipt, *, secret: str) -> str:
+    """Serialize to canonical JSON with a trusted-secret HMAC signature.
+
+    The signature (Redmine #13501 review F3) makes the receipt tamper-evident:
+    a hand-forged receipt has no valid signature, so :func:`parse_receipt`
+    rejects it and the preflight classifies the root as ``blocked``. Requires a
+    non-empty secret. The body carries no secrets — only step status, plan
+    parameters, and fingerprints.
+    """
+    if not isinstance(secret, str) or not secret:
+        raise ReceiptError("a non-empty trusted secret is required to sign the receipt")
+    body = _receipt_body(receipt)
+    record = dict(body)
+    record["signature"] = _receipt_signature(body, secret)
     return json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def parse_receipt(text: str) -> OnboardingReceipt:
-    """Parse receipt JSON, failing closed with :class:`ReceiptError`.
+def parse_receipt(text: str, *, secret: str) -> OnboardingReceipt:
+    """Parse + fully validate a receipt, failing closed with :class:`ReceiptError`.
 
-    A malformed / non-object / wrong-version / unknown-key / bad-status receipt
-    raises — the preflight then classifies the root as ``blocked`` (a broken
-    receipt is a hard block, never silently treated as absent).
+    Beyond structural checks, this enforces (Redmine #13501 review F3): closed
+    ``scaffold_preset`` / ``rules_store`` vocabularies; a valid trusted-secret
+    signature; ``complete`` iff every step is settled; and coherence between
+    ``failed_step`` and the step statuses. Any violation raises — the preflight
+    then classifies the root as ``blocked`` (a broken / forged receipt is a hard
+    block, never silently treated as absent or trusted for mutation).
     """
+    if not isinstance(secret, str) or not secret:
+        raise ReceiptError("a non-empty trusted secret is required to verify the receipt")
     try:
         record = json.loads(text)
     except (ValueError, TypeError) as exc:
@@ -208,6 +256,7 @@ def parse_receipt(text: str) -> OnboardingReceipt:
         "step_status",
         "failed_step",
         "failed_reason",
+        "signature",
     }
     unknown = set(record) - allowed
     if unknown:
@@ -229,10 +278,15 @@ def parse_receipt(text: str) -> OnboardingReceipt:
         raise ReceiptError("onboarding receipt is missing root_fingerprint")
     if not isinstance(plan_id, str) or not plan_id:
         raise ReceiptError("onboarding receipt is missing plan_id")
-    if not isinstance(scaffold_preset, str) or not scaffold_preset:
-        raise ReceiptError("onboarding receipt is missing scaffold_preset")
-    if not isinstance(rules_store, str) or not rules_store:
-        raise ReceiptError("onboarding receipt is missing rules_store")
+    if scaffold_preset not in _VALID_SCAFFOLD_PRESETS:
+        raise ReceiptError(
+            f"onboarding receipt scaffold_preset {scaffold_preset!r} is not a "
+            "recognised scaffold preset"
+        )
+    if rules_store not in _VALID_RULES_STORES:
+        raise ReceiptError(
+            f"onboarding receipt rules_store {rules_store!r} is not a recognised store"
+        )
 
     raw_status = record.get("step_status", {})
     if not isinstance(raw_status, dict):
@@ -254,7 +308,7 @@ def parse_receipt(text: str) -> OnboardingReceipt:
     if failed_reason is not None and not isinstance(failed_reason, str):
         raise ReceiptError("onboarding receipt failed_reason must be a string or null")
 
-    return OnboardingReceipt(
+    receipt = OnboardingReceipt(
         root_fingerprint=fingerprint,
         plan_id=plan_id,
         scaffold_preset=scaffold_preset,
@@ -265,3 +319,32 @@ def parse_receipt(text: str) -> OnboardingReceipt:
         failed_reason=failed_reason,
         version=ONBOARDING_RECEIPT_VERSION,
     )
+
+    # Signature verification (tamper-evidence).
+    signature = record.get("signature")
+    expected = _receipt_signature(_receipt_body(receipt), secret)
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise ReceiptError("onboarding receipt signature is missing or invalid")
+
+    # Coherence: failed_step iff exactly that step is `failed`.
+    failed_steps = {s for s, st in step_status.items() if st == STEP_STATUS_FAILED}
+    if failed_step is not None:
+        if step_status.get(failed_step) != STEP_STATUS_FAILED:
+            raise ReceiptError(
+                f"onboarding receipt failed_step {failed_step!r} is not marked failed"
+            )
+    if failed_steps and failed_step not in failed_steps:
+        raise ReceiptError("onboarding receipt has a failed step but no matching failed_step")
+    if len(failed_steps) > 1:
+        raise ReceiptError("onboarding receipt has more than one failed step")
+
+    # Coherence: `complete` iff every step is settled and nothing failed.
+    if state == RECEIPT_STATE_COMPLETE:
+        if failed_step is not None or failed_steps:
+            raise ReceiptError("onboarding receipt is complete but has a failed step")
+        if not receipt.all_settled():
+            raise ReceiptError(
+                "onboarding receipt is complete but not all steps are settled"
+            )
+
+    return receipt
