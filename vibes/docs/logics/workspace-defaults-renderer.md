@@ -217,6 +217,6 @@ acceptance criteria は次を要求する。
 4. **allowed-suffix 表**: `KIND_ALLOWED_SUFFIXES` に新 kind の許可 suffix set を 1 つ以上指定する。`test_kind_allowed_suffixes_table_is_pinned` を更新し、新 kind に対する mismatch reject / accept 双方の test を足す。
 5. **本 logic doc**: Schema, Rendered Output Shape (kind 別の section), Supported Kinds 表 (renderer + allowed suffixes 列), Extending To New Outputs を更新する。`.mcp.json` Deferral の 4 条件 (runtime 立証 / schema 拡張 / secret reject 維持 / 検証手順) を満たす場合は同 commit で deferral を解除する。
 
-config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `vibes/docs/temps/redmine-defaults.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい target の suffix は **既存 kind の allowed suffix set** に含まれていなければならず、`.codex/config.toml` のような非 Markdown path は schema 層で reject される。新しい format / config を要求する場合は新 kind を追加するルート (上記 5 点) を踏む。
+config-driven な多重 target 追加 (= 既存 kind で別 path に書く) は YAML だけで足りる。例: 既に `redmine_markdown` kind を持ち、追加で `.mozyo-bridge/redmine-defaults.copy.md` にも同じ Markdown snippet を写したい場合、`outputs:` リストに同 kind + 別 target を追加するだけで済む。新しい target の suffix は **既存 kind の allowed suffix set** に含まれていなければならず、`.codex/config.toml` のような非 Markdown path は schema 層で reject される。新しい format / config を要求する場合は新 kind を追加するルート (上記 5 点) を踏む。
 
 catalog 関連: 新 path を `fc-governance-artifacts` か新規 fc エントリに追加し、generator を回して `file_conventions.generated.yaml` を再生成する。

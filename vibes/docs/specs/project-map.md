@@ -38,4 +38,4 @@
 - `vibes/docs/rules/`: 作業規約
 - `vibes/docs/specs/`: project 構造・仕様
 - `vibes/docs/logics/`: 判断 logic・release flow
-- `vibes/docs/temps/`: template
+- `vibes/docs/temps/`: 一時ドキュメント (恒久参照にしない。stale は掃除対象)
