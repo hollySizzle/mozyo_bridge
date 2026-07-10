@@ -60,6 +60,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LANE_STATE_REVIEW_WAITING,
 )
 
+# ``unknown`` is the glance-only degraded workflow state: the lane was enumerated from the
+# active roster but its durable gate could not be resolved — the Redmine source was
+# unavailable, or the issue's journals carried no recognized canonical ``## Gate:`` template
+# (Redmine #13435 j#74307 point 6). It is deliberately distinct from ``idle`` (a lane with a
+# readable, gate-free durable record): ``unknown`` means "we could not read", not "there is
+# no work". A row is always emitted for it (never silently dropped), owned by the coordinator
+# to investigate. It is never produced from a successfully-folded durable record.
+WORKFLOW_STATE_UNKNOWN = "unknown"
+
 # ---------------------------------------------------------------------------
 # Delivery anomaly vocabulary (machine-readable; literal regardless of UI language).
 #
@@ -196,6 +205,11 @@ _STATE_NEXT: dict[str, tuple[str, str]] = {
         OWNER_COORDINATOR,
         "coordinator: no active durable work; dispatch or leave idle",
     ),
+    WORKFLOW_STATE_UNKNOWN: (
+        OWNER_COORDINATOR,
+        "coordinator: durable gate unresolved (source unavailable / unrecognized "
+        "template); verify lane",
+    ),
 }
 
 
@@ -255,6 +269,12 @@ class IssueGlanceSnapshot:
     lane: str = ""
     latest_gate_journal: str = ""
     delivery: DeliveryObservation = field(default_factory=DeliveryObservation)
+    #: False when the lane was enumerated (it is a real active lane) but its durable gate
+    #: could not be resolved — the Redmine source was unavailable, or the journals carried no
+    #: recognized ``## Gate:`` template. The fold then reports ``workflow_state=unknown``
+    #: instead of a state derived from the (empty / unread) signal, so a degraded lane is a
+    #: visible unknown, never a fabricated ``idle`` (Redmine #13435 j#74307).
+    durable_facts_available: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +372,15 @@ def fold_glance_row(snapshot: IssueGlanceSnapshot) -> WorkflowGlanceRow:
     (non-stale) anomaly re-owns the next action to the coordinator, because repairing a
     stuck transport is the coordinator's routing job — this is what makes a
     "completed but not delivered" lane read as a stall instead of silently looking done.
+
+    A snapshot whose ``durable_facts_available`` is False (the lane is real but its durable
+    gate could not be resolved) folds to :data:`WORKFLOW_STATE_UNKNOWN`, owned by the
+    coordinator to investigate — a visible degraded row, never a fabricated ``idle``.
     """
-    state_class = classify_lane_state(snapshot.signal)
+    if not snapshot.durable_facts_available:
+        state_class = WORKFLOW_STATE_UNKNOWN
+    else:
+        state_class = classify_lane_state(snapshot.signal)
 
     delivery = snapshot.delivery
     anomaly = delivery.anomaly if delivery.anomaly in DELIVERY_ANOMALIES else ANOMALY_UNKNOWN
@@ -402,12 +429,18 @@ def fold_glance_rows(snapshots) -> tuple[WorkflowGlanceRow, ...]:
 # ---------------------------------------------------------------------------
 
 
-def glance_payload(rows) -> dict[str, object]:
+def glance_payload(rows, *, degraded: bool = False, notes=()) -> dict[str, object]:
     """The structured ``--json`` envelope for a set of glance rows (pure).
 
     Carries the per-row payloads plus a small summary (row count, and the issues that
     carry a live delivery anomaly) so a caller / cockpit projection can spot the
     "looks stopped but is really delivery-stuck" lanes without re-deriving them.
+
+    ``degraded`` / ``notes`` report source health: ``degraded`` is true when a source a
+    lane needed was unavailable or unreadable (so an empty / partial projection is *not*
+    silently read as "nothing active"), and ``notes`` carries the per-source explanations
+    (Redmine #13435 j#74295 Finding 1: distinguish "no active lanes" from "source
+    unavailable").
     """
     rows = tuple(rows)
     active_anomalies = [r.issue_id for r in rows if r.has_active_anomaly]
@@ -415,6 +448,8 @@ def glance_payload(rows) -> dict[str, object]:
         "rows": [r.as_payload() for r in rows],
         "count": len(rows),
         "active_anomaly_issues": active_anomalies,
+        "degraded": bool(degraded),
+        "notes": list(notes),
     }
 
 
@@ -484,6 +519,7 @@ def render_glance_table(rows) -> str:
 
 
 __all__ = (
+    "WORKFLOW_STATE_UNKNOWN",
     "ANOMALY_NONE",
     "ANOMALY_TURN_START_UNCONFIRMED",
     "ANOMALY_STAGED_NOT_SUBMITTED",

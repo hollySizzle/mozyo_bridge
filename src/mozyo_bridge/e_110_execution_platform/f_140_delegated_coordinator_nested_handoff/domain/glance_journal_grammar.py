@@ -1,0 +1,308 @@
+"""Bounded, deterministic ``## Gate:`` journal-template grammar for `workflow glance`.
+
+Redmine #13435 review j#74295 Finding 1 asked the glance projection to fold the workflow
+state of every active lane from the durable Redmine record, and the coordinator's design
+answer (j#74307) fixed *how*: a **glance-only, read-only** grammar that reads the canonical
+governed journal template — never free-form prose — to a workflow gate.
+
+The boundary (j#74307):
+
+- **This is not the watcher intake seam.** The #12672 ``redmine_journal_source`` contract
+  (structured ``[mozyo:...]`` markers only; a gate is *never* inferred from prose) is left
+  exactly as-is; ``workflow watch`` still ingests markers only. This module is a separate
+  read-model adapter that interprets the *governed journal template* for display, and it
+  produces no watcher events and mutates nothing.
+- **Only line-anchored ``## Gate: <kind>`` headings are read**, normalized (case /
+  surrounding whitespace / a trailing ``(...)`` qualifier / separators) and **exact-matched**
+  against a fixed allowlist. Natural-language body text, ambiguous substrings, and pane
+  scrollback are never consulted. A ``##`` heading without the ``Gate:`` label (a
+  ``Progress Log`` / ``Handoff Delivery Record`` / ``Correction`` note) is structurally
+  ignored — it is not a gate.
+- **Combined headings carry several explicit gate facts.** ``## Gate: Implementation Done +
+  Review Request`` splits on ``+`` into two recognized gates in one journal.
+- **Collisions are excluded, not guessed.** ``Review Finding Verdict(s)`` is the
+  implementer's verdict, not an audit ``review``; ``Design Consultation Answer`` is not a
+  review result. Because the match is exact against the allowlist, these headings simply
+  contribute no gate (an unrecognized template → the caller marks the lane ``unknown``,
+  never a misclassified state). Misclassification is worse than non-classification.
+- **A review conclusion is read only from an audit ``review`` journal that carries an
+  explicit ``結論:`` field** (``承認`` -> approved, ``要修正`` -> changes requested). It is
+  never inferred from body sentiment.
+
+The output is a :class:`GateFacts` (or ``None`` when no canonical gate was recognized), which
+:func:`lane_signal_from_gate_facts` turns into the same
+:class:`...domain.sublane_admission.LaneSignal` the admission preflight and the glance fold
+already consume — so the glance does not invent a second state machine.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    CALLBACK_NONE,
+    GATE_BLOCKED,
+    GATE_CLOSE,
+    GATE_IMPLEMENTATION_DONE,
+    GATE_NONE,
+    GATE_OWNER_CLOSE_APPROVAL,
+    GATE_REVIEW,
+    GATE_REVIEW_REQUEST,
+    GATE_START,
+    LaneSignal,
+    REVIEW_APPROVED,
+    REVIEW_CHANGES_REQUESTED,
+    REVIEW_PENDING,
+)
+
+# ---------------------------------------------------------------------------
+# The allowlist: normalized ``## Gate: <kind>`` heading -> workflow gate.
+#
+# Keys are the heading text AFTER normalization (see :func:`_gate_heading_parts`):
+# lower-cased, a trailing ``(...)`` qualifier removed, whitespace collapsed. Dispatch
+# decisions fold to ``start`` (the lane is dispatched / implementing — a positive pipeline
+# occupancy, never a stop reason). The list is the governed template's lifecycle gates
+# (j#74307 point 5): dispatch, implementation_done, review_request, audit review,
+# integration disposition/deferred (via :data:`_INTEGRATION_HEADINGS`), owner_close_approval,
+# blocked, close/retire.
+# ---------------------------------------------------------------------------
+
+_HEADING_GATE: dict[str, str] = {
+    "start": GATE_START,
+    "implementation request dispatch": GATE_START,
+    "wave rebalance dispatch decision": GATE_START,
+    "dispatch": GATE_START,
+    "implementation done": GATE_IMPLEMENTATION_DONE,
+    "implementation_done": GATE_IMPLEMENTATION_DONE,
+    "review request": GATE_REVIEW_REQUEST,
+    "review_request": GATE_REVIEW_REQUEST,
+    "review": GATE_REVIEW,
+    "owner close approval": GATE_OWNER_CLOSE_APPROVAL,
+    "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
+    "blocked": GATE_BLOCKED,
+    "close": GATE_CLOSE,
+    "task close": GATE_CLOSE,
+    "task_close": GATE_CLOSE,
+    "retire": GATE_CLOSE,
+    "retirement": GATE_CLOSE,
+}
+
+#: Normalized headings that mark an integration disposition / deferral (they set
+#: ``integration_recorded`` without themselves being a lifecycle gate).
+_INTEGRATION_HEADINGS: frozenset[str] = frozenset(
+    {
+        "integration disposition",
+        "integration_disposition",
+        "integration deferral",
+        "integration deferred",
+        "integration disposition deferred",
+    }
+)
+
+#: Collision-prone canonical headings that are **explicitly not** the gate they resemble
+#: (j#74307 point 3). Exact-matching already keeps them out of :data:`_HEADING_GATE`; this
+#: set documents the intent and is asserted in tests so a future allowlist edit cannot make
+#: e.g. ``Review Finding Verdicts`` classify as an audit ``review``.
+_EXCLUDED_HEADINGS: frozenset[str] = frozenset(
+    {
+        "review finding verdict",
+        "review finding verdicts",
+        "design consultation",
+        "design consultation answer",
+    }
+)
+
+# Precedence within a single combined journal: pick the most-advanced gate. Across journals
+# the *latest journal id* wins regardless of precedence (a later durable gate is
+# authoritative); this order only breaks ties inside one journal's ``+``-combined heading.
+_GATE_PRECEDENCE: dict[str, int] = {
+    GATE_START: 1,
+    GATE_IMPLEMENTATION_DONE: 2,
+    GATE_REVIEW_REQUEST: 3,
+    GATE_REVIEW: 4,
+    GATE_OWNER_CLOSE_APPROVAL: 5,
+    GATE_CLOSE: 6,
+    GATE_BLOCKED: 7,
+}
+
+#: The gates whose journal may carry a commit hash (so the lane is commit-bearing and can be
+#: ``integration_waiting`` until merged). ``commit_bearing`` is sticky once seen.
+_COMMIT_BEARING_GATES: frozenset[str] = frozenset(
+    {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST, GATE_OWNER_CLOSE_APPROVAL, GATE_CLOSE}
+)
+
+# A line-anchored ``## Gate: <heading>`` (two or more ``#``, the ``Gate:`` label required so a
+# non-gate ``##`` section is structurally ignored). The ``:`` may be an ASCII or fullwidth
+# colon (governed journals are authored in a mixed JA/EN workspace).
+_GATE_HEADING_RE = re.compile(r"^\s{0,3}#{2,}\s*Gate\s*[:：]\s*(?P<title>.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_WS_RE = re.compile(r"\s+")
+_SPLIT_PLUS_RE = re.compile(r"\s*\+\s*")
+
+# An explicit ``結論:`` (conclusion) field line inside an audit review journal. ASCII or
+# fullwidth colon; a leading list marker (``-`` / ``*``) is tolerated.
+_CONCLUSION_RE = re.compile(r"^\s*[-*]?\s*結論\s*[:：]\s*(?P<value>.+?)\s*$", re.MULTILINE)
+
+# An explicit commit-hash field on a gate journal (``commit`` / ``commit_or_diff`` /
+# ``commit_hash`` / ``target_commit`` … : <hex>). Markdown emphasis / list markers tolerated.
+_COMMIT_FIELD_RE = re.compile(
+    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*[0-9a-f]{7,40}"
+)
+
+
+def _normalize_heading(title: str) -> str:
+    """Normalize one ``## Gate:`` heading title: drop a trailing ``(...)``, lower, collapse ws."""
+    title = _TRAILING_PAREN_RE.sub("", title).strip()
+    return _WS_RE.sub(" ", title).strip().lower()
+
+
+def _gate_heading_parts(notes: str) -> Tuple[str, ...]:
+    """Every normalized ``## Gate:`` heading part in one journal note (``+``-split; pure)."""
+    parts: list[str] = []
+    for match in _GATE_HEADING_RE.finditer(notes or ""):
+        normalized = _normalize_heading(match.group("title"))
+        for part in _SPLIT_PLUS_RE.split(normalized):
+            part = part.strip()
+            if part:
+                parts.append(part)
+    return tuple(parts)
+
+
+def _review_conclusion(notes: str) -> str:
+    """Read the explicit ``結論:`` field of an audit review journal (never body sentiment)."""
+    match = _CONCLUSION_RE.search(notes or "")
+    if not match:
+        return REVIEW_PENDING
+    value = match.group("value")
+    if "承認" in value or "approve" in value.lower():
+        return REVIEW_APPROVED
+    if "要修正" in value or "changes" in value.lower() or "needs" in value.lower():
+        return REVIEW_CHANGES_REQUESTED
+    return REVIEW_PENDING
+
+
+def _int_journal(journal_id) -> Optional[int]:
+    try:
+        return int(str(journal_id).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class GateFacts:
+    """The durable gate facts folded from one issue's canonical ``## Gate:`` journals.
+
+    ``latest_gate`` is the most-recent recognized gate (the max journal id; ties inside a
+    combined heading broken by :data:`_GATE_PRECEDENCE`). ``latest_gate_journal`` is that
+    journal id. ``review_conclusion`` is meaningful only when ``latest_gate`` is
+    :data:`GATE_REVIEW`. ``commit_bearing`` / ``integration_recorded`` are sticky facts
+    accumulated across the recognized gate journals; ``blocker_recorded`` is true when the
+    latest gate is :data:`GATE_BLOCKED`.
+    """
+
+    latest_gate: str
+    latest_gate_journal: str
+    review_conclusion: str = REVIEW_PENDING
+    commit_bearing: bool = False
+    integration_recorded: bool = False
+    blocker_recorded: bool = False
+
+
+@dataclass(frozen=True)
+class _RecognizedJournal:
+    journal_id: int
+    gate: str  # max-precedence gate of this journal (GATE_NONE if integration-only)
+    review_conclusion: str
+    commit_bearing: bool
+
+
+def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
+    """Fold one issue's journals into :class:`GateFacts`, or ``None`` if no gate recognized.
+
+    ``journals`` is an ordered sequence of ``(journal_id, notes)`` — the raw Redmine journal
+    id and note body (no prose is interpreted beyond the ``## Gate:`` grammar). Pure.
+
+    A journal contributes a gate only when it carries at least one allowlisted, line-anchored
+    ``## Gate: <kind>`` heading; an integration-disposition heading contributes
+    ``integration_recorded`` but is not itself a lifecycle gate. When nothing is recognized
+    the result is ``None`` so the caller surfaces the lane as ``unknown`` (an unrecognized
+    template) rather than a fabricated state.
+    """
+    recognized: list[_RecognizedJournal] = []
+    integration_recorded = False
+
+    for journal_id, notes in journals or ():
+        jint = _int_journal(journal_id)
+        if jint is None:
+            continue
+        gates: set[str] = set()
+        for part in _gate_heading_parts(notes):
+            if part in _EXCLUDED_HEADINGS:
+                continue
+            gate = _HEADING_GATE.get(part)
+            if gate is not None:
+                gates.add(gate)
+            if part in _INTEGRATION_HEADINGS:
+                integration_recorded = True
+        if not gates:
+            continue
+        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
+        conclusion = _review_conclusion(notes) if GATE_REVIEW in gates else REVIEW_PENDING
+        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
+        recognized.append(
+            _RecognizedJournal(
+                journal_id=jint,
+                gate=top_gate,
+                review_conclusion=conclusion,
+                commit_bearing=commit_bearing,
+            )
+        )
+
+    if not recognized:
+        return None
+
+    latest = max(recognized, key=lambda r: r.journal_id)
+    return GateFacts(
+        latest_gate=latest.gate,
+        latest_gate_journal=str(latest.journal_id),
+        review_conclusion=latest.review_conclusion if latest.gate == GATE_REVIEW else REVIEW_PENDING,
+        commit_bearing=any(r.commit_bearing for r in recognized),
+        integration_recorded=integration_recorded,
+        blocker_recorded=(latest.gate == GATE_BLOCKED),
+    )
+
+
+def lane_signal_from_gate_facts(
+    issue: str, facts: GateFacts, *, issue_open: bool = True
+) -> LaneSignal:
+    """Build the :class:`LaneSignal` the glance fold consumes from folded gate facts (pure).
+
+    ``issue_open`` comes from the Redmine issue status. Per j#74307 point 5 the closed status
+    is a stronger closed fact than the journal fold: a closed issue is projected onto a
+    :data:`GATE_CLOSE` gate so the classifier lands it in the close/retire family regardless
+    of the latest journal gate.
+    """
+    latest_gate = facts.latest_gate
+    blocker_recorded = facts.blocker_recorded
+    if not issue_open:
+        latest_gate = GATE_CLOSE
+        blocker_recorded = False
+    return LaneSignal(
+        issue=issue,
+        latest_gate=latest_gate,
+        review_conclusion=facts.review_conclusion,
+        callback_state=CALLBACK_NONE,
+        commit_bearing=facts.commit_bearing,
+        integration_recorded=facts.integration_recorded,
+        issue_open=issue_open,
+        blocker_recorded=blocker_recorded,
+    )
+
+
+__all__ = (
+    "GateFacts",
+    "fold_issue_gate_facts",
+    "lane_signal_from_gate_facts",
+)
