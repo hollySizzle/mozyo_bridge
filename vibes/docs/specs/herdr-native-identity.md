@@ -218,8 +218,11 @@ herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv
   渡し (tmux `cockpit append` parity、lane worker の prompt stall 防止)、bare `mozyo` の coordinator
   pair launch (`herdr_launch_command`、default no-lane session の claude + codex) も同じ default `auto`
   を渡す (#13397 finding 3 — 外部 project で coordinator Claude が manual mode 起動し headless 運用不能
-  だった非対称を lane worker parity で解消。env override は常に有効)。default `None` を渡す caller は
-  歴史的 flagless bare `claude` 起動のまま。codex には付与しない。invalid mode は launch を fail-closed。
+  だった非対称を lane worker parity で解消。env override は常に有効)。direct `herdr session-start` CLI
+  (`cmd_herdr_session_start`) も同じ default `auto` を渡す (#13452 / #13453 — runbook の relaunch command
+  単体で live argv が `sublane readiness` の `auto` projection と一致する parity。それ以前は CLI だけが
+  `None` を渡し flagless=manual だった)。default `None` を渡す caller は歴史的 flagless bare `claude`
+  起動のまま。codex には付与しない。invalid mode は launch を fail-closed。
 
 自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
 live smoke は coordinator の post-review step。

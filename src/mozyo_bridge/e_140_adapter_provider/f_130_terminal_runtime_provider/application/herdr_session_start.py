@@ -110,6 +110,7 @@ from mozyo_bridge.core.state.workspace_registry import (
     register_workspace,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
+    COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
     InvalidPermissionMode,
     resolve_claude_permission_mode,
 )
@@ -1000,6 +1001,7 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             lane_id=lane_id,
             env=os.environ,
             dry_run=dry_run,
+            claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=agent_launch,
         )
     except HerdrSessionStartError as exc:

@@ -1247,7 +1247,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1025
+    lines: 1027
     reason: >-
       herdr session-start orchestration (mint/adopt durable identities +
       workspace placement + base-pane reclaim). Was already at ~985 lines
@@ -1263,7 +1263,12 @@ allowlist:
       edits the identity/repo-root part of this same file); splitting it in this
       lane would conflict with #13392, so the module decomposition is a
       coordinator-sequenced follow-up under the herdr backend-swap program
-      (Version #308) once both US integrate.
+      (Version #308) once both US integrate. #13452 / #13453 added 2 lines
+      (1025 -> 1027): the direct `herdr session-start` CLI entrypoint now threads
+      the `auto` permission-mode policy default into `prepare_session` (one import
+      name + one kwarg), closing the CLI-only projection/live-argv divergence. The
+      wiring is minimal and reuses the existing `prepare_session` parameter; the
+      deferred split still absorbs the decomposition.
     owner_issue: "#13425"
     resolution_version: "v0.10.10 (Version #241 ratchet) — split coordinated with #13392 under the herdr backend-swap program (Version #308)"
     expires: "2027-11-30"
