@@ -442,9 +442,13 @@ class UpstreamCoordinatorHerdrRouteTests(unittest.TestCase):
         self.assertTrue(role.ok)
         self.assertEqual(role.role, "codex")
 
-    def test_explicit_upstream_coordinator_preserved_end_to_end(self):
-        # An explicit override is carried verbatim into the profile field / dispatch
-        # (never rewritten to the default token) across the same resolver surface.
+    def test_explicit_upstream_coordinator_wins_at_resolver(self):
+        # An explicit override is carried verbatim by the profile-field resolver (never
+        # rewritten to the default token). This is a resolver-level unit assertion — the
+        # `upstream_coordinator` profile field is guidance text, not a send route, so the
+        # real herdr callback-route resolution is pinned separately at the send entry
+        # (test_herdr_send_entry.CoordinatorPseudoTargetHerdrSendTest, #13476 j#74537
+        # re-review: this test does NOT exercise herdr send / target resolution).
         req = _req(upstream_coordinator="%9")
         self.assertEqual(req.resolved_upstream_coordinator(), "%9")
 
