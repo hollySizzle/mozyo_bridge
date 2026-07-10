@@ -23,11 +23,17 @@ sender env** に置き換える。
     を保つ。herdr 上の**配置**は Redmine #13380 (dedicated sublane host workspace) で分離:
     coordinator pair (default lane) は project workspace に、全 lane slot は単一の **sublane
     host workspace** に着地し、herdr workspace 数は「project 1 + host 1」の定数 (lane 数に
-    比例しない)。identity model はこの配置分離で変わらない (mzb1 名は workspace segment に
-    project identity を持ち続ける)。判別は git topology (`_is_linked_worktree`) +
+    比例しない)。**Redmine #13411 はこの host workspace 内をさらに lane=tab で細分化する:
+    非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair
+    として並置する (`herdr tab create` + `agent start --tab [--split right]`)。tab join は
+    live inventory の `tab_id` のみを authority とし (label は cosmetic)、fresh lane は tab を
+    mint、heal は生存 slot の `tab_id` を読んで同一 tab へ復帰する。** identity model はこの
+    配置分離・細分化で変わらない (mzb1 名は workspace segment に project identity を持ち続け、
+    tab は placement のみ)。判別は git topology (`_is_linked_worktree`) +
     `_main_worktree_root` 経由の main anchor 読みで行う (#13152 継承)。registry schema は
     無変更。mint (§5) と全 resolve 側 (send / retire / projection) は単一 resolver
-    `herdr_workspace_segment` を共有する。
+    `herdr_workspace_segment` を共有する。placement 判断 (workspace / tab) の pure core は
+    sibling module `herdr_lane_topology` (`_launch_target_for_lane` / `_tab_target_for_lane`)。
     - **legacy (correction history): #13331 j#73357 の per-lane workspace token
       (`derive_lane_workspace_token`, `wt_<hash>`)。** 2026-07-07〜08 の移行期に linked
       worktree lane を独自 herdr workspace として立て、その canonical path hash を
@@ -183,6 +189,17 @@ flow:
    herdr が最終 pane close で自動 close する (実測、#13380) ため残骸 husk は構造的に生じず、
    次の lane が on demand で再 mint する (per-lane workspace は作らない)。同 resolver を
    send / retire / projection の resolve 側でも使い、mint と resolve を一致させる。
+   **さらに非 default lane は host workspace 内の tab を lane-aware join
+   (`_tab_target_for_lane`, Redmine #13411) で決める: (1) 自 lane の live slots が pin する tab
+   (heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで同一 tab へ復帰、pair を分裂させ
+   ない)、(2) 自 slot が無い fresh lane は `herdr tab create --workspace <host> --label <lane key>`
+   で tab を mint する (label は cosmetic、join key は `tab_id`)。自 slot が loose pane (pre-#13411、
+   tab_id 無し) の heal は loose のまま launch する (pair を新 tab へ分裂させない。full relaunch で
+   tab へ移行)。自 slot が複数 tab に split したら fail-closed。default lane は tab を使わない
+   (byte-invariant)。launch は `agent start --workspace <host> --tab <tab_id>` で行い、tab 内 2
+   slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split right`。tab root pane は
+   #13330 の workspace base pane と同型で全 launch 成功後に reclaim し、tab 内最終 pane close で
+   herdr が tab を自動消滅させる (workspace 自動消滅と対称)。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
 4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
    launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /

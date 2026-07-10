@@ -119,7 +119,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     DEFAULT_LANE,
     _agent_locator,
     _norm,
-    decode_assigned_name,
     derive_lane_workspace_token,
     encode_assigned_name,
 )
@@ -144,16 +143,21 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     _bounded_detail,
     _resolve_binary,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
+    HerdrSessionStartError,
+    _host_workspace_label,
+    _launch_target_for_lane,
+    _parse_tab_created,
+    _parse_workspace_created,
+    _tab_target_for_lane,
+    _workspace_prefix,
+)
 from mozyo_bridge.shared.errors import die
 
 # Per-slot outcome tokens.
 SLOT_ADOPTED = "adopted"
 SLOT_LAUNCHED = "launched"
 SLOT_PLANNED = "planned"
-
-
-class HerdrSessionStartError(ValueError):
-    """A herdr session-start step cannot proceed (fail-closed)."""
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,20 @@ class SessionStartResult:
     - ``base_pane_reclaimed`` — True iff that created root pane was closed.
     - ``base_pane_detail`` — a non-fatal ``pane close`` failure detail, if any
       (a failed reclaim leaves harmless cosmetic residue, never a hard failure).
+
+    The tab fields (Redmine #13411) are the lane=tab analogue: a non-default lane
+    lands in its OWN dedicated herdr tab inside the sublane host workspace, its
+    gateway + worker split inside it. The default lane never uses a tab, so these
+    stay blank for it (byte-invariant coordinator path):
+
+    - ``herdr_tab_id`` — the herdr tab the launched lane agents live in (the one
+      this run created, or the tab its adopted slots already occupy). Blank for
+      the default lane / all-adopt / nothing launched.
+    - ``tab_pane_id`` — the ``root_pane.pane_id`` of the tab this run **created**
+      (blank when no tab was created: default lane, all-adopt, or a heal that
+      rejoined an existing tab). Only this exact pane is ever a reclaim target.
+    - ``tab_pane_reclaimed`` — True iff that created tab root pane was closed.
+    - ``tab_pane_detail`` — a non-fatal tab root ``pane close`` failure detail.
     """
 
     workspace_id: str
@@ -204,6 +222,10 @@ class SessionStartResult:
     base_pane_id: str = ""
     base_pane_reclaimed: bool = False
     base_pane_detail: str = ""
+    herdr_tab_id: str = ""
+    tab_pane_id: str = ""
+    tab_pane_reclaimed: bool = False
+    tab_pane_detail: str = ""
 
     def as_payload(self) -> dict:
         return {
@@ -214,6 +236,10 @@ class SessionStartResult:
             "base_pane_id": self.base_pane_id,
             "base_pane_reclaimed": self.base_pane_reclaimed,
             "base_pane_detail": self.base_pane_detail,
+            "herdr_tab_id": self.herdr_tab_id,
+            "tab_pane_id": self.tab_pane_id,
+            "tab_pane_reclaimed": self.tab_pane_reclaimed,
+            "tab_pane_detail": self.tab_pane_detail,
         }
 
 
@@ -353,125 +379,6 @@ def _parse_started_locator(stdout: object) -> Optional[str]:
     return locator or None
 
 
-def _workspace_prefix(locator: str) -> str:
-    """The herdr workspace id (``wN``) of a ``wN:pM`` locator (``""`` if unparseable).
-
-    herdr terminal locators are ``<workspace>:<pane>`` (e.g. ``w2:p3``); the part
-    before the first ``:`` is the workspace the pane lives in. Returns ``""`` for a
-    blank / colonless / malformed handle so the caller fails closed rather than
-    guessing a launch target.
-    """
-    loc = _norm(locator)
-    if ":" not in loc:
-        return ""
-    prefix = loc.split(":", 1)[0]
-    return prefix if valid_target(prefix) else ""
-
-
-def _launch_target_for_lane(
-    rows: Sequence[Mapping[str, object]],
-    workspace_id: str,
-    lane_id: str,
-    adopted_locators: Sequence[str],
-) -> str:
-    """The herdr workspace this lane's launches must join (``""`` -> create one).
-
-    Dedicated sublane host workspace model (Redmine #13380, refining the #13377
-    shared project workspace): one mozyo workspace occupies exactly TWO herdr
-    terminal workspaces — the project workspace hosting the coordinator pair
-    (default lane) and a single **sublane host workspace** hosting every lane
-    slot — so the workspace count stays a constant "project 1 + host 1", still
-    never scaling with the lane count. The identity model is unchanged (the mzb1
-    ``workspace`` segment stays the project identity, j#73613); only the herdr
-    placement splits. The target is picked from the live inventory, in order:
-
-    1. the lane's OWN live slots (plus this run's adopted slots — always
-       same-lane) pin the target. A heal never splits a gateway/worker pair
-       across workspaces, even for a lane still cohabiting the coordinator's
-       workspace (pre-#13380 placement, which drains via retire).
-    2. a non-default lane with no own pins joins the workspace the OTHER live
-       lane slots occupy, EXCLUDING any workspace the live default-lane
-       (coordinator) slots occupy. The exclusion is what lands a new lane in
-       the dedicated host instead of the coordinator's window while legacy
-       cohabiting lanes are still alive.
-    3. nothing pins one -> ``""``: the caller creates the workspace explicitly
-       (the project workspace for the default lane, the labelled sublane host
-       for a lane slot). A lane-zero host cannot linger to be rejoined — herdr
-       auto-closes a workspace with its last pane (live-measured, #13380) — so
-       the next lane simply re-mints it on demand.
-
-    The default lane only ever joins its own pins (rule 1): the coordinator
-    pair never lands in the sublane host, mirroring the separation.
-
-    Raises when any pin set spans more than one herdr workspace: refusing to
-    guess which one the launches belong to (the #13330 fail-closed posture).
-    """
-    lane = _norm(lane_id) or DEFAULT_LANE
-    own = [loc for loc in adopted_locators if loc]
-    sibling_lanes: list = []
-    coordinator: list = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decode.ok or decode.identity is None:
-            continue
-        if decode.identity.workspace_id != workspace_id:
-            continue
-        locator = _agent_locator(row)
-        if not locator:
-            continue
-        row_lane = decode.identity.lane_id or DEFAULT_LANE
-        if row_lane == lane:
-            own.append(locator)
-        elif row_lane == DEFAULT_LANE:
-            coordinator.append(locator)
-        else:
-            sibling_lanes.append(locator)
-    own_prefixes = {p for p in (_workspace_prefix(loc) for loc in own) if p}
-    if len(own_prefixes) > 1:
-        raise HerdrSessionStartError(
-            f"live slots of lane {lane!r} span multiple herdr workspaces "
-            f"{sorted(own_prefixes)!r}; refuse to guess which one new launches "
-            "belong to"
-        )
-    if own_prefixes:
-        return next(iter(own_prefixes))
-    if lane == DEFAULT_LANE:
-        return ""
-    coordinator_prefixes = {
-        p for p in (_workspace_prefix(loc) for loc in coordinator) if p
-    }
-    host_prefixes = {
-        p for p in (_workspace_prefix(loc) for loc in sibling_lanes) if p
-    } - coordinator_prefixes
-    if len(host_prefixes) > 1:
-        raise HerdrSessionStartError(
-            f"lane slots of mozyo workspace {workspace_id!r} span multiple herdr "
-            f"workspaces {sorted(host_prefixes)!r} outside the coordinator's; "
-            "refuse to guess which one is the sublane host"
-        )
-    return next(iter(host_prefixes)) if host_prefixes else ""
-
-
-def _host_workspace_label(repo_root: Path) -> str:
-    """Operator-readable label for a minted sublane host workspace (cosmetic only).
-
-    Derived from the MAIN checkout's directory name — the project surface the
-    operator recognises — not the lane worktree's (whose basename carries the
-    lane). Purely observability: every join decision keys on the live mzb1
-    inventory, never on this label (a herdr label is neither unique nor durable
-    identity, and a lane-zero host auto-closes anyway).
-    """
-    try:
-        resolved = Path(repo_root).expanduser().resolve()
-    except OSError:
-        return "sublanes"
-    main_root = _main_worktree_root(resolved)
-    base = (main_root or resolved).name
-    return f"{base}_sublanes" if base else "sublanes"
-
-
 def _lane_id_from_metadata(resolved_root: Path) -> str:
     """The recorded lane id for a lane worktree (``""`` when unrecorded).
 
@@ -492,46 +399,6 @@ def _lane_id_from_metadata(resolved_root: Path) -> str:
     return _norm(getattr(record, "lane_id", "")) or _norm(
         getattr(record, "lane_label", "")
     )
-
-
-def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
-    """``(workspace_id, root_pane_id)`` from a herdr ``workspace create`` payload.
-
-    Real herdr shape (coordinator-measured, #13330 probe)::
-
-        {"result": {"type": "workspace_created",
-                    "workspace": {"workspace_id": "w3", ...},
-                    "root_pane": {"pane_id": "w3:p1", ...}, ...}}
-
-    Every fresh workspace is born with exactly this ``root_pane`` — the empty base
-    shell #13330 reclaims. Returns ``None`` (so the caller fails closed and reclaims
-    nothing) when the payload is not JSON, not a ``workspace_created`` envelope, or
-    either id is missing / blank / malformed — never a guessed pane handle.
-    """
-    if not isinstance(stdout, str):
-        return None
-    try:
-        payload = json.loads(stdout)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    result = payload.get("result")
-    if not isinstance(result, Mapping):
-        return None
-    if _norm(result.get("type")) != "workspace_created":
-        return None
-    workspace = result.get("workspace")
-    root_pane = result.get("root_pane")
-    if not isinstance(workspace, Mapping) or not isinstance(root_pane, Mapping):
-        return None
-    workspace_id = _norm(workspace.get("workspace_id"))
-    root_pane_id = _norm(root_pane.get("pane_id"))
-    if not workspace_id or not valid_target(workspace_id):
-        return None
-    if not root_pane_id or not valid_target(root_pane_id):
-        return None
-    return workspace_id, root_pane_id
 
 
 def _create_workspace(
@@ -572,6 +439,40 @@ def _create_workspace(
     return parsed
 
 
+def _create_tab(
+    binary: str,
+    workspace_id: str,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+    label: str = "",
+) -> tuple[str, str]:
+    """Explicitly create a herdr tab in ``workspace_id``; return ``(tab_id, root_pane_id)``.
+
+    Lane=tab subdivision (Redmine #13411): a non-default lane gets its OWN tab in
+    the sublane host workspace, its gateway + worker placed as a split pair inside
+    it. Minting the tab ourselves turns its empty root pane into a *known* handle
+    to reclaim by id (the tab analogue of the #13330 workspace base pane), never
+    one we scan for. ``--label`` (the lane label) is cosmetic and operator-readable
+    only — every join decision keys on the live ``tab_id``, never the label.
+    ``--no-focus`` avoids stealing the operator's focus. Fails closed if the
+    response is unparseable.
+    """
+    argv = ["tab", "create", "--workspace", workspace_id]
+    if label:
+        argv.extend(["--label", label])
+    argv.append("--no-focus")
+    completed = _invoke(binary, argv, runner, timeout, env=dict(env))
+    parsed = _parse_tab_created(completed.stdout)
+    if parsed is None:
+        raise HerdrSessionStartError(
+            "herdr tab create returned no parseable tab id / root pane "
+            "(expected result.tab.tab_id + result.root_pane.pane_id in a "
+            "tab_created payload); refuse to guess a pane to reclaim"
+        )
+    return parsed
+
+
 def _close_base_pane(
     binary: str,
     pane_id: str,
@@ -579,11 +480,13 @@ def _close_base_pane(
     timeout: float,
     env: Mapping[str, str],
 ) -> tuple[bool, str]:
-    """Reclaim the created base pane; **never hard-fail** (cosmetic residue only).
+    """Reclaim a created root pane; **never hard-fail** (cosmetic residue only).
 
-    Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A failed
-    reclaim only leaves the harmless empty base pane behind — the agent slots are
-    already live — so it is recorded, not raised (Redmine #13330 ruling j#73225).
+    Used for both the #13330 workspace base pane and the #13411 lane tab root
+    pane. Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A
+    failed reclaim only leaves the harmless empty root pane behind — the agent
+    slots are already live — so it is recorded, not raised (Redmine #13330 ruling
+    j#73225).
     """
     try:
         _invoke(binary, ["pane", "close", pane_id], runner, timeout, env=dict(env))
@@ -786,20 +689,52 @@ def prepare_session(
             result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
 
+    # Resolve the launch-target tab within the host workspace (Redmine #13411,
+    # lane=tab). Only a non-default lane subdivides: its gateway + worker live in
+    # ONE dedicated tab, so a host with N lanes shows N tabs instead of 2N loose
+    # panes. The lane's own live/adopted slots pin their tab (a heal rejoins the
+    # SAME tab). When nothing pins a tab, mint one explicitly ONLY for a FRESH lane
+    # (no own live/adopted slots) — labelled with the lane key (cosmetic) so its
+    # empty root pane is a known handle to reclaim. A heal of a legacy pre-#13411
+    # lane whose live slots are LOOSE panes (adopts present, no tab pinned) launches
+    # loose too, keeping the pair together (it migrates to a tab on a full relaunch,
+    # the #13380 cohabiting precedent). The default lane never uses a tab, so the
+    # coordinator path stays byte-invariant.
+    target_tab = ""
+    if launch_plans and result.lane_id != DEFAULT_LANE:
+        target_tab = _tab_target_for_lane(
+            rows, workspace_id, target_workspace, result.lane_id
+        )
+        lane_has_own_slots = any(p.kind == "adopt" for p in plans)
+        if not target_tab and not lane_has_own_slots:
+            target_tab, tab_pane_id = _create_tab(
+                binary, target_workspace, runner, timeout, env, label=result.lane_id
+            )
+            result.tab_pane_id = tab_pane_id
+        result.herdr_tab_id = target_tab
+
     # Config-driven launch argv (Redmine #13425): the lane_class is `default` for the
     # coordinator pair (no-lane session) and `sublane` for a lane worker / gateway. The
     # per-slot argv comes from the single-source resolver; `None` config yields `[]`
     # everywhere, so an unconfigured launch is byte-for-byte the pre-#13425 command.
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
 
+    # Split placement inside the lane tab (Redmine #13411): the first slot to land
+    # in a tab occupies it; every subsequent slot — the second of a fresh pair, or
+    # a healing launch beside an already-live sibling — is placed with `--split
+    # right`. The tab starts occupied by this lane's already-adopted slots (which
+    # pinned it), so a mixed adopt+launch splits the launch beside the adopt.
+    tab_occupancy = sum(1 for p in plans if p.kind == "adopt") if target_tab else 0
+
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into
-    # the resolved target workspace). A launch failure raises here, before reclaim.
+    # the resolved target workspace/tab). A launch failure raises here, before reclaim.
     for plan in plans:
         launch_argv_extra = (
             agent_launch.resolve_launch_argv(plan.provider, lane_class)
             if agent_launch is not None
             else []
         )
+        split_tab = bool(target_tab) and plan.kind == "launch" and tab_occupancy > 0
         result.slots.append(
             _execute_slot(
                 plan,
@@ -807,6 +742,8 @@ def prepare_session(
                 workspace_id=workspace_id,
                 lane=result.lane_id,
                 target_workspace=target_workspace,
+                target_tab=target_tab,
+                split_tab=split_tab,
                 binary=binary,
                 env=env,
                 runner=runner,
@@ -815,17 +752,27 @@ def prepare_session(
                 launch_argv_extra=launch_argv_extra,
             )
         )
+        if plan.kind == "launch" and target_tab:
+            tab_occupancy += 1
 
-    # Reclaim the empty base pane we created — only after EVERY launch succeeded
+    # Reclaim the empty root panes we created — only after EVERY launch succeeded
     # (a launch failure raised above, so reaching here means all agents are live and
-    # the workspace is safe to keep with just its agent panes). Close only the exact
-    # root pane id we captured; a close failure is non-fatal cosmetic residue.
+    # the workspace/tab is safe to keep with just its agent panes). Close only the
+    # exact root pane ids we captured; a close failure is non-fatal cosmetic residue.
+    # The workspace base pane (#13330) and the lane tab root pane (#13411) are
+    # distinct handles — reclaim each independently, never one guessed for the other.
     if result.base_pane_id:
         reclaimed, detail = _close_base_pane(
             binary, result.base_pane_id, runner, timeout, env
         )
         result.base_pane_reclaimed = reclaimed
         result.base_pane_detail = detail
+    if result.tab_pane_id:
+        reclaimed, detail = _close_base_pane(
+            binary, result.tab_pane_id, runner, timeout, env
+        )
+        result.tab_pane_reclaimed = reclaimed
+        result.tab_pane_detail = detail
     return result
 
 
@@ -836,6 +783,8 @@ def _execute_slot(
     workspace_id: str,
     lane: str,
     target_workspace: str,
+    target_tab: str = "",
+    split_tab: bool = False,
     binary: str,
     env: Mapping[str, str],
     runner: Runner,
@@ -899,6 +848,18 @@ def _execute_slot(
         "--",
         plan.provider,
     ]
+    # Lane=tab placement (Redmine #13411): a non-default lane's gateway + worker
+    # land in ONE dedicated herdr tab inside the host workspace. `--tab` pins the
+    # tab the same way `--workspace` pins the workspace; `--split right` places the
+    # second slot beside the first (or a healing launch beside its live sibling) so
+    # the pair shares the tab. Inserted right after `--workspace <ws>`; the default
+    # lane passes no `target_tab`, so its argv is byte-for-byte the pre-#13411 shape.
+    if target_tab:
+        insert_at = launch_argv.index("--workspace") + 2
+        tab_flags = ["--tab", target_tab]
+        if split_tab:
+            tab_flags.extend(["--split", "right"])
+        launch_argv[insert_at:insert_at] = tab_flags
     # Reproducible permission mode for managed Claude agents (Redmine #11925 /
     # #13360): the tmux managed-pane chokepoint has always appended
     # `--permission-mode <mode>`; without the same suffix here every herdr lane
@@ -959,6 +920,8 @@ def _render_text(result: SessionStartResult) -> str:
     lines = [
         f"herdr session-start: workspace={result.workspace_id} lane={result.lane_id}"
     ]
+    if result.herdr_tab_id:
+        lines[0] += f" tab={result.herdr_tab_id}"
     for slot in result.slots:
         lines.append(
             f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
@@ -971,6 +934,13 @@ def _render_text(result: SessionStartResult) -> str:
             else f"reclaim-failed ({result.base_pane_detail})"
         )
         lines.append(f"base pane {result.base_pane_id}: {state}")
+    if result.tab_pane_id:
+        state = (
+            "reclaimed"
+            if result.tab_pane_reclaimed
+            else f"reclaim-failed ({result.tab_pane_detail})"
+        )
+        lines.append(f"tab root pane {result.tab_pane_id}: {state}")
     return "\n".join(lines)
 
 
