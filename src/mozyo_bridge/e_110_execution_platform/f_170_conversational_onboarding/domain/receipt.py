@@ -338,6 +338,39 @@ def parse_receipt(text: str, *, secret: str) -> OnboardingReceipt:
     if len(failed_steps) > 1:
         raise ReceiptError("onboarding receipt has more than one failed step")
 
+    # Coherence: no orphan failed_reason (a reason without a failed step).
+    if failed_reason is not None and failed_step is None:
+        raise ReceiptError(
+            "onboarding receipt has a failed_reason but no failed_step (orphan reason)"
+        )
+
+    # Coherence: the step statuses form a valid ordered prefix (Redmine #13501
+    # j#74856). Walking ORDERED_STEPS, a run of settled steps (done/no_op) may be
+    # followed by exactly one boundary step (`failed` or `pending`), after which
+    # every remaining step must be pending. A settled step after a pending/failed
+    # step (a gap), or a `failed` step that is not the boundary, is incoherent —
+    # the runner never produces such a shape, so a signed receipt claiming it is
+    # rejected fail-closed.
+    seen_unsettled = False
+    for step in ORDERED_STEPS:
+        status = step_status.get(step, STEP_STATUS_PENDING)
+        settled = status in _SETTLED_STATUSES
+        if not seen_unsettled:
+            if settled:
+                continue
+            seen_unsettled = True  # the boundary step (pending or failed)
+        else:
+            if settled:
+                raise ReceiptError(
+                    f"onboarding receipt step {step!r} is settled after an earlier "
+                    "unsettled step (step_status is not an ordered prefix)"
+                )
+            if status == STEP_STATUS_FAILED:
+                raise ReceiptError(
+                    f"onboarding receipt step {step!r} is failed but is not the "
+                    "first unsettled step"
+                )
+
     # Coherence: `complete` iff every step is settled and nothing failed.
     if state == RECEIPT_STATE_COMPLETE:
         if failed_step is not None or failed_steps:
