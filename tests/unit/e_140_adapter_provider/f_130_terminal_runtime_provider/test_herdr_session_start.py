@@ -278,14 +278,45 @@ class SessionStartTest(unittest.TestCase):
         herdr = _Herdr()
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(tmp, providers=["codex"], herdr=herdr)
-            # `_resolve_binary` returns a path-shaped trusted value verbatim (an
-            # existing executable), so the injected value is exactly what `_prepare`
-            # put in the env — no symlink resolution.
+            # `resolve_herdr_binary` returns the resolved ABSOLUTE path; the trusted
+            # env value here is already an absolute (non-symlink) executable, so the
+            # injected value is byte-for-byte what `_prepare` put in the env.
             binpath = str(Path(tmp) / "fake-herdr")
         start = herdr.start_argvs[0]
         self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
         # It rides on an `--env` flag (server-spawned agent path), never widened to a
         # repo-local binary — the value is the launcher's trusted resolved binary.
+        idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
+        self.assertEqual(start[idx - 1], "--env")
+
+    def test_launch_resolves_trusted_path_herdr_without_env(self) -> None:
+        # Redmine #13500 end-to-end: a launcher whose trusted env has NO
+        # MOZYO_HERDR_BINARY but an executable `herdr` on its trusted PATH still
+        # launches, and injects the PATH-resolved ABSOLUTE binary into the agent's
+        # `--env` — parity with the explicit-env launch above.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            binpath = bindir / "herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(
+                binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                prepare_session(
+                    repo_root=repo,
+                    providers=["codex"],
+                    lane_id="lane-1",
+                    env={"PATH": str(bindir)},  # no MOZYO_HERDR_BINARY
+                    runner=herdr.run,
+                )
+        start = herdr.start_argvs[0]
+        self.assertIn(f"MOZYO_HERDR_BINARY={binpath}", start)
         idx = start.index(f"MOZYO_HERDR_BINARY={binpath}")
         self.assertEqual(start[idx - 1], "--env")
 

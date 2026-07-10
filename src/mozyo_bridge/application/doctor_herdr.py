@@ -46,8 +46,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 # trusted-environment configuration gap; everything else means the herdr server
 # itself did not answer with a readable inventory (down / hung / incompatible).
 _BINARY_NEXT_ACTION = (
-    "configure MOZYO_HERDR_BINARY in the trusted environment (daemon env) with "
-    "the herdr executable, then re-run `mozyo-bridge doctor`"
+    "make herdr resolvable from the trusted environment (Redmine #13496): either "
+    "put an executable `herdr` on the trusted PATH, or set MOZYO_HERDR_BINARY "
+    "(daemon env) to the herdr executable, then re-run `mozyo-bridge doctor`"
 )
 _SERVER_NEXT_ACTION = (
     "herdr did not return a readable agent inventory (server down or "

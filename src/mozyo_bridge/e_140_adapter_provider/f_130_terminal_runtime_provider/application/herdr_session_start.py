@@ -140,7 +140,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     HERDR_BINARY_ENV,
     Runner,
     _bounded_detail,
-    _resolve_binary,
+    resolve_herdr_binary,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    TerminalTransportError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
@@ -246,20 +249,20 @@ class SessionStartResult:
 
 
 def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
-    raw = env.get(HERDR_BINARY_ENV)
-    binary = raw.strip() if isinstance(raw, str) else ""
-    if not binary:
-        raise HerdrSessionStartError(
-            f"no herdr binary is configured in the trusted environment "
-            f"({HERDR_BINARY_ENV})"
-        )
-    resolved = _resolve_binary(binary, env)
-    if resolved is None:
-        raise HerdrSessionStartError(
-            f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
-            f"executable file or on the trusted environment PATH"
-        )
-    return resolved
+    """The absolute herdr binary this launch injects, via the shared resolver.
+
+    Shares the single :func:`resolve_herdr_binary` trusted-environment order
+    (``MOZYO_HERDR_BINARY`` → trusted-PATH ``herdr``, realpath / executable
+    verified) so a launch never resolves a different binary than the send / read
+    paths (Redmine #13496). The resolved absolute path is what rides on the
+    launched agent's ``--env MOZYO_HERDR_BINARY=<path>`` (see :func:`_execute_slot`).
+    A fail-closed resolution is re-raised as :class:`HerdrSessionStartError` so the
+    session-start caller keeps its single error type.
+    """
+    try:
+        return resolve_herdr_binary(env).path
+    except TerminalTransportError as exc:
+        raise HerdrSessionStartError(str(exc)) from exc
 
 
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
