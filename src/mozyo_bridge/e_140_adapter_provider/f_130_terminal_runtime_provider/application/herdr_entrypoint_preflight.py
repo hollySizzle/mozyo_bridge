@@ -9,6 +9,13 @@ a tmux-shaped diagnostic (``no_candidate:repo`` / ``self_lane_unresolved``). Tha
 per-agent attention failure; it is a harness gap where the old tmux selection surface is
 still reachable as a *standard* entrypoint under the herdr backend.
 
+Scope note (Redmine #13489): ``workflow step`` no longer uses this module's fail-closed
+dead-end. It now resolves **herdr-natively** from the launch-time sender identity (see
+:mod:`...f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step`) and
+only reuses :func:`herdr_backend_active` for backend selection. The ``handoff send
+--select`` / ``agents targets`` selection surfaces still fail closed here with the standard
+dispatch hint, since a herdr session has no tmux semantic-selection equivalent to offer.
+
 This module is the single, config-guarded preflight helper those surfaces share. It does
 **not** re-implement herdr-native routing (that stays in :mod:`herdr_send_entry` /
 :mod:`herdr_route_authority`); it answers two narrow questions and owns one guidance

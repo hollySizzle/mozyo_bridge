@@ -79,17 +79,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_watch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
-    EXECUTION_BLOCKED,
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
-    OWNER_OPERATOR,
     PRIMITIVE_CHILD_INTAKE,
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
-    PRIMITIVE_NONE,
     PRIMITIVE_TICKETLESS_CALLBACK,
-    REASON_HERDR_SELF_LANE_UNRESOLVED,
-    STATE_LANE_UNRESOLVED,
     PendingCallback,
     WorkflowAnchor,
     WorkflowStepOutcome,
@@ -308,51 +303,44 @@ def _execute_primitive(
 
 
 def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | None:
-    """Herdr-backend preflight for ``workflow step`` (Redmine #13446), or ``None`` under tmux.
+    """Herdr-native ``workflow step`` resolution for the current lane, or ``None`` under tmux.
 
     ``workflow step`` resolves the current lane from ``current_pane()`` — the tmux
     ``TMUX_PANE`` ``%pane`` — matched against the tmux discovery inventory. Under
     ``terminal_transport.backend: herdr`` there is no ``TMUX_PANE`` (or the pane is not in
-    the tmux inventory), so the standard entrypoint dies on ``TMUX_PANE is not set`` or folds
-    to a tmux-shaped ``self_lane_unresolved`` — the #13435 j#74176 -> j#74177 recurrence.
+    the tmux inventory), so the standard entrypoint would die on ``TMUX_PANE is not set`` or
+    fold to a tmux-shaped ``self_lane_unresolved`` — the #13435 j#74176 -> j#74177 / #13494
+    recurrence.
 
-    When the repo selects the herdr backend, this preflight looks at the herdr-native
-    lane-identity env (``HERDR_PANE_ID`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
-    ``MOZYO_LANE_ID``) *first* and returns a fail-closed :class:`WorkflowStepOutcome` whose
-    ``reason`` is the herdr-specific :data:`REASON_HERDR_SELF_LANE_UNRESOLVED`, whose
-    ``next_action`` points at the standard ``sublane create/start --execute`` dispatch, and
-    whose ``detail`` records exactly which herdr env keys were observed — never a bare tmux
-    ``%pane`` diagnostic. Returns ``None`` under the tmux backend so the tmux path (and its
-    byte-identical output) is unchanged.
+    Redmine #13489 replaces the #13446 fail-closed dead end (which merely pointed the
+    operator at ``sublane create/start --execute``) with herdr-native resolution: when the
+    repo selects the herdr backend, this delegates to
+    :func:`...herdr_workflow_step.resolve_herdr_step_outcome`, which classifies the lane role
+    from the launch-time sender identity (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
+    ``MOZYO_LANE_ID``) + the workspace-registry project scope and returns a role-appropriate
+    :class:`WorkflowStepOutcome` (worker reads its own anchor; gateway dispatches / monitors
+    the same-lane worker; coordinator orchestrates the next sublane), or fails closed on an
+    unattested identity / unknown provider / gateway with no live worker. Returns ``None``
+    under the tmux backend so the tmux path (and its byte-identical output) is unchanged.
 
-    This is a preflight guard, not herdr-native ``workflow step`` routing: resolving the
-    step natively from the herdr inventory is out of this MVP's scope (Codex triage j#74179);
-    the guard replaces a tmux-shaped dead end with an actionable herdr-native fail-closed
-    outcome.
+    Increment 1 (Redmine #13489 j#74685 design_boundary) is resolution-only: the outcome
+    names the next action / owner / herdr surface but performs no sublane lifecycle mutation
+    and no delivery. The policy-permitted one-step auto-execution of ``sublane
+    create/start/dispatch`` (and the fail-closed destructive drain/retire boundary) is
+    increment 2, gated behind the mandatory task-level design mid-review.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        resolve_herdr_step_outcome,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
-        HERDR_STANDARD_DISPATCH_HINT,
         herdr_backend_active,
-        herdr_lane_env_detail,
     )
 
     repo_root = repo_root_from_args(args)
     if not herdr_backend_active(repo_root):
         return None
-    return WorkflowStepOutcome(
-        state=STATE_LANE_UNRESOLVED,
-        next_action=(
-            "herdr backend active: workflow step's tmux %pane self-lane resolution does "
-            "not apply in a herdr session. " + HERDR_STANDARD_DISPATCH_HINT
-        ),
-        execution=EXECUTION_BLOCKED,
-        reason=REASON_HERDR_SELF_LANE_UNRESOLVED,
-        next_owner=OWNER_OPERATOR,
-        primitive=PRIMITIVE_NONE,
-        repo_root=str(repo_root),
-        detail=herdr_lane_env_detail(),
-    )
+    return resolve_herdr_step_outcome(args)
 
 
 def cmd_workflow_step(args: argparse.Namespace) -> int:
