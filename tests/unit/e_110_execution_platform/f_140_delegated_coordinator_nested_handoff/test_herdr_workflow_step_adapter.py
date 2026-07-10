@@ -209,132 +209,159 @@ class SameLaneWorkerLivenessTest(unittest.TestCase):
             )
 
 
-from mozyo_bridge.core.state.workflow_runtime_store import (
-    WorkflowEventRow,
-    WorkflowRouteRow,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
+    RedmineJournalEntry,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+    LiveRedmineJournalError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
     ANCHOR_AMBIGUOUS,
-    ANCHOR_MISMATCH,
     ANCHOR_RETIRED,
+    ANCHOR_UNVERIFIED,
 )
 
 VERIFIED_PTR = "redmine:issue=13489:journal=74766"
 
-
-def _route(issue="13489", ws=WS, lane="issue_1"):
-    return WorkflowRouteRow(
-        route_id="r", issue=issue, workspace_id=ws, lane_id=lane, role="codex",
-        pane_name="p", last_seen_pane_id="", observed_at="t",
-    )
+# A real structured gate marker (handoff channel, gate-bearing kind) in a journal note. The
+# journal record's own id (74766) is the authoritative journal anchor, NOT the token's journal
+# field (redmine_journal_source contract).
+_GATE_NOTE = "[mozyo:handoff:source=redmine:issue=13489:journal=74766:kind=review_result:to=claude] review result"
 
 
-def _event(event_id, issue="13489"):
-    return WorkflowEventRow(
-        event_id=event_id, issue=issue, gate="review_request", review_conclusion="",
-        callback_state="", commit_bearing=False, integration_recorded=False,
-        issue_open=True, blocker_recorded=False,
-    )
+def _lane_record(**kw):
+    base = dict(repo_workspace_id=WS, lane_id="issue_1", issue_id="13489", retired=False)
+    base.update(kw)
+    return types.SimpleNamespace(**base)
 
 
-def _fake_store(routes=(), events=(), exists=True):
-    return types.SimpleNamespace(
-        path=types.SimpleNamespace(exists=lambda: exists),
-        read_route_identities=lambda: tuple(routes),
-        read_events=lambda: tuple(events),
-    )
+def _snapshot_source(journals):
+    return MappingRedmineJournalSource(payload={"issue": {"id": "13489"}, "journals": journals})
+
+
+class CandidateIssueTest(unittest.TestCase):
+    """Lane-metadata candidate issue with preserved record cardinality (F3b)."""
+
+    def _run(self, records):
+        from mozyo_bridge.core.state import lane_metadata
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            sublane_herdr_projection,
+        )
+
+        with patch.object(sublane_herdr_projection, "repo_scope_workspace_id", return_value=WS), \
+             patch.object(lane_metadata, "load_lane_records", return_value=records):
+            return adapter._candidate_issue(Path("/repo"), "issue_1")
+
+    def test_single_active_record_is_candidate(self):
+        issue, status = self._run({"t1": _lane_record()})
+        self.assertEqual((issue, status), ("13489", ""))
+
+    def test_duplicate_active_same_issue_fails_closed(self):
+        # F3b: two active records for the lane must NOT collapse to one candidate.
+        issue, status = self._run({"t1": _lane_record(), "t2": _lane_record()})
+        self.assertEqual((issue, status), ("", ANCHOR_AMBIGUOUS))
+
+    def test_active_plus_retired_stale_fails_closed(self):
+        issue, status = self._run(
+            {"t1": _lane_record(), "t2": _lane_record(retired=True)}
+        )
+        self.assertEqual((issue, status), ("", ANCHOR_AMBIGUOUS))
+
+    def test_single_retired_record_fails_closed(self):
+        issue, status = self._run({"t1": _lane_record(retired=True)})
+        self.assertEqual((issue, status), ("", ANCHOR_RETIRED))
+
+    def test_no_record_is_missing(self):
+        issue, status = self._run({"t1": _lane_record(lane_id="other")})
+        self.assertEqual((issue, status), ("", ANCHOR_MISSING))
+
+    def test_record_without_issue_is_missing(self):
+        issue, status = self._run({"t1": _lane_record(issue_id="")})
+        self.assertEqual((issue, status), ("", ANCHOR_MISSING))
+
+
+class VerifyLaneGateLiveTest(unittest.TestCase):
+    """The source-of-truth Redmine gate verification (F3a)."""
+
+    def _run(self, source):
+        with patch.object(adapter, "_redmine_journal_source_for", return_value=source):
+            return adapter._verify_lane_gate_live(argparse.Namespace(), "13489")
+
+    def test_gate_marker_journal_is_verified(self):
+        journal = self._run(_snapshot_source([{"id": 74766, "notes": _GATE_NOTE}]))
+        self.assertEqual(journal, "74766")
+
+    def test_note_without_gate_marker_is_unverified(self):
+        journal = self._run(_snapshot_source([{"id": 74766, "notes": "plain note, no marker"}]))
+        self.assertEqual(journal, "")
+
+    def test_unconfigured_credentials_fail_closed(self):
+        with patch.object(
+            adapter, "_redmine_journal_source_for", side_effect=LiveRedmineJournalError("unconfigured")
+        ):
+            self.assertEqual(adapter._verify_lane_gate_live(argparse.Namespace(), "13489"), "")
+
+    def test_transport_error_fails_closed(self):
+        class _BoomSource:
+            def read_entries(self, issue):
+                raise LiveRedmineJournalError("transport down")
+
+        self.assertEqual(self._run(_BoomSource()), "")
+
+    def test_marker_for_a_different_issue_is_rejected(self):
+        # A gate marker whose entry issue != the candidate issue must not verify (issue match).
+        class _MismatchSource:
+            def read_entries(self, issue):
+                return [RedmineJournalEntry(issue_id="99999", journal_id="74766", notes=_GATE_NOTE)]
+
+        self.assertEqual(self._run(_MismatchSource()), "")
+
+    def test_latest_gate_marker_wins(self):
+        journal = self._run(
+            _snapshot_source(
+                [
+                    {"id": 100, "notes": _GATE_NOTE},
+                    {"id": 200, "notes": _GATE_NOTE},
+                ]
+            )
+        )
+        self.assertEqual(journal, "200")
 
 
 class ResolveLaneAnchorTest(unittest.TestCase):
-    """The durable-workflow-gate issue+journal verification (F3, store-authoritative)."""
+    """Compose candidate + live-Redmine verification (F3)."""
 
-    def _run(self, *, store, candidate=(frozenset(), False)):
-        with patch.object(adapter, "_load_workflow_store", return_value=store), patch.object(
-            adapter, "_lane_metadata_candidate_issues", return_value=candidate
+    def _run(self, candidate, journal):
+        with patch.object(adapter, "_candidate_issue", return_value=candidate), patch.object(
+            adapter, "_verify_lane_gate_live", return_value=journal
         ):
-            return adapter._resolve_lane_anchor(
-                argparse.Namespace(store_path=None), WS, Path("/repo"), "issue_1"
-            )
+            return adapter._resolve_lane_anchor(argparse.Namespace(), Path("/repo"), "issue_1")
 
-    def test_verified_issue_plus_journal_from_store(self):
-        status, ptr = self._run(
-            store=_fake_store(routes=[_route()], events=[_event("13489:74766")])
-        )
+    def test_candidate_plus_verified_gate_is_verified(self):
+        status, ptr = self._run(("13489", ""), "74766")
         self.assertEqual(status, ANCHOR_VERIFIED)
-        self.assertEqual(ptr, VERIFIED_PTR)  # issue + journal, not issue-only
+        self.assertEqual(ptr, VERIFIED_PTR)  # issue + journal from source-of-truth Redmine
 
-    def test_display_record_only_without_store_route_is_missing(self):
-        # THE R1 regression: a display lane-metadata candidate alone is NOT proof.
-        status, _ = self._run(
-            store=_fake_store(routes=[], events=[]), candidate=({"13489"}, False)
-        )
-        self.assertEqual(status, ANCHOR_MISSING)
+    def test_candidate_failure_short_circuits_without_live_read(self):
+        called = {}
 
-    def test_absent_store_fails_closed(self):
-        status, _ = self._run(store=_fake_store(exists=False))
-        self.assertEqual(status, ANCHOR_MISSING)
+        def _verify(_a, _i):
+            called["hit"] = True
+            return "74766"
 
-    def test_unavailable_store_fails_closed(self):
-        status, _ = self._run(store=None)
-        self.assertEqual(status, ANCHOR_MISSING)
-
-    def test_unreadable_store_fails_closed(self):
-        def _boom():
-            raise RuntimeError("db error")
-
-        store = types.SimpleNamespace(
-            path=types.SimpleNamespace(exists=lambda: True),
-            read_route_identities=_boom,
-            read_events=lambda: (),
-        )
-        status, _ = self._run(store=store)
-        self.assertEqual(status, ANCHOR_MISSING)
-
-    def test_two_distinct_route_issues_is_ambiguous(self):
-        status, _ = self._run(
-            store=_fake_store(
-                routes=[_route(issue="13489"), _route(issue="13490")],
-                events=[_event("13489:1"), _event("13490:2", issue="13490")],
-            )
-        )
+        with patch.object(adapter, "_candidate_issue", return_value=("", ANCHOR_AMBIGUOUS)), \
+             patch.object(adapter, "_verify_lane_gate_live", side_effect=_verify):
+            status, _ = adapter._resolve_lane_anchor(argparse.Namespace(), Path("/repo"), "issue_1")
         self.assertEqual(status, ANCHOR_AMBIGUOUS)
+        self.assertNotIn("hit", called)  # no live read when the candidate already fails closed
 
-    def test_duplicate_route_same_issue_is_verified_not_ambiguous(self):
-        # Gateway + worker route rows share the lane's issue — one distinct issue, not drift.
-        status, ptr = self._run(
-            store=_fake_store(
-                routes=[_route(issue="13489"), _route(issue="13489")],
-                events=[_event("13489:74766")],
-            )
-        )
-        self.assertEqual(status, ANCHOR_VERIFIED)
-        self.assertEqual(ptr, VERIFIED_PTR)
-
-    def test_no_gate_journal_is_missing(self):
-        status, _ = self._run(store=_fake_store(routes=[_route()], events=[]))
-        self.assertEqual(status, ANCHOR_MISSING)
-
-    def test_latest_gate_event_journal_wins(self):
-        status, ptr = self._run(
-            store=_fake_store(
-                routes=[_route()], events=[_event("13489:100"), _event("13489:200")]
-            )
-        )
-        self.assertEqual(ptr, "redmine:issue=13489:journal=200")
-
-    def test_candidate_mismatch_fails_closed(self):
-        status, _ = self._run(
-            store=_fake_store(routes=[_route()], events=[_event("13489:74766")]),
-            candidate=({"99999"}, False),
-        )
-        self.assertEqual(status, ANCHOR_MISMATCH)
-
-    def test_all_retired_candidate_fails_closed(self):
-        status, _ = self._run(
-            store=_fake_store(routes=[_route()], events=[_event("13489:74766")]),
-            candidate=(set(), True),
-        )
-        self.assertEqual(status, ANCHOR_RETIRED)
+    def test_candidate_but_unverified_gate_fails_closed(self):
+        # THE core F3 regression: a lane-metadata candidate alone (no verified Redmine gate)
+        # is NOT proof -> fail closed, never a fabricated ready.
+        status, ptr = self._run(("13489", ""), "")
+        self.assertEqual(status, ANCHOR_UNVERIFIED)
+        self.assertEqual(ptr, "")
 
 
 if __name__ == "__main__":  # pragma: no cover

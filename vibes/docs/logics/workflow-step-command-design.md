@@ -236,15 +236,18 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   - **default** lane (provider 不問) → fail-closed (`ambiguous_default_coordinator_role`);
   - unknown provider → fail-closed (`herdr_lane_role_unresolved`)。
   - registry `project_name` を role/scope authority にしない (display metadata、dir 名 default)。
-- **anchor gate (j#74748 F3 / j#74766 R1)。** worker/gateway は **durable workflow gate =
-  workflow runtime store** (Redmine gate journal marker を `workflow watch`/`runtime` が畳んだ
-  `workflow_route_identities` + `workflow_events`) を authority として、`(workspace_id, lane_id)`
-  route join で issue を確定し、その issue の gate event (`event_id=<issue>:<journal>`) から journal
-  を取得して **exact `issue+journal` anchor を検証** した場合のみ ready/no_op を返す
-  (`durable_anchor=redmine:issue=<id>:journal=<id>`)。lane metadata (host-local display metadata,
-  never routing authority) は **candidate cross-check のみ** — store issue と不一致→`herdr_anchor_mismatch`、
-  all-retired→fail-closed。store absent/unreadable/route-missing/journal-missing/ambiguous は
-  **fail-closed** (herdr anchor gate は fail-open させない)。未検証 anchor で ready を返さない。
+- **anchor gate (j#74748 F3 / j#74784 / j#74787)。** worker/gateway は **source-of-truth Redmine**
+  を authority として anchor を検証した場合のみ ready/no_op を返す。lane metadata も workflow
+  runtime store も **caller-supplied advisory projection** (任意 caller が書ける) であり authority
+  ではない: lane の **単一 non-retired lane-metadata record** が *candidate* issue を名指す
+  (cardinality 保持 — duplicate active / active+retired stale / missing / retired は fail-closed、
+  set 化しない)。その candidate issue の journal を既存 credential-gated `LiveRedmineJournalSource`
+  (daemon-trusted credential / redirect 拒否 / injected transport / redacted error) で read-only 取得し、
+  `markers_from_source` の **structured gate marker** (gate-bearing kind のみ、machine `[mozyo:…]`
+  token、prose 不可) から issue 一致の exact journal を得て `durable_anchor=redmine:issue=<id>:journal=<id>`
+  を verify する。credential 未設定 / transport 失敗 / issue-journal 不在 / gate marker 無し / issue
+  不一致は **fail-closed** (`herdr_anchor_unverified`、credential/URL は出力しない)。未検証 anchor で
+  ready を返さない。新 credential/network 実装は既存 port を再利用し重複させない。
 - **same-lane worker liveness は cardinality (j#74749 F2 / j#74750)。** gateway は同一
   `(workspace, lane, claude)` の 0 / 1 / 2+ を保持し、2+ = ambiguous / locator 欠落 = fail-closed
   とし、重複 identity を silent target にしない。

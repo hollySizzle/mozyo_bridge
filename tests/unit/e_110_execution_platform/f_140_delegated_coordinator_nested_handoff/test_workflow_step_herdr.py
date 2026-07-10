@@ -33,13 +33,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
     ANCHOR_AMBIGUOUS,
-    ANCHOR_MISMATCH,
     ANCHOR_MISSING,
     ANCHOR_RETIRED,
+    ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
     REASON_HERDR_ANCHOR_AMBIGUOUS,
-    REASON_HERDR_ANCHOR_MISMATCH,
     REASON_HERDR_ANCHOR_UNRESOLVED,
+    REASON_HERDR_ANCHOR_UNVERIFIED,
     REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
     REASON_HERDR_LANE_ROLE_UNRESOLVED,
     REASON_HERDR_WORKER_AMBIGUOUS,
@@ -138,10 +138,10 @@ class ResolveWorkerLaneTest(unittest.TestCase):
         out = resolve_herdr_workflow_step(self._lane(), anchor_status=ANCHOR_RETIRED)
         self.assertEqual(out.reason, REASON_HERDR_ANCHOR_UNRESOLVED)
 
-    def test_mismatch_anchor_fails_closed(self):
-        out = resolve_herdr_workflow_step(self._lane(), anchor_status=ANCHOR_MISMATCH)
+    def test_unverified_anchor_fails_closed(self):
+        out = resolve_herdr_workflow_step(self._lane(), anchor_status=ANCHOR_UNVERIFIED)
         self.assertEqual(out.execution, EXECUTION_BLOCKED)
-        self.assertEqual(out.reason, REASON_HERDR_ANCHOR_MISMATCH)
+        self.assertEqual(out.reason, REASON_HERDR_ANCHOR_UNVERIFIED)
 
     def test_no_anchor_status_fails_closed(self):
         out = resolve_herdr_workflow_step(self._lane())

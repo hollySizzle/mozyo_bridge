@@ -93,8 +93,9 @@ ANCHOR_VERIFIED = "verified"
 ANCHOR_MISSING = "missing"
 ANCHOR_AMBIGUOUS = "ambiguous"
 ANCHOR_RETIRED = "retired"
-#: The candidate display record (lane metadata) disagrees with the durable gate's issue.
-ANCHOR_MISMATCH = "mismatch"
+#: The candidate issue could not be verified against the source-of-truth Redmine gate (the
+#: live journal read was unconfigured / failed / found no structured gate marker, R1/F3a).
+ANCHOR_UNVERIFIED = "unverified"
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +116,8 @@ REASON_HERDR_WORKER_LOCATOR_MISSING = "herdr_worker_locator_missing"
 REASON_HERDR_ANCHOR_UNRESOLVED = "herdr_anchor_unresolved"
 #: A worker / gateway lane resolves to more than one distinct Redmine issue anchor (drift).
 REASON_HERDR_ANCHOR_AMBIGUOUS = "herdr_anchor_ambiguous"
-#: The candidate display record disagrees with the durable workflow gate's issue (drift, R1).
-REASON_HERDR_ANCHOR_MISMATCH = "herdr_anchor_mismatch"
+#: The candidate issue could not be verified against the source-of-truth Redmine gate (F3a).
+REASON_HERDR_ANCHOR_UNVERIFIED = "herdr_anchor_unverified"
 #: A default-lane Codex/Claude pair carries no step-time durable role authority (j#74748 F1).
 REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED = "ambiguous_default_coordinator_role"
 #: The current herdr lane's provider is not a known runtime provider (claude / codex).
@@ -133,7 +134,7 @@ HERDR_STEP_REASONS = frozenset(
         REASON_HERDR_WORKER_LOCATOR_MISSING,
         REASON_HERDR_ANCHOR_UNRESOLVED,
         REASON_HERDR_ANCHOR_AMBIGUOUS,
-        REASON_HERDR_ANCHOR_MISMATCH,
+        REASON_HERDR_ANCHOR_UNVERIFIED,
         REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
         REASON_HERDR_LANE_ROLE_UNRESOLVED,
         REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
@@ -254,16 +255,19 @@ def _anchor_blocked(
     """Fail-closed outcome when the lane's Redmine issue+journal anchor is not verified (F3)."""
     reason = {
         ANCHOR_AMBIGUOUS: REASON_HERDR_ANCHOR_AMBIGUOUS,
-        ANCHOR_MISMATCH: REASON_HERDR_ANCHOR_MISMATCH,
+        ANCHOR_UNVERIFIED: REASON_HERDR_ANCHOR_UNVERIFIED,
     }.get(anchor_status or "", REASON_HERDR_ANCHOR_UNRESOLVED)
     detail = {
-        ANCHOR_AMBIGUOUS: "the lane resolves to more than one distinct Redmine issue anchor (drift)",
-        ANCHOR_MISMATCH: "the candidate display record disagrees with the durable workflow gate's issue",
-        ANCHOR_RETIRED: "the lane's Redmine anchor record is retired (tombstone / stale)",
-        ANCHOR_MISSING: (
-            "no verified issue+journal anchor joins this lane from the durable workflow "
-            "gate (runtime store absent / unreadable / no route / no gate journal)"
+        ANCHOR_AMBIGUOUS: (
+            "the lane has more than one candidate record (duplicate / stale-retired "
+            "coexistence); workflow step will not guess the anchor"
         ),
+        ANCHOR_UNVERIFIED: (
+            "the candidate issue could not be verified against the source-of-truth Redmine "
+            "gate (live journal read unconfigured / failed / no structured gate marker)"
+        ),
+        ANCHOR_RETIRED: "the lane's only candidate record is retired (tombstone / stale)",
+        ANCHOR_MISSING: "no candidate record joins this lane to a Redmine issue",
     }.get(anchor_status or "", "the lane's Redmine issue+journal anchor could not be verified")
     return WorkflowStepOutcome(
         state=state,
@@ -409,7 +413,7 @@ __all__ = (
     "ANCHOR_MISSING",
     "ANCHOR_AMBIGUOUS",
     "ANCHOR_RETIRED",
-    "ANCHOR_MISMATCH",
+    "ANCHOR_UNVERIFIED",
     "REASON_HERDR_WORKER_STEP_READY",
     "REASON_HERDR_WORKER_DISPATCH_READY",
     "REASON_HERDR_WORKER_SLOT_MISSING",
@@ -417,7 +421,7 @@ __all__ = (
     "REASON_HERDR_WORKER_LOCATOR_MISSING",
     "REASON_HERDR_ANCHOR_UNRESOLVED",
     "REASON_HERDR_ANCHOR_AMBIGUOUS",
-    "REASON_HERDR_ANCHOR_MISMATCH",
+    "REASON_HERDR_ANCHOR_UNVERIFIED",
     "REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED",
     "REASON_HERDR_LANE_ROLE_UNRESOLVED",
     "REASON_HERDR_SENDER_IDENTITY_UNRESOLVED",
