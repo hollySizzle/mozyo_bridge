@@ -18,11 +18,23 @@ The classifier resolves the raw path to a canonical, symlink-free identity and
 ``normal`` on doubt — a path whose identity we cannot resolve must stop the
 flow, not proceed as if safe.
 
-The only ambient inputs are ``home`` and the platform sync roots; both are
-injectable so the matrix (home / normal / sync / symlink-ambiguity / Git /
-non-Git) is testable against ``tempfile`` fixtures without depending on the
-runner's real home directory. The module performs read-only filesystem
-``exists``/``resolve`` probes only; it mutates nothing.
+``root_kind`` is resolved by Git **worktree ancestry** (``infer_git_worktree_root``),
+not just a ``.git`` entry directly under the root: a cwd nested inside a Git
+worktree — or a linked-worktree ``.git`` *file* — is ``git`` (Redmine #13508 F2).
+
+Sync/cloud detection combines three signals (Redmine #13508 F1): the injected
+platform sync roots (path prefix), known provider directory names, and — when a
+:class:`MountProbe` is supplied — **mount metadata**. Mount metadata that is
+``unavailable`` or ``conflicting`` fails closed to ``ambiguous`` (never
+``normal``). The probe is a Port: the domain consumes a closed
+:class:`MountFacts` value and never runs an ambient OS command itself.
+
+The only ambient inputs are ``home``, the platform sync roots, and the injected
+mount probe; all are injectable so the matrix (home / normal / sync / mount-
+metadata / symlink-ambiguity / Git-ancestry / non-Git) is testable against
+``tempfile`` fixtures and fakes without depending on the runner's real host. The
+module performs read-only filesystem ``exists``/``resolve`` probes only; it
+mutates nothing.
 """
 
 from __future__ import annotations
@@ -30,11 +42,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.shared.paths import (
     REPO_LOCAL_CONFIG_MARKER,
     WORKSPACE_MARKERS,
+    infer_git_worktree_root,
 )
 
 __all__ = (
@@ -50,6 +63,13 @@ __all__ = (
     "ADOPTION_WORKSPACE_ANCHOR",
     "ADOPTION_ONBOARDING_RECEIPT",
     "ONBOARDING_RECEIPT_MARKER",
+    "MOUNT_LOCAL",
+    "MOUNT_SYNC_CLOUD",
+    "MOUNT_NETWORK",
+    "MOUNT_UNAVAILABLE",
+    "MOUNT_CONFLICTING",
+    "MountFacts",
+    "MountProbe",
     "PathSafety",
     "platform_sync_roots",
     "classify_path_safety",
@@ -111,6 +131,50 @@ _SYNC_PROVIDER_COMPONENTS: frozenset[str] = frozenset(
         "iCloudDrive",
     }
 )
+
+# --- mount metadata (Redmine #13508 F1) --------------------------------------
+
+#: Closed mount-classification vocabulary the domain consumes. ``sync_cloud`` and
+#: ``network`` are treated as sync/cloud risk; ``local`` is a normal on-disk
+#: mount; ``unavailable`` (the probe could not read metadata) and ``conflicting``
+#: (the metadata disagrees with itself / the path signals) both fail closed to
+#: ``ambiguous`` — never ``normal``.
+MOUNT_LOCAL = "local"
+MOUNT_SYNC_CLOUD = "sync_cloud"
+MOUNT_NETWORK = "network"
+MOUNT_UNAVAILABLE = "unavailable"
+MOUNT_CONFLICTING = "conflicting"
+
+_MOUNT_SYNC_STATES: frozenset[str] = frozenset({MOUNT_SYNC_CLOUD, MOUNT_NETWORK})
+_MOUNT_AMBIGUOUS_STATES: frozenset[str] = frozenset(
+    {MOUNT_UNAVAILABLE, MOUNT_CONFLICTING}
+)
+
+
+@dataclass(frozen=True)
+class MountFacts:
+    """A closed, already-probed mount classification for a canonical root.
+
+    Produced by an application-layer :class:`MountProbe` adapter (which may read
+    ``statfs`` / mount tables / provider markers) and consumed by the pure
+    classifier. ``detail`` is a short, non-secret evidence string for rendering.
+    """
+
+    state: str
+    source: str = ""
+    detail: str = ""
+
+
+@runtime_checkable
+class MountProbe(Protocol):
+    """Port: classify a canonical path's mount into closed :class:`MountFacts`.
+
+    The domain never runs an ambient OS command; an application adapter
+    implements this and the classifier only consumes its closed result.
+    """
+
+    def classify_mount(self, path: Path) -> MountFacts:  # pragma: no cover - protocol
+        ...
 
 
 @dataclass(frozen=True)
@@ -195,14 +259,20 @@ def _within(root: Path, ancestor: Path) -> bool:
 
 
 def _classify_risk(
-    root: Path, *, home: Path, sync_roots: Sequence[Path]
+    root: Path,
+    *,
+    home: Path,
+    sync_roots: Sequence[Path],
+    mount_facts: MountFacts | None,
 ) -> tuple[str, tuple[str, ...]]:
     """Classify ``path_risk`` for an already-canonical ``root``.
 
-    Precedence is home → sync/cloud → normal. Home is checked first because it
-    is a hard block regardless of whether home itself happens to sit under a
-    sync root. ``ambiguous`` is not decided here — it is signalled upstream by
-    an unresolved canonical root.
+    Precedence: home → path-based sync signal (prefix / provider name) → mount
+    metadata → normal. Home is checked first because it is a hard block
+    regardless of whether home itself sits under a sync root. Mount metadata is
+    consulted when supplied: ``unavailable`` / ``conflicting`` fail closed to
+    ``ambiguous`` (never ``normal``), ``sync_cloud`` / ``network`` are
+    sync/cloud, ``local`` proceeds to ``normal``.
     """
     if root == home:
         return PATH_RISK_HOME, (f"root is the home directory {root}",)
@@ -222,6 +292,22 @@ def _classify_risk(
             (f"root path contains sync/cloud provider folder {sorted(hit)[0]!r}",),
         )
 
+    if mount_facts is not None:
+        if mount_facts.state in _MOUNT_AMBIGUOUS_STATES:
+            return (
+                PATH_RISK_AMBIGUOUS,
+                (
+                    f"mount metadata is {mount_facts.state} "
+                    f"({mount_facts.detail or 'no detail'}); refusing to classify "
+                    "sync/cloud vs local, so failing closed to ambiguous",
+                ),
+            )
+        if mount_facts.state in _MOUNT_SYNC_STATES:
+            return (
+                PATH_RISK_SYNC_OR_CLOUD,
+                (f"mount metadata classifies the root as {mount_facts.state}",),
+            )
+
     return PATH_RISK_NORMAL, ()
 
 
@@ -238,20 +324,23 @@ def classify_path_safety(
     *,
     home: Path,
     sync_roots: Sequence[Path] | None = None,
+    mount_probe: MountProbe | None = None,
 ) -> PathSafety:
     """Classify ``raw_root`` into a closed :class:`PathSafety`.
 
-    ``home`` and ``sync_roots`` are injectable (``sync_roots`` defaults to
-    :func:`platform_sync_roots` for ``home``) so the classification is a pure
-    function of its inputs. The steps:
+    ``home`` / ``sync_roots`` / ``mount_probe`` are injectable (``sync_roots``
+    defaults to :func:`platform_sync_roots` for ``home``) so the classification
+    is a pure function of its inputs. The steps:
 
     1. Resolve to a canonical, symlink-free directory identity. If that fails,
        return ``path_risk=ambiguous`` immediately (fail closed — never
        ``normal`` on doubt). ``root_kind`` / ``adoption_marker`` cannot be
        trusted for an unresolved identity, so they are reported as
        ``non_git`` / ``absent`` placeholders alongside the ambiguous verdict.
-    2. Classify ``root_kind`` from a ``.git`` entry at the canonical root.
-    3. Classify ``path_risk`` (home → sync/cloud → normal).
+    2. Classify ``root_kind`` from Git worktree **ancestry** of the canonical
+       root (nested cwd + linked-worktree ``.git`` file both count).
+    3. Classify ``path_risk`` (home → path sync signal → mount metadata →
+       normal), consulting ``mount_probe`` when supplied.
     4. Classify ``adoption_marker`` from the ordered marker probe.
     """
     # Resolve ``home`` to the same canonical form as the root so the home
@@ -279,9 +368,20 @@ def classify_path_safety(
     # matching is symlink-invariant.
     resolved_sync_roots = tuple(Path(s).expanduser().resolve() for s in sync_roots)
 
-    root_kind = ROOT_KIND_GIT if (canonical / ".git").exists() else ROOT_KIND_NON_GIT
+    # ``root_kind`` follows Git worktree ancestry, not just a ``.git`` entry at
+    # the root: a cwd nested inside a Git worktree is git-managed, and a linked
+    # worktree carries a ``.git`` *file* (Redmine #13508 F2).
+    root_kind = (
+        ROOT_KIND_GIT
+        if infer_git_worktree_root(canonical) is not None
+        else ROOT_KIND_NON_GIT
+    )
+    mount_facts = mount_probe.classify_mount(canonical) if mount_probe else None
     path_risk, risk_notes = _classify_risk(
-        canonical, home=home, sync_roots=resolved_sync_roots
+        canonical,
+        home=home,
+        sync_roots=resolved_sync_roots,
+        mount_facts=mount_facts,
     )
     adoption_marker = _classify_adoption(canonical)
 

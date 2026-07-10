@@ -19,15 +19,31 @@ from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.domai
     ADOPTION_ONBOARDING_RECEIPT,
     ADOPTION_SCAFFOLD,
     ADOPTION_WORKSPACE_ANCHOR,
+    MOUNT_CONFLICTING,
+    MOUNT_LOCAL,
+    MOUNT_NETWORK,
+    MOUNT_SYNC_CLOUD,
+    MOUNT_UNAVAILABLE,
     PATH_RISK_AMBIGUOUS,
     PATH_RISK_HOME,
     PATH_RISK_NORMAL,
     PATH_RISK_SYNC_OR_CLOUD,
     ROOT_KIND_GIT,
     ROOT_KIND_NON_GIT,
+    MountFacts,
     classify_path_safety,
     platform_sync_roots,
 )
+
+
+class _FakeMountProbe:
+    """A deterministic MountProbe returning a fixed classification."""
+
+    def __init__(self, state: str, detail: str = "") -> None:
+        self._facts = MountFacts(state=state, source="fake", detail=detail)
+
+    def classify_mount(self, path):  # noqa: ANN001 - Port shape
+        return self._facts
 
 
 def _mk(base: Path, rel: str) -> None:
@@ -175,6 +191,103 @@ class PathSafetyAdoptionMarkerTests(unittest.TestCase):
                 root, home=Path(tmp) / "home", sync_roots=()
             ).adoption_marker
             self.assertEqual(marker, ADOPTION_ONBOARDING_RECEIPT)
+
+
+class GitAncestryTests(unittest.TestCase):
+    """F2: root_kind follows Git worktree ancestry, not just a `.git` at root."""
+
+    def test_git_at_root_is_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            (root / ".git").mkdir(parents=True)
+            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
+            self.assertEqual(safety.root_kind, ROOT_KIND_GIT)
+
+    def test_nested_cwd_under_git_root_is_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            nested = repo / "pkg" / "sub"
+            nested.mkdir(parents=True)
+            safety = classify_path_safety(nested, home=Path(tmp) / "home", sync_roots=())
+            self.assertEqual(safety.root_kind, ROOT_KIND_GIT)
+
+    def test_linked_worktree_dot_git_file_is_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lw = Path(tmp) / "linked"
+            lw.mkdir()
+            (lw / ".git").write_text("gitdir: /somewhere/.git/worktrees/lw\n", encoding="utf-8")
+            safety = classify_path_safety(lw, home=Path(tmp) / "home", sync_roots=())
+            self.assertEqual(safety.root_kind, ROOT_KIND_GIT)
+
+    def test_non_git_tree_is_non_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "plain" / "nested"
+            root.mkdir(parents=True)
+            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
+            self.assertEqual(safety.root_kind, ROOT_KIND_NON_GIT)
+
+
+class MountMetadataTests(unittest.TestCase):
+    """F1: mount metadata is a sync signal, and unavailable/conflicting → ambiguous."""
+
+    def _classify(self, tmp, state):
+        root = Path(tmp) / "proj"
+        root.mkdir(parents=True, exist_ok=True)
+        return classify_path_safety(
+            root,
+            home=Path(tmp) / "home",
+            sync_roots=(),
+            mount_probe=_FakeMountProbe(state),
+        )
+
+    def test_sync_cloud_mount_is_caution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, MOUNT_SYNC_CLOUD)
+            self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
+
+    def test_network_mount_is_caution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, MOUNT_NETWORK)
+            self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
+
+    def test_known_local_mount_is_normal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, MOUNT_LOCAL)
+            self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
+
+    def test_unavailable_metadata_is_ambiguous_not_normal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, MOUNT_UNAVAILABLE)
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+            self.assertTrue(safety.is_hard_block)
+
+    def test_conflicting_metadata_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, MOUNT_CONFLICTING)
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+
+    def test_path_prefix_signal_wins_over_local_mount(self) -> None:
+        # A provider-name path signal is authoritative sync even if the mount
+        # probe reports local (deliberate positive signal, not a conflict).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Dropbox" / "project"
+            root.mkdir(parents=True)
+            safety = classify_path_safety(
+                root,
+                home=Path(tmp) / "home",
+                sync_roots=(),
+                mount_probe=_FakeMountProbe(MOUNT_LOCAL),
+            )
+            self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
+
+    def test_no_probe_falls_back_to_path_signals(self) -> None:
+        # Backward-compatible: without a probe, a plain local path is normal.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "code"
+            root.mkdir()
+            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
+            self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
 
 
 class PlatformSyncRootsTests(unittest.TestCase):
