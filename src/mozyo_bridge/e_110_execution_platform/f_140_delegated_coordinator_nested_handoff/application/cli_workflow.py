@@ -79,17 +79,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_watch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
-    EXECUTION_BLOCKED,
     EXECUTION_DRY_RUN,
     EXECUTION_EXECUTED,
-    OWNER_OPERATOR,
     PRIMITIVE_CHILD_INTAKE,
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
-    PRIMITIVE_NONE,
     PRIMITIVE_TICKETLESS_CALLBACK,
-    REASON_HERDR_SELF_LANE_UNRESOLVED,
-    STATE_LANE_UNRESOLVED,
     PendingCallback,
     WorkflowAnchor,
     WorkflowStepOutcome,
@@ -189,6 +184,24 @@ def _pending_callback_from_args(args: argparse.Namespace) -> PendingCallback | N
     if not classification:
         return None
     return PendingCallback(classification=classification)
+
+
+def _anchor_issue_of(durable_anchor: str) -> str | None:
+    """The Redmine issue id from a ``redmine:issue=<id>:journal=<id>`` pointer, or ``None``.
+
+    Used to issue-correlate the store reconcile with a herdr live outcome's verified anchor
+    (Redmine #13489 F3c). ``"none"`` / an empty / a non-Redmine pointer yields ``None`` (no
+    correlation constraint), so a herdr lane with no verified anchor reconciles unchanged.
+    """
+    s = (durable_anchor or "").strip()
+    if not s or s == "none" or not s.startswith("redmine:"):
+        return None
+    for field in s.split(":"):
+        field = field.strip()
+        if field.startswith("issue="):
+            issue = field[len("issue="):].strip()
+            return issue or None
+    return None
 
 
 def _print_outcome_text(outcome: WorkflowStepOutcome) -> None:
@@ -308,51 +321,47 @@ def _execute_primitive(
 
 
 def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | None:
-    """Herdr-backend preflight for ``workflow step`` (Redmine #13446), or ``None`` under tmux.
+    """Herdr-native ``workflow step`` resolution for the current lane, or ``None`` under tmux.
 
     ``workflow step`` resolves the current lane from ``current_pane()`` — the tmux
     ``TMUX_PANE`` ``%pane`` — matched against the tmux discovery inventory. Under
     ``terminal_transport.backend: herdr`` there is no ``TMUX_PANE`` (or the pane is not in
-    the tmux inventory), so the standard entrypoint dies on ``TMUX_PANE is not set`` or folds
-    to a tmux-shaped ``self_lane_unresolved`` — the #13435 j#74176 -> j#74177 recurrence.
+    the tmux inventory), so the standard entrypoint would die on ``TMUX_PANE is not set`` or
+    fold to a tmux-shaped ``self_lane_unresolved`` — the #13435 j#74176 -> j#74177 / #13494
+    recurrence.
 
-    When the repo selects the herdr backend, this preflight looks at the herdr-native
-    lane-identity env (``HERDR_PANE_ID`` / ``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
-    ``MOZYO_LANE_ID``) *first* and returns a fail-closed :class:`WorkflowStepOutcome` whose
-    ``reason`` is the herdr-specific :data:`REASON_HERDR_SELF_LANE_UNRESOLVED`, whose
-    ``next_action`` points at the standard ``sublane create/start --execute`` dispatch, and
-    whose ``detail`` records exactly which herdr env keys were observed — never a bare tmux
-    ``%pane`` diagnostic. Returns ``None`` under the tmux backend so the tmux path (and its
-    byte-identical output) is unchanged.
+    Redmine #13489 replaces the #13446 fail-closed dead end (which merely pointed the
+    operator at ``sublane create/start --execute``) with herdr-native resolution: when the
+    repo selects the herdr backend, this delegates to
+    :func:`...herdr_workflow_step.resolve_herdr_step_outcome`, which classifies the lane role
+    from the launch-time sender identity (``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``) — only a
+    non-default lane slot gets a class (``codex`` -> sublane gateway, ``claude`` -> worker); a
+    default-lane pair or unknown provider fails closed — verifies the lane's Redmine
+    ``issue+journal`` anchor against the durable workflow gate (runtime store), and for a
+    gateway resolves the same-lane worker cardinality. It returns a role-appropriate
+    :class:`WorkflowStepOutcome` (worker reads its verified anchor; gateway dispatches /
+    monitors its single live same-lane worker), or fails closed on an unattested identity /
+    unclassifiable lane / unverified anchor / missing-or-duplicate worker. Returns ``None``
+    under the tmux backend so the tmux path (and its byte-identical output) is unchanged.
 
-    This is a preflight guard, not herdr-native ``workflow step`` routing: resolving the
-    step natively from the herdr inventory is out of this MVP's scope (Codex triage j#74179);
-    the guard replaces a tmux-shaped dead end with an actionable herdr-native fail-closed
-    outcome.
+    Increment 1 (Redmine #13489 j#74685 design_boundary) is resolution-only: the outcome
+    names the next action / owner / herdr surface but performs no sublane lifecycle mutation
+    and no delivery. The policy-permitted one-step auto-execution of ``sublane
+    create/start/dispatch`` (and the fail-closed destructive drain/retire boundary) is
+    increment 2, gated behind the mandatory task-level design mid-review.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        resolve_herdr_step_outcome,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
-        HERDR_STANDARD_DISPATCH_HINT,
         herdr_backend_active,
-        herdr_lane_env_detail,
     )
 
     repo_root = repo_root_from_args(args)
     if not herdr_backend_active(repo_root):
         return None
-    return WorkflowStepOutcome(
-        state=STATE_LANE_UNRESOLVED,
-        next_action=(
-            "herdr backend active: workflow step's tmux %pane self-lane resolution does "
-            "not apply in a herdr session. " + HERDR_STANDARD_DISPATCH_HINT
-        ),
-        execution=EXECUTION_BLOCKED,
-        reason=REASON_HERDR_SELF_LANE_UNRESOLVED,
-        next_owner=OWNER_OPERATOR,
-        primitive=PRIMITIVE_NONE,
-        repo_root=str(repo_root),
-        detail=herdr_lane_env_detail(),
-    )
+    return resolve_herdr_step_outcome(args)
 
 
 def cmd_workflow_step(args: argparse.Namespace) -> int:
@@ -371,31 +380,35 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     fail-closed blocked outcome.
     """
     as_json = getattr(args, "as_json", False)
-
-    # Herdr-backend preflight (Redmine #13446): before touching the tmux rail, fail closed
-    # with a herdr-specific reason + `sublane` next_action instead of dying on the tmux
-    # `%pane` self-lane resolution a herdr session cannot serve. No-op under `backend: tmux`,
-    # so the tmux path below (and its output) is byte-identical.
-    herdr_pre = _herdr_step_preflight(args)
-    if herdr_pre is not None:
-        if as_json:
-            print(_json.dumps(herdr_pre.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-        else:
-            _print_outcome_text(herdr_pre)
-        return 0 if herdr_pre.ok else 1
-
-    require_tmux()
-    self_pane = current_pane()
     session = getattr(args, "session", None)
     dry_run = getattr(args, "dry_run", False)
 
-    live = resolve_workflow_step(
-        _discover_candidates(),
-        self_pane=self_pane,
-        anchor=_anchor_from_args(args),
-        pending_callback=_pending_callback_from_args(args),
-        session=session,
-    )
+    # Resolve the LIVE lane outcome. The backend difference is confined here (mid-review
+    # #13489 j#74748 F2): under the herdr backend the lane is resolved herdr-natively from the
+    # launch-time sender identity; otherwise the tmux rail resolves it from `current_pane` +
+    # the tmux inventory. Everything after this — the store reconcile, the dry-run / executable
+    # branch, the output envelope — is backend-agnostic, so herdr no longer runs a second,
+    # divergent next-action state machine. The tmux path stays byte-identical (herdr_live is
+    # None under `backend: tmux`, so `require_tmux()` and the tmux resolution run exactly as
+    # before).
+    herdr_live = _herdr_step_preflight(args)
+    if herdr_live is not None:
+        live = herdr_live
+        # The herdr live anchor was verified against source-of-truth Redmine; issue-correlate the
+        # store reconcile against it so a caller-supplied store's cross-issue pending action is not
+        # surfaced onto this lane (Redmine #13489 F3c). The tmux path passes None (byte-invariant).
+        live_anchor_issue = _anchor_issue_of(live.durable_anchor)
+    else:
+        require_tmux()
+        self_pane = current_pane()
+        live = resolve_workflow_step(
+            _discover_candidates(),
+            self_pane=self_pane,
+            anchor=_anchor_from_args(args),
+            pending_callback=_pending_callback_from_args(args),
+            session=session,
+        )
+        live_anchor_issue = None
 
     # Reconcile the live routing outcome with the persisted runtime store's pending
     # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades
@@ -404,7 +417,9 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     # Fold the store with the SAME repo-local binding resume uses, resolved from the
     # current self lane's repo root (review j#72693), so the reconcile input matches resume.
     store_action, store_status = _load_store_action(args, repo_root=live.repo_root)
-    reconciled = reconcile_step_with_store(live, store_action, store_status=store_status)
+    reconciled = reconcile_step_with_store(
+        live, store_action, store_status=store_status, live_anchor_issue=live_anchor_issue
+    )
     outcome = reconciled.outcome
 
     # Dry-run, or a non-executable outcome (blocked / gated / grandchild Redmine-work

@@ -5,8 +5,14 @@ Expresses the #13435 j#74176 -> j#74177 recurrence as an executable fixture: wit
 entrypoints an agent reaches for first — ``handoff send --select`` / ``agents targets``
 (tmux semantic selection) and ``workflow step`` (tmux ``%pane`` self-lane resolution) — used
 to fall through onto the tmux rails and die with a tmux-shaped ``no_candidate:repo`` /
-``self_lane_unresolved``. The preflight guard (#13446) makes each surface fail closed with
-``herdr backend active`` + the standard ``sublane create --execute`` dispatch instead.
+``self_lane_unresolved``.
+
+``handoff send --select`` / ``agents targets`` still fail closed with ``herdr backend
+active`` + the standard ``sublane create --execute`` dispatch (the #13446 preflight guard).
+``workflow step`` is now resolved **herdr-natively** (Redmine #13489): it no longer dead-ends
+on ``herdr_self_lane_unresolved`` but classifies the lane role from the launch-time sender
+identity and returns a role-appropriate outcome — the recurrence guard here is that it never
+touches the tmux ``%pane`` rail (``require_tmux`` / ``current_pane``) under the herdr backend.
 
 Hermetic: the herdr backend is simulated by patching the shared
 ``herdr_entrypoint_preflight.herdr_backend_active`` seam (the consumers import it at call
@@ -29,6 +35,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.application import commands_agents, commands_target_select
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow,
+    herdr_workflow_step,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+    EXECUTION_NO_OP,
+    OWNER_GRANDCHILD,
+    PRIMITIVE_NONE,
+    STATE_GRANDCHILD_REDMINE_WORK,
+    WorkflowStepOutcome,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+    REASON_HERDR_WORKER_STEP_READY,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (
     herdr_entrypoint_preflight as pre,
@@ -42,41 +59,68 @@ def _herdr_active():
     return patch.object(pre, "herdr_backend_active", return_value=True)
 
 
-class WorkflowStepRecurrenceTest(unittest.TestCase):
-    """`workflow step` must not die on tmux `%pane` / `self_lane_unresolved` under herdr."""
+def _worker_outcome():
+    """A representative herdr-native worker-lane outcome the adapter would resolve."""
+    return WorkflowStepOutcome(
+        state=STATE_GRANDCHILD_REDMINE_WORK,
+        next_action="read the worker anchor and implement",
+        execution=EXECUTION_NO_OP,
+        reason=REASON_HERDR_WORKER_STEP_READY,
+        next_owner=OWNER_GRANDCHILD,
+        primitive=PRIMITIVE_NONE,
+    )
 
-    def test_preflight_returns_herdr_specific_blocked_outcome(self):
-        with _herdr_active():
+
+def _boom(*_a, **_k):
+    raise AssertionError("tmux rail reached under the herdr backend")
+
+
+class WorkflowStepRecurrenceTest(unittest.TestCase):
+    """`workflow step` must resolve herdr-natively, never touch the tmux `%pane` rail."""
+
+    def test_preflight_delegates_to_herdr_native_resolution(self):
+        # Under herdr the preflight now returns the herdr-native resolution (no dead-end).
+        with _herdr_active(), patch.object(
+            herdr_workflow_step, "resolve_herdr_step_outcome", return_value=_worker_outcome()
+        ):
             outcome = cli_workflow._herdr_step_preflight(argparse.Namespace(repo=None))
         self.assertIsNotNone(outcome)
-        self.assertEqual(outcome.execution, "blocked")
-        # herdr-specific reason, NOT the tmux `self_lane_unresolved`.
-        self.assertEqual(outcome.reason, "herdr_self_lane_unresolved")
-        self.assertEqual(outcome.next_owner, "operator")
-        self.assertIn("sublane create --execute", outcome.next_action)
-        # It looked at the herdr-native lane env first (Acceptance 2), not a bare %pane.
-        self.assertIn("HERDR_PANE_ID=", outcome.detail)
-        self.assertIn("MOZYO_WORKSPACE_ID=", outcome.detail)
+        # herdr-native reason, NOT the tmux `self_lane_unresolved` nor the #13446 dead-end.
+        self.assertEqual(outcome.reason, REASON_HERDR_WORKER_STEP_READY)
+        self.assertNotEqual(outcome.reason, "self_lane_unresolved")
+        self.assertNotEqual(outcome.reason, "herdr_self_lane_unresolved")
 
-    def test_dry_run_json_is_herdr_specific_and_returns_rc1(self):
+    def test_dry_run_flows_through_shared_pipeline_not_the_tmux_rail(self):
+        # F2 (mid-review j#74748): the herdr live outcome flows through the SAME store
+        # reconcile / dry-run pipeline as tmux (no divergent second state machine), while never
+        # touching the tmux `%pane` rail. `require_tmux` / `current_pane` blow up if reached;
+        # `_load_store_action` is spied to prove the shared pipeline is entered (and kept
+        # hermetic from the real home store).
         args = argparse.Namespace(
             repo=None, dry_run=True, as_json=True, session=None,
             issue=None, journal=None, callback=None, store_path=None,
         )
+        seen = {}
+
+        def _store(_a, *, repo_root=""):
+            seen["called"] = True
+            return None, cli_workflow.STORE_ABSENT
+
         out = io.StringIO()
-        # `require_tmux` / `current_pane` are NOT patched: the preflight must fire before
-        # them, so a herdr session with no TMUX_PANE never reaches the tmux rail.
-        with _herdr_active(), patch("sys.stdout", out):
+        with _herdr_active(), patch.object(
+            herdr_workflow_step, "resolve_herdr_step_outcome", return_value=_worker_outcome()
+        ), patch.object(cli_workflow, "require_tmux", _boom), patch.object(
+            cli_workflow, "current_pane", _boom
+        ), patch.object(cli_workflow, "_load_store_action", _store), patch("sys.stdout", out):
             rc = cli_workflow.cmd_workflow_step(args)
         payload = json.loads(out.getvalue())
-        self.assertEqual(rc, 1)
-        self.assertEqual(payload["reason"], "herdr_self_lane_unresolved")
-        self.assertIn("HERDR_PANE_ID=", payload["detail"])
-        self.assertIn("sublane create --execute", payload["next_action"])
+        self.assertEqual(rc, 0)  # a worker no_op is a forward step
+        self.assertEqual(payload["reason"], REASON_HERDR_WORKER_STEP_READY)
+        self.assertTrue(seen.get("called"), "herdr live must flow through the shared store reconcile")
 
     def test_tmux_backend_preflight_is_a_noop(self):
         # Backend=tmux: the preflight returns None so the tmux path (and its output) is
-        # unchanged — the guard is strictly additive under herdr.
+        # unchanged — the herdr resolution is strictly gated on the herdr backend.
         with patch.object(pre, "herdr_backend_active", return_value=False):
             self.assertIsNone(
                 cli_workflow._herdr_step_preflight(argparse.Namespace(repo=None))
