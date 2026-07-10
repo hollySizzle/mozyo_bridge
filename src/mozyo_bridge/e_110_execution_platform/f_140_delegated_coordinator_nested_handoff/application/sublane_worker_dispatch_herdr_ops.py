@@ -29,11 +29,14 @@ differ:
   queue-enter`` CLI contract, composed through the shared argv builder and driven with the
   shared j#71597 SystemExit / stdout containment. The worker locator is a non-``%pane``
   target, so the send rides the **herdr rail** (#13320 effective-backend predicate): the
-  same-workspace route authority resolves the worker slot (#13305), the queue-enter rail
-  injects + submits with the #13322 Enter-resend self-healing, and the delivery is recorded
-  to the #13296 herdr ledger with the queue-enter turn-start observation (#13292). Exit 0
-  is the submit-complete delivery-ACK measurement — nothing more (the
-  ``ack-completion-receiver-state.md`` separation holds: no completion detector).
+  same-workspace route authority resolves the worker slot (#13305) — pinned to the lane's
+  **stable ``(workspace, lane_label, claude)`` identity** by an explicit ``--target-lane``
+  (Redmine #13485) so it is never re-derived from the sender's own lane — the queue-enter
+  rail injects + submits with the #13322 Enter-resend self-healing, and the delivery is
+  recorded to the #13296 herdr ledger with the queue-enter turn-start observation (#13292).
+  Exit 0 is the submit-complete delivery-ACK measurement to that stable worker target —
+  nothing more (the ``ack-completion-receiver-state.md`` separation holds: no completion
+  detector; the turn-start observation is separate telemetry, never conflated with the ACK).
 
 The tmux path is untouched: this adapter is only selected by
 ``_resolve_worker_dispatch_ops`` when the repo-local config selects ``backend: herdr``
@@ -123,8 +126,8 @@ class HerdrWorkerDispatchOps:
     ) -> int:
         """Drive the governed same-lane worker forward on the herdr rail (measured ACK).
 
-        Byte-for-byte the argv the tmux adapter composes — the backend split lives in the
-        send path itself: ``worker_pane`` is a live herdr locator (never ``%N``), so the
+        The argv the tmux adapter composes, plus two herdr-only pins (``--repo`` /
+        ``--target-lane``): ``worker_pane`` is a live herdr locator (never ``%N``), so the
         #13320 effective-backend predicate routes the send onto the herdr rail, where
         ``--target-repo auto`` resolves to the sender's own repo root (#13331 j#73312 #2 —
         the same-workspace worker's repo) and the queue-enter rail submit-completes with
@@ -133,6 +136,17 @@ class HerdrWorkerDispatchOps:
         case promotes (0) or fails closed on (non-0, ``gateway_notified`` kept). Calls
         resolve through the dispatcher module attribute so its established monkeypatch
         seams keep working.
+
+        Redmine #13485: the herdr rail re-resolves its target through the #13305
+        backend-neutral route authority, which discards the ``worker_pane`` locator and
+        derives the target lane. Passing ``target_lane=lane_label`` pins that lane to the
+        stable ``(workspace, lane_label, claude)`` identity the ``read_lane`` inventory
+        decode already confirmed, so the ACK measures submit-completion to the intended
+        worker even when the SENDER's launch-time lane attestation diverges (a coordinator
+        / cross-lane stall-drive, or a legacy gateway) — the send no longer silently
+        ACKs on a different / stale ``claude`` while the real lane worker stays idle
+        (#13483 j#74570). This mirrors the coordinator→gateway leg, which already pins
+        ``--target-lane`` (:meth:`HerdrSublaneActuatorOps.dispatch_argv`).
         """
         argv = _worker_dispatcher._worker_dispatch_argv(
             issue=issue,
@@ -142,6 +156,11 @@ class HerdrWorkerDispatchOps:
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            # Redmine #13485: pin the worker's stable lane identity so the herdr
+            # route authority resolves `(workspace, lane_label, claude)` explicitly,
+            # not the sender-derived lane (tier-2). The tmux adapter omits this
+            # (default None) and its `%pane` target never rides the lane rail.
+            target_lane=lane_label,
             # Redmine #13397: pin the inner send's effective-backend resolution to the
             # SAME repo the outer `sublane dispatch-worker` selected herdr on
             # (`self.repo_root` — the value `repo_backend_is_herdr` returned True for),

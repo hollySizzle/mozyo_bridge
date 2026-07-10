@@ -285,6 +285,7 @@ def _worker_dispatch_argv(
     target_repo: str,
     allow_direct_worker: bool = False,
     repo_root: Optional[str] = None,
+    target_lane: Optional[str] = None,
 ) -> list[str]:
     """The same-lane worker forward as the gateway would type it (pure).
 
@@ -316,6 +317,23 @@ def _worker_dispatch_argv(
     root makes the inner backend match the outer selection. ``None`` (the tmux
     :class:`LiveWorkerDispatchOps` default) omits the flag, so the tmux argv stays
     byte-for-byte the pre-#13397 shape.
+
+    ``target_lane`` (Redmine #13485) pins the explicit ``--target-lane`` so the inner
+    herdr send resolves the worker by its **stable ``(workspace_id, lane_id, role)``
+    identity** — the ``lane_label`` the ``read_lane`` inventory decode confirmed — and
+    NOT by re-deriving the lane from the *sender's* identity (``derive_target_lane``
+    tier-2 sender-same-lane). Without the pin the herdr rail discards the resolved
+    worker locator and re-resolves ``(sender.workspace_id, sender.lane_id, claude)``:
+    when the sender's launch-time lane attestation diverges from the worker's lane —
+    a coordinator / cross-lane stall-drive, or a legacy / mis-attested gateway — that
+    derives a DIFFERENT (or stale) ``claude`` slot, so the send delivery-ACKs (exit 0)
+    on the wrong agent while the real lane worker stays idle (the #13483 j#74570 live
+    divergence). Pinning the lane makes the ACK measure submit-completion to the
+    intended worker, exactly as the coordinator→gateway leg already pins
+    ``--target-lane`` (``sublane_actuator_herdr_ops.dispatch_argv``). ``None`` (the
+    tmux :class:`LiveWorkerDispatchOps` default) omits the flag: the tmux worker
+    addresses an explicit ``%pane`` and never rides the lane-derivation rail, so the
+    tmux argv stays byte-for-byte the pre-#13485 shape.
     """
     argv: list[str] = []
     if repo_root:
@@ -338,6 +356,12 @@ def _worker_dispatch_argv(
         worker_pane,
         "--target-repo",
         target_repo,
+    ]
+    if target_lane:
+        # Redmine #13485: explicit lane authority (mirrors the gateway dispatch's
+        # `--target-lane`). Placed with the other target coordinates, before `--mode`.
+        argv += ["--target-lane", target_lane]
+    argv += [
         "--mode",
         "queue-enter",
         "--role-profile",
