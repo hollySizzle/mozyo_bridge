@@ -835,6 +835,13 @@ class SessionStartCliTest(unittest.TestCase):
         with patch.dict(os.environ, env, clear=False), patch.object(
             hss, "prepare_session", _prepare_with_fake_runner
         ):
+            # Isolate the override rail (Finding 1, review j#74373): patch.dict merges
+            # with clear=False, so an ambient operator/CI MOZYO_CLAUDE_PERMISSION_MODE
+            # would leak into the default-path scenario and make it assert the external
+            # value instead of the policy default. Remove it unless the scenario sets it
+            # explicitly; patch.dict restores the original environ on exit.
+            if not (extra_env and "MOZYO_CLAUDE_PERMISSION_MODE" in extra_env):
+                os.environ.pop("MOZYO_CLAUDE_PERMISSION_MODE", None)
             rc = args.func(args)
         self.assertEqual(rc, 0)
         by_provider = {}
