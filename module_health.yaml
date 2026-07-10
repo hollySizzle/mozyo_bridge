@@ -1251,6 +1251,7 @@ allowlist:
 # deferral: the pure placement/topology decisions + payload parsers were extracted
 # to the cohesive sibling
 # `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_lane_topology.py`
-# (337 lines), dropping herdr_session_start to 997 lines — back under the 1000
-# threshold. The allowlist entry is removed (not silently raised); the sibling is
-# well under threshold and needs none.
+# (~446 lines: placement decisions + payload parsers + the workspace-segment
+# resolver), dropping herdr_session_start to ~970 lines — back under the 1000
+# threshold even after the j#74433 / j#74434 review-fix guards. The allowlist entry
+# is removed (not silently raised); the sibling is well under threshold and needs none.
