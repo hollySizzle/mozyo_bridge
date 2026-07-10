@@ -428,5 +428,92 @@ class SharedWorkspaceExplicitLaneDispatchTest(unittest.TestCase):
         self.assertEqual(pane["cwd"], str(Path(ctx.repo).resolve()))
 
 
+class CoordinatorPseudoTargetHerdrSendTest(unittest.TestCase):
+    """Redmine #13476 (Design Consultation Answer j#74599, Option A): the herdr send
+    rail consumes the `--target coordinator` semantic pseudo-target and routes the
+    sublane->parent coordinator callback to the workspace DEFAULT lane + the configured
+    coordinator provider — NOT the sender's own sublane (Review j#74511 Finding 1's
+    same-lane misroute). The documented backend-neutral form
+    `--to codex --target coordinator` stays intact and `--to` public choices are
+    unchanged (codex); the translation is internal. An explicit `--target-lane` still
+    overrides the pseudo-target, a non-coordinator target is unaffected, and a missing
+    default-lane coordinator fails closed (never a silent same-lane fallback).
+    """
+
+    @staticmethod
+    def _args(ctx, *, target=None, target_lane=None, to="codex"):
+        ns = argparse.Namespace()
+        ns.repo = str(ctx.repo)
+        ns.to = to
+        ns.target = target
+        ns.target_lane = target_lane
+        return ns
+
+    def _resolve(self, ctx, args):
+        with patch("subprocess.run", ctx.run), patch.dict(
+            os.environ, ctx.env(), clear=True
+        ):
+            return resolve_herdr_send_target(args, receiver=args.to)
+
+    @staticmethod
+    def _rows(ws):
+        # Two codex agents in the SAME workspace: the parent coordinator in the DEFAULT
+        # lane, and the sender's own sublane gateway in `lane-1`. A bare `--to codex`
+        # from the sublane would derive `lane-1` (same-lane); the coordinator
+        # pseudo-target must pick `default`.
+        return [
+            {"name": encode_assigned_name(ws, "codex", "default"), "pane_id": "wC:pC"},
+            {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wG:pG"},
+        ]
+
+    def test_coordinator_pseudo_target_resolves_default_lane_from_sublane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="lane-1", rows=self._rows)
+            pane = self._resolve(ctx, self._args(ctx, target="coordinator", to="codex"))
+        # The parent coordinator (default lane), never the sender's own sublane gateway.
+        self.assertEqual(pane["id"], "wC:pC")
+        self.assertEqual(pane["lane_id"], "default")
+
+    def test_explicit_target_lane_overrides_coordinator_pseudo_target(self) -> None:
+        # An intentional `--target-lane` override is never ignored (tier-1 explicit lane
+        # beats the coordinator pseudo-target's default-lane derivation).
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="lane-1", rows=self._rows)
+            pane = self._resolve(
+                ctx,
+                self._args(ctx, target="coordinator", target_lane="lane-1", to="codex"),
+            )
+        self.assertEqual(pane["id"], "wG:pG")
+        self.assertEqual(pane["lane_id"], "lane-1")
+
+    def test_non_coordinator_target_is_unaffected(self) -> None:
+        # A receiver-label target (not the coordinator pseudo-target) keeps the bare
+        # same-lane derivation — the translation is scoped to `coordinator` only.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(tmp, sender_role="codex", sender_lane="lane-1", rows=self._rows)
+            pane = self._resolve(ctx, self._args(ctx, target="codex", to="codex"))
+        self.assertEqual(pane["id"], "wG:pG")
+        self.assertEqual(pane["lane_id"], "lane-1")
+
+    def test_coordinator_pseudo_target_fails_closed_without_default_lane(self) -> None:
+        # No live default-lane coordinator -> fail closed. Critically, it must NOT fall
+        # back to the same-lane gateway (that silent fallback is the exact Finding 1
+        # misroute); the send raises rather than landing on the wrong target.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                sender_role="codex",
+                sender_lane="lane-1",
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "wG:pG",
+                    }
+                ],
+            )
+            with self.assertRaises(HerdrSendEntryError):
+                self._resolve(ctx, self._args(ctx, target="coordinator", to="codex"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
