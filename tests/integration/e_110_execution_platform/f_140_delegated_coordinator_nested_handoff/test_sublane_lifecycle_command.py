@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     INTEGRATION_BLOCKED,
     RETIRE_OK,
+    SublaneIntegrationPolicy,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
@@ -245,6 +246,34 @@ class CreateUseCaseTests(unittest.TestCase):
         )
         self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
         self.assertIn("missing_field:lane_label", outcome.plan.blocked_reasons)
+
+    def test_non_git_manage_worktree_false_still_relaxes(self):
+        # #13432 Review j#74285 finding 1: a non-git workspace under an operator
+        # `manage_worktree: false` opt-out collapses the launch action to skip_disabled
+        # BEFORE the non-git branch. The identity relaxation must track the probed
+        # git-ness, not the launch-action token, or the plan-only path would wrongly
+        # re-require --branch/--worktree and diverge from the actuator identity path.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneCreateUseCase(ops, policy).run(
+            _req(branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_PLANNED)
+        self.assertEqual(outcome.plan.launch_action, "skip_disabled")
+        self.assertEqual(len(outcome.plan.steps), 4)
+
+    def test_git_manage_worktree_false_keeps_full_identity_requirement(self):
+        # #13432 byte-invariance: the relaxation is scoped to a *non-git* workspace. A Git
+        # workspace under `manage_worktree: false` still requires the full Git identity, so
+        # a blank worktree fails closed (skip_disabled must not leak the non-git relaxation).
+        ops = FakeOps(git=True)
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneCreateUseCase(ops, policy).run(
+            _req(branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:branch", outcome.plan.blocked_reasons)
+        self.assertIn("missing_field:worktree_path", outcome.plan.blocked_reasons)
 
 
 class RetireUseCaseTests(unittest.TestCase):

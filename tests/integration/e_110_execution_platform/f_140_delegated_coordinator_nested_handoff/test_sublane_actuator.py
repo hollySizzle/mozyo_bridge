@@ -46,6 +46,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneActuationOutcome,
     render_actuation_journal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+    SublaneIntegrationPolicy,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SublaneCreateRequest,
     SublaneLaneView,
@@ -254,6 +257,23 @@ class MissingIdentityTests(unittest.TestCase):
         self.assertEqual(append_paths, ["/ws"])
         dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
         self.assertEqual(dispatch["target_repo"], "/ws")
+
+    def test_non_git_manage_worktree_false_still_actuates(self):
+        # #13432 Review j#74285 finding 1 (actuate-side parity): the omitted-identity
+        # relaxation must hold under an operator `manage_worktree: false` opt-out too. The
+        # actuator resolves identity from the probed git-ness (resolve_create_identity), so
+        # it never depended on the launch action — this pins the parity with the plan-only
+        # path, which the finding surfaced diverging under this exact policy.
+        ops = FakeActuatorOps(
+            git=False, workspace_root="/ws", lanes=[None, _lane(repo_root="/ws")]
+        )
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneActuateUseCase(ops, policy).run(
+            _req(branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.launch_action, "skip_disabled")
+        self.assertEqual(outcome.worktree_path, "/ws")
 
     def test_non_git_still_requires_issue_and_lane_label(self):
         # #13432: only the Git worktree identity relaxes in a non-git workspace; the lane

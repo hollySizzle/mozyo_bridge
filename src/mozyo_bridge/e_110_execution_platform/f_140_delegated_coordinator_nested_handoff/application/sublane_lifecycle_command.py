@@ -333,17 +333,25 @@ class SublaneCreateUseCase:
     policy: SublaneIntegrationPolicy = SublaneIntegrationPolicy.default()
 
     def run(self, request: SublaneCreateRequest) -> SublaneCreateOutcome:
-        # #13432: in a non-git (directory-scaffold) workspace the lane has no worktree
-        # (LAUNCH_SKIP_NO_GIT) — `--branch` / `--worktree` are optional there — and an
-        # omitted `--worktree` defaults to the workspace root (the #13392 論点1 lane runtime
-        # root), so the plan / dispatch carry the root the lane actually runs in. A Git
-        # workspace keeps the full identity requirement, so a missing field still fails
-        # closed in plan_sublane_create (byte-invariant contract). The shared
-        # decide_create_launch re-probes git for the launch action.
+        # #13432: in a non-git (directory-scaffold) workspace the lane has no worktree —
+        # `--branch` / `--worktree` are optional there — and an omitted `--worktree`
+        # defaults to the workspace root (the #13392 論点1 lane runtime root), so the plan /
+        # dispatch carry the root the lane actually runs in. A Git workspace keeps the full
+        # identity requirement, so a missing field still fails closed in
+        # plan_sublane_create (byte-invariant contract). The probed git-ness is passed
+        # explicitly to plan_sublane_create so the identity relaxation tracks the real
+        # workspace, not the launch-action token — an operator `manage_worktree: false`
+        # opt-out collapses the launch action to LAUNCH_SKIP_DISABLED before the non-git
+        # branch, and inferring git-ness from that token would wrongly re-require the Git
+        # identity and diverge from the actuator's resolve_create_identity path (Review
+        # #13432 j#74285 finding 1). The shared decide_create_launch re-probes git for the
+        # launch action.
         is_git = self.ops.is_git_workspace()
         request = default_nongit_worktree_request(self.ops, request, is_git)
         decision = decide_create_launch(self.ops, request, self.policy)
-        return SublaneCreateOutcome(plan=plan_sublane_create(request, decision))
+        return SublaneCreateOutcome(
+            plan=plan_sublane_create(request, decision, is_git=is_git)
+        )
 
 
 @dataclass

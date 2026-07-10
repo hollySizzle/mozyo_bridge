@@ -665,7 +665,10 @@ class SublaneCreatePlan:
 
 
 def plan_sublane_create(
-    request: SublaneCreateRequest, launch: WorktreeLaunchDecision
+    request: SublaneCreateRequest,
+    launch: WorktreeLaunchDecision,
+    *,
+    is_git: Optional[bool] = None,
 ) -> SublaneCreatePlan:
     """Compose the #12604 launch decision with the pane / dispatch steps (pure).
 
@@ -684,14 +687,23 @@ def plan_sublane_create(
 
     The steps are a *plan*: this function actuates nothing.
 
-    #13432: the launch decision carries the git-ness of the workspace. A
-    :data:`LAUNCH_SKIP_NO_GIT` action is the non-Git directory-scaffold path, where the
-    lane has no worktree — so ``--branch`` / ``--worktree`` are optional there and the
-    ``missing_field`` check relaxes accordingly. Every other action (Git create / reuse /
-    disabled / blocked) keeps the full Git identity requirement byte-invariant.
+    #13432: the identity requirement relaxes in a non-Git (directory-scaffold) workspace,
+    where the lane has no worktree — so ``--branch`` / ``--worktree`` are optional there.
+    The caller passes the runtime git-ness explicitly via ``is_git`` (the workspace's real
+    git probe), because the launch *action* alone cannot carry it: an operator opt-out
+    (``manage_worktree: false``) collapses to :data:`LAUNCH_SKIP_DISABLED` *before* the
+    non-Git branch of :func:`decide_worktree_launch`, so a non-Git lane under that policy
+    still reads as ``skip_disabled`` — inferring git-ness from the action token would then
+    wrongly require ``--branch`` / ``--worktree`` and diverge from the actuator's
+    identity path (Review #13432 j#74285 finding 1). When ``is_git`` is not supplied it
+    falls back to the launch-action heuristic (``action != LAUNCH_SKIP_NO_GIT``), which is
+    exact for every action a direct caller constructs except that one policy-opt-out combo;
+    every production caller passes the probed value. A Git workspace keeps the full Git
+    identity requirement byte-invariant.
     """
-    non_git = launch.action == LAUNCH_SKIP_NO_GIT
-    missing = request.missing_fields(is_git=not non_git)
+    if is_git is None:
+        is_git = launch.action != LAUNCH_SKIP_NO_GIT
+    missing = request.missing_fields(is_git=is_git)
     if missing:
         return SublaneCreatePlan(
             status=CREATE_BLOCKED,
