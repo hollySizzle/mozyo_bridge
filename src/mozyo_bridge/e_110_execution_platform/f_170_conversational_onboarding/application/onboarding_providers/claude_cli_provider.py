@@ -60,6 +60,7 @@ from ...domain.conversation_port import (
     IntentCandidate,
     build_turn_json_schema,
 )
+from .provider_binary import resolve_claude_binary
 
 __all__ = (
     "DEFAULT_CLAUDE_MODEL",
@@ -185,13 +186,21 @@ class SafeClaudeCliProvider:
     def __init__(
         self,
         *,
-        binary: str = "claude",
+        binary: str | None = None,
         model: str = DEFAULT_CLAUDE_MODEL,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         runner: ProviderRunner | None = None,
         system_prompt: str = _SYSTEM_PROMPT,
+        env: Mapping[str, str] | None = None,
+        resolver=resolve_claude_binary,
     ) -> None:
-        self._binary = binary
+        # ``binary=None`` (production) resolves to a verified absolute executable
+        # via ``resolver`` before any subprocess (j#74942); an explicit ``binary``
+        # (a pre-resolved / test value) is used verbatim.
+        self._explicit_binary = binary
+        self._resolver = resolver
+        self._env = env
+        self._resolved_binary: str | None = None
         self._model = model
         self._timeout_s = timeout_s
         self._runner = runner or _default_runner
@@ -200,10 +209,24 @@ class SafeClaudeCliProvider:
             build_turn_json_schema(), ensure_ascii=False, sort_keys=True
         )
 
+    def _binary(self) -> str:
+        """The verified executable for ``argv[0]`` (resolved once, fail-closed)."""
+        if self._explicit_binary is not None:
+            return self._explicit_binary
+        if self._resolved_binary is None:
+            # Raises ConversationProviderError on missing/non-executable/unsafe —
+            # the caller then spawns no subprocess and mutates nothing.
+            self._resolved_binary = self._resolver(self._env)
+        return self._resolved_binary
+
     def argv(self) -> list[str]:
-        """The exact fixed argv this binding will invoke (for evidence / tests)."""
+        """The exact fixed argv this binding will invoke (for evidence / tests).
+
+        Resolves the provider executable to a verified absolute path first, so
+        ``argv[0]`` is never a bare ambient-PATH name (j#74942).
+        """
         return build_safe_argv(
-            self._binary, self._model, self._system_prompt, self._turn_schema
+            self._binary(), self._model, self._system_prompt, self._turn_schema
         )
 
     def build_prompt(self, context: ConversationContext) -> str:
@@ -230,7 +253,7 @@ class SafeClaudeCliProvider:
         except FileNotFoundError as exc:
             raise ConversationProviderError(
                 PROVIDER_UNAVAILABLE,
-                f"conversation provider binary {self._binary!r} not found",
+                "conversation provider binary not found at the resolved path",
             ) from exc
         except OSError as exc:
             raise ConversationProviderError(

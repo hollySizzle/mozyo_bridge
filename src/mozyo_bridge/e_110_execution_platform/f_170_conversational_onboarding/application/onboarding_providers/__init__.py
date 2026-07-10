@@ -13,10 +13,13 @@ from .claude_cli_provider import (
     SafeClaudeCliProvider,
     build_safe_argv,
 )
+from .provider_binary import CLAUDE_BINARY_ENV, resolve_claude_binary
 
 __all__ = (
+    "CLAUDE_BINARY_ENV",
     "DEFAULT_CLAUDE_MODEL",
     "RunResult",
     "SafeClaudeCliProvider",
     "build_safe_argv",
+    "resolve_claude_binary",
 )

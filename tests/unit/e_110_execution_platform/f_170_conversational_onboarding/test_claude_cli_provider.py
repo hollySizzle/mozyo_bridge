@@ -152,7 +152,8 @@ class SanitizedPromptTest(unittest.TestCase):
 
 class ConverseParsingTest(unittest.TestCase):
     def _provider(self, run):
-        return SafeClaudeCliProvider(runner=lambda a, s, t: run(a, s, t))
+        # Explicit binary keeps the parse tests hermetic (no resolver / real CLI).
+        return SafeClaudeCliProvider(binary="claude", runner=lambda a, s, t: run(a, s, t))
 
     def test_explain_turn(self):
         provider = self._provider(
@@ -190,7 +191,8 @@ class ConverseParsingTest(unittest.TestCase):
 class ConverseFailClosedTest(unittest.TestCase):
     def test_nonzero_exit_fails_closed(self):
         provider = SafeClaudeCliProvider(
-            runner=lambda a, s, t: RunResult(returncode=2, stdout="", stderr="boom")
+            binary="claude",
+            runner=lambda a, s, t: RunResult(returncode=2, stdout="", stderr="boom"),
         )
         with self.assertRaises(ConversationProviderError) as ctx:
             provider.converse(_context())
@@ -199,9 +201,10 @@ class ConverseFailClosedTest(unittest.TestCase):
     def test_stderr_and_raw_payload_never_leaked_into_error(self):
         secret_payload = "SENSITIVE-STDERR-abc123"
         provider = SafeClaudeCliProvider(
+            binary="claude",
             runner=lambda a, s, t: RunResult(
                 returncode=3, stdout="garbage", stderr=secret_payload
-            )
+            ),
         )
         with self.assertRaises(ConversationProviderError) as ctx:
             provider.converse(_context())
@@ -212,7 +215,7 @@ class ConverseFailClosedTest(unittest.TestCase):
         def _timeout(argv, stdin, timeout):
             raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
 
-        provider = SafeClaudeCliProvider(runner=_timeout)
+        provider = SafeClaudeCliProvider(binary="claude", runner=_timeout)
         with self.assertRaises(ConversationProviderError) as ctx:
             provider.converse(_context())
         self.assertEqual(ctx.exception.code, PROVIDER_UNAVAILABLE)
@@ -221,21 +224,23 @@ class ConverseFailClosedTest(unittest.TestCase):
         def _missing(argv, stdin, timeout):
             raise FileNotFoundError(2, "No such file", argv[0])
 
-        provider = SafeClaudeCliProvider(runner=_missing)
+        provider = SafeClaudeCliProvider(binary="claude", runner=_missing)
         with self.assertRaises(ConversationProviderError) as ctx:
             provider.converse(_context())
         self.assertEqual(ctx.exception.code, PROVIDER_UNAVAILABLE)
 
     def test_non_json_output_fails_closed(self):
         provider = SafeClaudeCliProvider(
-            runner=lambda a, s, t: RunResult(returncode=0, stdout="not json", stderr="")
+            binary="claude",
+            runner=lambda a, s, t: RunResult(returncode=0, stdout="not json", stderr=""),
         )
         with self.assertRaises(ConversationProviderError):
             provider.converse(_context())
 
     def test_error_envelope_fails_closed(self):
         provider = SafeClaudeCliProvider(
-            runner=lambda a, s, t: _envelope("x", is_error=True)
+            binary="claude",
+            runner=lambda a, s, t: _envelope("x", is_error=True),
         )
         with self.assertRaises(ConversationProviderError):
             provider.converse(_context())
@@ -244,13 +249,14 @@ class ConverseFailClosedTest(unittest.TestCase):
         def _no_result(argv, stdin, timeout):
             return RunResult(returncode=0, stdout=json.dumps({"type": "result"}))
 
-        provider = SafeClaudeCliProvider(runner=_no_result)
+        provider = SafeClaudeCliProvider(binary="claude", runner=_no_result)
         with self.assertRaises(ConversationProviderError):
             provider.converse(_context())
 
     def test_malformed_turn_json_fails_closed(self):
         provider = SafeClaudeCliProvider(
-            runner=lambda a, s, t: _envelope("{not-json")
+            binary="claude",
+            runner=lambda a, s, t: _envelope("{not-json"),
         )
         with self.assertRaises(ConversationProviderError):
             provider.converse(_context())
