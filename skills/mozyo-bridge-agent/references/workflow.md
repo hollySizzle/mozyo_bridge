@@ -129,6 +129,36 @@ handoff / notify の運用判断は、しばしば三つの別概念を取り違
 
 深い signal layer model、runtime event 語彙、送信 rail との接続は採用 repo 側の doctrine が持つ (`mozyo_bridge` では `vibes/docs/logics/ack-completion-receiver-state.md` と `vibes/docs/logics/tmux-send-safety-contract.md`)。本節が固定するのは*三概念の分離と、それを取り違えない運用規範*だけである。
 
+## Wait / polling 効率標準
+
+`## ACK / delivery / completion の分離` が固定するとおり、pane の沈黙は completion detector ではなく、runtime signal で gate は前進しない。ここから運用上の帰結が出る: coordinator / sublane agent が次の進捗を待つとき、短周期の polling や同一 pane 出力の再読は進捗を早める手段ではなく、token とレビュー帯域を空費する anti-pattern である。本標準は待機を durable-record-anchored かつ低コストに保つ portable な規律を固定する (Redmine #13489 owner intent)。`## ACK / delivery / completion の分離` と `## Stall / no-progress 検出標準` の運用面の補完であり、いずれも緩めない。
+
+### blocking wait を token 消費と誤認しない
+
+- runtime が blocking で待てる場合、待機そのものは token 消費ではない。10–30 秒間隔の反復 poll を「進捗確認」として標準化しない。short-interval polling と、変化のない同一 pane 出力の再読は、進捗を生まず観測ノイズと帯域だけを増やす。
+- 通常の進捗待ちは durable な callback / state transition の到達を優先する。待機の解除条件は「pane に何か出た」ではなく「durable record が前進した」であり、`## Stall / no-progress 検出標準` の trigger と同じ source から読む。
+
+### bounded wait は user commentary SLA 内に収める
+
+- 明示的な bounded wait が必要なときは、user commentary SLA 内の **45–55 秒**を基本周期とする。これより短い 10–30 秒の反復 poll を標準の cadence にしない。
+- bounded wait を重ねても durable state が変わらないなら、それは進捗の不在であって観測の不足ではない。`## Stall / no-progress 検出標準` に従い durable record から stall candidate を分類し、pane を掘り返さない。
+
+### timeout / state 不変時に pane history を掘らない
+
+- bounded wait が timeout し durable state が不変なら、pane history を読まない。state の遷移・callback の到達・異常 (エラー / 停止 / 予期しない出力) が観測されたときだけ、pane 末尾の **20–40 行**を読む。
+- 同じ scrollback を再読しない。既読領域の再走査は新しい情報を生まず context と帯域を消費するだけである。pane は観測面であり正本ではない。
+
+### 通常 finding は gate journal にまとめ、即時 interrupt は Critical に限定する
+
+- 通常の finding / 進捗報告は `implementation_done` / `review_request` などの gate journal の時点でまとめて durable record に載せる。作業の途中で逐一 interrupt を送らない。
+- 即時 interrupt は、**安全・authority・不可逆リスクに関わる Critical** な事象に限定する (例: 破壊的操作の恐れ、権限逸脱、credential 露出、data loss)。それ以外は gate まで batch する。
+
+### 本標準が緩めない境界
+
+- **durable record が正本であり続ける。** 待機の解除・stall 判定・finding の集約はすべて Redmine issue / journal から導出し、pane scrollback / `status` / `doctor` は傍証の観測面に留める。
+- **効率化は fail-closed / gate の bypass ではない。** poll を減らすことは、gate journal の記録義務 (`## Sublane 完了 guardrail`) や callback outcome の記録を省く口実にならない。待機コストの削減は監査可能性を下げない。
+- **base cadence は portable、その先の tuning は operator 固有である。** user commentary SLA 内の 45–55 秒基本 cadence は portable な default であり本標準の一部である。operator の runtime policy に留まるのは、その base を超える project 固有の緩和・延長、どの signal を「異常」とみなすかの private な閾値、escalation 順序である (採用 repo の public / private 境界 rule を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は *blocking wait を token 消費と誤認しない / 短周期 poll と scrollback 再読を標準にしない / bounded wait を user commentary SLA 内の 45–55 秒基本 cadence に収める / timeout・不変時に pane history を掘らない / 通常 finding を gate journal にまとめ即時 interrupt を Critical に限定する / durable record を正本に保つ* ことである。
+
 ## Workspace 横断 handoff
 
 sender (Claude または Codex) が、別の tmux session — 例えば別 repo の workspace — にいる agent へ通知する必要がある場合、routing は workflow レベルだけでなく CLI でも制約される (Redmine #10332)。
