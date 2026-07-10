@@ -4,6 +4,20 @@
 
 本 reference は **mozyo-bridge package 自体** の release runbook である — `hollySizzle/mozyo_bridge` の versioning、TestPyPI / PyPI publishing、distribution check を扱う。採用 project がこの package を publish することはなく、自身の release にこの runbook を適用しない。project 自身の release process を使い、portable な姿勢のみを保つ (release の risk に見合った検証を実行し、local token upload より OIDC Trusted Publishing を優先する)。runbook は maintainer session と dogfooding session が携行できるよう配布本文に残す。
 
+## Versioning Policy
+
+mozyo-bridge package version は semantic versioning に従う。segment の意味は次で固定する。
+
+- **patch** (`x.y.Z`): 後方互換な fix。契約 (CLI surface / API / preset) を変えない bug fix と内部修正。
+- **minor** (`x.Y.0`): feature 追加、または backend capability の拡張。後方互換を保つ。
+- **major** (`X.0.0`): breaking contract。既存の CLI / API / preset 契約を後方非互換に変更する。
+
+次の feature release から **`0.10` 系** に入る (feature 追加のため minor bump)。
+
+- **Redmine Version (`#308` 等) は roadmap bucket** であり、package version でも release authority でもない。roadmap の grouping と、実際に出荷する package version / tag は別物として扱う。issue を Redmine Version に割り当てても、それが特定の package version を確約するわけではない。
+- herdr adapter のような feature は minor-release 候補だが、実際の package version は **下記の release gate でのみ決定** する。roadmap や本 policy 文書が version 番号を先取りして固定することはない。
+- version の **決定・bump・tag・TestPyPI / PyPI publication・GitHub Release は、本 policy 成文化では行わない**。それらは下記「Release フロー」「Distribution gate」の release gate でのみ行う。
+
 ## 標準検証
 
 変更に見合った最小の check set を使う。
