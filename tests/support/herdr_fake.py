@@ -38,7 +38,15 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   pane #13330 reclaims.
 - **E ``pane close``** — removes the pane and, when its workspace has **zero**
   panes left, auto-closes the workspace (live-measured #13380: a lane-zero host
-  workspace has no husk).
+  workspace has no husk). Symmetrically, when a **tab** has zero panes left the
+  tab auto-vanishes (live-measured #13411 j#73668), the tab analogue of E.
+- **G ``tab create`` / ``agent start --tab [--split right]``** (Redmine #13411) —
+  ``tab create --workspace <id>`` mints a fresh ``<id>:t<n>`` tab born with one
+  empty ``root_pane`` (the tab analogue of D), returned in a ``tab_created``
+  envelope. ``agent start --tab <tab_id>`` places the launched pane in that tab;
+  ``--split right`` places it beside the tab's live pane. Each ``agent list`` row
+  carries its ``tab_id`` (real 0.7.1 rows expose it alongside ``workspace_id``),
+  so a heal reads the live slot's tab to rejoin it.
 - **F ``wait agent-status``** — **change-semantics** (PoC E9): a wait returns only
   on a *change into* the requested status; already being in it does **not** return
   (it times out). Modelled deterministically with **no real time** — a pre-armed
@@ -126,12 +134,19 @@ class UnknownHerdrCommandError(AssertionError):
 
 @dataclass
 class _Workspace:
-    """One herdr terminal workspace: its live pane ids (root pane included)."""
+    """One herdr terminal workspace: its live pane ids (root pane included).
+
+    ``pane_tab`` maps each live pane to the tab it lives in (Redmine #13411);
+    the workspace base pane and any non-tab pane map to ``""`` (the default tab).
+    ``tab_seq`` is the monotonic per-workspace tab counter (never reused).
+    """
 
     workspace_id: str
     panes: list = field(default_factory=list)  # pane ids, in creation order
     cwd: str = ""
     pane_seq: int = 0  # monotonic per-workspace pane counter (never reused)
+    pane_tab: dict = field(default_factory=dict)  # pane_id -> tab_id ("" = default)
+    tab_seq: int = 0  # monotonic per-workspace tab counter (never reused)
 
 
 @dataclass
@@ -144,6 +159,7 @@ class _Agent:
     provider: str = ""
     cwd: str = ""
     status: str = DEFAULT_START_STATUS
+    tab_id: str = ""  # the herdr tab the agent's pane lives in (Redmine #13411)
     launch_argv: list = field(default_factory=list)  # the post-``--`` provider argv
     env: dict = field(default_factory=dict)  # the injected ``--env K=V`` pairs
 
@@ -271,6 +287,8 @@ class FakeHerdr:
         head = rest[:2]
         if head == ["workspace", "create"]:
             return self._cmd_workspace_create(argv, rest)
+        if head == ["tab", "create"]:
+            return self._cmd_tab_create(argv, rest)
         if head == ["agent", "start"]:
             return self._cmd_agent_start(argv, rest)
         if head == ["agent", "list"]:
@@ -323,6 +341,30 @@ class FakeHerdr:
             },
         )
 
+    def _cmd_tab_create(self, argv, rest):
+        # G (Redmine #13411): mint a fresh tab in an existing workspace, born with
+        # one empty root pane (the tab analogue of `workspace create`). Fails closed
+        # on an unknown workspace so the real code sees a create failure, never a
+        # fabricated tab id.
+        wid = _flag_value(rest, "--workspace")
+        ws = self._workspaces.get(wid)
+        if ws is None:
+            return _err(argv, f"unknown workspace: {wid}")
+        ws.tab_seq += 1
+        tab_id = f"{wid}:t{ws.tab_seq}"
+        root_pane = self._mint_pane(ws)
+        ws.pane_tab[root_pane] = tab_id
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "tab_created",
+                    "tab": {"tab_id": tab_id},
+                    "root_pane": {"pane_id": root_pane},
+                }
+            },
+        )
+
     def _cmd_agent_start(self, argv, rest):
         parsed = _parse_agent_start(rest)
         # Resolve (or auto-create) the target workspace. Real herdr with no
@@ -334,13 +376,21 @@ class FakeHerdr:
                 return _err(argv, f"unknown workspace: {parsed.workspace_id}")
         else:
             ws = self._mint_workspace(cwd=parsed.cwd)
+        # A `--tab` must name a live tab in the workspace (its root pane exists at
+        # launch time, before the reclaim). Fail closed on an unknown tab so the
+        # real code sees a launch failure rather than a fabricated placement (#13411).
+        if parsed.tab_id and parsed.tab_id not in set(ws.pane_tab.values()):
+            return _err(argv, f"unknown tab: {parsed.tab_id}")
         pane_id = self._mint_pane(ws)
+        if parsed.tab_id:
+            ws.pane_tab[pane_id] = parsed.tab_id
         self._agents[pane_id] = _Agent(
             name=parsed.name,
             pane_id=pane_id,
             workspace_id=ws.workspace_id,
             provider=parsed.provider,
             cwd=parsed.cwd,
+            tab_id=parsed.tab_id,
             launch_argv=parsed.launch_argv,
             env=parsed.env,
         )
@@ -373,6 +423,10 @@ class FakeHerdr:
         for agent in self._agents.values():
             row = {"name": agent.name, "agent_status": agent.status}
             row[self.locator_render_key] = agent.pane_id
+            # Real 0.7.1 rows carry the slot's tab (#13411); render it when the
+            # agent lives in one so a heal can rejoin the same tab.
+            if agent.tab_id:
+                row["tab_id"] = agent.tab_id
             rows.append(row)
         # Splice any injected malformed / extra rows verbatim (one-shot).
         if self.extra_list_rows:
@@ -415,6 +469,10 @@ class FakeHerdr:
         if ws is None:
             return _err(argv, f"no such pane: {pane_id}")
         ws.panes.remove(pane_id)
+        # E (tab axis, #13411): the pane leaves its tab; the tab lives on only while
+        # another pane still references it. `pane_tab` is the sole tab registry, so a
+        # tab with no remaining panes simply stops being referenced (auto-vanish).
+        ws.pane_tab.pop(pane_id, None)
         self._agents.pop(pane_id, None)
         # E: the last pane closing auto-vanishes the workspace (no husk, #13380).
         if not ws.panes:
@@ -494,6 +552,29 @@ class FakeHerdr:
         ws = self._workspaces.get(workspace_id)
         return list(ws.panes) if ws else []
 
+    def tab_ids(self, workspace_id: str) -> list:
+        """The distinct live tab ids in ``workspace_id`` (creation order, #13411).
+
+        A tab is live only while a pane still references it, so a tab whose panes
+        all closed has auto-vanished from this list (the tab-axis auto-vanish, E).
+        """
+        ws = self._workspaces.get(workspace_id)
+        if ws is None:
+            return []
+        seen: list = []
+        for pane in ws.panes:
+            tab = ws.pane_tab.get(pane, "")
+            if tab and tab not in seen:
+                seen.append(tab)
+        return seen
+
+    def tab_of(self, pane_id: str) -> str:
+        """The tab id a live pane lives in (``""`` for a default-tab / absent pane)."""
+        for ws in self._workspaces.values():
+            if pane_id in ws.pane_tab:
+                return ws.pane_tab[pane_id]
+        return ""
+
     @property
     def agents(self) -> list:
         """The live agents as ``{"name", "pane_id", "status"}`` dicts (list order)."""
@@ -551,6 +632,8 @@ class _FakeWaitProcess:
 class _StartArgs:
     name: str
     workspace_id: str = ""
+    tab_id: str = ""
+    split: str = ""
     cwd: str = ""
     provider: str = ""
     no_focus: bool = False
@@ -583,6 +666,12 @@ def _parse_agent_start(rest: list) -> _StartArgs:
             return args
         if token == "--workspace":
             args.workspace_id = rest[i + 1]
+            i += 2
+        elif token == "--tab":
+            args.tab_id = rest[i + 1]
+            i += 2
+        elif token == "--split":
+            args.split = rest[i + 1]
             i += 2
         elif token == "--cwd":
             args.cwd = rest[i + 1]

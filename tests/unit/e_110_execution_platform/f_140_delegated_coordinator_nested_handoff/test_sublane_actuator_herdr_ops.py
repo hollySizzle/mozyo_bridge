@@ -47,9 +47,10 @@ class _StatefulHerdr:
 
     def __init__(self, *, created_workspace="wL"):
         self.created_workspace = created_workspace
-        self.agents: list[dict] = []  # {"name", "pane_id"}
+        self.agents: list[dict] = []  # {"name", "pane_id", "tab_id"}
         self.start_argvs: list[list] = []
         self._pane_seq = 1
+        self._tab_seq = 0  # monotonic tab counter (Redmine #13411 lane=tab)
         # #13378: rendered pane text served by `agent read`; set to "" to simulate a
         # live-but-still-booting TUI (blank render).
         self.read_text = "codex composer rendered"
@@ -90,6 +91,26 @@ class _StatefulHerdr:
                 ),
                 stderr="",
             )
+        if rest[:2] == ["tab", "create"]:
+            # #13411 lane=tab: mint a tab in the requested workspace with a root pane.
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
+            self._tab_seq += 1
+            tab_id = f"{wid}:t{self._tab_seq}"
+            self._pane_seq += 1
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "tab_created",
+                            "tab": {"tab_id": tab_id},
+                            "root_pane": {"pane_id": f"{wid}:p{self._pane_seq}"},
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["pane", "close"]:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
@@ -98,9 +119,13 @@ class _StatefulHerdr:
             self.start_argvs.append(rest)
             name = rest[2]
             wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
+            tab_id = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
             self._pane_seq += 1
             pane_id = f"{wid}:p{self._pane_seq}"
-            self.agents.append({"name": name, "pane_id": pane_id})
+            row = {"name": name, "pane_id": pane_id}
+            if tab_id:
+                row["tab_id"] = tab_id
+            self.agents.append(row)
             return subprocess.CompletedProcess(
                 argv,
                 0,

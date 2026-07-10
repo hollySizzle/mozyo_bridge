@@ -1246,29 +1246,11 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1027
-    reason: >-
-      herdr session-start orchestration (mint/adopt durable identities +
-      workspace placement + base-pane reclaim). Was already at ~985 lines
-      (just under threshold) before #13425; the #13425 provider-agnostic
-      launch-argv wiring (the config-derived `agent_launch.resolve_launch_argv`
-      threaded through `prepare_session` -> lane_class derivation -> the
-      `launch_argv_extra` extend in `_execute_slot`, plus the CLI config load)
-      tipped it to 1025. The wiring is deliberately minimal — the launch-argv
-      vocabulary + validation live in the sibling
-      `f_140_rules_docs_catalog/domain/agent_launch_argv.py`, not here. A split
-      of this module is DEFERRED because it is a shared touch surface with the
-      in-flight #13392 (herdr non-git parity: lane repo-root collapse, which
-      edits the identity/repo-root part of this same file); splitting it in this
-      lane would conflict with #13392, so the module decomposition is a
-      coordinator-sequenced follow-up under the herdr backend-swap program
-      (Version #308) once both US integrate. #13452 / #13453 added 2 lines
-      (1025 -> 1027): the direct `herdr session-start` CLI entrypoint now threads
-      the `auto` permission-mode policy default into `prepare_session` (one import
-      name + one kwarg), closing the CLI-only projection/live-argv divergence. The
-      wiring is minimal and reuses the existing `prepare_session` parameter; the
-      deferred split still absorbs the decomposition.
-    owner_issue: "#13425"
-    resolution_version: "v0.10.10 (Version #241 ratchet) — split coordinated with #13392 under the herdr backend-swap program (Version #308)"
-    expires: "2027-11-30"
+# herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
+# deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the
+# deferral: the pure placement/topology decisions + payload parsers were extracted
+# to the cohesive sibling
+# `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_lane_topology.py`
+# (337 lines), dropping herdr_session_start to 997 lines — back under the 1000
+# threshold. The allowlist entry is removed (not silently raised); the sibling is
+# well under threshold and needs none.

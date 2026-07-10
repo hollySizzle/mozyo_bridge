@@ -20,7 +20,11 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
+_TESTS_ROOT = Path(__file__).resolve().parents[3]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
 
+from support.herdr_fake import FakeHerdr
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
@@ -59,6 +63,8 @@ class _Herdr:
         existing_rows=None,
         start_locator=None,
         created_workspace="wZ",
+        created_tab=None,
+        tab_bad_payload=False,
         start_fails=False,
         close_fails=False,
     ):
@@ -68,12 +74,18 @@ class _Herdr:
         # overrides that — used to force a mislocated launch (#13330 review j#73231).
         self.start_locator = start_locator
         self.created_workspace = created_workspace
+        # The tab id `tab create` mints (Redmine #13411); defaults to `<ws>:t1`.
+        # ``tab_bad_payload`` returns an unparseable `tab create` payload so the
+        # real code fails closed (the tab analogue of a malformed workspace create).
+        self.created_tab = created_tab
+        self.tab_bad_payload = tab_bad_payload
         self.start_fails = start_fails
         self.close_fails = close_fails
         self.calls: list = []
         self.launch_envs: list = []
         self.start_argvs: list = []
         self.workspace_creates: list = []
+        self.tab_creates: list = []
         self.pane_closes: list = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
@@ -96,6 +108,29 @@ class _Herdr:
                             "type": "workspace_created",
                             "workspace": {"workspace_id": wid},
                             "root_pane": {"pane_id": f"{wid}:p1"},
+                        },
+                    }
+                ),
+                stderr="",
+            )
+        if rest[:2] == ["tab", "create"]:
+            self.tab_creates.append(rest)
+            wid = rest[rest.index("--workspace") + 1]
+            if self.tab_bad_payload:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"result": {"type": "nope"}}), stderr=""
+                )
+            tab_id = self.created_tab or f"{wid}:t1"
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "id": "cli:tab:create",
+                        "result": {
+                            "type": "tab_created",
+                            "tab": {"tab_id": tab_id},
+                            "root_pane": {"pane_id": f"{tab_id}-root"},
                         },
                     }
                 ),
@@ -502,11 +537,13 @@ class SessionStartTest(unittest.TestCase):
     def test_cold_start_creates_workspace_launches_with_flag_and_reclaims(self) -> None:
         # Redmine #13330: a pure cold start explicitly creates the workspace, launches
         # every slot into it (`--workspace`), and reclaims ONLY the returned root pane
-        # after all launches succeed.
+        # after all launches succeed. Exercised on the DEFAULT lane so the #13411 tab
+        # axis (which adds a tab create + tab root reclaim) never enters — this pins
+        # the workspace axis in isolation.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, anchor, repo = self._prepare(
-                tmp, providers=["claude", "codex"], herdr=herdr
+                tmp, providers=["claude", "codex"], herdr=herdr, lane=""
             )
         # Exactly one workspace create; each launch carries `--workspace wZ`.
         self.assertEqual(len(herdr.workspace_creates), 1)
@@ -589,11 +626,12 @@ class SessionStartTest(unittest.TestCase):
 
     def test_root_pane_close_failure_is_non_fatal(self) -> None:
         # Redmine #13330: a `pane close` failure is cosmetic residue only — the agents
-        # are already live — so it is recorded, not raised.
+        # are already live — so it is recorded, not raised. Default lane so only the
+        # workspace base pane is in play (the #13411 tab axis is pinned separately).
         herdr = _Herdr(close_fails=True)
         with tempfile.TemporaryDirectory() as tmp:
             result, anchor, repo = self._prepare(
-                tmp, providers=["claude", "codex"], herdr=herdr
+                tmp, providers=["claude", "codex"], herdr=herdr, lane=""
             )
         self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
         self.assertEqual(result.base_pane_id, "wZ:p1")
@@ -973,8 +1011,20 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
             self.assertIn("--workspace", argv)
             self.assertEqual(argv[argv.index("--workspace") + 1], "wH")
         self.assertEqual(result.herdr_workspace_id, "wH")
-        # The host's empty root pane was reclaimed (#13330 choreography reused).
-        self.assertEqual(herdr.pane_closes, [["pane", "close", "wH:p1"]])
+        # Lane=tab (Redmine #13411): a fresh lane also mints a dedicated tab in the
+        # host (labelled with the lane key), pins both launches into it, and reclaims
+        # BOTH root panes — the host base pane (#13330) and the tab root pane.
+        self.assertEqual(len(herdr.tab_creates), 1)
+        tab_create = herdr.tab_creates[0]
+        self.assertEqual(tab_create[tab_create.index("--workspace") + 1], "wH")
+        self.assertEqual(tab_create[tab_create.index("--label") + 1], "issue_13377_x")
+        for argv in herdr.start_argvs:
+            self.assertEqual(argv[argv.index("--tab") + 1], "wH:t1")
+        self.assertEqual(result.herdr_tab_id, "wH:t1")
+        self.assertEqual(
+            herdr.pane_closes,
+            [["pane", "close", "wH:p1"], ["pane", "close", "wH:t1-root"]],
+        )
 
     def test_prepare_session_linked_worktree_joins_live_host_workspace(self) -> None:
         """A second lane joins the sublane host the first lane's slots occupy —
@@ -1014,11 +1064,23 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
                     runner=herdr.run,
                 )
         self.assertEqual(herdr.workspace_creates, [])
-        self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.herdr_workspace_id, "w8")
         for argv in herdr.start_argvs:
             self.assertIn("--workspace", argv)
             self.assertEqual(argv[argv.index("--workspace") + 1], "w8")
+        # Lane=tab (Redmine #13411): the second lane joins the SAME host workspace
+        # w8 (no new workspace) but gets its OWN dedicated tab inside it — the
+        # sibling lane's slots (a different lane) never pin this lane's tab. Its
+        # tab root pane is the only reclaim (no host base pane — the host already
+        # existed).
+        self.assertEqual(len(herdr.tab_creates), 1)
+        self.assertEqual(
+            herdr.tab_creates[0][herdr.tab_creates[0].index("--workspace") + 1], "w8"
+        )
+        self.assertEqual(result.herdr_tab_id, "w8:t1")
+        for argv in herdr.start_argvs:
+            self.assertEqual(argv[argv.index("--tab") + 1], "w8:t1")
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "w8:t1-root"]])
 
     def test_prepare_session_linked_worktree_unregistered_main_fails_closed(self) -> None:
         herdr = _Herdr()
@@ -1103,6 +1165,266 @@ class LinkedWorktreeIdentityTest(unittest.TestCase):
         self.assertEqual(
             names["codex"], encode_assigned_name(main_ws, "codex", "issue_13377_w")
         )
+
+
+class LaneTabSubdivisionTest(unittest.TestCase):
+    """Lane=tab / gateway+worker=split placement (Redmine #13411).
+
+    A non-default lane's gateway + worker land in ONE dedicated herdr tab inside
+    the sublane host workspace; the default lane never uses a tab. Argv-level pins
+    drive the local ``_Herdr``; a full-topology pin drives the shared ``FakeHerdr``
+    (real tab lifecycle: create → split → reclaim → auto-vanish on retire).
+    """
+
+    def _prepare(self, tmp, *, herdr, providers, lane, existing_rows=None):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+            )
+            ws = read_anchor(repo)["workspace_id"]
+        return result, ws
+
+    def test_fresh_lane_creates_dedicated_tab_and_splits_pair(self) -> None:
+        # A fresh non-default lane mints ONE tab (labelled with the lane key), lands
+        # the first slot in it (no --split), the second beside it (--split right),
+        # and reclaims the host base pane AND the tab root pane.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        self.assertEqual(len(herdr.tab_creates), 1)
+        tab_create = herdr.tab_creates[0]
+        self.assertEqual(tab_create[tab_create.index("--workspace") + 1], "wZ")
+        self.assertEqual(tab_create[tab_create.index("--label") + 1], "lane-1")
+        # First launch (codex) occupies the tab with no split; the second (claude)
+        # splits right beside it. Both carry `--tab wZ:t1`.
+        codex_argv = herdr.start_argvs[0]
+        claude_argv = herdr.start_argvs[1]
+        self.assertEqual(codex_argv[codex_argv.index("--tab") + 1], "wZ:t1")
+        self.assertNotIn("--split", codex_argv)
+        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "wZ:t1")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        # `--tab` sits right after `--workspace` (before the `-- provider` tail).
+        self.assertEqual(
+            codex_argv[codex_argv.index("--workspace") : codex_argv.index("--workspace") + 4],
+            ["--workspace", "wZ", "--tab", "wZ:t1"],
+        )
+        self.assertEqual(result.herdr_tab_id, "wZ:t1")
+        self.assertEqual(result.tab_pane_id, "wZ:t1-root")
+        self.assertTrue(result.tab_pane_reclaimed)
+        self.assertEqual(
+            herdr.pane_closes,
+            [["pane", "close", "wZ:p1"], ["pane", "close", "wZ:t1-root"]],
+        )
+
+    def test_default_lane_uses_no_tab_byte_invariant(self) -> None:
+        # The coordinator pair (default lane) never subdivides: no tab create, no
+        # `--tab` / `--split` in any launch argv, no tab fields set.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+            )
+        self.assertEqual(herdr.tab_creates, [])
+        for argv in herdr.start_argvs:
+            self.assertNotIn("--tab", argv)
+            self.assertNotIn("--split", argv)
+        self.assertEqual(result.herdr_tab_id, "")
+        self.assertEqual(result.tab_pane_id, "")
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
+
+    def test_heal_rejoins_the_same_tab_and_splits(self) -> None:
+        # A heal (one slot already live in a tab) rejoins the SAME tab and splits
+        # the relaunched slot beside its sibling — never a fresh tab, never a base
+        # pane, never a tab root reclaim.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",
+                            "tab_id": "w5:t3",
+                        }
+                    ]
+                )
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        # codex adopts; claude launches into the adopted tab with --split right.
+        self.assertEqual(herdr.tab_creates, [])
+        self.assertEqual(len(herdr.start_argvs), 1)
+        claude_argv = herdr.start_argvs[0]
+        self.assertEqual(claude_argv[claude_argv.index("--workspace") + 1], "w5")
+        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        self.assertEqual(result.herdr_tab_id, "w5:t3")
+        self.assertEqual(result.tab_pane_id, "")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_legacy_loose_lane_heal_stays_loose(self) -> None:
+        # A heal of a pre-#13411 lane whose live slot is a LOOSE pane (no tab_id)
+        # launches loose too — keeping the pair together — never minting a fresh tab
+        # that would split them (it migrates to a tab on a full relaunch).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+                register_workspace(repo, home=home)
+                ws = read_anchor(repo)["workspace_id"]
+                herdr = _Herdr(
+                    existing_rows=[
+                        {
+                            "name": encode_assigned_name(ws, "codex", "lane-1"),
+                            "pane_id": "w5:pC",  # no tab_id -> loose pre-#13411 slot
+                        }
+                    ]
+                )
+                result = prepare_session(
+                    repo_root=repo,
+                    providers=["codex", "claude"],
+                    lane_id="lane-1",
+                    env={HERDR_ENV: str(binpath)},
+                    runner=herdr.run,
+                )
+        self.assertEqual(herdr.tab_creates, [])
+        claude_argv = herdr.start_argvs[0]
+        self.assertEqual(claude_argv[claude_argv.index("--workspace") + 1], "w5")
+        self.assertNotIn("--tab", claude_argv)  # loose, matching the live sibling
+        self.assertEqual(result.herdr_tab_id, "")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_malformed_tab_create_fails_closed_before_launch(self) -> None:
+        # An unparseable `tab create` payload fails closed BEFORE any launch — the
+        # host base pane is residue (never reclaimed), no agent is started.
+        herdr = _Herdr(created_workspace="wZ", tab_bad_payload=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._prepare(
+                    tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+                )
+        self.assertIn("tab create", str(ctx.exception))
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(len(herdr.tab_creates), 1)
+        self.assertFalse([c for c in herdr.calls if c[:2] == ["agent", "start"]])
+        self.assertEqual(herdr.pane_closes, [])  # nothing reclaimed (raised first)
+
+    def test_tab_root_reclaim_failure_is_non_fatal(self) -> None:
+        # A tab root `pane close` failure is cosmetic residue only — the agents are
+        # live — so it is recorded, not raised (the tab analogue of #13330 j#73225).
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1", close_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        self.assertFalse(result.tab_pane_reclaimed)
+        self.assertTrue(result.tab_pane_detail)
+        self.assertTrue(all(s.outcome == SLOT_LAUNCHED for s in result.slots))
+
+    def test_multi_lane_shares_one_host_with_a_tab_each(self) -> None:
+        # End-to-end through the shared FakeHerdr (real tab lifecycle): two lanes
+        # land in ONE host workspace, each in its OWN tab with a split pair — the
+        # 7-lane = 7-tab density reduction, proven at N=2.
+        fake = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            env = {HERDR_ENV: str(binpath)}
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                a = prepare_session(
+                    repo_root=repo, providers=["codex", "claude"],
+                    lane_id="lane-a", env=env, runner=fake.run,
+                )
+                b = prepare_session(
+                    repo_root=repo, providers=["codex", "claude"],
+                    lane_id="lane-b", env=env, runner=fake.run,
+                )
+        # Both lanes share the single host workspace.
+        self.assertEqual(a.herdr_workspace_id, b.herdr_workspace_id)
+        host = a.herdr_workspace_id
+        self.assertEqual(fake.workspace_ids, [host])
+        # Two distinct tabs, one per lane, each with exactly its split pair.
+        self.assertEqual(a.herdr_tab_id, fake.tab_ids(host)[0])
+        self.assertEqual(b.herdr_tab_id, fake.tab_ids(host)[1])
+        self.assertEqual(len(fake.tab_ids(host)), 2)
+        agent_tabs = {ag["name"]: fake.tab_of(ag["pane_id"]) for ag in fake.agents}
+        for lane_tab in (a.herdr_tab_id, b.herdr_tab_id):
+            in_tab = [name for name, tab in agent_tabs.items() if tab == lane_tab]
+            self.assertEqual(len(in_tab), 2)  # gateway + worker split pair
+        # The base + tab root panes were reclaimed: only the 4 agent panes remain.
+        self.assertEqual(len(fake.panes_of(host)), 4)
+
+    def test_tab_target_for_lane_placement_rules(self) -> None:
+        # Pure decision function (Redmine #13411): own tab pins first, multi-tab
+        # fails closed, no own slots -> "" (caller mints / stays loose).
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
+            _tab_target_for_lane,
+        )
+
+        ws = "wsA"
+
+        def row(role, lane, pane, tab=None):
+            r = {"name": encode_assigned_name(ws, role, lane), "pane_id": pane}
+            if tab is not None:
+                r["tab_id"] = tab
+            return r
+
+        # 1. own live slot pins its tab within the host workspace.
+        rows = [row("codex", "lane-a", "w8:p2", "w8:t1")]
+        self.assertEqual(_tab_target_for_lane(rows, ws, "w8", "lane-a"), "w8:t1")
+        # 2. a different lane's slots never pin this lane's tab.
+        self.assertEqual(_tab_target_for_lane(rows, ws, "w8", "lane-b"), "")
+        # 3. own loose slot (no tab_id) pins nothing -> "" (loose heal downstream).
+        loose = [row("codex", "lane-a", "w8:p2")]
+        self.assertEqual(_tab_target_for_lane(loose, ws, "w8", "lane-a"), "")
+        # 4. a slot outside the target workspace never pins the tab.
+        self.assertEqual(_tab_target_for_lane(rows, ws, "w9", "lane-a"), "")
+        # 5. fail-closed: own slots span two tabs in the host.
+        split = [
+            row("codex", "lane-a", "w8:p2", "w8:t1"),
+            row("claude", "lane-a", "w8:p3", "w8:t2"),
+        ]
+        with self.assertRaises(HerdrSessionStartError):
+            _tab_target_for_lane(split, ws, "w8", "lane-a")
 
 
 if __name__ == "__main__":  # pragma: no cover
