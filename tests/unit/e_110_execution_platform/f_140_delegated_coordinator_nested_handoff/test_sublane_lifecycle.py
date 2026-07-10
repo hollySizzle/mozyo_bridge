@@ -39,6 +39,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
     CREATE_PLANNED,
+    DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
     STALE_HINT_BRANCH_INTEGRATED,
     STALE_HINT_DUPLICATE_ISSUE_LANE,
     STALE_HINT_GATEWAY_PANE_MISSING,
@@ -363,6 +364,34 @@ def _req(**kw):
     return SublaneCreateRequest(**base)
 
 
+class ResolvedUpstreamCoordinatorTests(unittest.TestCase):
+    """#13476: the request's single-source-of-truth callback-route default."""
+
+    def test_omitted_resolves_to_stable_route_token(self):
+        self.assertEqual(
+            _req(upstream_coordinator=None).resolved_upstream_coordinator(),
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
+        )
+
+    def test_blank_or_whitespace_resolves_to_stable_route_token(self):
+        # A blank / whitespace-only value is treated as omitted (never emitted verbatim).
+        for blank in ("", "   "):
+            self.assertEqual(
+                _req(upstream_coordinator=blank).resolved_upstream_coordinator(),
+                DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
+            )
+
+    def test_explicit_value_wins_and_is_stripped(self):
+        self.assertEqual(
+            _req(upstream_coordinator="  %7  ").resolved_upstream_coordinator(), "%7"
+        )
+
+    def test_stable_route_token_is_not_a_physical_pane_id(self):
+        # #13476 Boundary: the OSS default must not hard-code a physical pane id.
+        self.assertEqual(DEFAULT_UPSTREAM_COORDINATOR_ROUTE, "coordinator")
+        self.assertNotIn("%", DEFAULT_UPSTREAM_COORDINATOR_ROUTE)
+
+
 class MissingFieldsTests(unittest.TestCase):
     """#13432: the is_git-conditional identity requirement on the request."""
 
@@ -401,6 +430,32 @@ class PlanCreateTests(unittest.TestCase):
         self.assertIn("--issue 12955", dispatch.command)
         self.assertIn("implementation_gateway", dispatch.command)
         self.assertIn("lane=issue_12955_x", dispatch.command)
+
+    def test_dispatch_defaults_upstream_coordinator_to_stable_route_token(self):
+        # #13476: an omitted --upstream-coordinator no longer emits a hand-editable
+        # `<coordinator-pane>` literal into the profile field; the plan defaults to the
+        # stable `coordinator` route token (resolved workspace-scoped / fail-closed).
+        plan = plan_sublane_create(
+            _req(upstream_coordinator=None), self._launch(LAUNCH_CREATE_WORKTREE)
+        )
+        dispatch = plan.steps[-1]
+        self.assertIn(
+            f"upstream_coordinator={DEFAULT_UPSTREAM_COORDINATOR_ROUTE}",
+            dispatch.command,
+        )
+        self.assertNotIn("<coordinator-pane>", dispatch.command)
+
+    def test_dispatch_prefers_explicit_upstream_coordinator(self):
+        # #13476: an explicit --upstream-coordinator value always wins over the default.
+        plan = plan_sublane_create(
+            _req(upstream_coordinator="%7"), self._launch(LAUNCH_CREATE_WORKTREE)
+        )
+        dispatch = plan.steps[-1]
+        self.assertIn("upstream_coordinator=%7", dispatch.command)
+        self.assertNotIn(
+            f"upstream_coordinator={DEFAULT_UPSTREAM_COORDINATOR_ROUTE}",
+            dispatch.command,
+        )
 
     def test_base_ref_pins_the_planned_worktree_add(self):
         # #13293: an explicit base ref is reflected as the git <commit-ish> positional

@@ -76,6 +76,22 @@ class ResolveRoleProfileTest(unittest.TestCase):
         resolution = resolve_role_profile("implementation_gateway", {"lane": ""})
         self.assertIn("lane", resolution.unresolved_placeholders)
 
+    def test_stable_coordinator_route_token_fully_resolves_gateway(self) -> None:
+        # #13476: the sublane dispatch defaults `upstream_coordinator` to the stable
+        # `coordinator` route token; it must be a valid gateway profile value so the
+        # `<upstream_coordinator>` placeholder resolves (no unresolved-field pointer).
+        resolution = resolve_role_profile(
+            "implementation_gateway",
+            {
+                "lane": "issue_13476_x",
+                "durable_anchor": "#13476 j#74481",
+                "upstream_coordinator": "coordinator",
+            },
+        )
+        self.assertEqual(resolution.unresolved_placeholders, ())
+        self.assertNotIn("<upstream_coordinator>", resolution.resolved_text)
+        self.assertIn("coordinator", resolution.resolved_text)
+
     def test_structured_dict_is_free_text_free(self) -> None:
         resolution = resolve_role_profile(
             "delegated_coordinator", {"parent_project": "secret-value"}

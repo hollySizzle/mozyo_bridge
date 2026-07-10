@@ -50,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneIntegrationPolicy,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+    DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
     SublaneCreateRequest,
     SublaneLaneView,
 )
@@ -426,6 +427,29 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertEqual(append_paths, ["/wt/12973"])
         dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
         self.assertEqual(dispatch["target_repo"], "auto")
+
+    def test_execute_defaults_omitted_upstream_coordinator_to_stable_route(self):
+        # #13476: the live dispatch resolves an omitted --upstream-coordinator to the
+        # stable `coordinator` route token (never drops the field, never a literal).
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator=None), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(
+            dispatch["upstream_coordinator"], DEFAULT_UPSTREAM_COORDINATOR_ROUTE
+        )
+
+    def test_execute_prefers_explicit_upstream_coordinator(self):
+        # #13476: an explicit value flows through the live dispatch unchanged.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator="%9"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["upstream_coordinator"], "%9")
 
     def test_no_dispatch_stops_after_panes(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])

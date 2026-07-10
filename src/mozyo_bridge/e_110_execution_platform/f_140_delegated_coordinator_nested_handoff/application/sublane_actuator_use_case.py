@@ -731,7 +731,7 @@ class SublaneActuateUseCase:
                 journal=(request.journal or ""),
                 gateway_pane=gateway_pane or "",
                 lane_label=request.lane_label,
-                upstream_coordinator=request.upstream_coordinator,
+                upstream_coordinator=request.resolved_upstream_coordinator(),
                 target_repo=target_repo,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.
@@ -969,7 +969,7 @@ class SublaneActuateUseCase:
 
     def _dispatch_command(self, request: SublaneCreateRequest) -> str:
         journal = request.journal or "<journal>"
-        coordinator = request.upstream_coordinator or "<coordinator-pane>"
+        coordinator = request.resolved_upstream_coordinator()
         return (
             "mozyo-bridge handoff send --to codex --source redmine "
             f"--issue {request.issue} --journal {journal} "

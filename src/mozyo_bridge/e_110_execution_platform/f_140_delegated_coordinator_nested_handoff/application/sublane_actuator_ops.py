@@ -296,6 +296,9 @@ class LiveSublaneActuatorOps:
             "--profile-field",
             f"lane={lane_label}",
         ]
+        # The live callers resolve the #13476 stable-route default
+        # (SublaneCreateRequest.resolved_upstream_coordinator), so this is always
+        # non-empty in normal flow; the guard stays as null-safety for direct callers.
         if upstream_coordinator:
             argv += ["--profile-field", f"upstream_coordinator={upstream_coordinator}"]
         return self._drive_cli(argv)
