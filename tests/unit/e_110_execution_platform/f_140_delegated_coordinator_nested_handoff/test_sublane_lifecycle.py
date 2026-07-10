@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
+    LAUNCH_SKIP_DISABLED,
     LAUNCH_SKIP_NO_GIT,
     RETIRE_OK,
     RetireDecision,
@@ -467,6 +468,32 @@ class PlanCreateTests(unittest.TestCase):
         self.assertEqual(plan.status, CREATE_BLOCKED)
         self.assertEqual(plan.steps, ())
         self.assertIn(LAUNCH_BLOCKED, plan.blocked_reasons)
+
+    def test_explicit_is_git_false_relaxes_under_skip_disabled(self):
+        # #13432 Review j#74285 finding 1: a non-git workspace whose operator opted out of
+        # worktree management (`manage_worktree: false`) collapses to skip_disabled BEFORE
+        # the non-git launch branch. The caller carries the probed git-ness explicitly, so
+        # --branch/--worktree relax on the real git-ness, not the skip_disabled token.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_DISABLED),
+            is_git=False,
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+        self.assertEqual(plan.steps[0].title, "skip worktree")
+        self.assertEqual(len(plan.steps), 4)
+
+    def test_explicit_is_git_true_keeps_full_requirement_under_skip_disabled(self):
+        # #13432 byte-invariance: a Git workspace under `manage_worktree: false` still
+        # requires the full Git identity — the explicit git-ness governs, not the token.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_DISABLED),
+            is_git=True,
+        )
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:branch", plan.blocked_reasons)
+        self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
 
 
 class PlanWorkUnitGateTests(unittest.TestCase):
