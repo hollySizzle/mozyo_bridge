@@ -481,6 +481,16 @@ class ResolveLaneAnchorEndToEndStoreTest(unittest.TestCase):
         status, _ = self._run(self._store(routes=[self._route()], events=[]))
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)
 
+    def test_valid_then_latest_forged_fails_closed(self):
+        # End-to-end: the latest forged row must not fall back to the earlier valid one.
+        status, _ = self._run(
+            self._store(
+                routes=[self._route()],
+                events=[self._event("redmine:13489:74766"), self._event("opaque:99999")],
+            )
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
 
 class StoreLaneAnchorTest(unittest.TestCase):
     """The advisory store's per-lane (issue, journal, gate) extraction (F3c)."""
@@ -537,6 +547,34 @@ class StoreLaneAnchorTest(unittest.TestCase):
             store=self._store(routes=[self._route()], events=[self._event("opaque:74766")])
         )
         self.assertEqual(anchor, ("13489", "", ""))
+
+    def test_latest_forged_event_does_not_fall_back_to_earlier_valid(self):
+        # j#74838: a valid row followed by a latest forged row must NOT return the earlier valid.
+        anchor = self._run(
+            store=self._store(
+                routes=[self._route()],
+                events=[self._event("redmine:13489:74766"), self._event("opaque:99999")],
+            )
+        )
+        self.assertEqual(anchor, ("13489", "", ""))
+
+    def test_latest_valid_after_forged_is_used(self):
+        anchor = self._run(
+            store=self._store(
+                routes=[self._route()],
+                events=[self._event("opaque:1"), self._event("redmine:13489:74766")],
+            )
+        )
+        self.assertEqual(anchor, ("13489", "74766", "review"))
+
+    def test_multiple_valid_events_latest_wins(self):
+        anchor = self._run(
+            store=self._store(
+                routes=[self._route()],
+                events=[self._event("redmine:13489:100"), self._event("redmine:13489:200")],
+            )
+        )
+        self.assertEqual(anchor, ("13489", "200", "review"))
 
 
 if __name__ == "__main__":  # pragma: no cover

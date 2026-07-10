@@ -289,15 +289,18 @@ def _store_lane_anchor(
     if len(issues) >= 2:
         return "<ambiguous>", "", ""
     issue = next(iter(issues))
-    journal = ""
-    gate = ""
+    # Select the LATEST matching-issue event row first (events are seq-ordered), then validate
+    # ONLY that row — a latest forged / non-canonical row must never silently fall back to an
+    # earlier valid one (mid-review j#74838). A latest row that fails canonical validation yields
+    # ``journal=""`` (-> the caller's exact-match cross-check fails closed).
+    latest = None
     for event in events:
-        if _norm(getattr(event, "issue", "")) != issue:
-            continue
-        candidate = _canonical_event_journal(getattr(event, "event_id", ""), issue)
-        if candidate:
-            journal = candidate
-            gate = _norm(getattr(event, "gate", ""))
+        if _norm(getattr(event, "issue", "")) == issue:
+            latest = event
+    if latest is None:
+        return issue, "", ""
+    journal = _canonical_event_journal(getattr(latest, "event_id", ""), issue)
+    gate = _norm(getattr(latest, "gate", "")) if journal else ""
     return issue, journal, gate
 
 
