@@ -132,7 +132,7 @@ documents:
     type: task
     status: active
     canonical_path: vibes/docs/tasks/new-session-onboarding.md
-    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406)。読む順序 / Redmine 機能カタログ (Epic/Feature) / vibes/docs レイアウト / herdr 運用要点への pointer。state snapshot を焼かず、live state は Redmine journal を正本とする。
+    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406 / #13472)。読む順序 / Redmine 機能カタログ (Epic/Feature) / 現在地の見つけ方 / session boundary-prompt の必須 anchor / vibes/docs レイアウト / herdr lane 運用への pointer。state snapshot (日付・主戦場・open backlog) を焼かず、live state は Redmine journal を正本とする discovery / prompt contract。
     audit_role: new_session_onboarding_task
     related_document_refs:
       - rule-project-agent-workflow
