@@ -404,6 +404,80 @@ class ResolveLaneAnchorTest(unittest.TestCase):
         )
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)
 
+    def test_store_route_present_without_canonical_event_fails_closed(self):
+        # j#74827: a store route for the lane but a forged / synthetic / non-canonical event
+        # (empty journal) must NOT verify — the store asserted the lane but cannot corroborate.
+        status, _ = self._run(("13489", ""), ("74766", "review"), store_anchor=("13489", "", ""))
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+    def test_store_gate_mismatch_fails_closed(self):
+        status, _ = self._run(
+            ("13489", ""), ("74766", "review"), store_anchor=("13489", "74766", "implementation_done")
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+
+class ResolveLaneAnchorEndToEndStoreTest(unittest.TestCase):
+    """End-to-end resolver over the real store cross-check (`_store_lane_anchor` unpatched, j#74827)."""
+
+    def _route(self, issue="13489"):
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRouteRow
+
+        return WorkflowRouteRow(
+            route_id="r", issue=issue, workspace_id=WS, lane_id="issue_1", role="codex",
+            pane_name="p", last_seen_pane_id="", observed_at="t",
+        )
+
+    def _event(self, event_id, issue="13489", gate="review"):
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowEventRow
+
+        return WorkflowEventRow(
+            event_id=event_id, issue=issue, gate=gate, review_conclusion="",
+            callback_state="", commit_bearing=False, integration_recorded=False,
+            issue_open=True, blocker_recorded=False,
+        )
+
+    def _store(self, routes=(), events=(), exists=True):
+        return types.SimpleNamespace(
+            path=types.SimpleNamespace(exists=lambda: exists),
+            read_route_identities=lambda: tuple(routes),
+            read_events=lambda: tuple(events),
+        )
+
+    def _run(self, store):
+        # Live verifies issue 13489 / journal 74766 / gate review; only the store varies.
+        with patch.object(adapter, "_candidate_issue", return_value=("13489", "")), patch.object(
+            adapter, "_verify_lane_gate_live", return_value=("74766", "review")
+        ), patch.object(adapter, "_load_workflow_store", return_value=store):
+            return adapter._resolve_lane_anchor(argparse.Namespace(), WS, Path("/repo"), "issue_1")
+
+    def test_truly_absent_store_is_verified(self):
+        status, _ = self._run(self._store(exists=False))
+        self.assertEqual(status, ANCHOR_VERIFIED)
+
+    def test_matching_canonical_store_is_verified(self):
+        status, _ = self._run(
+            self._store(routes=[self._route()], events=[self._event("redmine:13489:74766")])
+        )
+        self.assertEqual(status, ANCHOR_VERIFIED)
+
+    def test_forged_synthetic_event_fails_closed(self):
+        # Store route present, but the event is non-canonical (opaque) -> cannot corroborate.
+        status, _ = self._run(
+            self._store(routes=[self._route()], events=[self._event("opaque:74766")])
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+    def test_issue_mismatched_event_fails_closed(self):
+        status, _ = self._run(
+            self._store(routes=[self._route()], events=[self._event("redmine:99999:74766")])
+        )
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+    def test_route_but_no_event_fails_closed(self):
+        status, _ = self._run(self._store(routes=[self._route()], events=[]))
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
 
 class StoreLaneAnchorTest(unittest.TestCase):
     """The advisory store's per-lane (issue, journal, gate) extraction (F3c)."""

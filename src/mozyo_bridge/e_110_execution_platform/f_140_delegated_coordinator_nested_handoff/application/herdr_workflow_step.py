@@ -293,22 +293,18 @@ def _store_lane_anchor(
 def _store_contradicts(
     store_anchor: "tuple[str, str, str] | None", issue: str, journal: str, gate: str
 ) -> bool:
-    """True when the advisory store asserts a *different* anchor for this lane (F3c).
+    """True when the advisory store asserts anything but the exact live anchor for this lane.
 
-    Only a **non-empty** store field that disagrees with the live-verified value is a
-    contradiction — an absent store field (the store agreed on the issue but recorded no
-    journal / gate) is not drift. ``None`` (no store assertion) never contradicts.
+    Once the store asserts a route for this lane (``store_anchor is not None``), it must
+    corroborate the source-of-truth Redmine verification **exactly** — the same canonical
+    ``(issue, journal, gate)`` — or it is drift / a forged / synthetic / non-canonical event
+    (mid-review j#74827). A route present with an unusable event yields ``(issue, "", "")``,
+    which is not the verified tuple, so it fails closed. ``None`` (no route for this lane, or an
+    absent / unreadable store) never contradicts — the live-authoritative path is unaffected.
     """
     if store_anchor is None:
         return False
-    s_issue, s_journal, s_gate = store_anchor
-    if s_issue and s_issue != issue:
-        return True
-    if s_journal and s_journal != journal:
-        return True
-    if s_gate and gate and s_gate != gate:
-        return True
-    return False
+    return store_anchor != (issue, journal, gate)
 
 
 def _resolve_lane_anchor(args: argparse.Namespace, workspace_id: str, repo_root, lane_id: str) -> tuple[str, str]:
