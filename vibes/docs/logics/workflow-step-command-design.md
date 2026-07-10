@@ -236,10 +236,15 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   - **default** lane (provider 不問) → fail-closed (`ambiguous_default_coordinator_role`);
   - unknown provider → fail-closed (`herdr_lane_role_unresolved`)。
   - registry `project_name` を role/scope authority にしない (display metadata、dir 名 default)。
-- **anchor gate (j#74748 F3)。** worker/gateway は lane metadata record を `(repo_workspace_id,
-  lane_id)` で join して Redmine issue anchor を **検証** した場合のみ ready/no_op を返し
-  (`durable_anchor` に載せる)、missing/ambiguous/retired は fail-closed。未検証 anchor で
-  ready を返さない。
+- **anchor gate (j#74748 F3 / j#74766 R1)。** worker/gateway は **durable workflow gate =
+  workflow runtime store** (Redmine gate journal marker を `workflow watch`/`runtime` が畳んだ
+  `workflow_route_identities` + `workflow_events`) を authority として、`(workspace_id, lane_id)`
+  route join で issue を確定し、その issue の gate event (`event_id=<issue>:<journal>`) から journal
+  を取得して **exact `issue+journal` anchor を検証** した場合のみ ready/no_op を返す
+  (`durable_anchor=redmine:issue=<id>:journal=<id>`)。lane metadata (host-local display metadata,
+  never routing authority) は **candidate cross-check のみ** — store issue と不一致→`herdr_anchor_mismatch`、
+  all-retired→fail-closed。store absent/unreadable/route-missing/journal-missing/ambiguous は
+  **fail-closed** (herdr anchor gate は fail-open させない)。未検証 anchor で ready を返さない。
 - **same-lane worker liveness は cardinality (j#74749 F2 / j#74750)。** gateway は同一
   `(workspace, lane, claude)` の 0 / 1 / 2+ を保持し、2+ = ambiguous / locator 欠落 = fail-closed
   とし、重複 identity を silent target にしない。

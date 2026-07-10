@@ -209,60 +209,132 @@ class SameLaneWorkerLivenessTest(unittest.TestCase):
             )
 
 
-def _record(**kw):
-    base = dict(repo_workspace_id=WS, lane_id="issue_1", issue_id="13489", retired=False)
-    base.update(kw)
-    return types.SimpleNamespace(**base)
+from mozyo_bridge.core.state.workflow_runtime_store import (
+    WorkflowEventRow,
+    WorkflowRouteRow,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+    ANCHOR_AMBIGUOUS,
+    ANCHOR_MISMATCH,
+    ANCHOR_RETIRED,
+)
+
+VERIFIED_PTR = "redmine:issue=13489:journal=74766"
+
+
+def _route(issue="13489", ws=WS, lane="issue_1"):
+    return WorkflowRouteRow(
+        route_id="r", issue=issue, workspace_id=ws, lane_id=lane, role="codex",
+        pane_name="p", last_seen_pane_id="", observed_at="t",
+    )
+
+
+def _event(event_id, issue="13489"):
+    return WorkflowEventRow(
+        event_id=event_id, issue=issue, gate="review_request", review_conclusion="",
+        callback_state="", commit_bearing=False, integration_recorded=False,
+        issue_open=True, blocker_recorded=False,
+    )
+
+
+def _fake_store(routes=(), events=(), exists=True):
+    return types.SimpleNamespace(
+        path=types.SimpleNamespace(exists=lambda: exists),
+        read_route_identities=lambda: tuple(routes),
+        read_events=lambda: tuple(events),
+    )
 
 
 class ResolveLaneAnchorTest(unittest.TestCase):
-    """The lane-metadata issue-anchor join (F3)."""
+    """The durable-workflow-gate issue+journal verification (F3, store-authoritative)."""
 
-    def _patch(self, records):
-        from mozyo_bridge.core.state import lane_metadata
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
-            sublane_herdr_projection,
+    def _run(self, *, store, candidate=(frozenset(), False)):
+        with patch.object(adapter, "_load_workflow_store", return_value=store), patch.object(
+            adapter, "_lane_metadata_candidate_issues", return_value=candidate
+        ):
+            return adapter._resolve_lane_anchor(
+                argparse.Namespace(store_path=None), WS, Path("/repo"), "issue_1"
+            )
+
+    def test_verified_issue_plus_journal_from_store(self):
+        status, ptr = self._run(
+            store=_fake_store(routes=[_route()], events=[_event("13489:74766")])
         )
-
-        return [
-            patch.object(sublane_herdr_projection, "repo_scope_workspace_id", return_value=WS),
-            patch.object(lane_metadata, "load_lane_records", return_value=records),
-        ]
-
-    def _run(self, records):
-        patches = self._patch(records)
-        for p in patches:
-            p.start()
-        try:
-            return adapter._resolve_lane_anchor(Path("/repo"), "issue_1")
-        finally:
-            for p in patches:
-                p.stop()
-
-    def test_single_record_verifies_issue_anchor(self):
-        status, ptr = self._run({"t1": _record()})
         self.assertEqual(status, ANCHOR_VERIFIED)
-        self.assertEqual(ptr, PTR)
+        self.assertEqual(ptr, VERIFIED_PTR)  # issue + journal, not issue-only
 
-    def test_two_distinct_issues_is_ambiguous(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
-            ANCHOR_AMBIGUOUS,
+    def test_display_record_only_without_store_route_is_missing(self):
+        # THE R1 regression: a display lane-metadata candidate alone is NOT proof.
+        status, _ = self._run(
+            store=_fake_store(routes=[], events=[]), candidate=({"13489"}, False)
         )
+        self.assertEqual(status, ANCHOR_MISSING)
 
-        status, _ = self._run({"t1": _record(issue_id="13489"), "t2": _record(issue_id="13490")})
+    def test_absent_store_fails_closed(self):
+        status, _ = self._run(store=_fake_store(exists=False))
+        self.assertEqual(status, ANCHOR_MISSING)
+
+    def test_unavailable_store_fails_closed(self):
+        status, _ = self._run(store=None)
+        self.assertEqual(status, ANCHOR_MISSING)
+
+    def test_unreadable_store_fails_closed(self):
+        def _boom():
+            raise RuntimeError("db error")
+
+        store = types.SimpleNamespace(
+            path=types.SimpleNamespace(exists=lambda: True),
+            read_route_identities=_boom,
+            read_events=lambda: (),
+        )
+        status, _ = self._run(store=store)
+        self.assertEqual(status, ANCHOR_MISSING)
+
+    def test_two_distinct_route_issues_is_ambiguous(self):
+        status, _ = self._run(
+            store=_fake_store(
+                routes=[_route(issue="13489"), _route(issue="13490")],
+                events=[_event("13489:1"), _event("13490:2", issue="13490")],
+            )
+        )
         self.assertEqual(status, ANCHOR_AMBIGUOUS)
 
-    def test_only_retired_is_retired(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
-            ANCHOR_RETIRED,
+    def test_duplicate_route_same_issue_is_verified_not_ambiguous(self):
+        # Gateway + worker route rows share the lane's issue — one distinct issue, not drift.
+        status, ptr = self._run(
+            store=_fake_store(
+                routes=[_route(issue="13489"), _route(issue="13489")],
+                events=[_event("13489:74766")],
+            )
         )
+        self.assertEqual(status, ANCHOR_VERIFIED)
+        self.assertEqual(ptr, VERIFIED_PTR)
 
-        status, _ = self._run({"t1": _record(retired=True)})
-        self.assertEqual(status, ANCHOR_RETIRED)
-
-    def test_no_matching_record_is_missing(self):
-        status, _ = self._run({"t1": _record(lane_id="other_lane")})
+    def test_no_gate_journal_is_missing(self):
+        status, _ = self._run(store=_fake_store(routes=[_route()], events=[]))
         self.assertEqual(status, ANCHOR_MISSING)
+
+    def test_latest_gate_event_journal_wins(self):
+        status, ptr = self._run(
+            store=_fake_store(
+                routes=[_route()], events=[_event("13489:100"), _event("13489:200")]
+            )
+        )
+        self.assertEqual(ptr, "redmine:issue=13489:journal=200")
+
+    def test_candidate_mismatch_fails_closed(self):
+        status, _ = self._run(
+            store=_fake_store(routes=[_route()], events=[_event("13489:74766")]),
+            candidate=({"99999"}, False),
+        )
+        self.assertEqual(status, ANCHOR_MISMATCH)
+
+    def test_all_retired_candidate_fails_closed(self):
+        status, _ = self._run(
+            store=_fake_store(routes=[_route()], events=[_event("13489:74766")]),
+            candidate=(set(), True),
+        )
+        self.assertEqual(status, ANCHOR_RETIRED)
 
 
 if __name__ == "__main__":  # pragma: no cover

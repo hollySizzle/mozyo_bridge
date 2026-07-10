@@ -316,11 +316,14 @@ def _herdr_step_preflight(args: argparse.Namespace) -> WorkflowStepOutcome | Non
     operator at ``sublane create/start --execute``) with herdr-native resolution: when the
     repo selects the herdr backend, this delegates to
     :func:`...herdr_workflow_step.resolve_herdr_step_outcome`, which classifies the lane role
-    from the launch-time sender identity (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
-    ``MOZYO_LANE_ID``) + the workspace-registry project scope and returns a role-appropriate
-    :class:`WorkflowStepOutcome` (worker reads its own anchor; gateway dispatches / monitors
-    the same-lane worker; coordinator orchestrates the next sublane), or fails closed on an
-    unattested identity / unknown provider / gateway with no live worker. Returns ``None``
+    from the launch-time sender identity (``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``) — only a
+    non-default lane slot gets a class (``codex`` -> sublane gateway, ``claude`` -> worker); a
+    default-lane pair or unknown provider fails closed — verifies the lane's Redmine
+    ``issue+journal`` anchor against the durable workflow gate (runtime store), and for a
+    gateway resolves the same-lane worker cardinality. It returns a role-appropriate
+    :class:`WorkflowStepOutcome` (worker reads its verified anchor; gateway dispatches /
+    monitors its single live same-lane worker), or fails closed on an unattested identity /
+    unclassifiable lane / unverified anchor / missing-or-duplicate worker. Returns ``None``
     under the tmux backend so the tmux path (and its byte-identical output) is unchanged.
 
     Increment 1 (Redmine #13489 j#74685 design_boundary) is resolution-only: the outcome

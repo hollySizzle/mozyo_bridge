@@ -43,6 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
     ANCHOR_AMBIGUOUS,
+    ANCHOR_MISMATCH,
     ANCHOR_MISSING,
     ANCHOR_RETIRED,
     ANCHOR_VERIFIED,
@@ -89,21 +90,40 @@ def _anchor_workspace_id(repo_root) -> Optional[str]:
     return anchor_ws
 
 
-def _resolve_lane_anchor(repo_root, lane_id: str) -> tuple[str, str]:
-    """Verify the lane's Redmine issue anchor from the lane metadata store (j#74748 F3).
+def _load_workflow_store(args: argparse.Namespace):
+    """The persisted workflow runtime store (``--store-path`` or the home default), or ``None``.
 
-    Joins the host-global lane metadata records on ``(repo_workspace_id, lane_id)`` — the same
-    repo scope key ``sublane list``'s herdr fold uses (``repo_scope_workspace_id``, the caller's
-    MAIN workspace identity) — and returns ``(anchor_status, anchor_pointer)``:
+    The store is the durable workflow gate: ``workflow watch`` / ``runtime`` fold Redmine gate
+    journal markers into its ``workflow_route_identities`` (issue per lane) and ``workflow_events``
+    (``event_id = <issue>:<journal>``) tables. Returns ``None`` on any construction failure — the
+    caller then fails **closed** (the herdr anchor gate never fail-opens on an unreadable store).
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_resume import (
+            _store_from_args,
+        )
 
-    - a single non-retired record with an ``issue_id`` -> :data:`ANCHOR_VERIFIED` + its pointer;
-    - two+ distinct non-retired issue ids -> :data:`ANCHOR_AMBIGUOUS` (drift);
-    - zero non-retired issues but a retired tombstone -> :data:`ANCHOR_RETIRED`;
-    - nothing joins (or the store is unreadable) -> :data:`ANCHOR_MISSING`.
+        return _store_from_args(args)
+    except Exception:  # noqa: BLE001 - a store construction failure fails the anchor gate closed
+        return None
 
-    The lane metadata record is host-local runtime state (a display join, never routing
-    authority): its ``issue_id`` names *which* Redmine issue is this lane's durable anchor, so
-    the returned pointer points at the Redmine record — the anchor authority — not the metadata.
+
+def _journal_from_event_id(event_id: str) -> str:
+    """The journal id from a durable event anchor (``<issue>:<journal>`` / ``redmine:<i>:<j>``)."""
+    s = (event_id or "").strip()
+    if ":" not in s:
+        return ""
+    return s.rsplit(":", 1)[1].strip()
+
+
+def _lane_metadata_candidate_issues(repo_root, lane_id: str) -> tuple[set[str], bool]:
+    """Candidate (display-only) issue ids for the lane + whether the records are all retired.
+
+    The lane metadata store is **display metadata, never routing authority** (its own module
+    contract): it is read here ONLY as a candidate/cross-check against the authoritative durable
+    gate — a mismatch or an all-retired lane fails the anchor gate closed. Returns
+    ``(active_issue_ids, all_retired)``; an empty set with ``all_retired=False`` means no record
+    joins this lane at all (the durable gate then stands alone as the authority).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
         repo_scope_workspace_id,
@@ -116,35 +136,99 @@ def _resolve_lane_anchor(repo_root, lane_id: str) -> tuple[str, str]:
     want_ws = _norm(repo_scope_workspace_id(repo_root))
     want_lane = _norm_lane(lane_id)
     if not want_ws:
-        return ANCHOR_MISSING, ""
+        return set(), False
     try:
         from mozyo_bridge.core.state.lane_metadata import load_lane_records
 
         records = load_lane_records()
-    except Exception:  # noqa: BLE001 - a lane-store read must never break a live resolution
-        return ANCHOR_MISSING, ""
+    except Exception:  # noqa: BLE001 - a display read never breaks the (store-authoritative) gate
+        return set(), False
 
-    issues: set[str] = set()
-    retired_seen = False
+    active: set[str] = set()
+    had_record = False
+    had_active = False
     for record in records.values():
         if _norm(getattr(record, "repo_workspace_id", "")) != want_ws:
             continue
         if _norm_lane(getattr(record, "lane_id", "")) != want_lane:
             continue
-        issue = _norm(getattr(record, "issue_id", ""))
+        had_record = True
         if getattr(record, "retired", False):
-            retired_seen = True
             continue
+        had_active = True
+        issue = _norm(getattr(record, "issue_id", ""))
         if issue:
-            issues.add(issue)
+            active.add(issue)
+    return active, (had_record and not had_active)
 
-    if len(issues) == 1:
-        return ANCHOR_VERIFIED, WorkflowAnchor(issue=next(iter(issues))).pointer()
+
+def _resolve_lane_anchor(args: argparse.Namespace, workspace_id: str, repo_root, lane_id: str) -> tuple[str, str]:
+    """Verify the lane's Redmine ``issue+journal`` anchor from the durable workflow gate (F3).
+
+    The **authoritative** source is the persisted workflow runtime store (fed from Redmine gate
+    journal markers via ``workflow watch`` / ``runtime``), NOT the display-only lane metadata
+    (mid-review j#74766/j#74767 R1). Resolution:
+
+    - the store's ``workflow_route_identities`` joined on ``(workspace_id, lane_id)`` give the
+      lane's issue: zero -> :data:`ANCHOR_MISSING`, two+ distinct -> :data:`ANCHOR_AMBIGUOUS`;
+    - the store's ``workflow_events`` for that issue give the gate journal (the latest
+      ``event_id = <issue>:<journal>``): no gate journal -> :data:`ANCHOR_MISSING`;
+    - the lane metadata is consulted ONLY as a candidate cross-check: a display record whose
+      issue disagrees with the store issue -> :data:`ANCHOR_MISMATCH`; an all-retired lane ->
+      :data:`ANCHOR_RETIRED`.
+
+    Store absent / unreadable / no route / no journal all fail **closed**
+    (:data:`ANCHOR_MISSING`) — the herdr anchor gate never fail-opens. On success returns
+    (:data:`ANCHOR_VERIFIED`, ``redmine:issue=<id>:journal=<id>``).
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _norm,
+        _norm_lane,
+    )
+
+    store = _load_workflow_store(args)
+    if store is None or not store.path.exists():
+        return ANCHOR_MISSING, ""
+    try:
+        routes = store.read_route_identities()
+        events = store.read_events()
+    except Exception:  # noqa: BLE001 - an unreadable store fails the anchor gate closed
+        return ANCHOR_MISSING, ""
+
+    want_ws = _norm(workspace_id)
+    want_lane = _norm_lane(lane_id)
+    issues = {
+        _norm(getattr(r, "issue", ""))
+        for r in routes
+        if _norm(getattr(r, "workspace_id", "")) == want_ws
+        and _norm_lane(getattr(r, "lane_id", "")) == want_lane
+        and _norm(getattr(r, "issue", ""))
+    }
+    if not issues:
+        return ANCHOR_MISSING, ""
     if len(issues) >= 2:
         return ANCHOR_AMBIGUOUS, ""
-    if retired_seen:
+    issue = next(iter(issues))
+
+    # The latest gate event for the issue supplies the journal (events are seq-ordered).
+    journal = ""
+    for event in events:
+        if _norm(getattr(event, "issue", "")) != issue:
+            continue
+        candidate = _journal_from_event_id(getattr(event, "event_id", ""))
+        if candidate:
+            journal = candidate
+    if not journal:
+        return ANCHOR_MISSING, ""
+
+    # Candidate cross-check against the display-only lane metadata (never the authority).
+    candidate_issues, all_retired = _lane_metadata_candidate_issues(repo_root, lane_id)
+    if candidate_issues and issue not in candidate_issues:
+        return ANCHOR_MISMATCH, ""
+    if all_retired:
         return ANCHOR_RETIRED, ""
-    return ANCHOR_MISSING, ""
+
+    return ANCHOR_VERIFIED, WorkflowAnchor(issue=issue, journal=journal).pointer()
 
 
 def _same_lane_worker_liveness(
@@ -254,7 +338,9 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
     anchor_pointer = ""
     worker_liveness: Optional[str] = None
     if lane.caller_role in (ROLE_IMPLEMENTATION_WORKER, ROLE_DELEGATED_COORDINATOR):
-        anchor_status, anchor_pointer = _resolve_lane_anchor(repo_root, sender.lane_id)
+        anchor_status, anchor_pointer = _resolve_lane_anchor(
+            args, sender.workspace_id, repo_root, sender.lane_id
+        )
     if lane.caller_role == ROLE_DELEGATED_COORDINATOR and anchor_status == ANCHOR_VERIFIED:
         # Only read the live inventory when the gateway lane actually reaches the worker gate.
         worker_liveness = _same_lane_worker_liveness(
