@@ -3,39 +3,44 @@
 `mozyo-bridge workflow step` resolves the current lane role from the discovered self
 candidate under the tmux backend (:func:`...workflow_step.classify_workflow_lane`, a tmux
 ``%pane`` matched against the tmux inventory). A **pure herdr session** has no ``TMUX_PANE``
-and the pane is not in the tmux inventory, so that path folds to
-``self_lane_unresolved`` and the #13446 preflight replaced the dead end with a fail-closed
-``herdr_self_lane_unresolved`` that just points the operator at ``sublane create/start``.
+and the pane is not in the tmux inventory, so that path folds to ``self_lane_unresolved`` and
+the #13446 preflight replaced the dead end with a fail-closed ``herdr_self_lane_unresolved``.
 
 This module is the herdr-native counterpart that #13489 puts in that preflight's place: it
 classifies the current lane role from the **herdr-native identity** (launch-time sender env
-``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID`` + the workspace-registry
-project scope) instead of a tmux ``%pane``, and maps that role onto the SAME replayable
+``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``) and maps that role onto the SAME replayable
 :class:`~...workflow_step.WorkflowStepOutcome` contract. It grows **no divergent identity
 model** (design principle 4): the lane-role vocabulary is exactly the tmux state machine's
-four roles, derived here from the documented herdr shared-project-workspace model (spec
+roles, derived here from the documented herdr shared-project-workspace model (spec
 ``vibes/docs/specs/herdr-native-identity.md`` §1, and the ``sublane list`` fold in
-:mod:`...application.sublane_herdr_projection`):
+:mod:`...application.sublane_herdr_projection`).
 
-- ``claude`` provider (any lane) -> ``implementation_worker`` (the grandchild worker);
-- ``codex`` provider + a **non-default** lane -> ``delegated_coordinator`` (the sublane
-  gateway / child coordinator);
-- ``codex`` provider + the **default** lane + a resolved project scope -> ``project_gateway``
-  (the project coordinator / parent);
-- ``codex`` provider + the **default** lane + no project scope -> ``grandparent_coordinator``
-  (the department-root coordinator);
-- anything else -> fail closed (``herdr_lane_role_unresolved``).
+Role authority (mid-review j#74748 F1 / j#74749 F1 / consolidation j#74750): the herdr mzb1
+``role`` field is a runtime **provider** token (``claude`` / ``codex``), NOT a workflow
+authority, and a default-lane pair (the coordinator's Codex + its Main-unit assistant Claude)
+carries no step-time durable role authority to tell a ``project_gateway`` from a
+``grandparent_coordinator`` — nor is a default-lane Claude an implementation worker. So this
+module classifies only the **non-default lane slots** it can attribute a lane-local class to
+(``codex`` -> the sublane gateway ``delegated_coordinator``; ``claude`` -> the
+``implementation_worker``) and **fails closed on the default lane**
+(``ambiguous_default_coordinator_role``) rather than promote provider/placement to a role
+authority. The earlier registry-``project_name`` project-scope heuristic (display metadata
+defaulted to the directory name) is removed — it was never a role authority.
+
+Anchor gate (mid-review j#74748 F3): a worker / gateway lane only reaches ``ready`` / ``no_op``
+with a **verified** Redmine issue anchor (resolved out of band from the lane metadata record
+and passed in as ``anchor_status`` / ``anchor_pointer``); a missing / ambiguous / retired
+anchor fails closed. Same-lane worker liveness is a **cardinality** (mid-review j#74749 F2 /
+consolidation j#74750): a duplicate ``(workspace, lane, claude)`` slot is ambiguity, not a
+dispatch target.
 
 **Scope (increment 1, Redmine #13489 j#74685 design_boundary).** This is *resolution-only*:
-it names the role-appropriate next action, next owner, and the herdr surface each lane uses
-(the worker reads its own dispatched Redmine anchor; the gateway dispatches / monitors the
-same-lane worker via ``sublane dispatch-worker``; the coordinator orchestrates the next
-sublane via ``workflow admission`` / ``sublane create|start``). It performs **no** sublane
-lifecycle mutation and **no** delivery — the policy-permitted one-step auto-execution of
-``sublane create/start/dispatch`` (and the fail-closed destructive drain/retire boundary) is
-increment 2, gated behind the mandatory task-level design mid-review. Everything here is
-pure: value objects + total functions over plain strings / booleans, no subprocess / env /
-registry read (the application adapter supplies those).
+it names the role-appropriate next action / owner / herdr surface and performs **no** sublane
+lifecycle mutation and **no** delivery (``primitive=none`` throughout). The policy-permitted
+one-step auto-execution and the fail-closed destructive drain/retire boundary are increment
+2, gated behind the mandatory task-level design mid-review. Everything here is pure: value
+objects + total functions over plain strings, no subprocess / env / registry / inventory read
+(the application adapter supplies the sender identity, the worker liveness, and the anchor).
 """
 
 from __future__ import annotations
@@ -46,23 +51,16 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_WORKER,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
-    ROLE_GRANDPARENT_COORDINATOR,
-    ROLE_PROJECT_GATEWAY,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
     EXECUTION_NO_OP,
-    OWNER_CALLER,
     OWNER_CHILD,
     OWNER_GRANDCHILD,
     OWNER_OPERATOR,
     PRIMITIVE_NONE,
     STATE_CHILD_WORKER_DISPATCH,
     STATE_GRANDCHILD_REDMINE_WORK,
-    STATE_GRANDPARENT_CONSULTATION,
     STATE_LANE_UNRESOLVED,
-    STATE_PARENT_WORK_INTAKE,
     WorkflowLane,
     WorkflowStepOutcome,
 )
@@ -77,26 +75,49 @@ HERDR_PROVIDER_CODEX = "codex"
 # herdr coordinator pair sits in this lane, every sublane slot in a non-default lane.
 HERDR_DEFAULT_LANE = "default"
 
+# ---------------------------------------------------------------------------
+# Same-lane worker liveness cardinality (mid-review j#74749 F2 / j#74750): 0 / 1 / 2+ and the
+# usable-locator distinction are preserved so a duplicate identity is ambiguity, not a target.
+# ---------------------------------------------------------------------------
+WORKER_LIVE = "live"  # exactly one same-lane worker slot with a usable locator
+WORKER_ABSENT = "absent"  # no same-lane worker slot
+WORKER_AMBIGUOUS = "ambiguous"  # 2+ same-lane worker slots (duplicate identity)
+WORKER_LOCATOR_MISSING = "locator_missing"  # one slot but no usable locator
+WORKER_UNAVAILABLE = "unavailable"  # the live inventory could not be read
+
+# ---------------------------------------------------------------------------
+# Redmine issue-anchor verification status (mid-review j#74748 F3): a worker / gateway lane is
+# only ``ready`` with a verified anchor; missing / ambiguous / retired fails closed.
+# ---------------------------------------------------------------------------
+ANCHOR_VERIFIED = "verified"
+ANCHOR_MISSING = "missing"
+ANCHOR_AMBIGUOUS = "ambiguous"
+ANCHOR_RETIRED = "retired"
+
 
 # ---------------------------------------------------------------------------
 # herdr-native reason vocabulary (machine-readable; kept literal regardless of UI language).
-# Namespaced `herdr_*` so the mid-review (Redmine #13489 j#74685) and any regression can see
-# the herdr resolution vocabulary distinctly from the tmux state machine's reasons.
 # ---------------------------------------------------------------------------
 
-#: The worker lane's own step: read its dispatched Redmine anchor and implement (no dispatch).
+#: The worker lane's own step: read its verified Redmine anchor and implement (no dispatch).
 REASON_HERDR_WORKER_STEP_READY = "herdr_worker_step_ready"
-#: The gateway lane's step: its same-lane worker slot is live, so dispatch / monitor it.
+#: The gateway lane's step: verified anchor + a single live same-lane worker -> dispatch / monitor.
 REASON_HERDR_WORKER_DISPATCH_READY = "herdr_worker_dispatch_ready"
 #: The gateway lane's step is blocked: no live same-lane worker slot to dispatch to.
 REASON_HERDR_WORKER_SLOT_MISSING = "herdr_worker_slot_missing"
-#: The coordinator lane's step: orchestrate the next sublane via the coordinator surfaces.
-REASON_HERDR_COORDINATOR_ORCHESTRATION = "herdr_coordinator_orchestration"
-#: The current herdr lane could not be classified into a workflow role (unknown provider).
+#: The gateway lane's step is blocked: 2+ same-lane worker slots (ambiguous identity, j#74749 F2).
+REASON_HERDR_WORKER_AMBIGUOUS = "herdr_worker_ambiguous"
+#: The gateway lane's step is blocked: the single same-lane worker slot has no usable locator.
+REASON_HERDR_WORKER_LOCATOR_MISSING = "herdr_worker_locator_missing"
+#: A worker / gateway lane has no verified Redmine issue anchor (missing / retired, j#74748 F3).
+REASON_HERDR_ANCHOR_UNRESOLVED = "herdr_anchor_unresolved"
+#: A worker / gateway lane resolves to more than one distinct Redmine issue anchor (drift).
+REASON_HERDR_ANCHOR_AMBIGUOUS = "herdr_anchor_ambiguous"
+#: A default-lane Codex/Claude pair carries no step-time durable role authority (j#74748 F1).
+REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED = "ambiguous_default_coordinator_role"
+#: The current herdr lane's provider is not a known runtime provider (claude / codex).
 REASON_HERDR_LANE_ROLE_UNRESOLVED = "herdr_lane_role_unresolved"
-#: The herdr-native sender identity itself could not be resolved (missing / mismatched env,
-#: unreadable anchor). The application adapter maps the `resolve_sender_identity` failure
-#: reason into this single fail-closed workflow-step reason (detail carries the specifics).
+#: The herdr-native sender identity itself could not be resolved (adapter maps to this).
 REASON_HERDR_SENDER_IDENTITY_UNRESOLVED = "herdr_sender_identity_unresolved"
 
 HERDR_STEP_REASONS = frozenset(
@@ -104,145 +125,202 @@ HERDR_STEP_REASONS = frozenset(
         REASON_HERDR_WORKER_STEP_READY,
         REASON_HERDR_WORKER_DISPATCH_READY,
         REASON_HERDR_WORKER_SLOT_MISSING,
-        REASON_HERDR_COORDINATOR_ORCHESTRATION,
+        REASON_HERDR_WORKER_AMBIGUOUS,
+        REASON_HERDR_WORKER_LOCATOR_MISSING,
+        REASON_HERDR_ANCHOR_UNRESOLVED,
+        REASON_HERDR_ANCHOR_AMBIGUOUS,
+        REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
         REASON_HERDR_LANE_ROLE_UNRESOLVED,
         REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
     }
 )
+
+# Fixed detail prefixes so :func:`resolve_herdr_workflow_step` can tell a default-lane block
+# (needs durable role authority) apart from an unknown-provider block, without a second field.
+_DEFAULT_COORDINATOR_PREFIX = "herdr default-lane coordinator pair:"
+_UNKNOWN_PROVIDER_PREFIX = "herdr unknown provider:"
 
 
 def classify_herdr_workflow_lane(
     *,
     provider: str,
     lane_id: str,
-    project_scope: str,
     repo_root: str,
     locator: str = "",
 ) -> WorkflowLane:
     """Classify the current herdr lane's workflow role from its herdr-native identity (pure).
 
-    Mirrors :func:`...workflow_step.classify_workflow_lane` but derives the role from the
-    herdr shared-project-workspace model instead of a tmux ``TargetCandidate``:
-
-    - ``claude`` provider (any lane) -> ``implementation_worker`` — a Claude slot is always
-      the grandchild worker, never a coordinator (matches the tmux rule);
-    - ``codex`` provider + a **non-default** lane -> ``delegated_coordinator`` — a sublane
-      lane's codex slot is its gateway / child coordinator;
-    - ``codex`` provider + the **default** lane + a project scope -> ``project_gateway``;
-    - ``codex`` provider + the **default** lane + no project scope ->
-      ``grandparent_coordinator`` (the department root has no project scope of its own);
-    - any other provider -> ``caller_role=None`` / ``provider_safe=False`` so the resolver
-      fails closed rather than route on a guessed role.
+    Only the **non-default lane slots** are attributed a lane-local class (mid-review j#74748
+    F1 / j#74750): a ``claude`` slot is the ``implementation_worker`` (grandchild), a ``codex``
+    slot is the sublane gateway ``delegated_coordinator`` (child). The **default lane** — the
+    coordinator's Codex + its Main-unit assistant Claude — carries no step-time durable role
+    authority to tell a project gateway from a department-root coordinator (nor is its Claude
+    an implementation worker), so it fails closed rather than promote provider / placement to
+    a role authority. An unknown provider fails closed too.
 
     ``locator`` is the herdr transient locator (``agent list`` ``pane_id``) carried into the
     outcome's ``self_pane`` for diagnostics only — never a route authority (spec §2).
     """
     provider = (provider or "").strip()
     lane = (lane_id or "").strip() or HERDR_DEFAULT_LANE
-    scope = (project_scope or "").strip()
     root = (repo_root or "").strip()
+
+    def _blocked(detail: str) -> WorkflowLane:
+        return WorkflowLane(
+            self_pane=locator,
+            caller_role=None,
+            repo_root=root,
+            project_scope="",
+            provider_safe=False,
+            detail=detail,
+        )
+
+    if provider not in (HERDR_PROVIDER_CLAUDE, HERDR_PROVIDER_CODEX):
+        return _blocked(
+            f"{_UNKNOWN_PROVIDER_PREFIX} sender provider {provider!r} is not a known runtime "
+            f"provider ({HERDR_PROVIDER_CLAUDE!r} / {HERDR_PROVIDER_CODEX!r}); cannot classify "
+            "the workflow lane role — fail closed rather than route on a guessed role"
+        )
+
+    if lane == HERDR_DEFAULT_LANE:
+        return _blocked(
+            f"{_DEFAULT_COORDINATOR_PREFIX} the default lane is the coordinator pair "
+            f"(provider={provider!r}); workflow step carries no durable role authority to tell "
+            "a project gateway from a department-root coordinator (and a default-lane Claude is "
+            "the coordinator's assistant, not an implementation worker). Fail closed rather "
+            "than promote provider/placement to a role authority"
+        )
 
     if provider == HERDR_PROVIDER_CLAUDE:
         return WorkflowLane(
             self_pane=locator,
             caller_role=ROLE_IMPLEMENTATION_WORKER,
             repo_root=root,
-            project_scope=scope,
+            project_scope="",
             provider_safe=True,
             detail=f"herdr implementation worker lane (grandchild), lane={lane!r}",
         )
-
-    if provider == HERDR_PROVIDER_CODEX:
-        if lane != HERDR_DEFAULT_LANE:
-            caller_role = ROLE_DELEGATED_COORDINATOR
-            detail = f"herdr sublane gateway lane (child), lane={lane!r}"
-        elif scope:
-            caller_role = ROLE_PROJECT_GATEWAY
-            detail = "herdr project gateway / coordinator lane (parent), default lane"
-        else:
-            caller_role = ROLE_GRANDPARENT_COORDINATOR
-            detail = "herdr department-root coordinator lane (grandparent), default lane"
-        return WorkflowLane(
-            self_pane=locator,
-            caller_role=caller_role,
-            repo_root=root,
-            project_scope=scope,
-            provider_safe=True,
-            detail=detail,
-        )
-
     return WorkflowLane(
         self_pane=locator,
-        caller_role=None,
+        caller_role=ROLE_DELEGATED_COORDINATOR,
         repo_root=root,
-        project_scope=scope,
-        provider_safe=False,
-        detail=(
-            f"herdr sender provider {provider!r} is not a known runtime provider "
-            f"({HERDR_PROVIDER_CLAUDE!r} / {HERDR_PROVIDER_CODEX!r}); cannot classify the "
-            "workflow lane role — fail closed rather than route on a guessed role"
+        project_scope="",
+        provider_safe=True,
+        detail=f"herdr sublane gateway lane (child), lane={lane!r}",
+    )
+
+
+def _blocked_lane_outcome(lane: WorkflowLane) -> WorkflowStepOutcome:
+    """Fail-closed outcome for an unclassifiable lane (default-lane pair / unknown provider)."""
+    if lane.detail.startswith(_DEFAULT_COORDINATOR_PREFIX):
+        reason = REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED
+        next_action = (
+            "default-lane coordinator pair: workflow step has no durable role authority to "
+            "resolve this lane's coordinator role herdr-natively yet. Resolve the coordinator "
+            "action from the durable Redmine record + `workflow admission` (herdr-native "
+            "coordinator orchestration inside workflow step is increment 2)."
+        )
+    else:
+        reason = REASON_HERDR_LANE_ROLE_UNRESOLVED
+        next_action = (
+            "resolve the current herdr lane identity before stepping: the launch-time sender "
+            "env (MOZYO_AGENT_ROLE) must name a known provider (claude / codex). Run from "
+            "inside an attested herdr lane agent."
+        )
+    return WorkflowStepOutcome(
+        state=STATE_LANE_UNRESOLVED,
+        next_action=next_action,
+        execution=EXECUTION_BLOCKED,
+        reason=reason,
+        next_owner=OWNER_OPERATOR,
+        primitive=PRIMITIVE_NONE,
+        caller_role=lane.caller_role or "",
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=lane.project_scope,
+        durable_anchor="none",
+        detail=lane.detail,
+    )
+
+
+def _anchor_blocked(
+    lane: WorkflowLane, state: str, anchor_status: Optional[str], next_owner: str
+) -> WorkflowStepOutcome:
+    """Fail-closed outcome when the lane's Redmine issue anchor is not verified (j#74748 F3)."""
+    reason = (
+        REASON_HERDR_ANCHOR_AMBIGUOUS
+        if anchor_status == ANCHOR_AMBIGUOUS
+        else REASON_HERDR_ANCHOR_UNRESOLVED
+    )
+    detail = {
+        ANCHOR_AMBIGUOUS: "the lane resolves to more than one distinct Redmine issue anchor (drift)",
+        ANCHOR_RETIRED: "the lane's only Redmine anchor record is retired (tombstone)",
+        ANCHOR_MISSING: "no Redmine issue anchor record joins this live lane unit",
+    }.get(anchor_status or "", "the lane's Redmine issue anchor could not be verified")
+    return WorkflowStepOutcome(
+        state=state,
+        next_action=(
+            "resolve and verify this lane's Redmine issue anchor before stepping: "
+            + detail
+            + ". workflow step does not implement / dispatch against an unverified anchor."
         ),
+        execution=EXECUTION_BLOCKED,
+        reason=reason,
+        next_owner=next_owner,
+        primitive=PRIMITIVE_NONE,
+        caller_role=lane.caller_role or "",
+        self_pane=lane.self_pane,
+        repo_root=lane.repo_root,
+        project_scope=lane.project_scope,
+        durable_anchor="none",
+        detail=lane.detail + "; " + detail,
     )
 
 
 def resolve_herdr_workflow_step(
     lane: WorkflowLane,
     *,
-    same_lane_worker_live: Optional[bool] = None,
+    worker_liveness: Optional[str] = None,
+    anchor_status: Optional[str] = None,
+    anchor_pointer: str = "",
 ) -> WorkflowStepOutcome:
     """Map a classified herdr lane onto a resolution-only :class:`WorkflowStepOutcome` (pure).
 
     Increment 1 (Redmine #13489 j#74685 design_boundary): resolution-only — it names the
-    role-appropriate next action, next owner, and the herdr surface each lane uses, and
-    performs no sublane mutation and no delivery (``primitive=none`` throughout; the
-    policy-permitted one-step auto-execution is increment 2, gated behind the mandatory
-    task-level design mid-review).
+    role-appropriate next action / owner / herdr surface and performs no sublane mutation and
+    no delivery (``primitive=none`` throughout).
 
-    - ``implementation_worker`` -> ``no_op`` (``herdr_worker_step_ready``): read the lane's
-      own dispatched Redmine anchor and implement / record on the durable record. The worker
-      reads its anchor from the durable record (not a ``workflow step`` flag), so this needs
-      no anchor input and is the worker's own action, never a dispatch.
-    - ``delegated_coordinator`` (sublane gateway): with a live same-lane worker slot ->
-      ``no_op`` (``herdr_worker_dispatch_ready``) naming ``sublane dispatch-worker`` and the
-      dispatch-vs-monitor decision the lane's Redmine gate settles (increment 2); with no
-      live worker slot -> ``blocked`` (``herdr_worker_slot_missing``), next owner the child
-      (launch the worker lane, then step again). ``same_lane_worker_live=None`` (inventory
-      unavailable) also blocks, conservatively.
-    - ``project_gateway`` / ``grandparent_coordinator`` (coordinator pair) -> ``no_op``
-      (``herdr_coordinator_orchestration``): the coordinator resolves the next sublane
-      action via ``workflow admission`` / ``sublane create|start --execute``. herdr-native
-      coordinator orchestration inside ``workflow step`` is increment 2.
-    - unclassified lane -> ``blocked`` (``herdr_lane_role_unresolved``), next owner operator.
+    - unclassifiable lane (default-lane pair / unknown provider) -> ``blocked``
+      (:data:`REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED` / :data:`REASON_HERDR_LANE_ROLE_UNRESOLVED`).
+    - ``implementation_worker`` -> with a verified anchor, ``no_op`` (``herdr_worker_step_ready``,
+      ``durable_anchor`` set): read the verified Redmine anchor and implement. Without a verified
+      anchor -> fail closed (:func:`_anchor_blocked`).
+    - ``delegated_coordinator`` (sublane gateway) -> requires a verified anchor AND a single live
+      same-lane worker: ``no_op`` (``herdr_worker_dispatch_ready``, ``durable_anchor`` set) naming
+      ``sublane dispatch-worker``. A missing anchor / a missing / duplicate / unaddressable worker
+      each fails closed with its fixed reason (:data:`WORKER_ABSENT` ->
+      ``herdr_worker_slot_missing``, :data:`WORKER_AMBIGUOUS` -> ``herdr_worker_ambiguous``,
+      :data:`WORKER_LOCATOR_MISSING` -> ``herdr_worker_locator_missing``).
     """
+    if lane.caller_role is None or not lane.provider_safe:
+        return _blocked_lane_outcome(lane)
+
     base = dict(
         caller_role=lane.caller_role or "",
         self_pane=lane.self_pane,
         repo_root=lane.repo_root,
         project_scope=lane.project_scope,
-        durable_anchor="none",
     )
 
-    if lane.caller_role is None or not lane.provider_safe:
-        return WorkflowStepOutcome(
-            state=STATE_LANE_UNRESOLVED,
-            next_action=(
-                "resolve the current herdr lane identity before stepping: the launch-time "
-                "sender env (MOZYO_AGENT_ROLE) must name a known provider (claude / codex). "
-                "Run from inside an attested herdr lane agent."
-            ),
-            execution=EXECUTION_BLOCKED,
-            reason=REASON_HERDR_LANE_ROLE_UNRESOLVED,
-            next_owner=OWNER_OPERATOR,
-            primitive=PRIMITIVE_NONE,
-            detail=lane.detail,
-            **base,
-        )
-
     if lane.caller_role == ROLE_IMPLEMENTATION_WORKER:
+        if anchor_status != ANCHOR_VERIFIED:
+            return _anchor_blocked(
+                lane, STATE_GRANDCHILD_REDMINE_WORK, anchor_status, OWNER_CHILD
+            )
         return WorkflowStepOutcome(
             state=STATE_GRANDCHILD_REDMINE_WORK,
             next_action=(
-                "read this worker lane's dispatched Redmine anchor (issue + journal) and its "
+                f"read this worker lane's verified Redmine anchor ({anchor_pointer}) and its "
                 "required docs, then implement / verify and record implementation_done / "
                 "review_request on the durable record. This is the worker's own action — "
                 "workflow step performs no dispatch here."
@@ -251,71 +329,61 @@ def resolve_herdr_workflow_step(
             reason=REASON_HERDR_WORKER_STEP_READY,
             next_owner=OWNER_GRANDCHILD,
             primitive=PRIMITIVE_NONE,
+            durable_anchor=anchor_pointer or "none",
             detail=lane.detail,
             **base,
         )
 
-    if lane.caller_role == ROLE_DELEGATED_COORDINATOR:
-        if same_lane_worker_live:
-            return WorkflowStepOutcome(
-                state=STATE_CHILD_WORKER_DISPATCH,
-                next_action=(
-                    "this sublane gateway's same-lane worker slot is live: dispatch or "
-                    "monitor it with `sublane dispatch-worker --execute` for this lane's "
-                    "Redmine anchor. Whether to dispatch (worker idle) or monitor "
-                    "(implementation in flight) is settled by the lane's Redmine gate — "
-                    "herdr-native gate resolution + one-step auto-dispatch is increment 2."
-                ),
-                execution=EXECUTION_NO_OP,
-                reason=REASON_HERDR_WORKER_DISPATCH_READY,
-                next_owner=OWNER_CHILD,
-                primitive=PRIMITIVE_NONE,
-                detail=lane.detail,
-                **base,
-            )
+    # delegated_coordinator (sublane gateway): anchor gate first, then worker cardinality.
+    if anchor_status != ANCHOR_VERIFIED:
+        return _anchor_blocked(lane, STATE_CHILD_WORKER_DISPATCH, anchor_status, OWNER_CHILD)
+
+    if worker_liveness == WORKER_LIVE:
         return WorkflowStepOutcome(
             state=STATE_CHILD_WORKER_DISPATCH,
             next_action=(
-                "this sublane gateway has no live same-lane worker slot to dispatch to: "
-                "launch the worker lane (`sublane start --execute`), then step again. "
-                "workflow step never launches the worker itself (anchor / lifecycle is the "
-                "child's decision)."
+                "this sublane gateway has a verified Redmine anchor "
+                f"({anchor_pointer}) and a single live same-lane worker: dispatch or monitor "
+                "it with `sublane dispatch-worker --execute`. Whether to dispatch (worker idle) "
+                "or monitor (implementation in flight) is settled by the lane's Redmine gate — "
+                "herdr-native gate resolution + one-step auto-dispatch is increment 2."
             ),
-            execution=EXECUTION_BLOCKED,
-            reason=REASON_HERDR_WORKER_SLOT_MISSING,
+            execution=EXECUTION_NO_OP,
+            reason=REASON_HERDR_WORKER_DISPATCH_READY,
             next_owner=OWNER_CHILD,
             primitive=PRIMITIVE_NONE,
-            detail=(
-                lane.detail
-                + (
-                    "; same-lane worker slot unavailable"
-                    if same_lane_worker_live is None
-                    else "; no live same-lane worker slot"
-                )
-            ),
+            durable_anchor=anchor_pointer or "none",
+            detail=lane.detail,
             **base,
         )
 
-    # project_gateway / grandparent_coordinator: the coordinator pair.
-    coordinator_state = (
-        STATE_PARENT_WORK_INTAKE
-        if lane.caller_role == ROLE_PROJECT_GATEWAY
-        else STATE_GRANDPARENT_CONSULTATION
-    )
+    if worker_liveness == WORKER_AMBIGUOUS:
+        reason = REASON_HERDR_WORKER_AMBIGUOUS
+        extra = "2+ live same-lane worker slots (duplicate identity); workflow step will not guess"
+    elif worker_liveness == WORKER_LOCATOR_MISSING:
+        reason = REASON_HERDR_WORKER_LOCATOR_MISSING
+        extra = "the single same-lane worker slot has no usable locator to address"
+    else:  # WORKER_ABSENT / WORKER_UNAVAILABLE / None
+        reason = REASON_HERDR_WORKER_SLOT_MISSING
+        extra = (
+            "the same-lane worker inventory is unavailable"
+            if worker_liveness in (WORKER_UNAVAILABLE, None)
+            else "no live same-lane worker slot to dispatch to"
+        )
     return WorkflowStepOutcome(
-        state=coordinator_state,
+        state=STATE_CHILD_WORKER_DISPATCH,
         next_action=(
-            "coordinator lane: resolve the next sublane action from the ready queue + "
-            "durable Redmine gate with `workflow admission` and dispatch via `sublane "
-            "create|start --execute` (through the coordinator). herdr-native coordinator "
-            "orchestration inside workflow step (one-step auto create/start/dispatch, "
-            "fail-closed destructive drain/retire) is increment 2."
+            "this sublane gateway cannot resolve a single same-lane worker to dispatch to: "
+            + extra
+            + ". Resolve the worker slot (launch / disambiguate), then step again. workflow "
+            "step never launches or guesses the worker itself."
         ),
-        execution=EXECUTION_NO_OP,
-        reason=REASON_HERDR_COORDINATOR_ORCHESTRATION,
-        next_owner=OWNER_CALLER,
+        execution=EXECUTION_BLOCKED,
+        reason=reason,
+        next_owner=OWNER_CHILD,
         primitive=PRIMITIVE_NONE,
-        detail=lane.detail,
+        durable_anchor=anchor_pointer or "none",
+        detail=lane.detail + "; " + extra,
         **base,
     )
 
@@ -324,10 +392,23 @@ __all__ = (
     "HERDR_PROVIDER_CLAUDE",
     "HERDR_PROVIDER_CODEX",
     "HERDR_DEFAULT_LANE",
+    "WORKER_LIVE",
+    "WORKER_ABSENT",
+    "WORKER_AMBIGUOUS",
+    "WORKER_LOCATOR_MISSING",
+    "WORKER_UNAVAILABLE",
+    "ANCHOR_VERIFIED",
+    "ANCHOR_MISSING",
+    "ANCHOR_AMBIGUOUS",
+    "ANCHOR_RETIRED",
     "REASON_HERDR_WORKER_STEP_READY",
     "REASON_HERDR_WORKER_DISPATCH_READY",
     "REASON_HERDR_WORKER_SLOT_MISSING",
-    "REASON_HERDR_COORDINATOR_ORCHESTRATION",
+    "REASON_HERDR_WORKER_AMBIGUOUS",
+    "REASON_HERDR_WORKER_LOCATOR_MISSING",
+    "REASON_HERDR_ANCHOR_UNRESOLVED",
+    "REASON_HERDR_ANCHOR_AMBIGUOUS",
+    "REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED",
     "REASON_HERDR_LANE_ROLE_UNRESOLVED",
     "REASON_HERDR_SENDER_IDENTITY_UNRESOLVED",
     "HERDR_STEP_REASONS",

@@ -223,29 +223,43 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
 - **identity source** = launch-time sender env (`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` /
   `MOZYO_LANE_ID`, spec `herdr-native-identity.md` §2) を `resolve_sender_identity` で
   fail-closed に読む + workspace registry の project scope。tmux `%pane` は使わない。
-- **lane role 分類は divergent model を作らない (設計原則 4)。** tmux state machine と同じ 4
-  role へ、documented shared-project-workspace model (spec §1 / `sublane list` fold
-  `sublane_herdr_projection`) から機械的に導出する:
-  - provider `claude` (lane 不問) → `implementation_worker` (孫 worker);
-  - provider `codex` + **非 default** lane → `delegated_coordinator` (sublane gateway / 子);
-  - provider `codex` + **default** lane + project scope → `project_gateway` (親 coordinator);
-  - provider `codex` + **default** lane + scope 無し → `grandparent_coordinator`;
-  - それ以外 → fail-closed (`herdr_lane_role_unresolved`)。
+- **lane role 分類は divergent model を作らない (設計原則 4)。** tmux state machine と同じ
+  role 語彙へ、documented shared-project-workspace model (spec §1 / `sublane list` fold
+  `sublane_herdr_projection`) から導出する。ただし **provider/placement は workflow authority
+  ではない** (mid-review j#74748 F1 / j#74749 F1 / j#74750): mzb1 `role` は runtime provider
+  token であり、default-lane pair は step 時点で gateway/grandparent を区別する durable role
+  authority を持たない (default-lane Claude は coordinator の assistant であって worker では
+  ない)。よって **非 default lane slot のみ** を lane-local class として分類し、default lane は
+  fail-closed する:
+  - **非 default** lane + provider `claude` → `implementation_worker` (孫 worker);
+  - **非 default** lane + provider `codex` → `delegated_coordinator` (sublane gateway / 子);
+  - **default** lane (provider 不問) → fail-closed (`ambiguous_default_coordinator_role`);
+  - unknown provider → fail-closed (`herdr_lane_role_unresolved`)。
+  - registry `project_name` を role/scope authority にしない (display metadata、dir 名 default)。
+- **anchor gate (j#74748 F3)。** worker/gateway は lane metadata record を `(repo_workspace_id,
+  lane_id)` で join して Redmine issue anchor を **検証** した場合のみ ready/no_op を返し
+  (`durable_anchor` に載せる)、missing/ambiguous/retired は fail-closed。未検証 anchor で
+  ready を返さない。
+- **same-lane worker liveness は cardinality (j#74749 F2 / j#74750)。** gateway は同一
+  `(workspace, lane, claude)` の 0 / 1 / 2+ を保持し、2+ = ambiguous / locator 欠落 = fail-closed
+  とし、重複 identity を silent target にしない。
 - 出力は tmux と同じ replayable `WorkflowStepOutcome` envelope。`workflow step` は backend に
-  依らず同じ contract を返す。
+  依らず同じ contract を返し、**herdr live outcome も tmux と同一の store reconcile / dry-run /
+  one-step execution pipeline を通る** (j#74748 F2、backend 差は live lane outcome 解決のみ)。
 
 ### Increment 境界 (j#74685 design_boundary / task-level mid-review)
 
 本 US は workflow / routing / compatibility / destructive boundary に触れるため、実装途中の
 task-level design mid-review が必須 (Start Gate j#74685)。増分は次で切る:
 
-- **Increment 1 (resolution-only)**: lane identity + role を解決し、role ごとの next_action /
-  next_owner / herdr surface を返す。worker は自分の dispatched Redmine anchor を読んで実装
-  (`no_op`); gateway は same-lane worker の liveness を live inventory で確認し、live なら
-  `sublane dispatch-worker` へ (`no_op`)、無ければ fail-closed (`herdr_worker_slot_missing`);
-  coordinator は `workflow admission` / `sublane create|start` へ pointer (`no_op`)。**sublane
-  lifecycle mutation も delivery も行わない** (`primitive=none`)。inventory read は gateway lane
-  のみ (worker/coordinator は env のみで解決し、down herdr でも block しない)。
+- **Increment 1 (resolution-only)**: 非 default lane の lane identity + role + anchor を解決し、
+  role ごとの next_action / next_owner / herdr surface を返す。worker は verified anchor を読んで
+  実装 (`no_op`); gateway は verified anchor + 単一 live same-lane worker を確認し
+  `sublane dispatch-worker` へ (`no_op`)、anchor 未検証 / worker missing・ambiguous・locator 欠落は
+  fail-closed; **default lane (coordinator pair) は durable role authority 不在で fail-closed
+  (`ambiguous_default_coordinator_role`)**。**sublane lifecycle mutation も delivery も行わない**
+  (`primitive=none`)。anchor read は worker/gateway、inventory read は gateway が anchor gate を
+  通過した場合のみ (default/unknown は store/inventory を読まず block)。
 - **Increment 2 (mid-review 後)**: policy が既に許可した create/start/dispatch の **一段** 自動
   実行、Redmine gate による dispatch-vs-monitor 判定、pending callback 解決、そして
   destructive drain/retire の fail-closed 境界 (owner 承認 + retirement preflight が durable

@@ -359,31 +359,30 @@ def cmd_workflow_step(args: argparse.Namespace) -> int:
     fail-closed blocked outcome.
     """
     as_json = getattr(args, "as_json", False)
-
-    # Herdr-backend preflight (Redmine #13446): before touching the tmux rail, fail closed
-    # with a herdr-specific reason + `sublane` next_action instead of dying on the tmux
-    # `%pane` self-lane resolution a herdr session cannot serve. No-op under `backend: tmux`,
-    # so the tmux path below (and its output) is byte-identical.
-    herdr_pre = _herdr_step_preflight(args)
-    if herdr_pre is not None:
-        if as_json:
-            print(_json.dumps(herdr_pre.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-        else:
-            _print_outcome_text(herdr_pre)
-        return 0 if herdr_pre.ok else 1
-
-    require_tmux()
-    self_pane = current_pane()
     session = getattr(args, "session", None)
     dry_run = getattr(args, "dry_run", False)
 
-    live = resolve_workflow_step(
-        _discover_candidates(),
-        self_pane=self_pane,
-        anchor=_anchor_from_args(args),
-        pending_callback=_pending_callback_from_args(args),
-        session=session,
-    )
+    # Resolve the LIVE lane outcome. The backend difference is confined here (mid-review
+    # #13489 j#74748 F2): under the herdr backend the lane is resolved herdr-natively from the
+    # launch-time sender identity; otherwise the tmux rail resolves it from `current_pane` +
+    # the tmux inventory. Everything after this — the store reconcile, the dry-run / executable
+    # branch, the output envelope — is backend-agnostic, so herdr no longer runs a second,
+    # divergent next-action state machine. The tmux path stays byte-identical (herdr_live is
+    # None under `backend: tmux`, so `require_tmux()` and the tmux resolution run exactly as
+    # before).
+    herdr_live = _herdr_step_preflight(args)
+    if herdr_live is not None:
+        live = herdr_live
+    else:
+        require_tmux()
+        self_pane = current_pane()
+        live = resolve_workflow_step(
+            _discover_candidates(),
+            self_pane=self_pane,
+            anchor=_anchor_from_args(args),
+            pending_callback=_pending_callback_from_args(args),
+            session=session,
+        )
 
     # Reconcile the live routing outcome with the persisted runtime store's pending
     # action (Redmine #13291). The store is read fail-open: absent / unreadable degrades

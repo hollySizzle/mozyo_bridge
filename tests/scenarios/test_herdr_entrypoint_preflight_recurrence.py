@@ -90,23 +90,33 @@ class WorkflowStepRecurrenceTest(unittest.TestCase):
         self.assertNotEqual(outcome.reason, "self_lane_unresolved")
         self.assertNotEqual(outcome.reason, "herdr_self_lane_unresolved")
 
-    def test_dry_run_never_touches_the_tmux_rail(self):
+    def test_dry_run_flows_through_shared_pipeline_not_the_tmux_rail(self):
+        # F2 (mid-review j#74748): the herdr live outcome flows through the SAME store
+        # reconcile / dry-run pipeline as tmux (no divergent second state machine), while never
+        # touching the tmux `%pane` rail. `require_tmux` / `current_pane` blow up if reached;
+        # `_load_store_action` is spied to prove the shared pipeline is entered (and kept
+        # hermetic from the real home store).
         args = argparse.Namespace(
             repo=None, dry_run=True, as_json=True, session=None,
             issue=None, journal=None, callback=None, store_path=None,
         )
+        seen = {}
+
+        def _store(_a, *, repo_root=""):
+            seen["called"] = True
+            return None, cli_workflow.STORE_ABSENT
+
         out = io.StringIO()
-        # `require_tmux` / `current_pane` blow up if reached: the herdr resolution must fire
-        # before them, so a herdr session with no TMUX_PANE never reaches the tmux rail.
         with _herdr_active(), patch.object(
             herdr_workflow_step, "resolve_herdr_step_outcome", return_value=_worker_outcome()
         ), patch.object(cli_workflow, "require_tmux", _boom), patch.object(
             cli_workflow, "current_pane", _boom
-        ), patch("sys.stdout", out):
+        ), patch.object(cli_workflow, "_load_store_action", _store), patch("sys.stdout", out):
             rc = cli_workflow.cmd_workflow_step(args)
         payload = json.loads(out.getvalue())
         self.assertEqual(rc, 0)  # a worker no_op is a forward step
         self.assertEqual(payload["reason"], REASON_HERDR_WORKER_STEP_READY)
+        self.assertTrue(seen.get("called"), "herdr live must flow through the shared store reconcile")
 
     def test_tmux_backend_preflight_is_a_noop(self):
         # Backend=tmux: the preflight returns None so the tmux path (and its output) is
