@@ -565,6 +565,99 @@ def load_repo_defaults(repo_root: Path) -> WorkspaceDefaults:
     return load_workspace_defaults(source.resolve())
 
 
+# Redmine #13477: soft resolution of the verified default project for callers
+# (e.g. handoff role-profile expansion) that must read the verified default
+# without dying on a missing / unverified / ambiguous file. Distinct from
+# `load_repo_defaults`, the mutating/explicit loader that fails closed loudly
+# with `die`: this resolver returns a typed status so the caller can fail closed
+# through its own structured surface (a handoff `blocked` outcome) instead of a
+# bare process exit.
+DEFAULT_PROJECT_VERIFIED = "verified"
+DEFAULT_PROJECT_UNVERIFIED = "unverified"
+DEFAULT_PROJECT_MISSING = "missing"
+DEFAULT_PROJECT_CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class DefaultProjectResolution:
+    """A non-fatal resolution of a workspace's verified default Redmine project.
+
+    ``identifier`` is populated only when ``status`` is
+    :data:`DEFAULT_PROJECT_VERIFIED`; every other status carries ``None`` so an
+    unverified / missing / ambiguous default can never be mistaken for a usable
+    value. ``detail`` explains a non-verified status for the caller's fail-closed
+    message.
+    """
+
+    status: str
+    identifier: str | None
+    detail: str
+
+    @property
+    def is_verified(self) -> bool:
+        return self.status == DEFAULT_PROJECT_VERIFIED
+
+
+def resolve_default_project(repo_root: Path) -> DefaultProjectResolution:
+    """Resolve the workspace-local *verified* default Redmine project, softly.
+
+    Returns a :class:`DefaultProjectResolution` instead of dying:
+
+    - no defaults file at all -> :data:`DEFAULT_PROJECT_MISSING`;
+    - both the new and legacy names present -> :data:`DEFAULT_PROJECT_CONFLICT`
+      (the ambiguous state is never silently resolved to one copy);
+    - a loadable file whose verification record is incomplete ->
+      :data:`DEFAULT_PROJECT_UNVERIFIED` (treated as a suggestion only, per the
+      workspace default-project resolution contract);
+    - a loadable, fully verified file -> :data:`DEFAULT_PROJECT_VERIFIED` with the
+      default project identifier.
+
+    A structurally malformed / credential-bearing file still fails closed loudly
+    through :func:`load_workspace_defaults` (``die``): that is a broken operator
+    file, not a "missing / unverified" state, and every other consumer already
+    rejects it the same way.
+    """
+    resolution = defaults_resolution(repo_root)
+    if resolution.neither_exists:
+        return DefaultProjectResolution(
+            status=DEFAULT_PROJECT_MISSING,
+            identifier=None,
+            detail=(
+                "no workspace-local Redmine default at "
+                f"{(repo_root / PROJECT_DEFAULTS_INPUT_RELATIVE).as_posix()} "
+                f"(or legacy {(repo_root / WORKSPACE_DEFAULTS_LEGACY_RELATIVE).as_posix()})"
+            ),
+        )
+    if resolution.both_exist:
+        return DefaultProjectResolution(
+            status=DEFAULT_PROJECT_CONFLICT,
+            identifier=None,
+            detail=(
+                f"both {PROJECT_DEFAULTS_INPUT_RELATIVE.as_posix()} and "
+                f"{WORKSPACE_DEFAULTS_LEGACY_RELATIVE.as_posix()} exist; resolve "
+                "the ambiguous state before the default is trusted"
+            ),
+        )
+    source = resolution.read_path
+    assert source is not None  # neither_exists handled above
+    defaults = load_workspace_defaults(source.resolve())
+    if not defaults.verification.is_complete:
+        return DefaultProjectResolution(
+            status=DEFAULT_PROJECT_UNVERIFIED,
+            identifier=None,
+            detail=(
+                f"the Redmine default in .mozyo-bridge/{source.name} is not "
+                "verified (verification record incomplete); treat as a "
+                "suggestion only"
+            ),
+        )
+    return DefaultProjectResolution(
+        status=DEFAULT_PROJECT_VERIFIED,
+        identifier=defaults.default_project.identifier,
+        detail="",
+    )
+
+
 def resolve_output_path(repo_root: Path, target: Path) -> Path:
     if target.is_absolute():
         return target

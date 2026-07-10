@@ -150,9 +150,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     resolve_queue_enter_retry_policy,
     resolve_standard_target_admission_policy,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (
+    resolve_handoff_profile_fields,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileError,
-    parse_profile_fields,
     resolve_role_profile,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
@@ -2758,17 +2760,25 @@ def orchestrate_handoff(
             workdir_abs, repo_root_abs=repo_anchor_abs
         )
 
-    # Redmine #12388: resolve the requested fixed role profile before any pane
-    # send. Auto-fill `durable_anchor` from the anchor so the most common
-    # placeholder needs no `--profile-field`. Fail closed (blocked /
-    # invalid_args) on an unknown role or a malformed `--profile-field`; omitting
+    # Redmine #12388 / #13477: resolve the requested fixed role profile before
+    # any pane send. `resolve_handoff_profile_fields` parses `--profile-field`,
+    # auto-fills `durable_anchor` from the anchor, and (Redmine #13477)
+    # auto-resolves a `redmine_project` placeholder from the verified
+    # workspace-local Redmine default when the role needs it and no explicit
+    # value was given (explicit wins; missing/unverified fails closed). Fail
+    # closed (blocked / invalid_args) on an unknown role, a malformed
+    # `--profile-field`, or an unresolvable required default; omitting
     # `--role-profile` is the explicit fallback of no profile expansion.
     role_profile_resolution = None
     role_profile_arg = getattr(args, "role_profile", None)
     if role_profile_arg:
         try:
-            profile_fields = parse_profile_fields(getattr(args, "profile_field", None))
-            profile_fields.setdefault("durable_anchor", anchor.human_pointer())
+            profile_fields = resolve_handoff_profile_fields(
+                role_profile_arg,
+                getattr(args, "profile_field", None),
+                anchor.human_pointer(),
+                repo_root_from_args(args),
+            )
             role_profile_resolution = resolve_role_profile(
                 role_profile_arg, profile_fields
             )
