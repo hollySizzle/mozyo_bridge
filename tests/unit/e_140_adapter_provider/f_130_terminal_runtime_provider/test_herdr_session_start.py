@@ -803,6 +803,79 @@ class SessionStartCliTest(unittest.TestCase):
             {s.provider for s in result.slots}, {"claude", "codex"}
         )
 
+    def _run_cli_with_fake_runner(self, tmp, herdr, *, extra_env=None):
+        # Drive the real `herdr session-start` CLI entrypoint (build_parser ->
+        # args.func) with the fake herdr injected as the launch runner, so the test
+        # observes the exact launched argv the CLI seam produces — not a
+        # prepare_session call the CLI might forget to make correctly.
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (
+            herdr_session_start as hss,
+        )
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        args = build_parser().parse_args(
+            ["herdr", "session-start", "--agent", "claude", "--agent", "codex"]
+        )
+        args.repo = str(repo)
+        real_prepare = hss.prepare_session
+
+        def _prepare_with_fake_runner(**kwargs):
+            return real_prepare(runner=herdr.run, **kwargs)
+
+        env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(home)}
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            hss, "prepare_session", _prepare_with_fake_runner
+        ):
+            rc = args.func(args)
+        self.assertEqual(rc, 0)
+        by_provider = {}
+        for argv in herdr.start_argvs:
+            by_provider[argv[argv.index("--") + 1]] = argv
+        return by_provider
+
+    def test_cli_session_start_threads_auto_permission_default(self) -> None:
+        # Regression #13452 / #13453: the direct `herdr session-start` CLI entrypoint
+        # must thread the cockpit/sublane policy default (`auto`) into launch
+        # preparation, so a managed Claude relaunched via the runbook command lands
+        # `--permission-mode auto` WITHOUT the operator setting
+        # MOZYO_CLAUDE_PERMISSION_MODE. Before the fix the CLI called prepare_session()
+        # omitting claude_permission_mode_default, so live argv was flagless
+        # (`manual mode on`) while `sublane readiness` projected `auto` — the exact
+        # projection/live divergence this US closes.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            by_provider = self._run_cli_with_fake_runner(tmp, herdr)
+        claude = by_provider["claude"]
+        idx = claude.index("--permission-mode")
+        self.assertEqual(claude[idx + 1], "auto")
+        # The flag rides AFTER `-- claude` so it reaches the claude CLI, not herdr.
+        self.assertGreater(idx, claude.index("--"))
+        # Codex argv is unchanged (Claude-only policy, #11925 rule 1).
+        self.assertNotIn("--permission-mode", by_provider["codex"])
+
+    def test_cli_session_start_env_override_wins_over_policy_default(self) -> None:
+        # Contract invariance: hardcoding the `auto` policy default at the CLI seam does
+        # NOT usurp the MOZYO_CLAUDE_PERMISSION_MODE override rail (#11857). An operator
+        # who exports `default` still gets `--permission-mode default`.
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            by_provider = self._run_cli_with_fake_runner(
+                tmp, herdr, extra_env={"MOZYO_CLAUDE_PERMISSION_MODE": "default"}
+            )
+        claude = by_provider["claude"]
+        idx = claude.index("--permission-mode")
+        self.assertEqual(claude[idx + 1], "default")
+        self.assertNotIn("--permission-mode", by_provider["codex"])
+
 
 class LinkedWorktreeIdentityTest(unittest.TestCase):
     """Redmine #13377 (design j#73613, shared project workspace): on a REAL linked git
