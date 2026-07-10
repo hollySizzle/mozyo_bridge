@@ -546,6 +546,18 @@ CREATE_BLOCKED = "blocked"
 
 CREATE_STATES = frozenset({CREATE_PLANNED, CREATE_BLOCKED})
 
+#: The stable-route callback token a dispatch defaults its ``upstream_coordinator``
+#: profile field to when the operator omits ``--upstream-coordinator`` (Redmine
+#: #13476). It is the ``--target coordinator`` pseudo-target — the workspace-scoped,
+#: fail-closed resolver that binds to the sender workspace's main-lane coordinator
+#: Codex (pane_resolver ``COORDINATOR_LABEL`` / role->provider binding, #12015 /
+#: #12673). Using the stable route token (not a hand-invented literal like
+#: ``<coordinator-pane>``) keeps the gateway's callback route resolvable without an
+#: operator edit, and — being a route token rather than a physical ``%pane`` id —
+#: carries no host-specific identity into the OSS default. An explicit
+#: ``--upstream-coordinator`` value always wins.
+DEFAULT_UPSTREAM_COORDINATOR_ROUTE = "coordinator"
+
 
 @dataclass(frozen=True)
 class SublaneCreateRequest:
@@ -554,8 +566,11 @@ class SublaneCreateRequest:
     Every field is caller-supplied so the domain never fabricates a worktree path or
     branch from the issue number (the boundary doc keeps issue-number -> path/branch
     generation an operator decision). ``journal`` is the durable anchor the dispatch
-    steps point at. ``upstream_coordinator`` is the coordinator pane the gateway calls
-    back to; ``None`` renders a placeholder in the dispatch step.
+    steps point at. ``upstream_coordinator`` is the coordinator route the gateway calls
+    back to; when the operator omits it, the dispatch defaults to the stable
+    ``--target coordinator`` route token (:data:`DEFAULT_UPSTREAM_COORDINATOR_ROUTE`,
+    #13476) rather than emitting a hand-editable ``<coordinator-pane>`` literal. An
+    explicit value always wins (see :meth:`resolved_upstream_coordinator`).
 
     ``work_unit`` declares the governed granularity of the dispatched unit (#13002):
     the caller-asserted kind of ``issue`` (``user_story`` standard default /
@@ -589,6 +604,20 @@ class SublaneCreateRequest:
             self.work_unit,
             explicit_decision_anchor=self.work_unit_decision_anchor,
         )
+
+    def resolved_upstream_coordinator(self) -> str:
+        """The ``upstream_coordinator`` profile-field value the dispatch carries (#13476).
+
+        Returns the explicit ``--upstream-coordinator`` value when the operator supplied
+        one (stripped), otherwise the stable ``--target coordinator`` route token
+        (:data:`DEFAULT_UPSTREAM_COORDINATOR_ROUTE`). Never returns empty, so the gateway
+        role profile's ``<upstream_coordinator>`` placeholder always resolves to a
+        routable callback target instead of a hand-editable ``<coordinator-pane>``
+        literal (or an unresolved placeholder). This is the single source of truth for
+        the default; every dispatch command / argv builder reads it.
+        """
+        explicit = (self.upstream_coordinator or "").strip()
+        return explicit or DEFAULT_UPSTREAM_COORDINATOR_ROUTE
 
     def missing_fields(self, *, is_git: bool = True) -> Tuple[str, ...]:
         """The required identity fields left blank (fail-closed trigger).
@@ -796,7 +825,7 @@ def plan_sublane_create(
 def _dispatch_command(request: SublaneCreateRequest) -> str:
     """The replayable gateway ``handoff send`` command for the create plan (pure)."""
     journal = request.journal or "<journal>"
-    coordinator = request.upstream_coordinator or "<coordinator-pane>"
+    coordinator = request.resolved_upstream_coordinator()
     return (
         "mozyo-bridge handoff send --to codex --source redmine "
         f"--issue {request.issue} --journal {journal} "

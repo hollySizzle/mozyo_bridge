@@ -218,7 +218,7 @@ def heal_and_retry_dispatch(
             journal=(request.journal or ""),
             gateway_pane=gateway_pane or "",
             lane_label=request.lane_label,
-            upstream_coordinator=request.upstream_coordinator,
+            upstream_coordinator=request.resolved_upstream_coordinator(),
             target_repo=target_repo,
         )
     except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.

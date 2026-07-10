@@ -427,7 +427,9 @@ def register_lifecycle(sub) -> None:
         "--upstream-coordinator",
         dest="upstream_coordinator",
         default=None,
-        help="Coordinator pane the gateway calls back to",
+        help="Coordinator route the gateway calls back to (default: the stable "
+        "`coordinator` route token, resolved workspace-scoped and fail-closed; "
+        "pass an explicit pane/route to override)",
     )
     # Governed work-unit granularity (Redmine #13002): the standard dispatch unit
     # is one UserStory (1US=1作業単位). `leaf_issue` is the task-level-exception
