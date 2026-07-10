@@ -474,6 +474,7 @@ def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
         worker_liveness=worker_liveness,
         anchor_status=anchor_status,
         anchor_pointer=anchor_pointer,
+        lane_label=sender.lane_id,
     )
 
 

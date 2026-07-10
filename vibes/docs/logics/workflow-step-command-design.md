@@ -275,11 +275,19 @@ task-level design mid-review が必須 (Start Gate j#74685)。増分は次で切
   (`ambiguous_default_coordinator_role`)**。**sublane lifecycle mutation も delivery も行わない**
   (`primitive=none`)。anchor read は worker/gateway、inventory read は gateway が anchor gate を
   通過した場合のみ (default/unknown は store/inventory を読まず block)。
-- **Increment 2 (mid-review 後)**: policy が既に許可した create/start/dispatch の **一段** 自動
-  実行、Redmine gate による dispatch-vs-monitor 判定、pending callback 解決、そして
-  destructive drain/retire の fail-closed 境界 (owner 承認 + retirement preflight が durable
-  record 上で既に成立する場合のみ実行、それ以外は resolution-only)。domain/design 判断・issue
-  起票・Review Gate・owner approval・release・credential は自動承認しない (`## 禁止される自動実行`)。
+- **Increment 2 (coordinator disposition j#74855 で bounded authorize)**: policy が既に許可した
+  sublane dispatch の **一段** 自動実行を実装。gateway lane が **verified source-of-truth anchor
+  + 単一 live same-lane worker (stable target) + identity-known** を満たす場合、`workflow step`
+  は executable outcome (`primitive=herdr_sublane_dispatch_worker`, `execution=ready`) を返し、
+  CLI が既存 `sublane dispatch-worker --execute` を **共通 pipeline (dry-run / store reconcile /
+  fail-closed) 経由で一段** 実行する (ACK は completion でない)。worker lane は自 anchor 読取
+  no_op のまま、coordinator (default) lane は fail-closed のまま。gating store action (issue-
+  correlated) は dispatch を blocked へ downgrade する。**destructive drain/retire の pane/
+  worktree/local-branch mutation、任意 target/lane/route、raw shell 直結、domain/design・issue
+  起票・Review Gate・owner approval・release・credential の自動承認は引き続き禁止** (j#74855)。
+  actual drain/retire actuator は専用 actuator + coordinator-only + exact owner approval +
+  closed/integrated/clean/origin-reachable/callback-drained/identity-known + task-level 再 review
+  を先に要する (j#74748)。
 
 実 module / reason token / next_action 文言は実装 (`domain/workflow_step_herdr.py` +
 `application/herdr_workflow_step.py` + tests) を正本にする。tmux path は byte 不変

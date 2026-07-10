@@ -84,6 +84,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PRIMITIVE_CHILD_INTAKE,
     PRIMITIVE_CONSULT,
     PRIMITIVE_HANDOFF_SEND,
+    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_TICKETLESS_CALLBACK,
     PendingCallback,
     WorkflowAnchor,
@@ -204,6 +205,18 @@ def _anchor_issue_of(durable_anchor: str) -> str | None:
     return None
 
 
+def _anchor_journal_of(durable_anchor: str) -> str:
+    """The journal id from a ``redmine:issue=<id>:journal=<id>`` pointer, or "" (pure)."""
+    s = (durable_anchor or "").strip()
+    if not s.startswith("redmine:"):
+        return ""
+    for field in s.split(":"):
+        field = field.strip()
+        if field.startswith("journal="):
+            return field[len("journal="):].strip()
+    return ""
+
+
 def _print_outcome_text(outcome: WorkflowStepOutcome) -> None:
     print(f"state: {outcome.state}")
     print(f"execution: {outcome.execution}")
@@ -292,6 +305,24 @@ def _primitive_argv(
             "--callback-reason", fields["callback_reason"],
             "--read-contract", outcome.callback_to_role,
         ]
+        return argv
+    if outcome.primitive == PRIMITIVE_HERDR_DISPATCH_WORKER:
+        # Herdr gateway one-step worker dispatch (Redmine #13489 increment 2, coordinator
+        # disposition j#74855). The verified source-of-truth anchor (issue + journal, parsed
+        # from the outcome's durable_anchor) and the stable lane target (lane_label) drive the
+        # existing `sublane dispatch-worker --execute` primitive once. The primitive owns its own
+        # anchor / target / readiness gating; the anchor here is already Redmine-verified.
+        issue = _anchor_issue_of(outcome.durable_anchor) or ""
+        journal = _anchor_journal_of(outcome.durable_anchor)
+        argv = [
+            "sublane", "dispatch-worker",
+            "--issue", issue,
+            "--lane-label", outcome.lane_label,
+            "--execute",
+            "--target-repo", "auto",
+        ]
+        if journal:
+            argv += ["--journal", journal]
         return argv
     raise AssertionError(  # pragma: no cover - guarded by outcome.executable
         f"non-executable primitive {outcome.primitive!r}"
