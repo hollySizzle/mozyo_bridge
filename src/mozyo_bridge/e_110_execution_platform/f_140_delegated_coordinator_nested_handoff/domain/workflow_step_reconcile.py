@@ -119,29 +119,43 @@ def store_action_is_pending(action: WorkflowNextAction) -> bool:
     return action.action not in _NON_PENDING_ACTIONS
 
 
+def _anchor_issue(anchor: str) -> str:
+    """The issue id embedded in a durable Redmine anchor pointer, or "" (pure).
+
+    Accepts ``issue:journal`` / ``redmine:issue:journal`` / ``redmine:issue=…:journal=…``.
+    """
+    a = (anchor or "").strip()
+    if not a:
+        return ""
+    tail = a.split(":", 1)[1] if a.startswith("redmine:") else a
+    first = tail.split(":", 1)[0].strip()
+    if first.startswith("issue="):
+        first = first[len("issue="):].strip()
+    return first
+
+
 def _action_matches_issue(action: WorkflowNextAction, issue: str) -> bool:
-    """True when the store action is about ``issue`` (its ``target_issue`` or anchor issue).
+    """True when **every** issue-bearing field of the store action equals ``issue`` (F3c-2).
 
     Used to issue-correlate a pending store action with the lane's live-verified anchor
-    (Redmine #13489 F3c). An action with no ``target_issue`` and no anchor issue cannot be
-    correlated, so it does **not** match — a caller-supplied store never surfaces an
-    uncorrelated action onto a source-of-truth-verified lane.
+    (Redmine #13489 F3c). Both the ``target_issue`` and the anchor issue are checked: an action
+    is a match only when *every present* issue-bearing field equals ``issue`` (and at least one
+    is present). A caller-supplied action that is internally contradictory (``target_issue=live,
+    anchor=other`` or the reverse) does **not** match — one field agreeing no longer lets it slip
+    through (mid-review j#74834). An action with no issue-bearing field cannot be correlated and
+    does not match.
     """
     want = (issue or "").strip()
     if not want:
         return False
-    if (action.target_issue or "").strip() == want:
-        return True
-    # ``anchor`` is a durable Redmine pointer (``issue:journal`` / ``redmine:issue=…:journal=…``);
-    # the issue is the first numeric-ish segment after any ``redmine:``/``issue=`` prefix.
-    anchor = (action.anchor or "").strip()
-    if not anchor:
+    fields = [
+        f
+        for f in ((action.target_issue or "").strip(), _anchor_issue(action.anchor))
+        if f
+    ]
+    if not fields:
         return False
-    tail = anchor.split(":", 1)[1] if anchor.startswith("redmine:") else anchor
-    first = tail.split(":", 1)[0].strip()
-    if first.startswith("issue="):
-        first = first[len("issue="):].strip()
-    return first == want
+    return all(f == want for f in fields)
 
 
 def store_action_is_gating(action: WorkflowNextAction) -> bool:

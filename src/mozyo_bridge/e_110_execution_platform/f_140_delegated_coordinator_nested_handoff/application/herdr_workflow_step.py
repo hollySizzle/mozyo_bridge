@@ -220,20 +220,31 @@ def _load_workflow_store(args: argparse.Namespace):
 
 
 def _canonical_event_journal(event_id: str, issue: str) -> str:
-    """The journal id of a canonical ``redmine:<issue>:<journal>`` / ``<issue>:<journal>`` anchor.
+    """The journal id of a **canonical** ``redmine:<issue>:<journal>`` anchor, else "".
 
-    Returns the journal **only** when the anchor's embedded issue equals ``issue`` (F3a canonical
-    validation); a non-canonical / issue-mismatched / synthetic id yields "" so it never counts
-    as this issue's gate anchor.
+    The source contract is :func:`...redmine_event_intake.redmine_event_id` — a canonical
+    Redmine anchor is ``redmine:<issue>:<journal>`` (mid-review j#74834 F3c-1). The ``redmine:``
+    prefix is **required**: a bare ``<issue>:<journal>`` (the internal store key any caller can
+    write), an opaque / extra-segment / issue-mismatched id all yield "" so a synthetic store
+    assertion never corroborates the source-of-truth anchor. The embedded issue must equal
+    ``issue`` and be re-derivable via :func:`redmine_event_id` (defensive round-trip).
     """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
+        redmine_event_id,
+    )
+
     s = (event_id or "").strip()
-    if s.startswith("redmine:"):
-        s = s[len("redmine:"):]
-    parts = s.split(":")
-    if len(parts) != 2:
+    if not s.startswith("redmine:"):
         return ""
-    eid_issue, journal = parts[0].strip(), parts[1].strip()
-    if not journal or eid_issue != (issue or "").strip():
+    parts = s.split(":")
+    if len(parts) != 3:
+        return ""
+    _, eid_issue, journal = parts[0], parts[1].strip(), parts[2].strip()
+    want = (issue or "").strip()
+    if not journal or eid_issue != want:
+        return ""
+    # Defensive: the id must be exactly the canonical form for this (issue, journal).
+    if s != redmine_event_id(want, journal):
         return ""
     return journal
 

@@ -146,6 +146,25 @@ class IssueCorrelationTest(unittest.TestCase):
         )
         self.assertEqual(rec.disposition, RECONCILE_STORE_ALIGNED)
 
+    def test_internally_contradictory_target_live_anchor_other_is_rejected(self):
+        # F3c-2: target_issue matches live but the anchor names a different issue -> not a match.
+        import dataclasses
+
+        na = dataclasses.replace(_na("perform_review"), anchor="99999:1")  # target_issue=13291
+        rec = reconcile_step_with_store(
+            _live_blocked(), na, store_status=STORE_PRESENT, live_anchor_issue="13291",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ISSUE_MISMATCH)
+
+    def test_internally_contradictory_target_other_anchor_live_is_rejected(self):
+        import dataclasses
+
+        na = dataclasses.replace(_na("perform_review"), target_issue="99999")  # anchor=13291:72672
+        rec = reconcile_step_with_store(
+            _live_blocked(), na, store_status=STORE_PRESENT, live_anchor_issue="13291",
+        )
+        self.assertEqual(rec.disposition, RECONCILE_STORE_ISSUE_MISMATCH)
+
 
 class PredicateTest(unittest.TestCase):
     def test_none_hold_await_are_not_pending(self):

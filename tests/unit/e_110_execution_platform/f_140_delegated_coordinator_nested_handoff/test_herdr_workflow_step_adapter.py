@@ -334,15 +334,18 @@ class CanonicalEventJournalTest(unittest.TestCase):
     def test_canonical_redmine_prefixed(self):
         self.assertEqual(adapter._canonical_event_journal("redmine:13489:74766", "13489"), "74766")
 
-    def test_canonical_bare(self):
-        self.assertEqual(adapter._canonical_event_journal("13489:74766", "13489"), "74766")
+    def test_bare_prefixless_id_rejected(self):
+        # F3c-1: canonical requires the `redmine:` prefix; a bare `<issue>:<journal>` (the
+        # internal store key any caller can write) is NOT a canonical Redmine anchor.
+        self.assertEqual(adapter._canonical_event_journal("13489:74766", "13489"), "")
 
     def test_issue_mismatch_rejected(self):
         self.assertEqual(adapter._canonical_event_journal("redmine:99999:74766", "13489"), "")
 
     def test_non_canonical_rejected(self):
         self.assertEqual(adapter._canonical_event_journal("opaque:74766", "13489"), "")
-        self.assertEqual(adapter._canonical_event_journal("13489:74766:extra", "13489"), "")
+        self.assertEqual(adapter._canonical_event_journal("redmine:13489:74766:extra", "13489"), "")
+        self.assertEqual(adapter._canonical_event_journal("redmine:13489", "13489"), "")
 
 
 class ResolveLaneAnchorTest(unittest.TestCase):
