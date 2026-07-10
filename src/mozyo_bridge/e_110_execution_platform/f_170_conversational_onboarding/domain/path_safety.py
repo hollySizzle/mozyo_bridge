@@ -146,8 +146,10 @@ MOUNT_UNAVAILABLE = "unavailable"
 MOUNT_CONFLICTING = "conflicting"
 
 _MOUNT_SYNC_STATES: frozenset[str] = frozenset({MOUNT_SYNC_CLOUD, MOUNT_NETWORK})
-_MOUNT_AMBIGUOUS_STATES: frozenset[str] = frozenset(
-    {MOUNT_UNAVAILABLE, MOUNT_CONFLICTING}
+# The full closed vocabulary. A ``MountFacts`` whose state is outside this set is
+# invalid and is treated as ``unavailable`` (fail closed, never ``normal``).
+_ALL_MOUNT_STATES: frozenset[str] = frozenset(
+    {MOUNT_LOCAL, MOUNT_SYNC_CLOUD, MOUNT_NETWORK, MOUNT_UNAVAILABLE, MOUNT_CONFLICTING}
 )
 
 
@@ -258,24 +260,86 @@ def _within(root: Path, ancestor: Path) -> bool:
         return False
 
 
+def _resolve_mount_facts(
+    canonical: Path,
+    *,
+    mount_facts: MountFacts | None,
+    mount_probe: MountProbe | None,
+) -> MountFacts:
+    """Resolve the mount facts for ``canonical``, always fail-closed.
+
+    Precedence: an explicit pre-probed ``mount_facts`` (the pure boundary — the
+    application adapter probes and hands the domain a closed fact) wins; else a
+    ``mount_probe`` is called *inside a guard* that converts any exception into a
+    credential-free ``MOUNT_UNAVAILABLE`` (F5 — an adapter failure never escapes
+    the hard gate); else, with neither supplied, mount metadata is *unavailable*
+    (F3 — a missing probe is not evidence of a local mount). Any result whose
+    ``state`` is outside the closed vocabulary is likewise ``MOUNT_UNAVAILABLE``
+    (F3 — an unknown state never falls through to ``normal``).
+    """
+    facts = mount_facts
+    if facts is None and mount_probe is not None:
+        try:
+            facts = mount_probe.classify_mount(canonical)
+        except Exception as exc:  # noqa: BLE001 - never leak past the hard gate
+            return MountFacts(
+                state=MOUNT_UNAVAILABLE,
+                source="probe_error",
+                detail=f"mount probe raised {type(exc).__name__}",
+            )
+    if facts is None:
+        return MountFacts(
+            state=MOUNT_UNAVAILABLE,
+            source="absent",
+            detail="no mount facts / probe supplied",
+        )
+    if not isinstance(facts, MountFacts) or facts.state not in _ALL_MOUNT_STATES:
+        return MountFacts(
+            state=MOUNT_UNAVAILABLE,
+            source="invalid",
+            detail=f"mount facts state {getattr(facts, 'state', facts)!r} is not recognised",
+        )
+    return facts
+
+
 def _classify_risk(
     root: Path,
     *,
     home: Path,
     sync_roots: Sequence[Path],
-    mount_facts: MountFacts | None,
+    mount_facts: MountFacts,
 ) -> tuple[str, tuple[str, ...]]:
     """Classify ``path_risk`` for an already-canonical ``root``.
 
-    Precedence: home → path-based sync signal (prefix / provider name) → mount
-    metadata → normal. Home is checked first because it is a hard block
-    regardless of whether home itself sits under a sync root. Mount metadata is
-    consulted when supplied: ``unavailable`` / ``conflicting`` fail closed to
-    ``ambiguous`` (never ``normal``), ``sync_cloud`` / ``network`` are
-    sync/cloud, ``local`` proceeds to ``normal``.
+    ``mount_facts`` is always a valid, resolved :class:`MountFacts` (see
+    :func:`_resolve_mount_facts`). Precedence, chosen so no branch can reach
+    ``normal`` without positive local-mount evidence:
+
+    1. ``home`` — hard block regardless of anything else.
+    2. ``conflicting`` mount metadata — the identity actively disagrees with
+       itself / the path signals, so it is ``ambiguous`` (hard block) *before*
+       any positive path signal can weaken it to a mere caution (F4).
+    3. path-based sync signal (sync-root prefix / provider name) — an
+       authoritative positive sync signal → ``sync_or_cloud``. This survives
+       ``unavailable`` (a missing probe does not contradict a name/prefix hit).
+    4. ``unavailable`` mount metadata (with no positive path signal) — the
+       sync-vs-local question is undeterminable → ``ambiguous`` (F3).
+    5. ``sync_cloud`` / ``network`` mount → ``sync_or_cloud``.
+    6. ``local`` mount → ``normal`` (the only path to ``normal`` — it requires
+       positive local-mount evidence).
+    7. defensive fallthrough → ``ambiguous`` (never ``normal``).
     """
     if root == home:
         return PATH_RISK_HOME, (f"root is the home directory {root}",)
+
+    if mount_facts.state == MOUNT_CONFLICTING:
+        return (
+            PATH_RISK_AMBIGUOUS,
+            (
+                f"mount metadata is conflicting ({mount_facts.detail or 'no detail'}); "
+                "the root identity is not unique, so failing closed to ambiguous",
+            ),
+        )
 
     for sync_root in sync_roots:
         if _within(root, sync_root):
@@ -292,23 +356,30 @@ def _classify_risk(
             (f"root path contains sync/cloud provider folder {sorted(hit)[0]!r}",),
         )
 
-    if mount_facts is not None:
-        if mount_facts.state in _MOUNT_AMBIGUOUS_STATES:
-            return (
-                PATH_RISK_AMBIGUOUS,
-                (
-                    f"mount metadata is {mount_facts.state} "
-                    f"({mount_facts.detail or 'no detail'}); refusing to classify "
-                    "sync/cloud vs local, so failing closed to ambiguous",
-                ),
-            )
-        if mount_facts.state in _MOUNT_SYNC_STATES:
-            return (
-                PATH_RISK_SYNC_OR_CLOUD,
-                (f"mount metadata classifies the root as {mount_facts.state}",),
-            )
+    if mount_facts.state == MOUNT_UNAVAILABLE:
+        return (
+            PATH_RISK_AMBIGUOUS,
+            (
+                f"mount metadata is unavailable ({mount_facts.detail or 'no detail'}); "
+                "cannot determine sync/cloud vs local, so failing closed to "
+                "ambiguous (never normal)",
+            ),
+        )
 
-    return PATH_RISK_NORMAL, ()
+    if mount_facts.state in _MOUNT_SYNC_STATES:
+        return (
+            PATH_RISK_SYNC_OR_CLOUD,
+            (f"mount metadata classifies the root as {mount_facts.state}",),
+        )
+
+    if mount_facts.state == MOUNT_LOCAL:
+        return PATH_RISK_NORMAL, ()
+
+    # Defensive: any state not handled above fails closed, never normal.
+    return (
+        PATH_RISK_AMBIGUOUS,
+        (f"unhandled mount state {mount_facts.state!r}; failing closed to ambiguous",),
+    )
 
 
 def _classify_adoption(root: Path) -> str:
@@ -324,23 +395,36 @@ def classify_path_safety(
     *,
     home: Path,
     sync_roots: Sequence[Path] | None = None,
+    mount_facts: MountFacts | None = None,
     mount_probe: MountProbe | None = None,
 ) -> PathSafety:
     """Classify ``raw_root`` into a closed :class:`PathSafety`.
 
-    ``home`` / ``sync_roots`` / ``mount_probe`` are injectable (``sync_roots``
-    defaults to :func:`platform_sync_roots` for ``home``) so the classification
-    is a pure function of its inputs. The steps:
+    ``home`` / ``sync_roots`` and the mount inputs are injectable so the
+    classification is deterministic. Supply mount metadata one of two ways:
+
+    - ``mount_facts`` — a pre-probed closed :class:`MountFacts` (the **pure
+      boundary**: the application adapter runs the OS probe and hands the domain
+      a validated fact); or
+    - ``mount_probe`` — a :class:`MountProbe` the classifier calls inside a guard
+      that converts any exception into ``MOUNT_UNAVAILABLE`` (a convenience whose
+      failures never escape the hard gate).
+
+    **Mount metadata is required to reach ``normal``.** With neither supplied —
+    or with an unknown/invalid state, or a probe error — the mount is treated as
+    ``unavailable`` and a plain path fails closed to ``ambiguous`` rather than
+    ``normal`` (F3/F5). ``normal`` is reachable only on a positive ``local``
+    mount fact.
+
+    Steps:
 
     1. Resolve to a canonical, symlink-free directory identity. If that fails,
        return ``path_risk=ambiguous`` immediately (fail closed — never
-       ``normal`` on doubt). ``root_kind`` / ``adoption_marker`` cannot be
-       trusted for an unresolved identity, so they are reported as
-       ``non_git`` / ``absent`` placeholders alongside the ambiguous verdict.
+       ``normal`` on doubt).
     2. Classify ``root_kind`` from Git worktree **ancestry** of the canonical
        root (nested cwd + linked-worktree ``.git`` file both count).
-    3. Classify ``path_risk`` (home → path sync signal → mount metadata →
-       normal), consulting ``mount_probe`` when supplied.
+    3. Resolve mount facts fail-closed, then classify ``path_risk`` (home →
+       conflicting → path sync signal → unavailable → mount sync → local-normal).
     4. Classify ``adoption_marker`` from the ordered marker probe.
     """
     # Resolve ``home`` to the same canonical form as the root so the home
@@ -376,12 +460,14 @@ def classify_path_safety(
         if infer_git_worktree_root(canonical) is not None
         else ROOT_KIND_NON_GIT
     )
-    mount_facts = mount_probe.classify_mount(canonical) if mount_probe else None
+    resolved_mount = _resolve_mount_facts(
+        canonical, mount_facts=mount_facts, mount_probe=mount_probe
+    )
     path_risk, risk_notes = _classify_risk(
         canonical,
         home=home,
         sync_roots=resolved_sync_roots,
-        mount_facts=mount_facts,
+        mount_facts=resolved_mount,
     )
     adoption_marker = _classify_adoption(canonical)
 

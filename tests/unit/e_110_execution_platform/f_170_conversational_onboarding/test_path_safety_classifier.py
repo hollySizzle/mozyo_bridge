@@ -46,6 +46,18 @@ class _FakeMountProbe:
         return self._facts
 
 
+class _RaisingMountProbe:
+    """A MountProbe whose probe raises — must be caught, never escape."""
+
+    def classify_mount(self, path):  # noqa: ANN001 - Port shape
+        raise OSError("statfs failed")
+
+
+# A local-mount fact: the positive evidence a path needs to be classified normal
+# (mount metadata is required to reach `normal`; a missing probe is ambiguous).
+_LOCAL_FACTS = MountFacts(state=MOUNT_LOCAL, source="test")
+
+
 def _mk(base: Path, rel: str) -> None:
     target = base / rel
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -57,7 +69,9 @@ class PathSafetyRootKindTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "proj"
             (root / ".git").mkdir(parents=True)
-            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
+            safety = classify_path_safety(
+                root, home=Path(tmp) / "home", sync_roots=(), mount_facts=_LOCAL_FACTS
+            )
             self.assertEqual(safety.root_kind, ROOT_KIND_GIT)
             self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
 
@@ -106,11 +120,13 @@ class PathSafetyRiskTests(unittest.TestCase):
             safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
             self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
 
-    def test_normal_root_is_normal(self) -> None:
+    def test_normal_root_requires_local_mount_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "code" / "project"
             root.mkdir(parents=True)
-            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
+            safety = classify_path_safety(
+                root, home=Path(tmp) / "home", sync_roots=(), mount_facts=_LOCAL_FACTS
+            )
             self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
 
 
@@ -138,12 +154,17 @@ class PathSafetyAmbiguityTests(unittest.TestCase):
             self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
 
     def test_symlink_to_real_dir_resolves_and_is_not_ambiguous(self) -> None:
+        # A symlink to a real dir resolves cleanly (not symlink-identity
+        # ambiguity); with a local mount fact it classifies normal, proving the
+        # identity resolved rather than failing closed.
         with tempfile.TemporaryDirectory() as tmp:
             real = Path(tmp) / "real"
             real.mkdir()
             link = Path(tmp) / "link"
             os.symlink(real, link)
-            safety = classify_path_safety(link, home=Path(tmp) / "home", sync_roots=())
+            safety = classify_path_safety(
+                link, home=Path(tmp) / "home", sync_roots=(), mount_facts=_LOCAL_FACTS
+            )
             self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
             self.assertEqual(safety.root, real.resolve())
 
@@ -229,65 +250,97 @@ class GitAncestryTests(unittest.TestCase):
 
 
 class MountMetadataTests(unittest.TestCase):
-    """F1: mount metadata is a sync signal, and unavailable/conflicting → ambiguous."""
+    """F1/F3/F4/F5: mount metadata is required to reach normal, and the
+    undeterminable / unknown / error / conflicting cases all fail closed."""
 
-    def _classify(self, tmp, state):
-        root = Path(tmp) / "proj"
+    def _classify(self, tmp, *, probe=None, facts=None, rel="proj"):
+        root = Path(tmp) / rel
         root.mkdir(parents=True, exist_ok=True)
         return classify_path_safety(
             root,
             home=Path(tmp) / "home",
             sync_roots=(),
-            mount_probe=_FakeMountProbe(state),
+            mount_probe=probe,
+            mount_facts=facts,
         )
 
     def test_sync_cloud_mount_is_caution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            safety = self._classify(tmp, MOUNT_SYNC_CLOUD)
+            safety = self._classify(tmp, probe=_FakeMountProbe(MOUNT_SYNC_CLOUD))
             self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
 
     def test_network_mount_is_caution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            safety = self._classify(tmp, MOUNT_NETWORK)
+            safety = self._classify(tmp, probe=_FakeMountProbe(MOUNT_NETWORK))
             self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
 
-    def test_known_local_mount_is_normal(self) -> None:
+    def test_local_mount_is_normal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            safety = self._classify(tmp, MOUNT_LOCAL)
+            safety = self._classify(tmp, facts=_LOCAL_FACTS)
             self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
 
     def test_unavailable_metadata_is_ambiguous_not_normal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            safety = self._classify(tmp, MOUNT_UNAVAILABLE)
+            safety = self._classify(tmp, probe=_FakeMountProbe(MOUNT_UNAVAILABLE))
             self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
             self.assertTrue(safety.is_hard_block)
 
     def test_conflicting_metadata_is_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            safety = self._classify(tmp, MOUNT_CONFLICTING)
+            safety = self._classify(tmp, probe=_FakeMountProbe(MOUNT_CONFLICTING))
             self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
 
-    def test_path_prefix_signal_wins_over_local_mount(self) -> None:
-        # A provider-name path signal is authoritative sync even if the mount
-        # probe reports local (deliberate positive signal, not a conflict).
+    # --- F3: no probe / unknown state must NOT reach normal -------------------
+
+    def test_no_probe_is_ambiguous_not_normal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "Dropbox" / "project"
-            root.mkdir(parents=True)
-            safety = classify_path_safety(
-                root,
-                home=Path(tmp) / "home",
-                sync_roots=(),
-                mount_probe=_FakeMountProbe(MOUNT_LOCAL),
+            safety = self._classify(tmp)  # neither facts nor probe
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+            self.assertTrue(safety.is_hard_block)
+
+    def test_unknown_state_is_ambiguous_not_normal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, probe=_FakeMountProbe("typo_state"))
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+
+    # --- F5: probe exception must be caught, converted to ambiguous ----------
+
+    def test_probe_exception_is_ambiguous_not_escaped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, probe=_RaisingMountProbe())
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+            self.assertTrue(safety.is_hard_block)
+
+    # --- F4: conflicting outranks a positive path signal ---------------------
+
+    def test_provider_prefix_plus_conflicting_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(
+                tmp, probe=_FakeMountProbe(MOUNT_CONFLICTING), rel="Dropbox/project"
+            )
+            self.assertEqual(safety.path_risk, PATH_RISK_AMBIGUOUS)
+            self.assertTrue(safety.is_hard_block)
+
+    def test_provider_prefix_plus_local_is_caution(self) -> None:
+        # Allowed safe-side caution: a provider-name path with a local mount is
+        # still sync_or_cloud (the positive path signal wins over local).
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(tmp, facts=_LOCAL_FACTS, rel="Dropbox/project")
+            self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
+
+    def test_provider_prefix_survives_unavailable(self) -> None:
+        # unavailable (absence, not conflict) does not defeat a positive prefix.
+        with tempfile.TemporaryDirectory() as tmp:
+            safety = self._classify(
+                tmp, probe=_FakeMountProbe(MOUNT_UNAVAILABLE), rel="Dropbox/project"
             )
             self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
 
-    def test_no_probe_falls_back_to_path_signals(self) -> None:
-        # Backward-compatible: without a probe, a plain local path is normal.
+    def test_pure_mount_facts_input_is_honored(self) -> None:
+        # The pure boundary: an application-probed MountFacts passed directly.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "code"
-            root.mkdir()
-            safety = classify_path_safety(root, home=Path(tmp) / "home", sync_roots=())
-            self.assertEqual(safety.path_risk, PATH_RISK_NORMAL)
+            safety = self._classify(tmp, facts=MountFacts(state=MOUNT_SYNC_CLOUD))
+            self.assertEqual(safety.path_risk, PATH_RISK_SYNC_OR_CLOUD)
 
 
 class PlatformSyncRootsTests(unittest.TestCase):
