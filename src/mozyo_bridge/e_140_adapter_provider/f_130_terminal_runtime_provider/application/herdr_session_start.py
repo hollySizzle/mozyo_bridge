@@ -82,7 +82,7 @@ a running herdr 0.7.1::
 - ``--no-focus`` avoids stealing the operator's focus.
 - output is a single JSON object on stdout; the transient locator for rebind/read is
   ``result.agent.pane_id`` under a ``result.type == "agent_started"`` envelope
-  (:func:`_parse_started_locator`, fail-closed).
+  (:func:`herdr_lane_topology._parse_started_agent`, fail-closed).
 
 Tests exercise the argv + JSON parsing through an injected subprocess ``runner`` (no
 live herdr binary); the end-to-end live smoke stays the coordinator's post-review step.
@@ -105,7 +105,6 @@ if TYPE_CHECKING:
 
 from mozyo_bridge.core.state.workspace_registry import (
     _is_linked_worktree,
-    _main_worktree_root,
     read_anchor,
     register_workspace,
 )
@@ -146,11 +145,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
     _host_workspace_label,
+    _lane_live_slot_tabs,
     _launch_target_for_lane,
+    _parse_started_agent,
     _parse_tab_created,
     _parse_workspace_created,
     _tab_target_for_lane,
     _workspace_prefix,
+    herdr_workspace_segment,
 )
 from mozyo_bridge.shared.errors import die
 
@@ -243,40 +245,6 @@ class SessionStartResult:
         }
 
 
-def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> str:
-    """The mzb1 ``workspace`` segment for ``repo_root`` (Redmine #13377, design j#73613).
-
-    The single, read-only resolver every herdr identity site shares so mint-time
-    (:func:`prepare_session`) and resolve-time (send, retire, projection, lane
-    read-back) always agree:
-
-    - a **linked git worktree** (a sublane lane checkout) → the **main checkout's**
-      registry / anchor ``workspace_id`` (#13152 identity inheritance). Under the
-      shared project workspace model (#13377 Opt3, superseding the per-lane
-      ``wt_<hash>`` workspace of #13331 j#73357) a lane's agents live in the
-      project workspace as ``mzb1_<project-ws>_<role>_<lane>`` slots, so the
-      ``workspace`` segment is the project identity and the *lane* segment is the
-      discriminant. The legacy per-lane token (:func:`derive_lane_workspace_token`)
-      is no longer minted for new slots; it survives only as the compatibility key
-      for pre-#13377 rows (legacy resolve / retire) and as the lane metadata
-      record's stable per-worktree join key;
-    - otherwise (**standalone / main checkout**) → the registry / anchor
-      ``workspace_id``, read-only (no registration), byte-for-byte the prior
-      behaviour. ``""`` when no anchor resolves (the caller decides whether that is
-      fatal — :func:`prepare_session` fails closed; the resolve sites treat ``""``
-      as "not a resolvable workspace").
-    """
-    resolved = Path(repo_root).expanduser().resolve()
-    if _is_linked_worktree(resolved):
-        main_root = _main_worktree_root(resolved)
-        if main_root is None:
-            return ""
-        anchor = read_anchor(main_root)
-        return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
-    anchor = read_anchor(resolved)
-    return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
-
-
 def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
     raw = env.get(HERDR_BINARY_ENV)
     binary = raw.strip() if isinstance(raw, str) else ""
@@ -344,39 +312,6 @@ def _find_named_agent(
         for row in rows
         if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == assigned_name
     ]
-
-
-def _parse_started_locator(stdout: object) -> Optional[str]:
-    """Read the live pane locator from a herdr ``agent start`` payload (fail-closed).
-
-    Real herdr 0.7.1 output (coordinator-measured): a single JSON object
-
-        {"id": "cli:agent:start",
-         "result": {"agent": {"pane_id": "w1:p2", "name": "...", ...},
-                    "argv": [...], "type": "agent_started"}}
-
-    The transient locator is ``result.agent.pane_id``. Returns ``None`` (so the
-    caller fails closed) when the payload is not JSON, ``result.type`` is not
-    ``agent_started``, or the ``pane_id`` is missing / blank — never a blank handle.
-    """
-    if not isinstance(stdout, str):
-        return None
-    try:
-        payload = json.loads(stdout)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    result = payload.get("result")
-    if not isinstance(result, Mapping):
-        return None
-    if _norm(result.get("type")) != "agent_started":
-        return None
-    agent = result.get("agent")
-    if not isinstance(agent, Mapping):
-        return None
-    locator = _norm(agent.get("pane_id"))
-    return locator or None
 
 
 def _lane_id_from_metadata(resolved_root: Path) -> str:
@@ -696,17 +631,27 @@ def prepare_session(
     # SAME tab). When nothing pins a tab, mint one explicitly ONLY for a FRESH lane
     # (no own live/adopted slots) — labelled with the lane key (cosmetic) so its
     # empty root pane is a known handle to reclaim. A heal of a legacy pre-#13411
-    # lane whose live slots are LOOSE panes (adopts present, no tab pinned) launches
-    # loose too, keeping the pair together (it migrates to a tab on a full relaunch,
-    # the #13380 cohabiting precedent). The default lane never uses a tab, so the
-    # coordinator path stays byte-invariant.
+    # lane whose live slots are LOOSE panes (own slots present, no tab pinned)
+    # launches loose too, keeping the pair together (it migrates to a tab on a full
+    # relaunch, the #13380 cohabiting precedent). The default lane never uses a tab,
+    # so the coordinator path stays byte-invariant.
+    #
+    # The fresh-vs-loose decision keys on the lane's WHOLE live inventory in the
+    # target workspace (`_lane_live_slot_tabs`), NOT this run's requested `plans`
+    # (review j#74433 finding 1): a single-provider heal requests only one provider,
+    # so the lane's OTHER live slot is in the inventory but never in `plans` —
+    # counting requested adopts alone would mint a fresh tab for a live loose sibling
+    # (splitting the pair).
     target_tab = ""
+    lane_slot_tabs: list = []
     if launch_plans and result.lane_id != DEFAULT_LANE:
+        lane_slot_tabs = _lane_live_slot_tabs(
+            rows, workspace_id, target_workspace, result.lane_id
+        )
         target_tab = _tab_target_for_lane(
             rows, workspace_id, target_workspace, result.lane_id
         )
-        lane_has_own_slots = any(p.kind == "adopt" for p in plans)
-        if not target_tab and not lane_has_own_slots:
+        if not target_tab and not lane_slot_tabs:
             target_tab, tab_pane_id = _create_tab(
                 binary, target_workspace, runner, timeout, env, label=result.lane_id
             )
@@ -720,11 +665,16 @@ def prepare_session(
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
 
     # Split placement inside the lane tab (Redmine #13411): the first slot to land
-    # in a tab occupies it; every subsequent slot — the second of a fresh pair, or
-    # a healing launch beside an already-live sibling — is placed with `--split
-    # right`. The tab starts occupied by this lane's already-adopted slots (which
-    # pinned it), so a mixed adopt+launch splits the launch beside the adopt.
-    tab_occupancy = sum(1 for p in plans if p.kind == "adopt") if target_tab else 0
+    # in a tab occupies it; every subsequent slot — the second of a fresh pair, or a
+    # healing launch beside an already-live sibling — is placed with `--split right`.
+    # The tab starts occupied by this lane's live slots ALREADY IN target_tab, read
+    # from the whole inventory (review j#74433 finding 1) — not just this run's
+    # requested adopts — so a single-provider heal beside a live tabbed sibling still
+    # splits. A freshly minted tab has no such slots, so its first launch does not
+    # split and its second does.
+    tab_occupancy = (
+        sum(1 for tab in lane_slot_tabs if tab == target_tab) if target_tab else 0
+    )
 
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into
     # the resolved target workspace/tab). A launch failure raises here, before reclaim.
@@ -885,12 +835,18 @@ def _execute_slot(
         timeout,
         env=dict(env),
     )
-    locator = _parse_started_locator(started.stdout)
-    if not locator or not valid_target(locator):
+    started_agent = _parse_started_agent(started.stdout)
+    if started_agent is None:
         raise HerdrSessionStartError(
             f"herdr agent start for {plan.provider!r} returned no usable live locator "
             "(expected result.agent.pane_id in an agent_started payload); refuse to "
             "return a blank handle"
+        )
+    locator, landed_tab = started_agent
+    if not valid_target(locator):
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} returned an invalid live locator "
+            f"{locator!r}; refuse to return a malformed handle"
         )
     # Verify the launch actually landed in the requested workspace (Redmine #13330
     # review j#73231). Passing `--workspace` is what keeps herdr from auto-creating a
@@ -906,6 +862,22 @@ def _execute_slot(
             f"{landed or '<none>'!r} but --workspace {target_workspace!r} was requested; "
             "refuse to trust a mislocated launch (herdr may have auto-created another "
             "workspace with its own base pane)"
+        )
+    # Verify the launch actually landed in the requested TAB (Redmine #13411 review
+    # j#74434 finding 2) — the tab-axis analogue of the workspace guard above. When
+    # a lane tab is requested (`--tab`, non-default lane), the `agent_started`
+    # envelope returns the landed `tab_id` (live probe #13411 j#74434); if herdr
+    # ignored / misplaced `--tab` and landed in a DIFFERENT tab of the same
+    # workspace, trusting it would leave the pair split and let us reclaim this run's
+    # tab root pane against a mislocated launch. A missing tab id is equally
+    # unverifiable, so both fail closed before any reclaim. The default lane passes
+    # no `target_tab`, so this guard is skipped and its behaviour is byte-invariant.
+    if target_tab and landed_tab != target_tab:
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} landed in tab "
+            f"{landed_tab or '<none>'!r} but --tab {target_tab!r} was requested; "
+            "refuse to trust a mislocated launch (the gateway/worker pair must "
+            "share one dedicated lane tab)"
         )
     return SlotResult(
         provider=plan.provider,

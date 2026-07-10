@@ -192,6 +192,11 @@ class FakeHerdr:
         # --- one-shot fail-closed injection state (design §2.1 stimuli) ---------
         self._misplace_next: Optional[str] = None
         self._drop_next_locator = False
+        #: Tab-axis stimuli (Redmine #13411): make the next ``agent start`` report a
+        #: DIFFERENT tab than requested (misplacement), or NO tab (missing), so the
+        #: real code's tab-landing guard fails closed. One-shot, cleared after use.
+        self._misplace_next_tab: Optional[str] = None
+        self._drop_next_tab = False
         #: Extra rows spliced verbatim into the next ``agent list`` payload (a
         #: malformed-row / recognised-empty injection face). Cleared after use.
         self.extra_list_rows: list = []
@@ -259,6 +264,25 @@ class FakeHerdr:
         deciding the outcome.
         """
         self._drop_next_locator = True
+
+    def misplace_next_tab(self, tab_id: str) -> None:
+        """Make the next ``agent start`` report landing in ``tab_id`` (Redmine #13411).
+
+        Reproduces herdr ignoring / misplacing ``--tab`` (landing in a different tab
+        of the same workspace) so the real code's tab-landing guard fails closed
+        (review j#74434 finding 2). The fake renders the mislocated tab; the real
+        code renders the verdict.
+        """
+        self._misplace_next_tab = tab_id
+
+    def drop_next_tab(self) -> None:
+        """Make the next ``agent start`` report NO ``tab_id`` (Redmine #13411).
+
+        Reproduces an ``agent_started`` envelope with no tab (herdr dropped the
+        placement) so the real code cannot verify the requested lane tab and fails
+        closed rather than trusting an unverifiable launch.
+        """
+        self._drop_next_tab = True
 
     def arm_transition(self, target: str, to_status: str) -> None:
         """Pre-arm a status *change into* ``to_status`` for ``target`` (FIFO).
@@ -403,6 +427,16 @@ class FakeHerdr:
         elif self._misplace_next is not None:
             rendered_locator = f"{self._misplace_next}:p1"
             self._misplace_next = None
+        # Tab-axis rendering (Redmine #13411): live 0.7.1 `agent_started` returns the
+        # landed `workspace_id` / `tab_id` alongside `pane_id`. Echo the requested tab
+        # (faithful placement) unless a misplacement / missing-tab stimulus is armed.
+        rendered_tab = parsed.tab_id
+        if self._drop_next_tab:
+            self._drop_next_tab = False
+            rendered_tab = ""
+        elif self._misplace_next_tab is not None:
+            rendered_tab = self._misplace_next_tab
+            self._misplace_next_tab = None
         return _ok(
             argv,
             {
@@ -411,6 +445,8 @@ class FakeHerdr:
                     "agent": {
                         "name": parsed.name,
                         "pane_id": rendered_locator,
+                        "workspace_id": ws.workspace_id,
+                        "tab_id": rendered_tab,
                         "argv": parsed.launch_argv,
                     },
                     "type": "agent_started",

@@ -65,6 +65,7 @@ class _Herdr:
         created_workspace="wZ",
         created_tab=None,
         tab_bad_payload=False,
+        start_tab=None,
         start_fails=False,
         close_fails=False,
     ):
@@ -79,6 +80,11 @@ class _Herdr:
         # real code fails closed (the tab analogue of a malformed workspace create).
         self.created_tab = created_tab
         self.tab_bad_payload = tab_bad_payload
+        # Landed tab reported by `agent start` (Redmine #13411 review j#74434 finding
+        # 2): `None` echoes the requested `--tab` (faithful placement); a string
+        # (incl. "") forces that landed tab, driving the misplacement / missing-tab
+        # fail-closed guard.
+        self.start_tab = start_tab
         self.start_fails = start_fails
         self.close_fails = close_fails
         self.calls: list = []
@@ -152,14 +158,17 @@ class _Herdr:
                 return subprocess.CompletedProcess(
                     argv, 1, stdout="", stderr="agent start refused"
                 )
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
             if self.start_locator is not None:
                 pane_id = self.start_locator
-            elif "--workspace" in rest:
+            elif wid:
                 # Land in the requested workspace with a distinct pane per launch.
-                wid = rest[rest.index("--workspace") + 1]
                 pane_id = f"{wid}:p{len(self.start_argvs) + 1}"
             else:
                 pane_id = "w1:pNEW"
+            # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
+            requested_tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+            landed_tab = self.start_tab if self.start_tab is not None else requested_tab
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -170,6 +179,8 @@ class _Herdr:
                             "agent": {
                                 "name": rest[2],
                                 "pane_id": pane_id,
+                                "workspace_id": wid,
+                                "tab_id": landed_tab,
                                 "agent_status": "unknown",
                             },
                             "argv": rest,
@@ -1355,6 +1366,114 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertTrue(result.tab_pane_detail)
         self.assertTrue(all(s.outcome == SLOT_LAUNCHED for s in result.slots))
 
+    def _heal_prepare(self, tmp, *, existing_rows, providers, lane="lane-1"):
+        """Register a repo and run prepare_session against a seeded live inventory."""
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            herdr = _Herdr(existing_rows=existing_rows(ws))
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env={HERDR_ENV: str(binpath)},
+                runner=herdr.run,
+            )
+        return result, herdr
+
+    def test_single_provider_heal_into_tabbed_sibling_splits(self) -> None:
+        # Review j#74433 finding 1: a SINGLE-provider heal (only claude requested)
+        # must see the lane's live codex sibling in the inventory — even though codex
+        # is not in this run's requested plans — and split claude beside it in the
+        # SAME tab, never dropping `--split right`.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._heal_prepare(
+                tmp,
+                existing_rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",
+                        "tab_id": "w5:t3",
+                    }
+                ],
+                providers=["claude"],
+            )
+        self.assertEqual(herdr.tab_creates, [])  # rejoin, never a fresh tab
+        self.assertEqual(len(herdr.start_argvs), 1)
+        claude_argv = herdr.start_argvs[0]
+        self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        self.assertEqual(result.herdr_tab_id, "w5:t3")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_single_provider_heal_legacy_loose_stays_loose(self) -> None:
+        # Review j#74433 finding 1 (loose case): a SINGLE-provider heal where the
+        # live sibling is a loose pre-#13411 pane (no tab_id) must stay loose — never
+        # mint a fresh tab that splits the pair — because the inventory shows a live
+        # own slot even though this run's plans hold no adopt.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, herdr = self._heal_prepare(
+                tmp,
+                existing_rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "lane-1"),
+                        "pane_id": "w5:pC",  # loose: no tab_id
+                    }
+                ],
+                providers=["claude"],
+            )
+        self.assertEqual(herdr.tab_creates, [])  # no fresh tab — pair stays together
+        claude_argv = herdr.start_argvs[0]
+        self.assertNotIn("--tab", claude_argv)
+        self.assertEqual(result.herdr_tab_id, "")
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_mislocated_tab_launch_fails_closed(self) -> None:
+        # Review j#74434 finding 2: if herdr lands the launch in a DIFFERENT tab than
+        # `--tab` requested, the returned `tab_id` mismatch fails closed before any
+        # reclaim — the tab-axis analogue of the #13330 workspace-landing guard.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1", start_tab="wZ:t9")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._prepare(
+                    tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+                )
+        self.assertIn("--tab", str(ctx.exception))
+        self.assertEqual(herdr.pane_closes, [])  # nothing reclaimed (raised first)
+
+    def test_missing_tab_in_start_payload_fails_closed(self) -> None:
+        # Review j#74434 finding 2: an `agent_started` envelope with no tab id is
+        # equally unverifiable against the requested lane tab, so it fails closed.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1", start_tab="")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                self._prepare(
+                    tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+                )
+        self.assertIn("--tab", str(ctx.exception))
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_default_lane_skips_tab_landing_guard(self) -> None:
+        # The tab-landing guard is scoped to non-default lanes (which pass `--tab`).
+        # The default lane passes no `--tab`, so even a fake reporting no tab_id
+        # launches fine — byte-invariant.
+        herdr = _Herdr(created_workspace="wZ", start_tab="")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+            )
+        self.assertTrue(all(s.outcome == SLOT_LAUNCHED for s in result.slots))
+        self.assertEqual(result.herdr_tab_id, "")
+
     def test_multi_lane_shares_one_host_with_a_tab_each(self) -> None:
         # End-to-end through the shared FakeHerdr (real tab lifecycle): two lanes
         # land in ONE host workspace, each in its OWN tab with a split pair — the
@@ -1392,6 +1511,31 @@ class LaneTabSubdivisionTest(unittest.TestCase):
             self.assertEqual(len(in_tab), 2)  # gateway + worker split pair
         # The base + tab root panes were reclaimed: only the 4 agent panes remain.
         self.assertEqual(len(fake.panes_of(host)), 4)
+
+    def test_shared_fake_tab_misplacement_stimulus_fails_closed(self) -> None:
+        # The shared FakeHerdr's tab-misplacement stimulus (Redmine #13411 review
+        # j#74434) drives the real code's landing guard: the fake reports a tab
+        # other than requested, and prepare_session fails closed.
+        fake = FakeHerdr()
+        fake.misplace_next_tab("w1:t9")  # next agent start reports a foreign tab
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError) as ctx:
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex", "claude"],
+                        lane_id="lane-a",
+                        env={HERDR_ENV: str(binpath)},
+                        runner=fake.run,
+                    )
+        self.assertIn("--tab", str(ctx.exception))
 
     def test_tab_target_for_lane_placement_rules(self) -> None:
         # Pure decision function (Redmine #13411): own tab pins first, multi-tab

@@ -33,7 +33,11 @@ import json
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.core.state.workspace_registry import _main_worktree_root
+from mozyo_bridge.core.state.workspace_registry import (
+    _is_linked_worktree,
+    _main_worktree_root,
+    read_anchor,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -53,6 +57,40 @@ AGENT_KEY_TAB = "tab_id"
 
 class HerdrSessionStartError(ValueError):
     """A herdr session-start step cannot proceed (fail-closed)."""
+
+
+def herdr_workspace_segment(repo_root: Path, *, home: Optional[Path] = None) -> str:
+    """The mzb1 ``workspace`` segment for ``repo_root`` (Redmine #13377, design j#73613).
+
+    The single, read-only resolver every herdr identity site shares so mint-time
+    (:func:`prepare_session`) and resolve-time (send, retire, projection, lane
+    read-back) always agree:
+
+    - a **linked git worktree** (a sublane lane checkout) → the **main checkout's**
+      registry / anchor ``workspace_id`` (#13152 identity inheritance). Under the
+      shared project workspace model (#13377 Opt3, superseding the per-lane
+      ``wt_<hash>`` workspace of #13331 j#73357) a lane's agents live in the
+      project workspace as ``mzb1_<project-ws>_<role>_<lane>`` slots, so the
+      ``workspace`` segment is the project identity and the *lane* segment is the
+      discriminant. The legacy per-lane token (:func:`derive_lane_workspace_token`)
+      is no longer minted for new slots; it survives only as the compatibility key
+      for pre-#13377 rows (legacy resolve / retire) and as the lane metadata
+      record's stable per-worktree join key;
+    - otherwise (**standalone / main checkout**) → the registry / anchor
+      ``workspace_id``, read-only (no registration), byte-for-byte the prior
+      behaviour. ``""`` when no anchor resolves (the caller decides whether that is
+      fatal — :func:`prepare_session` fails closed; the resolve sites treat ``""``
+      as "not a resolvable workspace").
+    """
+    resolved = Path(repo_root).expanduser().resolve()
+    if _is_linked_worktree(resolved):
+        main_root = _main_worktree_root(resolved)
+        if main_root is None:
+            return ""
+        anchor = read_anchor(main_root)
+        return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
+    anchor = read_anchor(resolved)
+    return _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
 
 
 def _workspace_prefix(locator: str) -> str:
@@ -169,6 +207,47 @@ def _launch_target_for_lane(
     return next(iter(host_prefixes)) if host_prefixes else ""
 
 
+def _lane_live_slot_tabs(
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    target_workspace: str,
+    lane_id: str,
+) -> list:
+    """Tab ids of every same-lane live slot located in ``target_workspace``.
+
+    The inventory basis for the fresh-vs-loose and tab-occupancy decisions
+    (Redmine #13411 review j#74433 finding 1). A single-provider heal requests only
+    ONE provider, so the lane's OTHER live slot is present in the inventory (``rows``)
+    but never in this run's requested ``plans``; counting requested adopts alone
+    would miss it and (a) drop the ``--split right`` a heal beside a live tabbed
+    sibling needs, and (b) mint a fresh tab for a loose legacy sibling, splitting the
+    pair. Reading the whole lane's live slots from ``rows`` fixes both.
+
+    Each element is the slot's ``tab_id`` (``""`` for a loose pre-#13411 pane). Only
+    slots whose locator is in ``target_workspace`` are counted (a lane's legacy slot
+    cohabiting a different herdr workspace drains via retire, the #13380 axis).
+    ``workspace_id`` is the mozyo identity segment; ``target_workspace`` is the
+    resolved herdr terminal workspace.
+    """
+    lane = _norm(lane_id) or DEFAULT_LANE
+    tabs: list = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        if decode.identity.workspace_id != workspace_id:
+            continue
+        if (decode.identity.lane_id or DEFAULT_LANE) != lane:
+            continue
+        locator = _agent_locator(row)
+        if not locator or _workspace_prefix(locator) != target_workspace:
+            continue
+        tabs.append(_tab_id_of_row(row))
+    return tabs
+
+
 def _tab_target_for_lane(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
@@ -199,23 +278,11 @@ def _tab_target_for_lane(
     resolved herdr terminal workspace the launches join.
     """
     lane = _norm(lane_id) or DEFAULT_LANE
-    own_tabs: set = set()
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decode.ok or decode.identity is None:
-            continue
-        if decode.identity.workspace_id != workspace_id:
-            continue
-        if (decode.identity.lane_id or DEFAULT_LANE) != lane:
-            continue
-        locator = _agent_locator(row)
-        if not locator or _workspace_prefix(locator) != target_workspace:
-            continue
-        tab = _tab_id_of_row(row)
-        if tab:
-            own_tabs.add(tab)
+    own_tabs = {
+        tab
+        for tab in _lane_live_slot_tabs(rows, workspace_id, target_workspace, lane_id)
+        if tab
+    }
     if len(own_tabs) > 1:
         raise HerdrSessionStartError(
             f"live slots of lane {lane!r} occupy multiple herdr tabs "
@@ -283,6 +350,45 @@ def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
     return workspace_id, root_pane_id
 
 
+def _parse_started_agent(stdout: object) -> Optional[tuple[str, str]]:
+    """``(pane_id, tab_id)`` from a herdr ``agent start`` payload (fail-closed).
+
+    Live herdr 0.7.1 output (coordinator-measured / probe #13411 j#74434): a single
+    JSON object whose ``result.agent`` carries the transient ``pane_id`` locator and,
+    for a tabbed launch, the landed ``tab_id`` alongside it::
+
+        {"result": {"type": "agent_started",
+                    "agent": {"pane_id": "w1:p2", "workspace_id": "w1",
+                              "tab_id": "w1:t1", "name": "..."}}}
+
+    Returns ``(pane_id, tab_id)`` — ``tab_id`` is ``""`` when the launch carried no
+    tab (a default-lane launch, or a payload that omits it). Returns ``None`` (so the
+    caller fails closed with "no usable live locator") when the payload is not JSON,
+    ``result.type`` is not ``agent_started``, or the ``pane_id`` is missing / blank —
+    never a blank handle. The caller separately verifies the landed workspace / tab.
+    """
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    if _norm(result.get("type")) != "agent_started":
+        return None
+    agent = result.get("agent")
+    if not isinstance(agent, Mapping):
+        return None
+    pane_id = _norm(agent.get("pane_id"))
+    if not pane_id:
+        return None
+    return pane_id, _norm(agent.get("tab_id"))
+
+
 def _parse_tab_created(stdout: object) -> Optional[tuple[str, str]]:
     """``(tab_id, root_pane_id)`` from a herdr ``tab create`` payload (fail-closed).
 
@@ -328,10 +434,13 @@ __all__ = (
     "AGENT_KEY_TAB",
     "HerdrSessionStartError",
     "_host_workspace_label",
+    "_lane_live_slot_tabs",
     "_launch_target_for_lane",
+    "_parse_started_agent",
     "_parse_tab_created",
     "_parse_workspace_created",
     "_tab_id_of_row",
     "_tab_target_for_lane",
     "_workspace_prefix",
+    "herdr_workspace_segment",
 )

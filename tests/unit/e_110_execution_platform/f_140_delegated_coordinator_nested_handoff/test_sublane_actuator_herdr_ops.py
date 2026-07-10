@@ -132,7 +132,14 @@ class _StatefulHerdr:
                 stdout=json.dumps(
                     {
                         "result": {
-                            "agent": {"name": name, "pane_id": pane_id},
+                            "agent": {
+                                "name": name,
+                                "pane_id": pane_id,
+                                "workspace_id": wid,
+                                # #13411: echo the requested tab so the landing guard
+                                # (returned tab_id == --tab) passes on the happy path.
+                                "tab_id": tab_id,
+                            },
                             "type": "agent_started",
                         }
                     }
