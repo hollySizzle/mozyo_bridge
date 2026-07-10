@@ -11,8 +11,9 @@ only performs the provider-owned CLI mechanics + JSON parsing, so the dependency
 points provider -> core.
 
 It deliberately reuses the #13245 transport adapter's plumbing rather than
-duplicating it: the trusted-environment binary resolver (:func:`_resolve_binary`,
-including the ``MOZYO_HERDR_BINARY`` / PATH-key fail-closed rules), the injected
+duplicating it: the shared trusted-environment binary resolver
+(:func:`resolve_herdr_binary`, the ``MOZYO_HERDR_BINARY`` → trusted-PATH ``herdr``
+fail-closed order), the injected
 :data:`Runner` shape, the command timeout, and the bounded-detail helper all
 come from :mod:`...infrastructure.herdr_transport`. The binary a checkout can
 cause mozyo to spawn is therefore pinned by the trusted environment exactly as
@@ -47,7 +48,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     REASON_BINARY_NOT_FOUND,
-    REASON_BINARY_UNCONFIGURED,
     REASON_INVALID_PAYLOAD,
     REASON_INVALID_TARGET,
     REASON_TRANSPORT_ERROR,
@@ -57,10 +57,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
-    HERDR_BINARY_ENV,
     Runner,
     _bounded_detail,
-    _resolve_binary,
+    resolve_herdr_binary,
 )
 
 # The herdr JSON keys a status token may live under (defensive: the exact
@@ -353,13 +352,13 @@ def resolve_agent_state_reader(
     """Resolve the built-in herdr agent-state reader for ``config``, or ``None``.
 
     Rides on the same default-off backend selection and trusted-environment
-    binary resolution as the transport resolver (#13245), reusing
-    :func:`_resolve_binary` so the two never drift. Fail-closed selection
-    semantics (no silent fallback to tmux):
+    binary resolution as the transport resolver (#13245), sharing the single
+    :func:`resolve_herdr_binary` so the resolution order never drifts. Fail-closed
+    selection semantics (no silent fallback to tmux):
 
     - the default / tmux backend returns ``None`` — herdr is off;
-    - the herdr backend with no :data:`HERDR_BINARY_ENV` in the trusted
-      environment raises :class:`TerminalTransportError` (``binary_unconfigured``);
+    - the herdr backend with no :data:`HERDR_BINARY_ENV` and no trusted-PATH
+      ``herdr`` raises :class:`TerminalTransportError` (``binary_unconfigured``);
     - the herdr backend with a configured but unresolvable binary raises
       :class:`TerminalTransportError` (``binary_not_found``);
     - the herdr backend with a resolvable binary returns a
@@ -370,24 +369,8 @@ def resolve_agent_state_reader(
     if not config.herdr_enabled:
         return None
     source_env = env if env is not None else os.environ
-    raw = source_env.get(HERDR_BINARY_ENV)
-    binary = raw.strip() if isinstance(raw, str) else ""
-    if not binary:
-        raise TerminalTransportError(
-            f"terminal transport backend 'herdr' is selected but no herdr binary "
-            f"is configured in the trusted environment ({HERDR_BINARY_ENV}); refusing "
-            f"to fall back to tmux",
-            reason=REASON_BINARY_UNCONFIGURED,
-        )
-    resolved = _resolve_binary(binary, source_env)
-    if resolved is None:
-        raise TerminalTransportError(
-            f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
-            f"executable file or on the trusted environment PATH; refusing to fall "
-            f"back to tmux",
-            reason=REASON_BINARY_NOT_FOUND,
-        )
-    return HerdrCliAgentStateReader(resolved, runner=runner)
+    resolution = resolve_herdr_binary(source_env)
+    return HerdrCliAgentStateReader(resolution.path, runner=runner)
 
 
 __all__ = (
