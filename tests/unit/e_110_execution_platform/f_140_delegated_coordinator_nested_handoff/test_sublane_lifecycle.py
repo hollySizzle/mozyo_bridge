@@ -57,6 +57,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     project_sublanes,
     redact_worktree_paths,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    LANE_BASIS_COORDINATOR_DEFAULT,
+    LANE_BASIS_SENDER_SAME_LANE,
+    SenderIdentity,
+    derive_target_lane,
+    resolve_target_role,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    DEFAULT_LANE,
+)
 
 # Redmine #13368: synthetic host-local absolute worktree path. Uses a `/workspace`
 # prefix (never a real home path) per the tracked-file no-home-literal convention
@@ -390,6 +400,53 @@ class ResolvedUpstreamCoordinatorTests(unittest.TestCase):
         # #13476 Boundary: the OSS default must not hard-code a physical pane id.
         self.assertEqual(DEFAULT_UPSTREAM_COORDINATOR_ROUTE, "coordinator")
         self.assertNotIn("%", DEFAULT_UPSTREAM_COORDINATOR_ROUTE)
+
+
+class UpstreamCoordinatorHerdrRouteTests(unittest.TestCase):
+    """#13476 Review j#74511 Finding 1: pin the default token against the REAL herdr
+    route authority the active backend consumes, so the coordinator-route identity is
+    verified end-to-end (not just asserted as a string) and the same-lane misroute
+    mechanism the finding identified stays visible to any future change.
+    """
+
+    def _sublane_sender(self):
+        # A sublane gateway/worker: a real (non-default) lane id.
+        return SenderIdentity(
+            workspace_id="ws1", role="codex", lane_id="issue_13476_x"
+        )
+
+    def test_token_derives_the_default_lane_coordinator_from_a_sublane(self):
+        # The default token, fed through the herdr lane authority as the receiver,
+        # derives the workspace DEFAULT lane (the parent coordinator), never the
+        # sender's own sublane. This is the routable coordinator identity.
+        deriv = derive_target_lane(
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE, self._sublane_sender()
+        )
+        self.assertEqual(deriv.lane, DEFAULT_LANE)
+        self.assertEqual(deriv.basis, LANE_BASIS_COORDINATOR_DEFAULT)
+
+    def test_bare_codex_receiver_from_a_sublane_derives_same_lane(self):
+        # The finding's misroute mechanism, pinned so it cannot silently "fix" itself:
+        # a bare `--to codex` from a sublane derives the sender's OWN lane (the herdr
+        # rail keys lane off the `--to` receiver, not `--target coordinator`). This is
+        # why the documented `--to codex --target coordinator` callback FORM misroutes
+        # under herdr — a routing-authority concern outside this lifecycle leaf.
+        deriv = derive_target_lane("codex", self._sublane_sender())
+        self.assertEqual(deriv.lane, "issue_13476_x")
+        self.assertEqual(deriv.basis, LANE_BASIS_SENDER_SAME_LANE)
+
+    def test_token_resolves_the_coordinator_provider_role(self):
+        role = resolve_target_role(
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE, coordinator_provider="codex"
+        )
+        self.assertTrue(role.ok)
+        self.assertEqual(role.role, "codex")
+
+    def test_explicit_upstream_coordinator_preserved_end_to_end(self):
+        # An explicit override is carried verbatim into the profile field / dispatch
+        # (never rewritten to the default token) across the same resolver surface.
+        req = _req(upstream_coordinator="%9")
+        self.assertEqual(req.resolved_upstream_coordinator(), "%9")
 
 
 class MissingFieldsTests(unittest.TestCase):

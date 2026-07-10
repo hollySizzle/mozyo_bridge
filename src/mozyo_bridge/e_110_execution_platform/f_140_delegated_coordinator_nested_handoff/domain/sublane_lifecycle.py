@@ -546,16 +546,29 @@ CREATE_BLOCKED = "blocked"
 
 CREATE_STATES = frozenset({CREATE_PLANNED, CREATE_BLOCKED})
 
-#: The stable-route callback token a dispatch defaults its ``upstream_coordinator``
-#: profile field to when the operator omits ``--upstream-coordinator`` (Redmine
-#: #13476). It is the ``--target coordinator`` pseudo-target — the workspace-scoped,
-#: fail-closed resolver that binds to the sender workspace's main-lane coordinator
-#: Codex (pane_resolver ``COORDINATOR_LABEL`` / role->provider binding, #12015 /
-#: #12673). Using the stable route token (not a hand-invented literal like
-#: ``<coordinator-pane>``) keeps the gateway's callback route resolvable without an
-#: operator edit, and — being a route token rather than a physical ``%pane`` id —
-#: carries no host-specific identity into the OSS default. An explicit
-#: ``--upstream-coordinator`` value always wins.
+#: The backend-neutral coordinator-route IDENTITY a dispatch defaults its
+#: ``upstream_coordinator`` role-profile field to when the operator omits
+#: ``--upstream-coordinator`` (Redmine #13476). The literal ``"coordinator"`` is the
+#: single token BOTH backends' route authorities recognise as the workspace parent
+#: coordinator: the tmux pane resolver (``pane_resolver.COORDINATOR_LABEL``, a
+#: ``--target coordinator`` pseudo-target) and the herdr route authority
+#: (``herdr_target_resolution.RECEIVER_COORDINATOR`` — a ``coordinator`` receiver
+#: derives the workspace DEFAULT lane, tier 3, and resolves the coordinator provider
+#: via the role->provider binding, #12015 / #12673 / #13305). It is a route identity,
+#: never a physical ``%pane`` id, so it carries no host-specific identity into the OSS
+#: default. An explicit ``--upstream-coordinator`` value always wins.
+#:
+#: IMPORTANT (Redmine #13476 Review j#74511, Finding 1): this token names the
+#: coordinator route *identity*; it does NOT by itself make the gateway's *callback*
+#: land on the parent coordinator under every backend. Under herdr the send rail
+#: derives the target lane from the ``--to`` receiver, so a bare ``--to codex`` from a
+#: sublane derives the sender's OWN lane (tier-2 same-lane); only the ``coordinator``
+#: receiver / an explicit default-lane derives the parent. Whether the documented
+#: gateway->coordinator callback FORM (`--to codex --target coordinator`) is consumed
+#: correctly on the herdr rail is a routing-authority concern owned outside this
+#: lifecycle leaf (the pseudo-target is a tmux pane-resolver construct the herdr rail
+#: does not currently consume). This default supplies the correct identity; the
+#: callback-form routing is tracked separately.
 DEFAULT_UPSTREAM_COORDINATOR_ROUTE = "coordinator"
 
 
