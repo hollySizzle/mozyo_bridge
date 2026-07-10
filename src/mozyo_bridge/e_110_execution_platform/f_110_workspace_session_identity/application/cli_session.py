@@ -126,6 +126,25 @@ def register(sub) -> None:
         help="Latest Redmine journal id on the issue (the anchor to read first).",
     )
     session_boundary.add_argument(
+        "--issue-subject",
+        dest="issue_subject",
+        required=True,
+        help=(
+            "Short issue subject so the prompt renders `#<id> <short subject>` "
+            "instead of a bare id. Must be non-empty (Redmine #13479)."
+        ),
+    )
+    session_boundary.add_argument(
+        "--issue-role",
+        dest="issue_role",
+        required=True,
+        help=(
+            "What the issue is (e.g. smoke本番 / pre-smoke再検証 / metadata "
+            "cleanup / operator decision) so a fresh session cannot misread its "
+            "purpose. Must be non-empty (Redmine #13479)."
+        ),
+    )
+    session_boundary.add_argument(
         "--parent", help="Parent UserStory issue id, when the active issue is a child Task."
     )
     session_boundary.add_argument(

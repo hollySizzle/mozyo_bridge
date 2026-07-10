@@ -84,6 +84,8 @@ class BoundaryPromptTests(unittest.TestCase):
             issue="12122",
             journal="59709",
             repo_pointer="mozyo-giken-3800-mozyo-bridge",
+            issue_subject="session boundary UX",
+            issue_role="implementation",
             parent_issue="12113",
             commit="abc1234",
             target_lane="issue_12122_session_boundary_ux",
@@ -100,6 +102,10 @@ class BoundaryPromptTests(unittest.TestCase):
     def test_prompt_carries_all_anchor_fields(self) -> None:
         text = build_boundary_prompt(self._full_prompt())
         self.assertIn("#12122 j#59709", text)
+        # Subject renders next to the id (`#<id> <short subject>`), never a
+        # bare id; the role sits adjacent so the purpose is unambiguous.
+        self.assertIn("#12122 session boundary UX", text)
+        self.assertIn("Role: implementation", text)
         self.assertIn("parent US `#12113`", text)
         self.assertIn("abc1234", text)
         self.assertIn("issue_12122_session_boundary_ux", text)
@@ -111,31 +117,84 @@ class BoundaryPromptTests(unittest.TestCase):
         self.assertIn("gate_transition", text)
         self.assertIn("read it from the source-of-truth system", text)
 
-    def test_minimal_prompt_only_requires_issue_and_journal(self) -> None:
+    def test_minimal_prompt_requires_anchor_subject_and_role(self) -> None:
         text = build_boundary_prompt(
-            BoundaryPrompt(issue="1", journal="2", repo_pointer="proj")
+            BoundaryPrompt(
+                issue="1",
+                journal="2",
+                repo_pointer="proj",
+                issue_subject="tidy up",
+                issue_role="cleanup",
+            )
         )
         self.assertIn("#1 j#2", text)
+        self.assertIn("#1 tidy up", text)
+        self.assertIn("Role: cleanup", text)
         self.assertIn("Commit: none", text)
         self.assertIn("Residual risks: none recorded", text)
 
     def test_missing_anchor_raises(self) -> None:
         with self.assertRaises(SessionBoundaryError):
-            BoundaryPrompt(issue="", journal="2", repo_pointer="proj")
+            BoundaryPrompt(
+                issue="",
+                journal="2",
+                repo_pointer="proj",
+                issue_subject="s",
+                issue_role="r",
+            )
         with self.assertRaises(SessionBoundaryError):
-            BoundaryPrompt(issue="1", journal="", repo_pointer="proj")
+            BoundaryPrompt(
+                issue="1",
+                journal="",
+                repo_pointer="proj",
+                issue_subject="s",
+                issue_role="r",
+            )
+
+    def test_empty_or_blank_subject_fails_closed(self) -> None:
+        for bad in ("", "   ", "\t\n"):
+            with self.assertRaises(SessionBoundaryError):
+                BoundaryPrompt(
+                    issue="1",
+                    journal="2",
+                    repo_pointer="proj",
+                    issue_subject=bad,
+                    issue_role="cleanup",
+                )
+
+    def test_empty_or_blank_role_fails_closed(self) -> None:
+        for bad in ("", "   ", "\t\n"):
+            with self.assertRaises(SessionBoundaryError):
+                BoundaryPrompt(
+                    issue="1",
+                    journal="2",
+                    repo_pointer="proj",
+                    issue_subject="tidy up",
+                    issue_role=bad,
+                )
 
     def test_absolute_repo_pointer_is_rejected(self) -> None:
         # The redaction contract: a pasteable pointer must be a portable
         # identifier, never an absolute / home path.
         for leaked in ("/workspace/project-alpha", "~/dev/proj", "\\\\srv\\share"):
             with self.assertRaises(SessionBoundaryError):
-                BoundaryPrompt(issue="1", journal="2", repo_pointer=leaked)
+                BoundaryPrompt(
+                    issue="1",
+                    journal="2",
+                    repo_pointer=leaked,
+                    issue_subject="s",
+                    issue_role="r",
+                )
 
     def test_invalid_next_actor_raises(self) -> None:
         with self.assertRaises(SessionBoundaryError):
             BoundaryPrompt(
-                issue="1", journal="2", repo_pointer="proj", next_actor="manager"
+                issue="1",
+                journal="2",
+                repo_pointer="proj",
+                issue_subject="s",
+                issue_role="r",
+                next_actor="manager",
             )
 
     def test_nested_execution_root_renders_portable_pointer(self) -> None:
@@ -245,6 +304,8 @@ class CliTests(unittest.TestCase):
             repo=str(ROOT),
             issue="12122",
             journal="59709",
+            issue_subject="session boundary UX",
+            issue_role="implementation",
             parent="12113",
             commit=None,
             target_lane="issue_12122_session_boundary_ux",
@@ -259,6 +320,8 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("#12122 j#59709", out)
+        self.assertIn("#12122 session boundary UX", out)
+        self.assertIn("Role: implementation", out)
         self.assertIn("risk one", out)
         # The absolute repo root must never appear in the pasteable prompt.
         self.assertNotIn(str(ROOT), out)
@@ -269,6 +332,8 @@ class CliTests(unittest.TestCase):
             repo=str(ROOT),
             issue="12122",
             journal="59709",
+            issue_subject="session boundary UX",
+            issue_role="pre-smoke再検証",
             parent=None,
             commit=None,
             target_lane=None,
@@ -285,6 +350,9 @@ class CliTests(unittest.TestCase):
         payload = json.loads(out)
         # Structured output is allowed to carry the absolute root for automation.
         self.assertEqual(payload["repo_root"], str(ROOT))
+        # Both required fields are also emitted as structured JSON fields.
+        self.assertEqual(payload["issue_subject"], "session boundary UX")
+        self.assertEqual(payload["issue_role"], "pre-smoke再検証")
         self.assertIn("prompt_markdown", payload)
         self.assertNotIn(str(ROOT), payload["prompt_markdown"])
 
