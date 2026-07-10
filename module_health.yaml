@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3518
+    lines: 3525
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1031,6 +1031,12 @@ allowlist:
       repo root instead of the `%pane`-only gate; the resolution itself is the new
       `herdr_send_entry.herdr_auto_target_repo` helper, not here — only the guarded branch
       remains). tmux `auto` is byte-invariant (the branch is guarded on `herdr_send`).
+      Raised 3518 -> 3525 for the #13477 role-profile `redmine_project` auto-resolution
+      wiring in `orchestrate_handoff`: the parse + `durable_anchor` + verified-default
+      auto-fill now go through the extracted
+      `f_130_handoff_routing/application/role_profile_field_resolution.py` helper (the
+      workspace-default read itself is `core.state.workspace_defaults.resolve_default_project`),
+      so only the one guarded call site + its import remain here.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"

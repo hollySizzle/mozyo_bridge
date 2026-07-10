@@ -71,6 +71,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_config.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/role_profile_field_resolution.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
   - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
   - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
@@ -103,13 +104,15 @@ rules:
   - tests/scenarios/test_delegated_coordinator_route_plan.py
   - tests/regressions/test_issue_12474_delegated_route_gaps.py
   - tests/support/delegation_route_fakes.py
+  - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
+  - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
-    と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-route-live-executor.md
-    と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
-    と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/unit-target-model.md
-    と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/role-profile-handoff-expansion.md と @vibes/docs/logics/delegated-coordinator-cockpit-display.md
+    と @vibes/docs/specs/delegation-policy-project-config.md と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md
+    と @vibes/docs/specs/delegated-route-live-executor.md と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
+    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/logics/unit-target-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
