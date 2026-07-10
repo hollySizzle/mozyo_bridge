@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 from mozyo_bridge import __version__
@@ -61,7 +63,13 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     RepoLocalConfig,
     RepoLocalConfigError,
 )
-from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, resolve_repo_root
+from mozyo_bridge.shared.paths import (
+    default_queue_path,
+    default_tmux_conf,
+    find_repo_root,
+    resolve_repo_root,
+    workspace_adoption_marker,
+)
 
 # --- Backward-compatible import surface (Redmine #12138 / #12141 / #12153). ---
 # Before the parser split, handler / helper / constant symbols were importable
@@ -332,6 +340,86 @@ def _exit_on_repo_local_config_error(exc: Exception) -> int:
     return 2
 
 
+def _select_bare_target_root(argv: Optional[list[str]]) -> Path:
+    """Select the bare-`mozyo` target root (Redmine #13497 j#74936).
+
+    Honors, in order: an explicit root-level `--repo`; the trusted `MOZYO_REPO`
+    environment override; without an override, an **adopted** ancestor of the cwd
+    (so launching from a subdirectory of an adopted project still launches it);
+    otherwise the canonical current directory itself as the fresh onboarding
+    target — never silently adopting an incidental *unadopted* ancestor (e.g. a
+    plain Git root or a stray marker in ``$HOME``). The same root is used for
+    config load/reload, adoption classification, inspect/plan/apply, and launch.
+    """
+    override = _root_repo_override(argv)
+    if override:
+        return Path(override).expanduser().resolve()
+    env_repo = os.environ.get("MOZYO_REPO")
+    if env_repo:
+        return Path(env_repo).expanduser().resolve()
+    candidate = find_repo_root()
+    if workspace_adoption_marker(candidate) is not None:
+        return candidate
+    return Path.cwd().resolve()
+
+
+def _backend_aware_launch(args: argparse.Namespace, target_root: Path) -> int:
+    """Reload ``target_root``'s config *now* and take its backend-aware launch.
+
+    The bare-`mozyo` backend selection (Redmine #13324) reads only the resolved
+    repo's `terminal_transport.backend`: `herdr` runs the single-command herdr
+    session-start + UI attach, otherwise the byte-invariant tmux cockpit path.
+    This re-resolves the config **at invocation** from the selected root rather
+    than closing over the config loaded at `main()` start: after a fresh
+    onboarding writes the typed `terminal_transport.backend: herdr`, a stale
+    pre-adoption closure would wrongly take the tmux path (Redmine #13497
+    j#74934). A broken config fails closed with the same actionable text.
+    """
+    try:
+        fresh = load_repo_local_config(str(target_root))
+    except (
+        RepoLocalConfigError,
+        ModuleRegistryError,
+        ProviderRegistryError,
+        PresentationRuntimeError,
+    ) as exc:
+        return _exit_on_repo_local_config_error(exc)
+    if fresh.terminal_transport.herdr_enabled:
+        from mozyo_bridge.application.herdr_launch_command import cmd_mozyo_herdr
+
+        return cmd_mozyo_herdr(args)
+    return cmd_mozyo(args)
+
+
+def _bare_mozyo_entry(args: argparse.Namespace, argv: Optional[list[str]]) -> int:
+    """Bare `mozyo` (no subcommand): route through the onboarding entry gate.
+
+    An already-adopted project launches unchanged; an in-progress adoption
+    resumes; a fresh root runs the provider-neutral conversation → visible plan →
+    human confirmation → deterministic apply, then reaches the same backend-aware
+    launch. All authority-sensitive mutation stays in the #13498 tool surface
+    (Redmine #13497). The launch is the shared reload-at-invocation callback so
+    the newly written herdr config is honored, bound to the same selected root.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.bare_entry import (
+        run_bare_entry,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.commands_onboarding import (
+        GATE_SECRET_ENV,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.onboarding_providers import (
+        SafeClaudeCliProvider,
+    )
+
+    target_root = _select_bare_target_root(argv)
+    return run_bare_entry(
+        target_root=target_root,
+        launch_adopted=lambda: _backend_aware_launch(args, target_root),
+        provider=SafeClaudeCliProvider(),
+        gate_secret=os.environ.get(GATE_SECRET_ENV),
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     # Read the repo-local YAML config (Redmine #12190 loader) and compose the
     # parser from it (Redmine #12191). The config is loaded from the same repo
@@ -378,16 +466,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _exit_on_repo_local_config_error(exc)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
-        # Backend-aware bare `mozyo` (Redmine #13324): only the resolved repo's
-        # `terminal_transport.backend` chooses the entrypoint. `herdr` runs the
-        # single-command herdr session-start + UI attach; `tmux` / unset / absent
-        # keeps the byte-invariant tmux cockpit path. A broken config already
-        # failed closed above, so `config` here is a valid selection.
-        if config.terminal_transport.herdr_enabled:
-            from mozyo_bridge.application.herdr_launch_command import cmd_mozyo_herdr
-
-            return cmd_mozyo_herdr(args)
-        return cmd_mozyo(args)
+        return _bare_mozyo_entry(args, argv)
     args = normalize_paths(args)
     _warn_deprecated_alias(args)
     return args.func(args)

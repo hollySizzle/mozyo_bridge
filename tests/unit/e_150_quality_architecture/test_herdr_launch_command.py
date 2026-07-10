@@ -20,10 +20,12 @@ auditor ruling's focused-test list (j#73153):
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.application.herdr_launch_command import (
     HerdrLaunchOutcome,
@@ -361,7 +363,14 @@ class DeliverHerdrLaunchOutcomeTests(unittest.TestCase):
 
 
 class BareMozyoBackendRoutingTests(unittest.TestCase):
-    """``cli.main`` routes bare ``mozyo`` by the resolved repo's backend."""
+    """``cli.main`` routes bare ``mozyo`` by the *adopted* repo's backend.
+
+    An adopted project (config present) still launches by its
+    ``terminal_transport.backend`` with no regression. An *unadopted* directory
+    no longer auto-launches tmux: it enters the #13497 onboarding gate, so no
+    backend launch happens until the project is adopted (contract change owned by
+    #13497; the adopted-launch regression is unchanged).
+    """
 
     def _run_main_with_config(self, config_body: str | None) -> tuple[bool, bool]:
         from mozyo_bridge.application import cli
@@ -395,10 +404,33 @@ class BareMozyoBackendRoutingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         return called["tmux"], called["herdr"]
 
-    def test_config_absent_routes_to_tmux_path(self) -> None:
-        tmux, herdr = self._run_main_with_config(None)
-        self.assertTrue(tmux)
-        self.assertFalse(herdr)
+    def test_config_absent_enters_onboarding_not_tmux(self) -> None:
+        # #13497: an unadopted directory no longer auto-launches tmux; bare
+        # `mozyo` enters onboarding. With no human on stdin it cancels/blocks
+        # fail-closed and never touches a backend launch.
+        from mozyo_bridge.application import cli
+        from mozyo_bridge.application import herdr_launch_command
+
+        called = {"tmux": False, "herdr": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orig_tmux = cli.cmd_mozyo
+            orig_herdr = herdr_launch_command.cmd_mozyo_herdr
+            cli.cmd_mozyo = lambda args: called.__setitem__("tmux", True) or 0
+            herdr_launch_command.cmd_mozyo_herdr = (
+                lambda args: called.__setitem__("herdr", True) or 0
+            )
+            try:
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    rc = cli.main(["--repo", str(repo), "--no-attach"])
+            finally:
+                cli.cmd_mozyo = orig_tmux
+                herdr_launch_command.cmd_mozyo_herdr = orig_herdr
+
+        self.assertNotEqual(rc, 0)  # onboarding not completed without a human
+        self.assertFalse(called["tmux"])
+        self.assertFalse(called["herdr"])
 
     def test_explicit_tmux_backend_routes_to_tmux_path(self) -> None:
         tmux, herdr = self._run_main_with_config(
