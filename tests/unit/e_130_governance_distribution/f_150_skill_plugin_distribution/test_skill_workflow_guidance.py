@@ -145,6 +145,13 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # runtime-fingerprint verification discipline.
         "## ACK / delivery / completion の分離",
         "## Runtime fingerprint 検証規律",
+        # Redmine #13489 (owner intent j#74953): the agent wait / polling
+        # efficiency standard, plus its four load-bearing sub-sections.
+        "## Wait / polling 効率標準",
+        "### blocking wait を token 消費と誤認しない",
+        "### bounded wait は user commentary SLA 内に収める",
+        "### timeout / state 不変時に pane history を掘らない",
+        "### 通常 finding は gate journal にまとめ、即時 interrupt は Critical に限定する",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
@@ -347,6 +354,21 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         ".mozyo-bridge/project-defaults.yaml",
         "明示の `project_id` は常に default に優先する",
         "UNVERIFIED",
+        # Redmine #13489 (owner intent j#74953): the load-bearing semantics of the
+        # wait / polling efficiency standard. A byte-parity pass alone would not
+        # catch these being deleted or weakened, so pin them verbatim: a blocking
+        # wait is not token spend, the 45-55s bounded cadence, no pane-history dig
+        # on an unchanged timeout, the 20-40 line read window, no scrollback re-read,
+        # findings batched to the gate journal, and immediate interrupts limited to
+        # Critical safety / authority / irreversibility.
+        "10–30 秒間隔の反復 poll を「進捗確認」として標準化しない",
+        "user commentary SLA 内の **45–55 秒**を基本周期とする",
+        "bounded wait が timeout し durable state が不変なら、pane history を読まない",
+        "pane 末尾の **20–40 行**を読む",
+        "同じ scrollback を再読しない",
+        "gate journal の時点でまとめて durable record に載せる",
+        "即時 interrupt は、**安全・authority・不可逆リスクに関わる Critical**",
+        "user commentary SLA 内の 45–55 秒基本 cadence に収める",
     )
 
     SKILL_PATH = (
