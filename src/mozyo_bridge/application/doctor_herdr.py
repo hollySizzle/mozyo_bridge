@@ -38,8 +38,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrInventoryView,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
+    REASON_BINARY_AMBIGUOUS,
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
+    REASON_BINARY_UNSAFE_PATH,
 )
 
 # Operator guidance per fail-closed inventory reason. The binary reasons are a
@@ -49,6 +51,19 @@ _BINARY_NEXT_ACTION = (
     "make herdr resolvable from the trusted environment (Redmine #13496): either "
     "put an executable `herdr` on the trusted PATH, or set MOZYO_HERDR_BINARY "
     "(daemon env) to the herdr executable, then re-run `mozyo-bridge doctor`"
+)
+_BINARY_AMBIGUOUS_NEXT_ACTION = (
+    "more than one distinct `herdr` executable resolved from the trusted PATH "
+    "(Redmine #13496): pin the intended one by setting MOZYO_HERDR_BINARY (daemon "
+    "env) to its absolute path, or remove the extra PATH entry, then re-run "
+    "`mozyo-bridge doctor`"
+)
+_BINARY_UNSAFE_PATH_NEXT_ACTION = (
+    "the trusted PATH has an empty or relative component that a shell would "
+    "resolve against the current directory (Redmine #13496): remove the unsafe "
+    "component (no leading/trailing/double `:` and no `.`), or set "
+    "MOZYO_HERDR_BINARY (daemon env) to the herdr absolute path, then re-run "
+    "`mozyo-bridge doctor`"
 )
 _SERVER_NEXT_ACTION = (
     "herdr did not return a readable agent inventory (server down or "
@@ -140,7 +155,11 @@ def evaluate_herdr_section(view: HerdrInventoryView) -> Optional[dict[str, Any]]
 
     if not view.ok:
         section["status"] = "error"
-        if view.reason in (REASON_BINARY_UNCONFIGURED, REASON_BINARY_NOT_FOUND):
+        if view.reason == REASON_BINARY_AMBIGUOUS:
+            section["next_action"].append(_BINARY_AMBIGUOUS_NEXT_ACTION)
+        elif view.reason == REASON_BINARY_UNSAFE_PATH:
+            section["next_action"].append(_BINARY_UNSAFE_PATH_NEXT_ACTION)
+        elif view.reason in (REASON_BINARY_UNCONFIGURED, REASON_BINARY_NOT_FOUND):
             section["next_action"].append(_BINARY_NEXT_ACTION)
         else:
             section["next_action"].append(_SERVER_NEXT_ACTION)

@@ -8,8 +8,10 @@ identities to resolve against.
 
 Flow (per requested provider agent, ``claude`` / ``codex``):
 
-1. resolve the herdr binary from the **trusted environment** (``MOZYO_HERDR_BINARY``);
-   unset / unresolvable fails closed (never a repo-local binary);
+1. resolve the herdr binary from the **trusted environment** — the explicit
+   ``MOZYO_HERDR_BINARY`` then an executable ``herdr`` on the trusted ``PATH``
+   (Redmine #13496; absolute PATH components only, realpath / executable verified);
+   unresolvable / ambiguous fails closed (never a repo-local or cwd binary);
 2. ensure the workspace is registered (``register_workspace`` / anchor reuse) and take
    its ``workspace_id`` — the workspace_registry schema is unchanged (#11425);
 3. mint the durable name ``encode_assigned_name(workspace_id, provider, lane)`` (#13247);

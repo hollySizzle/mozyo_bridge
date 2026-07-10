@@ -103,6 +103,21 @@ DEFAULT_PANE_READ_SOURCE = SOURCE_VISIBLE
 REASON_BACKEND_DISABLED = "backend_disabled"
 REASON_BINARY_UNCONFIGURED = "binary_unconfigured"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
+# More than one *distinct* herdr executable (by realpath) resolved from the
+# trusted sources — e.g. a different `herdr` on two trusted PATH entries. The
+# resolver refuses to guess which one the operator meant and fails closed rather
+# than silently picking the first (Redmine #13496 acceptance: ambiguous is
+# fail-closed). Duplicate PATH entries pointing at the SAME realpath are not
+# ambiguous.
+REASON_BINARY_AMBIGUOUS = "binary_ambiguous"
+# The trusted PATH (or a path-shaped explicit MOZYO_HERDR_BINARY) carries an
+# unsafe component — an empty component or a relative directory, both of which a
+# shell would resolve against the current working directory. The resolver does
+# NOT silently skip it and search the remaining absolute components: an unsafe
+# trusted environment fails closed as a whole so the caller's PATH semantics are
+# never quietly rewritten (Redmine #13496 review j#74773). Only an all-absolute
+# PATH is searched.
+REASON_BINARY_UNSAFE_PATH = "binary_unsafe_path"
 REASON_INVALID_TARGET = "invalid_target"
 REASON_INVALID_SOURCE = "invalid_source"
 # The provider's command ran but returned a payload that could not be recognised
@@ -119,6 +134,8 @@ TRANSPORT_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_BACKEND_DISABLED,
         REASON_BINARY_UNCONFIGURED,
         REASON_BINARY_NOT_FOUND,
+        REASON_BINARY_AMBIGUOUS,
+        REASON_BINARY_UNSAFE_PATH,
         REASON_INVALID_TARGET,
         REASON_INVALID_SOURCE,
         REASON_INVALID_PAYLOAD,
@@ -444,8 +461,10 @@ __all__ = (
     "DEFAULT_TERMINAL_BACKEND",
     "PANE_READ_SOURCES",
     "REASON_BACKEND_DISABLED",
+    "REASON_BINARY_AMBIGUOUS",
     "REASON_BINARY_NOT_FOUND",
     "REASON_BINARY_UNCONFIGURED",
+    "REASON_BINARY_UNSAFE_PATH",
     "REASON_INVALID_PAYLOAD",
     "REASON_INVALID_SOURCE",
     "REASON_INVALID_TARGET",
