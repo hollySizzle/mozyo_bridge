@@ -122,7 +122,98 @@ class SnapshotJsonTest(unittest.TestCase):
         self.assertEqual([r["issue_id"] for r in payload["rows"]], ["13435"])
 
 
-class ActiveLanesStoreTest(unittest.TestCase):
+class ActiveLanesRedmineFoldTest(unittest.TestCase):
+    """Default roster path: enumerate lanes (--issue) + fold canonical ``## Gate:`` journals.
+
+    Redmine #13435 review j#74295 Finding 1 / design j#74307: a known canonical gate returns
+    a concrete workflow state even with an **empty** runtime store; an unrecognized template
+    or an unavailable source is an explicit degraded ``unknown`` row, never silently dropped.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store_path = Path(self._tmp.name) / "workflow-runtime.sqlite"  # left empty
+        self.redmine = Path(self._tmp.name) / "redmine.json"
+        self.redmine.write_text(
+            json.dumps(
+                {
+                    "13425": {
+                        "issue": {"subject": "impl lane", "status": {"is_closed": False}},
+                        "journals": [
+                            {"id": "73900", "notes": "## Gate: Start (worker)\n- lane: x"},
+                            {
+                                "id": "73980",
+                                "notes": "## Gate: Implementation Done + Review Request (worker)\n"
+                                "- commit: `abc1234`",
+                            },
+                        ],
+                    },
+                    "13480": {  # journals present but no canonical gate -> unknown template
+                        "issue": {"subject": "noise lane", "status": {"is_closed": False}},
+                        "journals": [{"id": "1", "notes": "## Progress Log: hi"}],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_known_gate_folds_concretely_with_empty_store(self):
+        rc, out = _run(
+            [
+                "workflow", "glance", "--active-lanes", "--json", "--no-ledger",
+                "--issue", "13425",
+                "--redmine-json", str(self.redmine),
+                "--store-path", str(self.store_path),
+            ]
+        )
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        rows = {r["issue_id"]: r for r in payload["rows"]}
+        self.assertIn("13425", rows)  # roster + Redmine fold, NOT the (empty) store
+        self.assertEqual(rows["13425"]["workflow_state"], "review_waiting")  # impl_done+review_request
+        self.assertEqual(rows["13425"]["latest_journal"], "73980")
+        self.assertEqual(rows["13425"]["next_owner"], "auditor")
+        self.assertFalse(payload["degraded"])
+
+    def test_unrecognized_template_is_degraded_unknown_not_dropped(self):
+        rc, out = _run(
+            [
+                "workflow", "glance", "--active-lanes", "--json", "--no-ledger",
+                "--issue", "13480",
+                "--redmine-json", str(self.redmine),
+                "--store-path", str(self.store_path),
+            ]
+        )
+        payload = json.loads(out)
+        rows = {r["issue_id"]: r for r in payload["rows"]}
+        self.assertIn("13480", rows)  # never silently dropped
+        self.assertEqual(rows["13480"]["workflow_state"], "unknown")
+        self.assertEqual(rows["13480"]["next_owner"], "coordinator")
+        self.assertTrue(payload["degraded"])
+        self.assertTrue(payload["notes"])
+
+    def test_source_unavailable_is_degraded_not_silent_empty(self):
+        # An issue absent from the fixture -> the Redmine read raises -> a degraded unknown
+        # row (source unavailable), distinct from "no active lanes".
+        rc, out = _run(
+            [
+                "workflow", "glance", "--active-lanes", "--json", "--no-ledger",
+                "--issue", "99999",
+                "--redmine-json", str(self.redmine),
+                "--store-path", str(self.store_path),
+            ]
+        )
+        payload = json.loads(out)
+        rows = {r["issue_id"]: r for r in payload["rows"]}
+        self.assertIn("99999", rows)
+        self.assertEqual(rows["99999"]["workflow_state"], "unknown")
+        self.assertTrue(payload["degraded"])
+
+
+class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
+    """``--no-redmine``: roster + advisory runtime store + ledger (offline fallback)."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -132,28 +223,8 @@ class ActiveLanesStoreTest(unittest.TestCase):
         store = WorkflowRuntimeStore(path=self.store_path)
         store.append_events(
             [
-                {
-                    "event_id": "redmine:13425:73900",
-                    "issue": "13425",
-                    "gate": "progress",
-                },
-                {
-                    "event_id": "redmine:13425:73980",
-                    "issue": "13425",
-                    "gate": "implementation_done",
-                },
-            ]
-        )
-        store.put_route_identities(
-            [
-                {
-                    "route_id": "r1",
-                    "issue": "13425",
-                    "workspace_id": "wZ",
-                    "lane_id": "issue_13425_lane",
-                    "role": "implementation_worker",
-                    "pane_name": "claude_default",
-                }
+                {"event_id": "redmine:13425:73900", "issue": "13425", "gate": "progress"},
+                {"event_id": "redmine:13425:73980", "issue": "13425", "gate": "implementation_done"},
             ]
         )
         # A turn-start that injected but never confirmed -> turn_start_unconfirmed.
@@ -165,46 +236,37 @@ class ActiveLanesStoreTest(unittest.TestCase):
             )
         )
 
-    def test_active_lanes_enumerates_store_and_joins_ledger(self):
-        rc, out = _run(
-            [
-                "workflow", "glance", "--active-lanes", "--json",
-                "--store-path", str(self.store_path),
-                "--ledger-path", str(self.ledger_path),
-            ]
-        )
+    def _argv(self, *extra):
+        return [
+            "workflow", "glance", "--active-lanes", "--json", "--no-redmine",
+            "--issue", "13425",
+            "--store-path", str(self.store_path),
+            "--ledger-path", str(self.ledger_path),
+            *extra,
+        ]
+
+    def test_advisory_store_supplies_state_and_ledger_anomaly(self):
+        rc, out = _run(self._argv())
         self.assertEqual(rc, 0)
         payload = json.loads(out)
         rows = {r["issue_id"]: r for r in payload["rows"]}
         self.assertIn("13425", rows)
         row = rows["13425"]
-        self.assertEqual(row["workflow_state"], "review_waiting")  # latest event = impl_done
-        self.assertEqual(row["lane"], "issue_13425_lane")
+        self.assertEqual(row["workflow_state"], "review_waiting")  # latest advisory event = impl_done
         self.assertEqual(row["latest_journal"], "73980")
         self.assertEqual(row["delivery_anomaly"], "turn_start_unconfirmed")
         self.assertEqual(row["next_owner"], "coordinator")
         self.assertEqual(payload["active_anomaly_issues"], ["13425"])
+        self.assertFalse(payload["degraded"])  # advisory store satisfied the lane
 
     def test_glance_is_read_only_store_unchanged(self):
         before = WorkflowRuntimeStore(path=self.store_path).read_events()
-        _run(
-            [
-                "workflow", "glance", "--active-lanes", "--json",
-                "--store-path", str(self.store_path),
-                "--ledger-path", str(self.ledger_path),
-            ]
-        )
+        _run(self._argv())
         after = WorkflowRuntimeStore(path=self.store_path).read_events()
         self.assertEqual([e.as_payload() for e in before], [e.as_payload() for e in after])
 
     def test_no_ledger_flag_drops_delivery_join(self):
-        rc, out = _run(
-            [
-                "workflow", "glance", "--active-lanes", "--json", "--no-ledger",
-                "--store-path", str(self.store_path),
-                "--ledger-path", str(self.ledger_path),
-            ]
-        )
+        rc, out = _run(self._argv("--no-ledger"))
         payload = json.loads(out)
         rows = {r["issue_id"]: r for r in payload["rows"]}
         self.assertEqual(rows["13425"]["delivery_anomaly"], "none")

@@ -59,9 +59,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_glance_table,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
+    GlanceIssueRecord,
+    MappingGlanceRedmineSource,
     MappingGlanceSnapshotSource,
+    active_lane_snapshots,
     anomaly_from_ledger_record,
     store_active_lane_snapshots,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
+    fold_issue_gate_facts,
+    lane_signal_from_gate_facts,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    GATE_CLOSE,
+    GATE_REVIEW as _GATE_REVIEW,
+    REVIEW_CHANGES_REQUESTED,
+    classify_lane_state,
 )
 
 
@@ -401,6 +414,166 @@ class StoreEnumerationTest(unittest.TestCase):
 
     def test_store_read_failure_is_fail_open(self):
         self.assertEqual(store_active_lane_snapshots(_RaisingStore()), ())
+
+
+def _j(journal_id, notes):
+    return (journal_id, notes)
+
+
+class JournalGrammarTest(unittest.TestCase):
+    """The glance-only ``## Gate:`` template grammar (Redmine #13435 j#74307 Option C).
+
+    Fixtures are the real #13435 journal heading variants: only line-anchored ``## Gate:``
+    headings are read, combined headings split, collisions are excluded, and a review
+    conclusion is taken only from an explicit ``結論:`` field.
+    """
+
+    def test_combined_and_collisions_and_conclusion(self):
+        # The real #13435 sequence: Start, combined impl_done+review_request, audit review
+        # (要修正), then the Review Finding Verdicts / Design Consultation Answer collisions.
+        facts = fold_issue_gate_facts(
+            [
+                _j("74193", "## Gate: Start (Claude implementation_worker)\n- lane: x"),
+                _j(
+                    "74194",
+                    "## Gate: Implementation Done + Review Request (worker)\n- **commit: `93ac924`**",
+                ),
+                _j("74295", "## Gate: review (Codex US-level audit)\n- 結論: 要修正"),
+                _j("74298", "## Gate: Review Finding Verdicts (worker, 迎合禁止)\n- x"),
+                _j("74299", "## Gate: Design Consultation Answer (Codex)\n- y"),
+                _j("74316", "## Progress Log: Correction 実装再開\n- z"),  # not a gate
+            ]
+        )
+        self.assertEqual(facts.latest_gate, _GATE_REVIEW)  # not the later verdict/consult
+        self.assertEqual(facts.latest_gate_journal, "74295")
+        self.assertEqual(facts.review_conclusion, REVIEW_CHANGES_REQUESTED)
+        self.assertTrue(facts.commit_bearing)  # combined journal carried a commit
+        sig = lane_signal_from_gate_facts("13435", facts, issue_open=True)
+        self.assertEqual(classify_lane_state(sig), "implementing")  # 要修正 -> back to worker
+
+    def test_review_request_alone_is_review_waiting(self):
+        facts = fold_issue_gate_facts([_j("100", "## Gate: review_request\n- foo")])
+        sig = lane_signal_from_gate_facts("7", facts)
+        self.assertEqual(classify_lane_state(sig), "review_waiting")
+
+    def test_approved_review_conclusion(self):
+        facts = fold_issue_gate_facts([_j("100", "## Gate: review\n- 結論: 承認")])
+        self.assertEqual(classify_lane_state(lane_signal_from_gate_facts("7", facts)), "owner_waiting")
+
+    def test_dispatch_heading_is_implementing(self):
+        facts = fold_issue_gate_facts(
+            [_j("50", "## Gate: Implementation Request Dispatch (Codex coordinator)\n- x")]
+        )
+        self.assertEqual(classify_lane_state(lane_signal_from_gate_facts("7", facts)), "implementing")
+
+    def test_review_finding_verdicts_is_not_an_audit_review(self):
+        # A verdict journal alone must NOT classify as an audit review (collision guard).
+        facts = fold_issue_gate_facts([_j("100", "## Gate: Review Finding Verdicts (worker)\n- 結論: 承認")])
+        self.assertIsNone(facts)  # unrecognized -> unknown, never a fabricated review
+
+    def test_owner_close_then_integration_deferral(self):
+        facts = fold_issue_gate_facts(
+            [
+                _j("200", "## Gate: owner_close_approval\n- commit_hash: `deadbee`"),
+                _j("201", "## Gate: Integration Deferral (coordinator)\n- reason: later"),
+            ]
+        )
+        self.assertTrue(facts.integration_recorded)
+        # owner_close_approval is the latest gate; commit-bearing but integration IS recorded
+        # -> the lane is close_waiting (open issue), not integration_waiting.
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=True)
+        self.assertEqual(classify_lane_state(sig), "close_waiting")
+
+    def test_closed_status_overrides_to_retire(self):
+        facts = fold_issue_gate_facts([_j("100", "## Gate: review\n- 結論: 承認")])
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=False)
+        self.assertEqual(sig.latest_gate, GATE_CLOSE)  # closed is a stronger durable fact
+        self.assertEqual(classify_lane_state(sig), "retire_ready")
+
+    def test_non_gate_headings_yield_no_facts(self):
+        facts = fold_issue_gate_facts(
+            [
+                _j("1", "## Progress Log: hi"),
+                _j("2", "## Handoff Delivery Record\n- sent"),
+                _j("3", "## Correction: oops"),
+            ]
+        )
+        self.assertIsNone(facts)
+
+
+class _FakeRedmineSource:
+    def __init__(self, records):
+        self._records = records  # issue -> GlanceIssueRecord
+
+    def read_issue(self, issue_id):
+        if issue_id not in self._records:
+            raise KeyError(issue_id)
+        return self._records[issue_id]
+
+
+class ActiveLaneSnapshotsTest(unittest.TestCase):
+    """The default roster fold: Redmine grammar + advisory store + degraded/unknown."""
+
+    def test_known_gate_folds_with_empty_store(self):
+        src = _FakeRedmineSource(
+            {
+                "13425": GlanceIssueRecord(
+                    issue_id="13425",
+                    subject="impl lane",
+                    issue_open=True,
+                    journals=((("73980"), "## Gate: review_request\n- x"),),
+                )
+            }
+        )
+        collection = active_lane_snapshots([("13425", "lane_a")], redmine_source=src, store=None)
+        rows = fold_glance_rows(collection.snapshots)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].workflow_state, "review_waiting")  # from Redmine, empty store
+        self.assertEqual(rows[0].lane, "lane_a")
+        self.assertFalse(collection.degraded)
+
+    def test_unknown_template_is_degraded_row_not_dropped(self):
+        src = _FakeRedmineSource(
+            {
+                "13480": GlanceIssueRecord(
+                    issue_id="13480", journals=((("1"), "## Progress Log: hi"),)
+                )
+            }
+        )
+        collection = active_lane_snapshots([("13480", "lane_b")], redmine_source=src, store=None)
+        rows = fold_glance_rows(collection.snapshots)
+        self.assertEqual(len(rows), 1)  # NOT dropped
+        self.assertEqual(rows[0].workflow_state, "unknown")
+        self.assertTrue(collection.degraded)
+        self.assertTrue(collection.notes)
+
+    def test_source_unavailable_is_degraded_unknown(self):
+        src = _FakeRedmineSource({})  # every read raises KeyError
+        collection = active_lane_snapshots([("99999", "lane_c")], redmine_source=src, store=None)
+        rows = fold_glance_rows(collection.snapshots)
+        self.assertEqual(rows[0].workflow_state, "unknown")
+        self.assertTrue(collection.degraded)
+
+    def test_no_source_and_no_store_is_degraded_not_empty(self):
+        collection = active_lane_snapshots([("13435", "lane_d")], redmine_source=None, store=None)
+        rows = fold_glance_rows(collection.snapshots)
+        self.assertEqual(len(rows), 1)  # a real active lane is always surfaced
+        self.assertEqual(rows[0].workflow_state, "unknown")
+        self.assertTrue(collection.degraded)
+
+
+class LedgerAbsentIsNotCallbackFailureTest(unittest.TestCase):
+    """Finding 2: a generic turn-start ``absent`` is not a callback delivery failure."""
+
+    def test_absent_maps_to_turn_start_unconfirmed_not_callback(self):
+        rec = _FakeLedgerRecord(journal_id="9", turn_start_outcome={"outcome": "absent"})
+        obs = anomaly_from_ledger_record(rec)
+        self.assertEqual(obs.anomaly, ANOMALY_TURN_START_UNCONFIRMED)  # not callback_delivery_failed
+
+    def test_verbatim_callback_disposition_still_honoured(self):
+        # callback_delivery_failed is still used when the record ITSELF evidences a callback.
+        rec = _FakeLedgerRecord(disposition="callback_delivery_failed")
+        self.assertEqual(anomaly_from_ledger_record(rec).anomaly, "callback_delivery_failed")
 
 
 if __name__ == "__main__":
