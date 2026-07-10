@@ -29,7 +29,6 @@ from typing import Mapping, Sequence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     CALLBACK_NONE,
     CALLBACK_STATES,
-    GATE_CLOSE,
     GATE_KINDS,
     GATE_NONE,
     LaneSignal,
@@ -487,12 +486,18 @@ def _store_gate_index(store) -> dict:
 
 
 def enumerate_active_lanes(repo_root) -> tuple:
-    """Enumerate the active-lane roster (issue, lane label) from the sublane read model.
+    """Enumerate the active-lane roster from the sublane read model: ``(roster, error)``.
 
     Mirrors ``sublane list``'s backend branch (herdr projection vs the tmux lifecycle read
     model) so the glance enumerates the *same authoritative active-lane index* rather than
-    whatever happens to be in the workflow-runtime store. Fail-open: any enumeration error
-    yields an empty roster (the caller records a degraded note), never an exception.
+    whatever happens to be in the workflow-runtime store.
+
+    Returns a ``(roster, error)`` pair. ``roster`` is a tuple of ``(issue, lane_label)``.
+    ``error`` is ``None`` on a successful read (even an empty roster — genuinely "no active
+    lanes"), and a short explanation when the enumeration itself failed. The caller reports a
+    failure as ``degraded`` so a roster read that could not run is never confused with "nothing
+    active" (Redmine #13435 re-audit j#74323 Finding 2) — the very silent-empty the earlier
+    Finding 1 fixed, now closed at the roster boundary too.
     """
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
@@ -509,8 +514,8 @@ def enumerate_active_lanes(repo_root) -> tuple:
             )
 
             views = SublaneListUseCase(LiveSublaneLifecycleOps(repo_root=repo_root)).run().lanes
-    except Exception:  # noqa: BLE001 - a roster read never raises out of the read-only glance
-        return ()
+    except Exception as exc:  # noqa: BLE001 - a roster read never raises out of the glance
+        return (), f"active-lane roster enumeration failed ({type(exc).__name__})"
 
     roster = []
     for view in views:
@@ -519,7 +524,7 @@ def enumerate_active_lanes(repo_root) -> tuple:
         state = str(getattr(view, "state", "") or "").strip()
         if issue and state != "retired":
             roster.append((issue, lane))
-    return tuple(roster)
+    return tuple(roster), None
 
 
 def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=None) -> GlanceCollection:
@@ -570,13 +575,15 @@ def active_lane_snapshots(roster, *, redmine_source=None, store=None, ledger=Non
                 if facts is not None:
                     signal = lane_signal_from_gate_facts(issue, facts, issue_open=record.issue_open)
                     gate_journal = facts.latest_gate_journal
-                elif not record.issue_open:
-                    signal = LaneSignal(issue=issue, latest_gate=GATE_CLOSE, issue_open=False)
                 else:
+                    # No recognized gate. A closed Redmine status is NOT fabricated into a
+                    # retire decision here: without resolved gate/commit/integration facts we
+                    # cannot claim the issue is safe to retire (re-audit j#74323 Finding 3), so
+                    # it is an explicit degraded unknown row (verification required), whether
+                    # the issue is open or closed.
                     degraded = True
-                    notes.append(
-                        f"issue {issue}: no canonical Gate journal recognized (unknown template)"
-                    )
+                    kind = "closed issue, gate/commit facts unresolved" if not record.issue_open else "unknown template"
+                    notes.append(f"issue {issue}: no canonical Gate journal recognized ({kind})")
 
         if signal is None and not degraded:
             advisory = store_index.get(issue)

@@ -64,6 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MappingGlanceSnapshotSource,
     active_lane_snapshots,
     anomaly_from_ledger_record,
+    enumerate_active_lanes,
     store_active_lane_snapshots,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
@@ -471,24 +472,44 @@ class JournalGrammarTest(unittest.TestCase):
         facts = fold_issue_gate_facts([_j("100", "## Gate: Review Finding Verdicts (worker)\n- 結論: 承認")])
         self.assertIsNone(facts)  # unrecognized -> unknown, never a fabricated review
 
-    def test_owner_close_then_integration_deferral(self):
+    def test_integration_deferral_is_not_integration_complete(self):
+        # The real governed heading (#13446 j#74290): a deferral must NOT set
+        # integration_recorded, so a commit-bearing owner-approved lane stays
+        # integration_waiting (re-audit j#74323 Finding 1), not close_waiting.
         facts = fold_issue_gate_facts(
             [
                 _j("200", "## Gate: owner_close_approval\n- commit_hash: `deadbee`"),
-                _j("201", "## Gate: Integration Deferral (coordinator)\n- reason: later"),
+                _j("201", "## Integration disposition: explicit_deferral (bounded current wave)\n- reason: later"),
             ]
         )
-        self.assertTrue(facts.integration_recorded)
-        # owner_close_approval is the latest gate; commit-bearing but integration IS recorded
-        # -> the lane is close_waiting (open issue), not integration_waiting.
+        self.assertFalse(facts.integration_recorded)  # deferral != integrated
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=True)
+        self.assertEqual(classify_lane_state(sig), "integration_waiting")
+        self.assertEqual(facts.latest_gate_journal, "200")  # deferral is not a gate journal
+
+    def test_integration_completion_disposition_marks_recorded(self):
+        facts = fold_issue_gate_facts(
+            [
+                _j("200", "## Gate: owner_close_approval\n- commit_hash: `deadbee`"),
+                _j("201", "## Integration disposition: merged\n- into main"),
+            ]
+        )
+        self.assertTrue(facts.integration_recorded)  # a completion disposition IS integrated
         sig = lane_signal_from_gate_facts("7", facts, issue_open=True)
         self.assertEqual(classify_lane_state(sig), "close_waiting")
 
-    def test_closed_status_overrides_to_retire(self):
+    def test_closed_issue_does_not_fabricate_retire(self):
+        # closed + review-approved with NO commit facts must NOT be asserted retire_ready
+        # (re-audit j#74323 Finding 3): retirement needs positively-resolved integration.
         facts = fold_issue_gate_facts([_j("100", "## Gate: review\n- 結論: 承認")])
         sig = lane_signal_from_gate_facts("7", facts, issue_open=False)
-        self.assertEqual(sig.latest_gate, GATE_CLOSE)  # closed is a stronger durable fact
-        self.assertEqual(classify_lane_state(sig), "retire_ready")
+        self.assertNotEqual(classify_lane_state(sig), "retire_ready")
+
+    def test_closed_with_real_close_gate_unmerged_is_integration_waiting(self):
+        # A real close gate carrying an unmerged commit is integration_waiting, not retire.
+        facts = fold_issue_gate_facts([_j("100", "## Gate: close\n- commit_hash: `abc1234`")])
+        sig = lane_signal_from_gate_facts("7", facts, issue_open=False)
+        self.assertEqual(classify_lane_state(sig), "integration_waiting")
 
     def test_non_gate_headings_yield_no_facts(self):
         facts = fold_issue_gate_facts(
@@ -560,6 +581,37 @@ class ActiveLaneSnapshotsTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)  # a real active lane is always surfaced
         self.assertEqual(rows[0].workflow_state, "unknown")
         self.assertTrue(collection.degraded)
+
+    def test_closed_issue_no_facts_is_degraded_unknown_not_retire(self):
+        # re-audit j#74323 Finding 3: a closed issue with no recognized gate must NOT be
+        # projected onto retire_ready; it is an explicit degraded unknown (verification owed).
+        src = _FakeRedmineSource(
+            {
+                "9": GlanceIssueRecord(
+                    issue_id="9", issue_open=False, journals=((("1"), "## Progress Log: hi"),)
+                )
+            }
+        )
+        collection = active_lane_snapshots([("9", "lane_e")], redmine_source=src, store=None)
+        rows = fold_glance_rows(collection.snapshots)
+        self.assertEqual(rows[0].workflow_state, "unknown")  # not retire_ready
+        self.assertNotIn("retire", rows[0].next_action)
+        self.assertTrue(collection.degraded)
+
+
+class _BoomRepoRoot:
+    def __fspath__(self):
+        raise RuntimeError("boom")
+
+
+class EnumerateActiveLanesTest(unittest.TestCase):
+    """re-audit j#74323 Finding 2: a roster enumeration failure is not a silent healthy 0."""
+
+    def test_enumeration_failure_is_signaled_not_silent_empty(self):
+        lanes, error = enumerate_active_lanes(_BoomRepoRoot())
+        self.assertEqual(lanes, ())
+        self.assertIsNotNone(error)  # failure distinguished from success-empty
+        self.assertIn("enumeration failed", error)
 
 
 class LedgerAbsentIsNotCallbackFailureTest(unittest.TestCase):

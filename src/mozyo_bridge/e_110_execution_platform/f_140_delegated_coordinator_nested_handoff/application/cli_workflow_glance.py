@@ -126,10 +126,15 @@ def _redmine_source(args: argparse.Namespace):
 
 
 def _roster(args: argparse.Namespace):
-    """The active-lane roster: explicit ``--issue`` ids, else the live sublane read model."""
+    """The active-lane roster + enumeration error: ``(roster, error)``.
+
+    Explicit ``--issue`` ids form the roster directly (no enumeration, ``error=None``);
+    otherwise the live sublane read model is enumerated (``error`` set when the read failed, so
+    a roster that could not be read is reported degraded, not silently empty).
+    """
     issues = [i.strip() for i in (getattr(args, "issue", None) or []) if i.strip()]
     if issues:
-        return tuple((issue, "") for issue in issues)
+        return tuple((issue, "") for issue in issues), None
     return enumerate_active_lanes(Path.cwd())
 
 
@@ -164,8 +169,12 @@ def _collect(args: argparse.Namespace):
     # The roster fold is the default source (no snapshot file), and is also included when
     # --active-lanes is asked for alongside a snapshot file.
     if payload is None or active_lanes:
+        roster, roster_error = _roster(args)
+        if roster_error:
+            degraded = True
+            notes.append(roster_error)
         collection = active_lane_snapshots(
-            _roster(args),
+            roster,
             redmine_source=_redmine_source(args),
             store=_store_from_args(args),
             ledger=_ledger_from_args(args),
