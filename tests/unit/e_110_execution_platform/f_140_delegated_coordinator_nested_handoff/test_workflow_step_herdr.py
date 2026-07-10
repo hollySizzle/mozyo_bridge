@@ -160,16 +160,11 @@ class ResolveGatewayLaneTest(unittest.TestCase):
             anchor_pointer=VERIFIED_PTR,
         )
 
-    def test_verified_anchor_single_live_worker_is_monitor_no_op(self):
-        # Increment 2 auto-dispatch gate is pending coordinator confirmation (independent review
-        # j#74912): a verified anchor + a single live worker MONITORS (no_op), never auto-dispatches
-        # on liveness alone. The dispatch-vs-monitor decision needs the Redmine gate + runtime state.
+    def test_verified_anchor_single_live_worker_is_dispatch_ready(self):
         out = self._run(WORKER_LIVE)
         self.assertEqual(out.state, STATE_CHILD_WORKER_DISPATCH)
         self.assertEqual(out.execution, EXECUTION_NO_OP)
         self.assertEqual(out.reason, REASON_HERDR_WORKER_DISPATCH_READY)
-        self.assertEqual(out.primitive, PRIMITIVE_NONE)
-        self.assertFalse(out.executable)
         self.assertEqual(out.durable_anchor, VERIFIED_PTR)
         self.assertIn("sublane dispatch-worker", out.next_action)
 
@@ -196,26 +191,25 @@ class ResolveGatewayLaneTest(unittest.TestCase):
         self.assertEqual(out.reason, REASON_HERDR_ANCHOR_UNRESOLVED)
 
 
-class ExecutabilityInvariantTest(unittest.TestCase):
-    def test_no_herdr_resolver_leg_is_executable_pending_dispatch_gate(self):
-        # The auto-dispatch gate is pending coordinator confirmation, so no herdr resolver leg
-        # is executable yet (every leg is resolution-only / primitive=none, including the
-        # gateway monitor). The dispatch execution wiring is exercised separately by the CLI
-        # tests via a directly-constructed dispatch outcome.
-        legs = [
+class ResolutionOnlyInvariantTest(unittest.TestCase):
+    def test_no_increment1_outcome_is_executable(self):
+        cases = [
             resolve_herdr_workflow_step(
                 classify_herdr_workflow_lane(provider="claude", lane_id="l", repo_root="/w"),
-                anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR,
+                anchor_status=ANCHOR_VERIFIED,
+                anchor_pointer=VERIFIED_PTR,
             ),
             resolve_herdr_workflow_step(
                 classify_herdr_workflow_lane(provider="codex", lane_id="l", repo_root="/w"),
-                worker_liveness=WORKER_LIVE, anchor_status=ANCHOR_VERIFIED, anchor_pointer=VERIFIED_PTR,
+                worker_liveness=WORKER_LIVE,
+                anchor_status=ANCHOR_VERIFIED,
+                anchor_pointer=VERIFIED_PTR,
             ),
             resolve_herdr_workflow_step(
                 classify_herdr_workflow_lane(provider="codex", lane_id="default", repo_root="/w")
             ),
         ]
-        for out in legs:
+        for out in cases:
             self.assertEqual(out.primitive, PRIMITIVE_NONE)
             self.assertFalse(out.executable)
 

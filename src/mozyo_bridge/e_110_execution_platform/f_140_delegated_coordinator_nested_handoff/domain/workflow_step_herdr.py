@@ -306,7 +306,6 @@ def resolve_herdr_workflow_step(
     worker_liveness: Optional[str] = None,
     anchor_status: Optional[str] = None,
     anchor_pointer: str = "",
-    lane_label: str = "",
 ) -> WorkflowStepOutcome:
     """Map a classified herdr lane onto a resolution-only :class:`WorkflowStepOutcome` (pure).
 
@@ -363,21 +362,14 @@ def resolve_herdr_workflow_step(
         return _anchor_blocked(lane, STATE_CHILD_WORKER_DISPATCH, anchor_status, OWNER_CHILD)
 
     if worker_liveness == WORKER_LIVE:
-        # Increment 2 (coordinator disposition j#74855) authorizes a one-step worker dispatch,
-        # but the dispatch-vs-monitor decision must come from the verified Redmine gate + the
-        # worker runtime state + a duplicate fence — NOT from mere worker liveness (independent
-        # review j#74912 / audit j#74909). Pending the coordinator's confirmation of the exact
-        # dispatch-authorizing gate/state, runtime authority, and idempotency source (design
-        # consultation), this leg is **monitor / no_op** — it never auto-dispatches. Explicit
-        # dispatch stays the existing `sublane dispatch-worker --execute` primitive.
         return WorkflowStepOutcome(
             state=STATE_CHILD_WORKER_DISPATCH,
             next_action=(
                 "this sublane gateway has a verified Redmine anchor "
-                f"({anchor_pointer}) and a single live same-lane worker. Monitor the durable "
-                "record; dispatch (or re-dispatch) the worker with `sublane dispatch-worker "
-                "--execute` only when the Redmine gate + worker runtime state warrant it. The "
-                "one-step auto-dispatch gate is pending coordinator confirmation."
+                f"({anchor_pointer}) and a single live same-lane worker: dispatch or monitor "
+                "it with `sublane dispatch-worker --execute`. Whether to dispatch (worker idle) "
+                "or monitor (implementation in flight) is settled by the lane's Redmine gate — "
+                "herdr-native gate resolution + one-step auto-dispatch is increment 2."
             ),
             execution=EXECUTION_NO_OP,
             reason=REASON_HERDR_WORKER_DISPATCH_READY,

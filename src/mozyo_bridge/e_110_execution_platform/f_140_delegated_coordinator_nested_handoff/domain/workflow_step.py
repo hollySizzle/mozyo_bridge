@@ -1,27 +1,39 @@
 """Single standard `workflow step` state machine (Redmine #12755).
 
 `mozyo-bridge workflow step` is the one standard command an AI / operator runs to
-advance one safe workflow step. The as-is primitives (``project-gateway consult`` /
-``child-intake`` / ``handoff send`` / ``ticketless-callback`` / ``%pane`` debug) leak
-route, pane, rail, and role-transition decisions to the caller. The design
-(``vibes/docs/logics/workflow-step-command-design.md``) fixes a single entrypoint: the
-caller runs the same command and mozyo-bridge resolves the next safe action from current
-lane identity + durable gate + route identity, or fails closed with the next owner + reason.
+advance one safe workflow step. The as-is surface
+(``project-gateway consult`` / ``child-intake`` / ``handoff send`` /
+``handoff ticketless-callback`` / ``handoff q-enter`` / ``delegate-*`` /
+``%pane`` debug delivery) leaks route, pane, rail, and role-transition decisions
+to the caller. The design (``vibes/docs/logics/workflow-step-command-design.md``)
+fixes a single entrypoint: the caller runs the same command and mozyo-bridge
+resolves the next safe action from current lane identity + durable gate + route
+identity, or fails closed with the next responsible owner and a fixed reason.
 
-This module is the **pure, fail-closed** state machine. It owns the decision; it performs
-no tmux mutation and no delivery. It classifies the current lane role from the discovered
-self candidate's identity — never caller guesswork (:func:`classify_workflow_lane`); resolves
-the one-step-down route with the existing #12699 / #12748 resolvers so no divergent identity
-model grows; and maps the lane + route (+ optional anchor / pending callback) onto a
-replayable :class:`WorkflowStepOutcome` that always names the next owner.
+This module is the **pure, fail-closed** state machine. It owns the decision; it
+performs no tmux mutation and no delivery. It:
 
-Scope boundaries the state machine **must not** cross (design `## 禁止される自動実行`): it never
-creates a domain/design answer, selects/creates a Redmine issue, dispatches a grandchild worker
-without an existing anchor, or does owner-approval / release / credential / destructive work —
-those surface as fail-closed states with the responsible next owner. The CLI layer
-(:mod:`...application.cli_workflow`) gathers the runtime inputs, calls
-:func:`resolve_workflow_step`, and — only for a non-dry-run executable forward leg — dispatches
-the named internal primitive.
+- classifies the current lane role from the already-discovered self candidate's
+  identity (role / confidence / project scope / ``@mozyo_lane_kind`` stamp) — never
+  from caller guesswork (:func:`classify_workflow_lane`);
+- resolves the one-step-down delegation route with the existing #12699 / #12748
+  resolvers (:func:`resolve_relative_route` / :func:`resolve_child_intake_route`),
+  so no divergent identity model grows;
+- maps the lane + route (+ optional already-available Redmine anchor / pending
+  callback) onto a structured :class:`WorkflowStepOutcome` whose ``state`` /
+  ``next_action`` / ``execution`` / ``reason`` / ``next_owner`` / ``primitive`` /
+  ``durable_anchor`` are replayable and always name the next owner.
+
+Scope boundaries the state machine **must not** cross (design `## 禁止される自動実行`):
+it never creates a domain/design answer, never selects/creates a Redmine issue,
+never dispatches a grandchild worker without an existing anchor, and never does
+owner-approval / release / credential / destructive work. Those are surfaced as
+fail-closed states with the responsible next owner, not auto-performed.
+
+The CLI layer (:mod:`...application.cli_workflow`) gathers the runtime inputs
+(self pane, discovered candidates, dry-run flag), calls :func:`resolve_workflow_step`,
+and — only for a non-dry-run executable forward leg — dispatches the named
+internal primitive. Pane id stays a self-fence / cache, never a route authority.
 """
 
 from __future__ import annotations
@@ -107,9 +119,6 @@ PRIMITIVE_CONSULT = "project_gateway_consult"
 PRIMITIVE_CHILD_INTAKE = "project_gateway_child_intake"
 PRIMITIVE_HANDOFF_SEND = "handoff_send"
 PRIMITIVE_TICKETLESS_CALLBACK = "handoff_ticketless_callback"
-# The herdr gateway's one-step `sublane dispatch-worker --execute` (Redmine #13489 increment 2,
-# coordinator disposition j#74855): only with a verified anchor + a single live worker target.
-PRIMITIVE_HERDR_DISPATCH_WORKER = "herdr_sublane_dispatch_worker"
 PRIMITIVE_NONE = "none"
 
 # ``state`` — the resolved workflow state token.
@@ -255,9 +264,6 @@ class WorkflowStepOutcome:
     repo_root: str = ""
     project_scope: str = ""
     self_pane: str = ""
-    # The herdr lane label the one-step ``sublane dispatch-worker`` matches (#13489 increment 2);
-    # empty on the tmux path and every non-dispatch herdr leg.
-    lane_label: str = ""
     # Determined-callback execution wiring (only set on the pending-callback leg):
     # ``callback_classification`` is the lane's determined result class, and
     # ``callback_to_role`` is the caller lane role the callback returns to. The CLI
@@ -293,7 +299,6 @@ class WorkflowStepOutcome:
             PRIMITIVE_CHILD_INTAKE,
             PRIMITIVE_TICKETLESS_CALLBACK,
             PRIMITIVE_HANDOFF_SEND,
-            PRIMITIVE_HERDR_DISPATCH_WORKER,
         )
 
     def as_payload(self) -> dict[str, object]:
@@ -310,7 +315,6 @@ class WorkflowStepOutcome:
             "repo_root": self.repo_root,
             "project_scope": self.project_scope,
             "self_pane": self.self_pane,
-            "lane_label": self.lane_label,
             "callback_classification": self.callback_classification,
             "callback_to_role": self.callback_to_role,
             "ok": self.ok,
@@ -956,7 +960,6 @@ __all__ = (
     "PRIMITIVE_CHILD_INTAKE",
     "PRIMITIVE_HANDOFF_SEND",
     "PRIMITIVE_TICKETLESS_CALLBACK",
-    "PRIMITIVE_HERDR_DISPATCH_WORKER",
     "PRIMITIVE_NONE",
     "STATE_GRANDPARENT_CONSULTATION",
     "STATE_PARENT_WORK_INTAKE",

@@ -39,7 +39,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_NO_OP,
     EXECUTION_READY,
-    PRIMITIVE_HERDR_DISPATCH_WORKER,
     PRIMITIVE_NONE,
     WorkflowStepOutcome,
 )
@@ -341,72 +340,6 @@ class HerdrCommonReconcileTest(_StoreCase):
         self.assertEqual(payload["reconcile_disposition"], "store_aligned")
         self.assertEqual(payload["store_pending_action"]["action"], "perform_review")
         self.assertFalse(payload["store_pending_action"]["requires_confirmation"])
-
-
-class HerdrDispatchExecutionTest(_StoreCase):
-    """The herdr gateway one-step worker dispatch through the shared pipeline (increment 2)."""
-
-    def _dispatch(self, issue="13489"):
-        return WorkflowStepOutcome(
-            state="child_worker_dispatch",
-            next_action="dispatch the single live same-lane worker",
-            execution=EXECUTION_READY,
-            reason="herdr_worker_dispatch_ready",
-            next_owner="grandchild",
-            primitive=PRIMITIVE_HERDR_DISPATCH_WORKER,
-            durable_anchor=f"redmine:issue={issue}:journal=74766",
-            lane_label="issue_13489_herdr_workflow_step",
-        )
-
-    def _run(self, live, args, *, execute=None):
-        with patch.object(cli_workflow, "require_tmux", _boom), patch.object(
-            cli_workflow, "current_pane", _boom
-        ), patch.object(cli_workflow, "_herdr_step_preflight", lambda _a: live), patch.object(
-            cli_workflow, "_execute_primitive", execute or _boom
-        ), contextlib.redirect_stdout(io.StringIO()) as out:
-            rc = cli_workflow.cmd_workflow_step(args)
-        return rc, out.getvalue()
-
-    def test_dry_run_reports_ready_without_executing(self):
-        # A dispatch outcome under --dry-run must NOT run the primitive (`_execute_primitive`
-        # blows up if reached); it reports execution=dry_run.
-        with patch.object(cli_workflow, "_load_store_action", lambda _a, **_k: (None, cli_workflow.STORE_ABSENT)):
-            rc, text = self._run(self._dispatch(), _args(self.store_path, dry_run=True))
-        payload = json.loads(text)
-        self.assertEqual(rc, 0)
-        self.assertEqual(payload["execution"], "dry_run")
-        self.assertEqual(payload["primitive"], PRIMITIVE_HERDR_DISPATCH_WORKER)
-
-    def test_execute_drives_sublane_dispatch_worker_argv(self):
-        captured = {}
-
-        def _exec(outcome, args, *, session):
-            captured["argv"] = cli_workflow._primitive_argv(outcome, args, session=session)
-            return 0, "worker_dispatched"
-
-        with patch.object(cli_workflow, "_load_store_action", lambda _a, **_k: (None, cli_workflow.STORE_ABSENT)):
-            rc, text = self._run(self._dispatch(), _args(self.store_path), execute=_exec)
-        payload = json.loads(text)
-        self.assertEqual(payload["execution"], "executed")
-        argv = captured["argv"]
-        self.assertEqual(argv[:2], ["sublane", "dispatch-worker"])
-        for token in ("--issue", "13489", "--lane-label", "issue_13489_herdr_workflow_step",
-                      "--execute", "--target-repo", "auto", "--journal", "74766"):
-            self.assertIn(token, argv)
-
-    def test_gating_store_action_blocks_the_dispatch(self):
-        # The shared reconcile still fail-closes actuation: a gating store action for the SAME
-        # verified issue downgrades the dispatch to blocked -> the primitive is NOT executed.
-        self._persist(
-            "13489:review_request,id=13489:72672,commit=1",
-            "13489:review,id=13489:72700,conclusion=approved,commit=1",
-            routes=("route_id=r,issue=13489,ws=w,role=codex,pane_name=gw,pane_id=%17",),
-        )
-        rc, text = self._run(self._dispatch(issue="13489"), _args(self.store_path))
-        payload = json.loads(text)
-        self.assertEqual(rc, 1)
-        self.assertEqual(payload["execution"], "blocked")
-        self.assertEqual(payload["reason"], "store_pending_action_gates")
 
 
 if __name__ == "__main__":
