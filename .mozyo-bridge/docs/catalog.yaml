@@ -137,6 +137,7 @@ documents:
     related_document_refs:
       - rule-project-agent-workflow
       - rule-workflow-docs-boundary
+      - logic-session-boundary
       - task-herdr-lane-operations
       - task-external-project-herdr-adoption
 
