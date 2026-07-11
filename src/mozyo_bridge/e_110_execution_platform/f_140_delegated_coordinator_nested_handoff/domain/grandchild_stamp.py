@@ -484,11 +484,12 @@ def _coerce_unit(row: object) -> InventoryUnit:
 
     Accepts an :class:`InventoryUnit` as-is, or a positional row
     ``(unit_id, lane_kind, delegation_depth, delegation_parent, status[,
-    repo_identity])``. The tuple form is a caller convenience (pure planner
-    inputs / tests): it defaults ``has_codex_gateway=True`` and ``ambiguous=False``
-    because a positional row cannot express live gateway / ambiguity facts — the
-    live discovery path builds :class:`InventoryUnit` directly so those facts are
-    enforced end to end (Redmine #13571 F2).
+    repo_identity])``. A positional row **cannot** express the live gateway /
+    ambiguity facts, so it is coerced with ``has_codex_gateway=False`` — a legacy
+    tuple therefore never yields a positive realization on its own (it fails
+    closed on the gateway ROLE re-match). Only a typed :class:`InventoryUnit`
+    built by the live discovery path (with an explicitly resolved codex gateway)
+    can realize (Redmine #13571 j#75473 F2: no fail-open on tuple defaults).
     """
     if isinstance(row, InventoryUnit):
         return row
@@ -501,6 +502,7 @@ def _coerce_unit(row: object) -> InventoryUnit:
         delegation_parent=str(seq[3]),
         status=str(seq[4]),
         repo_identity=repo,
+        has_codex_gateway=False,
     )
 
 

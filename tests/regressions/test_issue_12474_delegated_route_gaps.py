@@ -43,6 +43,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GrandchildTargetIdentity,
 )
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_launch_adopt import (  # noqa: E402
+    LAUNCH_ADOPT_MODE_LAUNCH_NEW,
+)
+
 from support.delegation_route_fakes import (  # noqa: E402
     DELEGATED_COORDINATOR_UNIT,
     GRANDCHILD_UNIT,
@@ -50,6 +54,7 @@ from support.delegation_route_fakes import (  # noqa: E402
     FakeDelegationExecutor,
     base_request,
     contaminated_read,
+    gateway_candidate,
     insufficient_read,
     realized_grandchild_rows,
 )
@@ -187,6 +192,27 @@ class DispatchSelectedAuthorityRegressionTest(unittest.TestCase):
         self.assertTrue(plan.dispatch_decision.is_launch)
         self.assertEqual(PLAN_PROCEED, plan.verdict)
         self.assertEqual(GATE_REALIZED, plan.realization_gate.verdict)
+
+    def test_launch_target_colliding_with_prelaunch_candidate_blocks(self) -> None:
+        # #13571 j#75473 F5: a launch dispatch whose explicit target names an
+        # EXISTING pre-launch discovery candidate is an adopt smuggled in under a
+        # launch label -> fail closed (a launched lane must be genuinely new).
+        existing = GrandchildTargetIdentity(
+            unit_id=GRANDCHILD_UNIT,
+            delegation_parent=DELEGATED_COORDINATOR_UNIT,
+            repo_identity=CHILD_REPO_IDENTITY,
+        )
+        plan = plan_delegated_coordinator_route(
+            base_request(
+                launch_adopt_mode=LAUNCH_ADOPT_MODE_LAUNCH_NEW,
+                candidates=[gateway_candidate(lane_id="lane-grandchild")],
+                grandchild_target=existing,
+                realized_units=realized_grandchild_rows(),
+            )
+        )
+        self.assertTrue(plan.dispatch_decision.is_launch)
+        self.assertEqual(PLAN_BLOCKED, plan.verdict)
+        self.assertEqual(GATE_BLOCKED, plan.realization_gate.verdict)
 
 
 class SameLaneFallbackRegressionTest(unittest.TestCase):

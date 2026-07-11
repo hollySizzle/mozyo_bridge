@@ -1445,6 +1445,7 @@ file_conventions:
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_backend_neutral_resolver.py
       - tests/scenarios/test_delegated_coordinator_route_plan.py
       - tests/regressions/test_issue_12474_delegated_route_gaps.py
+      - tests/regressions/test_issue_13571_grandchild_realization_binding.py
       - tests/support/delegation_route_fakes.py
       - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
       - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py

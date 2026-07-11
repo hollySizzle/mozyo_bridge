@@ -57,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import (
     GrandchildTargetIdentity,
+    InventoryUnit,
     RealizationGateResult,
     evaluate_grandchild_realization_gate,
     resolve_realized_grandchild_binding,
@@ -137,9 +138,10 @@ class RoutePlanRequest:
     inference read, the delegation ``policy`` and launch/adopt ``mode``, the
     discovery ``candidates`` for the grandchild Codex gateway, the canonical
     ``target_repo_identity`` gate, the ``delegated_coordinator_unit`` the
-    grandchild must descend from, and the ``realized_units`` rows
-    (``(unit_id, lane_kind, delegation_depth, delegation_parent, status[,
-    repo_identity])``) the realization gate reads. ``grandchild_target``, when
+    grandchild must descend from, and the ``realized_units`` — the typed
+    :class:`InventoryUnit` rows re-resolved from the live inventory (a bare
+    positional tuple is coerced but, lacking a resolved codex gateway, can never
+    realize) the realization gate reads. ``grandchild_target``, when
     set, is the exact dispatch-selected/created/adopted grandchild identity the
     realization gate binds to; when unset, an adopt dispatch's selected candidate
     supplies it (Redmine #13571 / #12454 j#75444 F1). ``no_dispatch_reason``,
@@ -156,7 +158,7 @@ class RoutePlanRequest:
     candidates: Sequence[DelegationCandidate]
     target_repo_identity: Optional[str]
     delegated_coordinator_unit: str
-    realized_units: Sequence[Sequence[object]] = ()
+    realized_units: Sequence[InventoryUnit] = ()
     grandchild_target: Optional[GrandchildTargetIdentity] = None
     current_depth: int = DEFAULT_DELEGATED_COORDINATOR_DEPTH
     active_grandchild_lanes: int = 0
@@ -325,8 +327,17 @@ def _effective_grandchild_target(
             return None
         return derived
     # Launch: no selected candidate; the explicit post-launch identity (if any)
-    # is authoritative. None -> unbound -> blocked.
-    return request.grandchild_target
+    # is authoritative — but it must name a genuinely NEW lane. A launch target
+    # that collides with a pre-launch discovery candidate is an existing lane
+    # smuggled in under a launch label (an adopt masquerading as a launch), so
+    # fail closed rather than bind to it (Redmine #13571 j#75473 F5).
+    explicit = request.grandchild_target
+    if explicit is not None:
+        for cand in request.candidates:
+            cand_unit = f"{cand.workspace_id or ''}/{cand.lane_id or ''}"
+            if cand_unit == explicit.unit_id:
+                return None
+    return explicit
 
 
 def plan_delegated_coordinator_route(

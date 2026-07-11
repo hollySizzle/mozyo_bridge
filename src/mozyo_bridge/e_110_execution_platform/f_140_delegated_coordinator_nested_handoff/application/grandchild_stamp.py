@@ -68,6 +68,32 @@ _EXIT_GATE_BLOCKED = 3
 _ROOT_PARENT_TOKENS = frozenset({"", "-", "none", "root"})
 
 
+def _canonical_repo_identity(path: Optional[str]) -> Optional[str]:
+    """Canonicalize a repo path to the SAME identity the ``--target-repo`` gate uses.
+
+    Repo identity must be compared on one canonical form so a `.` / `..` /
+    ``~`` / NFC-vs-NFD spelling of the same checkout never reads as a mismatch
+    (Redmine #13571 j#75473 F3). Reuses the shared workspace-identity primitives:
+    :func:`mozyo_bridge.shared.paths.resolve_repo_root`
+    (``Path.expanduser().resolve()``) followed by
+    :func:`mozyo_bridge.shared.paths.normalize_path_unicode` (the fixed NFD form),
+    the same canonicalization the live discovery repo root goes through. Returns
+    ``None`` for an empty path (the binding then fails closed on the mandatory
+    repo re-match). Best-effort: an unresolvable path falls back to its
+    Unicode-normalized raw form rather than raising.
+    """
+    from mozyo_bridge.shared.paths import normalize_path_unicode, resolve_repo_root
+
+    if not path or not str(path).strip():
+        return None
+    raw = str(path).strip()
+    try:
+        resolved = str(resolve_repo_root(raw))
+    except (OSError, RuntimeError, ValueError):
+        resolved = raw
+    return normalize_path_unicode(resolved)
+
+
 def _parse_lane_spec(raw: str) -> DeclaredLane:
     """Parse one ``--lane`` spec into a :class:`DeclaredLane`.
 
@@ -274,16 +300,10 @@ def _discover_delegation_units(args: argparse.Namespace):
     read-only #12466 projection ``agents targets`` itself uses.
     """
     from mozyo_bridge.application.commands import _agents_target_candidates
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import AGENT_KIND_CODEX
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import CONFIDENCE_STRONG
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_display import derive_targets_delegation
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import InventoryUnit
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.grandchild_stamp import GRANDCHILD_GATEWAY_ROLE, InventoryUnit
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import require_tmux
-
-    def _norm_repo(path):
-        if not path:
-            return None
-        norm = str(path).strip().rstrip("/")
-        return norm or None
 
     require_tmux()
     candidates = _agents_target_candidates(args)
@@ -301,18 +321,30 @@ def _discover_delegation_units(args: argparse.Namespace):
 
     result: list[InventoryUnit] = []
     for unit_id, members in grouped.items():
-        has_codex = any(
-            getattr(cand, "agent_kind", None) == AGENT_KIND_CODEX for cand, _ in members
-        )
-        weak_candidate = any(getattr(cand, "ambiguous", False) for cand, _ in members)
-        repos = {
-            _norm_repo(getattr(cand, "repo_root", None))
+        # Resolve the route-bound Codex gateway as EXACTLY ONE strong,
+        # non-ambiguous `role==codex` candidate (the discovery projection uses
+        # `role`, not `agent_kind`). 0 / 2+ / weak / ambiguous all mean the unit
+        # is not a single trusted route-bound gateway (Redmine #13571 j#75473 F1).
+        strong_codex = [
+            cand
             for cand, _ in members
-            if _norm_repo(getattr(cand, "repo_root", None)) is not None
-        }
+            if getattr(cand, "role", None) == GRANDCHILD_GATEWAY_ROLE
+            and getattr(cand, "confidence", None) == CONFIDENCE_STRONG
+            and not getattr(cand, "ambiguous", False)
+        ]
+        weak_candidate = any(getattr(cand, "ambiguous", False) for cand, _ in members)
+        has_codex_gateway = len(strong_codex) == 1
+        # The gateway's OWN repo is authoritative — never synthesized from a
+        # sibling Claude pane's repo (F1). Missing gateway repo -> None -> the
+        # binding's mandatory repo re-match fails closed.
+        gateway_repo = (
+            _canonical_repo_identity(getattr(strong_codex[0], "repo_root", None))
+            if has_codex_gateway
+            else None
+        )
         derived = [d for _, d in members if d.status == "derived"]
-        # Authoritative facts come from the derived breadcrumb(s); if the derived
-        # panes disagree on KIND/depth/parent, the unit is ambiguous.
+        # Authoritative KIND/depth/parent come from the derived breadcrumb(s); if
+        # the derived panes disagree, the unit is ambiguous.
         derived_facts = {
             (d.lane_kind, d.delegation_depth, d.delegation_parent) for d in derived
         }
@@ -329,8 +361,7 @@ def _discover_delegation_units(args: argparse.Namespace):
                 first.delegation_parent,
                 first.status,
             )
-        ambiguous = weak_candidate or len(repos) > 1 or len(derived_facts) > 1
-        repo_identity = next(iter(repos)) if len(repos) == 1 else None
+        ambiguous = weak_candidate or len(strong_codex) > 1 or len(derived_facts) > 1
         result.append(
             InventoryUnit(
                 unit_id=unit_id,
@@ -338,8 +369,8 @@ def _discover_delegation_units(args: argparse.Namespace):
                 delegation_depth=depth,
                 delegation_parent=parent,
                 status=status,
-                repo_identity=repo_identity,
-                has_codex_gateway=has_codex,
+                repo_identity=gateway_repo,
+                has_codex_gateway=has_codex_gateway,
                 ambiguous=ambiguous,
             )
         )
@@ -412,7 +443,9 @@ def cmd_handoff_grandchild_gate(args: argparse.Namespace) -> int:
         GrandchildTargetIdentity(
             unit_id=gc_unit,
             delegation_parent=args.delegated_coordinator_unit,
-            repo_identity=(getattr(args, "grandchild_repo", None) or None),
+            # Canonicalize the operator-supplied repo to the same identity the
+            # live gateway repo is compared on (F3), so spelling never mismatches.
+            repo_identity=_canonical_repo_identity(getattr(args, "grandchild_repo", None)),
         )
         if gc_unit
         else None
